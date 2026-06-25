@@ -3,7 +3,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "sotto", version, about = "End-to-end-encrypted secret sync for teams")]
+#[command(
+    name = "sotto",
+    version,
+    about = "End-to-end-encrypted secret sync for teams"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

@@ -8,7 +8,9 @@ async fn main() {
     let app = Router::new().route("/health", get(|| async { "ok" }));
 
     let addr = "127.0.0.1:8080";
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind listener");
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind listener");
     println!("sotto-server listening on http://{addr} (M3 stub)");
 
     axum::serve(listener, app).await.expect("serve");

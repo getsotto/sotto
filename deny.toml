@@ -9,16 +9,15 @@ yanked = "deny"
 multiple-versions = "warn"
 
 [licenses]
+# Our own workspace crates are `publish = false` and intentionally unlicensed for now
+# (license decision pending — see README). Don't enforce license policy on them.
+private = { ignore = true }
 allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
-    "BSD-2-Clause",
     "BSD-3-Clause",
-    "ISC",
     "Unicode-3.0",
-    "Unicode-DFS-2016", # unicode-ident (transitive via syn/proc-macros)
-    "Zlib",
 ]
 confidence-threshold = 0.9
 
