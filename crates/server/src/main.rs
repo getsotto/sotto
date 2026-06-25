@@ -1,5 +1,5 @@
-//! The Sotto sync / API backend. See `docs/DATA-MODEL.md`. M0 is a health-check stub; the
-//! real REST surface (full-snapshot sync, versioned writes, grants, rotation) lands in M3.
+//! The Sotto sync / API backend. M0 is a health-check stub; the real REST surface
+//! (full-snapshot sync, versioned writes, grants, rotation) lands in M3.
 
 use axum::{routing::get, Router};
 

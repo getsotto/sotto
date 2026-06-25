@@ -1,4 +1,4 @@
-//! WASM bindings to the Sotto crypto core for the web client. See `docs/CRYPTO.md` §8.
+//! WASM bindings to the Sotto crypto core for the web client.
 //!
 //! The point of this crate: the browser runs the *same* crypto core as the CLI, compiled to
 //! WASM — one implementation, no second crypto codebase to audit. M1 exposes the real

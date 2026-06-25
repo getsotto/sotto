@@ -16,7 +16,7 @@ repository = "https://github.com/getsotto/sotto"
 # Internal
 sotto-core = { path = "crates/core" }
 
-# Crypto core (pinned per docs/CRYPTO.md — pure-Rust libsodium, trivial WASM)
+# Crypto core: pure-Rust libsodium (misuse-resistant, trivial WASM)
 dryoc = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 thiserror = "2"

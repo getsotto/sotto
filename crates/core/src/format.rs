@@ -1,6 +1,6 @@
-//! Human-facing key encoding: Crockford base32, versioned + checksummed. See `docs/CRYPTO.md`
-//! §7. Used for the secret key (`SK1-…`) and the Emergency Kit recovery key (`RK1-…`). Full
-//! encode/decode + checksum lands in M1.
+//! Human-facing key encoding: Crockford base32, versioned + checksummed. Used for the secret
+//! key (`SK1-…`) and the Emergency Kit recovery key (`RK1-…`). Full encode/decode + checksum
+//! lands in M1.
 
 /// Crockford base32 alphabet — excludes the ambiguous letters I, L, O, and U.
 pub const CROCKFORD_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";

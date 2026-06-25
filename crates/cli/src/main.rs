@@ -1,4 +1,4 @@
-//! The `sotto` CLI. See `docs/CLI.md`. M0 wires up the command surface; behaviour lands in M2.
+//! The `sotto` CLI. M0 wires up the command surface; behaviour lands in M2.
 
 use clap::{Parser, Subcommand};
 

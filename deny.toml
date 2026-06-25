@@ -1,4 +1,4 @@
-# cargo-deny config (supply-chain baseline — see docs/DESIGN.md code-integrity).
+# cargo-deny config — supply-chain baseline (advisories, bans, licenses, sources).
 # First run may surface dependency licenses to add to `allow` below — that's normal;
 # `cargo deny check licenses` prints exactly which ones (e.g. from the dryoc tree).
 

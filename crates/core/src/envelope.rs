@@ -1,4 +1,4 @@
-//! Versioned, self-describing ciphertext envelope. See `docs/CRYPTO.md` §5.
+//! Versioned, self-describing ciphertext envelope.
 //!
 //! Wire layout (implemented in M1):
 //! `[ scheme: u8 ][ alg: u8 ][ nonce: 24 ][ ciphertext ‖ Poly1305 tag ]`

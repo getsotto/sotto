@@ -1,5 +1,5 @@
 //! Sotto crypto core — one audited implementation, shared by the CLI (native) and the web
-//! client (WASM). See `docs/CRYPTO.md`.
+//! client (WASM).
 //!
 //! M1 implements: KDF (Argon2id + HKDF combine), the versioned envelope, XChaCha20-Poly1305
 //! with AAD context-binding, X25519 sealed-box key wrapping, and the Crockford key formats —
