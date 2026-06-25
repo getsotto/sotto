@@ -24,8 +24,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      - name: Build WASM core
-        run: cargo build -p sotto-wasm --target wasm32-unknown-unknown
+      # NOTE: the wasm32-unknown-unknown cross-build lands in M1, once getrandom's
+      # `wasm_js` backend is wired (dryoc -> rand -> getrandom). The wasm crate still
+      # compiles for the host as part of `cargo build --workspace` above.
 
   supply-chain:
     runs-on: ubuntu-latest

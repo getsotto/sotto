@@ -16,17 +16,18 @@ End-to-end-encrypted secret sync for developer teams. Stop Slacking your `.env`.
 
 ## Develop
 
-Prereqs: [Rust](https://rustup.rs) (stable) with the WASM target.
+Prereqs: [Rust](https://rustup.rs) (stable; ≥1.89, required by dryoc).
 
 ```sh
-rustup target add wasm32-unknown-unknown
-
 cargo build --workspace
 cargo test  --workspace
 cargo fmt   --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build -p sotto-wasm --target wasm32-unknown-unknown
 ```
+
+> The `wasm32-unknown-unknown` cross-build is deferred to M1, when getrandom's `wasm_js`
+> backend gets wired (dryoc → rand → getrandom). The WASM crate still builds for the host
+> as part of `cargo build --workspace`.
 
 Try the CLI stub:
 
