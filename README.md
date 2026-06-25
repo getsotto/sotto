@@ -34,7 +34,7 @@ Web client (WASM) ┘                         │
 
 The workspace contains four crates:
 
-- `crates/core` — shared cryptographic types and, in M1, the complete crypto implementation.
+- `crates/core` — shared cryptographic types and, the complete crypto implementation.
 - `crates/cli` — the `sotto` command-line interface and primary native client.
 - `crates/server` — the Axum-based synchronization API.
 - `crates/wasm` — `wasm-bindgen` bindings that expose the core to web clients.
@@ -106,10 +106,10 @@ cargo deny check
 ```
 
 The WASM crate currently builds for the host as part of the workspace. The
-`wasm32-unknown-unknown` cross-build is deferred until M1, when the `getrandom` WASM
+`wasm32-unknown-unknown` cross-build is deferred, when the `getrandom` WASM
 backend is configured.
 
-The M1 compatibility gate is native encryption and WASM decryption producing matching,
+The compatibility gate is native encryption and WASM decryption producing matching,
 byte-for-byte results from shared test vectors.
 
 ## Security
