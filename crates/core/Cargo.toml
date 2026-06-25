@@ -1,0 +1,12 @@
+[package]
+name = "sotto-core"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+dryoc.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true

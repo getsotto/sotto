@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/cli",
+    "crates/server",
+    "crates/wasm",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.89"  # dryoc 0.8 requires Rust >= 1.89
+repository = "https://github.com/getsotto/sotto"
+
+[workspace.dependencies]
+# Internal
+sotto-core = { path = "crates/core" }
+
+# Crypto core: pure-Rust libsodium (misuse-resistant, trivial WASM)
+dryoc = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Server
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+
+# WASM bindings
+wasm-bindgen = "0.2"
