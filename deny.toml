@@ -1,0 +1,26 @@
+# cargo-deny config (supply-chain baseline — see docs/DESIGN.md code-integrity).
+# First run may surface dependency licenses to add to `allow` below — that's normal;
+# `cargo deny check licenses` prints exactly which ones (e.g. from the dryoc tree).
+
+[advisories]
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

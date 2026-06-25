@@ -1,0 +1,16 @@
+[package]
+name = "sotto-cli"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+# The crate is `sotto-cli` (the bare `sotto` crate name is taken on crates.io — see
+# docs/BRAND.md), but it builds a binary named `sotto`.
+[[bin]]
+name = "sotto"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
