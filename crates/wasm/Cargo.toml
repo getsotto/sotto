@@ -3,7 +3,10 @@ name = "sotto-wasm"
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
-repository.workspace = true
+# `repository` is intentionally not inherited from the workspace: wasm-pack parses this manifest
+# itself and doesn't resolve `field.workspace = true`, so an inherited `repository` makes
+# `wasm-pack test` fail with "expected a string for key `package.repository`". The crate is
+# `publish = false`, so the metadata isn't needed here anyway.
 publish = false
 
 [lib]
