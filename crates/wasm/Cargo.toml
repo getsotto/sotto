@@ -12,3 +12,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 sotto-core.workspace = true
 wasm-bindgen.workspace = true
+
+# On wasm32-unknown-unknown, getrandom (via dryoc -> rand) needs the JS-backed RNG, selected
+# by the `wasm_js` feature alone (getrandom 0.4). Scoped to wasm so native builds are unaffected.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

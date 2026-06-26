@@ -1,34 +1,43 @@
 //! Authenticated encryption with associated data (AEAD).
 //!
-//! Built on dryoc's XChaCha20-Poly1305 `secretstream`, used as a one-shot (a single message
-//! sealed with `Tag::FINAL`). The `aad` is bound into the authentication tag, so a server that
-//! moves or rolls back a blob causes decryption to fail closed (see the data model: bind
-//! `aad = scheme ‖ env_id ‖ secret_id ‖ version ‖ field`).
+//! XChaCha20-Poly1305 (RustCrypto), one-shot, with a fresh random 192-bit nonce per call. The
+//! `aad` is bound into the authentication tag, so a server that moves or rolls back a blob
+//! causes decryption to fail closed (bind `aad = scheme ‖ env_id ‖ secret_id ‖ version ‖
+//! field`).
+//!
+//! Why RustCrypto here and dryoc elsewhere: dryoc's secretstream uses `usize::to_le_bytes()`
+//! for its length fields, which is 4 bytes on wasm32 and panics — broken in the browser. This
+//! is the one place we step outside dryoc, for a wasm32-safe, textbook one-shot AEAD.
 
-use dryoc::dryocstream::{DryocStream, Header, Key, Tag};
-use dryoc::types::Bytes;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 
-use crate::envelope::{Alg, HEADER_LEN, SCHEME_V1};
+use crate::envelope::{Alg, NONCE_LEN, SCHEME_V1};
 use crate::error::Error;
+use crate::random;
 
 /// Symmetric key length (XChaCha20-Poly1305), in bytes.
 pub const KEY_LEN: usize = 32;
 
 /// Encrypt `plaintext` under `key`, binding `aad`, returning a versioned envelope.
 pub fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
-    let key = Key::from(*key);
-    let (mut stream, header): (_, Header) = DryocStream::init_push(&key);
-    // dryoc's `Bytes` bound requires a sized type, and message + AAD must share a type.
-    let message = plaintext.to_vec();
-    let aad = aad.to_vec();
-    let ciphertext = stream
-        .push_to_vec(&message, Some(&aad), Tag::FINAL)
-        .expect("secretstream push cannot fail for valid inputs");
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce_bytes = random::bytes::<NONCE_LEN>();
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .expect("XChaCha20-Poly1305 encryption cannot fail for valid inputs");
 
-    let mut out = Vec::with_capacity(2 + HEADER_LEN + ciphertext.len());
+    let mut out = Vec::with_capacity(2 + NONCE_LEN + ciphertext.len());
     out.push(SCHEME_V1);
-    out.push(Alg::XChaCha20Poly1305Stream as u8);
-    out.extend_from_slice(header.as_slice());
+    out.push(Alg::XChaCha20Poly1305 as u8);
+    out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ciphertext);
     out
 }
@@ -38,27 +47,27 @@ pub fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
 /// Returns [`Error::Crypto`] on any authentication failure (wrong key, tampered ciphertext, or
 /// mismatched `aad`) — deliberately without distinguishing the cause.
 pub fn open(key: &[u8; KEY_LEN], envelope: &[u8], aad: &[u8]) -> Result<Vec<u8>, Error> {
-    if envelope.len() < 2 + HEADER_LEN {
+    if envelope.len() < 2 + NONCE_LEN {
         return Err(Error::Malformed("envelope too short"));
     }
     let scheme = envelope[0];
     let alg = envelope[1];
-    if scheme != SCHEME_V1 || Alg::from_u8(alg) != Some(Alg::XChaCha20Poly1305Stream) {
+    if scheme != SCHEME_V1 || Alg::from_u8(alg) != Some(Alg::XChaCha20Poly1305) {
         return Err(Error::UnsupportedScheme { scheme, alg });
     }
 
-    let header = Header::try_from(&envelope[2..2 + HEADER_LEN])
-        .map_err(|_| Error::Malformed("bad header"))?;
-    let ciphertext = envelope[2 + HEADER_LEN..].to_vec();
-    let aad = aad.to_vec();
-
-    let key = Key::from(*key);
-    let mut stream = DryocStream::init_pull(&key, &header);
-    let (plaintext, tag) = stream.pull_to_vec(&ciphertext, Some(&aad))?;
-    if tag != Tag::FINAL {
-        return Err(Error::Malformed("unexpected stream tag"));
-    }
-    Ok(plaintext)
+    let nonce = XNonce::from_slice(&envelope[2..2 + NONCE_LEN]);
+    let ciphertext = &envelope[2 + NONCE_LEN..];
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
+    cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| Error::Crypto)
 }
 
 #[cfg(test)]
