@@ -33,11 +33,16 @@ pub struct Keypair {
 /// Generate a fresh X25519 keypair.
 pub fn generate_keypair() -> Keypair {
     let kp = StackKeyPair::generate();
-    let mut public = [0u8; PUBLIC_KEY_LEN];
-    let mut secret = [0u8; SECRET_KEY_LEN];
-    public.copy_from_slice(kp.public_key.as_slice());
-    secret.copy_from_slice(kp.secret_key.as_slice());
-    Keypair { public, secret }
+    // Copy straight into the returned `Keypair` so the only raw secret buffer here is the one
+    // zeroized on drop — copying via a stack-local `[u8; 32]` (which is `Copy`) would leave a
+    // stray, un-zeroized duplicate of the secret behind on the stack.
+    let mut out = Keypair {
+        public: [0u8; PUBLIC_KEY_LEN],
+        secret: [0u8; SECRET_KEY_LEN],
+    };
+    out.public.copy_from_slice(kp.public_key.as_slice());
+    out.secret.copy_from_slice(kp.secret_key.as_slice());
+    out
 }
 
 /// Wrap `plaintext` (typically a symmetric key) to `recipient_public` via an X25519 sealed box.
