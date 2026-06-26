@@ -149,7 +149,10 @@ fn derive(password: &[u8], secret_key: &[u8], salt: &[u8; kdf::SALT_LEN]) -> Res
 }
 
 fn cache_session(keychain: &dyn Keychain, master_key: &MasterKey, ttl: Duration) -> Result<()> {
-    let expiry = now_ms().saturating_add(ttl.as_millis() as i64);
+    // Clamp rather than `as i64`: a huge TTL would otherwise wrap to a negative offset and make
+    // the session read as already-expired.
+    let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
+    let expiry = now_ms().saturating_add(ttl_ms);
     let mut buf = Vec::with_capacity(SESSION_LEN);
     buf.extend_from_slice(master_key.as_bytes());
     buf.extend_from_slice(&expiry.to_le_bytes());
