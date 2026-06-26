@@ -253,6 +253,9 @@ impl Store {
     ) -> Result<SecretRow> {
         let id = new_id();
         let ts = now_ms();
+        // The row insert and its history snapshot must be all-or-nothing: a failure between them
+        // would leave a secret with no version history. `unchecked_transaction` works on `&self`.
+        let tx = self.conn.unchecked_transaction()?;
         self.conn.execute(
             "INSERT INTO secrets
                 (id, env_id, enc_name, enc_value, enc_data_key, version, created_at, updated_at)
@@ -260,6 +263,7 @@ impl Store {
             params![id, env_id, enc_name, enc_value, enc_data_key, ts],
         )?;
         self.snapshot(&id, 1, enc_name, enc_value, enc_data_key, ts)?;
+        tx.commit()?;
         Ok(SecretRow {
             id,
             env_id: env_id.to_string(),
