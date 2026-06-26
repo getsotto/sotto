@@ -71,21 +71,29 @@ pub struct MemoryKeychain {
     items: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
 }
 
+impl MemoryKeychain {
+    /// Lock the map, turning a poisoned mutex into an error rather than aborting the process.
+    fn locked(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, std::collections::HashMap<String, Vec<u8>>>> {
+        self.items
+            .lock()
+            .map_err(|_| Error::Keychain("memory keychain lock poisoned".into()))
+    }
+}
+
 impl Keychain for MemoryKeychain {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self.items.lock().expect("lock").get(key).cloned())
+        Ok(self.locked()?.get(key).cloned())
     }
 
     fn set(&self, key: &str, value: &[u8]) -> Result<()> {
-        self.items
-            .lock()
-            .expect("lock")
-            .insert(key.to_string(), value.to_vec());
+        self.locked()?.insert(key.to_string(), value.to_vec());
         Ok(())
     }
 
     fn delete(&self, key: &str) -> Result<()> {
-        self.items.lock().expect("lock").remove(key);
+        self.locked()?.remove(key);
         Ok(())
     }
 }
