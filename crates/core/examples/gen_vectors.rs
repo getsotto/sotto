@@ -2,8 +2,8 @@
 //!
 //! Run: `cargo run -p sotto-core --example gen_vectors`
 //!
-//! Most vectors are deterministic; the AEAD envelope and sealed box embed a random
-//! header/ephemeral key, so we capture one instance and pin it (decryption is deterministic).
+//! Most vectors are deterministic; the AEAD envelope embeds a random nonce and the sealed box a
+//! random ephemeral key, so we capture one instance and pin it (decryption is deterministic).
 
 use sotto_core::{aead, format, kdf, wrap};
 
