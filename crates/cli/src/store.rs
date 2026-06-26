@@ -306,13 +306,30 @@ impl Store {
             )));
         }
         let ts = now_ms();
-        self.conn.execute(
+        // Compare-and-swap on the version column: gate the UPDATE on the version we just read so
+        // a racing writer (a second process on the same file) that already bumped it updates 0
+        // rows here and gets a deterministic Conflict, rather than slipping through to a
+        // secret_versions UNIQUE violation (which would surface as an opaque Error::Store).
+        let updated = self.conn.execute(
             "UPDATE secrets
              SET enc_name = ?2, enc_value = ?3, enc_data_key = ?4, version = ?5,
                  updated_at = ?6, deleted_at = NULL
-             WHERE id = ?1",
-            params![id, enc_name, enc_value, enc_data_key, new_version, ts],
+             WHERE id = ?1 AND version = ?7",
+            params![
+                id,
+                enc_name,
+                enc_value,
+                enc_data_key,
+                new_version,
+                ts,
+                current
+            ],
         )?;
+        if updated == 0 {
+            return Err(Error::Conflict(format!(
+                "secret {id}: version changed concurrently (expected {current})"
+            )));
+        }
         self.snapshot(id, new_version, enc_name, enc_value, enc_data_key, ts)?;
         tx.commit()?;
         Ok(())
