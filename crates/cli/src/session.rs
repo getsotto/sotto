@@ -65,11 +65,19 @@ pub fn init(
     let master_key = derive(password, &secret_key, &salt)?;
 
     let enc_verifier = aead::seal(master_key.as_bytes(), VERIFIER_PLAINTEXT, VERIFIER_AAD);
-    store.put_identity(&Identity {
+    // Persist the secret key before marking the store initialized. If we wrote the identity row
+    // first and the keychain write then failed, the store would look initialized with no
+    // recoverable secret key (future `init` is rejected, `unlock` can't re-derive). Writing the
+    // key first lets us roll it back if the store write fails, so a failed init leaves no
+    // half-initialized state.
+    keychain.set(KC_SECRET_KEY, &secret_key)?;
+    if let Err(e) = store.put_identity(&Identity {
         kdf_salt: salt.to_vec(),
         enc_verifier,
-    })?;
-    keychain.set(KC_SECRET_KEY, &secret_key)?;
+    }) {
+        let _ = keychain.delete(KC_SECRET_KEY);
+        return Err(e);
+    }
     cache_session(keychain, &master_key, ttl)?;
 
     let kit = EmergencyKit {
