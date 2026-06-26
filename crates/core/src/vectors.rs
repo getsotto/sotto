@@ -4,10 +4,11 @@
 //! golden values. The SAME function is run by a native unit test (below) and by the WASM
 //! `wasm-bindgen-test` in `crates/wasm` — so the two builds are proven to agree.
 //!
-//! dryoc is pure Rust, so native and WASM run identical code; the gate primarily proves the
-//! WASM build + runtime integration (getrandom, wasm-bindgen, memory) works and can decrypt
-//! native-produced ciphertext. The Argon2id master-key vector is checked natively only (it's
-//! identical in WASM by construction, and avoids running 256 MiB Argon2 inside wasm).
+//! The crypto core is pure Rust (dryoc plus RustCrypto's `chacha20poly1305` for AEAD), so native
+//! and WASM run identical code; the gate primarily proves the WASM build + runtime integration
+//! (getrandom, wasm-bindgen, memory) works and can decrypt native-produced ciphertext. The
+//! Argon2id master-key vector is checked natively only (it's identical in WASM by construction,
+//! and avoids running 256 MiB Argon2 inside wasm).
 //!
 //! Regenerate with `cargo run -p sotto-core --example gen_vectors`.
 
