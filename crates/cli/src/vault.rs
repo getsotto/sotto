@@ -3,7 +3,10 @@
 //! The key hierarchy: a master key (supplied by the session layer) unwraps an environment's
 //! **vault key**; each write generates a fresh per-secret **data key** wrapped under the vault
 //! key; names and values are sealed under the data key with associated data binding their
-//! location (`env`, `secret`, `version`, `field`) so the store can't swap or roll back a blob.
+//! location (`env`, `secret`, `version`, `field`) so the store can't swap, relocate, or mix
+//! blobs across secrets, environments, or versions. (AAD binding alone does not detect a
+//! rollback of a whole row to an earlier consistent version — that needs separate freshness /
+//! monotonic-version tracking.)
 //!
 //! Secret names are encrypted, so name→row resolution decrypts each row and matches — the store
 //! never sees plaintext.
