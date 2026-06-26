@@ -283,6 +283,10 @@ impl Store {
         enc_value: &[u8],
         enc_data_key: &[u8],
     ) -> Result<i64> {
+        // Read the current version, bump it, and snapshot history as one unit: otherwise a
+        // failure after the UPDATE would advance the secret without recording its history row.
+        // `unchecked_transaction` works on `&self`.
+        let tx = self.conn.unchecked_transaction()?;
         let current: i64 = self
             .conn
             .query_row(
@@ -302,6 +306,7 @@ impl Store {
             params![id, enc_name, enc_value, enc_data_key, next, ts],
         )?;
         self.snapshot(id, next, enc_name, enc_value, enc_data_key, ts)?;
+        tx.commit()?;
         Ok(next)
     }
 
