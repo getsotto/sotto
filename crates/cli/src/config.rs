@@ -27,7 +27,12 @@ impl Config {
     /// Load the config from `dir/sotto.toml`.
     pub fn load_from(dir: &Path) -> Result<Self> {
         let path = dir.join(CONFIG_FILE);
-        let text = std::fs::read_to_string(&path).map_err(|_| Error::NoConfig(path))?;
+        let text = std::fs::read_to_string(&path).map_err(|e| match e.kind() {
+            // A genuinely-absent file is "no config"; anything else (permission denied, invalid
+            // UTF-8, …) is a real I/O fault and must not masquerade as a missing config.
+            std::io::ErrorKind::NotFound => Error::NoConfig(path),
+            _ => Error::Io(e.to_string()),
+        })?;
         toml::from_str(&text).map_err(|e| Error::Config(e.to_string()))
     }
 
