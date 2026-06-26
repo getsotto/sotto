@@ -21,6 +21,16 @@ rusqlite.workspace = true
 uuid.workspace = true
 sotto-core.workspace = true
 zeroize.workspace = true
+# Linux uses the pure-Rust (zbus) Secret Service backend rather than `sync-secret-service`,
+# which links the system C library libdbus-1 and would require libdbus-1-dev on every Linux
+# build (CI and end users). `async-secret-service` needs a runtime (`async-io`) + crypto provider.
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "async-secret-service",
+    "async-io",
+    "crypto-rust",
+] }
 
 [dev-dependencies]
 tempfile = "3"

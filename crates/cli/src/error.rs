@@ -43,6 +43,18 @@ pub enum Error {
     /// A concurrent-modification conflict.
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// `init` was run but an identity already exists.
+    #[error("already initialized — an identity already exists")]
+    AlreadyInitialized,
+
+    /// No identity has been set up yet.
+    #[error("no identity — run `sotto init` first")]
+    NoIdentity,
+
+    /// The OS keychain could not be read or written.
+    #[error("keychain error: {0}")]
+    Keychain(String),
 }
 
 impl Error {
@@ -50,10 +62,10 @@ impl Error {
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::NotFound(_) | Error::NoConfig(_) => 3,
-            Error::Locked | Error::Crypto => 4,
-            Error::Store(_) | Error::Io(_) => 5,
+            Error::Locked | Error::Crypto | Error::NoIdentity => 4,
+            Error::Store(_) | Error::Io(_) | Error::Keychain(_) => 5,
             Error::Conflict(_) => 6,
-            Error::Config(_) => 1,
+            Error::Config(_) | Error::AlreadyInitialized => 1,
         }
     }
 }
