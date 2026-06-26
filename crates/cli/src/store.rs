@@ -177,18 +177,18 @@ impl Store {
 
     pub fn create_environment(
         &self,
+        id: &str,
         project_id: &str,
         name: &str,
         enc_vault_key: &[u8],
     ) -> Result<Environment> {
-        let id = new_id();
         self.conn.execute(
             "INSERT INTO environments (id, project_id, name, enc_vault_key, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, project_id, name, enc_vault_key, now_ms()],
         )?;
         Ok(Environment {
-            id,
+            id: id.to_string(),
             project_id: project_id.to_string(),
             name: name.to_string(),
             enc_vault_key: enc_vault_key.to_vec(),
@@ -243,15 +243,15 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Insert a new secret (version 1) and snapshot it into history.
+    /// Insert a new secret (version 1) with a caller-supplied id, snapshotting history.
     pub fn insert_secret(
         &self,
+        id: &str,
         env_id: &str,
         enc_name: &[u8],
         enc_value: &[u8],
         enc_data_key: &[u8],
     ) -> Result<SecretRow> {
-        let id = new_id();
         let ts = now_ms();
         // The row insert and its history snapshot must be all-or-nothing: a failure between them
         // would leave a secret with no version history. `unchecked_transaction` works on `&self`.
@@ -262,10 +262,10 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
             params![id, env_id, enc_name, enc_value, enc_data_key, ts],
         )?;
-        self.snapshot(&id, 1, enc_name, enc_value, enc_data_key, ts)?;
+        self.snapshot(id, 1, enc_name, enc_value, enc_data_key, ts)?;
         tx.commit()?;
         Ok(SecretRow {
-            id,
+            id: id.to_string(),
             env_id: env_id.to_string(),
             enc_name: enc_name.to_vec(),
             enc_value: enc_value.to_vec(),
@@ -274,18 +274,21 @@ impl Store {
         })
     }
 
-    /// Update an existing secret in place, bumping its version and snapshotting history.
-    /// Returns the new version. Un-deletes a tombstoned secret.
+    /// Update an existing secret to `new_version` (which must be the current version + 1),
+    /// snapshotting history and un-deleting any tombstone.
+    ///
+    /// Returns [`Error::NotFound`] if the secret is absent, or [`Error::Conflict`] if
+    /// `new_version` doesn't immediately follow the stored version (optimistic concurrency).
     pub fn update_secret(
         &self,
         id: &str,
+        new_version: i64,
         enc_name: &[u8],
         enc_value: &[u8],
         enc_data_key: &[u8],
-    ) -> Result<i64> {
-        // Read the current version, bump it, and snapshot history as one unit: otherwise a
-        // failure after the UPDATE would advance the secret without recording its history row.
-        // `unchecked_transaction` works on `&self`.
+    ) -> Result<()> {
+        // Read-check-write-snapshot as one unit, so a mid-update failure can't advance the
+        // version without recording history. `unchecked_transaction` works on `&self`.
         let tx = self.conn.unchecked_transaction()?;
         let current: i64 = self
             .conn
@@ -296,18 +299,23 @@ impl Store {
             )
             .optional()?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
-        let next = current + 1;
+        if new_version != current + 1 {
+            return Err(Error::Conflict(format!(
+                "secret {id}: expected version {}, got {new_version}",
+                current + 1
+            )));
+        }
         let ts = now_ms();
         self.conn.execute(
             "UPDATE secrets
              SET enc_name = ?2, enc_value = ?3, enc_data_key = ?4, version = ?5,
                  updated_at = ?6, deleted_at = NULL
              WHERE id = ?1",
-            params![id, enc_name, enc_value, enc_data_key, next, ts],
+            params![id, enc_name, enc_value, enc_data_key, new_version, ts],
         )?;
-        self.snapshot(id, next, enc_name, enc_value, enc_data_key, ts)?;
+        self.snapshot(id, new_version, enc_name, enc_value, enc_data_key, ts)?;
         tx.commit()?;
-        Ok(next)
+        Ok(())
     }
 
     /// Soft-delete a secret (tombstone). History is retained.
@@ -382,27 +390,30 @@ mod tests {
     fn environments_are_unique_per_project_and_listable() {
         let s = Store::open_in_memory().unwrap();
         let p = s.create_project("acme").unwrap();
-        s.create_environment(&p.id, "dev", b"k1").unwrap();
-        s.create_environment(&p.id, "prod", b"k2").unwrap();
+        s.create_environment("e-dev", &p.id, "dev", b"k1").unwrap();
+        s.create_environment("e-prod", &p.id, "prod", b"k2")
+            .unwrap();
         assert_eq!(s.list_environments(&p.id).unwrap(), vec!["dev", "prod"]);
         assert!(s.get_environment(&p.id, "prod").unwrap().is_some());
         assert!(s.get_environment(&p.id, "missing").unwrap().is_none());
         // duplicate (project, name) violates the UNIQUE constraint
-        assert!(s.create_environment(&p.id, "dev", b"k3").is_err());
+        assert!(s.create_environment("e-dup", &p.id, "dev", b"k3").is_err());
     }
 
     #[test]
     fn secret_lifecycle_keeps_version_history() {
         let s = Store::open_in_memory().unwrap();
         let p = s.create_project("acme").unwrap();
-        let e = s.create_environment(&p.id, "dev", b"vault").unwrap();
+        let e = s.create_environment("e1", &p.id, "dev", b"vault").unwrap();
 
-        let row = s.insert_secret(&e.id, b"n1", b"v1", b"dk1").unwrap();
+        let row = s
+            .insert_secret("sec-1", &e.id, b"n1", b"v1", b"dk1")
+            .unwrap();
         assert_eq!(row.version, 1);
         assert_eq!(s.list_secrets(&e.id).unwrap().len(), 1);
 
-        let v2 = s.update_secret(&row.id, b"n1", b"v2", b"dk2").unwrap();
-        assert_eq!(v2, 2);
+        s.update_secret(&row.id, 2, b"n1", b"v2", b"dk2").unwrap();
+        assert_eq!(s.list_secrets(&e.id).unwrap()[0].version, 2);
 
         let history = s.secret_versions(&row.id).unwrap();
         assert_eq!(history.len(), 2);
@@ -419,8 +430,20 @@ mod tests {
     fn update_missing_secret_is_not_found() {
         let s = Store::open_in_memory().unwrap();
         assert!(matches!(
-            s.update_secret("nope", b"n", b"v", b"dk"),
+            s.update_secret("nope", 2, b"n", b"v", b"dk"),
             Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn update_with_nonconsecutive_version_conflicts() {
+        let s = Store::open_in_memory().unwrap();
+        let p = s.create_project("p").unwrap();
+        let e = s.create_environment("e1", &p.id, "dev", b"v").unwrap();
+        let row = s.insert_secret("sec-1", &e.id, b"n", b"v", b"dk").unwrap();
+        assert!(matches!(
+            s.update_secret(&row.id, 3, b"n", b"v2", b"dk2"),
+            Err(Error::Conflict(_))
         ));
     }
 }
