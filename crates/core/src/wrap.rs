@@ -74,12 +74,14 @@ pub fn wrap_key(kek: &[u8; KEY_LEN], key: &[u8; KEY_LEN], aad: &[u8]) -> Vec<u8>
 /// Unwrap a key wrapped under `kek`, verifying `aad`.
 pub fn unwrap_key(kek: &[u8; KEY_LEN], wrapped: &[u8], aad: &[u8]) -> Result<[u8; KEY_LEN], Error> {
     let mut pt = aead::open(kek, wrapped, aad)?;
-    let key: [u8; KEY_LEN] = pt
+    // Zeroize the decrypted plaintext on every path, including the wrong-length error — `pt`
+    // holds secret material and a plain `Vec<u8>` is not zeroized on drop.
+    let key: Result<[u8; KEY_LEN], Error> = pt
         .as_slice()
         .try_into()
-        .map_err(|_| Error::Malformed("wrapped key wrong length"))?;
+        .map_err(|_| Error::Malformed("wrapped key wrong length"));
     pt.zeroize();
-    Ok(key)
+    key
 }
 
 #[cfg(test)]
