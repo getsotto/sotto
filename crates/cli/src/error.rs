@@ -1,0 +1,64 @@
+//! CLI error type with documented exit codes (see CLI spec §8).
+
+use std::path::PathBuf;
+
+use thiserror::Error;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, Error)]
+pub enum Error {
+    /// No `sotto.toml` in this directory or any parent.
+    #[error(
+        "no {} found in this directory or any parent",
+        crate::config::CONFIG_FILE
+    )]
+    NoConfig(PathBuf),
+
+    /// Failed to parse the config file.
+    #[error("config error: {0}")]
+    Config(String),
+
+    /// A project/environment/secret was not found.
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// The store is locked; the user must unlock first.
+    #[error("locked — run `sotto unlock` first")]
+    Locked,
+
+    /// A storage-layer (SQLite) error.
+    #[error("storage error: {0}")]
+    Store(String),
+
+    /// An I/O error.
+    #[error("i/o error: {0}")]
+    Io(String),
+
+    /// A cryptographic operation failed (e.g. wrong password, tampered data).
+    #[error("cryptographic operation failed")]
+    Crypto,
+
+    /// A concurrent-modification conflict.
+    #[error("conflict: {0}")]
+    Conflict(String),
+}
+
+impl Error {
+    /// The process exit code for this error (CLI spec §8).
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Error::NotFound(_) | Error::NoConfig(_) => 3,
+            Error::Locked | Error::Crypto => 4,
+            Error::Store(_) | Error::Io(_) => 5,
+            Error::Conflict(_) => 6,
+            Error::Config(_) => 1,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        Error::Store(e.to_string())
+    }
+}
