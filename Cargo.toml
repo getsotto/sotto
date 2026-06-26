@@ -25,6 +25,10 @@ thiserror = "2"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
 
 # Server
 axum = "0.8"
