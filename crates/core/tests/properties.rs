@@ -70,8 +70,11 @@ proptest! {
 
     /// X25519 sealed-box wrapping round-trips for the addressed keypair.
     #[test]
-    fn sealed_box_round_trip(pt in bytes(256)) {
-        let kp = wrap::generate_keypair();
+    fn sealed_box_round_trip(secret in key(), pt in bytes(256)) {
+        // Derive the recipient keypair from proptest-driven bytes (not OS randomness) so a
+        // failing case is reproducible from the persisted seed. Any 32 bytes is a valid X25519
+        // secret, and the public is derived consistently for both seal and open.
+        let kp = wrap::keypair_from_secret(&secret);
         let sealed = wrap::seal_to_public(&kp.public, &pt).expect("seal");
         prop_assert_eq!(wrap::open_sealed(&kp, &sealed).expect("unseal"), pt);
     }
