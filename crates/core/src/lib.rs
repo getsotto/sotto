@@ -16,6 +16,7 @@ pub mod error;
 pub mod format;
 pub mod kdf;
 pub mod random;
+pub mod vectors;
 pub mod wrap;
 
 pub use error::Error;

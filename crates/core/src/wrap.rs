@@ -56,6 +56,17 @@ pub fn seal_to_public(
     Ok(boxed.to_vec())
 }
 
+/// Reconstruct a keypair from its secret key (the public key is derived).
+pub fn keypair_from_secret(secret: &[u8; SECRET_KEY_LEN]) -> Keypair {
+    let kp = StackKeyPair::from_secret_key(SecretKey::from(*secret));
+    let mut public = [0u8; PUBLIC_KEY_LEN];
+    public.copy_from_slice(kp.public_key.as_slice());
+    Keypair {
+        public,
+        secret: *secret,
+    }
+}
+
 /// Open a sealed box addressed to `keypair`, returning the wrapped plaintext.
 pub fn open_sealed(keypair: &Keypair, sealed: &[u8]) -> Result<Vec<u8>, Error> {
     let kp = StackKeyPair::from_secret_key(SecretKey::from(keypair.secret));

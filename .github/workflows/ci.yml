@@ -24,9 +24,21 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
-      # NOTE: the wasm32-unknown-unknown cross-build lands in M1, once getrandom's
-      # `wasm_js` backend is wired (dryoc -> rand -> getrandom). The wasm crate still
-      # compiles for the host as part of `cargo build --workspace` above.
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+      - name: Build WASM core
+        run: cargo build -p sotto-wasm --target wasm32-unknown-unknown
+      - name: Cross-impl gate (native-produced vectors decrypt in WASM)
+        run: wasm-pack test --node crates/wasm
 
   supply-chain:
     runs-on: ubuntu-latest
