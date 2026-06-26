@@ -5,8 +5,10 @@
 //!
 //! - [`config`] — the committed, secret-free `sotto.toml` project config
 //! - [`store`] — the local SQLite store of encrypted rows + version history
+//! - [`vault`] — crypto orchestration (sotto-core over the store): the key hierarchy + E2EE secrets
 //! - [`error`] — CLI errors with documented exit codes
 
 pub mod config;
 pub mod error;
 pub mod store;
+pub mod vault;

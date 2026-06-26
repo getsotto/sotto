@@ -1258,10 +1258,12 @@ dependencies = [
  "clap",
  "rusqlite",
  "serde",
+ "sotto-core",
  "tempfile",
  "thiserror",
  "toml",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -63,3 +63,10 @@ impl From<rusqlite::Error> for Error {
         Error::Store(e.to_string())
     }
 }
+
+impl From<sotto_core::Error> for Error {
+    fn from(_: sotto_core::Error) -> Self {
+        // Stay opaque — never leak why an authenticated decryption failed.
+        Error::Crypto
+    }
+}
