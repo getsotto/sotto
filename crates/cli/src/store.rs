@@ -226,10 +226,25 @@ impl Store {
 
     /// List non-deleted secret rows for an environment.
     pub fn list_secrets(&self, env_id: &str) -> Result<Vec<SecretRow>> {
-        let mut stmt = self.conn.prepare(
+        self.secret_rows(env_id, false)
+    }
+
+    /// List tombstoned (soft-deleted) secret rows for an environment. The vault uses this to
+    /// resurrect a secret when a deleted name is set again — names are opaque ciphertext here,
+    /// so only the vault can match name→row by decrypting.
+    pub fn list_deleted_secrets(&self, env_id: &str) -> Result<Vec<SecretRow>> {
+        self.secret_rows(env_id, true)
+    }
+
+    fn secret_rows(&self, env_id: &str, deleted: bool) -> Result<Vec<SecretRow>> {
+        let sql = if deleted {
             "SELECT id, env_id, enc_name, enc_value, enc_data_key, version
-             FROM secrets WHERE env_id = ?1 AND deleted_at IS NULL",
-        )?;
+             FROM secrets WHERE env_id = ?1 AND deleted_at IS NOT NULL"
+        } else {
+            "SELECT id, env_id, enc_name, enc_value, enc_data_key, version
+             FROM secrets WHERE env_id = ?1 AND deleted_at IS NULL"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![env_id], |r| {
             Ok(SecretRow {
                 id: r.get(0)?,

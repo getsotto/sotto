@@ -93,8 +93,17 @@ impl<'a> Vault<'a> {
     }
 
     /// Set (insert or update) a secret by name.
+    ///
+    /// If the name belongs to a deleted (tombstoned) secret, it is resurrected in place — the
+    /// same secret id and version history continue — rather than starting a fresh secret at
+    /// version 1, so versions stay monotonic per name and there are no duplicate same-name rows.
     pub fn set(&self, name: &str, value: &[u8]) -> Result<()> {
-        match self.find_by_name(name)? {
+        // Prefer a live secret, then fall back to a tombstoned one to resurrect it.
+        let existing = match self.find_by_name(name)? {
+            Some(row) => Some(row),
+            None => self.find_deleted_by_name(name)?,
+        };
+        match existing {
             Some(row) => {
                 let new_version = row.version + 1;
                 let enc = self.encrypt(&row.id, new_version, name, value);
@@ -147,7 +156,16 @@ impl<'a> Vault<'a> {
     // --- internals ---
 
     fn find_by_name(&self, name: &str) -> Result<Option<SecretRow>> {
-        for row in self.store.list_secrets(&self.env_id)? {
+        self.resolve_name(name, self.store.list_secrets(&self.env_id)?)
+    }
+
+    fn find_deleted_by_name(&self, name: &str) -> Result<Option<SecretRow>> {
+        self.resolve_name(name, self.store.list_deleted_secrets(&self.env_id)?)
+    }
+
+    /// Match `name` against `rows` by decrypting each row's name (the store never sees plaintext).
+    fn resolve_name(&self, name: &str, rows: Vec<SecretRow>) -> Result<Option<SecretRow>> {
+        for row in rows {
             if self.decrypt_name(&row)? == name {
                 return Ok(Some(row));
             }
@@ -282,6 +300,26 @@ mod tests {
         vault.set("KEY", b"v").unwrap();
         vault.delete("KEY").unwrap();
         assert!(matches!(vault.get("KEY"), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn set_after_delete_resurrects_same_secret() {
+        let (store, pid) = project();
+        let vault = Vault::open(&store, &MASTER, &pid, "dev").unwrap();
+        vault.set("KEY", b"v1").unwrap();
+        vault.delete("KEY").unwrap();
+        vault.set("KEY", b"v2").unwrap();
+
+        assert_eq!(vault.get("KEY").unwrap(), b"v2");
+        assert_eq!(vault.list_names().unwrap(), vec!["KEY"]);
+
+        // Resurrected in place: one live row whose version continued (2), not a fresh v1, and no
+        // lingering tombstone.
+        let env = store.get_environment(&pid, "dev").unwrap().unwrap();
+        let live = store.list_secrets(&env.id).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].version, 2);
+        assert!(store.list_deleted_secrets(&env.id).unwrap().is_empty());
     }
 
     #[test]
