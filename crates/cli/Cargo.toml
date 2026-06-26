@@ -21,6 +21,12 @@ rusqlite.workspace = true
 uuid.workspace = true
 sotto-core.workspace = true
 zeroize.workspace = true
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }
 
 [dev-dependencies]
 tempfile = "3"

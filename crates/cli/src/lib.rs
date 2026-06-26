@@ -6,9 +6,13 @@
 //! - [`config`] — the committed, secret-free `sotto.toml` project config
 //! - [`store`] — the local SQLite store of encrypted rows + version history
 //! - [`vault`] — crypto orchestration (sotto-core over the store): the key hierarchy + E2EE secrets
+//! - [`keychain`] — OS keychain abstraction (with an in-memory mock for tests)
+//! - [`session`] — identity setup, unlock/lock, and the TTL master-key session
 //! - [`error`] — CLI errors with documented exit codes
 
 pub mod config;
 pub mod error;
+pub mod keychain;
+pub mod session;
 pub mod store;
 pub mod vault;

@@ -15,9 +15,10 @@ use crate::error::{Error, Result};
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS identity (
-    id         INTEGER PRIMARY KEY CHECK (id = 1),
-    kdf_salt   BLOB NOT NULL,
-    created_at INTEGER NOT NULL
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    kdf_salt     BLOB NOT NULL,
+    enc_verifier BLOB NOT NULL,
+    created_at   INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS projects (
     id         TEXT PRIMARY KEY,
@@ -102,6 +103,13 @@ pub struct SecretVersion {
     pub enc_data_key: Vec<u8>,
 }
 
+/// The local identity row: the KDF salt and an encrypted verifier used to check unlock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub kdf_salt: Vec<u8>,
+    pub enc_verifier: Vec<u8>,
+}
+
 /// The local SQLite store.
 pub struct Store {
     conn: Connection,
@@ -124,21 +132,29 @@ impl Store {
         Ok(Self { conn })
     }
 
-    // --- identity (the local KDF salt; the secret key lives in the OS keychain) ---
+    // --- identity (KDF salt + unlock verifier; the secret key lives in the OS keychain) ---
 
-    pub fn put_identity_salt(&self, kdf_salt: &[u8]) -> Result<()> {
+    pub fn put_identity(&self, identity: &Identity) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO identity (id, kdf_salt, created_at) VALUES (1, ?1, ?2)",
-            params![kdf_salt, now_ms()],
+            "INSERT OR REPLACE INTO identity (id, kdf_salt, enc_verifier, created_at)
+             VALUES (1, ?1, ?2, ?3)",
+            params![identity.kdf_salt, identity.enc_verifier, now_ms()],
         )?;
         Ok(())
     }
 
-    pub fn identity_salt(&self) -> Result<Option<Vec<u8>>> {
+    pub fn get_identity(&self) -> Result<Option<Identity>> {
         self.conn
-            .query_row("SELECT kdf_salt FROM identity WHERE id = 1", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT kdf_salt, enc_verifier FROM identity WHERE id = 1",
+                [],
+                |r| {
+                    Ok(Identity {
+                        kdf_salt: r.get(0)?,
+                        enc_verifier: r.get(1)?,
+                    })
+                },
+            )
             .optional()
             .map_err(Into::into)
     }
@@ -411,11 +427,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identity_salt_round_trips() {
+    fn identity_round_trips() {
         let s = Store::open_in_memory().unwrap();
-        assert!(s.identity_salt().unwrap().is_none());
-        s.put_identity_salt(b"sixteen-byte-slt").unwrap();
-        assert_eq!(s.identity_salt().unwrap().unwrap(), b"sixteen-byte-slt");
+        assert!(s.get_identity().unwrap().is_none());
+        let identity = Identity {
+            kdf_salt: b"sixteen-byte-slt".to_vec(),
+            enc_verifier: b"verifier-blob".to_vec(),
+        };
+        s.put_identity(&identity).unwrap();
+        assert_eq!(s.get_identity().unwrap().unwrap(), identity);
     }
 
     #[test]
