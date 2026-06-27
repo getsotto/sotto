@@ -445,6 +445,11 @@ fn export_secrets(app: &App, config: &Config, format: ExportFormat, reveal: bool
         ));
     }
     let entries = text_entries(app, config)?;
+    // Validate names before rendering: an unsafe name (spaces, newlines, shell metacharacters)
+    // would otherwise be emitted verbatim and could alter `--format shell` output that's sourced.
+    for (name, _) in &entries {
+        validate_env_key(name)?;
+    }
     let rendered = export::render(format, &entries);
     eprintln!("warning: export writes secrets in plaintext");
     let mut out = io::stdout().lock();
