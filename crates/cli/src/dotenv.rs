@@ -1,11 +1,12 @@
 //! A faithful `.env` parser for `sotto import`.
 //!
-//! Unlike shell / dotenvy semantics, values are **not** variable-expanded — secrets are imported
-//! verbatim, so a `$` or `#` in a value is never mangled. Supported syntax:
+//! Unlike shell / dotenvy semantics, values are **not** variable-expanded and inline comments
+//! are **not** stripped — a `$` or `#` inside a value is never mangled. Supported syntax:
 //! - `KEY=value` and `export KEY=value`
 //! - `#` comment lines and blank lines (skipped)
 //! - single-quoted values (literal) and double-quoted values (interpret `\n \r \t \\ \"`)
-//! - unquoted values are taken literally (no inline-comment stripping)
+//! - unquoted values: surrounding whitespace is trimmed (the usual `.env` convention, so a
+//!   `KEY= value` line imports `value`); quote the value to preserve leading/trailing spaces.
 //!
 //! Multi-line values are not supported; each line is one assignment.
 
@@ -125,6 +126,21 @@ export BAZ=qux
     fn single_quotes_are_literal_double_quotes_unescape() {
         assert_eq!(parse("A='lit\\n$x'").unwrap()[0].1, "lit\\n$x".to_string());
         assert_eq!(parse("B=\"a\\nb\"").unwrap()[0].1, "a\nb".to_string());
+    }
+
+    #[test]
+    fn unquoted_whitespace_trimmed_quoted_preserved() {
+        // Unquoted: surrounding whitespace is trimmed (conventional .env behaviour).
+        assert_eq!(parse("KEY=  value  ").unwrap()[0].1, "value".to_string());
+        // Quoting preserves leading/trailing spaces.
+        assert_eq!(
+            parse("KEY=\"  value  \"").unwrap()[0].1,
+            "  value  ".to_string()
+        );
+        assert_eq!(
+            parse("KEY='  value  '").unwrap()[0].1,
+            "  value  ".to_string()
+        );
     }
 
     #[test]
