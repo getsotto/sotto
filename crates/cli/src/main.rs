@@ -380,10 +380,18 @@ fn text_entries(app: &App, config: &Config) -> Result<Vec<(String, String)>> {
     Ok(entries)
 }
 
+/// A secret name is usable as an environment variable only if it's a POSIX identifier
+/// (`[A-Za-z_][A-Za-z0-9_]*`). Anything looser (spaces, newlines, shell metacharacters like
+/// `;` or `$`) is rejected — otherwise it could change the meaning of `export --format shell`
+/// output that a user `eval`s or `source`s.
 fn validate_env_key(key: &str) -> Result<()> {
-    if key.is_empty() || key.contains('=') || key.contains('\0') {
+    let mut chars = key.chars();
+    let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
         return Err(Error::Input(format!(
-            "secret name {key:?} is not a valid environment variable name"
+            "secret name {key:?} is not a usable environment variable name \
+             (expected [A-Za-z_][A-Za-z0-9_]*)"
         )));
     }
     Ok(())
