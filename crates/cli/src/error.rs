@@ -55,6 +55,10 @@ pub enum Error {
     /// The OS keychain could not be read or written.
     #[error("keychain error: {0}")]
     Keychain(String),
+
+    /// Invalid user input (bad arguments, mismatched passwords, or unsafe output).
+    #[error("{0}")]
+    Input(String),
 }
 
 impl Error {
@@ -65,7 +69,7 @@ impl Error {
             Error::Locked | Error::Crypto | Error::NoIdentity => 4,
             Error::Store(_) | Error::Io(_) | Error::Keychain(_) => 5,
             Error::Conflict(_) => 6,
-            Error::Config(_) | Error::AlreadyInitialized => 1,
+            Error::Config(_) | Error::AlreadyInitialized | Error::Input(_) => 1,
         }
     }
 }
