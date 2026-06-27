@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use sotto_cli::commands::App;
 use sotto_cli::config::{self, Config};
@@ -293,14 +293,14 @@ fn read_new_password() -> Result<Vec<u8>> {
     }
     eprint!("Choose a master password: ");
     io::stderr().flush().ok();
-    let first = rpassword::read_password().map_err(|e| Error::Io(e.to_string()))?;
+    let first = Zeroizing::new(rpassword::read_password().map_err(|e| Error::Io(e.to_string()))?);
     eprint!("Confirm master password: ");
     io::stderr().flush().ok();
-    let second = rpassword::read_password().map_err(|e| Error::Io(e.to_string()))?;
-    if first != second {
+    let second = Zeroizing::new(rpassword::read_password().map_err(|e| Error::Io(e.to_string()))?);
+    if first.as_str() != second.as_str() {
         return Err(Error::Input("passwords do not match".to_string()));
     }
-    Ok(first.into_bytes())
+    Ok(first.as_bytes().to_vec())
 }
 
 /// Read a secret value: inline `--value` (with a warning), `--stdin`, or a hidden prompt.
