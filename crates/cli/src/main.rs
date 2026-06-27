@@ -5,14 +5,15 @@
 //! All logic lives in the `sotto_cli` library.
 
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::{Zeroize, Zeroizing};
 
 use sotto_cli::commands::App;
 use sotto_cli::config::{self, Config};
+use sotto_cli::dotenv;
 use sotto_cli::error::{Error, Result};
 use sotto_cli::export::{self, ExportFormat};
 use sotto_cli::keychain::{Keychain, OsKeychain};
@@ -52,7 +53,11 @@ enum Command {
     /// Lock the store (clear the cached session).
     Lock,
     /// Show identity, session, and project status.
-    Status,
+    Status {
+        /// Output as a JSON object.
+        #[arg(long)]
+        json: bool,
+    },
     /// Set a secret. Reads the value from a hidden prompt unless --value/--stdin is given.
     Set {
         name: String,
@@ -71,7 +76,11 @@ enum Command {
         reveal: bool,
     },
     /// List secret names in the active environment.
-    Ls,
+    Ls {
+        /// Output as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a secret.
     Rm { name: String },
     /// Run a command with the environment's secrets injected as environment variables.
@@ -89,10 +98,20 @@ enum Command {
         #[arg(long)]
         reveal: bool,
     },
+    /// Import secrets from a .env file into the active environment.
+    Import {
+        /// Path to the .env file.
+        file: PathBuf,
+    },
     /// Manage environments.
     Env {
         #[command(subcommand)]
         command: EnvCommand,
+    },
+    /// Generate a shell completion script (to stdout).
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
     },
 }
 
@@ -113,6 +132,12 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // Completions need neither the store nor the keychain — handle before touching either.
+    if let Command::Completions { shell } = &cli.command {
+        clap_complete::generate(*shell, &mut Cli::command(), "sotto", &mut io::stdout());
+        return Ok(());
+    }
 
     let store_path = sotto_cli::paths::store_path()?;
     if let Some(parent) = store_path.parent() {
@@ -136,7 +161,7 @@ fn run() -> Result<()> {
             eprintln!("locked");
             Ok(())
         }
-        Command::Status => status(&app, &cwd),
+        Command::Status { json } => status(&app, &cwd, json),
         Command::Set { name, value, stdin } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
@@ -155,11 +180,16 @@ fn run() -> Result<()> {
             value.zeroize();
             result
         }
-        Command::Ls => {
+        Command::Ls { json } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
-            for name in app.list(&config)? {
-                println!("{name}");
+            let names = app.list(&config)?;
+            if json {
+                println!("{}", to_json(&names)?);
+            } else {
+                for name in names {
+                    println!("{name}");
+                }
             }
             Ok(())
         }
@@ -180,6 +210,11 @@ fn run() -> Result<()> {
             ensure_unlocked(&store, &keychain)?;
             export_secrets(&app, &config, format, reveal)
         }
+        Command::Import { file } => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            ensure_unlocked(&store, &keychain)?;
+            import_dotenv(&app, &config, &file)
+        }
         Command::Env { command } => match command {
             EnvCommand::Ls => {
                 let config = effective_config(&cwd, cli.env.as_deref())?;
@@ -191,6 +226,7 @@ fn run() -> Result<()> {
             }
             EnvCommand::Use { name } => env_use(&store, &cwd, &name),
         },
+        Command::Completions { .. } => unreachable!("completions are handled before store init"),
     }
 }
 
@@ -232,7 +268,7 @@ fn init(store: &Store, keychain: &dyn Keychain, cwd: &Path, name: Option<String>
     Ok(())
 }
 
-fn status(app: &App, cwd: &Path) -> Result<()> {
+fn status(app: &App, cwd: &Path, json: bool) -> Result<()> {
     // Only an actually-absent config is "no project"; a present-but-invalid or unreadable config
     // is a real error and must not be reported as "none".
     let config = match Config::discover(cwd) {
@@ -241,6 +277,18 @@ fn status(app: &App, cwd: &Path) -> Result<()> {
         Err(e) => return Err(e),
     };
     let status = app.status(config.as_ref())?;
+    if json {
+        let project = status.project.as_ref().map(
+            |(name, environment)| serde_json::json!({ "name": name, "environment": environment }),
+        );
+        let value = serde_json::json!({
+            "initialized": status.initialized,
+            "unlocked": status.unlocked,
+            "project": project,
+        });
+        println!("{}", to_json(&value)?);
+        return Ok(());
+    }
     println!(
         "identity: {}",
         if status.initialized {
@@ -277,6 +325,25 @@ fn env_use(store: &Store, cwd: &Path, name: &str) -> Result<()> {
     config.save_to(&dir)?;
     eprintln!("active environment: {name}");
     Ok(())
+}
+
+fn import_dotenv(app: &App, config: &Config, file: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| Error::Io(format!("reading {}: {e}", file.display())))?;
+    let pairs = dotenv::parse(&text)?;
+    let count = pairs.len();
+    for (name, value) in pairs {
+        app.set(config, &name, value.as_bytes())?;
+    }
+    eprintln!(
+        "imported {count} secret(s) into {} ({})",
+        config.project, config.environment
+    );
+    Ok(())
+}
+
+fn to_json<T: serde::Serialize>(value: &T) -> Result<String> {
+    serde_json::to_string(value).map_err(|e| Error::Io(e.to_string()))
 }
 
 fn ensure_unlocked(store: &Store, keychain: &dyn Keychain) -> Result<()> {
