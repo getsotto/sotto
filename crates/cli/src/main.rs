@@ -205,7 +205,13 @@ fn init(store: &Store, keychain: &dyn Keychain, cwd: &Path, name: Option<String>
 }
 
 fn status(app: &App, cwd: &Path) -> Result<()> {
-    let config = Config::discover(cwd).ok().map(|(c, _dir)| c);
+    // Only an actually-absent config is "no project"; a present-but-invalid or unreadable config
+    // is a real error and must not be reported as "none".
+    let config = match Config::discover(cwd) {
+        Ok((c, _dir)) => Some(c),
+        Err(Error::NoConfig(_)) => None,
+        Err(e) => return Err(e),
+    };
     let status = app.status(config.as_ref())?;
     println!(
         "identity: {}",
