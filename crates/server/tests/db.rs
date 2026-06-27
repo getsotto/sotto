@@ -1,9 +1,27 @@
 //! Database round-trip test.
 //!
-//! Runs only when `DATABASE_URL` is set (the CI `server` job's Postgres service, or a local
-//! `docker compose up`); otherwise it skips, so `cargo test --workspace` stays DB-free.
+//! Runs only when `SOTTO_RUN_DB_TESTS=1` and `DATABASE_URL` points at a local Postgres instance
+//! (the CI `server` job's Postgres service, or a local `docker compose up`); otherwise it skips,
+//! so `cargo test --workspace` stays DB-free.
 
 use sotto_server::db;
+use sqlx::postgres::PgConnectOptions;
+use std::str::FromStr;
+
+fn should_run_db_tests(database_url: &str) -> bool {
+    if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping: SOTTO_RUN_DB_TESTS=1 not set");
+        return false;
+    }
+
+    let options = PgConnectOptions::from_str(database_url).expect("parse DATABASE_URL");
+    let host = options.get_host();
+    assert!(
+        matches!(host, "localhost" | "127.0.0.1" | "::1"),
+        "refusing to run destructive DB tests against non-local host: {host}"
+    );
+    true
+}
 
 #[tokio::test]
 async fn migrations_apply_and_user_round_trips() {
@@ -11,6 +29,9 @@ async fn migrations_apply_and_user_round_trips() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
+    if !should_run_db_tests(&database_url) {
+        return;
+    }
 
     let pool = db::connect(&database_url).await.expect("connect");
     db::migrate(&pool).await.expect("migrate");

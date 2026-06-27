@@ -58,6 +58,7 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://sotto:sotto@localhost:5432/sotto
+      SOTTO_RUN_DB_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
