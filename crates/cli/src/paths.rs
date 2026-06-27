@@ -37,10 +37,12 @@ fn platform_data_dir() -> Option<PathBuf> {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn platform_data_dir() -> Option<PathBuf> {
-    // XDG Base Directory: $XDG_DATA_HOME (if a non-empty absolute path), else ~/.local/share.
+    // XDG Base Directory: $XDG_DATA_HOME (if an absolute path), else ~/.local/share. The spec
+    // says relative (and empty) values must be ignored — `is_absolute` covers both.
     if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("sotto"));
+        let xdg = PathBuf::from(xdg);
+        if xdg.is_absolute() {
+            return Some(xdg.join("sotto"));
         }
     }
     let home = std::env::var_os("HOME")?;
