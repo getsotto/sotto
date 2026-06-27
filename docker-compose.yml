@@ -1,0 +1,17 @@
+# Local development Postgres for the Sotto sync server.
+#   docker compose up -d
+#   DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto cargo run -p sotto-server
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: sotto
+      POSTGRES_PASSWORD: sotto
+      POSTGRES_DB: sotto
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sotto"]
+      interval: 5s
+      timeout: 5s
+      retries: 5

@@ -1,17 +1,38 @@
-//! The Sotto sync / API backend. M0 is a health-check stub; the real REST surface
-//! (full-snapshot sync, versioned writes, grants, rotation) lands in M3.
+//! The Sotto sync / API backend.
+//!
+//! M3 PR1: connect to Postgres, apply migrations, and serve a health check. The zero-knowledge
+//! sync endpoints (snapshot, versioned writes, …) land in later PRs.
 
 use axum::{routing::get, Router};
 
+use sotto_server::config::Config;
+use sotto_server::db;
+use sotto_server::error::{Error, Result};
+
 #[tokio::main]
 async fn main() {
-    let app = Router::new().route("/health", get(|| async { "ok" }));
+    if let Err(e) = run().await {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
 
-    let addr = "127.0.0.1:8080";
-    let listener = tokio::net::TcpListener::bind(addr)
+async fn run() -> Result<()> {
+    let config = Config::from_env()?;
+    let pool = db::connect(&config.database_url).await?;
+    db::migrate(&pool).await?;
+
+    let app = Router::new().route("/health", get(health)).with_state(pool);
+
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
-        .expect("bind listener");
-    println!("sotto-server listening on http://{addr} (M3 stub)");
+        .map_err(|e| Error::Io(e.to_string()))?;
+    println!("sotto-server listening on http://{}", config.bind_addr);
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| Error::Io(e.to_string()))
+}
 
-    axum::serve(listener, app).await.expect("serve");
+async fn health() -> &'static str {
+    "ok"
 }

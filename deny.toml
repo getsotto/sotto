@@ -18,6 +18,7 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "Unicode-3.0",
+    "Zlib",        # foldhash (via sqlx's hashbrown) — permissive, OSI-approved
 ]
 confidence-threshold = 0.9
 
