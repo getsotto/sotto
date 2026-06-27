@@ -13,6 +13,11 @@ const DATA_DIR_ENV: &str = "SOTTO_DATA_DIR";
 /// The directory holding the local store: `SOTTO_DATA_DIR` if set, else the OS data directory.
 pub fn data_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os(DATA_DIR_ENV) {
+        // An empty override would become `PathBuf::from("")`, which resolves to the current
+        // directory — almost certainly a misconfiguration, and the wrong place for a secret store.
+        if dir.is_empty() {
+            return Err(Error::Input(format!("{DATA_DIR_ENV} is set but empty")));
+        }
         return Ok(PathBuf::from(dir));
     }
     platform_data_dir().ok_or_else(|| Error::Io("could not determine a data directory".into()))
