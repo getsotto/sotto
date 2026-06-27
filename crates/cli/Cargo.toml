@@ -32,6 +32,7 @@ keyring = { version = "3", features = [
     "crypto-rust",
 ] }
 rpassword = "7"
+serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"

@@ -15,6 +15,7 @@
 pub mod commands;
 pub mod config;
 pub mod error;
+pub mod export;
 pub mod keychain;
 pub mod paths;
 pub mod session;

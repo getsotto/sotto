@@ -153,6 +153,17 @@ impl<'a> Vault<'a> {
         self.store.delete_secret(&row.id)
     }
 
+    /// All non-deleted secrets as `(name, value)` pairs, sorted by name. Unwraps each row's data
+    /// key once to decrypt both fields.
+    pub fn entries(&self) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut entries = Vec::new();
+        for row in self.store.list_secrets(&self.env_id)? {
+            entries.push(self.decrypt_entry(&row)?);
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(entries)
+    }
+
     // --- internals ---
 
     fn find_by_name(&self, name: &str) -> Result<Option<SecretRow>> {
@@ -228,6 +239,24 @@ impl<'a> Vault<'a> {
         dk.zeroize();
         Ok(value?)
     }
+
+    /// Decrypt both name and value from one row, unwrapping the data key a single time.
+    fn decrypt_entry(&self, row: &SecretRow) -> Result<(String, Vec<u8>)> {
+        let mut dk = self.data_key(row)?;
+        let name = aead::open(
+            &dk,
+            &row.enc_name,
+            name_aad(&self.env_id, &row.id, row.version).as_bytes(),
+        );
+        let value = aead::open(
+            &dk,
+            &row.enc_value,
+            value_aad(&self.env_id, &row.id, row.version).as_bytes(),
+        );
+        dk.zeroize();
+        let name = String::from_utf8(name?).map_err(|_| Error::Crypto)?;
+        Ok((name, value?))
+    }
 }
 
 /// Ciphertext components produced by one secret write.
@@ -269,6 +298,21 @@ mod tests {
         let vault = Vault::open(&store, &MASTER, &pid, "dev").unwrap();
         vault.set("DATABASE_URL", b"postgres://localhost").unwrap();
         assert_eq!(vault.get("DATABASE_URL").unwrap(), b"postgres://localhost");
+    }
+
+    #[test]
+    fn entries_returns_sorted_name_value_pairs() {
+        let (store, pid) = project();
+        let vault = Vault::open(&store, &MASTER, &pid, "dev").unwrap();
+        vault.set("B_KEY", b"b").unwrap();
+        vault.set("A_KEY", b"a").unwrap();
+        assert_eq!(
+            vault.entries().unwrap(),
+            vec![
+                ("A_KEY".to_string(), b"a".to_vec()),
+                ("B_KEY".to_string(), b"b".to_vec()),
+            ]
+        );
     }
 
     #[test]
