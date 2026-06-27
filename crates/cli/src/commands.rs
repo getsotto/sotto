@@ -53,6 +53,11 @@ impl<'a> App<'a> {
         self.vault(config)?.delete(name)
     }
 
+    /// All secrets in the configured environment as `(name, value)` pairs (for `run`/`export`).
+    pub fn entries(&self, config: &Config) -> Result<Vec<(String, Vec<u8>)>> {
+        self.vault(config)?.entries()
+    }
+
     /// List the project's environments (names are plaintext metadata; no unlock needed).
     pub fn env_list(&self, config: &Config) -> Result<Vec<String>> {
         self.store.list_environments(&config.project_id)
@@ -130,6 +135,7 @@ mod tests {
         assert!(matches!(app.set(&config, "X", b"v"), Err(Error::Locked)));
         assert!(matches!(app.get(&config, "X"), Err(Error::Locked)));
         assert!(matches!(app.list(&config), Err(Error::Locked)));
+        assert!(matches!(app.entries(&config), Err(Error::Locked)));
     }
 
     #[test]

@@ -14,6 +14,7 @@ use zeroize::{Zeroize, Zeroizing};
 use sotto_cli::commands::App;
 use sotto_cli::config::{self, Config};
 use sotto_cli::error::{Error, Result};
+use sotto_cli::export::{self, ExportFormat};
 use sotto_cli::keychain::{Keychain, OsKeychain};
 use sotto_cli::session;
 use sotto_cli::store::Store;
@@ -73,6 +74,21 @@ enum Command {
     Ls,
     /// Remove a secret.
     Rm { name: String },
+    /// Run a command with the environment's secrets injected as environment variables.
+    Run {
+        /// The command and its arguments (after `--`).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Print the environment's secrets in a chosen format (plaintext).
+    Export {
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = ExportFormat::Dotenv)]
+        format: ExportFormat,
+        /// Allow writing to a terminal.
+        #[arg(long)]
+        reveal: bool,
+    },
     /// Manage environments.
     Env {
         #[command(subcommand)]
@@ -153,6 +169,16 @@ fn run() -> Result<()> {
             app.remove(&config, &name)?;
             eprintln!("removed {name}");
             Ok(())
+        }
+        Command::Run { args } => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            ensure_unlocked(&store, &keychain)?;
+            run_injected(&app, &config, args)
+        }
+        Command::Export { format, reveal } => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            ensure_unlocked(&store, &keychain)?;
+            export_secrets(&app, &config, format, reveal)
         }
         Command::Env { command } => match command {
             EnvCommand::Ls => {
@@ -337,5 +363,97 @@ fn write_value(value: &[u8], reveal: bool) -> Result<()> {
     if is_tty {
         out.write_all(b"\n").ok();
     }
+    out.flush().map_err(|e| Error::Io(e.to_string()))
+}
+
+/// Decrypt all secrets as UTF-8 text pairs (for injection/export). Errors on non-UTF-8 values.
+fn text_entries(app: &App, config: &Config) -> Result<Vec<(String, String)>> {
+    let mut entries = Vec::new();
+    for (name, value) in app.entries(config)? {
+        let value = String::from_utf8(value).map_err(|_| {
+            Error::Input(format!(
+                "secret `{name}` is not valid UTF-8; cannot inject or export it as text"
+            ))
+        })?;
+        entries.push((name, value));
+    }
+    Ok(entries)
+}
+
+/// A secret name is usable as an environment variable only if it's a POSIX identifier
+/// (`[A-Za-z_][A-Za-z0-9_]*`). Anything looser (spaces, newlines, shell metacharacters like
+/// `;` or `$`) is rejected — otherwise it could change the meaning of `export --format shell`
+/// output that a user `eval`s or `source`s.
+fn validate_env_key(key: &str) -> Result<()> {
+    let mut chars = key.chars();
+    let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        return Err(Error::Input(format!(
+            "secret name {key:?} is not a usable environment variable name \
+             (expected [A-Za-z_][A-Za-z0-9_]*)"
+        )));
+    }
+    Ok(())
+}
+
+/// Run `args[0]` with the environment's secrets overlaid onto the inherited environment.
+fn run_injected(app: &App, config: &Config, args: Vec<String>) -> Result<()> {
+    let (program, rest) = args.split_first().ok_or_else(|| {
+        Error::Input("no command given; usage: sotto run -- <cmd> [args…]".to_string())
+    })?;
+
+    let entries = text_entries(app, config)?;
+    let mut command = std::process::Command::new(program);
+    command.args(rest);
+    for (name, value) in &entries {
+        validate_env_key(name)?;
+        if std::env::var_os(name).is_some() {
+            eprintln!("warning: overriding inherited environment variable {name}");
+        }
+        command.env(name, value);
+    }
+    exec_or_replace(command, program)
+}
+
+/// On Unix, replace this process with the command so signals and the exit code pass through
+/// transparently. Elsewhere, spawn it, wait, and propagate its exit code.
+#[cfg(unix)]
+fn exec_or_replace(mut command: std::process::Command, program: &str) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    // `exec` only returns if launching the program fails.
+    Err(Error::Io(format!(
+        "failed to run `{program}`: {}",
+        command.exec()
+    )))
+}
+
+#[cfg(not(unix))]
+fn exec_or_replace(mut command: std::process::Command, program: &str) -> Result<()> {
+    let status = command
+        .status()
+        .map_err(|e| Error::Io(format!("failed to run `{program}`: {e}")))?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Render the environment's secrets in `format`, refusing a terminal unless `reveal` is set.
+fn export_secrets(app: &App, config: &Config, format: ExportFormat, reveal: bool) -> Result<()> {
+    if io::stdout().is_terminal() && !reveal {
+        return Err(Error::Input(
+            "refusing to write secrets to a terminal; redirect to a file or use --reveal"
+                .to_string(),
+        ));
+    }
+    let entries = text_entries(app, config)?;
+    // Validate names before rendering: an unsafe name (spaces, newlines, shell metacharacters)
+    // would otherwise be emitted verbatim and could alter `--format shell` output that's sourced.
+    for (name, _) in &entries {
+        validate_env_key(name)?;
+    }
+    let rendered = export::render(format, &entries);
+    eprintln!("warning: export writes secrets in plaintext");
+    let mut out = io::stdout().lock();
+    out.write_all(rendered.as_bytes())
+        .map_err(|e| Error::Io(e.to_string()))?;
     out.flush().map_err(|e| Error::Io(e.to_string()))
 }

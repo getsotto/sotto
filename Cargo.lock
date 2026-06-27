@@ -1966,6 +1966,7 @@ dependencies = [
  "rpassword",
  "rusqlite",
  "serde",
+ "serde_json",
  "sotto-core",
  "tempfile",
  "thiserror",
