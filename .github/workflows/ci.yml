@@ -40,6 +40,32 @@ jobs:
       - name: Cross-impl gate (native-produced vectors decrypt in WASM)
         run: wasm-pack test --node crates/wasm
 
+  server:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sotto
+          POSTGRES_PASSWORD: sotto
+          POSTGRES_DB: sotto
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sotto"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://sotto:sotto@localhost:5432/sotto
+      SOTTO_RUN_DB_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Server tests (with Postgres)
+        run: cargo test -p sotto-server
+
   supply-chain:
     runs-on: ubuntu-latest
     steps:

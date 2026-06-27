@@ -9,3 +9,12 @@ publish = false
 [dependencies]
 axum.workspace = true
 tokio.workspace = true
+thiserror.workspace = true
+# Postgres via sqlx. No TLS feature for now (local/dev is plaintext); a prod TLS backend is a
+# deliberate deploy-time choice. Runtime queries for now — no compile-time DB / offline cache.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "macros",
+    "migrate",
+] }
