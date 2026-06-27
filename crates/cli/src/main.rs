@@ -100,7 +100,8 @@ fn run() -> Result<()> {
 
     let store_path = sotto_cli::paths::store_path()?;
     if let Some(parent) = store_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| Error::Io(format!("creating {}: {e}", parent.display())))?;
     }
     let store = Store::open(&store_path)?;
     let keychain = OsKeychain::new(KEYCHAIN_SERVICE);
