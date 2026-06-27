@@ -46,6 +46,20 @@ CREATE TABLE IF NOT EXISTS secrets (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS secrets_set_updated_at ON secrets;
+CREATE TRIGGER secrets_set_updated_at
+BEFORE UPDATE ON secrets
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
+
 CREATE TABLE IF NOT EXISTS secret_versions (
     id           TEXT PRIMARY KEY,
     secret_id    TEXT NOT NULL REFERENCES secrets (id) ON DELETE CASCADE,
