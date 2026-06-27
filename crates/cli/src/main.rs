@@ -134,8 +134,10 @@ fn run() -> Result<()> {
         Command::Get { name, reveal } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
-            let value = app.get(&config, &name)?;
-            write_value(&value, reveal)
+            let mut value = app.get(&config, &name)?;
+            let result = write_value(&value, reveal);
+            value.zeroize();
+            result
         }
         Command::Ls => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
