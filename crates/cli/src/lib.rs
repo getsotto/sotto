@@ -14,6 +14,7 @@
 
 pub mod commands;
 pub mod config;
+pub mod dotenv;
 pub mod error;
 pub mod export;
 pub mod keychain;
