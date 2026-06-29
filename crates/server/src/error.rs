@@ -32,6 +32,14 @@ pub enum Error {
     #[error("bad request: {0}")]
     BadRequest(String),
 
+    /// The requested resource does not exist (e.g. an uninitialized account).
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// The request conflicts with current state (e.g. re-initializing an account).
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// An optional feature (e.g. OAuth) is not configured on this server.
     #[error("not configured: {0}")]
     NotConfigured(String),
@@ -46,6 +54,8 @@ impl IntoResponse for Error {
         let (status, message) = match &self {
             Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
             Error::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
+            Error::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
+            Error::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
             Error::NotConfigured(m) => (StatusCode::SERVICE_UNAVAILABLE, m.clone()),
             Error::Upstream(_) => (
                 StatusCode::BAD_GATEWAY,

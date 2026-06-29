@@ -31,6 +31,8 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 async-trait = "0.1"
 url = "2"
+# Transport opaque account key material (public key, sealed private keys, …) as base64 in JSON.
+base64 = "0.22"
 
 [dev-dependencies]
 # Drive the router in-process (ServiceExt::oneshot) for handler tests.
