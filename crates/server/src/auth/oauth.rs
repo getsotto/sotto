@@ -3,6 +3,8 @@
 //! The provider is abstracted behind [`OAuthProvider`] so handlers depend on the trait, not on
 //! GitHub specifically — production wires up [`GithubOAuth`], tests inject a mock.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 
@@ -40,7 +42,13 @@ impl GithubOAuth {
             client_id,
             client_secret,
             redirect_uri,
-            http: reqwest::Client::new(),
+            // Bound every upstream call: a stalled GitHub (slow DNS/TLS, hung connection) must not
+            // tie up the request task and its socket indefinitely.
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .connect_timeout(Duration::from_secs(5))
+                .build()
+                .expect("reqwest client with static config builds"),
         }
     }
 
