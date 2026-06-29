@@ -1,13 +1,17 @@
 //! The Sotto sync / API backend.
 //!
-//! M3 PR1: connect to Postgres, apply migrations, and serve a health check. The zero-knowledge
-//! sync endpoints (snapshot, versioned writes, …) land in later PRs.
+//! M3 PR2: connect to Postgres, apply migrations, and serve health + GitHub OAuth login/sessions.
+//! The zero-knowledge sync endpoints (snapshot, versioned writes, …) land in later PRs.
+
+use std::sync::Arc;
 
 use axum::{routing::get, Router};
 
+use sotto_server::auth::{self, GithubOAuth, OAuthProvider};
 use sotto_server::config::Config;
 use sotto_server::db;
 use sotto_server::error::{Error, Result};
+use sotto_server::state::AppState;
 
 #[tokio::main]
 async fn main() {
@@ -22,7 +26,27 @@ async fn run() -> Result<()> {
     let pool = db::connect(&config.database_url).await?;
     db::migrate(&pool).await?;
 
-    let app = Router::new().route("/health", get(health)).with_state(pool);
+    let oauth: Option<Arc<dyn OAuthProvider>> = config.oauth.as_ref().map(|o| {
+        Arc::new(GithubOAuth::new(
+            o.github_client_id.clone(),
+            o.github_client_secret.clone(),
+            o.callback_url(),
+        )) as Arc<dyn OAuthProvider>
+    });
+    if oauth.is_none() {
+        eprintln!("warning: GITHUB_CLIENT_ID/SECRET unset — OAuth endpoints will return 503");
+    }
+
+    let state = AppState {
+        pool,
+        oauth,
+        oauth_config: config.oauth.clone(),
+    };
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .merge(auth::router())
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await

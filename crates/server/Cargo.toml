@@ -10,11 +10,28 @@ publish = false
 axum.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+uuid.workspace = true
+# CSPRNG + BLAKE2b for session-token generation/hashing (reuses the vetted core crypto dep).
+dryoc.workspace = true
 # Postgres via sqlx. No TLS feature for now (local/dev is plaintext); a prod TLS backend is a
 # deliberate deploy-time choice. Runtime queries for now — no compile-time DB / offline cache.
+# TTL math stays in SQL (now() + interval, expires_at > now()), so no chrono/time type feature.
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "postgres",
     "macros",
     "migrate",
 ] }
+# OAuth: GitHub identity over HTTPS. native-tls = Secure Transport (macOS) / system OpenSSL
+# (Linux) — license-clean (no ring) and present on our build/deploy hosts.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "native-tls",
+] }
+async-trait = "0.1"
+url = "2"
+
+[dev-dependencies]
+# Drive the router in-process (ServiceExt::oneshot) for handler tests.
+tower = { version = "0.5", features = ["util"] }
