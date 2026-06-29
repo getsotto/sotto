@@ -37,6 +37,14 @@ pub async fn login(
 
     validate_loopback(&params.redirect_uri)?;
 
+    // Opportunistically drop login states that can no longer succeed (older than the freshness
+    // window the callback enforces), so abandoned or bot-initiated logins don't accumulate.
+    sqlx::query(&format!(
+        "DELETE FROM oauth_logins WHERE created_at < now() - interval '{LOGIN_FRESHNESS}'"
+    ))
+    .execute(&state.pool)
+    .await?;
+
     let server_state = random_state();
     sqlx::query(
         "INSERT INTO oauth_logins (state, cli_redirect_uri, cli_state) VALUES ($1, $2, $3)",
