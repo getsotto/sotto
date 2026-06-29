@@ -6,9 +6,11 @@
 //! - [`config`] — server configuration from the environment
 //! - [`db`] — Postgres connection pool + migrations
 //! - [`auth`] — GitHub OAuth login, sessions, and the [`auth::AuthUser`] request extractor
+//! - [`account`] — account crypto-material sync (KDF params, public key, sealed private keys, …)
 //! - [`state`] — shared application state ([`state::AppState`])
 //! - [`error`] — server error type
 
+pub mod account;
 pub mod auth;
 pub mod config;
 pub mod db;
