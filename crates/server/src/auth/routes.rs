@@ -116,11 +116,13 @@ pub async fn me(user: AuthUser) -> Json<MeResponse> {
 }
 
 /// Insert the user on first login, or return the existing id on subsequent logins (refreshing the
-/// email). The `(oauth_provider, oauth_subject)` pair is the stable identity key.
+/// email only when the provider supplies one, so a later login without an email doesn't erase a
+/// previously stored address). The `(oauth_provider, oauth_subject)` pair is the stable identity key.
 async fn upsert_user(pool: &sqlx::PgPool, identity: &Identity) -> Result<String> {
     let user_id: String = sqlx::query_scalar(
         "INSERT INTO users (id, oauth_provider, oauth_subject, email) VALUES ($1, $2, $3, $4) \
-         ON CONFLICT (oauth_provider, oauth_subject) DO UPDATE SET email = EXCLUDED.email \
+         ON CONFLICT (oauth_provider, oauth_subject) \
+         DO UPDATE SET email = COALESCE(EXCLUDED.email, users.email) \
          RETURNING id",
     )
     .bind(uuid::Uuid::new_v4().to_string())
