@@ -119,11 +119,10 @@ async fn put_then_get_round_trips() {
         .await
         .expect("get");
     assert_eq!(resp.status(), StatusCode::OK);
-    let text = body_text(resp).await;
-    assert!(text.contains(&STANDARD.encode(pk)));
-    assert!(text.contains(&STANDARD.encode(&epk)));
-    assert!(text.contains(&STANDARD.encode(&kdf)));
-    assert!(text.contains(&STANDARD.encode(&rec)));
+    // Assert the exact payload, not just that each blob appears somewhere: this catches swapped,
+    // duplicated, missing, or extra fields. The response is compact serde_json in struct-field
+    // order, which is byte-identical to `bundle_json`.
+    assert_eq!(body_text(resp).await, bundle_json(&pk, &epk, &kdf, &rec));
 
     cleanup(&pool, user_id).await;
 }
