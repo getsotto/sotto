@@ -100,6 +100,8 @@ impl OAuthProvider for GithubOAuth {
             .send()
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| Error::Upstream(e.to_string()))?
             .json()
             .await
             .map_err(|e| Error::Upstream(e.to_string()))?;
