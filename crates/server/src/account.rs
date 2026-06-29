@@ -27,6 +27,9 @@ type AccountRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 const PUBLIC_KEY_LEN: usize = 32;
 /// Per-field cap on opaque key material (well above realistic sizes; axum also bounds the body).
 const MAX_BLOB: usize = 16 * 1024;
+/// Longest base64 input that can decode within [`MAX_BLOB`] (base64 is 4 chars per 3 bytes). Used
+/// to reject oversize fields before allocating/decoding them.
+const MAX_ENCODED: usize = MAX_BLOB.div_ceil(3) * 4;
 
 /// All four routes share the `/account` path.
 pub fn router() -> Router<AppState> {
@@ -110,6 +113,13 @@ async fn get_account(State(state): State<AppState>, user: AuthUser) -> Result<Js
 
 /// Decode a base64 field, rejecting malformed input or anything over [`MAX_BLOB`].
 fn decode(value: &str, field: &str) -> Result<Vec<u8>> {
+    // Bound the work up front: reject oversize input before decoding so a large field can't force a
+    // big allocation just to be rejected afterward.
+    if value.len() > MAX_ENCODED {
+        return Err(Error::BadRequest(format!(
+            "{field} exceeds {MAX_BLOB} bytes"
+        )));
+    }
     let bytes = STANDARD
         .decode(value)
         .map_err(|_| Error::BadRequest(format!("{field} is not valid base64")))?;
