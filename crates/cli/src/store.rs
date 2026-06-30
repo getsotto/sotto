@@ -61,6 +61,10 @@ CREATE TABLE IF NOT EXISTS secret_versions (
     created_at   INTEGER NOT NULL,
     UNIQUE (secret_id, version)
 );
+CREATE TABLE IF NOT EXISTS sync_state (
+    env_id          TEXT PRIMARY KEY REFERENCES environments(id),
+    synced_revision INTEGER NOT NULL
+);
 ";
 
 fn now_ms() -> i64 {
@@ -108,6 +112,17 @@ pub struct SecretVersion {
     pub enc_name: Vec<u8>,
     pub enc_value: Vec<u8>,
     pub enc_data_key: Vec<u8>,
+}
+
+/// A secret as the sync engine sees it: opaque ciphertext + version + tombstone flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncSecret {
+    pub id: String,
+    pub enc_name: Vec<u8>,
+    pub enc_value: Vec<u8>,
+    pub enc_data_key: Vec<u8>,
+    pub version: i64,
+    pub deleted: bool,
 }
 
 /// The local identity row: the KDF salt and an encrypted verifier used to check unlock.
@@ -221,13 +236,18 @@ impl Store {
     // --- projects ---
 
     pub fn create_project(&self, name: &str) -> Result<Project> {
-        let id = new_id();
+        self.create_project_with_id(&new_id(), name)
+    }
+
+    /// Create a project with a caller-supplied id (used when adopting a server/committed id, e.g.
+    /// on a new device from `sotto.toml`).
+    pub fn create_project_with_id(&self, id: &str, name: &str) -> Result<Project> {
         self.conn.execute(
             "INSERT INTO projects (id, name, created_at) VALUES (?1, ?2, ?3)",
             params![id, name, now_ms()],
         )?;
         Ok(Project {
-            id,
+            id: id.to_string(),
             name: name.to_string(),
         })
     }
@@ -452,6 +472,111 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // --- sync (the engine sees opaque ciphertext + version + tombstone state) ---
+
+    /// All secrets for an environment, including tombstones (for computing what to push).
+    pub fn all_secrets(&self, env_id: &str) -> Result<Vec<SyncSecret>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, enc_name, enc_value, enc_data_key, version, (deleted_at IS NOT NULL)
+             FROM secrets WHERE env_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![env_id], |r| {
+            Ok(SyncSecret {
+                id: r.get(0)?,
+                enc_name: r.get(1)?,
+                enc_value: r.get(2)?,
+                enc_data_key: r.get(3)?,
+                version: r.get(4)?,
+                deleted: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Look up a single secret (including a tombstone) by id within an environment.
+    pub fn find_secret(&self, env_id: &str, id: &str) -> Result<Option<SyncSecret>> {
+        self.conn
+            .query_row(
+                "SELECT id, enc_name, enc_value, enc_data_key, version, (deleted_at IS NOT NULL)
+                 FROM secrets WHERE env_id = ?1 AND id = ?2",
+                params![env_id, id],
+                |r| {
+                    Ok(SyncSecret {
+                        id: r.get(0)?,
+                        enc_name: r.get(1)?,
+                        enc_value: r.get(2)?,
+                        enc_data_key: r.get(3)?,
+                        version: r.get(4)?,
+                        deleted: r.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Apply server truth for one secret, overwriting local state and recording the version in
+    /// history (idempotently). Used by `pull`; bypasses the optimistic-version checks that guard
+    /// *local* edits, because the server's state is authoritative here.
+    pub fn put_remote_secret(&self, env_id: &str, secret: &SyncSecret) -> Result<()> {
+        let ts = now_ms();
+        let deleted_at: Option<i64> = secret.deleted.then_some(ts);
+        let tx = self.conn.unchecked_transaction()?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO secrets
+                (id, env_id, enc_name, enc_value, enc_data_key, version, deleted_at,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                secret.id,
+                env_id,
+                secret.enc_name,
+                secret.enc_value,
+                secret.enc_data_key,
+                secret.version,
+                deleted_at,
+                ts
+            ],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO secret_versions
+                (id, secret_id, version, enc_name, enc_value, enc_data_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                new_id(),
+                secret.id,
+                secret.version,
+                secret.enc_name,
+                secret.enc_value,
+                secret.enc_data_key,
+                ts
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The last server revision this environment was reconciled with (0 if never synced).
+    pub fn synced_revision(&self, env_id: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT synced_revision FROM sync_state WHERE env_id = ?1",
+                params![env_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(|o| o.unwrap_or(0))
+            .map_err(Into::into)
+    }
+
+    pub fn set_synced_revision(&self, env_id: &str, revision: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sync_state (env_id, synced_revision) VALUES (?1, ?2)",
+            params![env_id, revision],
+        )?;
+        Ok(())
     }
 
     fn snapshot(

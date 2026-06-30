@@ -1,0 +1,519 @@
+//! The sync engine: pull-rebase-push reconciliation of one environment's secrets.
+//!
+//! Secrets are opaque ciphertext whose AAD binds the (matching) `env_id`, secret id, and version,
+//! so reconciliation moves blobs verbatim — never re-encrypting. `pull` applies the server snapshot
+//! to the local store (server wins on a newer version, or an equal-version server-side tombstone);
+//! `push` fast-forwards from a fresh snapshot, diffs local-vs-server, writes the batch at that
+//! `base_revision`, and retries on a concurrency conflict (412). Project/environment names are the
+//! one thing encrypted here (under the master key) for the server's zero-knowledge `enc_name`.
+
+use std::collections::HashMap;
+
+use sotto_core::aead;
+
+use crate::account;
+use crate::config::Config;
+use crate::error::{Error, Result};
+use crate::store::{Environment, Project, Store, SyncSecret};
+
+use super::api::{
+    b64decode, b64encode, AccountBundle, BatchRequest, NewEnvironment, NewProject, SecretChange,
+    Snapshot, SyncApi,
+};
+
+/// Bound on pull-rebase-push retries before giving up under sustained concurrent writes.
+const MAX_SYNC_ATTEMPTS: usize = 5;
+
+/// Pull the active environment: apply the server snapshot locally and return the current revision.
+pub fn pull(api: &dyn SyncApi, store: &Store, config: &Config) -> Result<i64> {
+    let env = resolve_env(store, config)?;
+    let base = store.synced_revision(&env.id)?;
+    match api.snapshot(&env.id, Some(base))? {
+        None => Ok(base), // 304 Not Modified
+        Some(snapshot) => {
+            apply_snapshot(store, &env.id, &snapshot)?;
+            store.set_synced_revision(&env.id, snapshot.revision)?;
+            Ok(snapshot.revision)
+        }
+    }
+}
+
+/// Push the active environment: ensure account/project/environment exist server-side, then
+/// reconcile and upload local changes. Returns the resulting revision.
+pub fn push(api: &dyn SyncApi, store: &Store, master: &[u8; 32], config: &Config) -> Result<i64> {
+    let env = resolve_env(store, config)?;
+    let project = store
+        .get_project(&config.project_id)?
+        .ok_or_else(|| Error::NotFound(format!("project `{}`", config.project_id)))?;
+
+    ensure_account(api, store)?;
+    ensure_project_env(api, master, &project, &env)?;
+
+    for _ in 0..MAX_SYNC_ATTEMPTS {
+        // Fast-forward from the latest snapshot, then diff against it.
+        let snapshot = api
+            .snapshot(&env.id, None)?
+            .ok_or_else(|| Error::Server("server returned no snapshot".into()))?;
+        apply_snapshot(store, &env.id, &snapshot)?;
+        store.set_synced_revision(&env.id, snapshot.revision)?;
+
+        let changes = diff(store, &env.id, &snapshot)?;
+        if changes.is_empty() {
+            return Ok(snapshot.revision);
+        }
+
+        let batch = BatchRequest {
+            base_revision: snapshot.revision,
+            changes,
+        };
+        match api.write_secrets(&env.id, &batch) {
+            Ok(resp) => {
+                store.set_synced_revision(&env.id, resp.revision)?;
+                return Ok(resp.revision);
+            }
+            // Someone else advanced the revision between our snapshot and write — re-pull and retry.
+            Err(Error::Conflict(_)) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::Conflict(
+        "sync: too many concurrent updates; try again".into(),
+    ))
+}
+
+fn resolve_env(store: &Store, config: &Config) -> Result<Environment> {
+    store
+        .get_environment(&config.project_id, &config.environment)?
+        .ok_or_else(|| Error::NotFound(format!("environment `{}`", config.environment)))
+}
+
+/// Upload account crypto material on first push; a 409 means it's already initialized (fine).
+fn ensure_account(api: &dyn SyncApi, store: &Store) -> Result<()> {
+    let material = account::material(store)?;
+    let bundle = AccountBundle {
+        public_key: b64encode(&material.public_key),
+        enc_private_keys: b64encode(&material.enc_private_keys),
+        kdf_params: b64encode(&material.kdf_params),
+        recovery_blob: b64encode(&material.recovery_blob),
+    };
+    match api.put_account(&bundle) {
+        Ok(()) | Err(Error::Conflict(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Idempotently create the project + environment server-side (encrypting their names).
+fn ensure_project_env(
+    api: &dyn SyncApi,
+    master: &[u8; 32],
+    project: &Project,
+    env: &Environment,
+) -> Result<()> {
+    api.create_project(&NewProject {
+        id: project.id.clone(),
+        enc_name: b64encode(&encrypt_name(
+            master,
+            &project.name,
+            &project_name_aad(&project.id),
+        )),
+    })?;
+    api.create_environment(
+        &project.id,
+        &NewEnvironment {
+            id: env.id.clone(),
+            enc_name: b64encode(&encrypt_name(master, &env.name, &env_name_aad(&env.id))),
+            enc_vault_key: b64encode(&env.enc_vault_key),
+        },
+    )
+}
+
+/// Apply a server snapshot to the local store: server wins on a strictly newer version, or on an
+/// equal-version tombstone the server introduced.
+fn apply_snapshot(store: &Store, env_id: &str, snapshot: &Snapshot) -> Result<()> {
+    for remote in &snapshot.secrets {
+        let local = store.find_secret(env_id, &remote.id)?;
+        let apply = match &local {
+            None => true,
+            Some(local) => {
+                remote.version > local.version
+                    || (remote.version == local.version && remote.deleted && !local.deleted)
+            }
+        };
+        if apply {
+            store.put_remote_secret(
+                env_id,
+                &SyncSecret {
+                    id: remote.id.clone(),
+                    enc_name: b64decode(&remote.enc_name)?,
+                    enc_value: b64decode(&remote.enc_value)?,
+                    enc_data_key: b64decode(&remote.enc_data_key)?,
+                    version: remote.version,
+                    deleted: remote.deleted,
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Compute the changes to push: local secrets newer than the server, or locally-deleted ones the
+/// server still has live. (The caller has already fast-forwarded local from this snapshot.)
+fn diff(store: &Store, env_id: &str, snapshot: &Snapshot) -> Result<Vec<SecretChange>> {
+    let server: HashMap<&str, &super::api::SecretEntry> = snapshot
+        .secrets
+        .iter()
+        .map(|s| (s.id.as_str(), s))
+        .collect();
+
+    let mut changes = Vec::new();
+    for local in store.all_secrets(env_id)? {
+        match server.get(local.id.as_str()) {
+            None => {
+                if !local.deleted {
+                    changes.push(set_change(local));
+                }
+            }
+            Some(remote) => {
+                if !local.deleted && local.version > remote.version {
+                    changes.push(set_change(local));
+                } else if local.deleted && !remote.deleted {
+                    changes.push(SecretChange::delete(local.id));
+                }
+            }
+        }
+    }
+    Ok(changes)
+}
+
+fn set_change(local: SyncSecret) -> SecretChange {
+    SecretChange::set(
+        local.id,
+        local.version,
+        b64encode(&local.enc_name),
+        b64encode(&local.enc_value),
+        b64encode(&local.enc_data_key),
+    )
+}
+
+fn encrypt_name(master: &[u8; 32], name: &str, aad: &str) -> Vec<u8> {
+    aead::seal(master, name.as_bytes(), aad.as_bytes())
+}
+
+fn project_name_aad(project_id: &str) -> String {
+    format!("sotto/v1/project-name|id={project_id}")
+}
+
+fn env_name_aad(env_id: &str) -> String {
+    format!("sotto/v1/env-name|id={env_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Project;
+    use crate::vault::Vault;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+
+    const MASTER: [u8; 32] = [0x42; 32];
+
+    // --- a faithful in-memory server mirroring the real endpoints' semantics ---
+
+    struct ServerSecret {
+        enc_name: Vec<u8>,
+        enc_value: Vec<u8>,
+        enc_data_key: Vec<u8>,
+        version: i64,
+        deleted: bool,
+    }
+
+    struct EnvState {
+        revision: i64,
+        secrets: HashMap<String, ServerSecret>,
+    }
+
+    #[derive(Default)]
+    struct MockState {
+        account: Option<AccountBundle>,
+        projects: HashSet<String>,
+        envs: HashMap<String, EnvState>,
+        fail_writes: u32,
+    }
+
+    #[derive(Default)]
+    struct MockApi {
+        state: RefCell<MockState>,
+    }
+
+    impl MockApi {
+        fn fail_next_write(&self) {
+            self.state.borrow_mut().fail_writes += 1;
+        }
+        fn has_account(&self) -> bool {
+            self.state.borrow().account.is_some()
+        }
+    }
+
+    impl SyncApi for MockApi {
+        fn me(&self) -> Result<super::super::api::Me> {
+            Ok(super::super::api::Me {
+                user_id: "test-user".into(),
+            })
+        }
+
+        fn put_account(&self, bundle: &AccountBundle) -> Result<()> {
+            let mut s = self.state.borrow_mut();
+            if s.account.is_some() {
+                return Err(Error::Conflict("account already initialized".into()));
+            }
+            s.account = Some(bundle.clone());
+            Ok(())
+        }
+
+        fn get_account(&self) -> Result<Option<AccountBundle>> {
+            Ok(self.state.borrow().account.clone())
+        }
+
+        fn create_project(&self, project: &NewProject) -> Result<()> {
+            self.state.borrow_mut().projects.insert(project.id.clone());
+            Ok(())
+        }
+
+        fn create_environment(&self, _project_id: &str, env: &NewEnvironment) -> Result<()> {
+            self.state
+                .borrow_mut()
+                .envs
+                .entry(env.id.clone())
+                .or_insert(EnvState {
+                    revision: 0,
+                    secrets: HashMap::new(),
+                });
+            Ok(())
+        }
+
+        fn snapshot(&self, env_id: &str, if_none_match: Option<i64>) -> Result<Option<Snapshot>> {
+            let s = self.state.borrow();
+            let env = s
+                .envs
+                .get(env_id)
+                .ok_or_else(|| Error::NotFound("environment not found".into()))?;
+            if if_none_match == Some(env.revision) {
+                return Ok(None);
+            }
+            let mut secrets: Vec<_> = env
+                .secrets
+                .iter()
+                .map(|(id, sec)| super::super::api::SecretEntry {
+                    id: id.clone(),
+                    enc_name: b64encode(&sec.enc_name),
+                    enc_value: b64encode(&sec.enc_value),
+                    enc_data_key: b64encode(&sec.enc_data_key),
+                    version: sec.version,
+                    deleted: sec.deleted,
+                })
+                .collect();
+            secrets.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(Some(Snapshot {
+                revision: env.revision,
+                secrets,
+            }))
+        }
+
+        fn write_secrets(
+            &self,
+            env_id: &str,
+            batch: &BatchRequest,
+        ) -> Result<super::super::api::BatchResponse> {
+            let mut s = self.state.borrow_mut();
+            if s.fail_writes > 0 {
+                s.fail_writes -= 1;
+                return Err(Error::Conflict("injected conflict".into()));
+            }
+            let env = s
+                .envs
+                .get_mut(env_id)
+                .ok_or_else(|| Error::NotFound("environment not found".into()))?;
+            if batch.base_revision != env.revision {
+                return Err(Error::Conflict("stale base_revision".into()));
+            }
+            for change in &batch.changes {
+                match change.op.as_str() {
+                    "set" => {
+                        env.secrets.insert(
+                            change.id.clone(),
+                            ServerSecret {
+                                enc_name: b64decode(change.enc_name.as_ref().unwrap()).unwrap(),
+                                enc_value: b64decode(change.enc_value.as_ref().unwrap()).unwrap(),
+                                enc_data_key: b64decode(change.enc_data_key.as_ref().unwrap())
+                                    .unwrap(),
+                                version: change.version,
+                                deleted: false,
+                            },
+                        );
+                    }
+                    "delete" => {
+                        if let Some(sec) = env.secrets.get_mut(&change.id) {
+                            sec.deleted = true;
+                        }
+                    }
+                    other => panic!("unexpected op {other}"),
+                }
+            }
+            env.revision += 1;
+            Ok(super::super::api::BatchResponse {
+                revision: env.revision,
+            })
+        }
+    }
+
+    /// A store with an initialized account + a project (dev/staging/prod) and its config.
+    fn device() -> (Store, Project, Config) {
+        let store = Store::open_in_memory().unwrap();
+        let kc = crate::keychain::MemoryKeychain::default();
+        crate::session::init(&store, &kc, b"pw", std::time::Duration::from_secs(3600)).unwrap();
+        let project = Vault::create_project(&store, &MASTER, "acme").unwrap();
+        let config = Config {
+            project_id: project.id.clone(),
+            project: "acme".into(),
+            environment: "dev".into(),
+        };
+        (store, project, config)
+    }
+
+    /// A second device mirroring `src`'s project + dev environment (same ids + wrapped vault key),
+    /// as a real new device would after environment sync.
+    fn mirror(src: &Store, project: &Project) -> Store {
+        let store = Store::open_in_memory().unwrap();
+        // A real second device has its own initialized identity/account material (its push's
+        // duplicate account upload is ignored by the server). The vault still uses MASTER directly.
+        let kc = crate::keychain::MemoryKeychain::default();
+        crate::session::init(&store, &kc, b"pw", std::time::Duration::from_secs(3600)).unwrap();
+        store
+            .create_project_with_id(&project.id, &project.name)
+            .unwrap();
+        let dev = src.get_environment(&project.id, "dev").unwrap().unwrap();
+        store
+            .create_environment(&dev.id, &project.id, "dev", &dev.enc_vault_key)
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn push_provisions_and_round_trips_through_pull() {
+        let api = MockApi::default();
+        let (store, project, config) = device();
+        Vault::open(&store, &MASTER, &project.id, "dev")
+            .unwrap()
+            .set("DATABASE_URL", b"postgres://prod")
+            .unwrap();
+
+        let rev = push(&api, &store, &MASTER, &config).unwrap();
+        assert_eq!(rev, 1);
+        assert!(api.has_account());
+
+        // A second device pulls and decrypts the same value.
+        let b = mirror(&store, &project);
+        assert_eq!(pull(&api, &b, &config).unwrap(), 1);
+        let value = Vault::open(&b, &MASTER, &project.id, "dev")
+            .unwrap()
+            .get("DATABASE_URL")
+            .unwrap();
+        assert_eq!(value, b"postgres://prod");
+    }
+
+    #[test]
+    fn updates_and_deletes_propagate() {
+        let api = MockApi::default();
+        let (store, project, config) = device();
+        let a = Vault::open(&store, &MASTER, &project.id, "dev").unwrap();
+        a.set("KEY", b"v1").unwrap();
+        push(&api, &store, &MASTER, &config).unwrap();
+        let b = mirror(&store, &project);
+        pull(&api, &b, &config).unwrap();
+
+        // Update on A → pull on B.
+        a.set("KEY", b"v2").unwrap();
+        push(&api, &store, &MASTER, &config).unwrap();
+        pull(&api, &b, &config).unwrap();
+        assert_eq!(
+            Vault::open(&b, &MASTER, &project.id, "dev")
+                .unwrap()
+                .get("KEY")
+                .unwrap(),
+            b"v2"
+        );
+
+        // Delete on A → tombstone reaches B.
+        a.delete("KEY").unwrap();
+        push(&api, &store, &MASTER, &config).unwrap();
+        pull(&api, &b, &config).unwrap();
+        assert!(matches!(
+            Vault::open(&b, &MASTER, &project.id, "dev")
+                .unwrap()
+                .get("KEY"),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn pull_when_unchanged_is_a_noop() {
+        let api = MockApi::default();
+        let (store, project, config) = device();
+        Vault::open(&store, &MASTER, &project.id, "dev")
+            .unwrap()
+            .set("K", b"v")
+            .unwrap();
+        let rev = push(&api, &store, &MASTER, &config).unwrap();
+        // Pulling again returns the same revision (server responds 304) and changes nothing.
+        assert_eq!(pull(&api, &store, &config).unwrap(), rev);
+    }
+
+    #[test]
+    fn concurrent_writers_converge() {
+        let api = MockApi::default();
+        let (store, project, config) = device();
+        let b = {
+            // B must exist on the server first; A's push provisions the env.
+            Vault::open(&store, &MASTER, &project.id, "dev")
+                .unwrap()
+                .set("AKEY", b"a0")
+                .unwrap();
+            push(&api, &store, &MASTER, &config).unwrap();
+            mirror(&store, &project)
+        };
+        pull(&api, &b, &config).unwrap();
+
+        // B writes BKEY and pushes; then A writes another key and pushes (its internal pull
+        // rebases onto B's revision).
+        Vault::open(&b, &MASTER, &project.id, "dev")
+            .unwrap()
+            .set("BKEY", b"b0")
+            .unwrap();
+        push(&api, &b, &MASTER, &config).unwrap();
+
+        Vault::open(&store, &MASTER, &project.id, "dev")
+            .unwrap()
+            .set("CKEY", b"c0")
+            .unwrap();
+        push(&api, &store, &MASTER, &config).unwrap();
+        pull(&api, &store, &config).unwrap();
+
+        let a = Vault::open(&store, &MASTER, &project.id, "dev").unwrap();
+        assert_eq!(a.get("AKEY").unwrap(), b"a0");
+        assert_eq!(a.get("BKEY").unwrap(), b"b0");
+        assert_eq!(a.get("CKEY").unwrap(), b"c0");
+    }
+
+    #[test]
+    fn push_retries_after_a_conflict() {
+        let api = MockApi::default();
+        let (store, project, config) = device();
+        Vault::open(&store, &MASTER, &project.id, "dev")
+            .unwrap()
+            .set("K", b"v")
+            .unwrap();
+        api.fail_next_write(); // first write_secrets returns 412
+                               // The engine re-pulls and retries, succeeding on the second attempt.
+        assert_eq!(push(&api, &store, &MASTER, &config).unwrap(), 1);
+    }
+}
