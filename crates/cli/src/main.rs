@@ -61,6 +61,8 @@ enum Command {
     Push,
     /// Download the active environment's secrets from the server into the local store.
     Pull,
+    /// Set up this device from the server using your Emergency Kit (run after `login`).
+    Setup,
     /// Unlock the store for this session.
     Unlock,
     /// Lock the store (clear the cached session).
@@ -192,6 +194,7 @@ fn run() -> Result<()> {
             );
             Ok(())
         }
+        Command::Setup => setup(&store, &keychain, &cwd),
         Command::Unlock => {
             ensure_unlocked(&store, &keychain)?;
             eprintln!("unlocked");
@@ -308,6 +311,58 @@ fn init(store: &Store, keychain: &dyn Keychain, cwd: &Path, name: Option<String>
     config.save_to(cwd)?;
     eprintln!("initialized `{}` ({})", config.project, config.environment);
     Ok(())
+}
+
+/// Set up this device from the server: reconstruct the identity from the Emergency Kit + downloaded
+/// account, recreate the project/environments, and pull the active environment's secrets.
+fn setup(store: &Store, keychain: &dyn Keychain, cwd: &Path) -> Result<()> {
+    if store.get_identity()?.is_some() {
+        return Err(Error::AlreadyInitialized);
+    }
+    let (config, _dir) = Config::discover(cwd)?;
+    let client = sync_client(keychain)?;
+    let bundle = remote::SyncApi::get_account(&client)?.ok_or_else(|| {
+        Error::Input(
+            "no account on the server; run `sotto init` then `sotto push` on your first device"
+                .into(),
+        )
+    })?;
+
+    let mut secret_key = read_secret_key()?;
+    let mut password = read_password("Master password: ")?;
+    let result = remote::sync::restore_account(
+        store,
+        keychain,
+        &bundle,
+        &secret_key,
+        &password,
+        SESSION_TTL,
+    );
+    secret_key.zeroize();
+    password.zeroize();
+    result?;
+
+    let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
+    remote::sync::pull_environments(&client, store, master.as_bytes(), &config)?;
+    let revision = remote::sync::pull(&client, store, &config)?;
+    eprintln!(
+        "set up {} ({}) from the server — revision {revision}",
+        config.project, config.environment
+    );
+    Ok(())
+}
+
+/// Read the secret key from `SOTTO_SECRET_KEY` or a hidden prompt, returning its decoded bytes.
+fn read_secret_key() -> Result<Vec<u8>> {
+    let input = if let Ok(value) = std::env::var("SOTTO_SECRET_KEY") {
+        value
+    } else {
+        eprint!("Secret Key (SK1-…): ");
+        io::stderr().flush().ok();
+        rpassword::read_password().map_err(|e| Error::Io(e.to_string()))?
+    };
+    sotto_core::format::decode_key("SK", 1, input.trim())
+        .map_err(|_| Error::Input("invalid Secret Key".into()))
 }
 
 /// Build an authenticated sync client from the configured server URL + stored session token.

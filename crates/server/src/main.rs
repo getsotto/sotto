@@ -1,13 +1,12 @@
 //! The Sotto sync / API backend.
 //!
-//! M3 PR2: connect to Postgres, apply migrations, and serve health + GitHub OAuth login/sessions.
-//! The zero-knowledge sync endpoints (snapshot, versioned writes, …) land in later PRs.
+//! Boots the server: connect to Postgres, apply migrations, and serve the zero-knowledge API
+//! (health, GitHub OAuth login/sessions, account + secret sync). The router itself lives in
+//! [`sotto_server::app`] so the binary and the end-to-end tests share one wiring.
 
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
-
-use sotto_server::auth::{self, GithubOAuth, OAuthProvider};
+use sotto_server::auth::{GithubOAuth, OAuthProvider};
 use sotto_server::config::Config;
 use sotto_server::db;
 use sotto_server::error::{Error, Result};
@@ -43,22 +42,11 @@ async fn run() -> Result<()> {
         oauth_config: config.oauth.clone(),
     };
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .merge(auth::router())
-        .merge(sotto_server::account::router())
-        .merge(sotto_server::sync::router())
-        .with_state(state);
-
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
         .map_err(|e| Error::Io(e.to_string()))?;
     println!("sotto-server listening on http://{}", config.bind_addr);
-    axum::serve(listener, app)
+    axum::serve(listener, sotto_server::app(state))
         .await
         .map_err(|e| Error::Io(e.to_string()))
-}
-
-async fn health() -> &'static str {
-    "ok"
 }

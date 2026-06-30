@@ -309,6 +309,25 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Look up an environment by its id (used when reconstructing envs on a new device).
+    pub fn find_environment(&self, id: &str) -> Result<Option<Environment>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, name, enc_vault_key FROM environments WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(Environment {
+                        id: r.get(0)?,
+                        project_id: r.get(1)?,
+                        name: r.get(2)?,
+                        enc_vault_key: r.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn list_environments(&self, project_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
