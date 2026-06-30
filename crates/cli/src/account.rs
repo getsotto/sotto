@@ -37,7 +37,8 @@ impl KdfParams {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        serde_json::to_vec(self).map_err(|e| Error::Io(e.to_string()))
+        // Encoding kdf_params is not I/O; classify it as a config error to match `from_bytes`.
+        serde_json::to_vec(self).map_err(|e| Error::Config(format!("encoding kdf_params: {e}")))
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
