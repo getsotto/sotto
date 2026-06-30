@@ -5,15 +5,20 @@
 //! value. This exercises the real wire — the CLI's blocking HTTP client against the actual axum
 //! server and Postgres — that the mock-based engine tests stand in for.
 //!
-//! DB-gated: skips without `DATABASE_URL`. A session is minted directly (the GitHub OAuth handshake
-//! is covered by the server's own tests); everything past authentication is the genuine flow.
+//! DB-gated: runs only when `SOTTO_RUN_DB_TESTS=1` and `DATABASE_URL` points at a local Postgres
+//! (it applies migrations and writes rows, so it must never touch a non-local database). A session
+//! is minted directly (the GitHub OAuth handshake is covered by the server's own tests); everything
+//! past authentication is the genuine flow.
 //!
 //! Test data uses fresh UUID ids per run, so leftover rows never collide; CI runs against an
 //! ephemeral Postgres, so they don't accumulate.
 
+use std::str::FromStr;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+use sqlx::postgres::PgConnectOptions;
 
 use sotto_cli::config::Config;
 use sotto_cli::keychain::MemoryKeychain;
@@ -99,12 +104,31 @@ impl Drop for TestServer {
     }
 }
 
+/// Gate destructive DB tests behind an explicit opt-in and a local host, so a stray `DATABASE_URL`
+/// (e.g. one a developer exported for something else) can never run migrations/inserts against it.
+fn should_run_db_tests(database_url: &str) -> bool {
+    if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping: SOTTO_RUN_DB_TESTS=1 not set");
+        return false;
+    }
+    let options = PgConnectOptions::from_str(database_url).expect("parse DATABASE_URL");
+    let host = options.get_host();
+    assert!(
+        matches!(host, "localhost" | "127.0.0.1" | "::1"),
+        "refusing to run destructive DB tests against non-local host: {host}"
+    );
+    true
+}
+
 #[test]
 fn new_device_end_to_end_over_http() {
     let Ok(database_url) = std::env::var("DATABASE_URL") else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
+    if !should_run_db_tests(&database_url) {
+        return;
+    }
     let server = TestServer::start(&database_url);
     let ttl = Duration::from_secs(3600);
     let client = HttpClient::new(server.url.clone(), server.token.clone());
