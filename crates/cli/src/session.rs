@@ -114,6 +114,50 @@ pub fn init(
     Ok(kit)
 }
 
+/// Reconstruct the local identity on a new device from downloaded account material.
+///
+/// Derives the master key from the password + pasted secret key + the account's salt, verifies it
+/// by unwrapping the account's private keys, then persists the identity, account keys, and secret
+/// key, and starts a session. Errors if an identity already exists.
+#[allow(clippy::too_many_arguments)]
+pub fn restore(
+    store: &Store,
+    keychain: &dyn Keychain,
+    password: &[u8],
+    secret_key: &[u8],
+    salt: &[u8; kdf::SALT_LEN],
+    account_keys: &AccountKeys,
+    ttl: Duration,
+) -> Result<()> {
+    if store.get_identity()?.is_some() {
+        return Err(Error::AlreadyInitialized);
+    }
+    let master_key = derive(password, secret_key, salt)?;
+
+    // Verify password + secret key: the private keys must unwrap under the derived master key.
+    let mut probe = wrap::unwrap_key(
+        master_key.as_bytes(),
+        &account_keys.enc_private_keys,
+        PRIVKEYS_AAD,
+    )
+    .map_err(|_| Error::Crypto)?;
+    probe.zeroize();
+
+    let enc_verifier = aead::seal(master_key.as_bytes(), VERIFIER_PLAINTEXT, VERIFIER_AAD);
+    keychain.set(KC_SECRET_KEY, secret_key)?;
+    if let Err(e) = store.put_identity_with_keys(
+        &Identity {
+            kdf_salt: salt.to_vec(),
+            enc_verifier,
+        },
+        account_keys,
+    ) {
+        let _ = keychain.delete(KC_SECRET_KEY);
+        return Err(e);
+    }
+    cache_session(keychain, &master_key, ttl)
+}
+
 /// Re-derive the master key from the password, verify it, and start a session.
 pub fn unlock(
     store: &Store,
@@ -248,6 +292,48 @@ mod tests {
             init(&store, &kc, b"pw", TTL),
             Err(Error::AlreadyInitialized)
         ));
+    }
+
+    /// Reconstruct A's identity material for a new device: secret key + salt + account keys.
+    fn restore_inputs(
+        store: &Store,
+        kit: &EmergencyKit,
+    ) -> ([u8; kdf::SALT_LEN], AccountKeys, Vec<u8>) {
+        let identity = store.get_identity().unwrap().unwrap();
+        let keys = store.get_account_keys().unwrap().unwrap();
+        let salt: [u8; kdf::SALT_LEN] = identity.kdf_salt.as_slice().try_into().unwrap();
+        let secret_key = format::decode_key("SK", 1, &kit.secret_key).unwrap();
+        (salt, keys, secret_key)
+    }
+
+    #[test]
+    fn restore_reconstructs_the_same_master_key() {
+        let (store_a, kc_a) = setup();
+        let kit = init(&store_a, &kc_a, b"pw", TTL).unwrap();
+        let master_a = current_master_key(&kc_a).unwrap().unwrap();
+        let (salt, keys, secret_key) = restore_inputs(&store_a, &kit);
+
+        let (store_b, kc_b) = setup();
+        restore(&store_b, &kc_b, b"pw", &secret_key, &salt, &keys, TTL).unwrap();
+
+        let master_b = current_master_key(&kc_b).unwrap().unwrap();
+        assert_eq!(master_a.as_bytes(), master_b.as_bytes());
+        assert!(store_b.get_identity().unwrap().is_some());
+        assert_eq!(store_b.get_account_keys().unwrap().unwrap(), keys);
+    }
+
+    #[test]
+    fn restore_with_wrong_password_fails() {
+        let (store_a, kc_a) = setup();
+        let kit = init(&store_a, &kc_a, b"right", TTL).unwrap();
+        let (salt, keys, secret_key) = restore_inputs(&store_a, &kit);
+
+        let (store_b, kc_b) = setup();
+        assert!(matches!(
+            restore(&store_b, &kc_b, b"wrong", &secret_key, &salt, &keys, TTL),
+            Err(Error::Crypto)
+        ));
+        assert!(store_b.get_identity().unwrap().is_none());
     }
 
     #[test]

@@ -8,13 +8,16 @@
 //! one thing encrypted here (under the master key) for the server's zero-knowledge `enc_name`.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
-use sotto_core::aead;
+use sotto_core::{aead, kdf};
 
 use crate::account;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::store::{Environment, Project, Store, SyncSecret};
+use crate::keychain::Keychain;
+use crate::session;
+use crate::store::{AccountKeys, Environment, Project, Store, SyncSecret};
 
 use super::api::{
     b64decode, b64encode, AccountBundle, BatchRequest, NewEnvironment, NewProject, SecretChange,
@@ -207,6 +210,70 @@ fn env_name_aad(env_id: &str) -> String {
     format!("sotto/v1/env-name|id={env_id}")
 }
 
+/// Reconstruct the local identity on a new device from a downloaded account bundle plus the pasted
+/// secret key and master password. Decodes the bundle and delegates to [`session::restore`].
+pub fn restore_account(
+    store: &Store,
+    keychain: &dyn Keychain,
+    bundle: &AccountBundle,
+    secret_key: &[u8],
+    password: &[u8],
+    ttl: Duration,
+) -> Result<()> {
+    let params = account::KdfParams::from_bytes(&b64decode(&bundle.kdf_params)?)?;
+    let salt: [u8; kdf::SALT_LEN] = params
+        .salt
+        .as_slice()
+        .try_into()
+        .map_err(|_| Error::Crypto)?;
+    let account_keys = AccountKeys {
+        public_key: b64decode(&bundle.public_key)?,
+        enc_private_keys: b64decode(&bundle.enc_private_keys)?,
+        recovery_blob: b64decode(&bundle.recovery_blob)?,
+    };
+    session::restore(
+        store,
+        keychain,
+        password,
+        secret_key,
+        &salt,
+        &account_keys,
+        ttl,
+    )
+}
+
+/// Reconstruct the local project + environments from the server (decrypting env names under the
+/// master key). Existing local rows are left untouched. Run after [`restore_account`], before
+/// [`pull`], on a new device.
+pub fn pull_environments(
+    api: &dyn SyncApi,
+    store: &Store,
+    master: &[u8; 32],
+    config: &Config,
+) -> Result<()> {
+    if store.get_project(&config.project_id)?.is_none() {
+        store.create_project_with_id(&config.project_id, &config.project)?;
+    }
+    for env in api.list_environments(&config.project_id)? {
+        if store.find_environment(&env.id)?.is_some() {
+            continue;
+        }
+        let name = decrypt_name(master, &b64decode(&env.enc_name)?, &env_name_aad(&env.id))?;
+        store.create_environment(
+            &env.id,
+            &config.project_id,
+            &name,
+            &b64decode(&env.enc_vault_key)?,
+        )?;
+    }
+    Ok(())
+}
+
+fn decrypt_name(master: &[u8; 32], ciphertext: &[u8], aad: &str) -> Result<String> {
+    let bytes = aead::open(master, ciphertext, aad.as_bytes())?;
+    String::from_utf8(bytes).map_err(|_| Error::Crypto)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +295,9 @@ mod tests {
     }
 
     struct EnvState {
+        project_id: String,
+        enc_name: String,
+        enc_vault_key: String,
         revision: i64,
         secrets: HashMap<String, ServerSecret>,
     }
@@ -279,16 +349,39 @@ mod tests {
             Ok(())
         }
 
-        fn create_environment(&self, _project_id: &str, env: &NewEnvironment) -> Result<()> {
+        fn create_environment(&self, project_id: &str, env: &NewEnvironment) -> Result<()> {
             self.state
                 .borrow_mut()
                 .envs
                 .entry(env.id.clone())
                 .or_insert(EnvState {
+                    project_id: project_id.to_string(),
+                    enc_name: env.enc_name.clone(),
+                    enc_vault_key: env.enc_vault_key.clone(),
                     revision: 0,
                     secrets: HashMap::new(),
                 });
             Ok(())
+        }
+
+        fn list_environments(
+            &self,
+            project_id: &str,
+        ) -> Result<Vec<super::super::api::EnvironmentInfo>> {
+            let s = self.state.borrow();
+            let mut envs: Vec<_> = s
+                .envs
+                .iter()
+                .filter(|(_, e)| e.project_id == project_id)
+                .map(|(id, e)| super::super::api::EnvironmentInfo {
+                    id: id.clone(),
+                    enc_name: e.enc_name.clone(),
+                    enc_vault_key: e.enc_vault_key.clone(),
+                    revision: e.revision,
+                })
+                .collect();
+            envs.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(envs)
         }
 
         fn snapshot(&self, env_id: &str, if_none_match: Option<i64>) -> Result<Option<Snapshot>> {
@@ -515,5 +608,77 @@ mod tests {
         api.fail_next_write(); // first write_secrets returns 412
                                // The engine re-pulls and retries, succeeding on the second attempt.
         assert_eq!(push(&api, &store, &MASTER, &config).unwrap(), 1);
+    }
+
+    /// A real device whose vault uses the *derived* master key (not the `MASTER` constant), so the
+    /// account material is consistent with the secrets — required to test reconstruction.
+    fn real_device() -> (
+        Store,
+        [u8; 32],
+        crate::session::EmergencyKit,
+        Project,
+        Config,
+    ) {
+        let store = Store::open_in_memory().unwrap();
+        let kc = crate::keychain::MemoryKeychain::default();
+        let kit =
+            crate::session::init(&store, &kc, b"pw", std::time::Duration::from_secs(3600)).unwrap();
+        let master = *crate::session::current_master_key(&kc)
+            .unwrap()
+            .unwrap()
+            .as_bytes();
+        let project = Vault::create_project(&store, &master, "acme").unwrap();
+        let config = Config {
+            project_id: project.id.clone(),
+            project: "acme".into(),
+            environment: "dev".into(),
+        };
+        (store, master, kit, project, config)
+    }
+
+    #[test]
+    fn new_device_reconstructs_identity_environment_and_secrets() {
+        let api = MockApi::default();
+        let (store_a, master_a, kit, project, config) = real_device();
+        Vault::open(&store_a, &master_a, &project.id, "dev")
+            .unwrap()
+            .set("DATABASE_URL", b"postgres://prod")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+
+        // New device: fresh store, reconstruct identity from the server account + Emergency Kit.
+        let store_b = Store::open_in_memory().unwrap();
+        let kc_b = crate::keychain::MemoryKeychain::default();
+        let bundle = api.get_account().unwrap().unwrap();
+        let secret_key = sotto_core::format::decode_key("SK", 1, &kit.secret_key).unwrap();
+        restore_account(
+            &store_b,
+            &kc_b,
+            &bundle,
+            &secret_key,
+            b"pw",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master_b = *crate::session::current_master_key(&kc_b)
+            .unwrap()
+            .unwrap()
+            .as_bytes();
+        assert_eq!(
+            master_a, master_b,
+            "derived master key matches the original"
+        );
+
+        // Reconstruct environments (decrypting their names) and pull secrets.
+        pull_environments(&api, &store_b, &master_b, &config).unwrap();
+        pull(&api, &store_b, &config).unwrap();
+
+        // The env name was decrypted, and the secret decrypts with the reconstructed master key.
+        assert_eq!(store_b.list_environments(&project.id).unwrap(), vec!["dev"]);
+        let value = Vault::open(&store_b, &master_b, &project.id, "dev")
+            .unwrap()
+            .get("DATABASE_URL")
+            .unwrap();
+        assert_eq!(value, b"postgres://prod");
     }
 }

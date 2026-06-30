@@ -14,7 +14,8 @@ use serde::de::DeserializeOwned;
 use crate::error::{Error, Result};
 
 use super::api::{
-    AccountBundle, BatchRequest, BatchResponse, Me, NewEnvironment, NewProject, Snapshot, SyncApi,
+    AccountBundle, BatchRequest, BatchResponse, EnvironmentInfo, Me, NewEnvironment, NewProject,
+    Snapshot, SyncApi,
 };
 
 pub struct HttpClient {
@@ -132,6 +133,16 @@ impl SyncApi for HttpClient {
             .send()
             .map_err(net)?;
         ok(resp)
+    }
+
+    fn list_environments(&self, project_id: &str) -> Result<Vec<EnvironmentInfo>> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/projects/{project_id}/environments")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
     }
 
     fn snapshot(&self, env_id: &str, if_none_match: Option<i64>) -> Result<Option<Snapshot>> {

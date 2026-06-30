@@ -114,6 +114,15 @@ pub struct Snapshot {
     pub secrets: Vec<SecretEntry>,
 }
 
+/// An environment as returned by the list endpoint (used to reconstruct envs on a new device).
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnvironmentInfo {
+    pub id: String,
+    pub enc_name: String,
+    pub enc_vault_key: String,
+    pub revision: i64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Me {
     pub user_id: String,
@@ -129,6 +138,8 @@ pub trait SyncApi {
     fn get_account(&self) -> Result<Option<AccountBundle>>;
     fn create_project(&self, project: &NewProject) -> Result<()>;
     fn create_environment(&self, project_id: &str, env: &NewEnvironment) -> Result<()>;
+    /// List a project's environments (for reconstructing them on a new device).
+    fn list_environments(&self, project_id: &str) -> Result<Vec<EnvironmentInfo>>;
     /// Full snapshot, or `None` when `if_none_match` matches (server returns 304).
     fn snapshot(&self, env_id: &str, if_none_match: Option<i64>) -> Result<Option<Snapshot>>;
     /// Apply a batch atomically; returns the new revision.
