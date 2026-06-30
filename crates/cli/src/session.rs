@@ -1,7 +1,8 @@
 //! Identity setup and the unlock/lock session.
 //!
 //! - [`init`] creates the local identity: a fresh 128-bit secret key (stored in the keychain), a
-//!   KDF salt + encrypted verifier (stored in the [`Store`]), and returns the [`EmergencyKit`].
+//!   KDF salt + encrypted verifier, and the account key material (X25519 keypair + recovery key,
+//!   stored in the [`Store`]); it returns the [`EmergencyKit`] (secret key + recovery key).
 //! - [`unlock`] re-derives the master key from the password + secret key, checks it against the
 //!   verifier, and caches it.
 //! - [`current_master_key`] returns the cached master key while the session is valid; [`lock`]
@@ -12,15 +13,21 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sotto_core::{aead, format, kdf, random};
+use sotto_core::{aead, format, kdf, random, wrap};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::{Error, Result};
 use crate::keychain::Keychain;
-use crate::store::{Identity, Store};
+use crate::store::{AccountKeys, Identity, Store};
 
 /// Secret-key length, in bytes (128-bit).
 const SECRET_KEY_BYTES: usize = 16;
+/// Recovery-key length, in bytes (256-bit).
+const RECOVERY_KEY_BYTES: usize = 32;
+/// AAD binding the X25519 private key wrapped under the master key.
+const PRIVKEYS_AAD: &[u8] = b"sotto/v1/privkeys";
+/// AAD binding the master key wrapped under the recovery key.
+const RECOVERY_AAD: &[u8] = b"sotto/v1/recovery";
 /// Keychain entry holding the persistent secret key.
 const KC_SECRET_KEY: &str = "secret-key";
 /// Keychain entry holding the cached session (master key + expiry).
@@ -45,8 +52,10 @@ impl MasterKey {
 /// What a user must keep to recover access (shown once at `init`).
 #[derive(Debug, Clone)]
 pub struct EmergencyKit {
-    /// The secret key, formatted as `SK1-…`.
+    /// The secret key (second factor with the password), formatted as `SK1-…`.
     pub secret_key: String,
+    /// The recovery key (independent factor that unwraps the master key), formatted as `RK1-…`.
+    pub recovery_key: String,
 }
 
 /// Create the local identity and start an unlocked session. Errors if one already exists.
@@ -65,16 +74,32 @@ pub fn init(
     let master_key = derive(password, &secret_key, &salt)?;
 
     let enc_verifier = aead::seal(master_key.as_bytes(), VERIFIER_PLAINTEXT, VERIFIER_AAD);
+
+    // Account key material, generated at signup so a new device can reconstruct the account:
+    // an X25519 keypair (sharing) and an independent recovery key. The private key is sealed under
+    // the master key; the master key is sealed under the recovery key. The recovery key wraps the
+    // master key (it does not weaken the password+secret-key factor) and is a recovery-only factor.
+    let keypair = wrap::generate_keypair();
+    let mut recovery_key = random::bytes::<RECOVERY_KEY_BYTES>();
+    let account_keys = AccountKeys {
+        public_key: keypair.public.to_vec(),
+        enc_private_keys: wrap::wrap_key(master_key.as_bytes(), &keypair.secret, PRIVKEYS_AAD),
+        recovery_blob: wrap::wrap_key(&recovery_key, master_key.as_bytes(), RECOVERY_AAD),
+    };
+
     // Persist the secret key before marking the store initialized. If we wrote the identity row
     // first and the keychain write then failed, the store would look initialized with no
     // recoverable secret key (future `init` is rejected, `unlock` can't re-derive). Writing the
     // key first lets us roll it back if the store write fails, so a failed init leaves no
     // half-initialized state.
     keychain.set(KC_SECRET_KEY, &secret_key)?;
-    if let Err(e) = store.put_identity(&Identity {
-        kdf_salt: salt.to_vec(),
-        enc_verifier,
-    }) {
+    if let Err(e) = store.put_identity_with_keys(
+        &Identity {
+            kdf_salt: salt.to_vec(),
+            enc_verifier,
+        },
+        &account_keys,
+    ) {
         let _ = keychain.delete(KC_SECRET_KEY);
         return Err(e);
     }
@@ -82,8 +107,10 @@ pub fn init(
 
     let kit = EmergencyKit {
         secret_key: format::encode_key("SK", 1, &secret_key),
+        recovery_key: format::encode_key("RK", 1, &recovery_key),
     };
     secret_key.zeroize();
+    recovery_key.zeroize();
     Ok(kit)
 }
 
@@ -185,7 +212,32 @@ mod tests {
         let (store, kc) = setup();
         let kit = init(&store, &kc, b"correct horse battery", TTL).unwrap();
         assert!(kit.secret_key.starts_with("SK1-"));
+        assert!(kit.recovery_key.starts_with("RK1-"));
         assert!(current_master_key(&kc).unwrap().is_some());
+    }
+
+    #[test]
+    fn init_generates_consistent_account_key_material() {
+        let (store, kc) = setup();
+        let kit = init(&store, &kc, b"pw", TTL).unwrap();
+        let master = current_master_key(&kc).unwrap().unwrap();
+        let keys = store.get_account_keys().unwrap().unwrap();
+
+        // enc_private_keys unwraps (under the master key) to an X25519 secret whose public matches.
+        let secret =
+            wrap::unwrap_key(master.as_bytes(), &keys.enc_private_keys, PRIVKEYS_AAD).unwrap();
+        assert_eq!(
+            wrap::keypair_from_secret(&secret).public.to_vec(),
+            keys.public_key
+        );
+
+        // recovery_blob unwraps (under the recovery key from the kit) to the master key.
+        let recovery_key: [u8; RECOVERY_KEY_BYTES] = format::decode_key("RK", 1, &kit.recovery_key)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let recovered = wrap::unwrap_key(&recovery_key, &keys.recovery_blob, RECOVERY_AAD).unwrap();
+        assert_eq!(&recovered, master.as_bytes());
     }
 
     #[test]

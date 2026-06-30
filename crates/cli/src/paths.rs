@@ -59,6 +59,16 @@ pub fn store_path() -> Result<PathBuf> {
     Ok(store_file(&data_dir()?))
 }
 
+/// The global (secret-free) config path inside a given data directory.
+pub fn config_file(data_dir: &Path) -> PathBuf {
+    data_dir.join("config.toml")
+}
+
+/// The resolved global config path.
+pub fn config_path() -> Result<PathBuf> {
+    Ok(config_file(&data_dir()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

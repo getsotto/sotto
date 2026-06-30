@@ -17,6 +17,7 @@ use sotto_cli::dotenv;
 use sotto_cli::error::{Error, Result};
 use sotto_cli::export::{self, ExportFormat};
 use sotto_cli::keychain::{Keychain, OsKeychain};
+use sotto_cli::remote;
 use sotto_cli::session;
 use sotto_cli::store::Store;
 use sotto_cli::vault::Vault;
@@ -48,6 +49,14 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Log in to the sync server (opens a browser for OAuth).
+    Login {
+        /// The sync server URL (persisted; required on first login).
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Log out of the sync server (clear the stored session token).
+    Logout,
     /// Unlock the store for this session.
     Unlock,
     /// Lock the store (clear the cached session).
@@ -151,6 +160,12 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Init { name } => init(&store, &keychain, &cwd, name),
+        Command::Login { server } => login(&keychain, server.as_deref()),
+        Command::Logout => {
+            remote::auth::clear_session(&keychain)?;
+            eprintln!("logged out");
+            Ok(())
+        }
         Command::Unlock => {
             ensure_unlocked(&store, &keychain)?;
             eprintln!("unlocked");
@@ -244,8 +259,9 @@ fn init(store: &Store, keychain: &dyn Keychain, cwd: &Path, name: Option<String>
         password.zeroize();
         let kit = kit?;
         eprintln!();
-        eprintln!("  Save your Secret Key — it cannot be recovered:");
-        eprintln!("    {}", kit.secret_key);
+        eprintln!("  Save your Emergency Kit — these cannot be recovered:");
+        eprintln!("    Secret Key:   {}", kit.secret_key);
+        eprintln!("    Recovery Key: {}", kit.recovery_key);
         eprintln!();
     } else {
         ensure_unlocked(store, keychain)?;
@@ -265,6 +281,21 @@ fn init(store: &Store, keychain: &dyn Keychain, cwd: &Path, name: Option<String>
     };
     config.save_to(cwd)?;
     eprintln!("initialized `{}` ({})", config.project, config.environment);
+    Ok(())
+}
+
+/// Log in to the sync server via the loopback OAuth flow, then persist the session + server URL.
+fn login(keychain: &dyn Keychain, server_override: Option<&str>) -> Result<()> {
+    let config_path = sotto_cli::paths::config_path()?;
+    let server = remote::config::server_url(server_override, &config_path)?;
+    let token = remote::auth::authorize(&server)?;
+
+    // Verify the session works before persisting anything.
+    let client = remote::HttpClient::new(server.clone(), token.clone());
+    let me = remote::SyncApi::me(&client)?;
+    remote::auth::store_session(keychain, &token)?;
+    remote::config::GlobalConfig { server_url: server }.save_to(&config_path)?;
+    eprintln!("logged in (user {})", me.user_id);
     Ok(())
 }
 

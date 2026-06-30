@@ -56,6 +56,14 @@ pub enum Error {
     #[error("keychain error: {0}")]
     Keychain(String),
 
+    /// A network/transport failure talking to the server.
+    #[error("network error: {0}")]
+    Network(String),
+
+    /// The server returned an error response.
+    #[error("server error: {0}")]
+    Server(String),
+
     /// Invalid user input (bad arguments, mismatched passwords, or unsafe output).
     #[error("{0}")]
     Input(String),
@@ -68,6 +76,7 @@ impl Error {
             Error::NotFound(_) | Error::NoConfig(_) => 3,
             Error::Locked | Error::Crypto | Error::NoIdentity => 4,
             Error::Store(_) | Error::Io(_) | Error::Keychain(_) => 5,
+            Error::Network(_) | Error::Server(_) => 5,
             Error::Conflict(_) => 6,
             Error::Config(_) | Error::AlreadyInitialized | Error::Input(_) => 1,
         }
