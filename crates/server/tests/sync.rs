@@ -71,7 +71,12 @@ async fn send(app: Router, req: Request<Body>) -> (StatusCode, Option<String>, S
     (status, etag, body_text(resp).await)
 }
 
-async fn post(pool: &PgPool, token: &str, uri: &str, body: String) -> (StatusCode, Option<String>, String) {
+async fn post(
+    pool: &PgPool,
+    token: &str,
+    uri: &str,
+    body: String,
+) -> (StatusCode, Option<String>, String) {
     let req = Request::builder()
         .method("POST")
         .uri(uri)
@@ -132,12 +137,21 @@ async fn project_and_environment_lifecycle() {
     let token = fresh_session(&pool, "sync-life-u", "sync-life-s").await;
     let (proj, env) = ("sync-life-p", "sync-life-e");
 
-    assert_eq!(post(&pool, &token, "/projects", project_body(proj)).await.0, StatusCode::CREATED);
+    assert_eq!(
+        post(&pool, &token, "/projects", project_body(proj)).await.0,
+        StatusCode::CREATED
+    );
     // Idempotent re-create of one's own project.
-    assert_eq!(post(&pool, &token, "/projects", project_body(proj)).await.0, StatusCode::OK);
+    assert_eq!(
+        post(&pool, &token, "/projects", project_body(proj)).await.0,
+        StatusCode::OK
+    );
 
     let env_uri = format!("/projects/{proj}/environments");
-    assert_eq!(post(&pool, &token, &env_uri, env_body(env)).await.0, StatusCode::CREATED);
+    assert_eq!(
+        post(&pool, &token, &env_uri, env_body(env)).await.0,
+        StatusCode::CREATED
+    );
 
     let (status, _, body) = get(&pool, Some(&token), &env_uri, None).await;
     assert_eq!(status, StatusCode::OK);
@@ -145,7 +159,13 @@ async fn project_and_environment_lifecycle() {
     assert!(body.contains("\"revision\":0"));
 
     // Fresh environment snapshot: revision 0, no secrets.
-    let (status, etag, body) = get(&pool, Some(&token), &format!("/environments/{env}/secrets"), None).await;
+    let (status, etag, body) = get(
+        &pool,
+        Some(&token),
+        &format!("/environments/{env}/secrets"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(etag.as_deref(), Some("\"0\""));
     assert!(body.contains("\"revision\":0"));
@@ -161,7 +181,13 @@ async fn batch_set_then_snapshot() {
     let token = fresh_session(&pool, "sync-batch-u", "sync-batch-s").await;
     let (proj, env, secret) = ("sync-batch-p", "sync-batch-e", "sync-batch-s1");
     post(&pool, &token, "/projects", project_body(proj)).await;
-    post(&pool, &token, &format!("/projects/{proj}/environments"), env_body(env)).await;
+    post(
+        &pool,
+        &token,
+        &format!("/projects/{proj}/environments"),
+        env_body(env),
+    )
+    .await;
 
     let secrets_uri = format!("/environments/{env}/secrets");
     let (status, etag, body) = post(&pool, &token, &secrets_uri, set_body(0, secret, 1)).await;
@@ -178,11 +204,12 @@ async fn batch_set_then_snapshot() {
     assert!(body.contains("\"deleted\":false"));
 
     // History was recorded.
-    let versions: i64 = sqlx::query_scalar("SELECT count(*) FROM secret_versions WHERE secret_id = $1")
-        .bind(secret)
-        .fetch_one(&pool)
-        .await
-        .expect("count");
+    let versions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM secret_versions WHERE secret_id = $1")
+            .bind(secret)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
     assert_eq!(versions, 1);
 }
 
@@ -195,13 +222,26 @@ async fn stale_base_revision_is_rejected() {
     let token = fresh_session(&pool, "sync-stale-u", "sync-stale-s").await;
     let (proj, env) = ("sync-stale-p", "sync-stale-e");
     post(&pool, &token, "/projects", project_body(proj)).await;
-    post(&pool, &token, &format!("/projects/{proj}/environments"), env_body(env)).await;
+    post(
+        &pool,
+        &token,
+        &format!("/projects/{proj}/environments"),
+        env_body(env),
+    )
+    .await;
     let secrets_uri = format!("/environments/{env}/secrets");
 
-    assert_eq!(post(&pool, &token, &secrets_uri, set_body(0, "sync-stale-s1", 1)).await.0, StatusCode::OK);
+    assert_eq!(
+        post(&pool, &token, &secrets_uri, set_body(0, "sync-stale-s1", 1))
+            .await
+            .0,
+        StatusCode::OK
+    );
     // Revision is now 1; a write still claiming base_revision 0 is stale.
     assert_eq!(
-        post(&pool, &token, &secrets_uri, set_body(0, "sync-stale-s2", 1)).await.0,
+        post(&pool, &token, &secrets_uri, set_body(0, "sync-stale-s2", 1))
+            .await
+            .0,
         StatusCode::PRECONDITION_FAILED
     );
 }
@@ -215,7 +255,13 @@ async fn delete_tombstones_without_changing_version() {
     let token = fresh_session(&pool, "sync-del-u", "sync-del-s").await;
     let (proj, env, secret) = ("sync-del-p", "sync-del-e", "sync-del-s1");
     post(&pool, &token, "/projects", project_body(proj)).await;
-    post(&pool, &token, &format!("/projects/{proj}/environments"), env_body(env)).await;
+    post(
+        &pool,
+        &token,
+        &format!("/projects/{proj}/environments"),
+        env_body(env),
+    )
+    .await;
     let secrets_uri = format!("/environments/{env}/secrets");
 
     post(&pool, &token, &secrets_uri, set_body(0, secret, 1)).await; // rev 1
@@ -237,7 +283,13 @@ async fn snapshot_honors_if_none_match() {
     let token = fresh_session(&pool, "sync-etag-u", "sync-etag-s").await;
     let (proj, env) = ("sync-etag-p", "sync-etag-e");
     post(&pool, &token, "/projects", project_body(proj)).await;
-    post(&pool, &token, &format!("/projects/{proj}/environments"), env_body(env)).await;
+    post(
+        &pool,
+        &token,
+        &format!("/projects/{proj}/environments"),
+        env_body(env),
+    )
+    .await;
     let secrets_uri = format!("/environments/{env}/secrets");
 
     let (_, etag, _) = get(&pool, Some(&token), &secrets_uri, None).await;
@@ -255,17 +307,43 @@ async fn set_for_another_environments_secret_conflicts() {
     let token = fresh_session(&pool, "sync-xenv-u", "sync-xenv-s").await;
     let proj = "sync-xenv-p";
     post(&pool, &token, "/projects", project_body(proj)).await;
-    post(&pool, &token, &format!("/projects/{proj}/environments"), env_body("sync-xenv-a")).await;
-    post(&pool, &token, &format!("/projects/{proj}/environments"), env_body("sync-xenv-b")).await;
+    post(
+        &pool,
+        &token,
+        &format!("/projects/{proj}/environments"),
+        env_body("sync-xenv-a"),
+    )
+    .await;
+    post(
+        &pool,
+        &token,
+        &format!("/projects/{proj}/environments"),
+        env_body("sync-xenv-b"),
+    )
+    .await;
 
     let shared_secret = "sync-xenv-shared";
     assert_eq!(
-        post(&pool, &token, "/environments/sync-xenv-a/secrets", set_body(0, shared_secret, 1)).await.0,
+        post(
+            &pool,
+            &token,
+            "/environments/sync-xenv-a/secrets",
+            set_body(0, shared_secret, 1)
+        )
+        .await
+        .0,
         StatusCode::OK
     );
     // The same secret id under env B must not hijack env A's row.
     assert_eq!(
-        post(&pool, &token, "/environments/sync-xenv-b/secrets", set_body(0, shared_secret, 1)).await.0,
+        post(
+            &pool,
+            &token,
+            "/environments/sync-xenv-b/secrets",
+            set_body(0, shared_secret, 1)
+        )
+        .await
+        .0,
         StatusCode::CONFLICT
     );
     // Env B's revision was not bumped (transaction rolled back).
@@ -286,18 +364,39 @@ async fn ownership_is_enforced() {
     let intruder = fresh_session(&pool, "sync-own-b", "sync-own-b-s").await;
     let (proj, env) = ("sync-own-p", "sync-own-e");
     post(&pool, &owner, "/projects", project_body(proj)).await;
-    post(&pool, &owner, &format!("/projects/{proj}/environments"), env_body(env)).await;
+    post(
+        &pool,
+        &owner,
+        &format!("/projects/{proj}/environments"),
+        env_body(env),
+    )
+    .await;
 
     // The intruder cannot see the owner's environment snapshot.
-    let (status, _, _) = get(&pool, Some(&intruder), &format!("/environments/{env}/secrets"), None).await;
+    let (status, _, _) = get(
+        &pool,
+        Some(&intruder),
+        &format!("/environments/{env}/secrets"),
+        None,
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // …nor write to it.
-    let (status, _, _) = post(&pool, &intruder, &format!("/environments/{env}/secrets"), set_body(0, "x", 1)).await;
+    let (status, _, _) = post(
+        &pool,
+        &intruder,
+        &format!("/environments/{env}/secrets"),
+        set_body(0, "x", 1),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Clean up the second user (the first is cleaned by the next run's fresh_session).
-    sqlx::query("DELETE FROM users WHERE id = 'sync-own-a'").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM users WHERE id = 'sync-own-a'")
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -306,6 +405,14 @@ async fn auth_is_required() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    assert_eq!(get(&pool, None, "/projects", None).await.0, StatusCode::UNAUTHORIZED);
-    assert_eq!(get(&pool, None, "/environments/whatever/secrets", None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        get(&pool, None, "/projects", None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get(&pool, None, "/environments/whatever/secrets", None)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
 }

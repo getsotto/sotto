@@ -177,7 +177,11 @@ async fn write_secrets(
 }
 
 /// Upsert a secret (resurrecting a tombstone) and append a history row.
-async fn apply_set(tx: &mut Transaction<'_, Postgres>, env_id: &str, change: &Change) -> Result<()> {
+async fn apply_set(
+    tx: &mut Transaction<'_, Postgres>,
+    env_id: &str,
+    change: &Change,
+) -> Result<()> {
     if change.version < 1 {
         return Err(Error::BadRequest("set requires version >= 1".into()));
     }
