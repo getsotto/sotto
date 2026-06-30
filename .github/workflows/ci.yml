@@ -63,8 +63,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Server tests (with Postgres)
-        run: cargo test -p sotto-server
+      - name: Server + end-to-end tests (with Postgres)
+        run: cargo test -p sotto-server -p sotto-cli
 
   supply-chain:
     runs-on: ubuntu-latest

@@ -19,3 +19,23 @@ pub mod encoding;
 pub mod error;
 pub mod state;
 pub mod sync;
+
+use axum::routing::get;
+use axum::Router;
+
+use crate::state::AppState;
+
+/// Build the full application router (health + auth + account + sync) over the shared state. Shared
+/// by the binary and the end-to-end tests so they exercise the same wiring.
+pub fn app(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .merge(auth::router())
+        .merge(account::router())
+        .merge(sync::router())
+        .with_state(state)
+}
+
+async fn health() -> &'static str {
+    "ok"
+}

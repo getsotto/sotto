@@ -2547,6 +2547,7 @@ dependencies = [
 name = "sotto-cli"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "base64",
  "clap",
  "clap_complete",
@@ -2557,8 +2558,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sotto-core",
+ "sotto-server",
+ "sqlx",
  "tempfile",
  "thiserror",
+ "tokio",
  "toml",
  "uuid",
  "zeroize",
