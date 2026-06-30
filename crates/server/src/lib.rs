@@ -8,6 +8,7 @@
 //! - [`auth`] — GitHub OAuth login, sessions, and the [`auth::AuthUser`] request extractor
 //! - [`account`] — account crypto-material sync (KDF params, public key, sealed private keys, …)
 //! - [`sync`] — projects, environments, and the secret snapshot/batch hot path
+//! - [`share`] — one-time / expiring share links (the viral funnel)
 //! - [`state`] — shared application state ([`state::AppState`])
 //! - [`error`] — server error type
 
@@ -17,6 +18,7 @@ pub mod config;
 pub mod db;
 pub mod encoding;
 pub mod error;
+pub mod share;
 pub mod state;
 pub mod sync;
 
@@ -33,6 +35,7 @@ pub fn app(state: AppState) -> Router {
         .merge(auth::router())
         .merge(account::router())
         .merge(sync::router())
+        .merge(share::router())
         .with_state(state)
 }
 
