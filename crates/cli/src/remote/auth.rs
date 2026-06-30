@@ -21,9 +21,14 @@ pub fn store_session(keychain: &dyn Keychain, token: &str) -> Result<()> {
 }
 
 pub fn current_session(keychain: &dyn Keychain) -> Result<Option<String>> {
-    Ok(keychain
-        .get(KC_SERVER_SESSION)?
-        .map(|b| String::from_utf8_lossy(&b).into_owned()))
+    match keychain.get(KC_SERVER_SESSION)? {
+        // Fail loudly on corruption rather than `from_utf8_lossy`, which would silently swap in
+        // replacement chars and hand back a wrong-but-plausible bearer token.
+        Some(bytes) => Ok(Some(String::from_utf8(bytes).map_err(|_| {
+            Error::Keychain("stored session token is not valid UTF-8".into())
+        })?)),
+        None => Ok(None),
+    }
 }
 
 pub fn clear_session(keychain: &dyn Keychain) -> Result<()> {
