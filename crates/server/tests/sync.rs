@@ -392,7 +392,7 @@ async fn ownership_is_enforced() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    // Clean up the second user (the first is cleaned by the next run's fresh_session).
+    // Clean up the owner user (the intruder is cleaned by the next run's fresh_session).
     sqlx::query("DELETE FROM users WHERE id = 'sync-own-a'")
         .execute(&pool)
         .await
