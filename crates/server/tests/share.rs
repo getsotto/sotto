@@ -48,6 +48,23 @@ async fn fresh_session(pool: &PgPool, user_id: &str, subject: &str) -> String {
     session::issue(pool, user_id).await.expect("issue")
 }
 
+async fn cleanup(pool: &PgPool, user_id: &str) {
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("clean");
+}
+
+async fn share_exists(pool: &PgPool, token: &str) -> bool {
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM share_links WHERE token = $1")
+        .bind(token)
+        .fetch_one(pool)
+        .await
+        .expect("count");
+    count > 0
+}
+
 fn b64(bytes: &[u8]) -> String {
     STANDARD.encode(bytes)
 }
@@ -110,7 +127,8 @@ async fn create_fetch_then_burn() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let session = fresh_session(&pool, "share-burn-u", "share-burn-s").await;
+    let user = "share-burn-u";
+    let session = fresh_session(&pool, user, "share-burn-s").await;
 
     let (status, body) = create(&pool, &session, create_body(b"ciphertext", 1, Some(3600))).await;
     assert_eq!(status, StatusCode::CREATED);
@@ -124,10 +142,38 @@ async fn create_fetch_then_burn() {
     // …and the one-time link is now burned.
     assert_eq!(fetch(&pool, &token).await.0, StatusCode::NOT_FOUND);
 
-    sqlx::query("DELETE FROM users WHERE id = 'share-burn-u'")
+    cleanup(&pool, user).await;
+}
+
+#[tokio::test]
+async fn sweeper_purges_dead_links_but_keeps_live_ones() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let user = "share-sweep-u";
+    let session = fresh_session(&pool, user, "share-sweep-s").await;
+
+    let (_, live) = create(&pool, &session, create_body(b"live", 5, Some(3600))).await;
+    let live = token_of(&live);
+    let (_, dead) = create(&pool, &session, create_body(b"dead", 5, Some(3600))).await;
+    let dead = token_of(&dead);
+
+    // Push one link past its expiry; the sweep should reap it and spare the live one.
+    sqlx::query("UPDATE share_links SET expires_at = now() - interval '1 hour' WHERE token = $1")
+        .bind(&dead)
         .execute(&pool)
         .await
         .unwrap();
+
+    sotto_server::share::sweep_expired(&pool)
+        .await
+        .expect("sweep");
+
+    assert!(share_exists(&pool, &live).await);
+    assert!(!share_exists(&pool, &dead).await);
+
+    cleanup(&pool, user).await;
 }
 
 #[tokio::test]
@@ -136,7 +182,8 @@ async fn max_views_is_enforced() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let session = fresh_session(&pool, "share-views-u", "share-views-s").await;
+    let user = "share-views-u";
+    let session = fresh_session(&pool, user, "share-views-s").await;
     let (_, body) = create(&pool, &session, create_body(b"v", 2, None)).await;
     let token = token_of(&body);
 
@@ -144,10 +191,7 @@ async fn max_views_is_enforced() {
     assert_eq!(fetch(&pool, &token).await.0, StatusCode::OK);
     assert_eq!(fetch(&pool, &token).await.0, StatusCode::NOT_FOUND);
 
-    sqlx::query("DELETE FROM users WHERE id = 'share-views-u'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    cleanup(&pool, user).await;
 }
 
 #[tokio::test]
@@ -156,7 +200,8 @@ async fn expired_link_is_not_found() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let session = fresh_session(&pool, "share-exp-u", "share-exp-s").await;
+    let user = "share-exp-u";
+    let session = fresh_session(&pool, user, "share-exp-s").await;
     let (_, body) = create(&pool, &session, create_body(b"v", 5, Some(3600))).await;
     let token = token_of(&body);
 
@@ -168,10 +213,7 @@ async fn expired_link_is_not_found() {
         .unwrap();
     assert_eq!(fetch(&pool, &token).await.0, StatusCode::NOT_FOUND);
 
-    sqlx::query("DELETE FROM users WHERE id = 'share-exp-u'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    cleanup(&pool, user).await;
 }
 
 #[tokio::test]
@@ -180,8 +222,10 @@ async fn revoke_is_owner_only() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let owner = fresh_session(&pool, "share-rev-owner", "share-rev-owner-s").await;
-    let intruder = fresh_session(&pool, "share-rev-other", "share-rev-other-s").await;
+    let owner_id = "share-rev-owner";
+    let intruder_id = "share-rev-other";
+    let owner = fresh_session(&pool, owner_id, "share-rev-owner-s").await;
+    let intruder = fresh_session(&pool, intruder_id, "share-rev-other-s").await;
     let (_, body) = create(&pool, &owner, create_body(b"v", 5, None)).await;
     let token = token_of(&body);
 
@@ -207,10 +251,8 @@ async fn revoke_is_owner_only() {
     );
     assert_eq!(fetch(&pool, &token).await.0, StatusCode::NOT_FOUND);
 
-    sqlx::query("DELETE FROM users WHERE id IN ('share-rev-owner', 'share-rev-other')")
-        .execute(&pool)
-        .await
-        .unwrap();
+    cleanup(&pool, owner_id).await;
+    cleanup(&pool, intruder_id).await;
 }
 
 #[tokio::test]
@@ -219,7 +261,8 @@ async fn passphrase_salt_round_trips_and_create_requires_auth() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let session = fresh_session(&pool, "share-salt-u", "share-salt-s").await;
+    let user = "share-salt-u";
+    let session = fresh_session(&pool, user, "share-salt-s").await;
 
     let body = format!(
         r#"{{"enc_blob":"{}","max_views":1,"passphrase_salt":"{}"}}"#,
@@ -244,8 +287,5 @@ async fn passphrase_salt_round_trips_and_create_requires_auth() {
         StatusCode::UNAUTHORIZED
     );
 
-    sqlx::query("DELETE FROM users WHERE id = 'share-salt-u'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    cleanup(&pool, user).await;
 }

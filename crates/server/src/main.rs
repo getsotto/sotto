@@ -25,6 +25,9 @@ async fn run() -> Result<()> {
     let pool = db::connect(&config.database_url).await?;
     db::migrate(&pool).await?;
 
+    // Housekeeping: periodically purge dead share links (revoked / expired / exhausted).
+    sotto_server::share::spawn_sweeper(pool.clone());
+
     let oauth: Option<Arc<dyn OAuthProvider>> = config.oauth.as_ref().map(|o| {
         Arc::new(GithubOAuth::new(
             o.github_client_id.clone(),
