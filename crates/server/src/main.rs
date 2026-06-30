@@ -47,6 +47,7 @@ async fn run() -> Result<()> {
         .route("/health", get(health))
         .merge(auth::router())
         .merge(sotto_server::account::router())
+        .merge(sotto_server::sync::router())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)

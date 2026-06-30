@@ -40,6 +40,10 @@ pub enum Error {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// A precondition failed (e.g. a stale `base_revision` on a sync write).
+    #[error("precondition failed: {0}")]
+    Precondition(String),
+
     /// An optional feature (e.g. OAuth) is not configured on this server.
     #[error("not configured: {0}")]
     NotConfigured(String),
@@ -56,6 +60,7 @@ impl IntoResponse for Error {
             Error::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             Error::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
             Error::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
+            Error::Precondition(m) => (StatusCode::PRECONDITION_FAILED, m.clone()),
             Error::NotConfigured(m) => (StatusCode::SERVICE_UNAVAILABLE, m.clone()),
             Error::Upstream(_) => (
                 StatusCode::BAD_GATEWAY,
