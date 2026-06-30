@@ -20,6 +20,13 @@ CREATE TABLE IF NOT EXISTS identity (
     enc_verifier BLOB NOT NULL,
     created_at   INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS account_keys (
+    id               INTEGER PRIMARY KEY CHECK (id = 1),
+    public_key       BLOB NOT NULL,
+    enc_private_keys BLOB NOT NULL,
+    recovery_blob    BLOB NOT NULL,
+    created_at       INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS projects (
     id         TEXT PRIMARY KEY,
     name       TEXT NOT NULL,
@@ -110,6 +117,16 @@ pub struct Identity {
     pub enc_verifier: Vec<u8>,
 }
 
+/// Account key material — the server-opaque blobs a new device fetches after login.
+/// `public_key` is the shareable X25519 key; `enc_private_keys` is the X25519 private key sealed
+/// under the master key; `recovery_blob` is the master key sealed under the recovery key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountKeys {
+    pub public_key: Vec<u8>,
+    pub enc_private_keys: Vec<u8>,
+    pub recovery_blob: Vec<u8>,
+}
+
 /// The local SQLite store.
 pub struct Store {
     conn: Connection,
@@ -152,6 +169,48 @@ impl Store {
                     Ok(Identity {
                         kdf_salt: r.get(0)?,
                         enc_verifier: r.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Persist the identity and its account keys atomically (used by `init`): both rows land or
+    /// neither does, so a failure can't leave an identity with no key material.
+    pub fn put_identity_with_keys(&self, identity: &Identity, keys: &AccountKeys) -> Result<()> {
+        let ts = now_ms();
+        let tx = self.conn.unchecked_transaction()?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO identity (id, kdf_salt, enc_verifier, created_at)
+             VALUES (1, ?1, ?2, ?3)",
+            params![identity.kdf_salt, identity.enc_verifier, ts],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO account_keys
+                (id, public_key, enc_private_keys, recovery_blob, created_at)
+             VALUES (1, ?1, ?2, ?3, ?4)",
+            params![
+                keys.public_key,
+                keys.enc_private_keys,
+                keys.recovery_blob,
+                ts
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_account_keys(&self) -> Result<Option<AccountKeys>> {
+        self.conn
+            .query_row(
+                "SELECT public_key, enc_private_keys, recovery_blob FROM account_keys WHERE id = 1",
+                [],
+                |r| {
+                    Ok(AccountKeys {
+                        public_key: r.get(0)?,
+                        enc_private_keys: r.get(1)?,
+                        recovery_blob: r.get(2)?,
                     })
                 },
             )
@@ -436,6 +495,24 @@ mod tests {
         };
         s.put_identity(&identity).unwrap();
         assert_eq!(s.get_identity().unwrap().unwrap(), identity);
+    }
+
+    #[test]
+    fn identity_and_account_keys_persist_together() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.get_account_keys().unwrap().is_none());
+        let identity = Identity {
+            kdf_salt: b"sixteen-byte-slt".to_vec(),
+            enc_verifier: b"verifier-blob".to_vec(),
+        };
+        let keys = AccountKeys {
+            public_key: vec![1u8; 32],
+            enc_private_keys: b"sealed-privkey".to_vec(),
+            recovery_blob: b"sealed-master".to_vec(),
+        };
+        s.put_identity_with_keys(&identity, &keys).unwrap();
+        assert_eq!(s.get_identity().unwrap().unwrap(), identity);
+        assert_eq!(s.get_account_keys().unwrap().unwrap(), keys);
     }
 
     #[test]

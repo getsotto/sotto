@@ -244,8 +244,9 @@ fn init(store: &Store, keychain: &dyn Keychain, cwd: &Path, name: Option<String>
         password.zeroize();
         let kit = kit?;
         eprintln!();
-        eprintln!("  Save your Secret Key — it cannot be recovered:");
-        eprintln!("    {}", kit.secret_key);
+        eprintln!("  Save your Emergency Kit — these cannot be recovered:");
+        eprintln!("    Secret Key:   {}", kit.secret_key);
+        eprintln!("    Recovery Key: {}", kit.recovery_key);
         eprintln!();
     } else {
         ensure_unlocked(store, keychain)?;

@@ -12,6 +12,7 @@
 //! - [`paths`] — store / data-directory locations
 //! - [`error`] — CLI errors with documented exit codes
 
+pub mod account;
 pub mod commands;
 pub mod config;
 pub mod dotenv;
