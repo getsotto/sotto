@@ -1,0 +1,26 @@
+{
+  "name": "sotto-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:wasm": "wasm-pack build ../crates/wasm --target web --out-dir ../../web/src/wasm --out-name sotto_wasm",
+    "build:wasm:node": "wasm-pack build ../crates/wasm --target nodejs --out-dir ../../web/.wasm-node --out-name sotto_wasm",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run build:wasm && vite build",
+    "dev": "npm run build:wasm && vite",
+    "preview": "vite preview",
+    "smoke": "npm run build:wasm:node && node scripts/smoke.cjs"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}

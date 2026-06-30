@@ -40,6 +40,35 @@ jobs:
       - name: Cross-impl gate (native-produced vectors decrypt in WASM)
         run: wasm-pack test --node crates/wasm
 
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install web deps
+        run: npm ci
+      - name: Generate WASM bindings
+        run: npm run build:wasm
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build (vite bundle)
+        run: npx vite build
+      - name: WASM smoke (crypto core loads)
+        run: npm run smoke
+
   server:
     runs-on: ubuntu-latest
     services:
