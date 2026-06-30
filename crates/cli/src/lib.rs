@@ -20,6 +20,7 @@ pub mod error;
 pub mod export;
 pub mod keychain;
 pub mod paths;
+pub mod remote;
 pub mod session;
 pub mod store;
 pub mod vault;

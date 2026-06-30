@@ -34,6 +34,14 @@ keyring = { version = "3", features = [
 rpassword = "7"
 serde_json = "1"
 clap_complete = "4"
+# Sync client. Blocking reqwest keeps the CLI synchronous (no tokio runtime to manage); native-tls
+# matches the server (license-clean). base64 transports opaque ciphertext as JSON strings.
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "native-tls",
+] }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"
