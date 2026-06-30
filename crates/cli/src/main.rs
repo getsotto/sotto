@@ -57,6 +57,10 @@ enum Command {
     },
     /// Log out of the sync server (clear the stored session token).
     Logout,
+    /// Upload local changes for the active environment to the server.
+    Push,
+    /// Download the active environment's secrets from the server into the local store.
+    Pull,
     /// Unlock the store for this session.
     Unlock,
     /// Lock the store (clear the cached session).
@@ -164,6 +168,28 @@ fn run() -> Result<()> {
         Command::Logout => {
             remote::auth::clear_session(&keychain)?;
             eprintln!("logged out");
+            Ok(())
+        }
+        Command::Push => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            ensure_unlocked(&store, &keychain)?;
+            let master = session::current_master_key(&keychain)?.ok_or(Error::Locked)?;
+            let client = sync_client(&keychain)?;
+            let revision = remote::sync::push(&client, &store, master.as_bytes(), &config)?;
+            eprintln!(
+                "pushed {}/{} — revision {revision}",
+                config.project, config.environment
+            );
+            Ok(())
+        }
+        Command::Pull => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            let client = sync_client(&keychain)?;
+            let revision = remote::sync::pull(&client, &store, &config)?;
+            eprintln!(
+                "pulled {}/{} — revision {revision}",
+                config.project, config.environment
+            );
             Ok(())
         }
         Command::Unlock => {
@@ -282,6 +308,15 @@ fn init(store: &Store, keychain: &dyn Keychain, cwd: &Path, name: Option<String>
     config.save_to(cwd)?;
     eprintln!("initialized `{}` ({})", config.project, config.environment);
     Ok(())
+}
+
+/// Build an authenticated sync client from the configured server URL + stored session token.
+fn sync_client(keychain: &dyn Keychain) -> Result<remote::HttpClient> {
+    let config_path = sotto_cli::paths::config_path()?;
+    let server = remote::config::server_url(None, &config_path)?;
+    let token = remote::auth::current_session(keychain)?
+        .ok_or_else(|| Error::Input("not logged in; run `sotto login`".into()))?;
+    Ok(remote::HttpClient::new(server, token))
 }
 
 /// Log in to the sync server via the loopback OAuth flow, then persist the session + server URL.
