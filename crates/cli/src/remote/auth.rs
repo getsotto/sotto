@@ -5,7 +5,7 @@
 //! The pure pieces ([`authorize_url`], [`parse_callback`]) are unit-tested; the socket loop is thin.
 //! The session token is a bearer credential, so it lives in the OS keychain.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 
 use sotto_core::random;
@@ -90,20 +90,23 @@ pub fn authorize(server: &str) -> Result<String> {
 
 /// Accept exactly one loopback connection, capture the callback, and reply to the browser.
 fn accept_callback(listener: &TcpListener, expected_state: &str) -> Result<String> {
-    let (mut stream, _) = listener.accept().map_err(|e| Error::Io(e.to_string()))?;
-    let mut buf = [0u8; 4096];
-    let n = stream
-        .read(&mut buf)
+    let (stream, _) = listener.accept().map_err(|e| Error::Io(e.to_string()))?;
+    // `read()` may return the request only partially, so read just the first line: that's all we
+    // need, and `read_line` keeps reading until the newline rather than risking a truncated parse.
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    reader
+        .read_line(&mut request_line)
         .map_err(|e| Error::Io(e.to_string()))?;
-    let request = String::from_utf8_lossy(&buf[..n]);
 
     // Request line: `GET /?session=…&state=… HTTP/1.1`.
-    let target = request
+    let target = request_line
         .split_whitespace()
         .nth(1)
         .ok_or_else(|| Error::Server("malformed callback request".into()))?;
     let result = parse_callback(target, expected_state);
 
+    let mut stream = reader.into_inner();
     let (status, body) = match result {
         Ok(_) => (
             "200 OK",
