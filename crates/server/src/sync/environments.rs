@@ -49,7 +49,7 @@ async fn assert_project_owned(state: &AppState, project_id: &str, user_id: &str)
 }
 
 /// `POST /projects/{project_id}/environments` — create an environment in a project the caller owns.
-/// Idempotent on re-create of one's own id; 409 if the id is taken under a different environment.
+/// Idempotent on re-create of one's own id; 409 if the id is taken under a different project.
 async fn create_environment(
     State(state): State<AppState>,
     user: AuthUser,
