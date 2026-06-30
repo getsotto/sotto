@@ -60,10 +60,12 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: Install web deps
         run: npm ci
+      - name: Generate WASM bindings
+        run: npm run build:wasm
       - name: Typecheck
         run: npm run typecheck
-      - name: Build (wasm + vite)
-        run: npm run build
+      - name: Build (vite bundle)
+        run: npx vite build
       - name: WASM smoke (crypto core loads)
         run: npm run smoke
 
