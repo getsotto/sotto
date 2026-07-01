@@ -20,6 +20,9 @@ use std::time::Duration;
 
 use sqlx::postgres::PgConnectOptions;
 
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::Engine;
+
 use sotto_cli::config::Config;
 use sotto_cli::keychain::MemoryKeychain;
 use sotto_cli::remote::{self, HttpClient};
@@ -173,4 +176,53 @@ fn new_device_end_to_end_over_http() {
         .get("DATABASE_URL")
         .unwrap();
     assert_eq!(value, b"postgres://prod");
+}
+
+#[test]
+fn share_link_end_to_end_over_http() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    if !should_run_db_tests(&database_url) {
+        return;
+    }
+    let server = TestServer::start(&database_url);
+    let client = HttpClient::new(server.url.clone(), server.token.clone());
+
+    // Create a one-time share link, exactly as `sotto share` does.
+    let opts = remote::share::ShareOptions {
+        max_views: 1,
+        ttl_seconds: Some(3600),
+        passphrase: None,
+    };
+    let link = remote::share::create(&client, "https://app.example", b"the-secret", &opts).unwrap();
+
+    // Parse the recipient link: <web>/s/<token>#<fragment-key>.
+    let (base, fragment) = link.split_once('#').unwrap();
+    let token = base.rsplit('/').next().unwrap();
+    let fragment_key: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(fragment)
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+    // The recipient path (what the web page does): public fetch → base64-decode → decrypt.
+    let http = reqwest::blocking::Client::new();
+    let resp = http
+        .get(format!("{}/shares/{token}", server.url))
+        .send()
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body: serde_json::Value = resp.json().unwrap();
+    let enc_blob = STANDARD.decode(body["enc_blob"].as_str().unwrap()).unwrap();
+    let plaintext = sotto_core::share::open(&fragment_key, &enc_blob).unwrap();
+    assert_eq!(plaintext, b"the-secret");
+
+    // One-time: the second fetch is burned.
+    let resp2 = http
+        .get(format!("{}/shares/{token}", server.url))
+        .send()
+        .unwrap();
+    assert_eq!(resp2.status(), reqwest::StatusCode::NOT_FOUND);
 }

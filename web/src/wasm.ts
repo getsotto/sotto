@@ -4,7 +4,11 @@
 // and instantiates it. `loadWasm()` initializes on the first call and later calls await the same
 // promise; a failed init is not cached, so a subsequent call retries instead of staying broken.
 
-import init, { scheme_version } from "./wasm/sotto_wasm.js";
+import init, {
+  scheme_version,
+  share_open,
+  share_passphrase_key,
+} from "./wasm/sotto_wasm.js";
 import wasmUrl from "./wasm/sotto_wasm_bg.wasm?url";
 
 let ready: Promise<void> | null = null;
@@ -26,4 +30,4 @@ export function loadWasm(): Promise<void> {
   return pending;
 }
 
-export { scheme_version };
+export { scheme_version, share_open, share_passphrase_key };
