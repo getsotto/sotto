@@ -95,12 +95,16 @@ export function VaultView({ master, onLogout }: { master: Uint8Array; onLogout: 
 
   async function selectEnv(ne: NamedEnv) {
     setError(null);
+    setOpenEnv(null);
     setRevealed(null);
     try {
       const vaultKey = unwrapVaultKey(master, ne.env.encVaultKey, ne.env.id);
       const secrets = (await fetchSecrets(ne.env.id))
         .filter((entry) => !entry.deleted)
-        .map((entry) => ({ entry, name: decryptSecretName(vaultKey, ne.env.id, entry) }))
+        .map((entry) => ({
+          entry,
+          name: nameOr(entry.id, () => decryptSecretName(vaultKey, ne.env.id, entry)),
+        }))
         .sort((a, b) => a.name.localeCompare(b.name));
       setOpenEnv({ envId: ne.env.id, vaultKey, secrets });
     } catch (e) {
