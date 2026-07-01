@@ -3,23 +3,24 @@
 End-to-end encrypted secret sync for developer teams. Stop Slacking your `.env`.
 
 > [!WARNING]
-> Sotto is in early development. The repository currently contains milestone M0
-> scaffolding, not a working secret manager. Do not use it to protect production secrets.
+> Sotto is pre-1.0 and has **not** had a third-party cryptographic audit. It works end to end, but
+> should not yet be trusted with critical production secrets. See [SECURITY.md](SECURITY.md).
 
-Sotto is being designed around one Rust crypto implementation shared by the native CLI
-and browser clients through WebAssembly. The server will store and synchronize encrypted
-data without receiving plaintext secrets.
+Sotto is built around one Rust crypto implementation shared by the native CLI and the browser
+client through WebAssembly. The server stores and synchronizes encrypted data without ever
+receiving plaintext secrets or usable keys.
 
 ## Current status
 
-The workspace builds and tests, but most product behavior is still represented by stubs.
+The end-to-end flow works: encrypt locally, sync ciphertext, decrypt on another device or in the
+browser, and share a single secret via a one-time link.
 
-| Component | Available now | Planned |
-| --- | --- | --- |
-| Crypto core | Scheme version and format definitions | KDF, encryption, envelopes, key wrapping, and key encoding |
-| CLI | `init` and `run` command surface | Local secret management and environment injection |
-| Server | `GET /health` endpoint | Encrypted snapshot sync, grants, versioned writes, and rotation |
-| WASM | Exposes the shared scheme version | Browser encryption and decryption bindings |
+| Component | Available now |
+| --- | --- |
+| Crypto core | KDF, XChaCha20-Poly1305 AEAD + AAD, key wrapping, the environment vault hierarchy, share-link crypto, and key encoding — with native↔WASM golden vectors |
+| CLI | `init`, local secret management, `run`-style injection, `login`/`push`/`pull` sync, new-device `setup`, and `share` |
+| Server | OAuth login + sessions, account + snapshot sync (versioned writes, ETag), and share links — ciphertext only |
+| Web | Login (cookie session), in-browser unlock + vault decryption, one-time share create/receive |
 
 ## Architecture
 
@@ -60,33 +61,46 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Inspect the current CLI:
+Use the CLI locally (no server required):
 
 ```sh
 cargo run -p sotto-cli -- --help
-cargo run -p sotto-cli -- init
-cargo run -p sotto-cli -- run -- your-command --with-arguments
+cargo run -p sotto-cli -- init                 # create an identity + project; prints your Emergency Kit
+cargo run -p sotto-cli -- set DATABASE_URL     # hidden prompt
+cargo run -p sotto-cli -- run -- your-command  # inject secrets as env vars into a subprocess
 ```
 
-The commands are intentionally non-functional stubs until milestone M2.
+Secrets are encrypted at rest in a local SQLite store; the master key is cached in the OS keychain
+with a TTL. Syncing to a server (`login`/`push`/`pull`/`setup`/`share`) is optional.
 
-Run the development server:
+### Running the server
+
+The server needs Postgres (a `docker compose up -d` brings one up for local use):
 
 ```sh
-cargo run -p sotto-server
+DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto cargo run -p sotto-server
+curl http://127.0.0.1:8080/health   # → ok
 ```
 
-In another terminal, verify its health endpoint:
+GitHub OAuth login requires `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` (and, for the web client,
+`SOTTO_WEB_ORIGIN`); without them the server still serves health, sync, and share endpoints.
+
+### Web client
+
+The browser client runs the same crypto core via WebAssembly (`web/`):
 
 ```sh
-curl http://127.0.0.1:8080/health
+cd web
+npm ci
+npm run dev      # dev server (proxies the API to localhost:8080)
+npm run build    # production bundle → web/dist (strict CSP + Subresource Integrity)
 ```
 
-The response should be:
+### Deploying
 
-```text
-ok
-```
+Serve the web app and API from **one origin** (so the session cookie and CSP stay same-origin). The
+included [`Caddyfile`](Caddyfile) serves `web/dist` and reverse-proxies the API, with security
+headers; [`Dockerfile`](Dockerfile) builds the server image (migrations run on boot).
 
 ## Development checks
 
@@ -105,18 +119,22 @@ Supply-chain policy is defined in `deny.toml` and checked in CI with
 cargo deny check
 ```
 
-The WASM crate currently builds for the host as part of the workspace. The
-`wasm32-unknown-unknown` cross-build is deferred, when the `getrandom` WASM
-backend is configured.
+The cross-implementation gate proves the native and WASM builds agree — native-produced ciphertext
+decrypts byte-for-byte in WASM from shared golden vectors:
 
-The compatibility gate is native encryption and WASM decryption producing matching,
-byte-for-byte results from shared test vectors.
+```sh
+wasm-pack test --node crates/wasm
+```
+
+The web build and its dependency audit run in CI (`.github/workflows/ci.yml`).
 
 ## Security
 
-Sotto's intended security model is zero knowledge: plaintext secrets and usable
-decryption keys remain on client devices. That model is not implemented or audited yet.
-The current code must not be treated as production-ready cryptographic software.
+Sotto's model is zero-knowledge: plaintext secrets and usable decryption keys stay on client
+devices, and the server sees only ciphertext plus minimal metadata. This is implemented but **not
+yet independently audited** — see [SECURITY.md](SECURITY.md) for the model, the honest metadata
+exposure, and how the (re-fetched, weaker) web surface is hardened. Report vulnerabilities privately
+per that document.
 
 ## License
 

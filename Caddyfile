@@ -1,0 +1,43 @@
+# Sotto — same-origin deployment.
+#
+# Serves the built web app and reverse-proxies the API through ONE origin, so the session cookie
+# and CSP `connect-src 'self'` stay simple, and no CORS is needed. Caddy provisions HTTPS
+# automatically for a real domain.
+#
+#   1. Build the web app:   cd web && npm ci && npm run build     # → web/dist
+#   2. Run the API:         DATABASE_URL=… GITHUB_CLIENT_ID=… GITHUB_CLIENT_SECRET=… \
+#                           SOTTO_PUBLIC_URL=https://app.example.com \
+#                           SOTTO_WEB_ORIGIN=https://app.example.com  sotto-server
+#   3. Run Caddy:           SOTTO_DOMAIN=app.example.com SOTTO_API=127.0.0.1:8080  caddy run
+#
+# Register the GitHub OAuth app's callback as https://app.example.com/auth/github/callback (same
+# origin as the web app), matching SOTTO_PUBLIC_URL.
+
+{$SOTTO_DOMAIN:localhost} {
+	encode gzip
+
+	# The server's API endpoints (the same paths the web client and CLI call).
+	@api path /auth/github/* /auth/me /auth/logout /account /projects /projects/* /environments/* /shares /shares/*
+	handle @api {
+		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
+	}
+
+	# Everything else is the SPA, including client-side routes (/, /s/:token, /auth/callback).
+	handle {
+		root * ./web/dist
+		try_files {path} /index.html
+		file_server
+	}
+
+	# Defense-in-depth headers. The CSP is also baked into index.html (build-time) as a fallback for
+	# hosts that don't set headers; the header here is authoritative when present.
+	header {
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+		Cross-Origin-Opener-Policy "same-origin"
+		-Server
+	}
+}
