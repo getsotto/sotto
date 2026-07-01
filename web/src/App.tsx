@@ -1,27 +1,20 @@
-import { useEffect, useState } from "react";
+import { Home } from "./Home";
+import { RecipientPage } from "./RecipientPage";
 
-import { loadWasm, scheme_version } from "./wasm";
+// Minimal path routing (no router dependency): `/s/:token` is the share recipient page.
+function route(): { name: "recipient"; token: string } | { name: "home" } {
+  const match = /^\/s\/([^/]+)$/.exec(window.location.pathname);
+  if (match) {
+    return { name: "recipient", token: decodeURIComponent(match[1]) };
+  }
+  return { name: "home" };
+}
 
 export function App() {
-  const [version, setVersion] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    loadWasm()
-      .then(() => setVersion(scheme_version()))
-      .catch((e: unknown) => setError(String(e)));
-  }, []);
-
-  return (
-    <main>
-      <h1>Sotto</h1>
-      {error !== null ? (
-        <p>Failed to load the crypto core: {error}</p>
-      ) : version !== null ? (
-        <p>Crypto core loaded — scheme v{version}.</p>
-      ) : (
-        <p>Loading crypto core…</p>
-      )}
-    </main>
+  const current = route();
+  return current.name === "recipient" ? (
+    <RecipientPage token={current.token} />
+  ) : (
+    <Home />
   );
 }

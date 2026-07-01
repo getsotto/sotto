@@ -33,4 +33,11 @@ function cspPlugin(): Plugin {
 export default defineConfig({
   plugins: [react(), cspPlugin()],
   build: { target: "es2022" },
+  // Dev only: proxy the API so the browser talks to a single origin (keeps CSP `connect-src
+  // 'self'`). Production serves the web app and API from the same origin (a reverse proxy).
+  server: {
+    proxy: {
+      "/shares": { target: "http://localhost:8080", changeOrigin: true },
+    },
+  },
 });
