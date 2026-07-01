@@ -82,8 +82,12 @@ DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto cargo run -p sotto-serv
 curl http://127.0.0.1:8080/health   # → ok
 ```
 
-GitHub OAuth login requires `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` (and, for the web client,
-`SOTTO_WEB_ORIGIN`); without them the server still serves health, sync, and share endpoints.
+GitHub OAuth login requires `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`. For any non-local
+deployment also set `SOTTO_PUBLIC_URL` to the server's externally reachable origin — it builds the
+GitHub callback URL and must match the OAuth app's registered callback (it otherwise defaults to
+`http://localhost:8080`) — and, for the web client, `SOTTO_WEB_ORIGIN`. Without OAuth the server
+still boots (serving `/health` and running migrations), but login and every authenticated endpoint
+(sync, share creation) are unavailable.
 
 ### Web client
 
