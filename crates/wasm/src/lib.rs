@@ -186,3 +186,10 @@ pub fn vault_decrypt_value(
     )
     .map_err(|e| JsError::new(&e.to_string()))
 }
+
+/// Decode a human key string (e.g. a pasted `SK1-…` secret key) to its raw bytes, verifying the
+/// prefix, version, and checksum.
+#[wasm_bindgen]
+pub fn format_decode_key(prefix: &str, version: u8, s: &str) -> Result<Vec<u8>, JsError> {
+    sotto_core::format::decode_key(prefix, version, s).map_err(|e| JsError::new(&e.to_string()))
+}

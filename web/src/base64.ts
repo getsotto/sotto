@@ -17,3 +17,15 @@ export function urlSafeB64ToBytes(b64url: string): Uint8Array {
   }
   return standardB64ToBytes(b64);
 }
+
+export function bytesToStandardB64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const b of bytes) {
+    binary += String.fromCharCode(b);
+  }
+  return btoa(binary);
+}
+
+export function bytesToUrlSafeB64(bytes: Uint8Array): string {
+  return bytesToStandardB64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
