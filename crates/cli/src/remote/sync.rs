@@ -34,10 +34,42 @@ pub fn pull(api: &dyn SyncApi, store: &Store, config: &Config) -> Result<i64> {
     match api.snapshot(&env.id, Some(base))? {
         None => Ok(base), // 304 Not Modified
         Some(snapshot) => {
-            apply_snapshot(store, &env.id, &snapshot)?;
+            // An org env may have been rotated: if our grant changed, adopt the new vault key and
+            // force-refresh the rewrapped data keys (they keep the old versions the gate would skip).
+            let rotated =
+                config.org_id.is_some() && adopt_rotation(api, store, &env.id, &env.enc_vault_key)?;
+            apply_snapshot(store, &env.id, &snapshot, rotated)?;
             store.set_synced_revision(&env.id, snapshot.revision)?;
             Ok(snapshot.revision)
         }
+    }
+}
+
+/// If our grant for `env_id` changed on the server (a key rotation), store the new grant locally and
+/// return `true` so the caller force-refreshes the rewrapped data keys. `false` when the grant is
+/// unchanged or absent.
+fn adopt_rotation(
+    api: &dyn SyncApi,
+    store: &Store,
+    env_id: &str,
+    local_grant: &[u8],
+) -> Result<bool> {
+    let Some(grant_b64) = api.get_grant(env_id)? else {
+        return Ok(false);
+    };
+    let grant = b64decode(&grant_b64)?;
+    if grant == local_grant {
+        return Ok(false);
+    }
+    store.update_env_vault_key(env_id, &grant)?;
+    Ok(true)
+}
+
+/// Whether our grant for `env_id` differs from `local_grant` (without adopting it).
+fn grant_changed(api: &dyn SyncApi, env_id: &str, local_grant: &[u8]) -> Result<bool> {
+    match api.get_grant(env_id)? {
+        Some(grant_b64) => Ok(b64decode(&grant_b64)? != local_grant),
+        None => Ok(false),
     }
 }
 
@@ -57,12 +89,24 @@ pub fn push(api: &dyn SyncApi, store: &Store, master: &[u8; 32], config: &Config
         let snapshot = api
             .snapshot(&env.id, None)?
             .ok_or_else(|| Error::Server("server returned no snapshot".into()))?;
-        apply_snapshot(store, &env.id, &snapshot)?;
+        apply_snapshot(store, &env.id, &snapshot, false)?;
         store.set_synced_revision(&env.id, snapshot.revision)?;
 
         let changes = diff(store, &env.id, &snapshot)?;
         if changes.is_empty() {
+            // Nothing to push. Adopt a rotation if one happened, so our local key stays current.
+            if config.org_id.is_some() && adopt_rotation(api, store, &env.id, &env.enc_vault_key)? {
+                apply_snapshot(store, &env.id, &snapshot, true)?;
+            }
             return Ok(snapshot.revision);
+        }
+
+        // We have local changes. If the env was rotated, they're encrypted under the old vault key —
+        // refuse rather than upload data the team can no longer decrypt.
+        if config.org_id.is_some() && grant_changed(api, &env.id, &env.enc_vault_key)? {
+            return Err(Error::Conflict(
+                "environment was rotated; run `sotto pull` and re-apply your changes".into(),
+            ));
         }
 
         let batch = BatchRequest {
@@ -155,17 +199,20 @@ fn tolerate_org_forbidden(res: Result<()>, org_id: Option<&str>) -> Result<()> {
 }
 
 /// Apply a server snapshot to the local store: server wins on a strictly newer version, or on an
-/// equal-version tombstone the server introduced.
-fn apply_snapshot(store: &Store, env_id: &str, snapshot: &Snapshot) -> Result<()> {
+/// equal-version tombstone the server introduced. `force` overrides the version gate to overwrite
+/// every secret — used after a key rotation, where the data keys were rewrapped in place (same
+/// version) and would otherwise be missed.
+fn apply_snapshot(store: &Store, env_id: &str, snapshot: &Snapshot, force: bool) -> Result<()> {
     for remote in &snapshot.secrets {
         let local = store.find_secret(env_id, &remote.id)?;
-        let apply = match &local {
-            None => true,
-            Some(local) => {
-                remote.version > local.version
-                    || (remote.version == local.version && remote.deleted && !local.deleted)
-            }
-        };
+        let apply = force
+            || match &local {
+                None => true,
+                Some(local) => {
+                    remote.version > local.version
+                        || (remote.version == local.version && remote.deleted && !local.deleted)
+                }
+            };
         if apply {
             store.put_remote_secret(
                 env_id,
@@ -429,17 +476,23 @@ mod tests {
         }
 
         fn create_environment(&self, project_id: &str, env: &NewEnvironment) -> Result<()> {
-            self.state
-                .borrow_mut()
-                .envs
-                .entry(env.id.clone())
-                .or_insert(EnvState {
-                    project_id: project_id.to_string(),
-                    enc_name: env.enc_name.clone(),
-                    enc_vault_key: env.enc_vault_key.clone(),
-                    revision: 0,
-                    secrets: HashMap::new(),
-                });
+            let me = self.current_user();
+            let mut s = self.state.borrow_mut();
+            if !s.envs.contains_key(&env.id) {
+                s.envs.insert(
+                    env.id.clone(),
+                    EnvState {
+                        project_id: project_id.to_string(),
+                        enc_name: env.enc_name.clone(),
+                        enc_vault_key: env.enc_vault_key.clone(),
+                        revision: 0,
+                        secrets: HashMap::new(),
+                    },
+                );
+                // Mirror the server: env creation records the creator's own grant.
+                s.grants
+                    .insert((env.id.clone(), me), env.enc_vault_key.clone());
+            }
             Ok(())
         }
 
@@ -652,6 +705,79 @@ mod tests {
                 .grants
                 .get(&(env_id.to_string(), me))
                 .cloned())
+        }
+
+        fn list_grant_holders(&self, env_id: &str) -> Result<Vec<String>> {
+            let s = self.state.borrow();
+            let mut holders: Vec<String> = s
+                .grants
+                .keys()
+                .filter(|(e, _)| e == env_id)
+                .map(|(_, u)| u.clone())
+                .collect();
+            holders.sort();
+            Ok(holders)
+        }
+
+        fn member_env_grants(&self, _org_id: &str, user_id: &str) -> Result<Vec<String>> {
+            let s = self.state.borrow();
+            let mut envs: Vec<String> = s
+                .grants
+                .keys()
+                .filter(|(_, u)| u == user_id)
+                .map(|(e, _)| e.clone())
+                .collect();
+            envs.sort();
+            envs.dedup();
+            Ok(envs)
+        }
+
+        fn rotate(
+            &self,
+            env_id: &str,
+            req: &super::super::api::RotateRequest,
+        ) -> Result<super::super::api::RotateResponse> {
+            let me = self.current_user();
+            let mut s = self.state.borrow_mut();
+            let new_rev = {
+                let env = s
+                    .envs
+                    .get_mut(env_id)
+                    .ok_or_else(|| Error::NotFound("environment not found".into()))?;
+                if req.base_revision != env.revision {
+                    return Err(Error::Conflict("stale base_revision".into()));
+                }
+                for dk in &req.data_keys {
+                    if let Some(sec) = env.secrets.get_mut(&dk.secret_id) {
+                        sec.enc_data_key = b64decode(&dk.enc_data_key)?;
+                    }
+                }
+                env.revision += 1;
+                env.revision
+            };
+            // Replace the env's grant set wholesale, as the server does.
+            s.grants.retain(|(e, _), _| e != env_id);
+            for g in &req.grants {
+                s.grants.insert(
+                    (env_id.to_string(), g.user_id.clone()),
+                    g.enc_vault_key.clone(),
+                );
+            }
+            // Point the inline vault key at the caller's new grant.
+            if let Some(mine) = req.grants.iter().find(|g| g.user_id == me) {
+                if let Some(env) = s.envs.get_mut(env_id) {
+                    env.enc_vault_key = mine.enc_vault_key.clone();
+                }
+            }
+            Ok(super::super::api::RotateResponse { revision: new_rev })
+        }
+
+        fn remove_member(&self, org_id: &str, user_id: &str) -> Result<()> {
+            let mut s = self.state.borrow_mut();
+            if let Some(org) = s.orgs.get_mut(org_id) {
+                org.members.remove(user_id);
+            }
+            Ok(())
         }
     }
 
@@ -963,6 +1089,84 @@ mod tests {
             Some(&org_id)
         )
         .is_err());
+    }
+
+    #[test]
+    fn removing_a_member_rotates_the_env_and_locks_out_their_cached_key() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        // Alice (a real device) and Bob (a teammate) both have registered public keys.
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+
+        // Alice sets up the org + shared env and gives Bob a grant; Bob clones and reads.
+        let org_id = team::create_org(&api, &master_a, "acme").unwrap();
+        team::invite(&api, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        api.as_user("bob-user");
+        let store_b = Store::open_in_memory().unwrap();
+        let bob_config = team::clone_env(
+            &api,
+            &store_b,
+            &bob,
+            &project.id,
+            &env_id,
+            "acme",
+            "dev",
+            Some(&org_id),
+        )
+        .unwrap();
+        assert_eq!(
+            Vault::open(&store_b, &bob, &project.id, "dev")
+                .unwrap()
+                .get("API_KEY")
+                .unwrap(),
+            b"s3cr3t"
+        );
+
+        // Alice removes Bob (rotating the env), adopts the new key via pull, and writes a new secret.
+        api.as_user("test-user");
+        let report = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap();
+        assert_eq!(report.rotated, vec![env_id.clone()]);
+        pull(&api, &store_a, &config).unwrap();
+        assert_eq!(
+            Vault::open(&store_a, &alice, &project.id, "dev")
+                .unwrap()
+                .get("API_KEY")
+                .unwrap(),
+            b"s3cr3t",
+            "a remaining member still reads the rewrapped secret"
+        );
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("POST_ROTATION", b"new-write")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+
+        // Bob's grant is gone, and his cached old vault key can't read the post-rotation write.
+        api.as_user("bob-user");
+        assert!(api.get_grant(&env_id).unwrap().is_none());
+        pull(&api, &store_b, &bob_config).unwrap();
+        let bob_vault = Vault::open(&store_b, &bob, &project.id, "dev").unwrap();
+        assert_eq!(bob_vault.get("API_KEY").unwrap(), b"s3cr3t"); // what he already had
+        assert!(
+            bob_vault.get("POST_ROTATION").is_err(),
+            "the removed member's old key must not decrypt writes made after rotation"
+        );
     }
 
     // Uses the full MockApi (which stores uploaded share blobs) to exercise share creation.

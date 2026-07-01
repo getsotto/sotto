@@ -30,7 +30,10 @@ use crate::sync::MAX_ENC_KEY;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/environments/{env_id}/grants", post(create_grant))
+        .route(
+            "/environments/{env_id}/grants",
+            post(create_grant).get(list_grant_holders),
+        )
         .route("/environments/{env_id}/grant", get(get_grant))
         .route("/environments/{env_id}/rotate", post(rotate))
 }
@@ -46,6 +49,37 @@ struct CreateGrant {
 #[derive(Serialize)]
 struct GrantView {
     enc_vault_key: String,
+}
+
+#[derive(Serialize)]
+struct GrantHolder {
+    user_id: String,
+}
+
+/// `GET /environments/{env_id}/grants` — the user ids currently granted this environment (admin+),
+/// so a rotation knows who to re-grant.
+async fn list_grant_holders(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(env_id): Path<String>,
+) -> Result<Json<Vec<GrantHolder>>> {
+    let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
+    if !access.can_manage_structure() {
+        return Err(Error::Forbidden(
+            "must be an admin or owner to list grant holders".into(),
+        ));
+    }
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT user_id FROM environment_grants WHERE env_id = $1 ORDER BY user_id",
+    )
+    .bind(&env_id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|user_id| GrantHolder { user_id })
+            .collect(),
+    ))
 }
 
 /// `POST /environments/{env_id}/grants` — share an environment by storing a grant for a member.

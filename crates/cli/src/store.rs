@@ -328,6 +328,18 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Replace an environment's stored vault-key grant (used when adopting a server-side rotation).
+    pub fn update_env_vault_key(&self, env_id: &str, enc_vault_key: &[u8]) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE environments SET enc_vault_key = ?2 WHERE id = ?1",
+            params![env_id, enc_vault_key],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(env_id.to_string()));
+        }
+        Ok(())
+    }
+
     pub fn list_environments(&self, project_id: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn

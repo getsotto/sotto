@@ -74,6 +74,33 @@ pub struct GrantView {
     pub enc_vault_key: String,
 }
 
+/// One recipient's new grant in a rotation (the new vault key sealed to their public key).
+#[derive(Debug, Clone, Serialize)]
+pub struct GrantEntry {
+    pub user_id: String,
+    pub enc_vault_key: String,
+}
+
+/// One secret's data key, rewrapped under the new vault key, in a rotation.
+#[derive(Debug, Clone, Serialize)]
+pub struct DataKeyEntry {
+    pub secret_id: String,
+    pub enc_data_key: String,
+}
+
+/// A rotation request: rewrapped data keys + the replacement grant set, at a base revision.
+#[derive(Debug, Clone, Serialize)]
+pub struct RotateRequest {
+    pub base_revision: i64,
+    pub grants: Vec<GrantEntry>,
+    pub data_keys: Vec<DataKeyEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RotateResponse {
+    pub revision: i64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NewEnvironment {
     pub id: String,
@@ -218,6 +245,14 @@ pub trait SyncApi {
     fn create_grant(&self, env_id: &str, user_id: &str, enc_vault_key: &str) -> Result<()>;
     /// Fetch the caller's own vault-key grant for an environment, or `None` if they have none.
     fn get_grant(&self, env_id: &str) -> Result<Option<String>>;
+    /// The user ids currently granted an environment (for planning a rotation's re-grants).
+    fn list_grant_holders(&self, env_id: &str) -> Result<Vec<String>>;
+    /// The ids of an org's environments that `user_id` holds a grant to (for removal-time rotation).
+    fn member_env_grants(&self, org_id: &str, user_id: &str) -> Result<Vec<String>>;
+    /// Rotate an environment's vault key (rewrapped data keys + replacement grants); new revision.
+    fn rotate(&self, env_id: &str, req: &RotateRequest) -> Result<RotateResponse>;
+    /// Remove a member from an org (revokes their API access).
+    fn remove_member(&self, org_id: &str, user_id: &str) -> Result<()>;
 }
 
 #[cfg(test)]

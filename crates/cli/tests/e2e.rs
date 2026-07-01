@@ -226,12 +226,13 @@ fn share_link_end_to_end_over_http() {
     assert_eq!(resp2.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
-/// The full team-sharing loop over real HTTP: Alice creates an org + org-owned project, invites Bob
-/// by email, and shares an environment; Bob (a distinct user + session) fetches his grant, clones
-/// the environment, and decrypts the same secret. Exercises the CLI's org/invite/grant HTTP methods
-/// and the cross-user crypto against the real server + Postgres.
+/// The full team lifecycle over real HTTP: Alice creates an org + org-owned project, invites Bob by
+/// email, and shares an environment; Bob (a distinct user + session) clones it and decrypts the same
+/// secret, and writes back. Then Alice removes Bob — which rotates the environment's vault key — and
+/// Bob's access and grant are both gone while Alice keeps working under the new key. Exercises the
+/// CLI's org/invite/grant/rotate HTTP methods and the cross-user crypto against the real server.
 #[test]
-fn env_sharing_end_to_end_over_http() {
+fn env_sharing_and_removal_end_to_end_over_http() {
     let Ok(database_url) = std::env::var("DATABASE_URL") else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
@@ -365,4 +366,32 @@ fn env_sharing_end_to_end_over_http() {
             .unwrap(),
         b"from-bob"
     );
+
+    // --- Alice removes Bob, which rotates the shared env before dropping his membership. ---
+    let report =
+        remote::team::remove_member(&alice, &keypair_a, &org_id, &invited.user_id).unwrap();
+    assert_eq!(
+        report.rotated,
+        vec![env_id.clone()],
+        "the shared env was rotated on removal"
+    );
+
+    // Alice adopts the new vault key, still reads the rewrapped secrets, and writes under the new key.
+    remote::sync::pull(&alice, &store_a, &config).unwrap();
+    assert_eq!(
+        Vault::open(&store_a, &keypair_a, &project.id, "dev")
+            .unwrap()
+            .get("API_KEY")
+            .unwrap(),
+        b"s3cr3t"
+    );
+    Vault::open(&store_a, &keypair_a, &project.id, "dev")
+        .unwrap()
+        .set("ROTATED_KEY", b"after")
+        .unwrap();
+    remote::sync::push(&alice, &store_a, &master_a, &config).unwrap();
+
+    // Bob's access and grant are both gone: he can neither fetch his grant nor pull the env.
+    assert!(bob.get_grant(&env_id).unwrap().is_none());
+    assert!(remote::sync::pull(&bob, &store_b, &bob_config).is_err());
 }
