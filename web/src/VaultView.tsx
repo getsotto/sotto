@@ -106,7 +106,9 @@ export function VaultView({
     setOpenEnv(null);
     setRevealed(null);
     try {
-      const vaultKey = openEnvGrant(master, encPrivateKeys, ne.env.encVaultKey);
+      // encVaultKey now stores a vault-key grant (sealed to the account key), not a master-wrapped key.
+      const grant = ne.env.encVaultKey;
+      const vaultKey = openEnvGrant(master, encPrivateKeys, grant);
       const secrets = (await fetchSecrets(ne.env.id))
         .filter((entry) => !entry.deleted)
         .map((entry) => ({
