@@ -116,8 +116,13 @@ export function VaultView({ master, onLogout }: { master: Uint8Array; onLogout: 
     if (openEnv === null) {
       return;
     }
-    const value = decryptSecretValue(openEnv.vaultKey, openEnv.envId, ns.entry);
-    setRevealed({ name: ns.name, value, link: null });
+    setError(null);
+    try {
+      const value = decryptSecretValue(openEnv.vaultKey, openEnv.envId, ns.entry);
+      setRevealed({ name: ns.name, value, link: null });
+    } catch (e) {
+      setError(message(e));
+    }
   }
 
   async function share(current: Revealed) {
