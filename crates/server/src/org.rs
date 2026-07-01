@@ -330,7 +330,7 @@ async fn add_member(
             "user is already a member; use update to change their role".into(),
         )),
         // The user_id has no matching users row.
-        Err(e) if is_fk_violation(&e) => Err(Error::NotFound("user not found".into())),
+        Err(e) if is_user_fk_violation(&e) => Err(Error::NotFound("user not found".into())),
         Err(e) => Err(e.into()),
     }
 }
@@ -411,8 +411,16 @@ async fn remove_member(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn is_fk_violation(e: &sqlx::Error) -> bool {
-    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23503"))
+/// True only for the `user_id` foreign-key violation — the referenced user does not exist. Scoped
+/// to that one constraint by name so an unrelated FK failure (e.g. a racing org deletion breaking
+/// the `org_id` reference) isn't misreported as "user not found".
+fn is_user_fk_violation(e: &sqlx::Error) -> bool {
+    matches!(
+        e,
+        sqlx::Error::Database(db)
+            if db.code().as_deref() == Some("23503")
+                && db.constraint() == Some("organization_memberships_user_fk")
+    )
 }
 
 #[cfg(test)]

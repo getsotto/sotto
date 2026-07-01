@@ -19,7 +19,10 @@ CREATE TABLE IF NOT EXISTS organizations (
 
 CREATE TABLE IF NOT EXISTS organization_memberships (
     org_id     TEXT NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,
-    user_id    TEXT NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    -- Named so add_member can tell "the referenced user does not exist" apart from any other FK
+    -- failure and answer 404 only for that case.
+    user_id    TEXT NOT NULL
+        CONSTRAINT organization_memberships_user_fk REFERENCES users (id) ON DELETE CASCADE,
     -- Enforced in SQL as a backstop to the application's `Role` enum, so a bad write can't slip in.
     role       TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
