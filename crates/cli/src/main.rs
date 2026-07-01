@@ -54,9 +54,26 @@ enum Command {
         /// The sync server URL (persisted; required on first login).
         #[arg(long)]
         server: Option<String>,
+        /// The web app origin, for building share links (defaults to the server URL).
+        #[arg(long)]
+        web: Option<String>,
     },
     /// Log out of the sync server (clear the stored session token).
     Logout,
+    /// Create a one-time / expiring share link for a secret and print it.
+    Share {
+        /// The secret name to share.
+        name: String,
+        /// How many times the link may be viewed before it burns.
+        #[arg(long, default_value_t = 1)]
+        views: i32,
+        /// Link lifetime in seconds (default: no expiry).
+        #[arg(long)]
+        expire: Option<i64>,
+        /// Protect the link with a passphrase (prompted; a second factor beyond the link).
+        #[arg(long)]
+        passphrase: bool,
+    },
     /// Upload local changes for the active environment to the server.
     Push,
     /// Download the active environment's secrets from the server into the local store.
@@ -166,11 +183,21 @@ fn run() -> Result<()> {
 
     match cli.command {
         Command::Init { name } => init(&store, &keychain, &cwd, name),
-        Command::Login { server } => login(&keychain, server.as_deref()),
+        Command::Login { server, web } => login(&keychain, server.as_deref(), web.as_deref()),
         Command::Logout => {
             remote::auth::clear_session(&keychain)?;
             eprintln!("logged out");
             Ok(())
+        }
+        Command::Share {
+            name,
+            views,
+            expire,
+            passphrase,
+        } => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            ensure_unlocked(&store, &keychain)?;
+            share(&app, &keychain, &config, &name, views, expire, passphrase)
         }
         Command::Push => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
@@ -375,7 +402,11 @@ fn sync_client(keychain: &dyn Keychain) -> Result<remote::HttpClient> {
 }
 
 /// Log in to the sync server via the loopback OAuth flow, then persist the session + server URL.
-fn login(keychain: &dyn Keychain, server_override: Option<&str>) -> Result<()> {
+fn login(
+    keychain: &dyn Keychain,
+    server_override: Option<&str>,
+    web_override: Option<&str>,
+) -> Result<()> {
     let config_path = sotto_cli::paths::config_path()?;
     let server = remote::config::server_url(server_override, &config_path)?;
     let token = remote::auth::authorize(&server)?;
@@ -384,9 +415,68 @@ fn login(keychain: &dyn Keychain, server_override: Option<&str>) -> Result<()> {
     let client = remote::HttpClient::new(server.clone(), token.clone());
     let me = remote::SyncApi::me(&client)?;
     remote::auth::store_session(keychain, &token)?;
-    remote::config::GlobalConfig { server_url: server }.save_to(&config_path)?;
+
+    // Preserve a previously configured web URL unless this login overrides it.
+    let existing_web =
+        remote::config::GlobalConfig::load_from(&config_path)?.and_then(|c| c.web_url);
+    let web_url = web_override
+        .map(|w| w.trim_end_matches('/').to_string())
+        .or(existing_web);
+    remote::config::GlobalConfig {
+        server_url: server,
+        web_url,
+    }
+    .save_to(&config_path)?;
     eprintln!("logged in (user {})", me.user_id);
     Ok(())
+}
+
+/// Seal a secret, upload it as a share link, and print the link (the fragment key never leaves).
+fn share(
+    app: &App,
+    keychain: &dyn Keychain,
+    config: &Config,
+    name: &str,
+    views: i32,
+    expire: Option<i64>,
+    passphrase: bool,
+) -> Result<()> {
+    let mut value = app.get(config, name)?;
+    let client = sync_client(keychain)?;
+    let web_base = remote::config::web_base(&sotto_cli::paths::config_path()?)?;
+
+    let passphrase = if passphrase {
+        Some(read_share_passphrase()?)
+    } else {
+        None
+    };
+    let opts = remote::share::ShareOptions {
+        max_views: views,
+        ttl_seconds: expire,
+        passphrase,
+    };
+    let result = remote::share::create(&client, &web_base, &value, &opts);
+    value.zeroize();
+    if let Some(mut passphrase) = opts.passphrase {
+        passphrase.zeroize();
+    }
+    let link = result?;
+
+    eprintln!(
+        "share link ({}/{}) — burns after {views} view(s):",
+        config.project, config.environment
+    );
+    println!("{link}");
+    Ok(())
+}
+
+/// Read a share passphrase from a hidden prompt (never `SOTTO_PASSWORD`, which is the master).
+fn read_share_passphrase() -> Result<Vec<u8>> {
+    eprint!("Passphrase for the link: ");
+    io::stderr().flush().ok();
+    rpassword::read_password()
+        .map(String::into_bytes)
+        .map_err(|e| Error::Io(e.to_string()))
 }
 
 fn status(app: &App, cwd: &Path, json: bool) -> Result<()> {

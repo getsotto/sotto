@@ -128,6 +128,24 @@ pub struct Me {
     pub user_id: String,
 }
 
+/// A share link to create: the sealed blob + limits. `enc_blob`/`passphrase_salt` are base64.
+#[derive(Debug, Clone, Serialize)]
+pub struct NewShare {
+    pub enc_blob: String,
+    pub max_views: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub passphrase_salt: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreatedShare {
+    pub token: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
 /// The server operations the sync engine needs, abstracted for testability.
 pub trait SyncApi {
     /// Verify the session and return the authenticated user.
@@ -144,6 +162,8 @@ pub trait SyncApi {
     fn snapshot(&self, env_id: &str, if_none_match: Option<i64>) -> Result<Option<Snapshot>>;
     /// Apply a batch atomically; returns the new revision.
     fn write_secrets(&self, env_id: &str, batch: &BatchRequest) -> Result<BatchResponse>;
+    /// Create a share link; returns the public token.
+    fn create_share(&self, share: &NewShare) -> Result<CreatedShare>;
 }
 
 #[cfg(test)]

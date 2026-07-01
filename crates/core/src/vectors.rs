@@ -12,7 +12,7 @@
 //!
 //! Regenerate with `cargo run -p sotto-core --example gen_vectors`.
 
-use crate::{aead, format, kdf, wrap};
+use crate::{aead, format, kdf, share, wrap};
 
 const SUBKEY_HEX: &str = "a9c378fc08287281b23194842d223fd52f349c259d1c756ce31953ba9a1eb051";
 const CROCKFORD: &str = "000G40R40M30E209185GR38E1W";
@@ -26,6 +26,10 @@ const AEAD_ENV_HEX: &str = "010108afaabde244213e347b8b70d4fcfc922a0f695b3e4a7bd1
 const SB_SECRET_HEX: &str = "5755ecb1a6b3fa4e4bd3232678a440dcb3ca8ef1408e40fa8a5c346cf18c78ec";
 const SB_PT: &[u8] = b"vault-key-material-here-32-bytes!";
 const SB_SEALED_HEX: &str = "f97cfa5aa9fa49c213b6d308697a1fece85ab9d9663cc5303bcf75baf17f1358a103c315299a03918fbbdadec9516ae1afaaef59215a9950b9dfa89de041de637ca58e07426f06f69713532d9fcc4acccb";
+
+const SHARE_KEY: [u8; 32] = [0x33; 32];
+const SHARE_PT: &[u8] = b"share-secret-value";
+const SHARE_ENV_HEX: &str = "01012d36369a6771d17a1499ea93651931075e9ab1606c38e20c0885df13bc7508aa4e6dadaf7173b4d4c03bffb2aa81b7eb51333ed415acee97f59d";
 
 /// Decode a hex string to bytes. Panics on malformed input (vector helper).
 fn unhex(s: &str) -> Vec<u8> {
@@ -59,6 +63,16 @@ pub fn verify_cross_impl() -> Result<(), &'static str> {
     let opened = wrap::open_sealed(&kp, &unhex(SB_SEALED_HEX)).map_err(|_| "sealed open")?;
     if opened.as_slice() != SB_PT {
         return Err("sealed plaintext mismatch");
+    }
+
+    // Share envelope: native-produced, opens in every build; bound to the share AAD.
+    let share_env = unhex(SHARE_ENV_HEX);
+    let sp = share::open(&SHARE_KEY, &share_env).map_err(|_| "share open")?;
+    if sp.as_slice() != SHARE_PT {
+        return Err("share plaintext mismatch");
+    }
+    if aead::open(&SHARE_KEY, &share_env, b"sotto/v1/other").is_ok() {
+        return Err("share aad not enforced");
     }
 
     // Deterministic key derivation (BLAKE2b).

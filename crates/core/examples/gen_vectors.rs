@@ -5,7 +5,7 @@
 //! Most vectors are deterministic; the AEAD envelope embeds a random nonce and the sealed box a
 //! random ephemeral key, so we capture one instance and pin it (decryption is deterministic).
 
-use sotto_core::{aead, format, kdf, wrap};
+use sotto_core::{aead, format, kdf, share, wrap};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -39,4 +39,11 @@ fn main() {
     println!("SB_SECRET={}", hex(&kp.secret));
     println!("SB_PT={}", hex(sb_pt));
     println!("SB_SEALED={}", hex(&sealed));
+
+    let share_key = [0x33u8; share::KEY_LEN];
+    let share_pt = b"share-secret-value";
+    let share_env = share::seal(&share_key, share_pt);
+    println!("SHARE_KEY={}", hex(&share_key));
+    println!("SHARE_PT={}", hex(share_pt));
+    println!("SHARE_ENV={}", hex(&share_env));
 }

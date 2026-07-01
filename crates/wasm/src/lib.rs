@@ -30,3 +30,30 @@ pub fn aead_seal(key: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Js
 pub fn aead_open(key: &[u8], envelope: &[u8], aad: &[u8]) -> Result<Vec<u8>, JsError> {
     sotto_core::aead::open(&key32(key)?, envelope, aad).map_err(|e| JsError::new(&e.to_string()))
 }
+
+/// Seal a secret for a share link under a 32-byte share key; returns a versioned envelope.
+#[wasm_bindgen]
+pub fn share_seal(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, JsError> {
+    Ok(sotto_core::share::seal(&key32(key)?, plaintext))
+}
+
+/// Open a share envelope under a 32-byte share key (the recipient's decrypt path).
+#[wasm_bindgen]
+pub fn share_open(key: &[u8], envelope: &[u8]) -> Result<Vec<u8>, JsError> {
+    sotto_core::share::open(&key32(key)?, envelope).map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Derive the AEAD key for a passphrase-protected share from the fragment key + passphrase + salt.
+#[wasm_bindgen]
+pub fn share_passphrase_key(
+    fragment_key: &[u8],
+    passphrase: &[u8],
+    salt: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    let salt: [u8; 16] = salt
+        .try_into()
+        .map_err(|_| JsError::new("salt must be 16 bytes"))?;
+    sotto_core::share::passphrase_key(&key32(fragment_key)?, passphrase, &salt)
+        .map(|k| k.to_vec())
+        .map_err(|e| JsError::new(&e.to_string()))
+}
