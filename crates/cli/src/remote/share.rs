@@ -28,6 +28,22 @@ pub fn create(
     value: &[u8],
     opts: &ShareOptions,
 ) -> Result<String> {
+    const MAX_VIEWS: i32 = 100;
+    const MAX_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+    if !(1..=MAX_VIEWS).contains(&opts.max_views) {
+        return Err(crate::error::Error::Input(format!(
+            "views must be between 1 and {MAX_VIEWS}"
+        )));
+    }
+    if let Some(ttl) = opts.ttl_seconds {
+        if !(1..=MAX_TTL_SECONDS).contains(&ttl) {
+            return Err(crate::error::Error::Input(format!(
+                "expire must be between 1 and {MAX_TTL_SECONDS} seconds"
+            )));
+        }
+    }
+
     let fragment_key = random::bytes::<{ core_share::KEY_LEN }>();
     let (aead_key, passphrase_salt) = match &opts.passphrase {
         Some(passphrase) => {
