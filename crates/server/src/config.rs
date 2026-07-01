@@ -25,6 +25,10 @@ pub struct OAuthConfig {
     /// Public origin of this server (e.g. `https://api.sotto.dev`), used to build the callback URL
     /// that GitHub redirects to. Must match the OAuth app's registered callback.
     pub public_base_url: String,
+    /// Allowed web-app origin (e.g. `https://app.sotto.dev`), if a web client is deployed. A login
+    /// whose `redirect_uri` matches this origin gets a cookie session; loopback stays CLI (URL
+    /// token). `None` means no web client (loopback only).
+    pub web_origin: Option<String>,
 }
 
 impl OAuthConfig {
@@ -34,6 +38,14 @@ impl OAuthConfig {
             "{}/auth/github/callback",
             self.public_base_url.trim_end_matches('/')
         )
+    }
+
+    /// Whether session cookies should carry the `Secure` attribute (inferred from the web origin
+    /// scheme, so local http dev still works).
+    pub fn secure_cookies(&self) -> bool {
+        self.web_origin
+            .as_deref()
+            .is_some_and(|origin| origin.starts_with("https://"))
     }
 }
 
@@ -56,6 +68,7 @@ impl Config {
                 github_client_secret,
                 public_base_url: std::env::var("SOTTO_PUBLIC_URL")
                     .unwrap_or_else(|_| DEFAULT_PUBLIC_URL.to_string()),
+                web_origin: std::env::var("SOTTO_WEB_ORIGIN").ok(),
             }),
             _ => None,
         };

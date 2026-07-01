@@ -1,7 +1,9 @@
 //! OAuth login/callback handlers and the authenticated `/auth/me` endpoint.
 
 use axum::extract::{Query, State};
-use axum::response::Redirect;
+use axum::http::header::SET_COOKIE;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use url::{Host, Url};
@@ -35,7 +37,7 @@ pub async fn login(
         .as_ref()
         .ok_or_else(|| Error::NotConfigured("oauth is not configured".into()))?;
 
-    validate_loopback(&params.redirect_uri)?;
+    validate_redirect(&params.redirect_uri, config.web_origin.as_deref())?;
 
     // Opportunistically drop login states that can no longer succeed (older than the freshness
     // window the callback enforces), so abandoned or bot-initiated logins don't accumulate.
@@ -72,11 +74,16 @@ pub struct CallbackParams {
 }
 
 /// `GET /auth/github/callback` — GitHub redirects here. Verify state, exchange the code, upsert the
-/// user, mint a session, and hand the token back to the CLI's loopback listener.
+/// user, mint a session, and hand it back: a web login (redirect matches the web origin) gets an
+/// httpOnly cookie; a CLI login (loopback) gets the token in the redirect URL.
 pub async fn callback(
     State(state): State<AppState>,
     Query(params): Query<CallbackParams>,
-) -> Result<Redirect> {
+) -> Result<Response> {
+    let config = state
+        .oauth_config
+        .as_ref()
+        .ok_or_else(|| Error::NotConfigured("oauth is not configured".into()))?;
     let provider = state
         .oauth
         .as_ref()
@@ -101,14 +108,37 @@ pub async fn callback(
     let user_id = upsert_user(&state.pool, &identity).await?;
     let token = session::issue(&state.pool, &user_id).await?;
 
-    // redirect_uri was validated as a loopback when the login began.
     let mut url = Url::parse(&cli_redirect_uri)
         .map_err(|_| Error::BadRequest("stored redirect_uri is invalid".into()))?;
-    url.query_pairs_mut()
-        .append_pair("session", &token)
-        .append_pair("state", &cli_state);
 
-    Ok(Redirect::to(url.as_str()))
+    if is_web_redirect(&url, config.web_origin.as_deref()) {
+        // Web: set an httpOnly cookie; keep the token out of the URL/history.
+        url.query_pairs_mut().append_pair("state", &cli_state);
+        let cookie = session::session_cookie(&token, config.secure_cookies());
+        Ok(([(SET_COOKIE, cookie)], Redirect::to(url.as_str())).into_response())
+    } else {
+        // CLI loopback: hand the token to the local listener via the redirect URL.
+        url.query_pairs_mut()
+            .append_pair("session", &token)
+            .append_pair("state", &cli_state);
+        Ok(Redirect::to(url.as_str()).into_response())
+    }
+}
+
+/// `POST /auth/logout` — delete the session and clear the web cookie. Works for either transport.
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response> {
+    if let Some(token) = session::token_from_headers(&headers) {
+        session::revoke(&state.pool, &token).await?;
+    }
+    let secure = state
+        .oauth_config
+        .as_ref()
+        .is_some_and(|c| c.secure_cookies());
+    Ok((
+        [(SET_COOKIE, session::clear_cookie(secure))],
+        StatusCode::NO_CONTENT,
+    )
+        .into_response())
 }
 
 #[derive(Serialize)]
@@ -149,47 +179,71 @@ fn random_state() -> String {
     raw.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Reject any redirect target that is not an `http` loopback address — otherwise a crafted
-/// `redirect_uri` could exfiltrate the freshly minted session token.
-fn validate_loopback(redirect_uri: &str) -> Result<()> {
+/// Reject any redirect target that is neither an `http` loopback address (CLI) nor the configured
+/// web origin (web) — otherwise a crafted `redirect_uri` could exfiltrate the session.
+fn validate_redirect(redirect_uri: &str, web_origin: Option<&str>) -> Result<()> {
     let url = Url::parse(redirect_uri)
         .map_err(|_| Error::BadRequest("redirect_uri is not a valid URL".into()))?;
-    if url.scheme() != "http" {
-        return Err(Error::BadRequest(
-            "redirect_uri must use http on a loopback address".into(),
-        ));
-    }
-    let is_loopback = match url.host() {
-        Some(Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(Host::Ipv6(ip)) => ip.is_loopback(),
-        Some(Host::Domain(d)) => d == "localhost",
-        None => false,
-    };
-    if is_loopback {
+    if is_loopback(&url) || is_web_redirect(&url, web_origin) {
         Ok(())
     } else {
         Err(Error::BadRequest(
-            "redirect_uri must be a loopback address".into(),
+            "redirect_uri must be a loopback address or the configured web origin".into(),
         ))
     }
 }
 
+/// An `http` loopback address (`127.0.0.0/8`, `::1`, or `localhost`) — the CLI's local listener.
+fn is_loopback(url: &Url) -> bool {
+    if url.scheme() != "http" {
+        return false;
+    }
+    match url.host() {
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(Host::Domain(d)) => d == "localhost",
+        None => false,
+    }
+}
+
+/// Whether `url` is same-origin (scheme + host + port) with the configured web origin.
+fn is_web_redirect(url: &Url, web_origin: Option<&str>) -> bool {
+    let Some(origin) = web_origin.and_then(|o| Url::parse(o).ok()) else {
+        return false;
+    };
+    url.scheme() == origin.scheme()
+        && url.host() == origin.host()
+        && url.port_or_known_default() == origin.port_or_known_default()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_loopback;
+    use super::validate_redirect;
+
+    const WEB: Option<&str> = Some("https://app.sotto.dev");
 
     #[test]
     fn accepts_loopback_targets() {
-        assert!(validate_loopback("http://127.0.0.1:1234/cb").is_ok());
-        assert!(validate_loopback("http://localhost:55555/").is_ok());
-        assert!(validate_loopback("http://[::1]:9000/cb").is_ok());
+        assert!(validate_redirect("http://127.0.0.1:1234/cb", None).is_ok());
+        assert!(validate_redirect("http://localhost:55555/", None).is_ok());
+        assert!(validate_redirect("http://[::1]:9000/cb", None).is_ok());
+    }
+
+    #[test]
+    fn accepts_the_configured_web_origin() {
+        assert!(validate_redirect("https://app.sotto.dev/auth/callback", WEB).is_ok());
+        assert!(validate_redirect("https://app.sotto.dev/", WEB).is_ok());
+        // A different origin is rejected even when a web origin is configured.
+        assert!(validate_redirect("https://evil.example.com/cb", WEB).is_err());
+        // The web origin isn't accepted when unconfigured.
+        assert!(validate_redirect("https://app.sotto.dev/auth/callback", None).is_err());
     }
 
     #[test]
     fn rejects_non_loopback_or_non_http() {
-        assert!(validate_loopback("https://evil.example.com/cb").is_err());
-        assert!(validate_loopback("http://evil.example.com/cb").is_err());
-        assert!(validate_loopback("http://169.254.169.254/").is_err());
-        assert!(validate_loopback("not a url").is_err());
+        assert!(validate_redirect("https://evil.example.com/cb", None).is_err());
+        assert!(validate_redirect("http://evil.example.com/cb", None).is_err());
+        assert!(validate_redirect("http://169.254.169.254/", None).is_err());
+        assert!(validate_redirect("not a url", None).is_err());
     }
 }

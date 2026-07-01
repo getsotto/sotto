@@ -4,8 +4,9 @@
 //! stored, so a database leak cannot be replayed as a valid session.
 
 use axum::extract::FromRequestParts;
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, COOKIE};
 use axum::http::request::Parts;
+use axum::http::HeaderMap;
 use dryoc::generichash::{GenericHash, Key as GhKey};
 use sqlx::PgPool;
 
@@ -18,6 +19,10 @@ const TOKEN_BYTES: usize = 32;
 const TOKEN_PREFIX: &str = "st_";
 /// Session lifetime, expressed as a Postgres interval (TTL math stays in SQL).
 const SESSION_TTL: &str = "30 days";
+/// Same lifetime in seconds, for the cookie `Max-Age`.
+const SESSION_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+/// Name of the web session cookie.
+pub const SESSION_COOKIE: &str = "sotto_session";
 
 /// The authenticated principal, produced by extracting and validating the bearer token.
 pub struct AuthUser {
@@ -55,6 +60,57 @@ pub async fn resolve(pool: &PgPool, token: &str) -> Result<Option<String>> {
     Ok(user_id)
 }
 
+/// Delete a session (logout). A no-op if the token is unknown.
+pub async fn revoke(pool: &PgPool, token: &str) -> Result<()> {
+    sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
+        .bind(hash_token(token))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Extract the session token from a request: `Authorization: Bearer …` (CLI) or the
+/// `sotto_session` cookie (web).
+pub fn token_from_headers(headers: &HeaderMap) -> Option<String> {
+    if let Some(bearer) = headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        return Some(bearer.to_string());
+    }
+    headers
+        .get_all(COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|cookies| cookies.split(';'))
+        .filter_map(|kv| kv.trim().split_once('='))
+        .find(|(name, _)| *name == SESSION_COOKIE)
+        .map(|(_, value)| value.to_string())
+}
+
+/// Build a `Set-Cookie` value carrying the session (web login).
+pub fn session_cookie(token: &str, secure: bool) -> String {
+    let mut cookie = format!(
+        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={SESSION_TTL_SECONDS}"
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// Build a `Set-Cookie` value that clears the session cookie (logout).
+pub fn clear_cookie(secure: bool) -> String {
+    let mut cookie = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
 /// BLAKE2b hash of the token string; this is what we persist and compare against.
 fn hash_token(token: &str) -> Vec<u8> {
     GenericHash::hash_with_defaults_to_vec::<_, GhKey>(token.as_bytes(), None)
@@ -73,16 +129,8 @@ impl FromRequestParts<AppState> for AuthUser {
     type Rejection = Error;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self> {
-        let token = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .ok_or(Error::Unauthorized)?;
-
-        let user_id = resolve(&state.pool, token)
+        let token = token_from_headers(&parts.headers).ok_or(Error::Unauthorized)?;
+        let user_id = resolve(&state.pool, &token)
             .await?
             .ok_or(Error::Unauthorized)?;
         Ok(AuthUser { user_id })
