@@ -191,6 +191,30 @@ pub fn decrypt_secret(
     }
 }
 
+/// Rewrap a secret's data key from `old_vault_key` to `new_vault_key` — the heart of key rotation.
+///
+/// The data key itself and the name/value ciphertext are unchanged; only the wrapping key changes,
+/// so rotation is cheap and never re-encrypts secret values. The `(env, secret, version)` binding is
+/// preserved, so the rewrapped key decrypts exactly as before under the new vault key. Fails if the
+/// data key doesn't authenticate under `old_vault_key` with that binding.
+pub fn rewrap_data_key(
+    old_vault_key: &[u8; KEY_LEN],
+    new_vault_key: &[u8; KEY_LEN],
+    env_id: &str,
+    secret_id: &str,
+    version: i64,
+    enc_data_key: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let mut data_key = unwrap_data_key(old_vault_key, env_id, secret_id, version, enc_data_key)?;
+    let rewrapped = wrap::wrap_key(
+        new_vault_key,
+        &data_key,
+        data_key_aad(env_id, secret_id, version).as_bytes(),
+    );
+    data_key.zeroize();
+    Ok(rewrapped)
+}
+
 fn unwrap_data_key(
     vault_key: &[u8; KEY_LEN],
     env_id: &str,
@@ -247,6 +271,36 @@ mod tests {
         assert!(
             decrypt_value(&vault_key, "e1", "s2", 1, &enc.enc_value, &enc.enc_data_key).is_err()
         );
+    }
+
+    #[test]
+    fn rewrap_data_key_moves_a_secret_to_a_new_vault_key() {
+        let old = generate_vault_key();
+        let new = generate_vault_key();
+        let enc = encrypt_secret(&old, "e1", "s1", 3, b"NAME", b"value");
+
+        // Rewrap the data key under the new vault key; the value ciphertext is never touched.
+        let rewrapped = rewrap_data_key(&old, &new, "e1", "s1", 3, &enc.enc_data_key).unwrap();
+
+        // The new vault key decrypts the (unchanged) name + value via the rewrapped data key.
+        let (name, value) = decrypt_secret(
+            &new,
+            "e1",
+            "s1",
+            3,
+            &enc.enc_name,
+            &enc.enc_value,
+            &rewrapped,
+        )
+        .unwrap();
+        assert_eq!(name, b"NAME");
+        assert_eq!(value, b"value");
+
+        // The old vault key no longer opens the rewrapped key; the new key can't open the old wrap.
+        assert!(decrypt_value(&old, "e1", "s1", 3, &enc.enc_value, &rewrapped).is_err());
+        assert!(decrypt_value(&new, "e1", "s1", 3, &enc.enc_value, &enc.enc_data_key).is_err());
+        // A wrong (env, secret, version) binding fails on the unwrap.
+        assert!(rewrap_data_key(&old, &new, "e1", "s1", 4, &enc.enc_data_key).is_err());
     }
 
     #[test]
