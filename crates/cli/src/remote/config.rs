@@ -14,6 +14,10 @@ const SERVER_ENV: &str = "SOTTO_SERVER";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalConfig {
     pub server_url: String,
+    /// Origin of the web app, for building share links. Falls back to `server_url` when unset
+    /// (same-origin deploy).
+    #[serde(default)]
+    pub web_url: Option<String>,
 }
 
 impl GlobalConfig {
@@ -64,6 +68,19 @@ pub fn server_url(override_url: Option<&str>, config_path: &Path) -> Result<Stri
     })
 }
 
+/// Resolve the web-app origin for share links: the configured `web_url` if set, else the server URL
+/// (same-origin deploy).
+pub fn web_base(config_path: &Path) -> Result<String> {
+    let web = GlobalConfig::load_from(config_path)?.and_then(|c| c.web_url);
+    match web
+        .map(|w| w.trim_end_matches('/').to_string())
+        .filter(|w| !w.is_empty())
+    {
+        Some(web) => Ok(web),
+        None => server_url(None, config_path),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,6 +91,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         let config = GlobalConfig {
             server_url: "https://api.sotto.dev".into(),
+            web_url: Some("https://app.sotto.dev".into()),
         };
         config.save_to(&path).unwrap();
         assert_eq!(GlobalConfig::load_from(&path).unwrap().unwrap(), config);

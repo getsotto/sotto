@@ -17,6 +17,7 @@ pub mod error;
 pub mod format;
 pub mod kdf;
 pub mod random;
+pub mod share;
 pub mod vectors;
 pub mod wrap;
 

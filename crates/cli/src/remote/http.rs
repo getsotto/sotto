@@ -14,8 +14,8 @@ use serde::de::DeserializeOwned;
 use crate::error::{Error, Result};
 
 use super::api::{
-    AccountBundle, BatchRequest, BatchResponse, EnvironmentInfo, Me, NewEnvironment, NewProject,
-    Snapshot, SyncApi,
+    AccountBundle, BatchRequest, BatchResponse, CreatedShare, EnvironmentInfo, Me, NewEnvironment,
+    NewProject, NewShare, Snapshot, SyncApi,
 };
 
 pub struct HttpClient {
@@ -166,6 +166,17 @@ impl SyncApi for HttpClient {
             .post(self.url(&format!("/environments/{env_id}/secrets")))
             .bearer_auth(&self.token)
             .json(batch)
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
+    fn create_share(&self, share: &NewShare) -> Result<CreatedShare> {
+        let resp = self
+            .http
+            .post(self.url("/shares"))
+            .bearer_auth(&self.token)
+            .json(share)
             .send()
             .map_err(net)?;
         parse(resp)

@@ -307,6 +307,7 @@ mod tests {
         account: Option<AccountBundle>,
         projects: HashSet<String>,
         envs: HashMap<String, EnvState>,
+        shares: HashMap<String, super::super::api::NewShare>,
         fail_writes: u32,
     }
 
@@ -316,6 +317,9 @@ mod tests {
     }
 
     impl MockApi {
+        fn stored_share(&self, token: &str) -> Option<super::super::api::NewShare> {
+            self.state.borrow().shares.get(token).cloned()
+        }
         fn fail_next_write(&self) {
             self.state.borrow_mut().fail_writes += 1;
         }
@@ -455,6 +459,21 @@ mod tests {
             env.revision += 1;
             Ok(super::super::api::BatchResponse {
                 revision: env.revision,
+            })
+        }
+
+        fn create_share(
+            &self,
+            share: &super::super::api::NewShare,
+        ) -> Result<super::super::api::CreatedShare> {
+            let token = uuid::Uuid::new_v4().to_string();
+            self.state
+                .borrow_mut()
+                .shares
+                .insert(token.clone(), share.clone());
+            Ok(super::super::api::CreatedShare {
+                token,
+                expires_at: None,
             })
         }
     }
@@ -680,5 +699,68 @@ mod tests {
             .get("DATABASE_URL")
             .unwrap();
         assert_eq!(value, b"postgres://prod");
+    }
+
+    // Uses the full MockApi (which stores uploaded share blobs) to exercise share creation.
+    #[test]
+    fn share_create_seals_uploads_and_links() {
+        use crate::remote::api::b64decode;
+        use crate::remote::share::{create, ShareOptions};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let api = MockApi::default();
+
+        // No passphrase: the fragment key is the AEAD key.
+        let opts = ShareOptions {
+            max_views: 1,
+            ttl_seconds: Some(3600),
+            passphrase: None,
+        };
+        let link = create(&api, "https://app.sotto.dev/", b"api-token", &opts).unwrap();
+        assert!(link.starts_with("https://app.sotto.dev/s/"));
+
+        let (base, fragment) = link.split_once('#').unwrap();
+        let token = base.rsplit('/').next().unwrap();
+        let key: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(fragment)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let share = api.stored_share(token).unwrap();
+        assert!(share.passphrase_salt.is_none());
+        let enc_blob = b64decode(&share.enc_blob).unwrap();
+        assert_eq!(
+            sotto_core::share::open(&key, &enc_blob).unwrap(),
+            b"api-token"
+        );
+
+        // With a passphrase: the fragment key alone can't decrypt; fragment + passphrase can.
+        let opts = ShareOptions {
+            max_views: 1,
+            ttl_seconds: None,
+            passphrase: Some(b"hunter2".to_vec()),
+        };
+        let link = create(&api, "https://app.sotto.dev", b"secret", &opts).unwrap();
+        let (base, fragment) = link.split_once('#').unwrap();
+        let token = base.rsplit('/').next().unwrap();
+        let fragment_key: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(fragment)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let share = api.stored_share(token).unwrap();
+        let enc_blob = b64decode(&share.enc_blob).unwrap();
+        let salt: [u8; 16] = b64decode(&share.passphrase_salt.unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        assert!(sotto_core::share::open(&fragment_key, &enc_blob).is_err());
+        let aead_key = sotto_core::share::passphrase_key(&fragment_key, b"hunter2", &salt).unwrap();
+        assert_eq!(
+            sotto_core::share::open(&aead_key, &enc_blob).unwrap(),
+            b"secret"
+        );
     }
 }

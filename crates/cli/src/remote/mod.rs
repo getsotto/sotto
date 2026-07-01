@@ -7,6 +7,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod http;
+pub mod share;
 pub mod sync;
 
 pub use api::SyncApi;
