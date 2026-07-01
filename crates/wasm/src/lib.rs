@@ -57,3 +57,132 @@ pub fn share_passphrase_key(
         .map(|k| k.to_vec())
         .map_err(|e| JsError::new(&e.to_string()))
 }
+
+// --- vault: derive the master key, then the environment key hierarchy (the in-browser vault) ---
+
+/// Derive the 32-byte master key from the password, secret key, and 16-byte salt (Argon2id in WASM).
+#[wasm_bindgen]
+pub fn kdf_derive_master_key(
+    password: &[u8],
+    secret_key: &[u8],
+    salt: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    let salt: [u8; 16] = salt
+        .try_into()
+        .map_err(|_| JsError::new("salt must be 16 bytes"))?;
+    sotto_core::kdf::derive_master_key(password, secret_key, &salt)
+        .map(|k| k.to_vec())
+        .map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Wrap an environment vault key under the master key (used when creating an environment).
+#[wasm_bindgen]
+pub fn vault_wrap_key(
+    master_key: &[u8],
+    vault_key: &[u8],
+    env_id: &str,
+) -> Result<Vec<u8>, JsError> {
+    Ok(sotto_core::vault::wrap_vault_key(
+        &key32(master_key)?,
+        &key32(vault_key)?,
+        env_id,
+    ))
+}
+
+/// Unwrap an environment vault key under the master key.
+#[wasm_bindgen]
+pub fn vault_unwrap_key(
+    master_key: &[u8],
+    enc_vault_key: &[u8],
+    env_id: &str,
+) -> Result<Vec<u8>, JsError> {
+    sotto_core::vault::unwrap_vault_key(&key32(master_key)?, enc_vault_key, env_id)
+        .map(|k| k.to_vec())
+        .map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// The ciphertext of an encrypted secret, exposed to JS with getters.
+#[wasm_bindgen]
+pub struct EncryptedSecret {
+    inner: sotto_core::vault::EncryptedSecret,
+}
+
+#[wasm_bindgen]
+impl EncryptedSecret {
+    #[wasm_bindgen(getter)]
+    pub fn enc_name(&self) -> Vec<u8> {
+        self.inner.enc_name.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn enc_value(&self) -> Vec<u8> {
+        self.inner.enc_value.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn enc_data_key(&self) -> Vec<u8> {
+        self.inner.enc_data_key.clone()
+    }
+}
+
+/// Encrypt a secret's name + value under a fresh data key wrapped by the vault key.
+#[wasm_bindgen]
+pub fn vault_encrypt_secret(
+    vault_key: &[u8],
+    env_id: &str,
+    secret_id: &str,
+    version: i32,
+    name: &[u8],
+    value: &[u8],
+) -> Result<EncryptedSecret, JsError> {
+    Ok(EncryptedSecret {
+        inner: sotto_core::vault::encrypt_secret(
+            &key32(vault_key)?,
+            env_id,
+            secret_id,
+            version.into(),
+            name,
+            value,
+        ),
+    })
+}
+
+/// Decrypt a secret's name.
+#[wasm_bindgen]
+pub fn vault_decrypt_name(
+    vault_key: &[u8],
+    env_id: &str,
+    secret_id: &str,
+    version: i32,
+    enc_name: &[u8],
+    enc_data_key: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    sotto_core::vault::decrypt_name(
+        &key32(vault_key)?,
+        env_id,
+        secret_id,
+        version.into(),
+        enc_name,
+        enc_data_key,
+    )
+    .map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Decrypt a secret's value.
+#[wasm_bindgen]
+pub fn vault_decrypt_value(
+    vault_key: &[u8],
+    env_id: &str,
+    secret_id: &str,
+    version: i32,
+    enc_value: &[u8],
+    enc_data_key: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    sotto_core::vault::decrypt_value(
+        &key32(vault_key)?,
+        env_id,
+        secret_id,
+        version.into(),
+        enc_value,
+        enc_data_key,
+    )
+    .map_err(|e| JsError::new(&e.to_string()))
+}

@@ -11,7 +11,7 @@
 //! Secret names are encrypted, so name→row resolution decrypts each row and matches — the store
 //! never sees plaintext.
 
-use sotto_core::{aead, random, wrap};
+use sotto_core::vault as core_vault;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -19,7 +19,7 @@ use crate::error::{Error, Result};
 use crate::store::{Project, SecretRow, Store};
 
 /// Symmetric key length shared across the hierarchy.
-const KEY_LEN: usize = 32;
+const KEY_LEN: usize = core_vault::KEY_LEN;
 
 /// Environments created for a new project.
 pub const DEFAULT_ENVIRONMENTS: &[&str] = &["dev", "staging", "prod"];
@@ -59,9 +59,8 @@ impl<'a> Vault<'a> {
         name: &str,
     ) -> Result<()> {
         let env_id = Uuid::new_v4().to_string();
-        let mut vault_key = random::bytes::<KEY_LEN>();
-        let enc_vault_key =
-            wrap::wrap_key(master_key, &vault_key, vault_key_aad(&env_id).as_bytes());
+        let mut vault_key = core_vault::generate_vault_key();
+        let enc_vault_key = core_vault::wrap_vault_key(master_key, &vault_key, &env_id);
         vault_key.zeroize();
         store.create_environment(&env_id, project_id, name, &enc_vault_key)?;
         Ok(())
@@ -80,11 +79,7 @@ impl<'a> Vault<'a> {
         let env = store
             .get_environment(project_id, env_name)?
             .ok_or_else(|| Error::NotFound(format!("environment `{env_name}`")))?;
-        let vault_key = wrap::unwrap_key(
-            master_key,
-            &env.enc_vault_key,
-            vault_key_aad(&env.id).as_bytes(),
-        )?;
+        let vault_key = core_vault::unwrap_vault_key(master_key, &env.enc_vault_key, &env.id)?;
         Ok(Self {
             store,
             env_id: env.id,
@@ -107,8 +102,13 @@ impl<'a> Vault<'a> {
             Some(row) => {
                 let new_version = row.version + 1;
                 let enc = self.encrypt(&row.id, new_version, name, value);
-                self.store
-                    .update_secret(&row.id, new_version, &enc.name, &enc.value, &enc.data_key)
+                self.store.update_secret(
+                    &row.id,
+                    new_version,
+                    &enc.enc_name,
+                    &enc.enc_value,
+                    &enc.enc_data_key,
+                )
             }
             None => {
                 let id = Uuid::new_v4().to_string();
@@ -116,9 +116,9 @@ impl<'a> Vault<'a> {
                 self.store.insert_secret(
                     &id,
                     &self.env_id,
-                    &enc.name,
-                    &enc.value,
-                    &enc.data_key,
+                    &enc.enc_name,
+                    &enc.enc_value,
+                    &enc.enc_data_key,
                 )?;
                 Ok(())
             }
@@ -184,99 +184,61 @@ impl<'a> Vault<'a> {
         Ok(None)
     }
 
-    fn encrypt(&self, secret_id: &str, version: i64, name: &str, value: &[u8]) -> EncryptedSecret {
-        let mut data_key = random::bytes::<KEY_LEN>();
-        let name = aead::seal(
-            &data_key,
-            name.as_bytes(),
-            name_aad(&self.env_id, secret_id, version).as_bytes(),
-        );
-        let value = aead::seal(
-            &data_key,
-            value,
-            value_aad(&self.env_id, secret_id, version).as_bytes(),
-        );
-        let data_key_ct = wrap::wrap_key(
+    fn encrypt(
+        &self,
+        secret_id: &str,
+        version: i64,
+        name: &str,
+        value: &[u8],
+    ) -> core_vault::EncryptedSecret {
+        core_vault::encrypt_secret(
             &self.vault_key,
-            &data_key,
-            data_key_aad(&self.env_id, secret_id, version).as_bytes(),
-        );
-        data_key.zeroize();
-        EncryptedSecret {
-            name,
+            &self.env_id,
+            secret_id,
+            version,
+            name.as_bytes(),
             value,
-            data_key: data_key_ct,
-        }
+        )
     }
 
-    fn data_key(&self, row: &SecretRow) -> Result<[u8; KEY_LEN]> {
-        wrap::unwrap_key(
+    fn decrypt_name(&self, row: &SecretRow) -> Result<String> {
+        let bytes = core_vault::decrypt_name(
             &self.vault_key,
+            &self.env_id,
+            &row.id,
+            row.version,
+            &row.enc_name,
             &row.enc_data_key,
-            data_key_aad(&self.env_id, &row.id, row.version).as_bytes(),
+        )?;
+        String::from_utf8(bytes).map_err(|_| Error::Crypto)
+    }
+
+    fn decrypt_value(&self, row: &SecretRow) -> Result<Vec<u8>> {
+        core_vault::decrypt_value(
+            &self.vault_key,
+            &self.env_id,
+            &row.id,
+            row.version,
+            &row.enc_value,
+            &row.enc_data_key,
         )
         .map_err(Into::into)
     }
 
-    fn decrypt_name(&self, row: &SecretRow) -> Result<String> {
-        let mut dk = self.data_key(row)?;
-        let bytes = aead::open(
-            &dk,
-            &row.enc_name,
-            name_aad(&self.env_id, &row.id, row.version).as_bytes(),
-        );
-        dk.zeroize();
-        String::from_utf8(bytes?).map_err(|_| Error::Crypto)
-    }
-
-    fn decrypt_value(&self, row: &SecretRow) -> Result<Vec<u8>> {
-        let mut dk = self.data_key(row)?;
-        let value = aead::open(
-            &dk,
-            &row.enc_value,
-            value_aad(&self.env_id, &row.id, row.version).as_bytes(),
-        );
-        dk.zeroize();
-        Ok(value?)
-    }
-
     /// Decrypt both name and value from one row, unwrapping the data key a single time.
     fn decrypt_entry(&self, row: &SecretRow) -> Result<(String, Vec<u8>)> {
-        let mut dk = self.data_key(row)?;
-        let name = aead::open(
-            &dk,
+        let (name, value) = core_vault::decrypt_secret(
+            &self.vault_key,
+            &self.env_id,
+            &row.id,
+            row.version,
             &row.enc_name,
-            name_aad(&self.env_id, &row.id, row.version).as_bytes(),
-        );
-        let value = aead::open(
-            &dk,
             &row.enc_value,
-            value_aad(&self.env_id, &row.id, row.version).as_bytes(),
-        );
-        dk.zeroize();
-        let name = String::from_utf8(name?).map_err(|_| Error::Crypto)?;
-        Ok((name, value?))
+            &row.enc_data_key,
+        )?;
+        let name = String::from_utf8(name).map_err(|_| Error::Crypto)?;
+        Ok((name, value))
     }
-}
-
-/// Ciphertext components produced by one secret write.
-struct EncryptedSecret {
-    name: Vec<u8>,
-    value: Vec<u8>,
-    data_key: Vec<u8>,
-}
-
-fn vault_key_aad(env_id: &str) -> String {
-    format!("sotto/v1/vaultkey|env={env_id}")
-}
-fn data_key_aad(env_id: &str, secret_id: &str, version: i64) -> String {
-    format!("sotto/v1/datakey|env={env_id}|secret={secret_id}|ver={version}")
-}
-fn name_aad(env_id: &str, secret_id: &str, version: i64) -> String {
-    format!("sotto/v1/name|env={env_id}|secret={secret_id}|ver={version}")
-}
-fn value_aad(env_id: &str, secret_id: &str, version: i64) -> String {
-    format!("sotto/v1/value|env={env_id}|secret={secret_id}|ver={version}")
 }
 
 #[cfg(test)]

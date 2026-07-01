@@ -46,6 +46,7 @@ fn app(pool: PgPool, identity: Identity) -> Router {
             github_client_id: "test-client-id".into(),
             github_client_secret: "test-secret".into(),
             public_base_url: "http://localhost:8080".into(),
+            web_origin: Some("https://app.sotto.test".into()),
         }),
     };
     Router::new().merge(auth::router()).with_state(state)
@@ -271,6 +272,137 @@ async fn me_requires_a_valid_session() {
 
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("clean");
+}
+
+#[tokio::test]
+async fn me_accepts_a_session_cookie_and_logout_revokes_it() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let user_id = "test-cookie-user";
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("pre-clean");
+    sqlx::query("INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'github', $2)")
+        .bind(user_id)
+        .bind("test-cookie-subject")
+        .execute(&pool)
+        .await
+        .expect("insert user");
+    let token = session::issue(&pool, user_id).await.expect("issue");
+
+    // The web transport: a session cookie authenticates just like a bearer token.
+    let cookie_req = Request::builder()
+        .uri("/auth/me")
+        .header("cookie", format!("sotto_session={token}"))
+        .body(Body::empty())
+        .expect("req");
+    let resp = app(pool.clone(), identity("x", None))
+        .oneshot(cookie_req)
+        .await
+        .expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Logout revokes the session and clears the cookie.
+    let logout = Request::builder()
+        .method("POST")
+        .uri("/auth/logout")
+        .header("cookie", format!("sotto_session={token}"))
+        .body(Body::empty())
+        .expect("req");
+    let resp = app(pool.clone(), identity("x", None))
+        .oneshot(logout)
+        .await
+        .expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("set-cookie");
+    assert!(set_cookie.contains("sotto_session=") && set_cookie.contains("Max-Age=0"));
+
+    // The revoked cookie no longer authenticates.
+    let after = Request::builder()
+        .uri("/auth/me")
+        .header("cookie", format!("sotto_session={token}"))
+        .body(Body::empty())
+        .expect("req");
+    let resp = app(pool.clone(), identity("x", None))
+        .oneshot(after)
+        .await
+        .expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("clean");
+}
+
+#[tokio::test]
+async fn web_callback_sets_a_cookie_and_omits_the_token_from_the_url() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let subject = "test-web-cb-subject";
+    let state = "test-web-cb-state";
+    sqlx::query("DELETE FROM users WHERE oauth_provider = 'github' AND oauth_subject = $1")
+        .bind(subject)
+        .execute(&pool)
+        .await
+        .expect("pre-clean user");
+    sqlx::query("DELETE FROM oauth_logins WHERE state = $1")
+        .bind(state)
+        .execute(&pool)
+        .await
+        .expect("pre-clean login");
+    // A web login: the redirect matches the configured web origin.
+    sqlx::query(
+        "INSERT INTO oauth_logins (state, cli_redirect_uri, cli_state) VALUES ($1, $2, $3)",
+    )
+    .bind(state)
+    .bind("https://app.sotto.test/auth/callback")
+    .bind("web-cli-state")
+    .execute(&pool)
+    .await
+    .expect("seed login");
+
+    let resp = app(pool.clone(), identity(subject, Some("u@example.com")))
+        .oneshot(get(&format!(
+            "/auth/github/callback?code=any&state={state}"
+        )))
+        .await
+        .expect("oneshot");
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let set_cookie = resp
+        .headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("set-cookie");
+    assert!(set_cookie.contains("sotto_session=st_"));
+    assert!(set_cookie.contains("HttpOnly") && set_cookie.contains("Secure"));
+    let location = resp
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .expect("location");
+    assert!(location.starts_with("https://app.sotto.test/auth/callback?"));
+    assert!(location.contains("state=web-cli-state"));
+    // The session token must NOT be in the redirect URL for the web flow.
+    assert!(!location.contains("session="));
+
+    sqlx::query("DELETE FROM users WHERE oauth_provider = 'github' AND oauth_subject = $1")
+        .bind(subject)
         .execute(&pool)
         .await
         .expect("clean");

@@ -5,7 +5,7 @@
 //! Most vectors are deterministic; the AEAD envelope embeds a random nonce and the sealed box a
 //! random ephemeral key, so we capture one instance and pin it (decryption is deterministic).
 
-use sotto_core::{aead, format, kdf, share, wrap};
+use sotto_core::{aead, format, kdf, share, vault, wrap};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -46,4 +46,22 @@ fn main() {
     println!("SHARE_KEY={}", hex(&share_key));
     println!("SHARE_PT={}", hex(share_pt));
     println!("SHARE_ENV={}", hex(&share_env));
+
+    let vault_master = [0x55u8; vault::KEY_LEN];
+    let vault_key = [0x66u8; vault::KEY_LEN];
+    let enc_vault_key = vault::wrap_vault_key(&vault_master, &vault_key, "env-123");
+    println!("VAULT_MASTER={}", hex(&vault_master));
+    println!("VAULT_KEY={}", hex(&vault_key));
+    println!("VAULT_ENC_KEY={}", hex(&enc_vault_key));
+    let vsec = vault::encrypt_secret(
+        &vault_key,
+        "env-123",
+        "sec-1",
+        3,
+        b"DATABASE_URL",
+        b"postgres://x",
+    );
+    println!("VAULT_ENC_NAME={}", hex(&vsec.enc_name));
+    println!("VAULT_ENC_VALUE={}", hex(&vsec.enc_value));
+    println!("VAULT_ENC_DATA_KEY={}", hex(&vsec.enc_data_key));
 }
