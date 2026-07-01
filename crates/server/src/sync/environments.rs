@@ -55,18 +55,39 @@ async fn create_environment(
         ));
     }
 
-    let created: Option<String> = sqlx::query_scalar(
-        "INSERT INTO environments (id, project_id, enc_name, enc_vault_key) \
-         VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING RETURNING id",
-    )
-    .bind(&body.id)
-    .bind(&project_id)
-    .bind(&enc_name)
-    .bind(&enc_vault_key)
-    .fetch_optional(&state.pool)
-    .await?;
+    // The environment and the creator's own vault-key grant land together (the caller sealed
+    // `enc_vault_key` to their own public key), so "fetch my grant" works for the creator too.
+    let created = {
+        let mut tx = state.pool.begin().await?;
+        let created: Option<String> = sqlx::query_scalar(
+            "INSERT INTO environments (id, project_id, enc_name, enc_vault_key) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING RETURNING id",
+        )
+        .bind(&body.id)
+        .bind(&project_id)
+        .bind(&enc_name)
+        .bind(&enc_vault_key)
+        .fetch_optional(&mut *tx)
+        .await?;
 
-    if created.is_some() {
+        if created.is_some() {
+            sqlx::query(
+                "INSERT INTO environment_grants (env_id, user_id, enc_vault_key, granted_by) \
+                 VALUES ($1, $2, $3, $2) ON CONFLICT (env_id, user_id) DO NOTHING",
+            )
+            .bind(&body.id)
+            .bind(&user.user_id)
+            .bind(&enc_vault_key)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            true
+        } else {
+            false
+        }
+    };
+
+    if created {
         return Ok(StatusCode::CREATED);
     }
 
