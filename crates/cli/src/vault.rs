@@ -1,7 +1,7 @@
 //! Crypto orchestration — sotto-core over the local [`Store`].
 //!
-//! The key hierarchy: a master key (supplied by the session layer) unwraps an environment's
-//! **vault key**; each write generates a fresh per-secret **data key** wrapped under the vault
+//! The key hierarchy: the account keypair (from the session layer) opens an environment's **vault
+//! key** grant; each write generates a fresh per-secret **data key** wrapped under the vault
 //! key; names and values are sealed under the data key with associated data binding their
 //! location (`env`, `secret`, `version`, `field`) so the store can't swap, relocate, or mix
 //! blobs across secrets, environments, or versions. (AAD binding alone does not detect a
@@ -12,6 +12,7 @@
 //! never sees plaintext.
 
 use sotto_core::vault as core_vault;
+use sotto_core::wrap;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -26,8 +27,8 @@ pub const DEFAULT_ENVIRONMENTS: &[&str] = &["dev", "staging", "prod"];
 
 /// An unlocked view of one environment's secrets.
 ///
-/// Holds the environment's decrypted vault key, zeroized on drop. The master key is used only to
-/// construct the vault and is not retained.
+/// Holds the environment's decrypted vault key, zeroized on drop. The account keypair opens the
+/// environment's key grant and is not retained.
 #[derive(ZeroizeOnDrop)]
 pub struct Vault<'a> {
     #[zeroize(skip)]
@@ -38,48 +39,46 @@ pub struct Vault<'a> {
 }
 
 impl<'a> Vault<'a> {
-    /// Create a project with the [`DEFAULT_ENVIRONMENTS`], each holding a fresh wrapped vault key.
-    pub fn create_project(
-        store: &Store,
-        master_key: &[u8; KEY_LEN],
-        name: &str,
-    ) -> Result<Project> {
+    /// Create a project with the [`DEFAULT_ENVIRONMENTS`], each holding a vault key granted to the
+    /// account keypair.
+    pub fn create_project(store: &Store, keypair: &wrap::Keypair, name: &str) -> Result<Project> {
         let project = store.create_project(name)?;
         for env in DEFAULT_ENVIRONMENTS {
-            Self::create_environment(store, master_key, &project.id, env)?;
+            Self::create_environment(store, keypair, &project.id, env)?;
         }
         Ok(project)
     }
 
-    /// Create one environment with a freshly generated, master-key-wrapped vault key.
+    /// Create one environment with a freshly generated vault key, sealed (granted) to the account's
+    /// public key.
     pub fn create_environment(
         store: &Store,
-        master_key: &[u8; KEY_LEN],
+        keypair: &wrap::Keypair,
         project_id: &str,
         name: &str,
     ) -> Result<()> {
         let env_id = Uuid::new_v4().to_string();
         let mut vault_key = core_vault::generate_vault_key();
-        let enc_vault_key = core_vault::wrap_vault_key(master_key, &vault_key, &env_id);
+        let grant = core_vault::grant_vault_key(&keypair.public, &vault_key)?;
         vault_key.zeroize();
-        store.create_environment(&env_id, project_id, name, &enc_vault_key)?;
+        store.create_environment(&env_id, project_id, name, &grant)?;
         Ok(())
     }
 
     /// Open an environment for reading and writing.
     ///
-    /// Unwrapping the vault key with `master_key` doubles as the unlock check: a wrong master key
-    /// (or a tampered store) yields [`Error::Crypto`].
+    /// Opening the vault-key grant with `keypair` doubles as the check: a wrong keypair (or a
+    /// tampered store) yields [`Error::Crypto`].
     pub fn open(
         store: &'a Store,
-        master_key: &[u8; KEY_LEN],
+        keypair: &wrap::Keypair,
         project_id: &str,
         env_name: &str,
     ) -> Result<Self> {
         let env = store
             .get_environment(project_id, env_name)?
             .ok_or_else(|| Error::NotFound(format!("environment `{env_name}`")))?;
-        let vault_key = core_vault::unwrap_vault_key(master_key, &env.enc_vault_key, &env.id)?;
+        let vault_key = core_vault::open_vault_key(keypair, &env.enc_vault_key)?;
         Ok(Self {
             store,
             env_id: env.id,
@@ -246,26 +245,25 @@ mod tests {
     use super::*;
     use crate::store::Store;
 
-    const MASTER: [u8; KEY_LEN] = [0x42; KEY_LEN];
-
-    fn project() -> (Store, String) {
+    fn project() -> (Store, wrap::Keypair, String) {
         let store = Store::open_in_memory().unwrap();
-        let project = Vault::create_project(&store, &MASTER, "acme").unwrap();
-        (store, project.id)
+        let keypair = wrap::generate_keypair();
+        let project = Vault::create_project(&store, &keypair, "acme").unwrap();
+        (store, keypair, project.id)
     }
 
     #[test]
     fn set_get_round_trip() {
-        let (store, pid) = project();
-        let vault = Vault::open(&store, &MASTER, &pid, "dev").unwrap();
+        let (store, keypair, pid) = project();
+        let vault = Vault::open(&store, &keypair, &pid, "dev").unwrap();
         vault.set("DATABASE_URL", b"postgres://localhost").unwrap();
         assert_eq!(vault.get("DATABASE_URL").unwrap(), b"postgres://localhost");
     }
 
     #[test]
     fn entries_returns_sorted_name_value_pairs() {
-        let (store, pid) = project();
-        let vault = Vault::open(&store, &MASTER, &pid, "dev").unwrap();
+        let (store, keypair, pid) = project();
+        let vault = Vault::open(&store, &keypair, &pid, "dev").unwrap();
         vault.set("B_KEY", b"b").unwrap();
         vault.set("A_KEY", b"a").unwrap();
         assert_eq!(
@@ -279,8 +277,8 @@ mod tests {
 
     #[test]
     fn set_updates_existing_in_place() {
-        let (store, pid) = project();
-        let vault = Vault::open(&store, &MASTER, &pid, "dev").unwrap();
+        let (store, keypair, pid) = project();
+        let vault = Vault::open(&store, &keypair, &pid, "dev").unwrap();
         vault.set("KEY", b"v1").unwrap();
         vault.set("KEY", b"v2").unwrap();
         assert_eq!(vault.get("KEY").unwrap(), b"v2");
@@ -290,8 +288,8 @@ mod tests {
 
     #[test]
     fn list_names_is_sorted_and_resolution_is_correct() {
-        let (store, pid) = project();
-        let vault = Vault::open(&store, &MASTER, &pid, "dev").unwrap();
+        let (store, keypair, pid) = project();
+        let vault = Vault::open(&store, &keypair, &pid, "dev").unwrap();
         vault.set("B_KEY", b"b").unwrap();
         vault.set("A_KEY", b"a").unwrap();
         assert_eq!(vault.list_names().unwrap(), vec!["A_KEY", "B_KEY"]);
@@ -301,8 +299,8 @@ mod tests {
 
     #[test]
     fn delete_then_get_is_not_found() {
-        let (store, pid) = project();
-        let vault = Vault::open(&store, &MASTER, &pid, "dev").unwrap();
+        let (store, keypair, pid) = project();
+        let vault = Vault::open(&store, &keypair, &pid, "dev").unwrap();
         vault.set("KEY", b"v").unwrap();
         vault.delete("KEY").unwrap();
         assert!(matches!(vault.get("KEY"), Err(Error::NotFound(_))));
@@ -310,8 +308,8 @@ mod tests {
 
     #[test]
     fn set_after_delete_resurrects_same_secret() {
-        let (store, pid) = project();
-        let vault = Vault::open(&store, &MASTER, &pid, "dev").unwrap();
+        let (store, keypair, pid) = project();
+        let vault = Vault::open(&store, &keypair, &pid, "dev").unwrap();
         vault.set("KEY", b"v1").unwrap();
         vault.delete("KEY").unwrap();
         vault.set("KEY", b"v2").unwrap();
@@ -329,9 +327,9 @@ mod tests {
     }
 
     #[test]
-    fn wrong_master_key_cannot_open() {
-        let (store, pid) = project();
-        let wrong = [0x99; KEY_LEN];
+    fn wrong_keypair_cannot_open() {
+        let (store, _keypair, pid) = project();
+        let wrong = wrap::generate_keypair();
         assert!(matches!(
             Vault::open(&store, &wrong, &pid, "dev"),
             Err(Error::Crypto)
@@ -340,17 +338,17 @@ mod tests {
 
     #[test]
     fn environments_are_isolated() {
-        let (store, pid) = project();
-        Vault::open(&store, &MASTER, &pid, "dev")
+        let (store, keypair, pid) = project();
+        Vault::open(&store, &keypair, &pid, "dev")
             .unwrap()
             .set("KEY", b"dev-val")
             .unwrap();
-        Vault::open(&store, &MASTER, &pid, "prod")
+        Vault::open(&store, &keypair, &pid, "prod")
             .unwrap()
             .set("KEY", b"prod-val")
             .unwrap();
-        let dev = Vault::open(&store, &MASTER, &pid, "dev").unwrap();
-        let prod = Vault::open(&store, &MASTER, &pid, "prod").unwrap();
+        let dev = Vault::open(&store, &keypair, &pid, "dev").unwrap();
+        let prod = Vault::open(&store, &keypair, &pid, "prod").unwrap();
         assert_eq!(dev.get("KEY").unwrap(), b"dev-val");
         assert_eq!(prod.get("KEY").unwrap(), b"prod-val");
     }

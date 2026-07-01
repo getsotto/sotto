@@ -1,8 +1,9 @@
 // In-browser vault crypto — the same operations the CLI runs, via the WASM core.
 //
 // The master key is derived from the password + pasted secret key + account salt (Argon2id in
-// WASM), held only in memory. It unwraps a per-environment vault key, which decrypts each secret's
-// name/value. Sealing a secret for a share link produces the ciphertext + the fragment key.
+// WASM), held only in memory. It recovers the account keypair, which opens a per-environment
+// vault-key grant, which decrypts each secret's name/value. Sealing a secret for a share link
+// produces the ciphertext + the fragment key.
 
 import {
   aead_open,
@@ -12,7 +13,7 @@ import {
   share_seal,
   vault_decrypt_name,
   vault_decrypt_value,
-  vault_unwrap_key,
+  vault_open_grant,
 } from "./wasm";
 
 const TEXT = new TextEncoder();
@@ -38,12 +39,14 @@ export async function deriveMasterKey(
   return kdf_derive_master_key(TEXT.encode(password), secretKeyBytes, salt);
 }
 
-export function unwrapVaultKey(
+/// Open an environment's vault-key grant: recover the account keypair from the master-sealed
+/// private keys, then unseal the grant. The private key never leaves WASM.
+export function openEnvGrant(
   master: Uint8Array,
-  encVaultKey: Uint8Array,
-  envId: string,
+  encPrivateKeys: Uint8Array,
+  grant: Uint8Array,
 ): Uint8Array {
-  return vault_unwrap_key(master, encVaultKey, envId);
+  return vault_open_grant(master, encPrivateKeys, grant);
 }
 
 export function decryptSecretName(vaultKey: Uint8Array, envId: string, s: SecretEntry): string {

@@ -31,14 +31,14 @@ const SHARE_KEY: [u8; 32] = [0x33; 32];
 const SHARE_PT: &[u8] = b"share-secret-value";
 const SHARE_ENV_HEX: &str = "01012d36369a6771d17a1499ea93651931075e9ab1606c38e20c0885df13bc7508aa4e6dadaf7173b4d4c03bffb2aa81b7eb51333ed415acee97f59d";
 
-const VAULT_MASTER: [u8; 32] = [0x55; 32];
 const VAULT_KEY: [u8; 32] = [0x66; 32];
+const VAULT_GRANT_SECRET: [u8; 32] = [0x77; 32];
 const VAULT_ENV_ID: &str = "env-123";
 const VAULT_SECRET_ID: &str = "sec-1";
 const VAULT_VERSION: i64 = 3;
 const VAULT_NAME: &[u8] = b"DATABASE_URL";
 const VAULT_VALUE: &[u8] = b"postgres://x";
-const VAULT_ENC_KEY_HEX: &str = "0101da3c7961f0fef5b01148ccfd374abce4442120427c9b8e9e63113e8887b8f2112db3c8a4f21a77190f706d5da739e2287308b018f61e54afe95a0d7b65383d88f2dcd4c5aa91275e";
+const VAULT_GRANT_HEX: &str = "a47d6998938252e46ab272d1e4b6ef8b2616527ec73ddd7f7c9c68728d28a64760781f0681869360fde0158d6b74873d6f0a148ec9320bcc47122aa5206799870bf605f0b008b67756de40b3579b9e71";
 const VAULT_ENC_NAME_HEX: &str = "01016b1f915d1c1b92deb0518f6bcf5a3378d13b57ab030d540a690f47c4791b04cb62c673358a64719bd959b30d39134d6cb180a2b3";
 const VAULT_ENC_VALUE_HEX: &str = "01017d89c8584a0be4253539c83451ac7cf8ab34a20d73b4e81ec02d5f433618c25b0d6924317d2d957c8a71fe439093a626e375f93e";
 const VAULT_ENC_DATA_KEY_HEX: &str = "01016cbe18dc1fdc4c4df0287e80e06600c93d0ac2217f8bcfd9066099dca7b3e80b04dce3cd344b67c38381e7d5519c4ccda464d7bb0e12366c9cf519f0cd6bca84e52714e612ecc2fa";
@@ -87,9 +87,10 @@ pub fn verify_cross_impl() -> Result<(), &'static str> {
         return Err("share aad not enforced");
     }
 
-    // Vault key hierarchy: unwrap the env vault key, then decrypt a native-produced secret.
-    let vault_key = vault::unwrap_vault_key(&VAULT_MASTER, &unhex(VAULT_ENC_KEY_HEX), VAULT_ENV_ID)
-        .map_err(|_| "vault key unwrap")?;
+    // Vault key hierarchy: open a native-produced grant to the env vault key, then decrypt a secret.
+    let member = wrap::keypair_from_secret(&VAULT_GRANT_SECRET);
+    let vault_key =
+        vault::open_vault_key(&member, &unhex(VAULT_GRANT_HEX)).map_err(|_| "vault grant open")?;
     if vault_key != VAULT_KEY {
         return Err("vault key mismatch");
     }

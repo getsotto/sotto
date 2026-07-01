@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { fetchAccountSalt, logout, me } from "./api";
+import { fetchAccount, logout, me } from "./api";
 import { deriveMasterKey } from "./vault";
 import { VaultView } from "./VaultView";
 
@@ -8,8 +8,8 @@ type Phase =
   | { kind: "checking" }
   | { kind: "error"; message: string }
   | { kind: "loggedOut" }
-  | { kind: "locked"; salt: Uint8Array }
-  | { kind: "unlocked"; master: Uint8Array };
+  | { kind: "locked"; salt: Uint8Array; encPrivateKeys: Uint8Array }
+  | { kind: "unlocked"; master: Uint8Array; encPrivateKeys: Uint8Array };
 
 // Begin the OAuth flow: the server sets an httpOnly cookie and redirects back to /auth/callback.
 function startLogin() {
@@ -32,15 +32,15 @@ export function VaultApp() {
           setPhase({ kind: "loggedOut" });
           return;
         }
-        const salt = await fetchAccountSalt();
-        if (salt === null) {
+        const account = await fetchAccount();
+        if (account === null) {
           setPhase({
             kind: "error",
             message: "No account found — set up Sotto with the CLI first.",
           });
           return;
         }
-        setPhase({ kind: "locked", salt });
+        setPhase({ kind: "locked", salt: account.salt, encPrivateKeys: account.encPrivateKeys });
       } catch (e) {
         setPhase({ kind: "error", message: e instanceof Error ? e.message : String(e) });
       }
@@ -85,12 +85,20 @@ export function VaultApp() {
       return (
         <UnlockForm
           salt={phase.salt}
-          onUnlock={(master) => setPhase({ kind: "unlocked", master })}
+          onUnlock={(master) =>
+            setPhase({ kind: "unlocked", master, encPrivateKeys: phase.encPrivateKeys })
+          }
           onLogout={doLogout}
         />
       );
     case "unlocked":
-      return <VaultView master={phase.master} onLogout={doLogout} />;
+      return (
+        <VaultView
+          master={phase.master}
+          encPrivateKeys={phase.encPrivateKeys}
+          onLogout={doLogout}
+        />
+      );
   }
 }
 

@@ -324,12 +324,13 @@ fn init(store: &Store, keychain: &dyn Keychain, cwd: &Path, name: Option<String>
     }
 
     let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
+    let keypair = session::account_keypair(store, &master)?;
     let project_name = name.unwrap_or_else(|| {
         cwd.file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "project".to_string())
     });
-    let project = Vault::create_project(store, master.as_bytes(), &project_name)?;
+    let project = Vault::create_project(store, &keypair, &project_name)?;
     let config = Config {
         project_id: project.id,
         project: project_name,

@@ -284,6 +284,20 @@ mod tests {
 
     const MASTER: [u8; 32] = [0x42; 32];
 
+    /// A fixed account keypair for the vault-key grants, shared by the mock "devices" (they are the
+    /// same user, so their grants open with the same keypair). Independent of the name-encryption
+    /// `MASTER` above.
+    fn test_keypair() -> sotto_core::wrap::Keypair {
+        sotto_core::wrap::keypair_from_secret(&[0x42; 32])
+    }
+
+    /// Recover a device's real account keypair (used by the reconstruction tests, where the vault
+    /// keypair must genuinely match across devices).
+    fn device_keypair(store: &Store, master: &[u8; 32]) -> sotto_core::wrap::Keypair {
+        let enc_private_keys = store.get_account_keys().unwrap().unwrap().enc_private_keys;
+        sotto_core::vault::open_account_keypair(master, &enc_private_keys).unwrap()
+    }
+
     // --- a faithful in-memory server mirroring the real endpoints' semantics ---
 
     struct ServerSecret {
@@ -483,7 +497,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let kc = crate::keychain::MemoryKeychain::default();
         crate::session::init(&store, &kc, b"pw", std::time::Duration::from_secs(3600)).unwrap();
-        let project = Vault::create_project(&store, &MASTER, "acme").unwrap();
+        let project = Vault::create_project(&store, &test_keypair(), "acme").unwrap();
         let config = Config {
             project_id: project.id.clone(),
             project: "acme".into(),
@@ -514,7 +528,7 @@ mod tests {
     fn push_provisions_and_round_trips_through_pull() {
         let api = MockApi::default();
         let (store, project, config) = device();
-        Vault::open(&store, &MASTER, &project.id, "dev")
+        Vault::open(&store, &test_keypair(), &project.id, "dev")
             .unwrap()
             .set("DATABASE_URL", b"postgres://prod")
             .unwrap();
@@ -526,7 +540,7 @@ mod tests {
         // A second device pulls and decrypts the same value.
         let b = mirror(&store, &project);
         assert_eq!(pull(&api, &b, &config).unwrap(), 1);
-        let value = Vault::open(&b, &MASTER, &project.id, "dev")
+        let value = Vault::open(&b, &test_keypair(), &project.id, "dev")
             .unwrap()
             .get("DATABASE_URL")
             .unwrap();
@@ -537,7 +551,7 @@ mod tests {
     fn updates_and_deletes_propagate() {
         let api = MockApi::default();
         let (store, project, config) = device();
-        let a = Vault::open(&store, &MASTER, &project.id, "dev").unwrap();
+        let a = Vault::open(&store, &test_keypair(), &project.id, "dev").unwrap();
         a.set("KEY", b"v1").unwrap();
         push(&api, &store, &MASTER, &config).unwrap();
         let b = mirror(&store, &project);
@@ -548,7 +562,7 @@ mod tests {
         push(&api, &store, &MASTER, &config).unwrap();
         pull(&api, &b, &config).unwrap();
         assert_eq!(
-            Vault::open(&b, &MASTER, &project.id, "dev")
+            Vault::open(&b, &test_keypair(), &project.id, "dev")
                 .unwrap()
                 .get("KEY")
                 .unwrap(),
@@ -560,7 +574,7 @@ mod tests {
         push(&api, &store, &MASTER, &config).unwrap();
         pull(&api, &b, &config).unwrap();
         assert!(matches!(
-            Vault::open(&b, &MASTER, &project.id, "dev")
+            Vault::open(&b, &test_keypair(), &project.id, "dev")
                 .unwrap()
                 .get("KEY"),
             Err(Error::NotFound(_))
@@ -571,7 +585,7 @@ mod tests {
     fn pull_when_unchanged_is_a_noop() {
         let api = MockApi::default();
         let (store, project, config) = device();
-        Vault::open(&store, &MASTER, &project.id, "dev")
+        Vault::open(&store, &test_keypair(), &project.id, "dev")
             .unwrap()
             .set("K", b"v")
             .unwrap();
@@ -586,7 +600,7 @@ mod tests {
         let (store, project, config) = device();
         let b = {
             // B must exist on the server first; A's push provisions the env.
-            Vault::open(&store, &MASTER, &project.id, "dev")
+            Vault::open(&store, &test_keypair(), &project.id, "dev")
                 .unwrap()
                 .set("AKEY", b"a0")
                 .unwrap();
@@ -597,20 +611,20 @@ mod tests {
 
         // B writes BKEY and pushes; then A writes another key and pushes (its internal pull
         // rebases onto B's revision).
-        Vault::open(&b, &MASTER, &project.id, "dev")
+        Vault::open(&b, &test_keypair(), &project.id, "dev")
             .unwrap()
             .set("BKEY", b"b0")
             .unwrap();
         push(&api, &b, &MASTER, &config).unwrap();
 
-        Vault::open(&store, &MASTER, &project.id, "dev")
+        Vault::open(&store, &test_keypair(), &project.id, "dev")
             .unwrap()
             .set("CKEY", b"c0")
             .unwrap();
         push(&api, &store, &MASTER, &config).unwrap();
         pull(&api, &store, &config).unwrap();
 
-        let a = Vault::open(&store, &MASTER, &project.id, "dev").unwrap();
+        let a = Vault::open(&store, &test_keypair(), &project.id, "dev").unwrap();
         assert_eq!(a.get("AKEY").unwrap(), b"a0");
         assert_eq!(a.get("BKEY").unwrap(), b"b0");
         assert_eq!(a.get("CKEY").unwrap(), b"c0");
@@ -620,7 +634,7 @@ mod tests {
     fn push_retries_after_a_conflict() {
         let api = MockApi::default();
         let (store, project, config) = device();
-        Vault::open(&store, &MASTER, &project.id, "dev")
+        Vault::open(&store, &test_keypair(), &project.id, "dev")
             .unwrap()
             .set("K", b"v")
             .unwrap();
@@ -646,7 +660,8 @@ mod tests {
             .unwrap()
             .unwrap()
             .as_bytes();
-        let project = Vault::create_project(&store, &master, "acme").unwrap();
+        let keypair = device_keypair(&store, &master);
+        let project = Vault::create_project(&store, &keypair, "acme").unwrap();
         let config = Config {
             project_id: project.id.clone(),
             project: "acme".into(),
@@ -659,10 +674,15 @@ mod tests {
     fn new_device_reconstructs_identity_environment_and_secrets() {
         let api = MockApi::default();
         let (store_a, master_a, kit, project, config) = real_device();
-        Vault::open(&store_a, &master_a, &project.id, "dev")
-            .unwrap()
-            .set("DATABASE_URL", b"postgres://prod")
-            .unwrap();
+        Vault::open(
+            &store_a,
+            &device_keypair(&store_a, &master_a),
+            &project.id,
+            "dev",
+        )
+        .unwrap()
+        .set("DATABASE_URL", b"postgres://prod")
+        .unwrap();
         push(&api, &store_a, &master_a, &config).unwrap();
 
         // New device: fresh store, reconstruct identity from the server account + Emergency Kit.
@@ -694,10 +714,15 @@ mod tests {
 
         // The env name was decrypted, and the secret decrypts with the reconstructed master key.
         assert_eq!(store_b.list_environments(&project.id).unwrap(), vec!["dev"]);
-        let value = Vault::open(&store_b, &master_b, &project.id, "dev")
-            .unwrap()
-            .get("DATABASE_URL")
-            .unwrap();
+        let value = Vault::open(
+            &store_b,
+            &device_keypair(&store_b, &master_b),
+            &project.id,
+            "dev",
+        )
+        .unwrap()
+        .get("DATABASE_URL")
+        .unwrap();
         assert_eq!(value, b"postgres://prod");
     }
 

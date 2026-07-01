@@ -14,7 +14,7 @@ import init, {
   share_seal,
   vault_decrypt_name,
   vault_decrypt_value,
-  vault_unwrap_key,
+  vault_open_grant,
 } from "./wasm/sotto_wasm.js";
 import wasmUrl from "./wasm/sotto_wasm_bg.wasm?url";
 
@@ -47,5 +47,5 @@ export {
   share_seal,
   vault_decrypt_name,
   vault_decrypt_value,
-  vault_unwrap_key,
+  vault_open_grant,
 };

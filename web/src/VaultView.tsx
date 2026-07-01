@@ -14,8 +14,8 @@ import {
   decryptProjectName,
   decryptSecretName,
   decryptSecretValue,
+  openEnvGrant,
   sealForShare,
-  unwrapVaultKey,
   type SecretEntry,
 } from "./vault";
 
@@ -55,7 +55,15 @@ function nameOr(id: string, decrypt: () => string): string {
   }
 }
 
-export function VaultView({ master, onLogout }: { master: Uint8Array; onLogout: () => void }) {
+export function VaultView({
+  master,
+  encPrivateKeys,
+  onLogout,
+}: {
+  master: Uint8Array;
+  encPrivateKeys: Uint8Array;
+  onLogout: () => void;
+}) {
   const [projects, setProjects] = useState<NamedProject[] | null>(null);
   const [envs, setEnvs] = useState<NamedEnv[] | null>(null);
   const [openEnv, setOpenEnv] = useState<OpenEnv | null>(null);
@@ -98,7 +106,7 @@ export function VaultView({ master, onLogout }: { master: Uint8Array; onLogout: 
     setOpenEnv(null);
     setRevealed(null);
     try {
-      const vaultKey = unwrapVaultKey(master, ne.env.encVaultKey, ne.env.id);
+      const vaultKey = openEnvGrant(master, encPrivateKeys, ne.env.encVaultKey);
       const secrets = (await fetchSecrets(ne.env.id))
         .filter((entry) => !entry.deleted)
         .map((entry) => ({
