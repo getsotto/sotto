@@ -5,9 +5,16 @@
 // promise; a failed init is not cached, so a subsequent call retries instead of staying broken.
 
 import init, {
+  aead_open,
+  format_decode_key,
+  kdf_derive_master_key,
   scheme_version,
   share_open,
   share_passphrase_key,
+  share_seal,
+  vault_decrypt_name,
+  vault_decrypt_value,
+  vault_unwrap_key,
 } from "./wasm/sotto_wasm.js";
 import wasmUrl from "./wasm/sotto_wasm_bg.wasm?url";
 
@@ -30,4 +37,15 @@ export function loadWasm(): Promise<void> {
   return pending;
 }
 
-export { scheme_version, share_open, share_passphrase_key };
+export {
+  aead_open,
+  format_decode_key,
+  kdf_derive_master_key,
+  scheme_version,
+  share_open,
+  share_passphrase_key,
+  share_seal,
+  vault_decrypt_name,
+  vault_decrypt_value,
+  vault_unwrap_key,
+};

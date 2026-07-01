@@ -32,6 +32,15 @@ fn share_round_trip_via_bindings() {
     assert_eq!(pt, b"share-me");
 }
 
+/// Decoding a human key string (a pasted secret key) works in WASM.
+#[wasm_bindgen_test]
+fn decode_key_via_bindings() {
+    // The golden `KEYSTRING` vector: `encode_key("SK", 1, &[0xAB; 16])`.
+    let bytes = sotto_wasm::format_decode_key("SK", 1, "SK1-NENTQ-AXBNE-NTQAX-BNENT-QAXBN-DDBW")
+        .unwrap_or_else(|_| panic!("decode"));
+    assert_eq!(bytes, [0xAB; 16]);
+}
+
 /// Vault key hierarchy via the bindings (the in-browser vault read/write path runs in WASM).
 #[wasm_bindgen_test]
 fn vault_round_trip_via_bindings() {

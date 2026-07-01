@@ -17,3 +17,18 @@ export function urlSafeB64ToBytes(b64url: string): Uint8Array {
   }
   return standardB64ToBytes(b64);
 }
+
+export function bytesToStandardB64(bytes: Uint8Array): string {
+  // Build the binary string in chunks: appending one char at a time is slow for large blobs, while
+  // `String.fromCharCode(...bytes)` overflows the call-argument limit. Chunking avoids both.
+  let binary = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+export function bytesToUrlSafeB64(bytes: Uint8Array): string {
+  return bytesToStandardB64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}

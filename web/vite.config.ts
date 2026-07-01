@@ -30,14 +30,24 @@ function cspPlugin(): Plugin {
   };
 }
 
+// Dev only: proxy the API endpoints so the browser talks to a single origin (keeps CSP
+// `connect-src 'self'` and the session cookie same-origin). Production serves the web app and API
+// from one origin (a reverse proxy). `/auth/callback` is intentionally NOT proxied — it's the SPA's
+// post-login page, whereas `/auth/github/*` are the server's OAuth endpoints.
+const api = { target: "http://localhost:8080", changeOrigin: true };
+
 export default defineConfig({
   plugins: [react(), cspPlugin()],
   build: { target: "es2022" },
-  // Dev only: proxy the API so the browser talks to a single origin (keeps CSP `connect-src
-  // 'self'`). Production serves the web app and API from the same origin (a reverse proxy).
   server: {
     proxy: {
-      "/shares": { target: "http://localhost:8080", changeOrigin: true },
+      "/auth/github": api,
+      "/auth/me": api,
+      "/auth/logout": api,
+      "/account": api,
+      "/projects": api,
+      "/environments": api,
+      "/shares": api,
     },
   },
 });
