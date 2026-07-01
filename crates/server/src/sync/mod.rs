@@ -5,6 +5,7 @@
 //! pull keyed by a monotonic per-environment `revision` (the ETag, and the anti-rollback signal),
 //! with atomic batch writes guarded by optimistic concurrency on that revision.
 
+pub(crate) mod access;
 pub mod environments;
 pub mod projects;
 pub mod secrets;

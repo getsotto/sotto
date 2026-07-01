@@ -55,7 +55,7 @@ impl Role {
 
     /// Parse a role from its stored text. Unknown values mean the DB and this enum disagree — a bug,
     /// not client input (a `CHECK` constraint keeps the column to the three known values).
-    fn from_db(s: &str) -> Result<Role> {
+    pub(crate) fn from_db(s: &str) -> Result<Role> {
         match s {
             "owner" => Ok(Role::Owner),
             "admin" => Ok(Role::Admin),
@@ -74,10 +74,33 @@ impl Role {
         }
     }
 
+    /// Whether this role is at least as privileged as `other` (the ordering behind capability
+    /// checks, both here and in the sync layer's resource access).
+    pub(crate) fn is_at_least(self, other: Role) -> bool {
+        self.rank() >= other.rank()
+    }
+
     /// Whether this role may add, update, or remove members (owners and admins may; members may not).
     fn can_manage_members(self) -> bool {
-        self.rank() >= Role::Admin.rank()
+        self.is_at_least(Role::Admin)
     }
+}
+
+/// The caller's role in `org_id` if they are a member, else `None` — a non-erroring lookup for the
+/// sync layer's access checks (which turn "not a member" into a resource `404`, not an org error).
+pub(crate) async fn role_of(
+    pool: &sqlx::PgPool,
+    org_id: &str,
+    user_id: &str,
+) -> Result<Option<Role>> {
+    let role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM organization_memberships WHERE org_id = $1 AND user_id = $2",
+    )
+    .bind(org_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    role.map(|r| Role::from_db(&r)).transpose()
 }
 
 // --- request/response shapes -------------------------------------------------------------------
