@@ -80,6 +80,7 @@ export function VaultView({ master, onLogout }: { master: Uint8Array; onLogout: 
 
   async function selectProject(np: NamedProject) {
     setError(null);
+    setEnvs(null);
     setOpenEnv(null);
     setRevealed(null);
     try {
