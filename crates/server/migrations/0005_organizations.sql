@@ -23,8 +23,18 @@ CREATE TABLE IF NOT EXISTS organization_memberships (
     -- Enforced in SQL as a backstop to the application's `Role` enum, so a bad write can't slip in.
     role       TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Roles are mutable (a member can be promoted or demoted); `updated_at` records when so a role
+    -- change is auditable, not just its creation. Maintained by the trigger below.
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (org_id, user_id)
 );
+
+-- Reuse the `set_updated_at()` trigger function from 0001 so a role change stamps `updated_at`.
+DROP TRIGGER IF EXISTS organization_memberships_set_updated_at ON organization_memberships;
+CREATE TRIGGER organization_memberships_set_updated_at
+BEFORE UPDATE ON organization_memberships
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
 
 -- "Which orgs is this user in?" is the hot lookup (every org-scoped request resolves the caller's
 -- role); the PK already indexes "who is in this org?".
