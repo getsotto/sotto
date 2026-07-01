@@ -48,7 +48,15 @@ export function VaultApp() {
   }, []);
 
   function doLogout() {
-    void logout().finally(() => setPhase({ kind: "loggedOut" }));
+    void (async () => {
+      try {
+        await logout();
+        setPhase({ kind: "loggedOut" });
+      } catch (e) {
+        // The server couldn't clear the session — don't pretend we're logged out.
+        setPhase({ kind: "error", message: e instanceof Error ? e.message : String(e) });
+      }
+    })();
   }
 
   switch (phase.kind) {

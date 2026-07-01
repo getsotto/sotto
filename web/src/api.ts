@@ -31,7 +31,12 @@ export async function me(): Promise<{ userId: string } | null> {
 }
 
 export async function logout(): Promise<void> {
-  await fetch("/auth/logout", { method: "POST", ...CREDS });
+  const resp = await fetch("/auth/logout", { method: "POST", ...CREDS });
+  if (!resp.ok) {
+    // The session cookie is httpOnly, so only the server can clear it; report failure rather than
+    // letting callers assume the session is gone.
+    throw new Error(`server error (${resp.status})`);
+  }
 }
 
 /// The account KDF salt (needed to derive the master key), or `null` if the account isn't set up.
