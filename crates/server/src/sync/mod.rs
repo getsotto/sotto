@@ -7,6 +7,7 @@
 
 pub(crate) mod access;
 pub mod environments;
+pub mod grants;
 pub mod projects;
 pub mod secrets;
 
@@ -40,4 +41,5 @@ pub fn router() -> Router<AppState> {
         .merge(projects::router())
         .merge(environments::router())
         .merge(secrets::router())
+        .merge(grants::router())
 }

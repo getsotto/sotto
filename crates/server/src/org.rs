@@ -32,6 +32,7 @@ pub fn router() -> Router<AppState> {
             "/orgs/{org_id}/members/{user_id}",
             post(update_member).delete(remove_member),
         )
+        .route("/orgs/{org_id}/invites", post(invite_member))
 }
 
 /// A member's role in an organization. Ordered `member < admin < owner`; the numeric [`Role::rank`]
@@ -134,6 +135,22 @@ struct UpdateMember {
 struct MemberView {
     user_id: String,
     role: Role,
+    /// The member's X25519 public key (base64), or `null` if they haven't set up their account yet.
+    /// Sharing an environment seals its vault key to this.
+    public_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Invite {
+    email: String,
+}
+
+#[derive(Serialize)]
+struct InviteResult {
+    /// The resolved user's id, now a `member` of the org.
+    user_id: String,
+    /// Their public key (base64) if set — lets the inviter seal env grants immediately.
+    public_key: Option<String>,
 }
 
 // --- authorization helpers ---------------------------------------------------------------------
@@ -297,8 +314,10 @@ async fn list_members(
 ) -> Result<Json<Vec<MemberView>>> {
     caller_role(&state, &org_id, &user.user_id).await?;
 
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT user_id, role FROM organization_memberships WHERE org_id = $1 ORDER BY user_id",
+    let rows: Vec<(String, String, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT m.user_id, m.role, u.public_key \
+         FROM organization_memberships m JOIN users u ON m.user_id = u.id \
+         WHERE m.org_id = $1 ORDER BY m.user_id",
     )
     .bind(&org_id)
     .fetch_all(&state.pool)
@@ -306,10 +325,11 @@ async fn list_members(
 
     let members = rows
         .into_iter()
-        .map(|(user_id, role)| {
+        .map(|(user_id, role, public_key)| {
             Ok(MemberView {
                 user_id,
                 role: Role::from_db(&role)?,
+                public_key: public_key.as_deref().map(encoding::encode),
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -356,6 +376,54 @@ async fn add_member(
         Err(e) if is_user_fk_violation(&e) => Err(Error::NotFound("user not found".into())),
         Err(e) => Err(e.into()),
     }
+}
+
+/// `POST /orgs/{org_id}/invites` — invite an existing Sotto user by email (admin+). The email must
+/// resolve to exactly one existing user, who is added as a `member`; returns their id + public key
+/// so the inviter can seal env grants right away. 404 if no such user, 409 if ambiguous or already a
+/// member. (Existing-users-only: there is no pending-invite/onboarding flow yet.)
+async fn invite_member(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(org_id): Path<String>,
+    Json(body): Json<Invite>,
+) -> Result<Json<InviteResult>> {
+    let caller = caller_role(&state, &org_id, &user.user_id).await?;
+    if !caller.can_manage_members() {
+        return Err(Error::Forbidden(
+            "must be an admin or owner to invite members".into(),
+        ));
+    }
+
+    // Resolve the email to exactly one existing user (email is not unique in the schema, so guard
+    // against the ambiguous case rather than silently picking one).
+    let matches: Vec<(String, Option<Vec<u8>>)> =
+        sqlx::query_as("SELECT id, public_key FROM users WHERE email = $1")
+            .bind(&body.email)
+            .fetch_all(&state.pool)
+            .await?;
+    let (target_id, public_key) = match matches.as_slice() {
+        [] => return Err(Error::NotFound("no Sotto user with that email".into())),
+        [only] => only.clone(),
+        _ => return Err(Error::Conflict("multiple users share that email".into())),
+    };
+
+    let inserted: Option<String> = sqlx::query_scalar(
+        "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, 'member') \
+         ON CONFLICT (org_id, user_id) DO NOTHING RETURNING user_id",
+    )
+    .bind(&org_id)
+    .bind(&target_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    if inserted.is_none() {
+        return Err(Error::Conflict("user is already a member".into()));
+    }
+
+    Ok(Json(InviteResult {
+        user_id: target_id,
+        public_key: public_key.as_deref().map(encoding::encode),
+    }))
 }
 
 /// `POST /orgs/{org_id}/members/{user_id}` — change a member's role (admin+). Changing to or from

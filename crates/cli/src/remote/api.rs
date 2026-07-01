@@ -33,6 +33,45 @@ pub struct AccountBundle {
 pub struct NewProject {
     pub id: String,
     pub enc_name: String,
+    /// Owning organization, when creating a shared project; omitted for a personal one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+}
+
+/// An organization to create (its name is opaque ciphertext, like a project's).
+#[derive(Debug, Clone, Serialize)]
+pub struct NewOrg {
+    pub id: String,
+    pub enc_name: String,
+}
+
+/// An organization the caller belongs to, with their own role in it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrgInfo {
+    pub id: String,
+    pub enc_name: String,
+    pub role: String,
+}
+
+/// The result of inviting a user: their id (now a member) and public key (for sealing grants).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Invited {
+    pub user_id: String,
+    pub public_key: Option<String>,
+}
+
+/// A member of an organization.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemberInfo {
+    pub user_id: String,
+    pub role: String,
+    pub public_key: Option<String>,
+}
+
+/// The caller's vault-key grant for an environment (base64), as returned by `GET .../grant`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GrantView {
+    pub enc_vault_key: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,6 +203,21 @@ pub trait SyncApi {
     fn write_secrets(&self, env_id: &str, batch: &BatchRequest) -> Result<BatchResponse>;
     /// Create a share link; returns the public token.
     fn create_share(&self, share: &NewShare) -> Result<CreatedShare>;
+
+    // --- teams: organizations, invites, and environment vault-key grants ---
+
+    /// Create an organization (the caller becomes its owner).
+    fn create_org(&self, org: &NewOrg) -> Result<()>;
+    /// List the organizations the caller belongs to.
+    fn list_orgs(&self) -> Result<Vec<OrgInfo>>;
+    /// Invite an existing user (by email) into an org as a member; returns their id + public key.
+    fn invite_member(&self, org_id: &str, email: &str) -> Result<Invited>;
+    /// List an org's members (with their public keys, for sealing grants).
+    fn list_members(&self, org_id: &str) -> Result<Vec<MemberInfo>>;
+    /// Store a member's vault-key grant for an environment (sharing).
+    fn create_grant(&self, env_id: &str, user_id: &str, enc_vault_key: &str) -> Result<()>;
+    /// Fetch the caller's own vault-key grant for an environment, or `None` if they have none.
+    fn get_grant(&self, env_id: &str) -> Result<Option<String>>;
 }
 
 #[cfg(test)]

@@ -48,6 +48,35 @@ enum Command {
         /// Project name (defaults to the directory name).
         #[arg(long)]
         name: Option<String>,
+        /// Create the project inside an organization (shareable with that team).
+        #[arg(long)]
+        org: Option<String>,
+    },
+    /// Manage organizations (teams).
+    Org {
+        #[command(subcommand)]
+        command: OrgCommand,
+    },
+    /// Share the active environment with an organization member (by their user id).
+    Grant {
+        /// The member's user id (from `sotto org invite` or `sotto org members`).
+        user_id: String,
+    },
+    /// Clone a shared environment onto this device (run in the destination directory).
+    Clone {
+        /// The project id (told to you by whoever granted access).
+        project_id: String,
+        /// The environment id to clone.
+        env_id: String,
+        /// Local name for the cloned environment (names aren't shared-readable yet).
+        #[arg(long = "as", default_value = "shared")]
+        as_name: String,
+        /// Local label for the project.
+        #[arg(long, default_value = "shared")]
+        name: String,
+        /// The owning organization id (from the grantor), so later pushes match the server.
+        #[arg(long)]
+        org: Option<String>,
     },
     /// Log in to the sync server (opens a browser for OAuth).
     Login {
@@ -155,6 +184,18 @@ enum EnvCommand {
     Use { name: String },
 }
 
+#[derive(Subcommand)]
+enum OrgCommand {
+    /// Create an organization; prints its id.
+    Create { name: String },
+    /// List your organizations.
+    Ls,
+    /// Invite an existing Sotto user into an org by email; prints their user id.
+    Invite { org_id: String, email: String },
+    /// List an org's members and their ids.
+    Members { org_id: String },
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e}");
@@ -182,7 +223,32 @@ fn run() -> Result<()> {
     let cwd = std::env::current_dir().map_err(|e| Error::Io(e.to_string()))?;
 
     match cli.command {
-        Command::Init { name } => init(&store, &keychain, &cwd, name),
+        Command::Init { name, org } => init(&store, &keychain, &cwd, name, org),
+        Command::Org { command } => org_command(&store, &keychain, command),
+        Command::Grant { user_id } => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            ensure_unlocked(&store, &keychain)?;
+            grant_env(&store, &keychain, &config, &user_id)
+        }
+        Command::Clone {
+            project_id,
+            env_id,
+            as_name,
+            name,
+            org,
+        } => {
+            ensure_unlocked(&store, &keychain)?;
+            clone_env(
+                &store,
+                &keychain,
+                &cwd,
+                &project_id,
+                &env_id,
+                &name,
+                &as_name,
+                org.as_deref(),
+            )
+        }
         Command::Login { server, web } => login(&keychain, server.as_deref(), web.as_deref()),
         Command::Logout => {
             remote::auth::clear_session(&keychain)?;
@@ -301,7 +367,13 @@ fn run() -> Result<()> {
     }
 }
 
-fn init(store: &Store, keychain: &dyn Keychain, cwd: &Path, name: Option<String>) -> Result<()> {
+fn init(
+    store: &Store,
+    keychain: &dyn Keychain,
+    cwd: &Path,
+    name: Option<String>,
+    org: Option<String>,
+) -> Result<()> {
     if cwd.join(config::CONFIG_FILE).exists() {
         return Err(Error::Input(format!(
             "{} already exists in this directory",
@@ -335,9 +407,118 @@ fn init(store: &Store, keychain: &dyn Keychain, cwd: &Path, name: Option<String>
         project_id: project.id,
         project: project_name,
         environment: "dev".to_string(),
+        org_id: org,
     };
     config.save_to(cwd)?;
-    eprintln!("initialized `{}` ({})", config.project, config.environment);
+    match &config.org_id {
+        Some(org) => eprintln!(
+            "initialized `{}` ({}) in organization {org}",
+            config.project, config.environment
+        ),
+        None => eprintln!("initialized `{}` ({})", config.project, config.environment),
+    }
+    Ok(())
+}
+
+/// Organization management: create/list orgs, invite members, list members.
+fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> Result<()> {
+    let client = sync_client(keychain)?;
+    match command {
+        OrgCommand::Create { name } => {
+            ensure_unlocked(store, keychain)?;
+            let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
+            let id = remote::team::create_org(&client, master.as_bytes(), &name)?;
+            eprintln!("created organization `{name}`");
+            println!("{id}");
+            Ok(())
+        }
+        OrgCommand::Ls => {
+            ensure_unlocked(store, keychain)?;
+            let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
+            for org in remote::team::list_orgs(&client, master.as_bytes())? {
+                println!("{}  {}  ({})", org.id, org.name, org.role);
+            }
+            Ok(())
+        }
+        OrgCommand::Invite { org_id, email } => {
+            let invited = remote::team::invite(&client, &org_id, &email)?;
+            let keys = if invited.public_key.is_some() {
+                "ready to receive shares"
+            } else {
+                "no account keys yet — they must log in and set up before you can share"
+            };
+            eprintln!("invited {email} — {keys}");
+            println!("{}", invited.user_id);
+            Ok(())
+        }
+        OrgCommand::Members { org_id } => {
+            for m in remote::team::members(&client, &org_id)? {
+                let keys = if m.public_key.is_some() {
+                    "keys"
+                } else {
+                    "no-keys"
+                };
+                println!("{}  ({})  [{keys}]", m.user_id, m.role);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Share the active environment with an org member: reseal its vault key to them and upload it.
+fn grant_env(store: &Store, keychain: &dyn Keychain, config: &Config, user_id: &str) -> Result<()> {
+    let org_id = config.org_id.as_deref().ok_or_else(|| {
+        Error::Input(
+            "this project is not in an organization; create one with `sotto org create` and \
+             `sotto init --org <id>`"
+                .into(),
+        )
+    })?;
+    let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
+    let keypair = session::account_keypair(store, &master)?;
+    let client = sync_client(keychain)?;
+    let env_id = remote::team::share_env(&client, store, &keypair, org_id, user_id, config)?;
+    eprintln!(
+        "shared {}/{} with {user_id}; they can clone it with:",
+        config.project, config.environment
+    );
+    println!("sotto clone {} {env_id} --org {org_id}", config.project_id);
+    Ok(())
+}
+
+/// Clone a shared environment into the current directory: fetch our grant, reconstruct it, and pull.
+#[allow(clippy::too_many_arguments)]
+fn clone_env(
+    store: &Store,
+    keychain: &dyn Keychain,
+    cwd: &Path,
+    project_id: &str,
+    env_id: &str,
+    project_label: &str,
+    env_label: &str,
+    org_id: Option<&str>,
+) -> Result<()> {
+    if cwd.join(config::CONFIG_FILE).exists() {
+        return Err(Error::Input(format!(
+            "{} already exists in this directory",
+            config::CONFIG_FILE
+        )));
+    }
+    let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
+    let keypair = session::account_keypair(store, &master)?;
+    let client = sync_client(keychain)?;
+    let config = remote::team::clone_env(
+        &client,
+        store,
+        &keypair,
+        project_id,
+        env_id,
+        project_label,
+        env_label,
+        org_id,
+    )?;
+    config.save_to(cwd)?;
+    eprintln!("cloned into `{}` ({})", config.project, config.environment);
     Ok(())
 }
 

@@ -9,6 +9,7 @@ pub mod config;
 pub mod http;
 pub mod share;
 pub mod sync;
+pub mod team;
 
 pub use api::SyncApi;
 pub use http::HttpClient;

@@ -21,6 +21,9 @@ pub struct Config {
     pub project: String,
     /// Default environment for this directory (e.g. `dev`).
     pub environment: String,
+    /// Owning organization id, when this project is shared with a team. Absent = personal project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
 }
 
 impl Config {
@@ -64,6 +67,7 @@ mod tests {
             project_id: "11111111-1111-1111-1111-111111111111".into(),
             project: "acme-api".into(),
             environment: "dev".into(),
+            org_id: None,
         }
     }
 

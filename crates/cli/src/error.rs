@@ -64,6 +64,11 @@ pub enum Error {
     #[error("server error: {0}")]
     Server(String),
 
+    /// The server authenticated the caller but refused the action (HTTP 403) — e.g. a plain org
+    /// member attempting a structural change that needs admin+.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     /// Invalid user input (bad arguments, mismatched passwords, or unsafe output).
     #[error("{0}")]
     Input(String),
@@ -76,7 +81,7 @@ impl Error {
             Error::NotFound(_) | Error::NoConfig(_) => 3,
             Error::Locked | Error::Crypto | Error::NoIdentity => 4,
             Error::Store(_) | Error::Io(_) | Error::Keychain(_) => 5,
-            Error::Network(_) | Error::Server(_) => 5,
+            Error::Network(_) | Error::Server(_) | Error::Forbidden(_) => 5,
             Error::Conflict(_) => 6,
             Error::Config(_) | Error::AlreadyInitialized | Error::Input(_) => 1,
         }
