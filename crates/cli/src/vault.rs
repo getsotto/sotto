@@ -78,7 +78,9 @@ impl<'a> Vault<'a> {
         let env = store
             .get_environment(project_id, env_name)?
             .ok_or_else(|| Error::NotFound(format!("environment `{env_name}`")))?;
-        let vault_key = core_vault::open_vault_key(keypair, &env.enc_vault_key)?;
+        // `enc_vault_key` now stores a vault-key grant (sealed box), not a master-wrapped key.
+        let grant = &env.enc_vault_key;
+        let vault_key = core_vault::open_vault_key(keypair, grant)?;
         Ok(Self {
             store,
             env_id: env.id,
