@@ -47,12 +47,14 @@ fn main() {
     println!("SHARE_PT={}", hex(share_pt));
     println!("SHARE_ENV={}", hex(&share_env));
 
-    let vault_master = [0x55u8; vault::KEY_LEN];
     let vault_key = [0x66u8; vault::KEY_LEN];
-    let enc_vault_key = vault::wrap_vault_key(&vault_master, &vault_key, "env-123");
-    println!("VAULT_MASTER={}", hex(&vault_master));
+    let grant_secret = [0x77u8; vault::KEY_LEN];
+    let grant =
+        vault::grant_vault_key(&wrap::keypair_from_secret(&grant_secret).public, &vault_key)
+            .unwrap();
     println!("VAULT_KEY={}", hex(&vault_key));
-    println!("VAULT_ENC_KEY={}", hex(&enc_vault_key));
+    println!("VAULT_GRANT_SECRET={}", hex(&grant_secret));
+    println!("VAULT_GRANT={}", hex(&grant));
     let vsec = vault::encrypt_secret(
         &vault_key,
         "env-123",

@@ -140,17 +140,16 @@ fn new_device_end_to_end_over_http() {
     let store_a = Store::open_in_memory().unwrap();
     let kc_a = MemoryKeychain::default();
     let kit = session::init(&store_a, &kc_a, b"pw", ttl).unwrap();
-    let master_a = *session::current_master_key(&kc_a)
-        .unwrap()
-        .unwrap()
-        .as_bytes();
-    let project = Vault::create_project(&store_a, &master_a, "acme").unwrap();
+    let master_key_a = session::current_master_key(&kc_a).unwrap().unwrap();
+    let keypair_a = session::account_keypair(&store_a, &master_key_a).unwrap();
+    let master_a = *master_key_a.as_bytes();
+    let project = Vault::create_project(&store_a, &keypair_a, "acme").unwrap();
     let config = Config {
         project_id: project.id.clone(),
         project: "acme".into(),
         environment: "dev".into(),
     };
-    Vault::open(&store_a, &master_a, &project.id, "dev")
+    Vault::open(&store_a, &keypair_a, &project.id, "dev")
         .unwrap()
         .set("DATABASE_URL", b"postgres://prod")
         .unwrap();
@@ -162,16 +161,15 @@ fn new_device_end_to_end_over_http() {
     let bundle = remote::SyncApi::get_account(&client).unwrap().unwrap();
     let secret_key = sotto_core::format::decode_key("SK", 1, &kit.secret_key).unwrap();
     remote::sync::restore_account(&store_b, &kc_b, &bundle, &secret_key, b"pw", ttl).unwrap();
-    let master_b = *session::current_master_key(&kc_b)
-        .unwrap()
-        .unwrap()
-        .as_bytes();
+    let master_key_b = session::current_master_key(&kc_b).unwrap().unwrap();
+    let keypair_b = session::account_keypair(&store_b, &master_key_b).unwrap();
+    let master_b = *master_key_b.as_bytes();
     assert_eq!(master_a, master_b, "reconstructed master key matches");
 
     remote::sync::pull_environments(&client, &store_b, &master_b, &config).unwrap();
     remote::sync::pull(&client, &store_b, &config).unwrap();
 
-    let value = Vault::open(&store_b, &master_b, &project.id, "dev")
+    let value = Vault::open(&store_b, &keypair_b, &project.id, "dev")
         .unwrap()
         .get("DATABASE_URL")
         .unwrap();

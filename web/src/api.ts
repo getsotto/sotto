@@ -39,8 +39,16 @@ export async function logout(): Promise<void> {
   }
 }
 
-/// The account KDF salt (needed to derive the master key), or `null` if the account isn't set up.
-export async function fetchAccountSalt(): Promise<Uint8Array | null> {
+export interface Account {
+  /// KDF salt, needed to derive the master key.
+  salt: Uint8Array;
+  /// The account's X25519 private keys, sealed under the master key. Opening a vault-key grant
+  /// needs the recovered private key, so the browser fetches this ciphertext alongside the salt.
+  encPrivateKeys: Uint8Array;
+}
+
+/// The account's KDF salt + master-sealed private keys, or `null` if the account isn't set up.
+export async function fetchAccount(): Promise<Account | null> {
   const resp = await fetch("/account", CREDS);
   if (resp.status === 404) {
     return null;
@@ -48,11 +56,14 @@ export async function fetchAccountSalt(): Promise<Uint8Array | null> {
   if (!resp.ok) {
     throw new Error(`server error (${resp.status})`);
   }
-  const body = (await resp.json()) as { kdf_params: string };
+  const body = (await resp.json()) as { kdf_params: string; enc_private_keys: string };
   const kdf = JSON.parse(new TextDecoder().decode(standardB64ToBytes(body.kdf_params))) as {
     salt: number[];
   };
-  return new Uint8Array(kdf.salt);
+  return {
+    salt: new Uint8Array(kdf.salt),
+    encPrivateKeys: standardB64ToBytes(body.enc_private_keys),
+  };
 }
 
 export interface Project {

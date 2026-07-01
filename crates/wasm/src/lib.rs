@@ -75,28 +75,25 @@ pub fn kdf_derive_master_key(
         .map_err(|e| JsError::new(&e.to_string()))
 }
 
-/// Wrap an environment vault key under the master key (used when creating an environment).
+/// Seal a vault key to a member's public key (a grant), for creating/sharing an environment.
 #[wasm_bindgen]
-pub fn vault_wrap_key(
-    master_key: &[u8],
-    vault_key: &[u8],
-    env_id: &str,
-) -> Result<Vec<u8>, JsError> {
-    Ok(sotto_core::vault::wrap_vault_key(
-        &key32(master_key)?,
-        &key32(vault_key)?,
-        env_id,
-    ))
+pub fn vault_grant_key(recipient_public: &[u8], vault_key: &[u8]) -> Result<Vec<u8>, JsError> {
+    let recipient: [u8; 32] = recipient_public
+        .try_into()
+        .map_err(|_| JsError::new("public key must be 32 bytes"))?;
+    sotto_core::vault::grant_vault_key(&recipient, &key32(vault_key)?)
+        .map_err(|e| JsError::new(&e.to_string()))
 }
 
-/// Unwrap an environment vault key under the master key.
+/// Open an environment vault-key grant: recover the account keypair from `enc_private_keys` under
+/// the master key, then unseal the grant. (The private key never leaves WASM.)
 #[wasm_bindgen]
-pub fn vault_unwrap_key(
+pub fn vault_open_grant(
     master_key: &[u8],
-    enc_vault_key: &[u8],
-    env_id: &str,
+    enc_private_keys: &[u8],
+    grant: &[u8],
 ) -> Result<Vec<u8>, JsError> {
-    sotto_core::vault::unwrap_vault_key(&key32(master_key)?, enc_vault_key, env_id)
+    sotto_core::vault::open_vault_grant(&key32(master_key)?, enc_private_keys, grant)
         .map(|k| k.to_vec())
         .map_err(|e| JsError::new(&e.to_string()))
 }

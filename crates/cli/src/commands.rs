@@ -75,9 +75,10 @@ impl<'a> App<'a> {
     /// Open the vault for the configured project/environment, requiring an unlocked session.
     fn vault(&self, config: &Config) -> Result<Vault<'a>> {
         let master = self.require_unlocked()?;
+        let keypair = session::account_keypair(self.store, &master)?;
         Vault::open(
             self.store,
-            master.as_bytes(),
+            &keypair,
             &config.project_id,
             &config.environment,
         )
@@ -100,7 +101,8 @@ mod tests {
         let keychain = MemoryKeychain::default();
         session::init(&store, &keychain, b"pw", Duration::from_secs(3600)).unwrap();
         let master = session::current_master_key(&keychain).unwrap().unwrap();
-        let project = Vault::create_project(&store, master.as_bytes(), "acme").unwrap();
+        let keypair = session::account_keypair(&store, &master).unwrap();
+        let project = Vault::create_project(&store, &keypair, "acme").unwrap();
         let config = Config {
             project_id: project.id,
             project: "acme".into(),

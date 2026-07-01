@@ -13,6 +13,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use sotto_core::vault as core_vault;
 use sotto_core::{aead, format, kdf, random, wrap};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -24,8 +25,6 @@ use crate::store::{AccountKeys, Identity, Store};
 const SECRET_KEY_BYTES: usize = 16;
 /// Recovery-key length, in bytes (256-bit).
 const RECOVERY_KEY_BYTES: usize = 32;
-/// AAD binding the X25519 private key wrapped under the master key.
-const PRIVKEYS_AAD: &[u8] = b"sotto/v1/privkeys";
 /// AAD binding the master key wrapped under the recovery key.
 const RECOVERY_AAD: &[u8] = b"sotto/v1/recovery";
 /// Keychain entry holding the persistent secret key.
@@ -83,7 +82,7 @@ pub fn init(
     let mut recovery_key = random::bytes::<RECOVERY_KEY_BYTES>();
     let account_keys = AccountKeys {
         public_key: keypair.public.to_vec(),
-        enc_private_keys: wrap::wrap_key(master_key.as_bytes(), &keypair.secret, PRIVKEYS_AAD),
+        enc_private_keys: core_vault::wrap_private_key(master_key.as_bytes(), &keypair.secret),
         recovery_blob: wrap::wrap_key(&recovery_key, master_key.as_bytes(), RECOVERY_AAD),
     };
 
@@ -134,14 +133,9 @@ pub fn restore(
     }
     let master_key = derive(password, secret_key, salt)?;
 
-    // Verify password + secret key: the private keys must unwrap under the derived master key.
-    let mut probe = wrap::unwrap_key(
-        master_key.as_bytes(),
-        &account_keys.enc_private_keys,
-        PRIVKEYS_AAD,
-    )
-    .map_err(|_| Error::Crypto)?;
-    probe.zeroize();
+    // Verify password + secret key: the account keypair must recover from the private keys.
+    core_vault::open_account_keypair(master_key.as_bytes(), &account_keys.enc_private_keys)
+        .map_err(|_| Error::Crypto)?;
 
     let enc_verifier = aead::seal(master_key.as_bytes(), VERIFIER_PLAINTEXT, VERIFIER_AAD);
     keychain.set(KC_SECRET_KEY, secret_key)?;
@@ -185,6 +179,13 @@ pub fn unlock(
 /// Clear the cached session (lock the store).
 pub fn lock(keychain: &dyn Keychain) -> Result<()> {
     keychain.delete(KC_SESSION)
+}
+
+/// Recover the account keypair (X25519) from the store's key material under the master key. The
+/// vault layer uses it to open environment key grants.
+pub fn account_keypair(store: &Store, master: &MasterKey) -> Result<wrap::Keypair> {
+    let keys = store.get_account_keys()?.ok_or(Error::NoIdentity)?;
+    core_vault::open_account_keypair(master.as_bytes(), &keys.enc_private_keys).map_err(Into::into)
 }
 
 /// Return the cached master key if the session is still valid, else `None` (locked or expired).
@@ -267,13 +268,9 @@ mod tests {
         let master = current_master_key(&kc).unwrap().unwrap();
         let keys = store.get_account_keys().unwrap().unwrap();
 
-        // enc_private_keys unwraps (under the master key) to an X25519 secret whose public matches.
-        let secret =
-            wrap::unwrap_key(master.as_bytes(), &keys.enc_private_keys, PRIVKEYS_AAD).unwrap();
-        assert_eq!(
-            wrap::keypair_from_secret(&secret).public.to_vec(),
-            keys.public_key
-        );
+        // The account keypair recovers from enc_private_keys, and its public matches.
+        let keypair = account_keypair(&store, &master).unwrap();
+        assert_eq!(keypair.public.to_vec(), keys.public_key);
 
         // recovery_blob unwraps (under the recovery key from the kit) to the master key.
         let recovery_key: [u8; RECOVERY_KEY_BYTES] = format::decode_key("RK", 1, &kit.recovery_key)

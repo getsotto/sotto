@@ -46,12 +46,16 @@ fn decode_key_via_bindings() {
 fn vault_round_trip_via_bindings() {
     let master = [0x55u8; 32];
     let vault_key = [0x66u8; 32];
+    // The account keypair and its master-wrapped private key, as an account carries them.
+    let keypair = sotto_core::wrap::keypair_from_secret(&[0x77u8; 32]);
+    let enc_private_keys = sotto_core::vault::wrap_private_key(&master, &keypair.secret);
 
-    let enc_vk =
-        sotto_wasm::vault_wrap_key(&master, &vault_key, "e1").unwrap_or_else(|_| panic!("wrap"));
-    let unwrapped =
-        sotto_wasm::vault_unwrap_key(&master, &enc_vk, "e1").unwrap_or_else(|_| panic!("unwrap"));
-    assert_eq!(unwrapped, vault_key);
+    // Grant the vault key to the member, then open it from the master + enc_private_keys.
+    let grant = sotto_wasm::vault_grant_key(&keypair.public, &vault_key)
+        .unwrap_or_else(|_| panic!("grant"));
+    let opened = sotto_wasm::vault_open_grant(&master, &enc_private_keys, &grant)
+        .unwrap_or_else(|_| panic!("open grant"));
+    assert_eq!(opened, vault_key.to_vec());
 
     let enc = sotto_wasm::vault_encrypt_secret(&vault_key, "e1", "s1", 2, b"NAME", b"value")
         .unwrap_or_else(|_| panic!("encrypt"));
