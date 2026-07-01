@@ -304,10 +304,19 @@ fn env_sharing_end_to_end_over_http() {
 
     // --- Alice invites Bob by email and shares the dev environment with him. ---
     let invited = remote::team::invite(&alice, &org_id, &bob_email).unwrap();
-    assert!(invited.public_key.is_some(), "Bob's key should be on the server");
-    let env_id =
-        remote::team::share_env(&alice, &store_a, &keypair_a, &org_id, &invited.user_id, &config)
-            .unwrap();
+    assert!(
+        invited.public_key.is_some(),
+        "Bob's key should be on the server"
+    );
+    let env_id = remote::team::share_env(
+        &alice,
+        &store_a,
+        &keypair_a,
+        &org_id,
+        &invited.user_id,
+        &config,
+    )
+    .unwrap();
 
     // --- Bob clones the shared environment and decrypts the same secret. ---
     let bob_config = remote::team::clone_env(
@@ -331,4 +340,29 @@ fn env_sharing_end_to_end_over_http() {
     .get("API_KEY")
     .unwrap();
     assert_eq!(value, b"s3cr3t");
+
+    // Bob is a plain member, not an admin. Regression: `push` re-runs the structural "ensure
+    // project/environment exist" step, which 403s for a member on an org-owned project; that must be
+    // tolerated so the member can still write secrets to the env they cloned.
+    let master_b = *master_key_b.as_bytes();
+    Vault::open(
+        &store_b,
+        &keypair_b,
+        &bob_config.project_id,
+        &bob_config.environment,
+    )
+    .unwrap()
+    .set("BOB_KEY", b"from-bob")
+    .unwrap();
+    remote::sync::push(&bob, &store_b, &master_b, &bob_config).unwrap();
+
+    // Alice pulls and sees Bob's write, confirming it landed on the shared env.
+    remote::sync::pull(&alice, &store_a, &config).unwrap();
+    assert_eq!(
+        Vault::open(&store_a, &keypair_a, &project.id, "dev")
+            .unwrap()
+            .get("BOB_KEY")
+            .unwrap(),
+        b"from-bob"
+    );
 }

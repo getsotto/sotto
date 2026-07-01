@@ -1,8 +1,8 @@
 //! The reqwest (blocking) implementation of [`SyncApi`].
 //!
 //! Every request carries the session as a bearer token. Status handling: 2xx parse; 304/404 map to
-//! `None` where meaningful; 409/412 → [`Error::Conflict`] (the engine re-pulls); other non-2xx →
-//! [`Error::Server`]; transport failures → [`Error::Network`].
+//! `None` where meaningful; 409/412 → [`Error::Conflict`] (the engine re-pulls); 403 →
+//! [`Error::Forbidden`]; other non-2xx → [`Error::Server`]; transport failures → [`Error::Network`].
 
 use std::time::Duration;
 
@@ -56,6 +56,7 @@ fn server_error(resp: Response) -> Error {
             Error::Conflict(format!("{status}: {body}"))
         }
         StatusCode::UNAUTHORIZED => Error::Server("unauthorized — run `sotto login`".into()),
+        StatusCode::FORBIDDEN => Error::Forbidden(format!("{status}: {body}")),
         _ => Error::Server(format!("{status}: {body}")),
     }
 }

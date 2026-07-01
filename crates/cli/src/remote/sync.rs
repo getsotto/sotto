@@ -107,6 +107,12 @@ fn ensure_account(api: &dyn SyncApi, store: &Store) -> Result<()> {
 
 /// Idempotently create the project + environment server-side (encrypting their names). `org_id`,
 /// when set, creates the project under that organization (the caller must be an admin+ of it).
+///
+/// On an org-owned project a plain member lacks the admin+ rights these structural creates require,
+/// so the server answers 403 — but the member cloned an environment that already exists and may
+/// still write its secrets, so that 403 is expected and non-fatal. Any other error, or a 403 on a
+/// personal project, stays fatal. A member whose env genuinely doesn't exist server-side still fails
+/// later, as a 404 from the snapshot call.
 fn ensure_project_env(
     api: &dyn SyncApi,
     master: &[u8; 32],
@@ -114,23 +120,38 @@ fn ensure_project_env(
     project: &Project,
     env: &Environment,
 ) -> Result<()> {
-    api.create_project(&NewProject {
-        id: project.id.clone(),
-        enc_name: b64encode(&encrypt_name(
-            master,
-            &project.name,
-            &project_name_aad(&project.id),
-        )),
-        org_id: org_id.map(str::to_string),
-    })?;
-    api.create_environment(
-        &project.id,
-        &NewEnvironment {
-            id: env.id.clone(),
-            enc_name: b64encode(&encrypt_name(master, &env.name, &env_name_aad(&env.id))),
-            enc_vault_key: b64encode(&env.enc_vault_key),
-        },
+    tolerate_org_forbidden(
+        api.create_project(&NewProject {
+            id: project.id.clone(),
+            enc_name: b64encode(&encrypt_name(
+                master,
+                &project.name,
+                &project_name_aad(&project.id),
+            )),
+            org_id: org_id.map(str::to_string),
+        }),
+        org_id,
+    )?;
+    tolerate_org_forbidden(
+        api.create_environment(
+            &project.id,
+            &NewEnvironment {
+                id: env.id.clone(),
+                enc_name: b64encode(&encrypt_name(master, &env.name, &env_name_aad(&env.id))),
+                enc_vault_key: b64encode(&env.enc_vault_key),
+            },
+        ),
+        org_id,
     )
+}
+
+/// Swallow a 403 from an idempotent structural create when the project is org-owned (see
+/// [`ensure_project_env`]); pass every other outcome through unchanged.
+fn tolerate_org_forbidden(res: Result<()>, org_id: Option<&str>) -> Result<()> {
+    match res {
+        Err(Error::Forbidden(_)) if org_id.is_some() => Ok(()),
+        other => other,
+    }
 }
 
 /// Apply a server snapshot to the local store: server wins on a strictly newer version, or on an
