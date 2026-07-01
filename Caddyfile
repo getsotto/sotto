@@ -17,7 +17,7 @@
 	encode gzip
 
 	# The server's API endpoints (the same paths the web client and CLI call).
-	@api path /auth/github/* /auth/me /auth/logout /account /projects /projects/* /environments/* /shares /shares/*
+	@api path /health /auth/github/* /auth/me /auth/logout /account /projects /projects/* /environments/* /shares /shares/*
 	handle @api {
 		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
 	}
