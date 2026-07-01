@@ -18,6 +18,7 @@ pub mod format;
 pub mod kdf;
 pub mod random;
 pub mod share;
+pub mod vault;
 pub mod vectors;
 pub mod wrap;
 

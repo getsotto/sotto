@@ -12,7 +12,7 @@
 //!
 //! Regenerate with `cargo run -p sotto-core --example gen_vectors`.
 
-use crate::{aead, format, kdf, share, wrap};
+use crate::{aead, format, kdf, share, vault, wrap};
 
 const SUBKEY_HEX: &str = "a9c378fc08287281b23194842d223fd52f349c259d1c756ce31953ba9a1eb051";
 const CROCKFORD: &str = "000G40R40M30E209185GR38E1W";
@@ -30,6 +30,18 @@ const SB_SEALED_HEX: &str = "f97cfa5aa9fa49c213b6d308697a1fece85ab9d9663cc5303bc
 const SHARE_KEY: [u8; 32] = [0x33; 32];
 const SHARE_PT: &[u8] = b"share-secret-value";
 const SHARE_ENV_HEX: &str = "01012d36369a6771d17a1499ea93651931075e9ab1606c38e20c0885df13bc7508aa4e6dadaf7173b4d4c03bffb2aa81b7eb51333ed415acee97f59d";
+
+const VAULT_MASTER: [u8; 32] = [0x55; 32];
+const VAULT_KEY: [u8; 32] = [0x66; 32];
+const VAULT_ENV_ID: &str = "env-123";
+const VAULT_SECRET_ID: &str = "sec-1";
+const VAULT_VERSION: i64 = 3;
+const VAULT_NAME: &[u8] = b"DATABASE_URL";
+const VAULT_VALUE: &[u8] = b"postgres://x";
+const VAULT_ENC_KEY_HEX: &str = "0101da3c7961f0fef5b01148ccfd374abce4442120427c9b8e9e63113e8887b8f2112db3c8a4f21a77190f706d5da739e2287308b018f61e54afe95a0d7b65383d88f2dcd4c5aa91275e";
+const VAULT_ENC_NAME_HEX: &str = "01016b1f915d1c1b92deb0518f6bcf5a3378d13b57ab030d540a690f47c4791b04cb62c673358a64719bd959b30d39134d6cb180a2b3";
+const VAULT_ENC_VALUE_HEX: &str = "01017d89c8584a0be4253539c83451ac7cf8ab34a20d73b4e81ec02d5f433618c25b0d6924317d2d957c8a71fe439093a626e375f93e";
+const VAULT_ENC_DATA_KEY_HEX: &str = "01016cbe18dc1fdc4c4df0287e80e06600c93d0ac2217f8bcfd9066099dca7b3e80b04dce3cd344b67c38381e7d5519c4ccda464d7bb0e12366c9cf519f0cd6bca84e52714e612ecc2fa";
 
 /// Decode a hex string to bytes. Panics on malformed input (vector helper).
 fn unhex(s: &str) -> Vec<u8> {
@@ -73,6 +85,26 @@ pub fn verify_cross_impl() -> Result<(), &'static str> {
     }
     if aead::open(&SHARE_KEY, &share_env, b"sotto/v1/other").is_ok() {
         return Err("share aad not enforced");
+    }
+
+    // Vault key hierarchy: unwrap the env vault key, then decrypt a native-produced secret.
+    let vault_key = vault::unwrap_vault_key(&VAULT_MASTER, &unhex(VAULT_ENC_KEY_HEX), VAULT_ENV_ID)
+        .map_err(|_| "vault key unwrap")?;
+    if vault_key != VAULT_KEY {
+        return Err("vault key mismatch");
+    }
+    let (name, value) = vault::decrypt_secret(
+        &VAULT_KEY,
+        VAULT_ENV_ID,
+        VAULT_SECRET_ID,
+        VAULT_VERSION,
+        &unhex(VAULT_ENC_NAME_HEX),
+        &unhex(VAULT_ENC_VALUE_HEX),
+        &unhex(VAULT_ENC_DATA_KEY_HEX),
+    )
+    .map_err(|_| "vault decrypt")?;
+    if name.as_slice() != VAULT_NAME || value.as_slice() != VAULT_VALUE {
+        return Err("vault plaintext mismatch");
     }
 
     // Deterministic key derivation (BLAKE2b).

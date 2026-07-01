@@ -31,3 +31,39 @@ fn share_round_trip_via_bindings() {
     let pt = sotto_wasm::share_open(&key, &env).unwrap_or_else(|_| panic!("open"));
     assert_eq!(pt, b"share-me");
 }
+
+/// Vault key hierarchy via the bindings (the in-browser vault read/write path runs in WASM).
+#[wasm_bindgen_test]
+fn vault_round_trip_via_bindings() {
+    let master = [0x55u8; 32];
+    let vault_key = [0x66u8; 32];
+
+    let enc_vk =
+        sotto_wasm::vault_wrap_key(&master, &vault_key, "e1").unwrap_or_else(|_| panic!("wrap"));
+    let unwrapped =
+        sotto_wasm::vault_unwrap_key(&master, &enc_vk, "e1").unwrap_or_else(|_| panic!("unwrap"));
+    assert_eq!(unwrapped, vault_key);
+
+    let enc = sotto_wasm::vault_encrypt_secret(&vault_key, "e1", "s1", 2, b"NAME", b"value")
+        .unwrap_or_else(|_| panic!("encrypt"));
+    let name = sotto_wasm::vault_decrypt_name(
+        &vault_key,
+        "e1",
+        "s1",
+        2,
+        &enc.enc_name(),
+        &enc.enc_data_key(),
+    )
+    .unwrap_or_else(|_| panic!("decrypt name"));
+    let value = sotto_wasm::vault_decrypt_value(
+        &vault_key,
+        "e1",
+        "s1",
+        2,
+        &enc.enc_value(),
+        &enc.enc_data_key(),
+    )
+    .unwrap_or_else(|_| panic!("decrypt value"));
+    assert_eq!(name, b"NAME");
+    assert_eq!(value, b"value");
+}
