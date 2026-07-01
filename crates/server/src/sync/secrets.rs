@@ -14,6 +14,7 @@ use crate::auth::AuthUser;
 use crate::encoding;
 use crate::error::{Error, Result};
 use crate::state::AppState;
+use crate::sync::access::env_access;
 use crate::sync::{validate_id, MAX_ENC_KEY, MAX_ENC_NAME, MAX_ENC_VALUE};
 
 /// Snapshot row: `(id, enc_name, enc_value, enc_data_key, version, deleted)`.
@@ -85,7 +86,9 @@ async fn snapshot(
     Path(env_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response> {
-    let revision = current_revision(&state, &env_id, &user.user_id).await?;
+    // Any member (or the personal owner) may read the snapshot.
+    env_access(&state, &env_id, &user.user_id).await?;
+    let revision = env_revision(&state, &env_id).await?;
     let etag = format!("\"{revision}\"");
 
     if let Some(inm) = headers.get(IF_NONE_MATCH).and_then(|v| v.to_str().ok()) {
@@ -131,17 +134,17 @@ async fn write_secrets(
         ));
     }
 
+    // Authorize before touching the environment; any member (or personal owner) may write secrets.
+    env_access(&state, &env_id, &user.user_id).await?;
+
     let mut tx = state.pool.begin().await?;
 
-    // Lock the environment row (owned by the caller) so concurrent batches serialize.
-    let current: Option<i64> = sqlx::query_scalar(
-        "SELECT e.revision FROM environments e JOIN projects p ON e.project_id = p.id \
-         WHERE e.id = $1 AND p.owner_id = $2 FOR UPDATE OF e",
-    )
-    .bind(&env_id)
-    .bind(&user.user_id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    // Lock the environment row so concurrent batches serialize on its revision.
+    let current: Option<i64> =
+        sqlx::query_scalar("SELECT revision FROM environments WHERE id = $1 FOR UPDATE")
+            .bind(&env_id)
+            .fetch_optional(&mut *tx)
+            .await?;
     let current = current.ok_or_else(|| Error::NotFound("environment not found".into()))?;
 
     if current != req.base_revision {
@@ -255,16 +258,14 @@ async fn apply_delete(
     Ok(())
 }
 
-/// Look up an environment's current revision, enforcing caller ownership.
-async fn current_revision(state: &AppState, env_id: &str, user_id: &str) -> Result<i64> {
-    let revision: Option<i64> = sqlx::query_scalar(
-        "SELECT e.revision FROM environments e JOIN projects p ON e.project_id = p.id \
-         WHERE e.id = $1 AND p.owner_id = $2",
-    )
-    .bind(env_id)
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await?;
+/// Look up an environment's current revision. The caller must already be authorized via
+/// [`env_access`]; this only reads the revision the ETag is built from.
+async fn env_revision(state: &AppState, env_id: &str) -> Result<i64> {
+    let revision: Option<i64> =
+        sqlx::query_scalar("SELECT revision FROM environments WHERE id = $1")
+            .bind(env_id)
+            .fetch_optional(&state.pool)
+            .await?;
     revision.ok_or_else(|| Error::NotFound("environment not found".into()))
 }
 

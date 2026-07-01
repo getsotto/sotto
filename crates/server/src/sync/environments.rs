@@ -11,6 +11,7 @@ use crate::auth::AuthUser;
 use crate::encoding;
 use crate::error::{Error, Result};
 use crate::state::AppState;
+use crate::sync::access;
 use crate::sync::{validate_id, MAX_ENC_KEY, MAX_ENC_NAME};
 
 pub fn router() -> Router<AppState> {
@@ -35,21 +36,9 @@ struct EnvironmentView {
     revision: i64,
 }
 
-/// Return an error unless `project_id` exists and is owned by the caller.
-async fn assert_project_owned(state: &AppState, project_id: &str, user_id: &str) -> Result<()> {
-    let owned: Option<i32> =
-        sqlx::query_scalar("SELECT 1 FROM projects WHERE id = $1 AND owner_id = $2")
-            .bind(project_id)
-            .bind(user_id)
-            .fetch_optional(&state.pool)
-            .await?;
-    owned
-        .map(|_| ())
-        .ok_or_else(|| Error::NotFound("project not found".into()))
-}
-
-/// `POST /projects/{project_id}/environments` — create an environment in a project the caller owns.
-/// Idempotent on re-create of one's own id; 409 if the id is taken under a different project.
+/// `POST /projects/{project_id}/environments` — create an environment. Creating one is a structural
+/// change, so the caller must be the personal owner or an admin+ of the project's org. Idempotent on
+/// re-create of the same id; 409 if the id is taken under a different project.
 async fn create_environment(
     State(state): State<AppState>,
     user: AuthUser,
@@ -59,7 +48,12 @@ async fn create_environment(
     validate_id(&body.id, "id")?;
     let enc_name = encoding::decode(&body.enc_name, "enc_name", MAX_ENC_NAME)?;
     let enc_vault_key = encoding::decode(&body.enc_vault_key, "enc_vault_key", MAX_ENC_KEY)?;
-    assert_project_owned(&state, &project_id, &user.user_id).await?;
+    let access = access::project_access(&state, &project_id, &user.user_id).await?;
+    if !access.can_manage_structure() {
+        return Err(Error::Forbidden(
+            "must be an admin or owner to create an environment".into(),
+        ));
+    }
 
     let created: Option<String> = sqlx::query_scalar(
         "INSERT INTO environments (id, project_id, enc_name, enc_vault_key) \
@@ -88,13 +82,13 @@ async fn create_environment(
     }
 }
 
-/// `GET /projects/{project_id}/environments` — list environments in a project the caller owns.
+/// `GET /projects/{project_id}/environments` — list environments in a project the caller can reach.
 async fn list_environments(
     State(state): State<AppState>,
     user: AuthUser,
     Path(project_id): Path<String>,
 ) -> Result<Json<Vec<EnvironmentView>>> {
-    assert_project_owned(&state, &project_id, &user.user_id).await?;
+    access::project_access(&state, &project_id, &user.user_id).await?;
 
     let rows: Vec<(String, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
         "SELECT id, enc_name, enc_vault_key, revision FROM environments \
