@@ -14,8 +14,8 @@ use serde::de::DeserializeOwned;
 use crate::error::{Error, Result};
 
 use super::api::{
-    AccountBundle, BatchRequest, BatchResponse, CreatedShare, EnvironmentInfo, Me, NewEnvironment,
-    NewProject, NewShare, Snapshot, SyncApi,
+    AccountBundle, BatchRequest, BatchResponse, CreatedShare, EnvironmentInfo, GrantView, Invited,
+    Me, MemberInfo, NewEnvironment, NewOrg, NewProject, NewShare, OrgInfo, Snapshot, SyncApi,
 };
 
 pub struct HttpClient {
@@ -180,5 +180,71 @@ impl SyncApi for HttpClient {
             .send()
             .map_err(net)?;
         parse(resp)
+    }
+
+    fn create_org(&self, org: &NewOrg) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url("/orgs"))
+            .bearer_auth(&self.token)
+            .json(org)
+            .send()
+            .map_err(net)?;
+        ok(resp)
+    }
+
+    fn list_orgs(&self) -> Result<Vec<OrgInfo>> {
+        let resp = self
+            .http
+            .get(self.url("/orgs"))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
+    fn invite_member(&self, org_id: &str, email: &str) -> Result<Invited> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/orgs/{org_id}/invites")))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "email": email }))
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
+    fn list_members(&self, org_id: &str) -> Result<Vec<MemberInfo>> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/orgs/{org_id}/members")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
+    fn create_grant(&self, env_id: &str, user_id: &str, enc_vault_key: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/environments/{env_id}/grants")))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "user_id": user_id, "enc_vault_key": enc_vault_key }))
+            .send()
+            .map_err(net)?;
+        ok(resp)
+    }
+
+    fn get_grant(&self, env_id: &str) -> Result<Option<String>> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/environments/{env_id}/grant")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        parse::<GrantView>(resp).map(|g| Some(g.enc_vault_key))
     }
 }

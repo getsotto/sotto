@@ -25,7 +25,7 @@ use base64::Engine;
 
 use sotto_cli::config::Config;
 use sotto_cli::keychain::MemoryKeychain;
-use sotto_cli::remote::{self, HttpClient};
+use sotto_cli::remote::{self, HttpClient, SyncApi};
 use sotto_cli::session;
 use sotto_cli::store::Store;
 use sotto_cli::vault::Vault;
@@ -148,6 +148,7 @@ fn new_device_end_to_end_over_http() {
         project_id: project.id.clone(),
         project: "acme".into(),
         environment: "dev".into(),
+        org_id: None,
     };
     Vault::open(&store_a, &keypair_a, &project.id, "dev")
         .unwrap()
@@ -223,4 +224,111 @@ fn share_link_end_to_end_over_http() {
         .send()
         .unwrap();
     assert_eq!(resp2.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+/// The full team-sharing loop over real HTTP: Alice creates an org + org-owned project, invites Bob
+/// by email, and shares an environment; Bob (a distinct user + session) fetches his grant, clones
+/// the environment, and decrypts the same secret. Exercises the CLI's org/invite/grant HTTP methods
+/// and the cross-user crypto against the real server + Postgres.
+#[test]
+fn env_sharing_end_to_end_over_http() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    if !should_run_db_tests(&database_url) {
+        return;
+    }
+    let server = TestServer::start(&database_url);
+    let ttl = Duration::from_secs(3600);
+
+    // --- Alice: create an org, an org-owned project with a secret, and push. ---
+    let alice = HttpClient::new(server.url.clone(), server.token.clone());
+    let store_a = Store::open_in_memory().unwrap();
+    let kc_a = MemoryKeychain::default();
+    session::init(&store_a, &kc_a, b"pw", ttl).unwrap();
+    let master_key_a = session::current_master_key(&kc_a).unwrap().unwrap();
+    let keypair_a = session::account_keypair(&store_a, &master_key_a).unwrap();
+    let master_a = *master_key_a.as_bytes();
+
+    let org_id = remote::team::create_org(&alice, &master_a, "acme-team").unwrap();
+    let project = Vault::create_project(&store_a, &keypair_a, "acme").unwrap();
+    let config = Config {
+        project_id: project.id.clone(),
+        project: "acme".into(),
+        environment: "dev".into(),
+        org_id: Some(org_id.clone()),
+    };
+    Vault::open(&store_a, &keypair_a, &project.id, "dev")
+        .unwrap()
+        .set("API_KEY", b"s3cr3t")
+        .unwrap();
+    remote::sync::push(&alice, &store_a, &master_a, &config).unwrap();
+
+    // --- Bob: a second user, with a session + email, on the same server. ---
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (bob_token, bob_email) = rt.block_on(async {
+        let pool = sotto_server::db::connect(&database_url).await.unwrap();
+        let bob_id = format!("e2e-bob-{}", uuid::Uuid::new_v4());
+        let bob_email = format!("{bob_id}@example.test");
+        sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject, email) \
+             VALUES ($1, 'github', $1, $2)",
+        )
+        .bind(&bob_id)
+        .bind(&bob_email)
+        .execute(&pool)
+        .await
+        .expect("insert bob");
+        let token = sotto_server::auth::session::issue(&pool, &bob_id)
+            .await
+            .expect("issue bob session");
+        (token, bob_email)
+    });
+    let bob = HttpClient::new(server.url.clone(), bob_token);
+
+    // Bob sets up his device and uploads his account material, so his public key is on the server.
+    let store_b = Store::open_in_memory().unwrap();
+    let kc_b = MemoryKeychain::default();
+    session::init(&store_b, &kc_b, b"pwB", ttl).unwrap();
+    let master_key_b = session::current_master_key(&kc_b).unwrap().unwrap();
+    let keypair_b = session::account_keypair(&store_b, &master_key_b).unwrap();
+    let m = sotto_cli::account::material(&store_b).unwrap();
+    bob.put_account(&remote::api::AccountBundle {
+        public_key: STANDARD.encode(&m.public_key),
+        enc_private_keys: STANDARD.encode(&m.enc_private_keys),
+        kdf_params: STANDARD.encode(&m.kdf_params),
+        recovery_blob: STANDARD.encode(&m.recovery_blob),
+    })
+    .unwrap();
+
+    // --- Alice invites Bob by email and shares the dev environment with him. ---
+    let invited = remote::team::invite(&alice, &org_id, &bob_email).unwrap();
+    assert!(invited.public_key.is_some(), "Bob's key should be on the server");
+    let env_id =
+        remote::team::share_env(&alice, &store_a, &keypair_a, &org_id, &invited.user_id, &config)
+            .unwrap();
+
+    // --- Bob clones the shared environment and decrypts the same secret. ---
+    let bob_config = remote::team::clone_env(
+        &bob,
+        &store_b,
+        &keypair_b,
+        &project.id,
+        &env_id,
+        "acme",
+        "dev",
+        Some(&org_id),
+    )
+    .unwrap();
+    let value = Vault::open(
+        &store_b,
+        &keypair_b,
+        &bob_config.project_id,
+        &bob_config.environment,
+    )
+    .unwrap()
+    .get("API_KEY")
+    .unwrap();
+    assert_eq!(value, b"s3cr3t");
 }

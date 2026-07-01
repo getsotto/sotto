@@ -107,6 +107,7 @@ mod tests {
             project_id: project.id,
             project: "acme".into(),
             environment: "dev".into(),
+            org_id: None,
         };
         (store, keychain, config)
     }

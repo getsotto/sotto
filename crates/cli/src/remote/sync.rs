@@ -50,7 +50,7 @@ pub fn push(api: &dyn SyncApi, store: &Store, master: &[u8; 32], config: &Config
         .ok_or_else(|| Error::NotFound(format!("project `{}`", config.project_id)))?;
 
     ensure_account(api, store)?;
-    ensure_project_env(api, master, &project, &env)?;
+    ensure_project_env(api, master, config.org_id.as_deref(), &project, &env)?;
 
     for _ in 0..MAX_SYNC_ATTEMPTS {
         // Fast-forward from the latest snapshot, then diff against it.
@@ -105,10 +105,12 @@ fn ensure_account(api: &dyn SyncApi, store: &Store) -> Result<()> {
     }
 }
 
-/// Idempotently create the project + environment server-side (encrypting their names).
+/// Idempotently create the project + environment server-side (encrypting their names). `org_id`,
+/// when set, creates the project under that organization (the caller must be an admin+ of it).
 fn ensure_project_env(
     api: &dyn SyncApi,
     master: &[u8; 32],
+    org_id: Option<&str>,
     project: &Project,
     env: &Environment,
 ) -> Result<()> {
@@ -119,6 +121,7 @@ fn ensure_project_env(
             &project.name,
             &project_name_aad(&project.id),
         )),
+        org_id: org_id.map(str::to_string),
     })?;
     api.create_environment(
         &project.id,
@@ -316,18 +319,36 @@ mod tests {
         secrets: HashMap<String, ServerSecret>,
     }
 
+    struct MemberRec {
+        role: String,
+        public_key: Option<Vec<u8>>,
+    }
+
+    struct OrgState {
+        enc_name: String,
+        members: HashMap<String, MemberRec>,
+    }
+
     #[derive(Default)]
     struct MockState {
         account: Option<AccountBundle>,
         projects: HashSet<String>,
         envs: HashMap<String, EnvState>,
         shares: HashMap<String, super::super::api::NewShare>,
+        orgs: HashMap<String, OrgState>,
+        /// `(env_id, user_id)` → the member's vault-key grant (base64).
+        grants: HashMap<(String, String), String>,
+        /// email → `(user_id, public_key)`, the pool of "existing users" invites resolve against.
+        users_by_email: HashMap<String, (String, Option<Vec<u8>>)>,
         fail_writes: u32,
     }
 
     #[derive(Default)]
     struct MockApi {
         state: RefCell<MockState>,
+        /// Which user the next calls act as (empty = the default "test-user"). Lets one test drive
+        /// the server as two different members, the way distinct sessions would.
+        current_user: RefCell<String>,
     }
 
     impl MockApi {
@@ -339,6 +360,25 @@ mod tests {
         }
         fn has_account(&self) -> bool {
             self.state.borrow().account.is_some()
+        }
+        fn current_user(&self) -> String {
+            let u = self.current_user.borrow();
+            if u.is_empty() {
+                "test-user".to_string()
+            } else {
+                u.clone()
+            }
+        }
+        /// Act as `user_id` for subsequent calls (as a different session would).
+        fn as_user(&self, user_id: &str) {
+            *self.current_user.borrow_mut() = user_id.to_string();
+        }
+        /// Register an existing user that invites can resolve by email.
+        fn register_user(&self, email: &str, user_id: &str, public_key: &[u8]) {
+            self.state.borrow_mut().users_by_email.insert(
+                email.to_string(),
+                (user_id.to_string(), Some(public_key.to_vec())),
+            );
         }
     }
 
@@ -490,6 +530,108 @@ mod tests {
                 expires_at: None,
             })
         }
+
+        fn create_org(&self, org: &super::super::api::NewOrg) -> Result<()> {
+            let me = self.current_user();
+            let mut s = self.state.borrow_mut();
+            let public_key = s
+                .users_by_email
+                .values()
+                .find(|(uid, _)| *uid == me)
+                .and_then(|(_, pk)| pk.clone());
+            let mut members = HashMap::new();
+            members.insert(
+                me,
+                MemberRec {
+                    role: "owner".into(),
+                    public_key,
+                },
+            );
+            s.orgs.insert(
+                org.id.clone(),
+                OrgState {
+                    enc_name: org.enc_name.clone(),
+                    members,
+                },
+            );
+            Ok(())
+        }
+
+        fn list_orgs(&self) -> Result<Vec<super::super::api::OrgInfo>> {
+            let me = self.current_user();
+            let s = self.state.borrow();
+            let mut orgs: Vec<_> = s
+                .orgs
+                .iter()
+                .filter_map(|(id, o)| {
+                    o.members.get(&me).map(|rec| super::super::api::OrgInfo {
+                        id: id.clone(),
+                        enc_name: o.enc_name.clone(),
+                        role: rec.role.clone(),
+                    })
+                })
+                .collect();
+            orgs.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(orgs)
+        }
+
+        fn invite_member(&self, org_id: &str, email: &str) -> Result<super::super::api::Invited> {
+            let mut s = self.state.borrow_mut();
+            let (user_id, public_key) = s
+                .users_by_email
+                .get(email)
+                .cloned()
+                .ok_or_else(|| Error::NotFound("no user with that email".into()))?;
+            let org = s
+                .orgs
+                .get_mut(org_id)
+                .ok_or_else(|| Error::NotFound("organization not found".into()))?;
+            org.members.entry(user_id.clone()).or_insert(MemberRec {
+                role: "member".into(),
+                public_key: public_key.clone(),
+            });
+            Ok(super::super::api::Invited {
+                user_id,
+                public_key: public_key.map(|k| b64encode(&k)),
+            })
+        }
+
+        fn list_members(&self, org_id: &str) -> Result<Vec<super::super::api::MemberInfo>> {
+            let s = self.state.borrow();
+            let org = s
+                .orgs
+                .get(org_id)
+                .ok_or_else(|| Error::NotFound("organization not found".into()))?;
+            let mut members: Vec<_> = org
+                .members
+                .iter()
+                .map(|(uid, rec)| super::super::api::MemberInfo {
+                    user_id: uid.clone(),
+                    role: rec.role.clone(),
+                    public_key: rec.public_key.as_ref().map(|k| b64encode(k)),
+                })
+                .collect();
+            members.sort_by(|a, b| a.user_id.cmp(&b.user_id));
+            Ok(members)
+        }
+
+        fn create_grant(&self, env_id: &str, user_id: &str, enc_vault_key: &str) -> Result<()> {
+            self.state.borrow_mut().grants.insert(
+                (env_id.to_string(), user_id.to_string()),
+                enc_vault_key.to_string(),
+            );
+            Ok(())
+        }
+
+        fn get_grant(&self, env_id: &str) -> Result<Option<String>> {
+            let me = self.current_user();
+            Ok(self
+                .state
+                .borrow()
+                .grants
+                .get(&(env_id.to_string(), me))
+                .cloned())
+        }
     }
 
     /// A store with an initialized account + a project (dev/staging/prod) and its config.
@@ -502,6 +644,7 @@ mod tests {
             project_id: project.id.clone(),
             project: "acme".into(),
             environment: "dev".into(),
+            org_id: None,
         };
         (store, project, config)
     }
@@ -666,6 +809,7 @@ mod tests {
             project_id: project.id.clone(),
             project: "acme".into(),
             environment: "dev".into(),
+            org_id: None,
         };
         (store, master, kit, project, config)
     }
@@ -724,6 +868,80 @@ mod tests {
         .get("DATABASE_URL")
         .unwrap();
         assert_eq!(value, b"postgres://prod");
+    }
+
+    #[test]
+    fn share_and_clone_gives_a_member_the_secrets() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        // Bob is an existing user with an account keypair; register his public key for invites.
+        let bob = sotto_core::wrap::generate_keypair();
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+
+        // Alice: a real device whose vault keypair matches its account material.
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+
+        // Alice creates an org, invites Bob, and marks her project org-owned.
+        let org_id = team::create_org(&api, &master_a, "acme").unwrap();
+        assert_eq!(
+            team::invite(&api, &org_id, "bob@example.test")
+                .unwrap()
+                .user_id,
+            "bob-user"
+        );
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+
+        // Alice writes a secret and pushes, then shares the dev environment with Bob.
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // Bob (a fresh device, acting as himself) clones the shared env and decrypts the secret.
+        api.as_user("bob-user");
+        let store_b = Store::open_in_memory().unwrap();
+        let bob_config = team::clone_env(
+            &api,
+            &store_b,
+            &bob,
+            &project.id,
+            &env_id,
+            "acme",
+            "dev",
+            Some(&org_id),
+        )
+        .unwrap();
+        assert_eq!(bob_config.org_id.as_deref(), Some(org_id.as_str()));
+        assert_eq!(
+            Vault::open(&store_b, &bob, &project.id, "dev")
+                .unwrap()
+                .get("API_KEY")
+                .unwrap(),
+            b"s3cr3t"
+        );
+
+        // A different user, never granted this env, cannot clone it.
+        api.as_user("carol-user");
+        let store_c = Store::open_in_memory().unwrap();
+        let carol = sotto_core::wrap::generate_keypair();
+        assert!(team::clone_env(
+            &api,
+            &store_c,
+            &carol,
+            &project.id,
+            &env_id,
+            "acme",
+            "dev",
+            Some(&org_id)
+        )
+        .is_err());
     }
 
     // Uses the full MockApi (which stores uploaded share blobs) to exercise share creation.
