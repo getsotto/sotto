@@ -15,6 +15,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use sqlx::{Postgres, Transaction};
 
 use crate::auth::AuthUser;
 use crate::encoding;
@@ -130,14 +131,18 @@ async fn caller_role(state: &AppState, org_id: &str, user_id: &str) -> Result<Ro
     }
 }
 
-/// The current role of `target` in `org_id`, or `404` if they are not a member.
-async fn member_role(state: &AppState, org_id: &str, target: &str) -> Result<Role> {
+/// The current role of `target` in `org_id`, or `404` if they are not a member. Generic over the
+/// executor so it reads either from the pool or from within a transaction holding the owner lock.
+async fn member_role<'e, E>(exec: E, org_id: &str, target: &str) -> Result<Role>
+where
+    E: sqlx::PgExecutor<'e>,
+{
     let role: Option<String> = sqlx::query_scalar(
         "SELECT role FROM organization_memberships WHERE org_id = $1 AND user_id = $2",
     )
     .bind(org_id)
     .bind(target)
-    .fetch_optional(&state.pool)
+    .fetch_optional(exec)
     .await?;
     match role {
         Some(r) => Role::from_db(&r),
@@ -145,15 +150,18 @@ async fn member_role(state: &AppState, org_id: &str, target: &str) -> Result<Rol
     }
 }
 
-/// Count the owners of an org — the guard behind last-owner protection.
-async fn owner_count(state: &AppState, org_id: &str) -> Result<i64> {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM organization_memberships WHERE org_id = $1 AND role = 'owner'",
+/// Lock every owner row of `org_id` for the rest of `tx`, returning how many there are. Holding
+/// these row locks serializes concurrent demotions and removals: without it two owners can each
+/// observe "more than one owner", both proceed, and leave the org with zero owners.
+async fn lock_owner_count(tx: &mut Transaction<'_, Postgres>, org_id: &str) -> Result<usize> {
+    let owners: Vec<String> = sqlx::query_scalar(
+        "SELECT user_id FROM organization_memberships \
+         WHERE org_id = $1 AND role = 'owner' FOR UPDATE",
     )
     .bind(org_id)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(Into::into)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(owners.len())
 }
 
 // --- handlers ----------------------------------------------------------------------------------
@@ -341,17 +349,18 @@ async fn update_member(
             "must be an admin or owner to change roles".into(),
         ));
     }
-    let current = member_role(&state, &org_id, &target).await?;
+    // Lock the org's owner set for the rest of the transaction so the last-owner guard and the
+    // write commit atomically; two owners demoting each other concurrently serialize here.
+    let mut tx = state.pool.begin().await?;
+    let owners = lock_owner_count(&mut tx, &org_id).await?;
+    let current = member_role(&mut *tx, &org_id, &target).await?;
 
     if (body.role == Role::Owner || current == Role::Owner) && caller != Role::Owner {
         return Err(Error::Forbidden(
             "only an owner can change the owner role".into(),
         ));
     }
-    if current == Role::Owner
-        && body.role != Role::Owner
-        && owner_count(&state, &org_id).await? == 1
-    {
+    if current == Role::Owner && body.role != Role::Owner && owners == 1 {
         return Err(Error::Conflict("cannot demote the last owner".into()));
     }
 
@@ -359,8 +368,9 @@ async fn update_member(
         .bind(&org_id)
         .bind(&target)
         .bind(body.role.as_str())
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(StatusCode::OK)
 }
 
@@ -377,13 +387,17 @@ async fn remove_member(
             "must be an admin or owner to remove members".into(),
         ));
     }
-    let current = member_role(&state, &org_id, &target).await?;
+    // Lock the org's owner set for the rest of the transaction so the last-owner guard and the
+    // delete commit atomically; two owners removing each other concurrently serialize here.
+    let mut tx = state.pool.begin().await?;
+    let owners = lock_owner_count(&mut tx, &org_id).await?;
+    let current = member_role(&mut *tx, &org_id, &target).await?;
 
     if current == Role::Owner {
         if caller != Role::Owner {
             return Err(Error::Forbidden("only an owner can remove an owner".into()));
         }
-        if owner_count(&state, &org_id).await? == 1 {
+        if owners == 1 {
             return Err(Error::Conflict("cannot remove the last owner".into()));
         }
     }
@@ -391,8 +405,9 @@ async fn remove_member(
     sqlx::query("DELETE FROM organization_memberships WHERE org_id = $1 AND user_id = $2")
         .bind(&org_id)
         .bind(&target)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
