@@ -28,6 +28,10 @@ pub enum Error {
     #[error("unauthorized")]
     Unauthorized,
 
+    /// The caller is authenticated but lacks the role/permission for this action.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     /// The request was malformed (bad/expired login state, non-loopback redirect, …).
     #[error("bad request: {0}")]
     BadRequest(String),
@@ -57,6 +61,7 @@ impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
             Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
+            Error::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
             Error::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             Error::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
             Error::Conflict(m) => (StatusCode::CONFLICT, m.clone()),

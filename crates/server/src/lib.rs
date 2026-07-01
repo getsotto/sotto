@@ -7,6 +7,7 @@
 //! - [`db`] — Postgres connection pool + migrations
 //! - [`auth`] — GitHub OAuth login, sessions, and the [`auth::AuthUser`] request extractor
 //! - [`account`] — account crypto-material sync (KDF params, public key, sealed private keys, …)
+//! - [`org`] — organizations, memberships, and roles (the team-RBAC substrate)
 //! - [`sync`] — projects, environments, and the secret snapshot/batch hot path
 //! - [`share`] — one-time / expiring share links (the viral funnel)
 //! - [`state`] — shared application state ([`state::AppState`])
@@ -18,6 +19,7 @@ pub mod config;
 pub mod db;
 pub mod encoding;
 pub mod error;
+pub mod org;
 pub mod share;
 pub mod state;
 pub mod sync;
@@ -27,13 +29,14 @@ use axum::Router;
 
 use crate::state::AppState;
 
-/// Build the full application router (health + auth + account + sync) over the shared state. Shared
-/// by the binary and the end-to-end tests so they exercise the same wiring.
+/// Build the full application router (health + auth + account + org + sync + share) over the shared
+/// state. Shared by the binary and the end-to-end tests so they exercise the same wiring.
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(auth::router())
         .merge(account::router())
+        .merge(org::router())
         .merge(sync::router())
         .merge(share::router())
         .with_state(state)
