@@ -140,7 +140,20 @@ pub fn decrypt_secret(
         value_aad(env_id, secret_id, version).as_bytes(),
     );
     data_key.zeroize();
-    Ok((name?, value?))
+    // If only one field authenticates, don't leave the other's plaintext lingering un-zeroized on
+    // the error path; scrub it and surface the real failure.
+    match (name, value) {
+        (Ok(name), Ok(value)) => Ok((name, value)),
+        (Ok(mut name), Err(e)) => {
+            name.zeroize();
+            Err(e)
+        }
+        (Err(e), Ok(mut value)) => {
+            value.zeroize();
+            Err(e)
+        }
+        (Err(e), Err(_)) => Err(e),
+    }
 }
 
 fn unwrap_data_key(
