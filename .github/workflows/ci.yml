@@ -60,6 +60,8 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: Install web deps
         run: npm ci
+      - name: Dependency audit (shipped deps)
+        run: npm audit --omit=dev --audit-level=high
       - name: Generate WASM bindings
         run: npm run build:wasm
       - name: Typecheck

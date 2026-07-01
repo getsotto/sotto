@@ -6,7 +6,7 @@
   "scripts": {
     "build:wasm": "wasm-pack build ../crates/wasm --target web --out-dir ../../web/src/wasm --out-name sotto_wasm",
     "build:wasm:node": "wasm-pack build ../crates/wasm --target nodejs --out-dir ../../web/.wasm-node --out-name sotto_wasm",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.node.json",
     "build": "npm run build:wasm && vite build",
     "dev": "npm run build:wasm && vite",
     "preview": "vite preview",
@@ -17,6 +17,7 @@
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@types/node": "^22.10.0",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^4.3.4",
