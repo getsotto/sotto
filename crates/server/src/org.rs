@@ -507,19 +507,21 @@ async fn invite_member(
         _ => return Err(Error::Conflict("multiple users share that email".into())),
     };
 
+    // Insert and audit commit together, so a failed audit can't leave an un-logged new member.
+    let mut tx = state.pool.begin().await?;
     let inserted: Option<String> = sqlx::query_scalar(
         "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, 'member') \
          ON CONFLICT (org_id, user_id) DO NOTHING RETURNING user_id",
     )
     .bind(&org_id)
     .bind(&target_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if inserted.is_none() {
         return Err(Error::Conflict("user is already a member".into()));
     }
-    audit::record(
-        &state.pool,
+    audit::record_tx(
+        &mut tx,
         &org_id,
         &user.user_id,
         "member.invited",
@@ -529,6 +531,7 @@ async fn invite_member(
         },
     )
     .await?;
+    tx.commit().await?;
 
     Ok(Json(InviteResult {
         user_id: target_id,
