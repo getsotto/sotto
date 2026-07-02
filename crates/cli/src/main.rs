@@ -197,6 +197,23 @@ enum EnvCommand {
     Ls,
     /// Set the active environment for this project.
     Use { name: String },
+    /// Compare two environments key by key (presence + "differs" markers).
+    Diff {
+        left: String,
+        right: String,
+        /// Show the differing values, not just markers.
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Copy secrets from one environment to another (promotion). Dry-run by default;
+    /// adds and updates only — never deletes destination keys.
+    Copy {
+        src: String,
+        dst: String,
+        /// Actually apply the copy (otherwise only the plan is printed).
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -413,6 +430,20 @@ fn run() -> Result<()> {
                 Ok(())
             }
             EnvCommand::Use { name } => env_use(&store, &cwd, &name),
+            EnvCommand::Diff {
+                left,
+                right,
+                reveal,
+            } => {
+                let config = effective_config(&cwd, cli.env.as_deref())?;
+                ensure_unlocked(&store, &keychain)?;
+                env_diff(&app, &config, &left, &right, reveal)
+            }
+            EnvCommand::Copy { src, dst, confirm } => {
+                let config = effective_config(&cwd, cli.env.as_deref())?;
+                ensure_unlocked(&store, &keychain)?;
+                env_copy(&app, &config, &src, &dst, confirm)
+            }
         },
         Command::Completions { .. } => unreachable!("completions are handled before store init"),
     }
@@ -892,6 +923,76 @@ fn status(app: &App, cwd: &Path, json: bool) -> Result<()> {
     match status.project {
         Some((project, env)) => println!("project:  {project} ({env})"),
         None => println!("project:  none (no {} here)", config::CONFIG_FILE),
+    }
+    Ok(())
+}
+
+/// Render an environment diff: one line per key with a presence/difference marker; values only
+/// with `--reveal`.
+fn env_diff(app: &App, config: &Config, left: &str, right: &str, reveal: bool) -> Result<()> {
+    use sotto_cli::commands::DiffStatus;
+
+    let diff = app.env_diff(config, left, right)?;
+    if diff.is_empty() {
+        eprintln!("both environments are empty");
+        return Ok(());
+    }
+    if reveal {
+        eprintln!("warning: --reveal prints secret values in plaintext");
+    }
+    let mut differing = 0usize;
+    for entry in &diff {
+        let marker = match entry.status {
+            DiffStatus::Equal => "=",
+            DiffStatus::Differs => "!",
+            DiffStatus::OnlyLeft => "<",
+            DiffStatus::OnlyRight => ">",
+        };
+        let detail = match entry.status {
+            DiffStatus::Equal => String::new(),
+            DiffStatus::Differs if reveal => format!(
+                "  {} -> {}",
+                String::from_utf8_lossy(entry.left.as_deref().unwrap_or_default()),
+                String::from_utf8_lossy(entry.right.as_deref().unwrap_or_default()),
+            ),
+            DiffStatus::Differs => "  (differs)".into(),
+            DiffStatus::OnlyLeft => format!("  (only in {left})"),
+            DiffStatus::OnlyRight => format!("  (only in {right})"),
+        };
+        if entry.status != DiffStatus::Equal {
+            differing += 1;
+        }
+        println!("{marker} {}{detail}", entry.name);
+    }
+    eprintln!(
+        "{} key(s), {} difference(s) between {left} and {right}",
+        diff.len(),
+        differing
+    );
+    Ok(())
+}
+
+/// Render (and with --confirm, apply) an environment copy plan.
+fn env_copy(app: &App, config: &Config, src: &str, dst: &str, confirm: bool) -> Result<()> {
+    let plan = app.env_copy(config, src, dst, confirm)?;
+    for name in &plan.create {
+        println!("create {name}");
+    }
+    for name in &plan.update {
+        println!("update {name}");
+    }
+    let summary = format!(
+        "{} to create, {} to update, {} unchanged",
+        plan.create.len(),
+        plan.update.len(),
+        plan.unchanged.len()
+    );
+    if confirm {
+        eprintln!("copied {src} -> {dst}: {summary}");
+        eprintln!("run `sotto push --env {dst}` to sync the changes");
+    } else {
+        eprintln!("dry-run {src} -> {dst}: {summary}");
+        eprintln!("nothing written; re-run with --confirm to apply");
     }
     Ok(())
 }
