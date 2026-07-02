@@ -43,14 +43,18 @@ pub fn parse_token(token: &str) -> Result<MachineToken> {
         .ok_or_else(|| Error::Input("malformed SOTTO_TOKEN (expected <token>.<MT1-…>)".into()))?;
     let mut secret_bytes = format::decode_key(KEY_PREFIX, KEY_VERSION, key_part)
         .map_err(|_| Error::Input("invalid machine key in SOTTO_TOKEN".into()))?;
-    let secret: [u8; 32] = secret_bytes
+    let mut secret: [u8; 32] = secret_bytes
         .as_slice()
         .try_into()
         .map_err(|_| Error::Input("invalid machine key in SOTTO_TOKEN".into()))?;
     secret_bytes.zeroize();
+    // `keypair_from_secret` copies the secret into the returned keypair (zeroized on drop); clear
+    // this stack-local copy too, so no stray duplicate of the machine key is left behind.
+    let keypair = wrap::keypair_from_secret(&secret);
+    secret.zeroize();
     Ok(MachineToken {
         api_token: api_token.to_string(),
-        keypair: wrap::keypair_from_secret(&secret),
+        keypair,
     })
 }
 
