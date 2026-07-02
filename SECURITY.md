@@ -10,8 +10,11 @@ high-entropy **secret key**. Neither ever leaves your device (CLI) or browser ta
 server cannot derive them. The server stores **ciphertext plus minimal metadata** and can never read
 your secret names or values.
 
-- **Key hierarchy:** `master key = Argon2id(password, salt) combined with the secret key` → wraps a
-  per-environment **vault key** → wraps a per-secret **data key** → encrypts the name and value.
+- **Key hierarchy:** `master key = Argon2id(password, salt) combined with the secret key` → seals
+  your account **X25519 keypair** → opens per-environment **vault-key grants** (the vault key
+  sealed to each member's — or machine token's — public key) → the vault key wraps a per-secret
+  **data key** → encrypts the name and value. Sharing seals the vault key to a teammate's public
+  key; removing a member rotates the vault key and rewraps the data keys.
 - **One audited implementation:** the crypto lives in `sotto-core` (Rust) and runs identically in
   the CLI (native) and the browser (WASM). A cross-implementation gate pins byte-for-byte test
   vectors so the two builds can't silently diverge.

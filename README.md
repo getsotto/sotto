@@ -13,14 +13,16 @@ receiving plaintext secrets or usable keys.
 ## Current status
 
 The end-to-end flow works: encrypt locally, sync ciphertext, decrypt on another device or in the
-browser, and share a single secret via a one-time link.
+browser, and share a single secret via a one-time link. Teams work end to end too: organizations
+with roles, per-member environment grants, key rotation on member removal, machine tokens for CI,
+and lost-key account recovery.
 
 | Component | Available now |
 | --- | --- |
-| Crypto core | KDF, XChaCha20-Poly1305 AEAD + AAD, key wrapping, the environment vault hierarchy, share-link crypto, and key encoding — with native↔WASM golden vectors |
-| CLI | `init`, local secret management, `run`-style injection, `login`/`push`/`pull` sync, new-device `setup`, and `share` |
-| Server | OAuth login + sessions, account + snapshot sync (versioned writes, ETag), and share links — ciphertext only |
-| Web | Login (cookie session), in-browser unlock + vault decryption, one-time share create/receive |
+| Crypto core | KDF, XChaCha20-Poly1305 AEAD + AAD, key wrapping, X25519 sealed-box grants, the environment vault hierarchy, data-key rewrap (rotation), share-link crypto, and key encoding — with native↔WASM golden vectors |
+| CLI | `init`, local secret management, `run`-style injection, `login`/`push`/`pull` sync, new-device `setup`, `share`; teams: `org create/ls/invite/members/remove`, `grant`, `clone`, `rotate`, machine `token create/ls/revoke` (with `SOTTO_TOKEN` mode for CI), lost-kit `reset` |
+| Server | OAuth login + sessions, account + snapshot sync (versioned writes, ETag), orgs + memberships + roles, per-member vault-key grants, transactional key rotation, machine tokens, account reset, and share links — ciphertext only |
+| Web | Login (cookie session), in-browser unlock + vault decryption via your own grant, one-time share create/receive, and a team panel: orgs, members, invite by email, share an environment with a member |
 
 ## Architecture
 

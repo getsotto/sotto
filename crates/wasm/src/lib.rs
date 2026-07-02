@@ -2,8 +2,7 @@
 //!
 //! The browser runs the SAME crypto core as the CLI, compiled to WASM — one implementation,
 //! one audit surface. The cross-implementation gate (`tests/cross_impl.rs`) proves this build
-//! decrypts native-produced ciphertext. More bindings (wrap, kdf, keygen) land with the web
-//! client in M4.
+//! decrypts native-produced ciphertext byte-for-byte.
 
 use wasm_bindgen::prelude::*;
 
