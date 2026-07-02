@@ -18,7 +18,13 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::store::Store;
 
-use super::api::{b64decode, b64encode, Invited, MemberInfo, NewOrg, OrgInfo, SyncApi};
+use super::api::{
+    b64decode, b64encode, DataKeyEntry, GrantEntry, Invited, MemberInfo, NewOrg, OrgInfo,
+    RotateRequest, SyncApi,
+};
+
+/// Re-snapshot + retry budget when a concurrent write bumps the revision during a rotation.
+const ROTATE_ATTEMPTS: usize = 5;
 
 fn org_name_aad(id: &str) -> String {
     format!("sotto/v1/org-name|id={id}")
@@ -154,4 +160,113 @@ pub fn clone_env(
     };
     super::sync::pull(api, store, &config)?;
     Ok(config)
+}
+
+/// Rotate an environment's vault key: rewrap every data key and re-grant the current holders, minus
+/// `revoke`. Returns `Some(new_revision)`, or `None` if the caller holds no grant to this env (so
+/// can't open it to re-key) — the caller reports that as skipped. Retries when a concurrent write
+/// moves the revision.
+pub fn rotate_env(
+    api: &dyn SyncApi,
+    keypair: &wrap::Keypair,
+    org_id: &str,
+    env_id: &str,
+    revoke: Option<&str>,
+) -> Result<Option<i64>> {
+    let members = api.list_members(org_id)?;
+    for _ in 0..ROTATE_ATTEMPTS {
+        // Our current grant → the old vault key. Without one, we can't rotate this environment.
+        let Some(old_grant) = api.get_grant(env_id)? else {
+            return Ok(None);
+        };
+        let mut old_vault = vault::open_vault_key(keypair, &b64decode(&old_grant)?)?;
+        let mut new_vault = vault::generate_vault_key();
+
+        // Rewrap every current secret's data key from the old vault key to the new one.
+        let snapshot = api
+            .snapshot(env_id, None)?
+            .ok_or_else(|| Error::Server("server returned no snapshot".into()))?;
+        let mut data_keys = Vec::with_capacity(snapshot.secrets.len());
+        for s in &snapshot.secrets {
+            let rewrapped = vault::rewrap_data_key(
+                &old_vault,
+                &new_vault,
+                env_id,
+                &s.id,
+                s.version,
+                &b64decode(&s.enc_data_key)?,
+            )?;
+            data_keys.push(DataKeyEntry {
+                secret_id: s.id.clone(),
+                enc_data_key: b64encode(&rewrapped),
+            });
+        }
+        old_vault.zeroize();
+
+        // Re-grant every current holder except the revoked one, sealing the new vault key to each.
+        let mut grants = Vec::new();
+        for holder in api.list_grant_holders(env_id)? {
+            if Some(holder.as_str()) == revoke {
+                continue;
+            }
+            let public_key_b64 = members
+                .iter()
+                .find(|m| m.user_id == holder)
+                .and_then(|m| m.public_key.clone())
+                .ok_or_else(|| {
+                    Error::Input(format!("cannot re-grant `{holder}`: no public key on file"))
+                })?;
+            let public_key: [u8; wrap::PUBLIC_KEY_LEN] = b64decode(&public_key_b64)?
+                .try_into()
+                .map_err(|_| Error::Crypto)?;
+            grants.push(GrantEntry {
+                user_id: holder,
+                enc_vault_key: b64encode(&vault::grant_vault_key(&public_key, &new_vault)?),
+            });
+        }
+        new_vault.zeroize();
+
+        let req = RotateRequest {
+            base_revision: snapshot.revision,
+            grants,
+            data_keys,
+        };
+        match api.rotate(env_id, &req) {
+            Ok(resp) => return Ok(Some(resp.revision)),
+            // A concurrent write bumped the revision between our snapshot and rotate — retry.
+            Err(Error::Conflict(_)) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::Conflict(
+        "rotation kept racing concurrent writes; try again".into(),
+    ))
+}
+
+/// The outcome of removing a member: which environments were re-keyed, and which were skipped
+/// because this caller holds no grant to them (someone who does must rotate those).
+pub struct RemovalReport {
+    pub rotated: Vec<String>,
+    pub skipped: Vec<String>,
+}
+
+/// Remove a member from an org, first rotating every environment they could decrypt (dropping their
+/// grant) so their cached vault keys can't read future writes, then dropping their membership.
+pub fn remove_member(
+    api: &dyn SyncApi,
+    keypair: &wrap::Keypair,
+    org_id: &str,
+    user_id: &str,
+) -> Result<RemovalReport> {
+    let mut rotated = Vec::new();
+    let mut skipped = Vec::new();
+    for env_id in api.member_env_grants(org_id, user_id)? {
+        match rotate_env(api, keypair, org_id, &env_id, Some(user_id))? {
+            Some(_) => rotated.push(env_id),
+            None => skipped.push(env_id),
+        }
+    }
+    // Finally drop the membership, revoking their API access.
+    api.remove_member(org_id, user_id)?;
+    Ok(RemovalReport { rotated, skipped })
 }

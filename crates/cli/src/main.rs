@@ -62,6 +62,8 @@ enum Command {
         /// The member's user id (from `sotto org invite` or `sotto org members`).
         user_id: String,
     },
+    /// Rotate the active environment's vault key (re-key + re-grant its current members).
+    Rotate,
     /// Clone a shared environment onto this device (run in the destination directory).
     Clone {
         /// The project id (told to you by whoever granted access).
@@ -194,6 +196,8 @@ enum OrgCommand {
     Invite { org_id: String, email: String },
     /// List an org's members and their ids.
     Members { org_id: String },
+    /// Remove a member and rotate every environment they could access.
+    Remove { org_id: String, user_id: String },
 }
 
 fn main() {
@@ -229,6 +233,11 @@ fn run() -> Result<()> {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
             grant_env(&store, &keychain, &config, &user_id)
+        }
+        Command::Rotate => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            ensure_unlocked(&store, &keychain)?;
+            rotate_active(&store, &keychain, &config)
         }
         Command::Clone {
             project_id,
@@ -462,6 +471,52 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
             }
             Ok(())
         }
+        OrgCommand::Remove { org_id, user_id } => {
+            ensure_unlocked(store, keychain)?;
+            let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
+            let keypair = session::account_keypair(store, &master)?;
+            let report = remote::team::remove_member(&client, &keypair, &org_id, &user_id)?;
+            eprintln!(
+                "removed {user_id}; rotated {} environment(s)",
+                report.rotated.len()
+            );
+            if !report.skipped.is_empty() {
+                eprintln!(
+                    "warning: {} environment(s) you can't open were not rotated — ask a member \
+                     who holds them to run `sotto rotate`: {}",
+                    report.skipped.len(),
+                    report.skipped.join(", ")
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Rotate the active environment's vault key, then pull to adopt the new key locally.
+fn rotate_active(store: &Store, keychain: &dyn Keychain, config: &Config) -> Result<()> {
+    let org_id = config.org_id.as_deref().ok_or_else(|| {
+        Error::Input("rotation only applies to environments in an organization".into())
+    })?;
+    let env = store
+        .get_environment(&config.project_id, &config.environment)?
+        .ok_or_else(|| Error::NotFound(format!("environment `{}`", config.environment)))?;
+    let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
+    let keypair = session::account_keypair(store, &master)?;
+    let client = sync_client(keychain)?;
+    match remote::team::rotate_env(&client, &keypair, org_id, &env.id, None)? {
+        Some(rev) => {
+            // Adopt the new key + rewrapped data keys into the local store.
+            remote::sync::pull(&client, store, config)?;
+            eprintln!(
+                "rotated {}/{} — revision {rev}",
+                config.project, config.environment
+            );
+            Ok(())
+        }
+        None => Err(Error::Input(
+            "you don't have a grant to this environment, so you can't rotate it".into(),
+        )),
     }
 }
 

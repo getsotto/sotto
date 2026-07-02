@@ -32,6 +32,10 @@ pub fn router() -> Router<AppState> {
             "/orgs/{org_id}/members/{user_id}",
             post(update_member).delete(remove_member),
         )
+        .route(
+            "/orgs/{org_id}/members/{user_id}/grants",
+            get(member_env_grants),
+        )
         .route("/orgs/{org_id}/invites", post(invite_member))
 }
 
@@ -424,6 +428,40 @@ async fn invite_member(
         user_id: target_id,
         public_key: public_key.as_deref().map(encoding::encode),
     }))
+}
+
+#[derive(Serialize)]
+struct EnvGrantRef {
+    env_id: String,
+}
+
+/// `GET /orgs/{org_id}/members/{user_id}/grants` — the ids of this org's environments that `user_id`
+/// currently holds a grant to (admin+). The removal flow uses this to enumerate what to re-key.
+async fn member_env_grants(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((org_id, target)): Path<(String, String)>,
+) -> Result<Json<Vec<EnvGrantRef>>> {
+    let caller = caller_role(&state, &org_id, &user.user_id).await?;
+    if !caller.can_manage_members() {
+        return Err(Error::Forbidden(
+            "must be an admin or owner to list a member's grants".into(),
+        ));
+    }
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT eg.env_id FROM environment_grants eg \
+         JOIN environments e ON eg.env_id = e.id JOIN projects p ON e.project_id = p.id \
+         WHERE p.org_id = $1 AND eg.user_id = $2 ORDER BY eg.env_id",
+    )
+    .bind(&org_id)
+    .bind(&target)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|env_id| EnvGrantRef { env_id })
+            .collect(),
+    ))
 }
 
 /// `POST /orgs/{org_id}/members/{user_id}` — change a member's role (admin+). Changing to or from

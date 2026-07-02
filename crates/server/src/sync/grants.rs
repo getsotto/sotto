@@ -5,12 +5,20 @@
 //! opens with their private key. Sharing (`POST .../grants`) is an admin+/owner action, restricted
 //! to org environments and to members of that org. A member fetches their own grant with
 //! `GET .../grant`; not having one is a `404` even when they can otherwise reach the environment.
+//!
+//! `POST .../rotate` re-keys an environment: the client generates a new vault key, rewraps every
+//! secret's data key under it, and re-grants the remaining members. The server applies the new
+//! grants (replacing the old set, so a removed member's grant is dropped) and the rewrapped data
+//! keys in one transaction, guarded by optimistic concurrency on the environment revision.
+
+use std::collections::HashSet;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use sqlx::{Postgres, Transaction};
 
 use crate::auth::AuthUser;
 use crate::encoding;
@@ -22,8 +30,12 @@ use crate::sync::MAX_ENC_KEY;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/environments/{env_id}/grants", post(create_grant))
+        .route(
+            "/environments/{env_id}/grants",
+            post(create_grant).get(list_grant_holders),
+        )
         .route("/environments/{env_id}/grant", get(get_grant))
+        .route("/environments/{env_id}/rotate", post(rotate))
 }
 
 #[derive(Deserialize)]
@@ -37,6 +49,37 @@ struct CreateGrant {
 #[derive(Serialize)]
 struct GrantView {
     enc_vault_key: String,
+}
+
+#[derive(Serialize)]
+struct GrantHolder {
+    user_id: String,
+}
+
+/// `GET /environments/{env_id}/grants` — the user ids currently granted this environment (admin+),
+/// so a rotation knows who to re-grant.
+async fn list_grant_holders(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(env_id): Path<String>,
+) -> Result<Json<Vec<GrantHolder>>> {
+    let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
+    if !access.can_manage_structure() {
+        return Err(Error::Forbidden(
+            "must be an admin or owner to list grant holders".into(),
+        ));
+    }
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT user_id FROM environment_grants WHERE env_id = $1 ORDER BY user_id",
+    )
+    .bind(&env_id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|user_id| GrantHolder { user_id })
+            .collect(),
+    ))
 }
 
 /// `POST /environments/{env_id}/grants` — share an environment by storing a grant for a member.
@@ -114,4 +157,201 @@ async fn get_grant(
     Ok(Json(GrantView {
         enc_vault_key: encoding::encode(&enc_vault_key),
     }))
+}
+
+#[derive(Deserialize)]
+struct RotateRequest {
+    /// The env revision the rewrap was computed against; the rotation applies only if it still holds.
+    base_revision: i64,
+    /// The new grant set (the new vault key sealed to each remaining member). It *replaces* the whole
+    /// grant set, so any member not listed here (e.g. one just removed) loses access.
+    grants: Vec<GrantEntry>,
+    /// Every current secret's data key, rewrapped under the new vault key.
+    data_keys: Vec<DataKeyEntry>,
+}
+
+#[derive(Deserialize)]
+struct GrantEntry {
+    user_id: String,
+    enc_vault_key: String,
+}
+
+#[derive(Deserialize)]
+struct DataKeyEntry {
+    secret_id: String,
+    enc_data_key: String,
+}
+
+#[derive(Serialize)]
+struct RotateResponse {
+    revision: i64,
+}
+
+/// `POST /environments/{env_id}/rotate` — re-key an environment. Admin+/owner only, org-owned envs
+/// only. In one transaction: verify `base_revision`, rewrap every secret's data key, replace the
+/// grant set (dropping anyone not re-granted), repoint the inline vault key at the caller's new
+/// grant, and bump the revision. Fails closed with 412 if a concurrent write moved the revision, or
+/// 400 if the data keys don't cover exactly the env's secrets, the caller omitted their own grant,
+/// or the grant set names a non-member or a duplicate user.
+async fn rotate(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(env_id): Path<String>,
+    Json(req): Json<RotateRequest>,
+) -> Result<Json<RotateResponse>> {
+    let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
+    if !access.can_manage_structure() {
+        return Err(Error::Forbidden(
+            "must be an admin or owner to rotate an environment".into(),
+        ));
+    }
+
+    // Rotation re-grants org members, so the env must be org-owned.
+    let org_id: Option<String> = sqlx::query_scalar(
+        "SELECT p.org_id FROM environments e JOIN projects p ON e.project_id = p.id WHERE e.id = $1",
+    )
+    .bind(&env_id)
+    .fetch_one(&state.pool)
+    .await?;
+    let org_id =
+        org_id.ok_or_else(|| Error::BadRequest("environment is not in an organization".into()))?;
+
+    // Every grantee must be a distinct member of that org — the same rule `create_grant` enforces.
+    // Without the membership check an admin could re-grant the env to a non-member; without the
+    // duplicate check a repeated user_id would trip the environment_grants PK mid-transaction and
+    // surface as a 500 instead of a clean 400.
+    let member_rows: Vec<String> =
+        sqlx::query_scalar("SELECT user_id FROM organization_memberships WHERE org_id = $1")
+            .bind(&org_id)
+            .fetch_all(&state.pool)
+            .await?;
+    let members: HashSet<&str> = member_rows.iter().map(String::as_str).collect();
+    let mut seen: HashSet<&str> = HashSet::with_capacity(req.grants.len());
+    for g in &req.grants {
+        if !seen.insert(g.user_id.as_str()) {
+            return Err(Error::BadRequest(
+                "duplicate user_id in the rotation grant set".into(),
+            ));
+        }
+        if !members.contains(g.user_id.as_str()) {
+            return Err(Error::BadRequest(
+                "a grant recipient is not a member of this organization".into(),
+            ));
+        }
+    }
+
+    // Decode all blobs up front (bounds-checked), so a bad field fails before we touch anything.
+    let mut grants = Vec::with_capacity(req.grants.len());
+    for g in &req.grants {
+        grants.push((
+            g.user_id.clone(),
+            encoding::decode(&g.enc_vault_key, "enc_vault_key", MAX_ENC_KEY)?,
+        ));
+    }
+    let mut data_keys = Vec::with_capacity(req.data_keys.len());
+    for d in &req.data_keys {
+        data_keys.push((
+            d.secret_id.clone(),
+            encoding::decode(&d.enc_data_key, "enc_data_key", MAX_ENC_KEY)?,
+        ));
+    }
+
+    // The caller must keep their own grant, or they'd lock themselves out of the env they just rekeyed.
+    let my_enc_vault_key = grants
+        .iter()
+        .find(|(uid, _)| *uid == user.user_id)
+        .map(|(_, key)| key.clone())
+        .ok_or_else(|| {
+            Error::BadRequest("you must include your own grant in the rotation".into())
+        })?;
+
+    let mut tx = state.pool.begin().await?;
+
+    // Lock the environment row so the rotation serializes against concurrent secret writes.
+    let current: Option<i64> =
+        sqlx::query_scalar("SELECT revision FROM environments WHERE id = $1 FOR UPDATE")
+            .bind(&env_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let current = current.ok_or_else(|| Error::NotFound("environment not found".into()))?;
+    if current != req.base_revision {
+        return Err(Error::Precondition(
+            "base_revision is stale; re-pull and re-rotate".into(),
+        ));
+    }
+
+    // The rewrapped data keys must cover exactly the env's secrets — none left under the old key, and
+    // none for a secret that isn't here (a mismatch means the client rewrapped a stale snapshot).
+    verify_covers_all_secrets(&mut tx, &env_id, &data_keys).await?;
+    for (secret_id, enc_data_key) in &data_keys {
+        sqlx::query("UPDATE secrets SET enc_data_key = $3 WHERE id = $1 AND env_id = $2")
+            .bind(secret_id)
+            .bind(&env_id)
+            .bind(enc_data_key)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // Replace the grant set wholesale: this is what drops a removed member's grant.
+    sqlx::query("DELETE FROM environment_grants WHERE env_id = $1")
+        .bind(&env_id)
+        .execute(&mut *tx)
+        .await?;
+    for (user_id, enc_vault_key) in &grants {
+        sqlx::query(
+            "INSERT INTO environment_grants (env_id, user_id, enc_vault_key, granted_by) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&env_id)
+        .bind(user_id)
+        .bind(enc_vault_key)
+        .bind(&user.user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            if is_fk_violation(&e) {
+                Error::BadRequest("a grant recipient is not a known user".into())
+            } else {
+                e.into()
+            }
+        })?;
+    }
+
+    let new_revision = current + 1;
+    sqlx::query("UPDATE environments SET enc_vault_key = $2, revision = $3 WHERE id = $1")
+        .bind(&env_id)
+        .bind(&my_enc_vault_key)
+        .bind(new_revision)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(Json(RotateResponse {
+        revision: new_revision,
+    }))
+}
+
+/// Verify the provided data keys reference exactly the environment's current secrets (live +
+/// tombstoned), so no secret is stranded under the old vault key.
+async fn verify_covers_all_secrets(
+    tx: &mut Transaction<'_, Postgres>,
+    env_id: &str,
+    data_keys: &[(String, Vec<u8>)],
+) -> Result<()> {
+    let existing: Vec<String> = sqlx::query_scalar("SELECT id FROM secrets WHERE env_id = $1")
+        .bind(env_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    let existing: HashSet<&str> = existing.iter().map(String::as_str).collect();
+    let provided: HashSet<&str> = data_keys.iter().map(|(id, _)| id.as_str()).collect();
+    if provided != existing {
+        return Err(Error::BadRequest(
+            "rotation must rewrap exactly the environment's current secrets".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_fk_violation(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23503"))
 }

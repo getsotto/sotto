@@ -15,8 +15,19 @@ use crate::error::{Error, Result};
 
 use super::api::{
     AccountBundle, BatchRequest, BatchResponse, CreatedShare, EnvironmentInfo, GrantView, Invited,
-    Me, MemberInfo, NewEnvironment, NewOrg, NewProject, NewShare, OrgInfo, Snapshot, SyncApi,
+    Me, MemberInfo, NewEnvironment, NewOrg, NewProject, NewShare, OrgInfo, RotateRequest,
+    RotateResponse, Snapshot, SyncApi,
 };
+
+/// Row shapes for the two "list of ids" endpoints (each returns `[{ "user_id"|"env_id": ... }]`).
+#[derive(serde::Deserialize)]
+struct HolderRow {
+    user_id: String,
+}
+#[derive(serde::Deserialize)]
+struct EnvRefRow {
+    env_id: String,
+}
 
 pub struct HttpClient {
     base_url: String,
@@ -231,6 +242,49 @@ impl SyncApi for HttpClient {
             .post(self.url(&format!("/environments/{env_id}/grants")))
             .bearer_auth(&self.token)
             .json(&serde_json::json!({ "user_id": user_id, "enc_vault_key": enc_vault_key }))
+            .send()
+            .map_err(net)?;
+        ok(resp)
+    }
+
+    fn list_grant_holders(&self, env_id: &str) -> Result<Vec<String>> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/environments/{env_id}/grants")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        let holders: Vec<HolderRow> = parse(resp)?;
+        Ok(holders.into_iter().map(|h| h.user_id).collect())
+    }
+
+    fn member_env_grants(&self, org_id: &str, user_id: &str) -> Result<Vec<String>> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/orgs/{org_id}/members/{user_id}/grants")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        let envs: Vec<EnvRefRow> = parse(resp)?;
+        Ok(envs.into_iter().map(|e| e.env_id).collect())
+    }
+
+    fn rotate(&self, env_id: &str, req: &RotateRequest) -> Result<RotateResponse> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/environments/{env_id}/rotate")))
+            .bearer_auth(&self.token)
+            .json(req)
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
+    fn remove_member(&self, org_id: &str, user_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/orgs/{org_id}/members/{user_id}")))
+            .bearer_auth(&self.token)
             .send()
             .map_err(net)?;
         ok(resp)
