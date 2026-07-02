@@ -19,9 +19,14 @@ use crate::error::{Error, Result};
 use crate::store::Store;
 
 use super::api::{
-    b64decode, b64encode, DataKeyEntry, GrantEntry, Invited, MemberInfo, NewOrg, OrgInfo,
-    RotateRequest, SyncApi,
+    b64decode, b64encode, DataKeyEntry, GrantEntry, Invited, MachineGrantEntry, MemberInfo, NewOrg,
+    OrgInfo, RotateRequest, SyncApi,
 };
+
+/// Decode a base64 X25519 public key into its fixed-size array.
+fn decode_public_key(b64: &str) -> Result<[u8; wrap::PUBLIC_KEY_LEN]> {
+    b64decode(b64)?.try_into().map_err(|_| Error::Crypto)
+}
 
 /// Re-snapshot + retry budget when a concurrent write bumps the revision during a rotation.
 const ROTATE_ATTEMPTS: usize = 5;
@@ -216,12 +221,25 @@ pub fn rotate_env(
                 .ok_or_else(|| {
                     Error::Input(format!("cannot re-grant `{holder}`: no public key on file"))
                 })?;
-            let public_key: [u8; wrap::PUBLIC_KEY_LEN] = b64decode(&public_key_b64)?
-                .try_into()
-                .map_err(|_| Error::Crypto)?;
             grants.push(GrantEntry {
                 user_id: holder,
-                enc_vault_key: b64encode(&vault::grant_vault_key(&public_key, &new_vault)?),
+                enc_vault_key: b64encode(&vault::grant_vault_key(
+                    &decode_public_key(&public_key_b64)?,
+                    &new_vault,
+                )?),
+            });
+        }
+
+        // Re-seal to every active machine token too — the server rejects a rotation that would
+        // strand CI on the old key.
+        let mut machine_grants = Vec::new();
+        for token in api.list_machine_tokens(env_id)? {
+            machine_grants.push(MachineGrantEntry {
+                token_id: token.token_id,
+                enc_vault_key: b64encode(&vault::grant_vault_key(
+                    &decode_public_key(&token.public_key)?,
+                    &new_vault,
+                )?),
             });
         }
         new_vault.zeroize();
@@ -230,6 +248,7 @@ pub fn rotate_env(
             base_revision: snapshot.revision,
             grants,
             data_keys,
+            machine_grants,
         };
         match api.rotate(env_id, &req) {
             Ok(resp) => return Ok(Some(resp.revision)),
@@ -269,4 +288,35 @@ pub fn remove_member(
     // Finally drop the membership, revoking their API access.
     api.remove_member(org_id, user_id)?;
     Ok(RemovalReport { rotated, skipped })
+}
+
+/// Create a machine token for an environment: generate the machine's X25519 keypair locally, open
+/// our own grant, re-seal the vault key to the machine, upload the public half, and assemble the
+/// `SOTTO_TOKEN` string. The machine's private key never reaches the server.
+pub fn create_machine_token(
+    api: &dyn SyncApi,
+    store: &Store,
+    keypair: &wrap::Keypair,
+    config: &Config,
+    name: &str,
+) -> Result<String> {
+    let env = store
+        .get_environment(&config.project_id, &config.environment)?
+        .ok_or_else(|| Error::NotFound(format!("environment `{}`", config.environment)))?;
+
+    let machine = wrap::generate_keypair();
+    let mut vault_key = vault::open_vault_key(keypair, &env.enc_vault_key)?;
+    let machine_grant = vault::grant_vault_key(&machine.public, &vault_key)?;
+    vault_key.zeroize();
+
+    let created = api.create_machine_token(
+        &env.id,
+        name,
+        &b64encode(&machine.public),
+        &b64encode(&machine_grant),
+    )?;
+    Ok(super::machine::assemble_token(
+        &created.token,
+        &machine.secret,
+    ))
 }

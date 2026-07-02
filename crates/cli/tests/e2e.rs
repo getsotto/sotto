@@ -395,3 +395,53 @@ fn env_sharing_and_removal_end_to_end_over_http() {
     assert!(bob.get_grant(&env_id).unwrap().is_none());
     assert!(remote::sync::pull(&bob, &store_b, &bob_config).is_err());
 }
+
+/// The machine (CI) loop over real HTTP: create a machine token for a personal environment, then
+/// decrypt the secrets with nothing but the SOTTO_TOKEN string — no store, keychain, or password —
+/// and verify revocation kills access immediately.
+#[test]
+fn machine_token_end_to_end_over_http() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    if !should_run_db_tests(&database_url) {
+        return;
+    }
+    let server = TestServer::start(&database_url);
+    let ttl = Duration::from_secs(3600);
+    let client = HttpClient::new(server.url.clone(), server.token.clone());
+
+    // A personal project with one secret, pushed (solo-dev CI is a first-class path).
+    let store = Store::open_in_memory().unwrap();
+    let kc = MemoryKeychain::default();
+    session::init(&store, &kc, b"pw", ttl).unwrap();
+    let master_key = session::current_master_key(&kc).unwrap().unwrap();
+    let keypair = session::account_keypair(&store, &master_key).unwrap();
+    let project = Vault::create_project(&store, &keypair, "acme").unwrap();
+    let config = Config {
+        project_id: project.id.clone(),
+        project: "acme".into(),
+        environment: "dev".into(),
+        org_id: None,
+    };
+    Vault::open(&store, &keypair, &project.id, "dev")
+        .unwrap()
+        .set("CI_KEY", b"ci-value")
+        .unwrap();
+    remote::sync::push(&client, &store, master_key.as_bytes(), &config).unwrap();
+
+    // Mint a machine token and use it exactly as CI would: token string in, plaintext out.
+    let token_str =
+        remote::team::create_machine_token(&client, &store, &keypair, &config, "ci").unwrap();
+    let machine = remote::machine::parse_token(&token_str).unwrap();
+    let entries = remote::machine::fetch_entries(&server.url, &machine).unwrap();
+    assert_eq!(entries, vec![("CI_KEY".to_string(), b"ci-value".to_vec())]);
+
+    // Revoke the token: the machine path dies immediately.
+    let env = store.get_environment(&project.id, "dev").unwrap().unwrap();
+    let tokens = remote::SyncApi::list_machine_tokens(&client, &env.id).unwrap();
+    assert_eq!(tokens.len(), 1);
+    remote::SyncApi::revoke_machine_token(&client, &env.id, &tokens[0].token_id).unwrap();
+    assert!(remote::machine::fetch_entries(&server.url, &machine).is_err());
+}

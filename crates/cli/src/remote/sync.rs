@@ -399,6 +399,13 @@ mod tests {
         members: HashMap<String, MemberRec>,
     }
 
+    struct MachineTokenRec {
+        env_id: String,
+        public_key: Vec<u8>,
+        enc_vault_key: String,
+        revoked: bool,
+    }
+
     #[derive(Default)]
     struct MockState {
         account: Option<AccountBundle>,
@@ -410,6 +417,8 @@ mod tests {
         grants: HashMap<(String, String), String>,
         /// email → `(user_id, public_key)`, the pool of "existing users" invites resolve against.
         users_by_email: HashMap<String, (String, Option<Vec<u8>>)>,
+        /// token_id → machine token record.
+        machine_tokens: HashMap<String, MachineTokenRec>,
         fail_writes: u32,
     }
 
@@ -771,6 +780,29 @@ mod tests {
                     env.enc_vault_key = mine.enc_vault_key.clone();
                 }
             }
+            // Machine grants must cover exactly the env's active tokens (as the server enforces),
+            // and each covered token's stored grant is re-sealed.
+            let active: HashSet<String> = s
+                .machine_tokens
+                .iter()
+                .filter(|(_, t)| t.env_id == env_id && !t.revoked)
+                .map(|(id, _)| id.clone())
+                .collect();
+            let provided: HashSet<String> = req
+                .machine_grants
+                .iter()
+                .map(|m| m.token_id.clone())
+                .collect();
+            if provided != active {
+                return Err(Error::Server(
+                    "rotation must re-grant exactly the environment's active machine tokens".into(),
+                ));
+            }
+            for m in &req.machine_grants {
+                if let Some(t) = s.machine_tokens.get_mut(&m.token_id) {
+                    t.enc_vault_key = m.enc_vault_key.clone();
+                }
+            }
             Ok(super::super::api::RotateResponse { revision: new_rev })
         }
 
@@ -779,6 +811,58 @@ mod tests {
             if let Some(org) = s.orgs.get_mut(org_id) {
                 org.members.remove(user_id);
             }
+            Ok(())
+        }
+
+        fn create_machine_token(
+            &self,
+            env_id: &str,
+            _name: &str,
+            public_key: &str,
+            enc_vault_key: &str,
+        ) -> Result<super::super::api::CreatedMachineToken> {
+            let token_id = uuid::Uuid::new_v4().to_string();
+            self.state.borrow_mut().machine_tokens.insert(
+                token_id.clone(),
+                MachineTokenRec {
+                    env_id: env_id.to_string(),
+                    public_key: b64decode(public_key)?,
+                    enc_vault_key: enc_vault_key.to_string(),
+                    revoked: false,
+                },
+            );
+            Ok(super::super::api::CreatedMachineToken {
+                token_id,
+                token: format!("smt_mock_{}", uuid::Uuid::new_v4()),
+            })
+        }
+
+        fn list_machine_tokens(
+            &self,
+            env_id: &str,
+        ) -> Result<Vec<super::super::api::MachineTokenInfo>> {
+            let s = self.state.borrow();
+            let mut tokens: Vec<_> = s
+                .machine_tokens
+                .iter()
+                .filter(|(_, t)| t.env_id == env_id && !t.revoked)
+                .map(|(id, t)| super::super::api::MachineTokenInfo {
+                    token_id: id.clone(),
+                    name: "ci".into(),
+                    public_key: b64encode(&t.public_key),
+                })
+                .collect();
+            tokens.sort_by(|a, b| a.token_id.cmp(&b.token_id));
+            Ok(tokens)
+        }
+
+        fn revoke_machine_token(&self, _env_id: &str, token_id: &str) -> Result<()> {
+            let mut s = self.state.borrow_mut();
+            let t = s
+                .machine_tokens
+                .get_mut(token_id)
+                .ok_or_else(|| Error::NotFound("machine token not found".into()))?;
+            t.revoked = true;
             Ok(())
         }
     }
@@ -1247,6 +1331,87 @@ mod tests {
             ),
             "a member dropped from the grant set must not be able to push"
         );
+    }
+
+    #[test]
+    fn machine_token_survives_rotation() {
+        use crate::remote::{machine, team};
+        let api = MockApi::default();
+
+        // Alice: an org env with one secret, pushed.
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        let org_id = team::create_org(&api, &master_a, "acme").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env = store_a
+            .get_environment(&project.id, "dev")
+            .unwrap()
+            .unwrap();
+
+        // Create a machine token; its grant opens to the same vault key the env uses.
+        let token_str = team::create_machine_token(&api, &store_a, &alice, &config, "ci").unwrap();
+        let machine_token = machine::parse_token(&token_str).unwrap();
+        let read_machine_grant = |api: &MockApi| -> Vec<u8> {
+            let s = api.state.borrow();
+            let rec = s.machine_tokens.values().next().unwrap();
+            b64decode(&rec.enc_vault_key).unwrap()
+        };
+        let vault_key_before =
+            sotto_core::vault::open_vault_key(&machine_token.keypair, &read_machine_grant(&api))
+                .unwrap();
+        assert_eq!(
+            vault_key_before,
+            sotto_core::vault::open_vault_key(&alice, &env.enc_vault_key).unwrap()
+        );
+
+        // Rotate the env: the machine's grant is re-sealed to the NEW vault key automatically.
+        team::rotate_env(&api, &alice, &org_id, &env.id, None)
+            .unwrap()
+            .unwrap();
+        let vault_key_after =
+            sotto_core::vault::open_vault_key(&machine_token.keypair, &read_machine_grant(&api))
+                .unwrap();
+        assert_ne!(
+            vault_key_before, vault_key_after,
+            "rotation changed the vault key"
+        );
+
+        // The rewrapped data key decrypts under the machine's post-rotation vault key.
+        let snap = api.snapshot(&env.id, None).unwrap().unwrap();
+        let secret = &snap.secrets[0];
+        let value = sotto_core::vault::decrypt_value(
+            &vault_key_after,
+            &env.id,
+            &secret.id,
+            secret.version,
+            &b64decode(&secret.enc_value).unwrap(),
+            &b64decode(&secret.enc_data_key).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value, b"s3cr3t");
+
+        // A revoked token drops out of rotation coverage: revoke, rotate again — still succeeds.
+        let token_id = api
+            .state
+            .borrow()
+            .machine_tokens
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        api.revoke_machine_token(&env.id, &token_id).unwrap();
+        team::rotate_env(&api, &alice, &org_id, &env.id, None)
+            .unwrap()
+            .unwrap();
     }
 
     // Uses the full MockApi (which stores uploaded share blobs) to exercise share creation.

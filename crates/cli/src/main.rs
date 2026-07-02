@@ -64,6 +64,11 @@ enum Command {
     },
     /// Rotate the active environment's vault key (re-key + re-grant its current members).
     Rotate,
+    /// Manage machine tokens (CI / service access) for the active environment.
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
     /// Clone a shared environment onto this device (run in the destination directory).
     Clone {
         /// The project id (told to you by whoever granted access).
@@ -187,6 +192,20 @@ enum EnvCommand {
 }
 
 #[derive(Subcommand)]
+enum TokenCommand {
+    /// Create a machine token for the active environment; prints the SOTTO_TOKEN once.
+    Create {
+        /// Human label for the token ("github-actions").
+        #[arg(long, default_value = "ci")]
+        name: String,
+    },
+    /// List the active environment's machine tokens.
+    Ls,
+    /// Revoke a machine token (its access dies immediately; also run `sotto rotate` to re-key).
+    Revoke { token_id: String },
+}
+
+#[derive(Subcommand)]
 enum OrgCommand {
     /// Create an organization; prints its id.
     Create { name: String },
@@ -216,6 +235,16 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
+    // Machine mode: with SOTTO_TOKEN set, `run`/`export` decrypt entirely in memory — no store,
+    // keychain, config, or password. This is the CI path.
+    if let Ok(token) = std::env::var("SOTTO_TOKEN") {
+        match &cli.command {
+            Command::Run { args } => return machine_run(&token, args.clone()),
+            Command::Export { format, reveal } => return machine_export(&token, *format, *reveal),
+            _ => {} // every other command proceeds as a normal session
+        }
+    }
+
     let store_path = sotto_cli::paths::store_path()?;
     if let Some(parent) = store_path.parent() {
         std::fs::create_dir_all(parent)
@@ -238,6 +267,10 @@ fn run() -> Result<()> {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
             rotate_active(&store, &keychain, &config)
+        }
+        Command::Token { command } => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            token_command(&store, &keychain, &config, command)
         }
         Command::Clone {
             project_id,
@@ -488,6 +521,45 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
                     report.skipped.join(", ")
                 );
             }
+            Ok(())
+        }
+    }
+}
+
+/// Machine-token management for the active environment.
+fn token_command(
+    store: &Store,
+    keychain: &dyn Keychain,
+    config: &Config,
+    command: TokenCommand,
+) -> Result<()> {
+    let client = sync_client(keychain)?;
+    let env = store
+        .get_environment(&config.project_id, &config.environment)?
+        .ok_or_else(|| Error::NotFound(format!("environment `{}`", config.environment)))?;
+    match command {
+        TokenCommand::Create { name } => {
+            ensure_unlocked(store, keychain)?;
+            let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
+            let keypair = session::account_keypair(store, &master)?;
+            let token =
+                remote::team::create_machine_token(&client, store, &keypair, config, &name)?;
+            eprintln!(
+                "machine token `{name}` for {}/{} — save it now; it is never shown again:",
+                config.project, config.environment
+            );
+            println!("{token}");
+            Ok(())
+        }
+        TokenCommand::Ls => {
+            for t in remote::SyncApi::list_machine_tokens(&client, &env.id)? {
+                println!("{}  {}", t.token_id, t.name);
+            }
+            Ok(())
+        }
+        TokenCommand::Revoke { token_id } => {
+            remote::SyncApi::revoke_machine_token(&client, &env.id, &token_id)?;
+            eprintln!("revoked {token_id}; run `sotto rotate` to also re-key the environment");
             Ok(())
         }
     }
@@ -914,11 +986,16 @@ fn validate_env_key(key: &str) -> Result<()> {
 
 /// Run `args[0]` with the environment's secrets overlaid onto the inherited environment.
 fn run_injected(app: &App, config: &Config, args: Vec<String>) -> Result<()> {
+    run_with_entries(text_entries(app, config)?, args)
+}
+
+/// Run `args[0]` with `entries` overlaid onto the inherited environment (both session and machine
+/// mode funnel through here).
+fn run_with_entries(entries: Vec<(String, String)>, args: Vec<String>) -> Result<()> {
     let (program, rest) = args.split_first().ok_or_else(|| {
         Error::Input("no command given; usage: sotto run -- <cmd> [args…]".to_string())
     })?;
 
-    let entries = text_entries(app, config)?;
     let mut command = std::process::Command::new(program);
     command.args(rest);
     for (name, value) in &entries {
@@ -953,13 +1030,21 @@ fn exec_or_replace(mut command: std::process::Command, program: &str) -> Result<
 
 /// Render the environment's secrets in `format`, refusing a terminal unless `reveal` is set.
 fn export_secrets(app: &App, config: &Config, format: ExportFormat, reveal: bool) -> Result<()> {
+    export_with_entries(text_entries(app, config)?, format, reveal)
+}
+
+/// Render `entries` in `format` to stdout (both session and machine mode funnel through here).
+fn export_with_entries(
+    entries: Vec<(String, String)>,
+    format: ExportFormat,
+    reveal: bool,
+) -> Result<()> {
     if io::stdout().is_terminal() && !reveal {
         return Err(Error::Input(
             "refusing to write secrets to a terminal; redirect to a file or use --reveal"
                 .to_string(),
         ));
     }
-    let entries = text_entries(app, config)?;
     // Validate names before rendering: an unsafe name (spaces, newlines, shell metacharacters)
     // would otherwise be emitted verbatim and could alter `--format shell` output that's sourced.
     for (name, _) in &entries {
@@ -971,4 +1056,43 @@ fn export_secrets(app: &App, config: &Config, format: ExportFormat, reveal: bool
     out.write_all(rendered.as_bytes())
         .map_err(|e| Error::Io(e.to_string()))?;
     out.flush().map_err(|e| Error::Io(e.to_string()))
+}
+
+// --- machine (SOTTO_TOKEN) mode ---
+
+/// Resolve the server URL for machine mode: `SOTTO_SERVER` (the CI-friendly path), else the global
+/// config written by `sotto login`.
+fn machine_server_url() -> Result<String> {
+    if let Ok(server) = std::env::var("SOTTO_SERVER") {
+        return Ok(server.trim_end_matches('/').to_string());
+    }
+    let config_path = sotto_cli::paths::config_path()?;
+    remote::config::server_url(None, &config_path)
+        .map_err(|_| Error::Input("set SOTTO_SERVER to your sync server URL".into()))
+}
+
+/// Fetch + decrypt the token's environment in memory, as UTF-8 text pairs.
+fn machine_entries(token: &str) -> Result<Vec<(String, String)>> {
+    let token = remote::machine::parse_token(token)?;
+    let server = machine_server_url()?;
+    let mut entries = Vec::new();
+    for (name, value) in remote::machine::fetch_entries(&server, &token)? {
+        let value = String::from_utf8(value).map_err(|_| {
+            Error::Input(format!(
+                "secret `{name}` is not valid UTF-8; cannot inject or export it as text"
+            ))
+        })?;
+        entries.push((name, value));
+    }
+    Ok(entries)
+}
+
+/// `sotto run` in machine mode: decrypt via SOTTO_TOKEN and inject.
+fn machine_run(token: &str, args: Vec<String>) -> Result<()> {
+    run_with_entries(machine_entries(token)?, args)
+}
+
+/// `sotto export` in machine mode.
+fn machine_export(token: &str, format: ExportFormat, reveal: bool) -> Result<()> {
+    export_with_entries(machine_entries(token)?, format, reveal)
 }

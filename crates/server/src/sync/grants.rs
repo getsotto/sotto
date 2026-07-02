@@ -168,11 +168,21 @@ struct RotateRequest {
     grants: Vec<GrantEntry>,
     /// Every current secret's data key, rewrapped under the new vault key.
     data_keys: Vec<DataKeyEntry>,
+    /// The new vault key re-sealed to every *active* machine token's public key. Must cover exactly
+    /// the env's active tokens (revoke a token first to drop it), so rotation never strands CI.
+    #[serde(default)]
+    machine_grants: Vec<MachineGrantEntry>,
 }
 
 #[derive(Deserialize)]
 struct GrantEntry {
     user_id: String,
+    enc_vault_key: String,
+}
+
+#[derive(Deserialize)]
+struct MachineGrantEntry {
+    token_id: String,
     enc_vault_key: String,
 }
 
@@ -192,7 +202,7 @@ struct RotateResponse {
 /// grant set (dropping anyone not re-granted), repoint the inline vault key at the caller's new
 /// grant, and bump the revision. Fails closed with 412 if a concurrent write moved the revision, or
 /// 400 if the data keys don't cover exactly the env's secrets, the caller omitted their own grant,
-/// or the grant set names a non-member or a duplicate user.
+/// or the grant set names a non-member, a duplicate user, or a duplicate machine token.
 async fn rotate(
     State(state): State<AppState>,
     user: AuthUser,
@@ -255,6 +265,21 @@ async fn rotate(
             encoding::decode(&d.enc_data_key, "enc_data_key", MAX_ENC_KEY)?,
         ));
     }
+    // Reject a duplicate token_id up front, as with user grants: the coverage check below dedups
+    // via a set, so a repeat would slip through and drive an ambiguous double-UPDATE of one token.
+    let mut machine_grants = Vec::with_capacity(req.machine_grants.len());
+    let mut seen_tokens: HashSet<&str> = HashSet::with_capacity(req.machine_grants.len());
+    for m in &req.machine_grants {
+        if !seen_tokens.insert(m.token_id.as_str()) {
+            return Err(Error::BadRequest(
+                "duplicate token_id in the rotation machine-grant set".into(),
+            ));
+        }
+        machine_grants.push((
+            m.token_id.clone(),
+            encoding::decode(&m.enc_vault_key, "enc_vault_key", MAX_ENC_KEY)?,
+        ));
+    }
 
     // The caller must keep their own grant, or they'd lock themselves out of the env they just rekeyed.
     let my_enc_vault_key = grants
@@ -283,6 +308,30 @@ async fn rotate(
     // The rewrapped data keys must cover exactly the env's secrets — none left under the old key, and
     // none for a secret that isn't here (a mismatch means the client rewrapped a stale snapshot).
     verify_covers_all_secrets(&mut tx, &env_id, &data_keys).await?;
+
+    // Machine grants must cover exactly the env's *active* tokens: leaving one out would strand its
+    // CI on the old key with no way to notice (revoke a token first to genuinely drop it).
+    let active_tokens: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM machine_tokens WHERE env_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(&env_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let active: HashSet<&str> = active_tokens.iter().map(String::as_str).collect();
+    let provided: HashSet<&str> = machine_grants.iter().map(|(id, _)| id.as_str()).collect();
+    if provided != active {
+        return Err(Error::BadRequest(
+            "rotation must re-grant exactly the environment's active machine tokens".into(),
+        ));
+    }
+    for (token_id, enc_vault_key) in &machine_grants {
+        sqlx::query("UPDATE machine_tokens SET enc_vault_key = $3 WHERE id = $1 AND env_id = $2")
+            .bind(token_id)
+            .bind(&env_id)
+            .bind(enc_vault_key)
+            .execute(&mut *tx)
+            .await?;
+    }
     for (secret_id, enc_data_key) in &data_keys {
         sqlx::query("UPDATE secrets SET enc_data_key = $3 WHERE id = $1 AND env_id = $2")
             .bind(secret_id)

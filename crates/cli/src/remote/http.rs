@@ -14,9 +14,9 @@ use serde::de::DeserializeOwned;
 use crate::error::{Error, Result};
 
 use super::api::{
-    AccountBundle, BatchRequest, BatchResponse, CreatedShare, EnvironmentInfo, GrantView, Invited,
-    Me, MemberInfo, NewEnvironment, NewOrg, NewProject, NewShare, OrgInfo, RotateRequest,
-    RotateResponse, Snapshot, SyncApi,
+    AccountBundle, BatchRequest, BatchResponse, CreatedMachineToken, CreatedShare, EnvironmentInfo,
+    GrantView, Invited, MachineTokenInfo, Me, MemberInfo, NewEnvironment, NewOrg, NewProject,
+    NewShare, OrgInfo, RotateRequest, RotateResponse, Snapshot, SyncApi,
 };
 
 /// Row shapes for the two "list of ids" endpoints (each returns `[{ "user_id"|"env_id": ... }]`).
@@ -284,6 +284,47 @@ impl SyncApi for HttpClient {
         let resp = self
             .http
             .delete(self.url(&format!("/orgs/{org_id}/members/{user_id}")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        ok(resp)
+    }
+
+    fn create_machine_token(
+        &self,
+        env_id: &str,
+        name: &str,
+        public_key: &str,
+        enc_vault_key: &str,
+    ) -> Result<CreatedMachineToken> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/environments/{env_id}/tokens")))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "name": name,
+                "public_key": public_key,
+                "enc_vault_key": enc_vault_key,
+            }))
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
+    fn list_machine_tokens(&self, env_id: &str) -> Result<Vec<MachineTokenInfo>> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/environments/{env_id}/tokens")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
+    fn revoke_machine_token(&self, env_id: &str, token_id: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/environments/{env_id}/tokens/{token_id}")))
             .bearer_auth(&self.token)
             .send()
             .map_err(net)?;
