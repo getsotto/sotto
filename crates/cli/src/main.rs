@@ -116,6 +116,14 @@ enum Command {
     Pull,
     /// Set up this device from the server using your Emergency Kit (run after `login`).
     Setup,
+    /// DANGER: reset your account with fresh keys (for a lost Emergency Kit; run after `login`).
+    /// Everything encrypted under the old keys becomes permanently unreadable; org admins must
+    /// re-grant your shared environments.
+    Reset {
+        /// Skip the interactive confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Unlock the store for this session.
     Unlock,
     /// Lock the store (clear the cached session).
@@ -330,6 +338,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Setup => setup(&store, &keychain, &cwd),
+        Command::Reset { yes } => reset(&store, &keychain, yes),
         Command::Unlock => {
             ensure_unlocked(&store, &keychain)?;
             eprintln!("unlocked");
@@ -685,6 +694,54 @@ fn setup(store: &Store, keychain: &dyn Keychain, cwd: &Path) -> Result<()> {
         "set up {} ({}) from the server — revision {revision}",
         config.project, config.environment
     );
+    Ok(())
+}
+
+/// Reset the account with fresh keys (the lost-Emergency-Kit path): generate a new identity
+/// locally, replace the server-side account material, and print the new kit. Everything encrypted
+/// under the old keys — local personal data included — becomes permanently unreadable.
+fn reset(store: &Store, keychain: &dyn Keychain, yes: bool) -> Result<()> {
+    // Require a working login first, so we don't destroy local state and then fail to upload.
+    let client = sync_client(keychain)?;
+
+    if !yes {
+        eprintln!("This PERMANENTLY discards your account keys. Secrets encrypted under them");
+        eprintln!("(including local personal projects) become unreadable, and org admins must");
+        eprintln!("re-grant your shared environments.");
+        eprint!("Type `reset` to continue: ");
+        io::stderr().flush().ok();
+        let mut line = String::new();
+        io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| Error::Io(e.to_string()))?;
+        if line.trim() != "reset" {
+            return Err(Error::Input("reset aborted".into()));
+        }
+    }
+
+    let mut password = read_new_password()?;
+    let kit = session::reinit(store, keychain, &password, SESSION_TTL);
+    password.zeroize();
+    let kit = kit?;
+
+    // Upload the fresh material; the server also drops our now-dead env grants.
+    let material = sotto_cli::account::material(store)?;
+    remote::SyncApi::reset_account(
+        &client,
+        &remote::api::AccountBundle {
+            public_key: remote::api::b64encode(&material.public_key),
+            enc_private_keys: remote::api::b64encode(&material.enc_private_keys),
+            kdf_params: remote::api::b64encode(&material.kdf_params),
+            recovery_blob: remote::api::b64encode(&material.recovery_blob),
+        },
+    )?;
+
+    eprintln!();
+    eprintln!("  Account reset. Save your NEW Emergency Kit — the old one is void:");
+    eprintln!("    Secret Key:   {}", kit.secret_key);
+    eprintln!("    Recovery Key: {}", kit.recovery_key);
+    eprintln!();
+    eprintln!("  Ask your org admins to re-share environments with you (`sotto grant`).");
     Ok(())
 }
 

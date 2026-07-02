@@ -33,7 +33,9 @@ const MAX_ENCODED: usize = MAX_BLOB.div_ceil(3) * 4;
 
 /// All four routes share the `/account` path.
 pub fn router() -> Router<AppState> {
-    Router::new().route("/account", get(get_account).put(put_account))
+    Router::new()
+        .route("/account", get(get_account).put(put_account))
+        .route("/account/reset", axum::routing::post(reset_account))
 }
 
 /// The account bundle as it travels over the wire (all fields base64-encoded).
@@ -86,6 +88,54 @@ async fn put_account(
         Some(_) => Ok(StatusCode::CREATED),
         None => Err(Error::Conflict("account already initialized".into())),
     }
+}
+
+/// `POST /account/reset` — replace the account's crypto material with freshly generated keys (the
+/// recovery path for a user who lost their Emergency Kit but can still log in). Everything sealed
+/// to the OLD keys becomes permanently unreadable — that is the zero-knowledge deal — so the user's
+/// now-dead environment grants are deleted in the same transaction: a clean "not granted" beats a
+/// confusing decrypt failure, and org admins simply re-grant the new key. 404 until the account is
+/// initialized (first-time setup goes through `PUT /account`).
+async fn reset_account(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(bundle): Json<AccountBundle>,
+) -> Result<StatusCode> {
+    let public_key = decode(&bundle.public_key, "public_key")?;
+    if public_key.len() != PUBLIC_KEY_LEN {
+        return Err(Error::BadRequest(format!(
+            "public_key must decode to {PUBLIC_KEY_LEN} bytes"
+        )));
+    }
+    let enc_private_keys = decode(&bundle.enc_private_keys, "enc_private_keys")?;
+    let kdf_params = decode(&bundle.kdf_params, "kdf_params")?;
+    let recovery_blob = decode(&bundle.recovery_blob, "recovery_blob")?;
+
+    let mut tx = state.pool.begin().await?;
+    let reset: Option<String> = sqlx::query_scalar(
+        "UPDATE users \
+         SET public_key = $2, enc_private_keys = $3, kdf_params = $4, recovery_blob = $5 \
+         WHERE id = $1 AND public_key IS NOT NULL \
+         RETURNING id",
+    )
+    .bind(&user.user_id)
+    .bind(&public_key)
+    .bind(&enc_private_keys)
+    .bind(&kdf_params)
+    .bind(&recovery_blob)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if reset.is_none() {
+        return Err(Error::NotFound(
+            "account is not initialized; use PUT /account".into(),
+        ));
+    }
+    sqlx::query("DELETE FROM environment_grants WHERE user_id = $1")
+        .bind(&user.user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(StatusCode::OK)
 }
 
 /// `GET /account` — download the owner's crypto material. 404 until the account is initialized.
