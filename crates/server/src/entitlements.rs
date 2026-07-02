@@ -132,7 +132,9 @@ async fn get_entitlements(
     }
 
     let (tier, trial_ends_at): (String, Option<String>) = sqlx::query_as(
-        "SELECT tier, to_char(trial_ends_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+        // `AT TIME ZONE 'UTC'` normalizes the timestamptz to UTC before formatting, so the trailing
+        // `Z` is truthful regardless of the DB session's time zone.
+        "SELECT tier, to_char(trial_ends_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
          FROM organizations WHERE id = $1",
     )
     .bind(&org_id)
