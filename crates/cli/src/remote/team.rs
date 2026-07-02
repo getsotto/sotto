@@ -21,8 +21,8 @@ use crate::error::{Error, Result};
 use crate::store::Store;
 
 use super::api::{
-    b64decode, b64encode, DataKeyEntry, GrantEntry, Invited, MachineGrantEntry, MemberInfo, NewOrg,
-    RotateRequest, SyncApi,
+    b64decode, b64encode, DataKeyEntry, GrantEntry, HistoryKeyEntry, Invited, MachineGrantEntry,
+    MemberInfo, NewOrg, RotateRequest, SyncApi,
 };
 
 /// Decode a base64 X25519 public key into its fixed-size array.
@@ -280,6 +280,26 @@ pub fn rotate_env(
                 enc_data_key: b64encode(&rewrapped),
             });
         }
+
+        // Rewrap every retained history version too, so no version silently dies with the old key
+        // (the server rejects a rotation that doesn't cover them all).
+        let history = api.list_history(env_id)?;
+        let mut history_keys = Vec::with_capacity(history.len());
+        for row in &history {
+            let rewrapped = vault::rewrap_data_key(
+                &old_vault,
+                &new_vault,
+                env_id,
+                &row.secret_id,
+                row.version,
+                &b64decode(&row.enc_data_key)?,
+            )?;
+            history_keys.push(HistoryKeyEntry {
+                secret_id: row.secret_id.clone(),
+                version: row.version,
+                enc_data_key: b64encode(&rewrapped),
+            });
+        }
         old_vault.zeroize();
 
         // Re-grant every current holder except the revoked one, sealing the new vault key to each.
@@ -323,6 +343,7 @@ pub fn rotate_env(
             grants,
             data_keys,
             machine_grants,
+            history_keys,
         };
         match api.rotate(env_id, &req) {
             Ok(resp) => return Ok(Some(resp.revision)),

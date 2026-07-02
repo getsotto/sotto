@@ -172,6 +172,17 @@ struct RotateRequest {
     /// the env's active tokens (revoke a token first to drop it), so rotation never strands CI.
     #[serde(default)]
     machine_grants: Vec<MachineGrantEntry>,
+    /// Every retained history version's data key, rewrapped under the new vault key. Must cover
+    /// exactly the env's `secret_versions` rows, so history never silently dies at a rotation.
+    #[serde(default)]
+    history_keys: Vec<HistoryKeyEntry>,
+}
+
+#[derive(Deserialize)]
+struct HistoryKeyEntry {
+    secret_id: String,
+    version: i64,
+    enc_data_key: String,
 }
 
 #[derive(Deserialize)]
@@ -280,6 +291,21 @@ async fn rotate(
             encoding::decode(&m.enc_vault_key, "enc_vault_key", MAX_ENC_KEY)?,
         ));
     }
+    // Rewrapped history keys, keyed by (secret_id, version); duplicates rejected like the others.
+    let mut history_keys = Vec::with_capacity(req.history_keys.len());
+    let mut seen_history: HashSet<(&str, i64)> = HashSet::with_capacity(req.history_keys.len());
+    for h in &req.history_keys {
+        if !seen_history.insert((h.secret_id.as_str(), h.version)) {
+            return Err(Error::BadRequest(
+                "duplicate (secret_id, version) in the rotation history set".into(),
+            ));
+        }
+        history_keys.push((
+            h.secret_id.clone(),
+            h.version,
+            encoding::decode(&h.enc_data_key, "enc_data_key", MAX_ENC_KEY)?,
+        ));
+    }
 
     // The caller must keep their own grant, or they'd lock themselves out of the env they just rekeyed.
     if !grants.iter().any(|(uid, _)| *uid == user.user_id) {
@@ -306,6 +332,39 @@ async fn rotate(
     // The rewrapped data keys must cover exactly the env's secrets — none left under the old key, and
     // none for a secret that isn't here (a mismatch means the client rewrapped a stale snapshot).
     verify_covers_all_secrets(&mut tx, &env_id, &data_keys).await?;
+
+    // History must be covered exactly too — a version left under the old key would silently become
+    // unreadable, and a row that isn't there means the client rewrapped a stale view.
+    let existing_history: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT sv.secret_id, sv.version FROM secret_versions sv \
+         JOIN secrets s ON sv.secret_id = s.id WHERE s.env_id = $1",
+    )
+    .bind(&env_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let existing_set: HashSet<(&str, i64)> = existing_history
+        .iter()
+        .map(|(id, v)| (id.as_str(), *v))
+        .collect();
+    let provided_set: HashSet<(&str, i64)> = history_keys
+        .iter()
+        .map(|(id, v, _)| (id.as_str(), *v))
+        .collect();
+    if provided_set != existing_set {
+        return Err(Error::BadRequest(
+            "rotation must rewrap exactly the environment's retained history versions".into(),
+        ));
+    }
+    for (secret_id, version, enc_data_key) in &history_keys {
+        sqlx::query(
+            "UPDATE secret_versions SET enc_data_key = $3 WHERE secret_id = $1 AND version = $2",
+        )
+        .bind(secret_id)
+        .bind(version)
+        .bind(enc_data_key)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     // Machine grants must cover exactly the env's *active* tokens: leaving one out would strand its
     // CI on the old key with no way to notice (revoke a token first to genuinely drop it).

@@ -21,10 +21,12 @@ use crate::sync::{validate_id, MAX_ENC_KEY, MAX_ENC_NAME, MAX_ENC_VALUE};
 type SecretRow = (String, Vec<u8>, Vec<u8>, Vec<u8>, i64, bool);
 
 pub fn router() -> Router<AppState> {
-    Router::new().route(
-        "/environments/{env_id}/secrets",
-        get(snapshot).post(write_secrets),
-    )
+    Router::new()
+        .route(
+            "/environments/{env_id}/secrets",
+            get(snapshot).post(write_secrets),
+        )
+        .route("/environments/{env_id}/history", get(history))
 }
 
 #[derive(Serialize)]
@@ -36,6 +38,52 @@ struct SecretView {
     version: i64,
     /// Tombstone marker: the secret was soft-deleted (its ciphertext is retained at its version).
     deleted: bool,
+}
+
+#[derive(Serialize)]
+struct HistoryRow {
+    secret_id: String,
+    version: i64,
+    enc_name: String,
+    enc_value: String,
+    enc_data_key: String,
+}
+
+/// `GET /environments/{env_id}/history` — every retained version of every secret (server-side
+/// history is the complete record; local stores only hold the versions they happened to sync).
+/// Rotation keeps these rows decryptable by rewrapping their data keys, so any member with the
+/// current vault key can read any version.
+async fn history(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(env_id): Path<String>,
+) -> Result<Json<Vec<HistoryRow>>> {
+    env_access(&state, &env_id, &user.user_id).await?;
+
+    /// History row: `(secret_id, version, enc_name, enc_value, enc_data_key)`.
+    type Row = (String, i64, Vec<u8>, Vec<u8>, Vec<u8>);
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT sv.secret_id, sv.version, sv.enc_name, sv.enc_value, sv.enc_data_key \
+         FROM secret_versions sv JOIN secrets s ON sv.secret_id = s.id \
+         WHERE s.env_id = $1 ORDER BY sv.secret_id, sv.version",
+    )
+    .bind(&env_id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(
+        rows.into_iter()
+            .map(
+                |(secret_id, version, enc_name, enc_value, enc_data_key)| HistoryRow {
+                    secret_id,
+                    version,
+                    enc_name: encoding::encode(&enc_name),
+                    enc_value: encoding::encode(&enc_value),
+                    enc_data_key: encoding::encode(&enc_data_key),
+                },
+            )
+            .collect(),
+    ))
 }
 
 #[derive(Serialize)]

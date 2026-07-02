@@ -97,6 +97,29 @@ pub fn vault_open_grant(
         .map_err(|e| JsError::new(&e.to_string()))
 }
 
+/// Rewrap a secret's data key from the old vault key to a new one — the browser side of key
+/// rotation. Ciphertext is untouched; only the wrapping changes (same `(env, secret, version)`
+/// binding), exactly as the CLI does it.
+#[wasm_bindgen]
+pub fn vault_rewrap_data_key(
+    old_vault_key: &[u8],
+    new_vault_key: &[u8],
+    env_id: &str,
+    secret_id: &str,
+    version: i32,
+    enc_data_key: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    sotto_core::vault::rewrap_data_key(
+        &key32(old_vault_key)?,
+        &key32(new_vault_key)?,
+        env_id,
+        secret_id,
+        version.into(),
+        enc_data_key,
+    )
+    .map_err(|e| JsError::new(&e.to_string()))
+}
+
 /// The ciphertext of an encrypted secret, exposed to JS with getters.
 #[wasm_bindgen]
 pub struct EncryptedSecret {

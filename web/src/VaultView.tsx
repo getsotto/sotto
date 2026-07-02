@@ -4,12 +4,17 @@ import {
   createGrant,
   createShare,
   fetchEnvironments,
+  fetchGrantHolders,
+  fetchHistory,
+  fetchMachineTokens,
   fetchMembers,
   fetchMyGrant,
   fetchOrgs,
   fetchProjects,
   fetchSecrets,
+  fetchSnapshot,
   grantOrgKey,
+  postRotate,
   type Environment,
   type Member,
   type Project,
@@ -23,6 +28,7 @@ import {
   decryptSecretValue,
   openEnvGrant,
   openOrgKey,
+  rewrapDataKey,
   sealForShare,
   sealGrantTo,
   type SecretEntry,
@@ -83,6 +89,8 @@ export function VaultView({
   const [shareTo, setShareTo] = useState("");
   // Opened org keys by org id — org project/env names decrypt under these.
   const [orgKeys, setOrgKeys] = useState<Map<string, Uint8Array>>(new Map());
+  // The caller's role per org id (rotation is admin/owner-only).
+  const [orgRoles, setOrgRoles] = useState<Map<string, string>>(new Map());
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -96,7 +104,9 @@ export function VaultView({
       try {
         // Open every org key we hold first, so org project names decrypt on first paint.
         const keys = new Map<string, Uint8Array>();
+        const roles = new Map<string, string>();
         for (const org of await fetchOrgs()) {
+          roles.set(org.id, org.role);
           if (org.encOrgKey !== null) {
             try {
               keys.set(org.id, openOrgKey(master, encPrivateKeys, org.encOrgKey));
@@ -106,6 +116,7 @@ export function VaultView({
           }
         }
         setOrgKeys(keys);
+        setOrgRoles(roles);
 
         const rows = await fetchProjects();
         setProjects(
@@ -214,6 +225,56 @@ export function VaultView({
     }
   }
 
+  /// Rotate the open environment's vault key (admin/owner): rewrap every current + history data
+  /// key, re-seal grants for the current holders and machine tokens, then reload under the new key.
+  async function rotateEnv() {
+    if (openEnv === null || members === null) {
+      return;
+    }
+    setError(null);
+    setNotice(null);
+    try {
+      const newKey = crypto.getRandomValues(new Uint8Array(32));
+      const snap = await fetchSnapshot(openEnv.envId);
+      const dataKeys = snap.secrets.map((s) => ({
+        secretId: s.id,
+        encDataKey: rewrapDataKey(openEnv.vaultKey, newKey, openEnv.envId, s.id, s.version, s.encDataKey),
+      }));
+      const historyKeys = (await fetchHistory(openEnv.envId)).map((h) => ({
+        secretId: h.secretId,
+        version: h.version,
+        encDataKey: rewrapDataKey(openEnv.vaultKey, newKey, openEnv.envId, h.secretId, h.version, h.encDataKey),
+      }));
+      const grants = [];
+      for (const holder of await fetchGrantHolders(openEnv.envId)) {
+        const m = members.find((mm) => mm.userId === holder);
+        if (m === undefined || m.publicKey === null) {
+          throw new Error(`cannot re-grant ${holder}: no public key on file`);
+        }
+        grants.push({ userId: holder, encVaultKey: sealGrantTo(m.publicKey, newKey) });
+      }
+      const machineGrants = (await fetchMachineTokens(openEnv.envId)).map((t) => ({
+        tokenId: t.tokenId,
+        encVaultKey: sealGrantTo(t.publicKey, newKey),
+      }));
+      await postRotate(openEnv.envId, {
+        baseRevision: snap.revision,
+        grants,
+        dataKeys,
+        machineGrants,
+        historyKeys,
+      });
+      setNotice("environment key rotated");
+      // Reload the environment under the new key (fetches the re-sealed grant).
+      const current = envs?.find((e) => e.env.id === openEnv.envId);
+      if (current !== undefined) {
+        await selectEnv(current);
+      }
+    } catch (e) {
+      setError(message(e));
+    }
+  }
+
   function reveal(ns: NamedSecret) {
     if (openEnv === null) {
       return;
@@ -310,6 +371,16 @@ export function VaultView({
               </button>
             </form>
           )}
+          {(() => {
+            const orgId = activeProject?.project.orgId ?? null;
+            const canRotate =
+              orgId !== null && ["owner", "admin"].includes(orgRoles.get(orgId) ?? "");
+            return canRotate ? (
+              <p>
+                <button onClick={() => void rotateEnv()}>Rotate environment key</button>
+              </p>
+            ) : null;
+          })()}
         </section>
       )}
 

@@ -173,7 +173,21 @@ fn rotate_body(base: i64, grants: &[(&str, &[u8])], data_keys: &[(&str, &[u8])])
         .map(|(s, k)| format!(r#"{{"secret_id":"{s}","enc_data_key":"{}"}}"#, b64(k)))
         .collect::<Vec<_>>()
         .join(",");
-    format!(r#"{{"base_revision":{base},"grants":[{grants}],"data_keys":[{dks}]}}"#)
+    // Every test secret is set exactly once (version 1), so its single history row is covered by
+    // a rewrapped key at version 1 — rotation requires exact history coverage.
+    let hist = data_keys
+        .iter()
+        .map(|(s, k)| {
+            format!(
+                r#"{{"secret_id":"{s}","version":1,"enc_data_key":"{}"}}"#,
+                b64(&[k, &b"-hist"[..]].concat())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"base_revision":{base},"grants":[{grants}],"data_keys":[{dks}],"history_keys":[{hist}]}}"#
+    )
 }
 
 /// Owner creates org `o`, an org project `p` with env `e`, adds `member` (a member) and grants them
@@ -373,6 +387,60 @@ async fn rotate_requires_the_callers_own_grant() {
         .0,
         StatusCode::BAD_REQUEST
     );
+}
+
+#[tokio::test]
+async fn rotate_rewraps_history_and_rejects_missing_coverage() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e, s1) = ("rot-hist-o", "rot-hist-p", "rot-hist-e", "rot-hist-s1");
+    reset_orgs(&pool, &[o]).await;
+    let owner = fresh_session(&pool, "rot-hist-owner", "rot-hist-owner-s").await;
+    ensure_user(&pool, "rot-hist-member", "rot-hist-member-s").await;
+    let rev = seed(&pool, &owner, o, p, e, "rot-hist-member", &[s1]).await;
+
+    // The history endpoint lists the retained version with its original key.
+    let (status, body) = get(&pool, &owner, &format!("/environments/{e}/history")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(s1) && body.contains("\"version\":1"));
+    assert!(body.contains(&b64(b"old-dk")));
+
+    // A rotation that omits history coverage is rejected, and nothing changed.
+    let no_history = format!(
+        r#"{{"base_revision":{rev},"grants":[{{"user_id":"rot-hist-owner","enc_vault_key":"{}"}}],"data_keys":[{{"secret_id":"{s1}","enc_data_key":"{}"}}]}}"#,
+        b64(b"new-grant"),
+        b64(b"new-dk"),
+    );
+    assert_eq!(
+        post(
+            &pool,
+            &owner,
+            &format!("/environments/{e}/rotate"),
+            no_history
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    let (_, body) = get(&pool, &owner, &format!("/environments/{e}/history")).await;
+    assert!(
+        body.contains(&b64(b"old-dk")),
+        "history untouched after rejection"
+    );
+
+    // A covered rotation rewraps the history row.
+    let (status, _) = post(
+        &pool,
+        &owner,
+        &format!("/environments/{e}/rotate"),
+        rotate_body(rev, &[("rot-hist-owner", b"new-grant")], &[(s1, b"new-dk")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, body) = get(&pool, &owner, &format!("/environments/{e}/history")).await;
+    assert!(body.contains(&b64(&[&b"new-dk"[..], &b"-hist"[..]].concat())));
+    assert!(!body.contains(&b64(b"old-dk")));
 }
 
 #[tokio::test]
