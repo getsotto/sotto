@@ -127,7 +127,11 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 fn org_body(id: &str) -> String {
-    format!(r#"{{"id":"{id}","enc_name":"{}"}}"#, b64(b"org"))
+    format!(
+        r#"{{"id":"{id}","enc_name":"{}","enc_org_key":"{}"}}"#,
+        b64(b"org"),
+        b64(b"sealed-org-key"),
+    )
 }
 
 fn member_body(user_id: &str, role: &str) -> String {

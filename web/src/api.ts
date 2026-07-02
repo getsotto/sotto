@@ -87,17 +87,18 @@ export async function fetchProjects(): Promise<Project[]> {
 export interface Environment {
   id: string;
   encName: Uint8Array;
-  encVaultKey: Uint8Array;
+  /// The caller's OWN vault-key grant, or `null` if they hold none for this environment.
+  encVaultKey: Uint8Array | null;
 }
 
 export async function fetchEnvironments(projectId: string): Promise<Environment[]> {
-  const rows = await authedJson<{ id: string; enc_name: string; enc_vault_key: string }[]>(
-    `/projects/${encodeURIComponent(projectId)}/environments`,
-  );
+  const rows = await authedJson<
+    { id: string; enc_name: string; enc_vault_key: string | null }[]
+  >(`/projects/${encodeURIComponent(projectId)}/environments`);
   return rows.map((r) => ({
     id: r.id,
     encName: standardB64ToBytes(r.enc_name),
-    encVaultKey: standardB64ToBytes(r.enc_vault_key),
+    encVaultKey: r.enc_vault_key ? standardB64ToBytes(r.enc_vault_key) : null,
   }));
 }
 
@@ -120,11 +121,40 @@ export interface Org {
   encName: Uint8Array;
   /// The caller's own role in this org.
   role: string;
+  /// The org key sealed to the caller, or `null` if not granted (names fall back to ids).
+  encOrgKey: Uint8Array | null;
 }
 
 export async function fetchOrgs(): Promise<Org[]> {
-  const rows = await authedJson<{ id: string; enc_name: string; role: string }[]>("/orgs");
-  return rows.map((r) => ({ id: r.id, encName: standardB64ToBytes(r.enc_name), role: r.role }));
+  const rows = await authedJson<
+    { id: string; enc_name: string; role: string; enc_org_key: string | null }[]
+  >("/orgs");
+  return rows.map((r) => ({
+    id: r.id,
+    encName: standardB64ToBytes(r.enc_name),
+    role: r.role,
+    encOrgKey: r.enc_org_key ? standardB64ToBytes(r.enc_org_key) : null,
+  }));
+}
+
+/// Store (or replace) a member's sealed copy of the org key.
+export async function grantOrgKey(
+  orgId: string,
+  userId: string,
+  encOrgKey: Uint8Array,
+): Promise<void> {
+  const resp = await fetch(
+    `/orgs/${encodeURIComponent(orgId)}/members/${encodeURIComponent(userId)}/org-key`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enc_org_key: bytesToStandardB64(encOrgKey) }),
+      ...CREDS,
+    },
+  );
+  if (!resp.ok) {
+    throw new Error(`server error (${resp.status})`);
+  }
 }
 
 export interface Member {
@@ -145,8 +175,14 @@ export async function fetchMembers(orgId: string): Promise<Member[]> {
   }));
 }
 
-/// Invite an existing Sotto user into an org by email; returns their user id.
-export async function inviteMember(orgId: string, email: string): Promise<string> {
+export interface InvitedMember {
+  userId: string;
+  /// Their public key (for sealing the org key to them), or `null` if they haven't set up yet.
+  publicKey: Uint8Array | null;
+}
+
+/// Invite an existing Sotto user into an org by email.
+export async function inviteMember(orgId: string, email: string): Promise<InvitedMember> {
   const resp = await fetch(`/orgs/${encodeURIComponent(orgId)}/invites`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -162,8 +198,11 @@ export async function inviteMember(orgId: string, email: string): Promise<string
   if (!resp.ok) {
     throw new Error(`server error (${resp.status})`);
   }
-  const body = (await resp.json()) as { user_id: string };
-  return body.user_id;
+  const body = (await resp.json()) as { user_id: string; public_key: string | null };
+  return {
+    userId: body.user_id,
+    publicKey: body.public_key ? standardB64ToBytes(body.public_key) : null,
+  };
 }
 
 /// Store a member's vault-key grant for an environment (sharing).

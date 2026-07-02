@@ -38,19 +38,22 @@ pub struct NewProject {
     pub org_id: Option<String>,
 }
 
-/// An organization to create (its name is opaque ciphertext, like a project's).
+/// An organization to create: name ciphertext + the org key sealed to the creator.
 #[derive(Debug, Clone, Serialize)]
 pub struct NewOrg {
     pub id: String,
     pub enc_name: String,
+    pub enc_org_key: String,
 }
 
-/// An organization the caller belongs to, with their own role in it.
+/// An organization the caller belongs to, with their own role and (if granted) sealed org key.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrgInfo {
     pub id: String,
     pub enc_name: String,
     pub role: String,
+    #[serde(default)]
+    pub enc_org_key: Option<String>,
 }
 
 /// The result of inviting a user: their id (now a member) and public key (for sealing grants).
@@ -210,7 +213,8 @@ pub struct Snapshot {
 pub struct EnvironmentInfo {
     pub id: String,
     pub enc_name: String,
-    pub enc_vault_key: String,
+    /// The caller's OWN vault-key grant, or `None` if they hold none for this environment.
+    pub enc_vault_key: Option<String>,
     pub revision: i64,
 }
 
@@ -281,6 +285,8 @@ pub trait SyncApi {
     fn rotate(&self, env_id: &str, req: &RotateRequest) -> Result<RotateResponse>;
     /// Remove a member from an org (revokes their API access).
     fn remove_member(&self, org_id: &str, user_id: &str) -> Result<()>;
+    /// Store (or replace) a member's sealed copy of the org key (display-name access).
+    fn grant_org_key(&self, org_id: &str, user_id: &str, enc_org_key: &str) -> Result<()>;
     /// Create a machine token for an environment (public key + sealed grant are client-generated).
     fn create_machine_token(
         &self,

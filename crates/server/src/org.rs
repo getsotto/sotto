@@ -37,6 +37,10 @@ pub fn router() -> Router<AppState> {
             "/orgs/{org_id}/members/{user_id}/grants",
             get(member_env_grants),
         )
+        .route(
+            "/orgs/{org_id}/members/{user_id}/org-key",
+            post(grant_org_key),
+        )
         .route("/orgs/{org_id}/invites", post(invite_member))
 }
 
@@ -114,7 +118,10 @@ pub(crate) async fn role_of(
 #[derive(Deserialize)]
 struct CreateOrg {
     id: String,
+    /// The org name, encrypted under the org key (client-generated).
     enc_name: String,
+    /// The org key sealed to the creator's public key — their own copy, stored on their membership.
+    enc_org_key: String,
 }
 
 #[derive(Serialize)]
@@ -123,6 +130,15 @@ struct OrgView {
     enc_name: String,
     /// The caller's own role in this org.
     role: Role,
+    /// The org key sealed to the caller (base64), or `null` if they haven't been granted it —
+    /// without it, clients show record ids instead of names.
+    enc_org_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GrantOrgKey {
+    /// The org key sealed to the target member's public key.
+    enc_org_key: String,
 }
 
 #[derive(Deserialize)]
@@ -220,8 +236,10 @@ async fn create_org(
 ) -> Result<StatusCode> {
     validate_id(&body.id, "id")?;
     let enc_name = encoding::decode(&body.enc_name, "enc_name", MAX_ENC_NAME)?;
+    let enc_org_key = encoding::decode(&body.enc_org_key, "enc_org_key", MAX_ENC_NAME)?;
 
-    // Org row and the creator's owner membership must land together, or not at all.
+    // Org row and the creator's owner membership (carrying their sealed org key) must land
+    // together, or not at all.
     let created = {
         let mut tx = state.pool.begin().await?;
         let created: Option<String> = sqlx::query_scalar(
@@ -236,11 +254,12 @@ async fn create_org(
 
         if created.is_some() {
             sqlx::query(
-                "INSERT INTO organization_memberships (org_id, user_id, role) \
-                 VALUES ($1, $2, 'owner')",
+                "INSERT INTO organization_memberships (org_id, user_id, role, enc_org_key) \
+                 VALUES ($1, $2, 'owner', $3)",
             )
             .bind(&body.id)
             .bind(&user.user_id)
+            .bind(&enc_org_key)
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -269,10 +288,14 @@ async fn create_org(
     }
 }
 
-/// `GET /orgs` — the orgs the caller belongs to, each with the caller's own role.
+/// Org listing row: `(id, enc_name, role, enc_org_key)`.
+type OrgRow = (String, Vec<u8>, String, Option<Vec<u8>>);
+
+/// `GET /orgs` — the orgs the caller belongs to, each with the caller's own role and (when granted)
+/// their sealed copy of the org key.
 async fn list_orgs(State(state): State<AppState>, user: AuthUser) -> Result<Json<Vec<OrgView>>> {
-    let rows: Vec<(String, Vec<u8>, String)> = sqlx::query_as(
-        "SELECT o.id, o.enc_name, m.role \
+    let rows: Vec<OrgRow> = sqlx::query_as(
+        "SELECT o.id, o.enc_name, m.role, m.enc_org_key \
          FROM organizations o JOIN organization_memberships m ON o.id = m.org_id \
          WHERE m.user_id = $1 ORDER BY o.id",
     )
@@ -282,15 +305,46 @@ async fn list_orgs(State(state): State<AppState>, user: AuthUser) -> Result<Json
 
     let orgs = rows
         .into_iter()
-        .map(|(id, enc_name, role)| {
+        .map(|(id, enc_name, role, enc_org_key)| {
             Ok(OrgView {
                 id,
                 enc_name: encoding::encode(&enc_name),
                 role: Role::from_db(&role)?,
+                enc_org_key: enc_org_key.as_deref().map(encoding::encode),
             })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Json(orgs))
+}
+
+/// `POST /orgs/{org_id}/members/{user_id}/org-key` — store (or replace) a member's sealed copy of
+/// the org key (admin+). Invites and env-sharing upsert this so members can read display names;
+/// it also re-grants a member whose account reset NULLed their copy.
+async fn grant_org_key(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path((org_id, target)): Path<(String, String)>,
+    Json(body): Json<GrantOrgKey>,
+) -> Result<StatusCode> {
+    let caller = caller_role(&state, &org_id, &user.user_id).await?;
+    if !caller.can_manage_members() {
+        return Err(Error::Forbidden(
+            "must be an admin or owner to grant the org key".into(),
+        ));
+    }
+    let enc_org_key = encoding::decode(&body.enc_org_key, "enc_org_key", MAX_ENC_NAME)?;
+    let updated = sqlx::query(
+        "UPDATE organization_memberships SET enc_org_key = $3 WHERE org_id = $1 AND user_id = $2",
+    )
+    .bind(&org_id)
+    .bind(&target)
+    .bind(&enc_org_key)
+    .execute(&state.pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Err(Error::NotFound("member not found".into()));
+    }
+    Ok(StatusCode::OK)
 }
 
 /// `DELETE /orgs/{org_id}` — delete an org (owner only). Cascades to its memberships.

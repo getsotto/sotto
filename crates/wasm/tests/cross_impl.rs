@@ -41,6 +41,29 @@ fn decode_key_via_bindings() {
     assert_eq!(bytes, [0xAB; 16]);
 }
 
+/// Metadata name decryption via the bindings agrees with the native scheme.
+#[wasm_bindgen_test]
+fn name_decrypt_via_bindings() {
+    let key = [0x44u8; 32];
+    let enc = sotto_core::names::encrypt_project_name(&key, "p1", b"acme");
+    assert_eq!(
+        sotto_wasm::name_decrypt_project(&key, "p1", &enc).unwrap_or_else(|_| panic!("project")),
+        b"acme"
+    );
+    let enc = sotto_core::names::encrypt_env_name(&key, "e1", b"prod");
+    assert_eq!(
+        sotto_wasm::name_decrypt_env(&key, "e1", &enc).unwrap_or_else(|_| panic!("env")),
+        b"prod"
+    );
+    let enc = sotto_core::names::encrypt_org_name(&key, "o1", b"team");
+    assert_eq!(
+        sotto_wasm::name_decrypt_org(&key, "o1", &enc).unwrap_or_else(|_| panic!("org")),
+        b"team"
+    );
+    // The wrong record id fails (AAD binding survives the boundary).
+    assert!(sotto_wasm::name_decrypt_org(&key, "o2", &enc).is_err());
+}
+
 /// Vault key hierarchy via the bindings (the in-browser vault read/write path runs in WASM).
 #[wasm_bindgen_test]
 fn vault_round_trip_via_bindings() {

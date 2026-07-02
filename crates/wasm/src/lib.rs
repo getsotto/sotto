@@ -189,3 +189,30 @@ pub fn vault_decrypt_value(
 pub fn format_decode_key(prefix: &str, version: u8, s: &str) -> Result<Vec<u8>, JsError> {
     sotto_core::format::decode_key(prefix, version, s).map_err(|e| JsError::new(&e.to_string()))
 }
+
+// --- metadata display names (single-source scheme in `sotto_core::names`) ---
+
+/// Decrypt an organization's name (org key for shared orgs; older orgs used the creator's master).
+#[wasm_bindgen]
+pub fn name_decrypt_org(key: &[u8], org_id: &str, ciphertext: &[u8]) -> Result<Vec<u8>, JsError> {
+    sotto_core::names::decrypt_org_name(&key32(key)?, org_id, ciphertext)
+        .map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Decrypt a project's name (master key for personal projects, org key for org projects).
+#[wasm_bindgen]
+pub fn name_decrypt_project(
+    key: &[u8],
+    project_id: &str,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    sotto_core::names::decrypt_project_name(&key32(key)?, project_id, ciphertext)
+        .map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Decrypt an environment's name (master key for personal projects, org key for org projects).
+#[wasm_bindgen]
+pub fn name_decrypt_env(key: &[u8], env_id: &str, ciphertext: &[u8]) -> Result<Vec<u8>, JsError> {
+    sotto_core::names::decrypt_env_name(&key32(key)?, env_id, ciphertext)
+        .map_err(|e| JsError::new(&e.to_string()))
+}

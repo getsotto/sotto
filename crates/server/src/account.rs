@@ -134,6 +134,12 @@ async fn reset_account(
         .bind(&user.user_id)
         .execute(&mut *tx)
         .await?;
+    // Org keys were sealed to the old keypair too; NULL them so clients fall back to id labels
+    // until an admin re-grants (invite/share flows upsert the org key).
+    sqlx::query("UPDATE organization_memberships SET enc_org_key = NULL WHERE user_id = $1")
+        .bind(&user.user_id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(StatusCode::OK)
 }

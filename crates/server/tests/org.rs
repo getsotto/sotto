@@ -118,8 +118,9 @@ async fn delete(pool: &PgPool, token: &str, uri: &str) -> (StatusCode, String) {
 
 fn org_body(id: &str) -> String {
     format!(
-        r#"{{"id":"{id}","enc_name":"{}"}}"#,
-        STANDARD.encode(b"org")
+        r#"{{"id":"{id}","enc_name":"{}","enc_org_key":"{}"}}"#,
+        STANDARD.encode(b"org"),
+        STANDARD.encode(b"sealed-org-key"),
     )
 }
 
@@ -497,6 +498,61 @@ async fn add_nonexistent_user_is_404() {
             &owner,
             &format!("/orgs/{org}/members"),
             member_body("org-ghost-nobody", "member")
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn org_key_is_stored_listed_and_grantable() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let org = "org-key-o";
+    reset_orgs(&pool, &[org]).await;
+    let owner = fresh_session(&pool, "org-key-owner", "org-key-owner-s").await;
+    let member = fresh_session(&pool, "org-key-member", "org-key-member-s").await;
+    post(&pool, &owner, "/orgs", org_body(org)).await;
+    post(
+        &pool,
+        &owner,
+        &format!("/orgs/{org}/members"),
+        member_body("org-key-member", "member"),
+    )
+    .await;
+
+    // The creator's sealed copy (from org creation) shows in their listing; the member has none.
+    let (_, body) = get(&pool, Some(&owner), "/orgs").await;
+    assert!(body.contains(&STANDARD.encode(b"sealed-org-key")));
+    let (_, body) = get(&pool, Some(&member), "/orgs").await;
+    assert!(body.contains("\"enc_org_key\":null"));
+
+    // A plain member cannot grant the org key; an owner can, and the member then sees their copy.
+    let grant_uri = format!("/orgs/{org}/members/org-key-member/org-key");
+    let grant_body = format!(
+        r#"{{"enc_org_key":"{}"}}"#,
+        STANDARD.encode(b"member-org-key")
+    );
+    assert_eq!(
+        post(&pool, &member, &grant_uri, grant_body.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        post(&pool, &owner, &grant_uri, grant_body).await.0,
+        StatusCode::OK
+    );
+    let (_, body) = get(&pool, Some(&member), "/orgs").await;
+    assert!(body.contains(&STANDARD.encode(b"member-org-key")));
+
+    // Granting to a non-member is 404.
+    assert_eq!(
+        post(
+            &pool,
+            &owner,
+            &format!("/orgs/{org}/members/org-key-nobody/org-key"),
+            format!(r#"{{"enc_org_key":"{}"}}"#, STANDARD.encode(b"x")),
         )
         .await
         .0,

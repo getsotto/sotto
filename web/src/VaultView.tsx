@@ -6,8 +6,10 @@ import {
   fetchEnvironments,
   fetchMembers,
   fetchMyGrant,
+  fetchOrgs,
   fetchProjects,
   fetchSecrets,
+  grantOrgKey,
   type Environment,
   type Member,
   type Project,
@@ -20,6 +22,7 @@ import {
   decryptSecretName,
   decryptSecretValue,
   openEnvGrant,
+  openOrgKey,
   sealForShare,
   sealGrantTo,
   type SecretEntry,
@@ -78,24 +81,47 @@ export function VaultView({
   // Org members of the active project (loaded when an org env is opened), for the share picker.
   const [members, setMembers] = useState<Member[] | null>(null);
   const [shareTo, setShareTo] = useState("");
+  // Opened org keys by org id — org project/env names decrypt under these.
+  const [orgKeys, setOrgKeys] = useState<Map<string, Uint8Array>>(new Map());
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  /// The name-decryption key for a project: its org key when we hold one, else the master key.
+  function nameKeyFor(orgId: string | null): Uint8Array {
+    return (orgId !== null ? orgKeys.get(orgId) : undefined) ?? master;
+  }
 
   useEffect(() => {
     void (async () => {
       try {
+        // Open every org key we hold first, so org project names decrypt on first paint.
+        const keys = new Map<string, Uint8Array>();
+        for (const org of await fetchOrgs()) {
+          if (org.encOrgKey !== null) {
+            try {
+              keys.set(org.id, openOrgKey(master, encPrivateKeys, org.encOrgKey));
+            } catch {
+              // A copy sealed to keys we no longer hold: fall back to master-key naming.
+            }
+          }
+        }
+        setOrgKeys(keys);
+
         const rows = await fetchProjects();
         setProjects(
-          rows.map((project) => ({
-            project,
-            name: nameOr(project.id, () => decryptProjectName(master, project.id, project.encName)),
-          })),
+          rows.map((project) => {
+            const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
+            return {
+              project,
+              name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
+            };
+          }),
         );
       } catch (e) {
         setError(message(e));
       }
     })();
-  }, [master]);
+  }, [master, encPrivateKeys]);
 
   async function selectProject(np: NamedProject) {
     setError(null);
@@ -107,9 +133,10 @@ export function VaultView({
     setMembers(null);
     setShareTo(""); // drop a stale member pick so the next env's Share button starts disabled
     try {
+      const key = nameKeyFor(np.project.orgId);
       const rows = await fetchEnvironments(np.project.id);
       setEnvs(
-        rows.map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(master, env.id, env.encName)) })),
+        rows.map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(key, env.id, env.encName)) })),
       );
     } catch (e) {
       setError(message(e));
@@ -169,6 +196,13 @@ export function VaultView({
     try {
       const sealed = sealGrantTo(member.publicKey, openEnv.vaultKey);
       await createGrant(openEnv.envId, member.userId, sealed);
+      // Whoever can decrypt the environment should read its display names too: upsert their
+      // org-key copy alongside the env grant (best-effort — needs our own copy).
+      const orgId = activeProject?.project.orgId ?? null;
+      const orgKey = orgId !== null ? orgKeys.get(orgId) : undefined;
+      if (orgId !== null && orgKey !== undefined) {
+        await grantOrgKey(orgId, member.userId, sealGrantTo(member.publicKey, orgKey));
+      }
       setNotice(`shared this environment with ${member.userId}`);
     } catch (e) {
       setError(message(e));
@@ -289,7 +323,7 @@ export function VaultView({
         </section>
       )}
 
-      <TeamPanel master={master} />
+      <TeamPanel master={master} encPrivateKeys={encPrivateKeys} />
     </main>
   );
 }

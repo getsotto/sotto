@@ -6,10 +6,12 @@
 // produces the ciphertext + the fragment key.
 
 import {
-  aead_open,
   format_decode_key,
   kdf_derive_master_key,
   loadWasm,
+  name_decrypt_env,
+  name_decrypt_org,
+  name_decrypt_project,
   share_seal,
   vault_decrypt_name,
   vault_decrypt_value,
@@ -58,21 +60,28 @@ export function decryptSecretValue(vaultKey: Uint8Array, envId: string, s: Secre
   return DEC.decode(vault_decrypt_value(vaultKey, envId, s.id, s.version, s.encValue, s.encDataKey));
 }
 
-// Project/environment names are encrypted under the master key with this AAD. NOTE: the format is
-// mirrored from the CLI/server (`cli/remote/sync.rs`); moving that metadata-name crypto into
-// `sotto-core` (like the vault crypto) is a documented follow-up so there is a single source.
-export function decryptProjectName(master: Uint8Array, projectId: string, encName: Uint8Array): string {
-  return DEC.decode(aead_open(master, encName, TEXT.encode(`sotto/v1/project-name|id=${projectId}`)));
+// Display names decrypt through the single-source scheme in `sotto_core::names` (WASM bindings).
+// `key` is the org key for org resources, or the master key for personal ones; callers try the
+// org key first and fall back to the master, then to showing the record id.
+export function decryptProjectName(key: Uint8Array, projectId: string, encName: Uint8Array): string {
+  return DEC.decode(name_decrypt_project(key, projectId, encName));
 }
 
-export function decryptEnvName(master: Uint8Array, envId: string, encName: Uint8Array): string {
-  return DEC.decode(aead_open(master, encName, TEXT.encode(`sotto/v1/env-name|id=${envId}`)));
+export function decryptEnvName(key: Uint8Array, envId: string, encName: Uint8Array): string {
+  return DEC.decode(name_decrypt_env(key, envId, encName));
 }
 
-/// Decrypt an org's name — like project names, sealed under the *creator's* master key, so for a
-/// non-creator this throws and callers fall back to the org id (per-org keys are a follow-up).
-export function decryptOrgName(master: Uint8Array, orgId: string, encName: Uint8Array): string {
-  return DEC.decode(aead_open(master, encName, TEXT.encode(`sotto/v1/org-name|id=${orgId}`)));
+export function decryptOrgName(key: Uint8Array, orgId: string, encName: Uint8Array): string {
+  return DEC.decode(name_decrypt_org(key, orgId, encName));
+}
+
+/// Open the caller's sealed org-key copy (same sealed-box grant scheme as vault keys).
+export function openOrgKey(
+  master: Uint8Array,
+  encPrivateKeys: Uint8Array,
+  encOrgKey: Uint8Array,
+): Uint8Array {
+  return vault_open_grant(master, encPrivateKeys, encOrgKey);
 }
 
 /// Seal an environment's vault key to a member's public key — the grant uploaded when sharing.

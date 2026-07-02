@@ -32,7 +32,9 @@ struct CreateEnvironment {
 struct EnvironmentView {
     id: String,
     enc_name: String,
-    enc_vault_key: String,
+    /// The CALLER's own vault-key grant for this environment, or `null` if they hold none (they can
+    /// see the environment exists via org access, but can't decrypt it until someone shares it).
+    enc_vault_key: Option<String>,
     revision: i64,
 }
 
@@ -55,18 +57,18 @@ async fn create_environment(
         ));
     }
 
-    // The environment and the creator's own vault-key grant land together (the caller sealed
-    // `enc_vault_key` to their own public key), so "fetch my grant" works for the creator too.
+    // The environment and the creator's vault-key grant land together (the caller sealed
+    // `enc_vault_key` to their own public key). The grant row is the only storage — there is no
+    // inline copy on the environment row.
     let created = {
         let mut tx = state.pool.begin().await?;
         let created: Option<String> = sqlx::query_scalar(
-            "INSERT INTO environments (id, project_id, enc_name, enc_vault_key) \
-             VALUES ($1, $2, $3, $4) ON CONFLICT (id) DO NOTHING RETURNING id",
+            "INSERT INTO environments (id, project_id, enc_name) \
+             VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING RETURNING id",
         )
         .bind(&body.id)
         .bind(&project_id)
         .bind(&enc_name)
-        .bind(&enc_vault_key)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -103,7 +105,8 @@ async fn create_environment(
     }
 }
 
-/// `GET /projects/{project_id}/environments` — list environments in a project the caller can reach.
+/// `GET /projects/{project_id}/environments` — list environments in a project the caller can
+/// reach, each with the caller's OWN vault-key grant (null when they hold none).
 async fn list_environments(
     State(state): State<AppState>,
     user: AuthUser,
@@ -111,11 +114,15 @@ async fn list_environments(
 ) -> Result<Json<Vec<EnvironmentView>>> {
     access::project_access(&state, &project_id, &user.user_id).await?;
 
-    let rows: Vec<(String, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
-        "SELECT id, enc_name, enc_vault_key, revision FROM environments \
-         WHERE project_id = $1 ORDER BY id",
+    /// Listing row: `(id, enc_name, caller's grant, revision)`.
+    type EnvRow = (String, Vec<u8>, Option<Vec<u8>>, i64);
+    let rows: Vec<EnvRow> = sqlx::query_as(
+        "SELECT e.id, e.enc_name, eg.enc_vault_key, e.revision FROM environments e \
+         LEFT JOIN environment_grants eg ON eg.env_id = e.id AND eg.user_id = $2 \
+         WHERE e.project_id = $1 ORDER BY e.id",
     )
     .bind(&project_id)
+    .bind(&user.user_id)
     .fetch_all(&state.pool)
     .await?;
 
@@ -124,7 +131,7 @@ async fn list_environments(
             .map(|(id, enc_name, enc_vault_key, revision)| EnvironmentView {
                 id,
                 enc_name: encoding::encode(&enc_name),
-                enc_vault_key: encoding::encode(&enc_vault_key),
+                enc_vault_key: enc_vault_key.as_deref().map(encoding::encode),
                 revision,
             })
             .collect(),
