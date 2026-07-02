@@ -967,7 +967,8 @@ fn history(
     if reveal {
         eprintln!("warning: --reveal prints secret values in plaintext");
     }
-    for v in &versions {
+    let count = versions.len();
+    for mut v in versions {
         match (&v.value, reveal) {
             (Some(value), true) => {
                 println!("v{}  {}", v.version, String::from_utf8_lossy(value))
@@ -975,12 +976,15 @@ fn history(
             (Some(value), false) => println!("v{}  ({} bytes)", v.version, value.len()),
             (None, _) => println!("v{}  (unreadable — run `sotto pull` first)", v.version),
         }
+        // Zeroize each decrypted plaintext as soon as it's printed, so the whole history isn't left
+        // resident in memory for the rest of the command.
+        if let Some(value) = v.value.as_mut() {
+            value.zeroize();
+        }
     }
     eprintln!(
-        "{} version(s) of {name} ({}/{})",
-        versions.len(),
-        config.project,
-        config.environment
+        "{count} version(s) of {name} ({}/{})",
+        config.project, config.environment
     );
     Ok(())
 }
