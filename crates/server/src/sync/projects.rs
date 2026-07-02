@@ -31,6 +31,9 @@ struct CreateProject {
 struct ProjectView {
     id: String,
     enc_name: String,
+    /// Owning organization, or `null` for a personal project. Structural metadata (not secret);
+    /// the web client uses it to offer team actions (share, members) on org projects.
+    org_id: Option<String>,
 }
 
 /// `POST /projects` — create a project. Personal (no `org_id`) is owned by the caller; an org
@@ -97,8 +100,8 @@ async fn list_projects(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Json<Vec<ProjectView>>> {
-    let rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
-        "SELECT id, enc_name FROM projects p \
+    let rows: Vec<(String, Vec<u8>, Option<String>)> = sqlx::query_as(
+        "SELECT id, enc_name, org_id FROM projects p \
          WHERE (p.org_id IS NULL AND p.owner_id = $1) \
             OR (p.org_id IS NOT NULL AND EXISTS ( \
                    SELECT 1 FROM organization_memberships m \
@@ -111,9 +114,10 @@ async fn list_projects(
 
     Ok(Json(
         rows.into_iter()
-            .map(|(id, enc_name)| ProjectView {
+            .map(|(id, enc_name, org_id)| ProjectView {
                 id,
                 enc_name: encoding::encode(&enc_name),
+                org_id,
             })
             .collect(),
     ))
