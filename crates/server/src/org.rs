@@ -438,6 +438,8 @@ async fn add_member(
         ));
     }
 
+    // Insert and audit commit together, so a failed audit can't leave an un-logged new member.
+    let mut tx = state.pool.begin().await?;
     let inserted: std::result::Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
         "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, $3) \
          ON CONFLICT (org_id, user_id) DO NOTHING RETURNING user_id",
@@ -445,13 +447,13 @@ async fn add_member(
     .bind(&org_id)
     .bind(&body.user_id)
     .bind(body.role.as_str())
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await;
 
     match inserted {
         Ok(Some(_)) => {
-            audit::record(
-                &state.pool,
+            audit::record_tx(
+                &mut tx,
                 &org_id,
                 &user.user_id,
                 "member.added",
@@ -462,6 +464,7 @@ async fn add_member(
                 },
             )
             .await?;
+            tx.commit().await?;
             Ok(StatusCode::CREATED)
         }
         // No row inserted, no error: the (org, user) pair already existed.
