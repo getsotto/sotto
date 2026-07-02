@@ -112,56 +112,76 @@ async fn reset_replaces_material_and_deletes_grants() {
         let (status, body) = send(&pool, "PUT", "/account", token, Some(bundle_body(tag))).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
     }
-    send(
-        &pool,
-        "POST",
-        "/orgs",
-        &owner,
-        Some(format!(r#"{{"id":"rec-o","enc_name":"{}"}}"#, b64(b"org"))),
-    )
-    .await;
-    send(
-        &pool,
-        "POST",
-        "/orgs/rec-o/members",
-        &owner,
-        Some(r#"{"user_id":"rec-member","role":"member"}"#.into()),
-    )
-    .await;
-    send(
-        &pool,
-        "POST",
-        "/projects",
-        &owner,
-        Some(format!(
-            r#"{{"id":"rec-p","enc_name":"{}","org_id":"rec-o"}}"#,
-            b64(b"p")
-        )),
-    )
-    .await;
-    send(
-        &pool,
-        "POST",
-        "/projects/rec-p/environments",
-        &owner,
-        Some(format!(
-            r#"{{"id":"rec-e","enc_name":"{}","enc_vault_key":"{}"}}"#,
-            b64(b"e"),
-            b64(b"vk")
-        )),
-    )
-    .await;
-    send(
-        &pool,
-        "POST",
-        "/environments/rec-e/grants",
-        &owner,
-        Some(format!(
-            r#"{{"user_id":"rec-member","enc_vault_key":"{}"}}"#,
-            b64(b"member-grant")
-        )),
-    )
-    .await;
+    // Assert each setup step succeeds, so a later auth/validation/schema change surfaces here with a
+    // clear status + body rather than as a confusing failure in the reset assertions below.
+    let expect_ok = |label: &str, (status, body): (StatusCode, String)| {
+        assert!(status.is_success(), "{label} failed: {status} — {body}");
+    };
+    expect_ok(
+        "create org",
+        send(
+            &pool,
+            "POST",
+            "/orgs",
+            &owner,
+            Some(format!(r#"{{"id":"rec-o","enc_name":"{}"}}"#, b64(b"org"))),
+        )
+        .await,
+    );
+    expect_ok(
+        "add member",
+        send(
+            &pool,
+            "POST",
+            "/orgs/rec-o/members",
+            &owner,
+            Some(r#"{"user_id":"rec-member","role":"member"}"#.into()),
+        )
+        .await,
+    );
+    expect_ok(
+        "create project",
+        send(
+            &pool,
+            "POST",
+            "/projects",
+            &owner,
+            Some(format!(
+                r#"{{"id":"rec-p","enc_name":"{}","org_id":"rec-o"}}"#,
+                b64(b"p")
+            )),
+        )
+        .await,
+    );
+    expect_ok(
+        "create environment",
+        send(
+            &pool,
+            "POST",
+            "/projects/rec-p/environments",
+            &owner,
+            Some(format!(
+                r#"{{"id":"rec-e","enc_name":"{}","enc_vault_key":"{}"}}"#,
+                b64(b"e"),
+                b64(b"vk")
+            )),
+        )
+        .await,
+    );
+    expect_ok(
+        "create grant",
+        send(
+            &pool,
+            "POST",
+            "/environments/rec-e/grants",
+            &owner,
+            Some(format!(
+                r#"{{"user_id":"rec-member","enc_vault_key":"{}"}}"#,
+                b64(b"member-grant")
+            )),
+        )
+        .await,
+    );
     assert_eq!(
         send(&pool, "GET", "/environments/rec-e/grant", &member, None)
             .await
