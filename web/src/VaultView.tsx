@@ -228,12 +228,24 @@ export function VaultView({
   /// Rotate the open environment's vault key (admin/owner): rewrap every current + history data
   /// key, re-seal grants for the current holders and machine tokens, then reload under the new key.
   async function rotateEnv() {
-    if (openEnv === null || members === null) {
+    if (openEnv === null) {
       return;
     }
     setError(null);
     setNotice(null);
     try {
+      // Rotation re-seals a grant for every current holder, so we need the member roster (their
+      // public keys). It normally loads when the env opens; fetch it here if it isn't ready yet,
+      // instead of silently doing nothing, and surface any failure as an error.
+      let roster = members;
+      if (roster === null) {
+        const orgId = activeProject?.project.orgId;
+        if (!orgId) {
+          throw new Error("this environment is not in an organization; nothing to rotate");
+        }
+        roster = await fetchMembers(orgId);
+        setMembers(roster);
+      }
       const newKey = crypto.getRandomValues(new Uint8Array(32));
       const snap = await fetchSnapshot(openEnv.envId);
       const dataKeys = snap.secrets.map((s) => ({
@@ -247,7 +259,7 @@ export function VaultView({
       }));
       const grants = [];
       for (const holder of await fetchGrantHolders(openEnv.envId)) {
-        const m = members.find((mm) => mm.userId === holder);
+        const m = roster.find((mm) => mm.userId === holder);
         if (m === undefined || m.publicKey === null) {
           throw new Error(`cannot re-grant ${holder}: no public key on file`);
         }
