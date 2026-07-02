@@ -178,6 +178,9 @@ export async function createGrant(
     body: JSON.stringify({ user_id: userId, enc_vault_key: bytesToStandardB64(encVaultKey) }),
     ...CREDS,
   });
+  if (resp.status === 403) {
+    throw new Error("only an admin or owner can share this environment");
+  }
   if (!resp.ok) {
     throw new Error(`server error (${resp.status})`);
   }
