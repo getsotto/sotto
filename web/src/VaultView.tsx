@@ -159,6 +159,7 @@ export function VaultView({
     setNotice(null);
     const member = members.find((m) => m.userId === shareTo);
     if (member === undefined) {
+      setError("pick a member to share with");
       return;
     }
     if (member.publicKey === null) {
