@@ -188,20 +188,22 @@ async fn revoke_token(
             "must be an admin or owner to revoke a machine token".into(),
         ));
     }
+    // Revoke and its audit event commit together, so a failed audit can't leave one un-logged.
+    let mut tx = state.pool.begin().await?;
     let revoked = sqlx::query(
         "UPDATE machine_tokens SET revoked_at = now() \
          WHERE id = $1 AND env_id = $2 AND revoked_at IS NULL",
     )
     .bind(&token_id)
     .bind(&env_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
     if revoked.rows_affected() == 0 {
         return Err(Error::NotFound("machine token not found".into()));
     }
     if let Some(org) = access.org_id() {
-        audit::record(
-            &state.pool,
+        audit::record_tx(
+            &mut tx,
             org,
             &user.user_id,
             "token.revoked",
@@ -213,6 +215,7 @@ async fn revoke_token(
         )
         .await?;
     }
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
