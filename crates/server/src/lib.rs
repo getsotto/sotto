@@ -8,6 +8,7 @@
 //! - [`auth`] — GitHub OAuth login, sessions, and the [`auth::AuthUser`] request extractor
 //! - [`account`] — account crypto-material sync (KDF params, public key, sealed private keys, …)
 //! - [`org`] — organizations, memberships, and roles (the team-RBAC substrate)
+//! - [`machine`] — per-environment machine tokens (CI / service access)
 //! - [`sync`] — projects, environments, and the secret snapshot/batch hot path
 //! - [`share`] — one-time / expiring share links (the viral funnel)
 //! - [`state`] — shared application state ([`state::AppState`])
@@ -19,6 +20,7 @@ pub mod config;
 pub mod db;
 pub mod encoding;
 pub mod error;
+pub mod machine;
 pub mod org;
 pub mod share;
 pub mod state;
@@ -37,6 +39,7 @@ pub fn app(state: AppState) -> Router {
         .merge(auth::router())
         .merge(account::router())
         .merge(org::router())
+        .merge(machine::router())
         .merge(sync::router())
         .merge(share::router())
         .with_state(state)

@@ -111,13 +111,14 @@ pub fn clear_cookie(secure: bool) -> String {
     cookie
 }
 
-/// BLAKE2b hash of the token string; this is what we persist and compare against.
-fn hash_token(token: &str) -> Vec<u8> {
+/// BLAKE2b hash of the token string; this is what we persist and compare against. Shared with
+/// machine tokens (`crate::machine`), which follow the same hash-only storage scheme.
+pub(crate) fn hash_token(token: &str) -> Vec<u8> {
     GenericHash::hash_with_defaults_to_vec::<_, GhKey>(token.as_bytes(), None)
         .expect("BLAKE2b over a small input cannot fail")
 }
 
-fn to_hex(bytes: &[u8]) -> String {
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));
