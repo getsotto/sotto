@@ -154,6 +154,40 @@ impl<'a> Vault<'a> {
         self.store.delete_secret(&row.id)
     }
 
+    /// Resolve a secret's id by name, checking live rows first, then tombstones (so history and
+    /// rollback still work for a deleted secret — rolling it back resurrects it).
+    pub fn find_id_by_name(&self, name: &str) -> Result<Option<String>> {
+        if let Some(row) = self.find_by_name(name)? {
+            return Ok(Some(row.id));
+        }
+        Ok(self.find_deleted_by_name(name)?.map(|row| row.id))
+    }
+
+    /// This environment's id (the AAD component history decryption binds to).
+    pub fn env_id(&self) -> &str {
+        &self.env_id
+    }
+
+    /// Decrypt one value with this vault's key at an explicit `(secret_id, version)` binding —
+    /// used for history rows, whose AAD is pinned to their original version.
+    pub fn decrypt_at(
+        &self,
+        secret_id: &str,
+        version: i64,
+        enc_value: &[u8],
+        enc_data_key: &[u8],
+    ) -> Result<Vec<u8>> {
+        core_vault::decrypt_value(
+            &self.vault_key,
+            &self.env_id,
+            secret_id,
+            version,
+            enc_value,
+            enc_data_key,
+        )
+        .map_err(Into::into)
+    }
+
     /// All non-deleted secrets as `(name, value)` pairs, sorted by name. Unwraps each row's data
     /// key once to decrypt both fields.
     pub fn entries(&self) -> Result<Vec<(String, Vec<u8>)>> {

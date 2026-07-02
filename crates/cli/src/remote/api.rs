@@ -98,14 +98,34 @@ pub struct MachineGrantEntry {
     pub enc_vault_key: String,
 }
 
-/// A rotation request: rewrapped data keys + the replacement grant set (users and machines), at a
-/// base revision. `machine_grants` must cover exactly the env's active machine tokens.
+/// One retained history version's data key, rewrapped under the new vault key, in a rotation.
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryKeyEntry {
+    pub secret_id: String,
+    pub version: i64,
+    pub enc_data_key: String,
+}
+
+/// A rotation request: rewrapped data keys (current + history) + the replacement grant set (users
+/// and machines), at a base revision. `machine_grants` must cover exactly the env's active machine
+/// tokens; `history_keys` exactly its retained versions.
 #[derive(Debug, Clone, Serialize)]
 pub struct RotateRequest {
     pub base_revision: i64,
     pub grants: Vec<GrantEntry>,
     pub data_keys: Vec<DataKeyEntry>,
     pub machine_grants: Vec<MachineGrantEntry>,
+    pub history_keys: Vec<HistoryKeyEntry>,
+}
+
+/// One retained version of one secret, as the server's history endpoint returns it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HistoryRow {
+    pub secret_id: String,
+    pub version: i64,
+    pub enc_name: String,
+    pub enc_value: String,
+    pub enc_data_key: String,
 }
 
 /// An active machine token, as listed for admins (rotation re-seals to `public_key`).
@@ -283,6 +303,8 @@ pub trait SyncApi {
     fn member_env_grants(&self, org_id: &str, user_id: &str) -> Result<Vec<String>>;
     /// Rotate an environment's vault key (rewrapped data keys + replacement grants); new revision.
     fn rotate(&self, env_id: &str, req: &RotateRequest) -> Result<RotateResponse>;
+    /// Every retained version of every secret in an environment (the complete history).
+    fn list_history(&self, env_id: &str) -> Result<Vec<HistoryRow>>;
     /// Remove a member from an org (revokes their API access).
     fn remove_member(&self, org_id: &str, user_id: &str) -> Result<()>;
     /// Store (or replace) a member's sealed copy of the org key (display-name access).

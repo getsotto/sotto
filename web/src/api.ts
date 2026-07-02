@@ -225,8 +225,15 @@ export async function createGrant(
   }
 }
 
-export async function fetchSecrets(envId: string): Promise<SecretEntry[]> {
+export interface Snapshot {
+  revision: number;
+  secrets: SecretEntry[];
+}
+
+/// The full snapshot including its revision (rotation writes against this as `base_revision`).
+export async function fetchSnapshot(envId: string): Promise<Snapshot> {
   const snap = await authedJson<{
+    revision: number;
     secrets: {
       id: string;
       enc_name: string;
@@ -236,14 +243,111 @@ export async function fetchSecrets(envId: string): Promise<SecretEntry[]> {
       deleted: boolean;
     }[];
   }>(`/environments/${encodeURIComponent(envId)}/secrets`);
-  return snap.secrets.map((s) => ({
-    id: s.id,
-    encName: standardB64ToBytes(s.enc_name),
-    encValue: standardB64ToBytes(s.enc_value),
-    encDataKey: standardB64ToBytes(s.enc_data_key),
-    version: s.version,
-    deleted: s.deleted,
+  return {
+    revision: snap.revision,
+    secrets: snap.secrets.map((s) => ({
+      id: s.id,
+      encName: standardB64ToBytes(s.enc_name),
+      encValue: standardB64ToBytes(s.enc_value),
+      encDataKey: standardB64ToBytes(s.enc_data_key),
+      version: s.version,
+      deleted: s.deleted,
+    })),
+  };
+}
+
+export async function fetchSecrets(envId: string): Promise<SecretEntry[]> {
+  return (await fetchSnapshot(envId)).secrets;
+}
+
+export interface HistoryRow {
+  secretId: string;
+  version: number;
+  encDataKey: Uint8Array;
+}
+
+/// Every retained history version's (secret, version, data key) — rotation must rewrap them all.
+export async function fetchHistory(envId: string): Promise<HistoryRow[]> {
+  const rows = await authedJson<{ secret_id: string; version: number; enc_data_key: string }[]>(
+    `/environments/${encodeURIComponent(envId)}/history`,
+  );
+  return rows.map((r) => ({
+    secretId: r.secret_id,
+    version: r.version,
+    encDataKey: standardB64ToBytes(r.enc_data_key),
   }));
+}
+
+/// The user ids currently granted an environment (rotation re-grants exactly these).
+export async function fetchGrantHolders(envId: string): Promise<string[]> {
+  const rows = await authedJson<{ user_id: string }[]>(
+    `/environments/${encodeURIComponent(envId)}/grants`,
+  );
+  return rows.map((r) => r.user_id);
+}
+
+export interface MachineTokenInfo {
+  tokenId: string;
+  name: string;
+  publicKey: Uint8Array;
+}
+
+/// The environment's active machine tokens (rotation re-seals the new key to each).
+export async function fetchMachineTokens(envId: string): Promise<MachineTokenInfo[]> {
+  const rows = await authedJson<{ token_id: string; name: string; public_key: string }[]>(
+    `/environments/${encodeURIComponent(envId)}/tokens`,
+  );
+  return rows.map((r) => ({
+    tokenId: r.token_id,
+    name: r.name,
+    publicKey: standardB64ToBytes(r.public_key),
+  }));
+}
+
+export interface RotatePayload {
+  baseRevision: number;
+  grants: { userId: string; encVaultKey: Uint8Array }[];
+  dataKeys: { secretId: string; encDataKey: Uint8Array }[];
+  machineGrants: { tokenId: string; encVaultKey: Uint8Array }[];
+  historyKeys: { secretId: string; version: number; encDataKey: Uint8Array }[];
+}
+
+/// Apply a key rotation (rewrapped keys + the replacement grant set) at a base revision.
+export async function postRotate(envId: string, payload: RotatePayload): Promise<void> {
+  const resp = await fetch(`/environments/${encodeURIComponent(envId)}/rotate`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      base_revision: payload.baseRevision,
+      grants: payload.grants.map((g) => ({
+        user_id: g.userId,
+        enc_vault_key: bytesToStandardB64(g.encVaultKey),
+      })),
+      data_keys: payload.dataKeys.map((d) => ({
+        secret_id: d.secretId,
+        enc_data_key: bytesToStandardB64(d.encDataKey),
+      })),
+      machine_grants: payload.machineGrants.map((m) => ({
+        token_id: m.tokenId,
+        enc_vault_key: bytesToStandardB64(m.encVaultKey),
+      })),
+      history_keys: payload.historyKeys.map((h) => ({
+        secret_id: h.secretId,
+        version: h.version,
+        enc_data_key: bytesToStandardB64(h.encDataKey),
+      })),
+    }),
+    ...CREDS,
+  });
+  if (resp.status === 412) {
+    throw new Error("the environment changed while rotating — try again");
+  }
+  if (resp.status === 403) {
+    throw new Error("only an admin or owner can rotate this environment");
+  }
+  if (!resp.ok) {
+    throw new Error(`server error (${resp.status})`);
+  }
 }
 
 /// Create a share link (session required); returns the public token.

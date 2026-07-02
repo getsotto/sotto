@@ -17,6 +17,7 @@ import {
   vault_decrypt_value,
   vault_grant_key,
   vault_open_grant,
+  vault_rewrap_data_key,
 } from "./wasm";
 
 const TEXT = new TextEncoder();
@@ -73,6 +74,18 @@ export function decryptEnvName(key: Uint8Array, envId: string, encName: Uint8Arr
 
 export function decryptOrgName(key: Uint8Array, orgId: string, encName: Uint8Array): string {
   return DEC.decode(name_decrypt_org(key, orgId, encName));
+}
+
+/// Rewrap one data key from the old vault key to the new one (rotation). Ciphertext untouched.
+export function rewrapDataKey(
+  oldVaultKey: Uint8Array,
+  newVaultKey: Uint8Array,
+  envId: string,
+  secretId: string,
+  version: number,
+  encDataKey: Uint8Array,
+): Uint8Array {
+  return vault_rewrap_data_key(oldVaultKey, newVaultKey, envId, secretId, version, encDataKey);
 }
 
 /// Open the caller's sealed org-key copy (same sealed-box grant scheme as vault keys).

@@ -280,6 +280,16 @@ impl SyncApi for HttpClient {
         Ok(envs.into_iter().map(|e| e.env_id).collect())
     }
 
+    fn list_history(&self, env_id: &str) -> Result<Vec<super::api::HistoryRow>> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/environments/{env_id}/history")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
     fn rotate(&self, env_id: &str, req: &RotateRequest) -> Result<RotateResponse> {
         let resp = self
             .http

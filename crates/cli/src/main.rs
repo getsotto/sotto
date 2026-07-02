@@ -161,6 +161,19 @@ enum Command {
     },
     /// Remove a secret.
     Rm { name: String },
+    /// Show a secret's version history (from the server; run after `login`).
+    History {
+        name: String,
+        /// Show each version's value, not just its number and size.
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Restore an old version of a secret as a new version (local until you `push`).
+    Rollback {
+        name: String,
+        /// The version to restore (see `sotto history`).
+        version: i64,
+    },
     /// Run a command with the environment's secrets injected as environment variables.
     Run {
         /// The command and its arguments (after `--`).
@@ -406,6 +419,16 @@ fn run() -> Result<()> {
             app.remove(&config, &name)?;
             eprintln!("removed {name}");
             Ok(())
+        }
+        Command::History { name, reveal } => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            ensure_unlocked(&store, &keychain)?;
+            history(&store, &keychain, &config, &name, reveal)
+        }
+        Command::Rollback { name, version } => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            ensure_unlocked(&store, &keychain)?;
+            rollback(&store, &keychain, &config, &name, version)
         }
         Command::Run { args } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
@@ -926,6 +949,61 @@ fn status(app: &App, cwd: &Path, json: bool) -> Result<()> {
         Some((project, env)) => println!("project:  {project} ({env})"),
         None => println!("project:  none (no {} here)", config::CONFIG_FILE),
     }
+    Ok(())
+}
+
+/// Show a secret's server-side version history, newest first.
+fn history(
+    store: &Store,
+    keychain: &dyn Keychain,
+    config: &Config,
+    name: &str,
+    reveal: bool,
+) -> Result<()> {
+    let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
+    let keypair = session::account_keypair(store, &master)?;
+    let client = sync_client(keychain)?;
+    let versions = remote::sync::history(&client, store, &keypair, config, name)?;
+    if reveal {
+        eprintln!("warning: --reveal prints secret values in plaintext");
+    }
+    let count = versions.len();
+    for mut v in versions {
+        match (&v.value, reveal) {
+            (Some(value), true) => {
+                println!("v{}  {}", v.version, String::from_utf8_lossy(value))
+            }
+            (Some(value), false) => println!("v{}  ({} bytes)", v.version, value.len()),
+            (None, _) => println!("v{}  (unreadable — run `sotto pull` first)", v.version),
+        }
+        // Zeroize each decrypted plaintext as soon as it's printed, so the whole history isn't left
+        // resident in memory for the rest of the command.
+        if let Some(value) = v.value.as_mut() {
+            value.zeroize();
+        }
+    }
+    eprintln!(
+        "{count} version(s) of {name} ({}/{})",
+        config.project, config.environment
+    );
+    Ok(())
+}
+
+/// Restore an old version of a secret as a new version (local until pushed).
+fn rollback(
+    store: &Store,
+    keychain: &dyn Keychain,
+    config: &Config,
+    name: &str,
+    version: i64,
+) -> Result<()> {
+    let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
+    let keypair = session::account_keypair(store, &master)?;
+    let client = sync_client(keychain)?;
+    let len = remote::sync::rollback(&client, store, &keypair, config, name, version)?;
+    eprintln!(
+        "restored {name} to version {version} ({len} bytes) as a new version; run `sotto push` to sync"
+    );
     Ok(())
 }
 

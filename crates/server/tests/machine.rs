@@ -340,9 +340,10 @@ async fn rotation_must_regrant_active_tokens() {
 
     // Omitting the machine grant is rejected, and nothing changed.
     let without = format!(
-        r#"{{"base_revision":1,"grants":[{{"user_id":"mt-rot-owner","enc_vault_key":"{}"}}],"data_keys":[{{"secret_id":"{s1}","enc_data_key":"{}"}}]}}"#,
+        r#"{{"base_revision":1,"grants":[{{"user_id":"mt-rot-owner","enc_vault_key":"{}"}}],"data_keys":[{{"secret_id":"{s1}","enc_data_key":"{}"}}],"history_keys":[{{"secret_id":"{s1}","version":1,"enc_data_key":"{}"}}]}}"#,
         b64(b"owner-new"),
         b64(b"new-dk"),
+        b64(b"new-dk-hist"),
     );
     assert_eq!(
         post(&pool, &owner, &rotate_uri, without).await.0,
@@ -356,9 +357,10 @@ async fn rotation_must_regrant_active_tokens() {
 
     // Including it succeeds, and the machine immediately sees its re-sealed grant.
     let with = format!(
-        r#"{{"base_revision":1,"grants":[{{"user_id":"mt-rot-owner","enc_vault_key":"{}"}}],"data_keys":[{{"secret_id":"{s1}","enc_data_key":"{}"}}],"machine_grants":[{{"token_id":"{token_id}","enc_vault_key":"{}"}}]}}"#,
+        r#"{{"base_revision":1,"grants":[{{"user_id":"mt-rot-owner","enc_vault_key":"{}"}}],"data_keys":[{{"secret_id":"{s1}","enc_data_key":"{}"}}],"history_keys":[{{"secret_id":"{s1}","version":1,"enc_data_key":"{}"}}],"machine_grants":[{{"token_id":"{token_id}","enc_vault_key":"{}"}}]}}"#,
         b64(b"owner-new"),
         b64(b"new-dk"),
+        b64(b"new-dk-hist"),
         b64(b"machine-new"),
     );
     assert_eq!(
@@ -376,9 +378,10 @@ async fn rotation_must_regrant_active_tokens() {
     )
     .await;
     let after_revoke = format!(
-        r#"{{"base_revision":2,"grants":[{{"user_id":"mt-rot-owner","enc_vault_key":"{}"}}],"data_keys":[{{"secret_id":"{s1}","enc_data_key":"{}"}}]}}"#,
+        r#"{{"base_revision":2,"grants":[{{"user_id":"mt-rot-owner","enc_vault_key":"{}"}}],"data_keys":[{{"secret_id":"{s1}","enc_data_key":"{}"}}],"history_keys":[{{"secret_id":"{s1}","version":1,"enc_data_key":"{}"}}]}}"#,
         b64(b"owner-newer"),
         b64(b"newer-dk"),
+        b64(b"newer-dk-hist"),
     );
     assert_eq!(
         post(&pool, &owner, &rotate_uri, after_revoke).await.0,
@@ -399,9 +402,10 @@ async fn rotation_rejects_duplicate_machine_tokens() {
     // Listing the one active token twice would dedup to a valid coverage set but drive an ambiguous
     // double-UPDATE; it must be rejected as malformed input, like a duplicate user grant.
     let dup = format!(
-        r#"{{"base_revision":1,"grants":[{{"user_id":"mt-dup-owner","enc_vault_key":"{}"}}],"data_keys":[{{"secret_id":"{s1}","enc_data_key":"{}"}}],"machine_grants":[{{"token_id":"{token_id}","enc_vault_key":"{}"}},{{"token_id":"{token_id}","enc_vault_key":"{}"}}]}}"#,
+        r#"{{"base_revision":1,"grants":[{{"user_id":"mt-dup-owner","enc_vault_key":"{}"}}],"data_keys":[{{"secret_id":"{s1}","enc_data_key":"{}"}}],"history_keys":[{{"secret_id":"{s1}","version":1,"enc_data_key":"{}"}}],"machine_grants":[{{"token_id":"{token_id}","enc_vault_key":"{}"}},{{"token_id":"{token_id}","enc_vault_key":"{}"}}]}}"#,
         b64(b"owner-new"),
         b64(b"new-dk"),
+        b64(b"new-dk-hist"),
         b64(b"machine-a"),
         b64(b"machine-b"),
     );

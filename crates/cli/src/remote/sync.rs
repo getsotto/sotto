@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use sotto_core::{kdf, names};
+use zeroize::Zeroize;
 
 use crate::account;
 use crate::config::Config;
@@ -293,6 +294,104 @@ fn set_change(local: SyncSecret) -> SecretChange {
     )
 }
 
+/// One decrypted history version of a secret.
+pub struct HistoryVersion {
+    pub version: i64,
+    /// The decrypted value, or `None` when this row doesn't authenticate under the current vault
+    /// key (it predates a rotation this device hasn't caught up with — `sotto pull` first).
+    pub value: Option<Vec<u8>>,
+}
+
+/// The server-side version history of one secret, newest first, decrypted under the current vault
+/// key. The server is the source of truth for history — local stores only hold the versions they
+/// happened to sync — and rotation rewraps history keys, so every row should decrypt.
+pub fn history(
+    api: &dyn SyncApi,
+    store: &Store,
+    keypair: &sotto_core::wrap::Keypair,
+    config: &Config,
+    name: &str,
+) -> Result<Vec<HistoryVersion>> {
+    let (vault, secret_id) = open_secret(store, keypair, config, name)?;
+    let mut versions: Vec<HistoryVersion> = api
+        .list_history(vault.env_id())?
+        .into_iter()
+        .filter(|row| row.secret_id == secret_id)
+        .map(|row| {
+            let value = vault
+                .decrypt_at(
+                    &secret_id,
+                    row.version,
+                    &b64decode(&row.enc_value)?,
+                    &b64decode(&row.enc_data_key)?,
+                )
+                .ok();
+            Ok(HistoryVersion {
+                version: row.version,
+                value,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if versions.is_empty() {
+        return Err(Error::NotFound(format!(
+            "no server history for `{name}`; has this environment been pushed?"
+        )));
+    }
+    versions.sort_by_key(|v| std::cmp::Reverse(v.version));
+    Ok(versions)
+}
+
+/// Roll a secret back: decrypt `version`'s value from the server history and set it as a NEW
+/// version through the normal set path (monotonic versions, normal sync — nothing is rewritten).
+/// The change is local until the next `push`. Returns the restored value's byte length.
+pub fn rollback(
+    api: &dyn SyncApi,
+    store: &Store,
+    keypair: &sotto_core::wrap::Keypair,
+    config: &Config,
+    name: &str,
+    version: i64,
+) -> Result<usize> {
+    let (vault, secret_id) = open_secret(store, keypair, config, name)?;
+    let row = api
+        .list_history(vault.env_id())?
+        .into_iter()
+        .find(|row| row.secret_id == secret_id && row.version == version)
+        .ok_or_else(|| Error::NotFound(format!("`{name}` has no version {version}")))?;
+    let mut value = vault
+        .decrypt_at(
+            &secret_id,
+            version,
+            &b64decode(&row.enc_value)?,
+            &b64decode(&row.enc_data_key)?,
+        )
+        .map_err(|_| {
+            Error::Input(
+                "that version doesn't decrypt under the current vault key; run `sotto pull` and try again"
+                    .into(),
+            )
+        })?;
+    let len = value.len();
+    let result = vault.set(name, &value);
+    value.zeroize();
+    result?;
+    Ok(len)
+}
+
+/// Open the active environment's vault and resolve `name` to its secret id (live or tombstoned).
+fn open_secret<'a>(
+    store: &'a Store,
+    keypair: &sotto_core::wrap::Keypair,
+    config: &Config,
+    name: &str,
+) -> Result<(crate::vault::Vault<'a>, String)> {
+    let vault = crate::vault::Vault::open(store, keypair, &config.project_id, &config.environment)?;
+    let secret_id = vault
+        .find_id_by_name(name)?
+        .ok_or_else(|| Error::NotFound(name.to_string()))?;
+    Ok((vault, secret_id))
+}
+
 /// Reconstruct the local identity on a new device from a downloaded account bundle plus the pasted
 /// secret key and master password. Decodes the bundle and delegates to [`session::restore`].
 pub fn restore_account(
@@ -394,11 +493,16 @@ mod tests {
         deleted: bool,
     }
 
+    /// One retained history version: `(enc_name, enc_value, enc_data_key)`.
+    type HistoryRec = (Vec<u8>, Vec<u8>, Vec<u8>);
+
     struct EnvState {
         project_id: String,
         enc_name: String,
         revision: i64,
         secrets: HashMap<String, ServerSecret>,
+        /// `(secret_id, version)` → `(enc_name, enc_value, enc_data_key)` — the retained history.
+        history: HashMap<(String, i64), HistoryRec>,
     }
 
     struct MemberRec {
@@ -537,6 +641,7 @@ mod tests {
                         enc_name: env.enc_name.clone(),
                         revision: 0,
                         secrets: HashMap::new(),
+                        history: HashMap::new(),
                     },
                 );
                 // Mirror the server: env creation records the creator's own grant.
@@ -627,6 +732,14 @@ mod tests {
                                 deleted: false,
                             },
                         );
+                        // Mirror the server: every set appends a history row.
+                        env.history
+                            .entry((change.id.clone(), change.version))
+                            .or_insert((
+                                b64decode(change.enc_name.as_ref().unwrap()).unwrap(),
+                                b64decode(change.enc_value.as_ref().unwrap()).unwrap(),
+                                b64decode(change.enc_data_key.as_ref().unwrap()).unwrap(),
+                            ));
                     }
                     "delete" => {
                         if let Some(sec) = env.secrets.get_mut(&change.id) {
@@ -801,6 +914,31 @@ mod tests {
             Ok(envs)
         }
 
+        fn list_history(&self, env_id: &str) -> Result<Vec<super::super::api::HistoryRow>> {
+            let s = self.state.borrow();
+            let env = s
+                .envs
+                .get(env_id)
+                .ok_or_else(|| Error::NotFound("environment not found".into()))?;
+            let mut rows: Vec<_> = env
+                .history
+                .iter()
+                .map(
+                    |((secret_id, version), (enc_name, enc_value, enc_data_key))| {
+                        super::super::api::HistoryRow {
+                            secret_id: secret_id.clone(),
+                            version: *version,
+                            enc_name: b64encode(enc_name),
+                            enc_value: b64encode(enc_value),
+                            enc_data_key: b64encode(enc_data_key),
+                        }
+                    },
+                )
+                .collect();
+            rows.sort_by(|a, b| (&a.secret_id, a.version).cmp(&(&b.secret_id, b.version)));
+            Ok(rows)
+        }
+
         fn rotate(
             &self,
             env_id: &str,
@@ -818,6 +956,23 @@ mod tests {
                 for dk in &req.data_keys {
                     if let Some(sec) = env.secrets.get_mut(&dk.secret_id) {
                         sec.enc_data_key = b64decode(&dk.enc_data_key)?;
+                    }
+                }
+                // History coverage must be exact (as the server enforces), then rows are rewrapped.
+                let existing: HashSet<(String, i64)> = env.history.keys().cloned().collect();
+                let provided: HashSet<(String, i64)> = req
+                    .history_keys
+                    .iter()
+                    .map(|h| (h.secret_id.clone(), h.version))
+                    .collect();
+                if provided != existing {
+                    return Err(Error::Server(
+                        "rotation must rewrap exactly the environment's retained history".into(),
+                    ));
+                }
+                for h in &req.history_keys {
+                    if let Some(row) = env.history.get_mut(&(h.secret_id.clone(), h.version)) {
+                        row.2 = b64decode(&h.enc_data_key)?;
                     }
                 }
                 env.revision += 1;
@@ -1540,6 +1695,70 @@ mod tests {
         // The old keypair stays locked out: it can't open the new grant.
         let new_grant = b64decode(&api.get_grant(&env_id).unwrap().unwrap()).unwrap();
         assert!(sotto_core::vault::open_vault_key(&bob_old, &new_grant).is_err());
+    }
+
+    #[test]
+    fn history_and_rollback_survive_rotation() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        // A real org env with three versions of one secret, pushed.
+        let (store, master, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store, &master);
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        // Server history records *synced* versions: push after each set so all three land.
+        let vault = || Vault::open(&store, &alice, &project.id, "dev").unwrap();
+        for value in [&b"v1"[..], b"v2", b"v3"] {
+            vault().set("KEY", value).unwrap();
+            push(&api, &store, &master, &config).unwrap();
+        }
+
+        // History lists all three versions, newest first, decrypted.
+        let versions = history(&api, &store, &alice, &config, "KEY").unwrap();
+        assert_eq!(
+            versions
+                .iter()
+                .map(|v| (v.version, v.value.clone().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![
+                (3, b"v3".to_vec()),
+                (2, b"v2".to_vec()),
+                (1, b"v1".to_vec())
+            ]
+        );
+
+        // Rotate, adopt the new key, and history STILL decrypts — the rotation rewrapped it.
+        let env = store.get_environment(&project.id, "dev").unwrap().unwrap();
+        team::rotate_env(&api, &alice, &org_id, &env.id, None)
+            .unwrap()
+            .unwrap();
+        pull(&api, &store, &config).unwrap();
+        let versions = history(&api, &store, &alice, &config, "KEY").unwrap();
+        assert!(
+            versions.iter().all(|v| v.value.is_some()),
+            "all history versions decrypt under the post-rotation key"
+        );
+
+        // Rollback to v1: the old value lands as a NEW version (4), nothing rewritten.
+        let len = rollback(&api, &store, &alice, &config, "KEY", 1).unwrap();
+        assert_eq!(len, 2);
+        assert_eq!(vault().get("KEY").unwrap(), b"v1");
+        push(&api, &store, &master, &config).unwrap();
+        let versions = history(&api, &store, &alice, &config, "KEY").unwrap();
+        assert_eq!(versions[0].version, 4);
+        assert_eq!(versions[0].value.as_deref(), Some(&b"v1"[..]));
+        assert_eq!(versions.len(), 4, "history is append-only");
+
+        // Rolling back to a nonexistent version fails cleanly.
+        assert!(matches!(
+            rollback(&api, &store, &alice, &config, "KEY", 99),
+            Err(Error::NotFound(_))
+        ));
     }
 
     #[test]

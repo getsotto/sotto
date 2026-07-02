@@ -41,6 +41,23 @@ fn decode_key_via_bindings() {
     assert_eq!(bytes, [0xAB; 16]);
 }
 
+/// Rotation rewrap via the bindings: the untouched ciphertext decrypts under the new key.
+#[wasm_bindgen_test]
+fn rewrap_via_bindings() {
+    let old = [0x11u8; 32];
+    let new = [0x22u8; 32];
+    let enc = sotto_core::vault::encrypt_secret(&old, "e1", "s1", 3, b"NAME", b"value");
+    let rewrapped = sotto_wasm::vault_rewrap_data_key(&old, &new, "e1", "s1", 3, &enc.enc_data_key)
+        .unwrap_or_else(|_| panic!("rewrap"));
+    let value = sotto_wasm::vault_decrypt_value(&new, "e1", "s1", 3, &enc.enc_value, &rewrapped)
+        .unwrap_or_else(|_| panic!("decrypt under new key"));
+    assert_eq!(value, b"value");
+    // The old key no longer opens the rewrapped data key.
+    assert!(
+        sotto_wasm::vault_decrypt_value(&old, "e1", "s1", 3, &enc.enc_value, &rewrapped).is_err()
+    );
+}
+
 /// Metadata name decryption via the bindings agrees with the native scheme.
 #[wasm_bindgen_test]
 fn name_decrypt_via_bindings() {
