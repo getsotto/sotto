@@ -51,7 +51,7 @@ jobs:
           STAGE=sotto-${{ github.ref_name }}-${{ matrix.target }}
           mkdir -p "$STAGE/completions"
           cp "$BIN" "$STAGE/"
-          cp THREAT-MODEL.md SECURITY.md "$STAGE/"
+          cp LICENSE THREAT-MODEL.md SECURITY.md "$STAGE/"
           for shell in bash zsh fish; do
             "$BIN" completions "$shell" > "$STAGE/completions/sotto.$shell"
           done
