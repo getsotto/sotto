@@ -13,6 +13,7 @@ import {
   share_seal,
   vault_decrypt_name,
   vault_decrypt_value,
+  vault_grant_key,
   vault_open_grant,
 } from "./wasm";
 
@@ -66,6 +67,17 @@ export function decryptProjectName(master: Uint8Array, projectId: string, encNam
 
 export function decryptEnvName(master: Uint8Array, envId: string, encName: Uint8Array): string {
   return DEC.decode(aead_open(master, encName, TEXT.encode(`sotto/v1/env-name|id=${envId}`)));
+}
+
+/// Decrypt an org's name — like project names, sealed under the *creator's* master key, so for a
+/// non-creator this throws and callers fall back to the org id (per-org keys are a follow-up).
+export function decryptOrgName(master: Uint8Array, orgId: string, encName: Uint8Array): string {
+  return DEC.decode(aead_open(master, encName, TEXT.encode(`sotto/v1/org-name|id=${orgId}`)));
+}
+
+/// Seal an environment's vault key to a member's public key — the grant uploaded when sharing.
+export function sealGrantTo(memberPublicKey: Uint8Array, vaultKey: Uint8Array): Uint8Array {
+  return vault_grant_key(memberPublicKey, vaultKey);
 }
 
 /// Seal a secret value for a share link. Returns the ciphertext to upload + the fragment key that

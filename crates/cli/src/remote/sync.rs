@@ -477,6 +477,30 @@ mod tests {
             Ok(())
         }
 
+        fn reset_account(&self, bundle: &AccountBundle) -> Result<()> {
+            let me = self.current_user();
+            let mut s = self.state.borrow_mut();
+            if s.account.is_none() {
+                return Err(Error::NotFound("account is not initialized".into()));
+            }
+            s.account = Some(bundle.clone());
+            // Mirror the server: the caller's now-dead grants are deleted with the reset, and
+            // (since the real server reads `users` live) their listed public key is the new one.
+            s.grants.retain(|(_, uid), _| *uid != me);
+            let new_key = b64decode(&bundle.public_key)?;
+            for (uid, key) in s.users_by_email.values_mut() {
+                if *uid == me {
+                    *key = Some(new_key.clone());
+                }
+            }
+            for org in s.orgs.values_mut() {
+                if let Some(rec) = org.members.get_mut(&me) {
+                    rec.public_key = Some(new_key.clone());
+                }
+            }
+            Ok(())
+        }
+
         fn get_account(&self) -> Result<Option<AccountBundle>> {
             Ok(self.state.borrow().account.clone())
         }
@@ -1412,6 +1436,83 @@ mod tests {
         team::rotate_env(&api, &alice, &org_id, &env.id, None)
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    fn account_reset_kills_old_grants_and_regrant_recovers_access() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        // Alice shares an org env with Bob; Bob reads it (the established happy path).
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob_old = sotto_core::wrap::generate_keypair();
+        api.register_user("bob@example.test", "bob-user", &bob_old.public);
+        let org_id = team::create_org(&api, &master_a, "acme").unwrap();
+        team::invite(&api, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // Bob loses everything and resets: fresh keypair, new account material uploaded.
+        api.as_user("bob-user");
+        let bob_new = sotto_core::wrap::generate_keypair();
+        api.reset_account(&AccountBundle {
+            public_key: b64encode(&bob_new.public),
+            enc_private_keys: b64encode(b"new-sealed-privkeys"),
+            kdf_params: b64encode(b"new-kdf"),
+            recovery_blob: b64encode(b"new-recovery"),
+        })
+        .unwrap();
+
+        // His old grant died with the reset: cloning fails clean ("not granted"), not with a
+        // confusing crypto error.
+        assert!(api.get_grant(&env_id).unwrap().is_none());
+        let store_b = Store::open_in_memory().unwrap();
+        assert!(team::clone_env(
+            &api,
+            &store_b,
+            &bob_new,
+            &project.id,
+            &env_id,
+            "acme",
+            "dev",
+            Some(&org_id)
+        )
+        .is_err());
+
+        // Alice re-grants (sealing to Bob's NEW key, as listed fresh by the server) and Bob is back.
+        api.as_user("test-user");
+        team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+        api.as_user("bob-user");
+        team::clone_env(
+            &api,
+            &store_b,
+            &bob_new,
+            &project.id,
+            &env_id,
+            "acme",
+            "dev",
+            Some(&org_id),
+        )
+        .unwrap();
+        assert_eq!(
+            Vault::open(&store_b, &bob_new, &project.id, "dev")
+                .unwrap()
+                .get("API_KEY")
+                .unwrap(),
+            b"s3cr3t"
+        );
+        // The old keypair stays locked out: it can't open the new grant.
+        let new_grant = b64decode(&api.get_grant(&env_id).unwrap().unwrap()).unwrap();
+        assert!(sotto_core::vault::open_vault_key(&bob_old, &new_grant).is_err());
     }
 
     // Uses the full MockApi (which stores uploaded share blobs) to exercise share creation.

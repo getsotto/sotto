@@ -112,6 +112,17 @@ impl SyncApi for HttpClient {
         ok(resp)
     }
 
+    fn reset_account(&self, bundle: &AccountBundle) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url("/account/reset"))
+            .bearer_auth(&self.token)
+            .json(bundle)
+            .send()
+            .map_err(net)?;
+        ok(resp)
+    }
+
     fn get_account(&self) -> Result<Option<AccountBundle>> {
         let resp = self
             .http

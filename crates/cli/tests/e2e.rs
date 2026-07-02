@@ -396,6 +396,145 @@ fn env_sharing_and_removal_end_to_end_over_http() {
     assert!(remote::sync::pull(&bob, &store_b, &bob_config).is_err());
 }
 
+/// Org-admin recovery over real HTTP: Bob (a member with a shared env) loses his Emergency Kit,
+/// resets his account (fresh keys; the server deletes his dead grants), and the admin re-grants —
+/// after which Bob decrypts the shared secret again under his new keypair.
+#[test]
+fn account_reset_recovery_end_to_end_over_http() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    if !should_run_db_tests(&database_url) {
+        return;
+    }
+    let server = TestServer::start(&database_url);
+    let ttl = Duration::from_secs(3600);
+
+    // Alice: org + org project + secret, pushed.
+    let alice = HttpClient::new(server.url.clone(), server.token.clone());
+    let store_a = Store::open_in_memory().unwrap();
+    let kc_a = MemoryKeychain::default();
+    session::init(&store_a, &kc_a, b"pw", ttl).unwrap();
+    let master_key_a = session::current_master_key(&kc_a).unwrap().unwrap();
+    let keypair_a = session::account_keypair(&store_a, &master_key_a).unwrap();
+    let org_id = remote::team::create_org(&alice, master_key_a.as_bytes(), "acme-team").unwrap();
+    let project = Vault::create_project(&store_a, &keypair_a, "acme").unwrap();
+    let config = Config {
+        project_id: project.id.clone(),
+        project: "acme".into(),
+        environment: "dev".into(),
+        org_id: Some(org_id.clone()),
+    };
+    Vault::open(&store_a, &keypair_a, &project.id, "dev")
+        .unwrap()
+        .set("API_KEY", b"s3cr3t")
+        .unwrap();
+    remote::sync::push(&alice, &store_a, master_key_a.as_bytes(), &config).unwrap();
+
+    // Bob: second user with an initialized account, invited and granted the env.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (bob_token, bob_email) = rt.block_on(async {
+        let pool = sotto_server::db::connect(&database_url).await.unwrap();
+        let bob_id = format!("e2e-reset-bob-{}", uuid::Uuid::new_v4());
+        let bob_email = format!("{bob_id}@example.test");
+        sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject, email) \
+             VALUES ($1, 'github', $1, $2)",
+        )
+        .bind(&bob_id)
+        .bind(&bob_email)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let token = sotto_server::auth::session::issue(&pool, &bob_id)
+            .await
+            .unwrap();
+        (token, bob_email)
+    });
+    let bob = HttpClient::new(server.url.clone(), bob_token);
+    let store_b = Store::open_in_memory().unwrap();
+    let kc_b = MemoryKeychain::default();
+    session::init(&store_b, &kc_b, b"pwB", ttl).unwrap();
+    let m = sotto_cli::account::material(&store_b).unwrap();
+    bob.put_account(&remote::api::AccountBundle {
+        public_key: STANDARD.encode(&m.public_key),
+        enc_private_keys: STANDARD.encode(&m.enc_private_keys),
+        kdf_params: STANDARD.encode(&m.kdf_params),
+        recovery_blob: STANDARD.encode(&m.recovery_blob),
+    })
+    .unwrap();
+    let invited = remote::team::invite(&alice, &org_id, &bob_email).unwrap();
+    let env_id = remote::team::share_env(
+        &alice,
+        &store_a,
+        &keypair_a,
+        &org_id,
+        &invited.user_id,
+        &config,
+    )
+    .unwrap();
+    let master_key_b = session::current_master_key(&kc_b).unwrap().unwrap();
+    let keypair_b = session::account_keypair(&store_b, &master_key_b).unwrap();
+    remote::team::clone_env(
+        &bob,
+        &store_b,
+        &keypair_b,
+        &project.id,
+        &env_id,
+        "acme",
+        "dev",
+        Some(&org_id),
+    )
+    .unwrap();
+
+    // Bob loses everything and resets: fresh identity on his store + fresh material on the server.
+    session::reinit(&store_b, &kc_b, b"pwB2", ttl).unwrap();
+    let m2 = sotto_cli::account::material(&store_b).unwrap();
+    remote::SyncApi::reset_account(
+        &bob,
+        &remote::api::AccountBundle {
+            public_key: STANDARD.encode(&m2.public_key),
+            enc_private_keys: STANDARD.encode(&m2.enc_private_keys),
+            kdf_params: STANDARD.encode(&m2.kdf_params),
+            recovery_blob: STANDARD.encode(&m2.recovery_blob),
+        },
+    )
+    .unwrap();
+    // His grant died with the reset.
+    assert!(bob.get_grant(&env_id).unwrap().is_none());
+
+    // Alice re-grants (the server lists Bob's NEW public key); Bob re-clones and decrypts.
+    remote::team::share_env(
+        &alice,
+        &store_a,
+        &keypair_a,
+        &org_id,
+        &invited.user_id,
+        &config,
+    )
+    .unwrap();
+    let master_key_b2 = session::current_master_key(&kc_b).unwrap().unwrap();
+    let keypair_b2 = session::account_keypair(&store_b, &master_key_b2).unwrap();
+    let store_b2 = Store::open_in_memory().unwrap();
+    let bob_config = remote::team::clone_env(
+        &bob,
+        &store_b2,
+        &keypair_b2,
+        &project.id,
+        &env_id,
+        "acme",
+        "dev",
+        Some(&org_id),
+    )
+    .unwrap();
+    let value = Vault::open(&store_b2, &keypair_b2, &bob_config.project_id, "dev")
+        .unwrap()
+        .get("API_KEY")
+        .unwrap();
+    assert_eq!(value, b"s3cr3t");
+}
+
 /// The machine (CI) loop over real HTTP: create a machine token for a personal environment, then
 /// decrypt the secrets with nothing but the SOTTO_TOKEN string — no store, keychain, or password —
 /// and verify revocation kills access immediately.

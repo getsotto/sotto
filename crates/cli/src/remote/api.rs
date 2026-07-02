@@ -243,6 +243,9 @@ pub trait SyncApi {
     fn me(&self) -> Result<Me>;
     /// Upload account crypto material (first-time account init).
     fn put_account(&self, bundle: &AccountBundle) -> Result<()>;
+    /// Replace the account's crypto material with fresh keys (Emergency-Kit-lost recovery). The
+    /// server also deletes the user's now-dead environment grants.
+    fn reset_account(&self, bundle: &AccountBundle) -> Result<()>;
     /// Download account crypto material, or `None` if the account isn't initialized.
     fn get_account(&self) -> Result<Option<AccountBundle>>;
     fn create_project(&self, project: &NewProject) -> Result<()>;

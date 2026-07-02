@@ -67,7 +67,18 @@ pub fn init(
     if store.get_identity()?.is_some() {
         return Err(Error::AlreadyInitialized);
     }
+    reinit(store, keychain, password, ttl)
+}
 
+/// Create a **fresh** identity, overwriting any existing one — the account-reset path for a user
+/// who lost their Emergency Kit. Everything sealed to the old keys (local or remote) becomes
+/// permanently unreadable; callers must warn loudly before invoking this.
+pub fn reinit(
+    store: &Store,
+    keychain: &dyn Keychain,
+    password: &[u8],
+    ttl: Duration,
+) -> Result<EmergencyKit> {
     let mut secret_key = random::bytes::<SECRET_KEY_BYTES>();
     let salt: [u8; kdf::SALT_LEN] = random::bytes();
     let master_key = derive(password, &secret_key, &salt)?;

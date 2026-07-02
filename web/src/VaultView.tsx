@@ -1,14 +1,19 @@
 import { useEffect, useState } from "react";
 
 import {
+  createGrant,
   createShare,
   fetchEnvironments,
+  fetchMembers,
+  fetchMyGrant,
   fetchProjects,
   fetchSecrets,
   type Environment,
+  type Member,
   type Project,
 } from "./api";
 import { bytesToUrlSafeB64 } from "./base64";
+import { TeamPanel } from "./TeamPanel";
 import {
   decryptEnvName,
   decryptProjectName,
@@ -16,6 +21,7 @@ import {
   decryptSecretValue,
   openEnvGrant,
   sealForShare,
+  sealGrantTo,
   type SecretEntry,
 } from "./vault";
 
@@ -65,9 +71,14 @@ export function VaultView({
   onLogout: () => void;
 }) {
   const [projects, setProjects] = useState<NamedProject[] | null>(null);
+  const [activeProject, setActiveProject] = useState<NamedProject | null>(null);
   const [envs, setEnvs] = useState<NamedEnv[] | null>(null);
   const [openEnv, setOpenEnv] = useState<OpenEnv | null>(null);
   const [revealed, setRevealed] = useState<Revealed | null>(null);
+  // Org members of the active project (loaded when an org env is opened), for the share picker.
+  const [members, setMembers] = useState<Member[] | null>(null);
+  const [shareTo, setShareTo] = useState("");
+  const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -88,9 +99,13 @@ export function VaultView({
 
   async function selectProject(np: NamedProject) {
     setError(null);
+    setNotice(null);
+    setActiveProject(np);
     setEnvs(null);
     setOpenEnv(null);
     setRevealed(null);
+    setMembers(null);
+    setShareTo(""); // drop a stale member pick so the next env's Share button starts disabled
     try {
       const rows = await fetchEnvironments(np.project.id);
       setEnvs(
@@ -103,11 +118,19 @@ export function VaultView({
 
   async function selectEnv(ne: NamedEnv) {
     setError(null);
+    setNotice(null);
     setOpenEnv(null);
     setRevealed(null);
+    setMembers(null);
+    setShareTo(""); // the new env reloads its own members; don't carry a stale pick across
     try {
-      // encVaultKey now stores a vault-key grant (sealed to the account key), not a master-wrapped key.
-      const grant = ne.env.encVaultKey;
+      // Open via our OWN grant, not the env's inline key — on a shared env the inline key is the
+      // creator's grant, which our keypair can't open.
+      const grant = await fetchMyGrant(ne.env.id);
+      if (grant === null) {
+        setError("you have no key for this environment — ask an admin to share it with you");
+        return;
+      }
       const vaultKey = openEnvGrant(master, encPrivateKeys, grant);
       const secrets = (await fetchSecrets(ne.env.id))
         .filter((entry) => !entry.deleted)
@@ -117,6 +140,36 @@ export function VaultView({
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
       setOpenEnv({ envId: ne.env.id, vaultKey, secrets });
+      // Org project: load the member list so the env can be shared from here.
+      const orgId = activeProject?.project.orgId;
+      if (orgId) {
+        setMembers(await fetchMembers(orgId));
+      }
+    } catch (e) {
+      setError(message(e));
+    }
+  }
+
+  /// Share the open environment with an org member: seal its vault key to their public key.
+  async function shareWithMember() {
+    if (openEnv === null || members === null) {
+      return;
+    }
+    setError(null);
+    setNotice(null);
+    const member = members.find((m) => m.userId === shareTo);
+    if (member === undefined) {
+      setError("pick a member to share with");
+      return;
+    }
+    if (member.publicKey === null) {
+      setError("that member has no account keys yet — they must finish setup first");
+      return;
+    }
+    try {
+      const sealed = sealGrantTo(member.publicKey, openEnv.vaultKey);
+      await createGrant(openEnv.envId, member.userId, sealed);
+      setNotice(`shared this environment with ${member.userId}`);
     } catch (e) {
       setError(message(e));
     }
@@ -151,6 +204,7 @@ export function VaultView({
       <h1>Your vault</h1>
       <button onClick={onLogout}>Log out</button>
       {error !== null && <p role="alert">{error}</p>}
+      {notice !== null && <p>{notice}</p>}
 
       <section>
         <h2>Projects</h2>
@@ -194,6 +248,29 @@ export function VaultView({
               ))}
             </ul>
           )}
+          {members !== null && members.length > 0 && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                void shareWithMember();
+              }}
+            >
+              <label>
+                Share this environment with
+                <select value={shareTo} onChange={(e) => setShareTo(e.target.value)}>
+                  <option value="">— pick a member —</option>
+                  {members.map((m) => (
+                    <option key={m.userId} value={m.userId}>
+                      {m.userId} ({m.role})
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button type="submit" disabled={shareTo === ""}>
+                Share
+              </button>
+            </form>
+          )}
         </section>
       )}
 
@@ -211,6 +288,8 @@ export function VaultView({
           )}
         </section>
       )}
+
+      <TeamPanel master={master} />
     </main>
   );
 }
