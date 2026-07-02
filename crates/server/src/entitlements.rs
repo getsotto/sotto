@@ -102,16 +102,30 @@ pub async fn check_can_add_member(tx: &mut Transaction<'_, Postgres>, org_id: &s
     Ok(())
 }
 
-/// Quota gate for creating a NEW org project (free tier: at most [`FREE_MAX_ORG_PROJECTS`]).
-/// Callers must apply this only to genuinely new projects — idempotent re-creates (every `push`
-/// re-sends the create) must keep working for orgs already at the limit.
-pub async fn check_can_create_org_project(pool: &PgPool, org_id: &str) -> Result<()> {
-    if effective_tier(pool, org_id).await? == Tier::Team {
+/// Quota gate for creating an org project (free tier: at most [`FREE_MAX_ORG_PROJECTS`]). Runs
+/// inside `tx` and locks the org row, so the count and the caller's insert commit atomically — two
+/// concurrent creates can't both pass the check and overshoot the limit. The quota applies only to a
+/// genuinely new `project_id`: an idempotent re-create of one that already exists always passes (so
+/// re-sent `push` creates keep working for an org already at the limit), and that check runs under
+/// the same lock so a concurrent re-create of a just-created id isn't mistaken for a new one.
+pub async fn check_can_create_org_project(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: &str,
+    project_id: &str,
+) -> Result<()> {
+    if effective_tier_locked(tx, org_id).await? == Tier::Team {
+        return Ok(());
+    }
+    let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM projects WHERE id = $1")
+        .bind(project_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if exists.is_some() {
         return Ok(());
     }
     let projects: i64 = sqlx::query_scalar("SELECT count(*) FROM projects WHERE org_id = $1")
         .bind(org_id)
-        .fetch_one(pool)
+        .fetch_one(&mut **tx)
         .await?;
     if projects >= FREE_MAX_ORG_PROJECTS {
         return Err(Error::Quota(format!(

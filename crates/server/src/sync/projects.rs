@@ -58,17 +58,14 @@ async fn create_project(
             }
             None => return Err(Error::NotFound("organization not found".into())),
         }
-        // The project quota applies only to genuinely NEW projects: every `push` re-sends this
-        // create idempotently, and an org already at its limit must keep syncing what it has.
-        let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM projects WHERE id = $1")
-            .bind(&body.id)
-            .fetch_optional(&state.pool)
-            .await?;
-        if exists.is_none() {
-            crate::entitlements::check_can_create_org_project(&state.pool, org_id).await?;
-        }
     }
 
+    // Quota check and insert share one transaction: the check locks the org row, so it and the
+    // insert are atomic against concurrent creates that would otherwise both slip past the limit.
+    let mut tx = state.pool.begin().await?;
+    if let Some(org_id) = &body.org_id {
+        crate::entitlements::check_can_create_org_project(&mut tx, org_id, &body.id).await?;
+    }
     let created: Option<String> = sqlx::query_scalar(
         "INSERT INTO projects (id, owner_id, org_id, enc_name) VALUES ($1, $2, $3, $4) \
          ON CONFLICT (id) DO NOTHING RETURNING id",
@@ -77,8 +74,9 @@ async fn create_project(
     .bind(&user.user_id)
     .bind(&body.org_id)
     .bind(&enc_name)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     if created.is_some() {
         return Ok(StatusCode::CREATED);
