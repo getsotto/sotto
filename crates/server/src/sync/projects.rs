@@ -58,6 +58,15 @@ async fn create_project(
             }
             None => return Err(Error::NotFound("organization not found".into())),
         }
+        // The project quota applies only to genuinely NEW projects: every `push` re-sends this
+        // create idempotently, and an org already at its limit must keep syncing what it has.
+        let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM projects WHERE id = $1")
+            .bind(&body.id)
+            .fetch_optional(&state.pool)
+            .await?;
+        if exists.is_none() {
+            crate::entitlements::check_can_create_org_project(&state.pool, org_id).await?;
+        }
     }
 
     let created: Option<String> = sqlx::query_scalar(

@@ -257,6 +257,8 @@ enum OrgCommand {
     Members { org_id: String },
     /// Remove a member and rotate every environment they could access.
     Remove { org_id: String, user_id: String },
+    /// Show the org's plan: tier, trial, and the limits in effect.
+    Plan { org_id: String },
     /// Show the org audit log, newest first (admins/owners).
     Audit {
         org_id: String,
@@ -599,6 +601,22 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
                     report.skipped.len(),
                     report.skipped.join(", ")
                 );
+            }
+            Ok(())
+        }
+        OrgCommand::Plan { org_id } => {
+            let plan = remote::SyncApi::org_entitlements(&client, &org_id)?;
+            println!("tier:      {}", plan.tier);
+            println!("effective: {}", plan.effective_tier);
+            if let Some(ends) = plan.trial_ends_at {
+                println!("trial:     ends {ends}");
+            }
+            match plan.limits {
+                Some(l) => println!(
+                    "limits:    {} members, {} org project(s)",
+                    l.max_members, l.max_org_projects
+                ),
+                None => println!("limits:    none (Team)"),
             }
             Ok(())
         }

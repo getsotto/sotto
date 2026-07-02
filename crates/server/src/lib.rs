@@ -20,6 +20,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod encoding;
+pub mod entitlements;
 pub mod error;
 pub mod machine;
 pub mod org;
@@ -39,6 +40,7 @@ pub fn app(state: AppState) -> Router {
         .route("/health", get(health))
         .merge(auth::router())
         .merge(audit::router())
+        .merge(entitlements::router())
         .merge(account::router())
         .merge(org::router())
         .merge(machine::router())

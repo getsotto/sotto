@@ -914,6 +914,17 @@ mod tests {
             Ok(envs)
         }
 
+        fn org_entitlements(&self, _org_id: &str) -> Result<super::super::api::Entitlements> {
+            // Like the audit log, plans are a server-side concern with no client crypto; the
+            // server DB tests own the behavior.
+            Ok(super::super::api::Entitlements {
+                tier: "free".into(),
+                effective_tier: "team".into(),
+                trial_ends_at: None,
+                limits: None,
+            })
+        }
+
         fn org_audit(
             &self,
             _org_id: &str,

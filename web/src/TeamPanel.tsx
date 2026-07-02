@@ -2,11 +2,13 @@ import { useEffect, useState } from "react";
 
 import {
   fetchAudit,
+  fetchEntitlements,
   fetchMembers,
   fetchOrgs,
   grantOrgKey,
   inviteMember,
   type AuditEvent,
+  type Entitlements,
   type Member,
   type Org,
 } from "./api";
@@ -48,6 +50,7 @@ export function TeamPanel({
   const [openOrg, setOpenOrg] = useState<NamedOrg | null>(null);
   const [members, setMembers] = useState<Member[] | null>(null);
   const [audit, setAudit] = useState<AuditEvent[] | null>(null);
+  const [plan, setPlan] = useState<Entitlements | null>(null);
   const [email, setEmail] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -69,10 +72,16 @@ export function TeamPanel({
     setOpenOrg(no);
     setMembers(null);
     setAudit(null);
+    setPlan(null);
     try {
       setMembers(await fetchMembers(no.org.id));
-      // The audit log is admin/owner-only; members simply don't get the section.
-      if (["owner", "admin"].includes(no.org.role)) {
+      const entitlements = await fetchEntitlements(no.org.id);
+      setPlan(entitlements);
+      // The audit log is admin/owner-only AND a Team feature; skip the fetch when gated.
+      if (
+        ["owner", "admin"].includes(no.org.role) &&
+        entitlements.effectiveTier === "team"
+      ) {
         setAudit(await fetchAudit(no.org.id));
       }
     } catch (e) {
@@ -130,6 +139,17 @@ export function TeamPanel({
 
       {openOrg !== null && (
         <>
+          {plan !== null && (
+            <p>
+              Plan: <strong>{plan.effectiveTier}</strong>
+              {plan.tier !== plan.effectiveTier && plan.trialEndsAt !== null
+                ? ` (trial ends ${plan.trialEndsAt})`
+                : ""}
+              {plan.limits !== null
+                ? ` — up to ${plan.limits.maxMembers} members, ${plan.limits.maxOrgProjects} project(s)`
+                : ""}
+            </p>
+          )}
           <h3>Members of {openOrg.name}</h3>
           {members === null ? (
             <p>Loading…</p>

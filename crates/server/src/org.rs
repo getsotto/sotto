@@ -244,7 +244,8 @@ async fn create_org(
     let created = {
         let mut tx = state.pool.begin().await?;
         let created: Option<String> = sqlx::query_scalar(
-            "INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, $2, $3) \
+            "INSERT INTO organizations (id, enc_name, created_by, trial_ends_at) \
+             VALUES ($1, $2, $3, now() + interval '14 days') \
              ON CONFLICT (id) DO NOTHING RETURNING id",
         )
         .bind(&body.id)
@@ -432,6 +433,7 @@ async fn add_member(
             "must be an admin or owner to add members".into(),
         ));
     }
+    crate::entitlements::check_can_add_member(&state.pool, &org_id).await?;
     if body.role == Role::Owner && caller != Role::Owner {
         return Err(Error::Forbidden(
             "only an owner can grant the owner role".into(),
@@ -493,6 +495,7 @@ async fn invite_member(
             "must be an admin or owner to invite members".into(),
         ));
     }
+    crate::entitlements::check_can_add_member(&state.pool, &org_id).await?;
 
     // Resolve the email to exactly one existing user (email is not unique in the schema, so guard
     // against the ambiguous case rather than silently picking one).
