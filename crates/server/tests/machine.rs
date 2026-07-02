@@ -383,6 +383,39 @@ async fn rotation_must_regrant_active_tokens() {
 }
 
 #[tokio::test]
+async fn rotation_rejects_duplicate_machine_tokens() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-dup-o", "mt-dup-p", "mt-dup-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-dup-owner").await;
+    let (token_id, _api_token) = create_token(&pool, &owner, e, b"machine-old").await;
+    let s1 = format!("{e}-s1");
+
+    // Listing the one active token twice would dedup to a valid coverage set but drive an ambiguous
+    // double-UPDATE; it must be rejected as malformed input, like a duplicate user grant.
+    let dup = format!(
+        r#"{{"base_revision":1,"grants":[{{"user_id":"mt-dup-owner","enc_vault_key":"{}"}}],"data_keys":[{{"secret_id":"{s1}","enc_data_key":"{}"}}],"machine_grants":[{{"token_id":"{token_id}","enc_vault_key":"{}"}},{{"token_id":"{token_id}","enc_vault_key":"{}"}}]}}"#,
+        b64(b"owner-new"),
+        b64(b"new-dk"),
+        b64(b"machine-a"),
+        b64(b"machine-b"),
+    );
+    assert_eq!(
+        post(&pool, &owner, &format!("/environments/{e}/rotate"), dup)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    // The rejected rotation changed nothing: the machine still holds its original grant.
+    let (_, body) = get(&pool, &owner, &format!("/environments/{e}/tokens")).await;
+    assert!(
+        body.contains(&token_id),
+        "token still active after rejection"
+    );
+}
+
+#[tokio::test]
 async fn personal_project_tokens_work() {
     let Some(pool) = pool_or_skip().await else {
         return;

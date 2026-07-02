@@ -202,7 +202,7 @@ struct RotateResponse {
 /// grant set (dropping anyone not re-granted), repoint the inline vault key at the caller's new
 /// grant, and bump the revision. Fails closed with 412 if a concurrent write moved the revision, or
 /// 400 if the data keys don't cover exactly the env's secrets, the caller omitted their own grant,
-/// or the grant set names a non-member or a duplicate user.
+/// or the grant set names a non-member, a duplicate user, or a duplicate machine token.
 async fn rotate(
     State(state): State<AppState>,
     user: AuthUser,
@@ -265,8 +265,16 @@ async fn rotate(
             encoding::decode(&d.enc_data_key, "enc_data_key", MAX_ENC_KEY)?,
         ));
     }
+    // Reject a duplicate token_id up front, as with user grants: the coverage check below dedups
+    // via a set, so a repeat would slip through and drive an ambiguous double-UPDATE of one token.
     let mut machine_grants = Vec::with_capacity(req.machine_grants.len());
+    let mut seen_tokens: HashSet<&str> = HashSet::with_capacity(req.machine_grants.len());
     for m in &req.machine_grants {
+        if !seen_tokens.insert(m.token_id.as_str()) {
+            return Err(Error::BadRequest(
+                "duplicate token_id in the rotation machine-grant set".into(),
+            ));
+        }
         machine_grants.push((
             m.token_id.clone(),
             encoding::decode(&m.enc_vault_key, "enc_vault_key", MAX_ENC_KEY)?,
