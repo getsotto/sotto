@@ -222,11 +222,15 @@ async fn machine_grant(
     State(state): State<AppState>,
     machine: MachineAuth,
 ) -> Result<Json<MachineGrant>> {
-    let enc_vault_key: Vec<u8> =
-        sqlx::query_scalar("SELECT enc_vault_key FROM machine_tokens WHERE id = $1")
-            .bind(&machine.token_id)
-            .fetch_one(&state.pool)
-            .await?;
+    // Fail closed: if the token row vanished (e.g. an env-deletion cascade in the window after auth)
+    // or was revoked, answer 401 rather than letting `RowNotFound` bubble up as a 500.
+    let enc_vault_key: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT enc_vault_key FROM machine_tokens WHERE id = $1 AND revoked_at IS NULL",
+    )
+    .bind(&machine.token_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let enc_vault_key = enc_vault_key.ok_or(Error::Unauthorized)?;
     Ok(Json(MachineGrant {
         env_id: machine.env_id,
         enc_vault_key: encoding::encode(&enc_vault_key),
