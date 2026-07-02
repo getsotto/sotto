@@ -8,6 +8,8 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -952,8 +954,8 @@ fn env_diff(app: &App, config: &Config, left: &str, right: &str, reveal: bool) -
             DiffStatus::Equal => String::new(),
             DiffStatus::Differs if reveal => format!(
                 "  {} -> {}",
-                String::from_utf8_lossy(entry.left.as_deref().unwrap_or_default()),
-                String::from_utf8_lossy(entry.right.as_deref().unwrap_or_default()),
+                display_secret(entry.left.as_deref().unwrap_or_default()),
+                display_secret(entry.right.as_deref().unwrap_or_default()),
             ),
             DiffStatus::Differs => "  (differs)".into(),
             DiffStatus::OnlyLeft => format!("  (only in {left})"),
@@ -1118,6 +1120,18 @@ fn write_value(value: &[u8], reveal: bool) -> Result<()> {
     out.flush().map_err(|e| Error::Io(e.to_string()))
 }
 
+/// Render a secret value for the human `env diff --reveal` view. Secrets are arbitrary bytes (see
+/// [`write_value`]), so a raw `from_utf8_lossy` would both collapse distinct non-UTF-8 byte
+/// sequences to the same replacement glyph and let embedded control/ANSI sequences move the cursor
+/// or forge terminal output. Escape a valid-UTF-8 value (control characters become visible escapes,
+/// keeping it on one line) and show non-UTF-8 as unambiguous base64.
+fn display_secret(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.escape_debug().to_string(),
+        Err(_) => format!("base64:{}", STANDARD.encode(bytes)),
+    }
+}
+
 /// Decrypt all secrets as UTF-8 text pairs (for injection/export). Errors on non-UTF-8 values.
 fn text_entries(app: &App, config: &Config) -> Result<Vec<(String, String)>> {
     let mut entries = Vec::new();
@@ -1260,4 +1274,35 @@ fn machine_run(token: &str, args: Vec<String>) -> Result<()> {
 /// `sotto export` in machine mode.
 fn machine_export(token: &str, format: ExportFormat, reveal: bool) -> Result<()> {
     export_with_entries(machine_entries(token)?, format, reveal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_secret;
+
+    #[test]
+    fn display_secret_keeps_plain_text() {
+        assert_eq!(display_secret(b"postgres://prod"), "postgres://prod");
+    }
+
+    #[test]
+    fn display_secret_escapes_control_and_ansi_sequences() {
+        // A newline can't split the diff line, and an ESC can't start a real ANSI sequence.
+        assert_eq!(display_secret(b"a\nb"), "a\\nb");
+        let rendered = display_secret(b"\x1b[31mred\x1b[0m");
+        assert!(
+            !rendered.contains('\x1b'),
+            "escape byte must not survive: {rendered}"
+        );
+        assert!(rendered.contains("\\u{1b}"));
+    }
+
+    #[test]
+    fn display_secret_base64_encodes_non_utf8() {
+        // Two distinct non-UTF-8 byte strings must render differently (no lossy collapsing).
+        let a = display_secret(&[0xff, 0x00]);
+        let b = display_secret(&[0xfe, 0x00]);
+        assert!(a.starts_with("base64:"));
+        assert_ne!(a, b);
+    }
 }
