@@ -71,10 +71,16 @@ export function TeamPanel({
     try {
       const invited = await inviteMember(no.org.id, email.trim());
       // Grant the invitee the org key so display names decrypt for them (best-effort: needs their
-      // public key on file and our own org-key copy).
+      // public key on file and our own org-key copy). A failure here — e.g. our copy is sealed to an
+      // old keypair after a reset, or the server rejects the grant — must not fail the invite, which
+      // has already succeeded; the invitee just sees the org id until someone re-grants the key.
       if (invited.publicKey !== null && no.org.encOrgKey !== null) {
-        const orgKey = openOrgKey(master, encPrivateKeys, no.org.encOrgKey);
-        await grantOrgKey(no.org.id, invited.userId, sealGrantTo(invited.publicKey, orgKey));
+        try {
+          const orgKey = openOrgKey(master, encPrivateKeys, no.org.encOrgKey);
+          await grantOrgKey(no.org.id, invited.userId, sealGrantTo(invited.publicKey, orgKey));
+        } catch {
+          // Best-effort only.
+        }
       }
       setNotice(`invited ${email.trim()} (${invited.userId})`);
       setEmail("");
