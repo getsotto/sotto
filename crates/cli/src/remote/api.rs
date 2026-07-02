@@ -88,12 +88,37 @@ pub struct DataKeyEntry {
     pub enc_data_key: String,
 }
 
-/// A rotation request: rewrapped data keys + the replacement grant set, at a base revision.
+/// The new vault key re-sealed to one machine token's public key, in a rotation.
+#[derive(Debug, Clone, Serialize)]
+pub struct MachineGrantEntry {
+    pub token_id: String,
+    pub enc_vault_key: String,
+}
+
+/// A rotation request: rewrapped data keys + the replacement grant set (users and machines), at a
+/// base revision. `machine_grants` must cover exactly the env's active machine tokens.
 #[derive(Debug, Clone, Serialize)]
 pub struct RotateRequest {
     pub base_revision: i64,
     pub grants: Vec<GrantEntry>,
     pub data_keys: Vec<DataKeyEntry>,
+    pub machine_grants: Vec<MachineGrantEntry>,
+}
+
+/// An active machine token, as listed for admins (rotation re-seals to `public_key`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct MachineTokenInfo {
+    pub token_id: String,
+    pub name: String,
+    /// The machine's X25519 public key (base64).
+    pub public_key: String,
+}
+
+/// A freshly created machine token: its id + the raw API token (shown by the server exactly once).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreatedMachineToken {
+    pub token_id: String,
+    pub token: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -253,6 +278,18 @@ pub trait SyncApi {
     fn rotate(&self, env_id: &str, req: &RotateRequest) -> Result<RotateResponse>;
     /// Remove a member from an org (revokes their API access).
     fn remove_member(&self, org_id: &str, user_id: &str) -> Result<()>;
+    /// Create a machine token for an environment (public key + sealed grant are client-generated).
+    fn create_machine_token(
+        &self,
+        env_id: &str,
+        name: &str,
+        public_key: &str,
+        enc_vault_key: &str,
+    ) -> Result<CreatedMachineToken>;
+    /// The environment's active machine tokens (for listings and rotation re-sealing).
+    fn list_machine_tokens(&self, env_id: &str) -> Result<Vec<MachineTokenInfo>>;
+    /// Revoke a machine token (its API access dies immediately).
+    fn revoke_machine_token(&self, env_id: &str, token_id: &str) -> Result<()>;
 }
 
 #[cfg(test)]
