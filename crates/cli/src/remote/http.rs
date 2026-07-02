@@ -68,6 +68,8 @@ fn server_error(resp: Response) -> Error {
         }
         StatusCode::UNAUTHORIZED => Error::Server("unauthorized — run `sotto login`".into()),
         StatusCode::FORBIDDEN => Error::Forbidden(format!("{status}: {body}")),
+        // A quota / Team-feature gate: the server message says exactly what to do.
+        StatusCode::PAYMENT_REQUIRED => Error::Input(body),
         _ => Error::Server(format!("{status}: {body}")),
     }
 }
@@ -278,6 +280,16 @@ impl SyncApi for HttpClient {
             .map_err(net)?;
         let envs: Vec<EnvRefRow> = parse(resp)?;
         Ok(envs.into_iter().map(|e| e.env_id).collect())
+    }
+
+    fn org_entitlements(&self, org_id: &str) -> Result<super::api::Entitlements> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/orgs/{org_id}/entitlements")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
     }
 
     fn org_audit(&self, org_id: &str, limit: Option<i64>) -> Result<Vec<super::api::AuditEvent>> {

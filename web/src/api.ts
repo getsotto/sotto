@@ -137,6 +137,31 @@ export async function fetchOrgs(): Promise<Org[]> {
   }));
 }
 
+export interface Entitlements {
+  tier: string;
+  effectiveTier: string;
+  trialEndsAt: string | null;
+  limits: { maxMembers: number; maxOrgProjects: number } | null;
+}
+
+/// The org's plan (tier, trial, limits), visible to any member.
+export async function fetchEntitlements(orgId: string): Promise<Entitlements> {
+  const r = await authedJson<{
+    tier: string;
+    effective_tier: string;
+    trial_ends_at: string | null;
+    limits: { max_members: number; max_org_projects: number } | null;
+  }>(`/orgs/${encodeURIComponent(orgId)}/entitlements`);
+  return {
+    tier: r.tier,
+    effectiveTier: r.effective_tier,
+    trialEndsAt: r.trial_ends_at,
+    limits: r.limits
+      ? { maxMembers: r.limits.max_members, maxOrgProjects: r.limits.max_org_projects }
+      : null,
+  };
+}
+
 export interface AuditEvent {
   id: number;
   actor: string;

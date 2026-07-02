@@ -244,7 +244,8 @@ async fn create_org(
     let created = {
         let mut tx = state.pool.begin().await?;
         let created: Option<String> = sqlx::query_scalar(
-            "INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, $2, $3) \
+            "INSERT INTO organizations (id, enc_name, created_by, trial_ends_at) \
+             VALUES ($1, $2, $3, now() + interval '14 days') \
              ON CONFLICT (id) DO NOTHING RETURNING id",
         )
         .bind(&body.id)
@@ -438,8 +439,11 @@ async fn add_member(
         ));
     }
 
-    // Insert and audit commit together, so a failed audit can't leave an un-logged new member.
+    // Insert, quota check, and audit all commit together. The quota check locks the org row, so it
+    // and the insert are atomic against concurrent adds; a failed audit can't leave an un-logged
+    // member either.
     let mut tx = state.pool.begin().await?;
+    crate::entitlements::check_can_add_member(&mut tx, &org_id).await?;
     let inserted: std::result::Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
         "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, $3) \
          ON CONFLICT (org_id, user_id) DO NOTHING RETURNING user_id",
@@ -493,7 +497,6 @@ async fn invite_member(
             "must be an admin or owner to invite members".into(),
         ));
     }
-
     // Resolve the email to exactly one existing user (email is not unique in the schema, so guard
     // against the ambiguous case rather than silently picking one).
     let matches: Vec<(String, Option<Vec<u8>>)> =
@@ -507,8 +510,11 @@ async fn invite_member(
         _ => return Err(Error::Conflict("multiple users share that email".into())),
     };
 
-    // Insert and audit commit together, so a failed audit can't leave an un-logged new member.
+    // Insert, quota check, and audit all commit together. The quota check locks the org row, so it
+    // and the insert are atomic against concurrent invites; a failed audit can't leave an un-logged
+    // member either.
     let mut tx = state.pool.begin().await?;
+    crate::entitlements::check_can_add_member(&mut tx, &org_id).await?;
     let inserted: Option<String> = sqlx::query_scalar(
         "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, 'member') \
          ON CONFLICT (org_id, user_id) DO NOTHING RETURNING user_id",

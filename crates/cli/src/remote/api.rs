@@ -118,6 +118,21 @@ pub struct RotateRequest {
     pub history_keys: Vec<HistoryKeyEntry>,
 }
 
+/// An org's plan: assigned + effective tier, trial end, and the limits in effect.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Entitlements {
+    pub tier: String,
+    pub effective_tier: String,
+    pub trial_ends_at: Option<String>,
+    pub limits: Option<PlanLimits>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlanLimits {
+    pub max_members: i64,
+    pub max_org_projects: i64,
+}
+
 /// One org audit event, newest-first from the server's log.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuditEvent {
@@ -320,6 +335,8 @@ pub trait SyncApi {
     fn list_history(&self, env_id: &str) -> Result<Vec<HistoryRow>>;
     /// An org's audit events, newest first (admin+).
     fn org_audit(&self, org_id: &str, limit: Option<i64>) -> Result<Vec<AuditEvent>>;
+    /// An org's plan (tier, trial, limits), visible to any member.
+    fn org_entitlements(&self, org_id: &str) -> Result<Entitlements>;
     /// Remove a member from an org (revokes their API access).
     fn remove_member(&self, org_id: &str, user_id: &str) -> Result<()>;
     /// Store (or replace) a member's sealed copy of the org key (display-name access).

@@ -32,6 +32,10 @@ pub enum Error {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// A plan quota or Team-feature gate blocked the request (upgrade to proceed).
+    #[error("quota: {0}")]
+    Quota(String),
+
     /// The request was malformed (bad/expired login state, non-loopback redirect, …).
     #[error("bad request: {0}")]
     BadRequest(String),
@@ -62,6 +66,7 @@ impl IntoResponse for Error {
         let (status, message) = match &self {
             Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
             Error::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
+            Error::Quota(m) => (StatusCode::PAYMENT_REQUIRED, m.clone()),
             Error::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             Error::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
             Error::Conflict(m) => (StatusCode::CONFLICT, m.clone()),
