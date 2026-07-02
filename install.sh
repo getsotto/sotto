@@ -2,7 +2,7 @@
 # Sotto installer: download the latest release for this machine, verify its checksum (and its
 # Sigstore signature when `cosign` is installed), and install the `sotto` binary.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Maxerns/sotto/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh
 #
 # Options (environment variables):
 #   SOTTO_INSTALL_DIR  install directory        (default: ~/.local/bin)
@@ -12,7 +12,7 @@
 
 set -eu
 
-REPO="Maxerns/sotto"
+REPO="getsotto/sotto"
 INSTALL_DIR="${SOTTO_INSTALL_DIR:-$HOME/.local/bin}"
 
 say() { printf '%s\n' "$*" >&2; }

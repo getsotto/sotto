@@ -55,7 +55,7 @@ workflow identity via GitHub OIDC — there is no long-lived signing key to stea
 sha256sum --check --ignore-missing SHA256SUMS
 cosign verify-blob \
   --bundle sotto-<version>-<target>.tar.gz.sigstore.json \
-  --certificate-identity-regexp '^https://github.com/Maxerns/sotto/.github/workflows/release.yml/tags/v' \
+  --certificate-identity-regexp '^https://github.com/getsotto/sotto/.github/workflows/release.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   sotto-<version>-<target>.tar.gz
 ```

@@ -29,12 +29,12 @@ and lost-key account recovery.
 Prebuilt, signed binaries for macOS (Apple Silicon + Intel) and Linux x86_64:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Maxerns/sotto/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh
 ```
 
 The installer verifies the tarball's SHA-256 checksum — and its Sigstore signature, when `cosign`
 is installed — before installing to `~/.local/bin`. Prefer to look first? Grab a tarball from the
-[releases page](https://github.com/Maxerns/sotto/releases) and verify it manually per
+[releases page](https://github.com/getsotto/sotto/releases) and verify it manually per
 [SECURITY.md](SECURITY.md), or build from source (see [Developing](#developing)).
 
 ## Quick start
@@ -89,7 +89,7 @@ target automatically.
 Clone the repository, then build and test the complete workspace:
 
 ```sh
-git clone https://github.com/Maxerns/sotto.git
+git clone https://github.com/getsotto/sotto.git
 cd sotto
 
 cargo build --workspace
