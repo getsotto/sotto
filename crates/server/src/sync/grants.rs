@@ -121,6 +121,8 @@ async fn create_grant(
         ));
     }
 
+    // Grant and its audit event commit together, so a failed audit can't leave an un-logged share.
+    let mut tx = state.pool.begin().await?;
     sqlx::query(
         "INSERT INTO environment_grants (env_id, user_id, enc_vault_key, granted_by) \
          VALUES ($1, $2, $3, $4) \
@@ -131,10 +133,10 @@ async fn create_grant(
     .bind(&body.user_id)
     .bind(&enc_vault_key)
     .bind(&user.user_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
-    audit::record(
-        &state.pool,
+    audit::record_tx(
+        &mut tx,
         &org_id,
         &user.user_id,
         "env.shared",
@@ -145,6 +147,7 @@ async fn create_grant(
         },
     )
     .await?;
+    tx.commit().await?;
     Ok(StatusCode::OK)
 }
 
