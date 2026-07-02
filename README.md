@@ -139,8 +139,9 @@ The web build and its dependency audit run in CI (`.github/workflows/ci.yml`).
 Sotto's model is zero-knowledge: plaintext secrets and usable decryption keys stay on client
 devices, and the server sees only ciphertext plus minimal metadata. This is implemented but **not
 yet independently audited** — see [SECURITY.md](SECURITY.md) for the model, the honest metadata
-exposure, and how the (re-fetched, weaker) web surface is hardened. Report vulnerabilities privately
-per that document.
+exposure, how the (re-fetched, weaker) web surface is hardened, and how to verify signed releases.
+The full adversary model, guarantees, and explicit non-goals are published in
+[THREAT-MODEL.md](THREAT-MODEL.md). Report vulnerabilities privately per SECURITY.md.
 
 ## License
 
