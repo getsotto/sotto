@@ -65,11 +65,13 @@ fn adopt_rotation(
     Ok(true)
 }
 
-/// Whether our grant for `env_id` differs from `local_grant` (without adopting it).
+/// Whether our grant for `env_id` differs from `local_grant` (without adopting it). A missing grant
+/// (404) counts as changed: a rotation dropped us from the grant set, so our local key is stale and
+/// pushing under it would upload secrets the team can no longer decrypt — fail closed.
 fn grant_changed(api: &dyn SyncApi, env_id: &str, local_grant: &[u8]) -> Result<bool> {
     match api.get_grant(env_id)? {
         Some(grant_b64) => Ok(b64decode(&grant_b64)? != local_grant),
-        None => Ok(false),
+        None => Ok(true),
     }
 }
 
@@ -1166,6 +1168,84 @@ mod tests {
         assert!(
             bob_vault.get("POST_ROTATION").is_err(),
             "the removed member's old key must not decrypt writes made after rotation"
+        );
+    }
+
+    #[test]
+    fn a_member_dropped_from_the_grant_set_cannot_push() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+
+        // Bob is his own initialized device; his account keypair is what grants seal to.
+        let store_b = Store::open_in_memory().unwrap();
+        let kc_b = crate::keychain::MemoryKeychain::default();
+        crate::session::init(
+            &store_b,
+            &kc_b,
+            b"pwB",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master_b = *crate::session::current_master_key(&kc_b)
+            .unwrap()
+            .unwrap()
+            .as_bytes();
+        let bob = device_keypair(&store_b, &master_b);
+
+        // Both public keys are on file so the removal's rotation can re-grant the remaining member.
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+
+        // Alice sets up the shared env, grants Bob, Bob clones it.
+        let org_id = team::create_org(&api, &master_a, "acme").unwrap();
+        team::invite(&api, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        api.as_user("bob-user");
+        let bob_config = team::clone_env(
+            &api,
+            &store_b,
+            &bob,
+            &project.id,
+            &env_id,
+            "acme",
+            "dev",
+            Some(&org_id),
+        )
+        .unwrap();
+
+        // Bob makes a local edit he hasn't pushed yet.
+        Vault::open(&store_b, &bob, &project.id, "dev")
+            .unwrap()
+            .set("BOB_LOCAL", b"pending")
+            .unwrap();
+
+        // Alice rotates Bob out of the grant set (Bob never adopts the new key).
+        api.as_user("test-user");
+        team::remove_member(&api, &alice, &org_id, "bob-user").unwrap();
+
+        // Regression: Bob's grant is gone (`get_grant` → None), so pushing his pending change must
+        // fail closed rather than upload a secret under a vault key the rotated team can't decrypt.
+        api.as_user("bob-user");
+        assert!(api.get_grant(&env_id).unwrap().is_none());
+        assert!(
+            matches!(
+                push(&api, &store_b, &master_b, &bob_config),
+                Err(Error::Conflict(_))
+            ),
+            "a member dropped from the grant set must not be able to push"
         );
     }
 
