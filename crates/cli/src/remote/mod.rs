@@ -1,7 +1,10 @@
-//! Talking to the sync server: configuration, the HTTP client, and login.
+//! Talking to the sync server.
 //!
-//! PR5b-i (connectivity): server-URL config, the [`SyncApi`] client over HTTP, and the loopback
-//! `login` flow. The sync engine (push/pull reconciliation) lands in PR5b-ii, targeting [`SyncApi`].
+//! - [`config`] — server-URL configuration; [`auth`] — the loopback OAuth `login` flow
+//! - [`api`] — the [`SyncApi`] trait + wire types; [`http`] — its reqwest implementation
+//! - [`sync`] — the push/pull reconciliation engine
+//! - [`team`] — organizations, invites, environment sharing, rotation, and removal
+//! - [`machine`] — the `SOTTO_TOKEN` (CI) mode; [`share`] — one-time share links
 
 pub mod api;
 pub mod auth;

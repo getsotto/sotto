@@ -5,7 +5,7 @@
 //! known-answer test in `vectors.rs`.
 
 use proptest::prelude::*;
-use sotto_core::{aead, format, kdf, wrap};
+use sotto_core::{aead, format, kdf, vault, wrap};
 
 fn key() -> impl Strategy<Value = [u8; 32]> {
     prop::array::uniform32(any::<u8>())
@@ -86,5 +86,31 @@ proptest! {
         let a = kdf::derive_subkey(&master, b"vaultkey", id1).expect("subkey");
         let b = kdf::derive_subkey(&master, b"vaultkey", id2).expect("subkey");
         prop_assert_ne!(a, b);
+    }
+
+    /// Rotation: rewrapping a data key moves a secret from the old vault key to the new one — the
+    /// unchanged name/value ciphertext decrypts under the new key, and the old key is locked out.
+    #[test]
+    fn rewrap_moves_secret_between_vault_keys(
+        old in key(),
+        new in key(),
+        version in 1i64..1_000_000,
+        name in bytes(64),
+        value in bytes(256),
+    ) {
+        prop_assume!(old != new);
+        let enc = vault::encrypt_secret(&old, "env", "secret", version, &name, &value);
+        let rewrapped = vault::rewrap_data_key(&old, &new, "env", "secret", version, &enc.enc_data_key)
+            .expect("rewrap");
+
+        // The untouched ciphertext opens under the new vault key via the rewrapped data key…
+        let (got_name, got_value) =
+            vault::decrypt_secret(&new, "env", "secret", version, &enc.enc_name, &enc.enc_value, &rewrapped)
+                .expect("decrypt under new key");
+        prop_assert_eq!(got_name, name);
+        prop_assert_eq!(got_value, value);
+        // …and neither key opens the other's wrap.
+        prop_assert!(vault::decrypt_value(&old, "env", "secret", version, &enc.enc_value, &rewrapped).is_err());
+        prop_assert!(vault::decrypt_value(&new, "env", "secret", version, &enc.enc_value, &enc.enc_data_key).is_err());
     }
 }

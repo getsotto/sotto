@@ -6,9 +6,10 @@
 //! exist, a non-member is answered with `404` (not `403`) — `403` is reserved for a member who is
 //! in the org but lacks the role for the action.
 //!
-//! This is the authorization layer only. Wiring org membership into *secret* access, and issuing
-//! the crypto grants that let members actually decrypt, arrives with grant sharing in a later PR;
-//! `enc_name` here is server-opaque ciphertext, exactly like `projects.enc_name`.
+//! This is the authorization layer. Resource access is resolved from membership in
+//! [`crate::sync::access`], and the crypto grants that let members actually *decrypt* live in
+//! [`crate::sync::grants`] — cryptography is not access control, so both layers check. `enc_name`
+//! here is server-opaque ciphertext, exactly like `projects.enc_name`.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

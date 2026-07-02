@@ -1,6 +1,6 @@
-//! The server sync API surface: request/response types and the [`SyncApi`] trait the engine
-//! depends on. The reqwest implementation is [`super::http::HttpClient`]; the sync engine (PR5b-ii)
-//! targets the trait and is tested with a mock. Opaque ciphertext travels as base64 JSON strings.
+//! The server sync API surface: request/response types and the [`SyncApi`] trait the engine and
+//! team operations depend on. The reqwest implementation is [`super::http::HttpClient`]; callers
+//! target the trait and are tested with a mock. Opaque ciphertext travels as base64 JSON strings.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
