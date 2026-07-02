@@ -1,0 +1,70 @@
+# Sotto — production deployment: Postgres + API server + Caddy (web app, HTTPS) in one command.
+#
+#   cd deploy
+#   cp .env.example .env   # then fill it in
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# See deploy/README.md for the full runbook (DNS, GitHub OAuth app, backups, upgrades).
+#
+# Topology: only Caddy is exposed (80/443). It serves the web app and reverse-proxies the API,
+# so everything lives on ONE origin (session cookie + CSP stay same-origin). Postgres and the
+# server are reachable only on the internal compose network.
+
+name: sotto
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sotto
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}
+      POSTGRES_DB: sotto
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sotto"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: ..
+    restart: unless-stopped
+    environment:
+      # The password is interpolated into a URL — keep it URL-safe (see .env.example).
+      DATABASE_URL: postgres://sotto:${POSTGRES_PASSWORD}@postgres:5432/sotto
+      SOTTO_PUBLIC_URL: https://${SOTTO_DOMAIN:?set SOTTO_DOMAIN in deploy/.env}
+      SOTTO_WEB_ORIGIN: https://${SOTTO_DOMAIN}
+      # Optional: without these the server still boots (health + migrations), but login and every
+      # authenticated endpoint return 503. Fill them in for a usable instance.
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  caddy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+    restart: unless-stopped
+    environment:
+      SOTTO_DOMAIN: ${SOTTO_DOMAIN}
+      SOTTO_API: server:8080
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    volumes:
+      # Persist certificates and Caddy state across restarts (avoids re-issuing on every deploy).
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - server
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:

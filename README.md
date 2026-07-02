@@ -137,9 +137,12 @@ npm run build    # production bundle → web/dist (strict CSP + Subresource Inte
 
 ### Deploying
 
-Serve the web app and API from **one origin** (so the session cookie and CSP stay same-origin). The
-included [`Caddyfile`](Caddyfile) serves `web/dist` and reverse-proxies the API, with security
-headers; [`Dockerfile`](Dockerfile) builds the server image (migrations run on boot).
+One command brings up a complete hosted instance — Postgres, the server, and Caddy with automatic
+HTTPS — from [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml); the runbook is
+[`deploy/README.md`](deploy/README.md). The pieces also work standalone: serve the web app and API
+from **one origin** (so the session cookie and CSP stay same-origin) — the included
+[`Caddyfile`](Caddyfile) serves `web/dist` and reverse-proxies the API, with security headers;
+[`Dockerfile`](Dockerfile) builds the server image (migrations run on boot).
 
 ## Development checks
 

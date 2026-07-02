@@ -4,3 +4,8 @@ target
 docs
 **/*.db
 *.log
+# Web: dependencies and generated artifacts are (re)built inside the image.
+web/node_modules
+web/dist
+web/src/wasm
+web/.wasm-node
