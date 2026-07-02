@@ -24,6 +24,39 @@ and lost-key account recovery.
 | Server | OAuth login + sessions, account + snapshot sync (versioned writes, ETag), orgs + memberships + roles, per-member vault-key grants, transactional key rotation, machine tokens, account reset, and share links — ciphertext only |
 | Web | Login (cookie session), in-browser unlock + vault decryption via your own grant, one-time share create/receive, and a team panel: orgs, members, invite by email, share an environment with a member |
 
+## Install
+
+Prebuilt, signed binaries for macOS (Apple Silicon + Intel) and Linux x86_64:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Maxerns/sotto/main/install.sh | sh
+```
+
+The installer verifies the tarball's SHA-256 checksum — and its Sigstore signature, when `cosign`
+is installed — before installing to `~/.local/bin`. Prefer to look first? Grab a tarball from the
+[releases page](https://github.com/Maxerns/sotto/releases) and verify it manually per
+[SECURITY.md](SECURITY.md), or build from source (see [Developing](#developing)).
+
+## Quick start
+
+```sh
+sotto init                   # create your identity + first project — SAVE the printed Emergency Kit
+sotto set DATABASE_URL       # hidden prompt; encrypted locally before it ever touches disk
+sotto run -- npm start       # inject the environment's secrets into any command
+sotto login && sotto push    # optional: sync ciphertext through a server
+sotto share DATABASE_URL     # one-time, burn-after-reading link for a single secret
+```
+
+Working with a team:
+
+```sh
+sotto org create acme                      # prints the org id
+sotto init --org <org-id>                  # an org-owned project
+sotto org invite <org-id> dev@example.com  # invite an existing Sotto user
+sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
+sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
+```
+
 ## Architecture
 
 ```text
@@ -51,12 +84,12 @@ The workspace contains four crates:
 The checked-in `rust-toolchain.toml` asks Rustup to install the required components and
 target automatically.
 
-## Getting started
+## Developing
 
 Clone the repository, then build and test the complete workspace:
 
 ```sh
-git clone https://github.com/getsotto/sotto.git
+git clone https://github.com/Maxerns/sotto.git
 cd sotto
 
 cargo build --workspace

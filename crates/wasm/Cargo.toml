@@ -1,6 +1,6 @@
 [package]
 name = "sotto-wasm"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 # `repository` is intentionally not inherited from the workspace: wasm-pack parses this manifest
