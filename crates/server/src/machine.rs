@@ -17,6 +17,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::audit;
 use crate::auth::session;
 use crate::auth::AuthUser;
 use crate::encoding;
@@ -103,9 +104,12 @@ async fn create_token(
             "must be an admin or owner to create a machine token".into(),
         ));
     }
+    let audit_org = access.org_id().map(str::to_string);
 
     let token_id = uuid::Uuid::new_v4().to_string();
     let token = generate_token();
+    // Token row and its audit event commit together, so a failed audit can't leave one un-logged.
+    let mut tx = state.pool.begin().await?;
     sqlx::query(
         "INSERT INTO machine_tokens (id, env_id, name, token_hash, public_key, enc_vault_key, created_by) \
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -117,8 +121,24 @@ async fn create_token(
     .bind(&public_key)
     .bind(&enc_vault_key)
     .bind(&user.user_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
+    // Personal environments have no org, hence no audit log to write to.
+    if let Some(org) = &audit_org {
+        audit::record_tx(
+            &mut tx,
+            org,
+            &user.user_id,
+            "token.created",
+            audit::Context {
+                target: Some(&token_id),
+                env_id: Some(&env_id),
+                detail: Some(&body.name),
+            },
+        )
+        .await?;
+    }
+    tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(CreatedToken { token_id, token })))
 }
@@ -168,17 +188,34 @@ async fn revoke_token(
             "must be an admin or owner to revoke a machine token".into(),
         ));
     }
+    // Revoke and its audit event commit together, so a failed audit can't leave one un-logged.
+    let mut tx = state.pool.begin().await?;
     let revoked = sqlx::query(
         "UPDATE machine_tokens SET revoked_at = now() \
          WHERE id = $1 AND env_id = $2 AND revoked_at IS NULL",
     )
     .bind(&token_id)
     .bind(&env_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
     if revoked.rows_affected() == 0 {
         return Err(Error::NotFound("machine token not found".into()));
     }
+    if let Some(org) = access.org_id() {
+        audit::record_tx(
+            &mut tx,
+            org,
+            &user.user_id,
+            "token.revoked",
+            audit::Context {
+                target: Some(&token_id),
+                env_id: Some(&env_id),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

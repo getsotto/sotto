@@ -30,6 +30,7 @@ fn app(pool: PgPool) -> Router {
     };
     Router::new()
         .merge(sotto_server::account::router())
+        .merge(sotto_server::audit::router())
         .merge(sotto_server::org::router())
         .merge(sotto_server::sync::router())
         .with_state(state)
@@ -240,6 +241,13 @@ async fn reset_replaces_material_and_deletes_grants() {
     assert!(
         !body.contains(&b64(b"member-org-key")),
         "reset must clear the member's org-key copy"
+    );
+    // The reset surfaced in the org's audit log, so admins know to re-grant.
+    let (status, body) = send(&pool, "GET", "/orgs/rec-o/audit", &owner, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("account.reset"),
+        "reset must be audited: {body}"
     );
 }
 

@@ -914,6 +914,16 @@ mod tests {
             Ok(envs)
         }
 
+        fn org_audit(
+            &self,
+            _org_id: &str,
+            _limit: Option<i64>,
+        ) -> Result<Vec<super::super::api::AuditEvent>> {
+            // Audit is a server-side ledger with no client crypto; its behavior is covered by the
+            // server DB tests, so the mock has nothing to prove and returns an empty log.
+            Ok(Vec::new())
+        }
+
         fn list_history(&self, env_id: &str) -> Result<Vec<super::super::api::HistoryRow>> {
             let s = self.state.borrow();
             let env = s

@@ -137,6 +137,40 @@ export async function fetchOrgs(): Promise<Org[]> {
   }));
 }
 
+export interface AuditEvent {
+  id: number;
+  actor: string;
+  action: string;
+  target: string | null;
+  envId: string | null;
+  detail: string | null;
+  at: string;
+}
+
+/// The org's audit events, newest first (admins/owners only).
+export async function fetchAudit(orgId: string, limit = 50): Promise<AuditEvent[]> {
+  const rows = await authedJson<
+    {
+      id: number;
+      actor: string;
+      action: string;
+      target: string | null;
+      env_id: string | null;
+      detail: string | null;
+      at: string;
+    }[]
+  >(`/orgs/${encodeURIComponent(orgId)}/audit?limit=${limit}`);
+  return rows.map((r) => ({
+    id: r.id,
+    actor: r.actor,
+    action: r.action,
+    target: r.target,
+    envId: r.env_id,
+    detail: r.detail,
+    at: r.at,
+  }));
+}
+
 /// Store (or replace) a member's sealed copy of the org key.
 export async function grantOrgKey(
   orgId: string,

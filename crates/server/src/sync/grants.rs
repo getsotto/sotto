@@ -20,6 +20,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Transaction};
 
+use crate::audit;
 use crate::auth::AuthUser;
 use crate::encoding;
 use crate::error::{Error, Result};
@@ -120,6 +121,8 @@ async fn create_grant(
         ));
     }
 
+    // Grant and its audit event commit together, so a failed audit can't leave an un-logged share.
+    let mut tx = state.pool.begin().await?;
     sqlx::query(
         "INSERT INTO environment_grants (env_id, user_id, enc_vault_key, granted_by) \
          VALUES ($1, $2, $3, $4) \
@@ -130,8 +133,21 @@ async fn create_grant(
     .bind(&body.user_id)
     .bind(&enc_vault_key)
     .bind(&user.user_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
+    audit::record_tx(
+        &mut tx,
+        &org_id,
+        &user.user_id,
+        "env.shared",
+        audit::Context {
+            target: Some(&body.user_id),
+            env_id: Some(&env_id),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
     Ok(StatusCode::OK)
 }
 
@@ -429,6 +445,24 @@ async fn rotate(
         .bind(new_revision)
         .execute(&mut *tx)
         .await?;
+    let detail = format!(
+        "{} member grant(s), {} machine grant(s), {} history version(s)",
+        grants.len(),
+        machine_grants.len(),
+        history_keys.len()
+    );
+    audit::record_tx(
+        &mut tx,
+        &org_id,
+        &user.user_id,
+        "env.rotated",
+        audit::Context {
+            env_id: Some(&env_id),
+            detail: Some(&detail),
+            ..Default::default()
+        },
+    )
+    .await?;
     tx.commit().await?;
 
     Ok(Json(RotateResponse {

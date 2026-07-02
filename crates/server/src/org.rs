@@ -18,6 +18,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Transaction};
 
+use crate::audit;
 use crate::auth::AuthUser;
 use crate::encoding;
 use crate::error::{Error, Result};
@@ -91,7 +92,7 @@ impl Role {
     }
 
     /// Whether this role may add, update, or remove members (owners and admins may; members may not).
-    fn can_manage_members(self) -> bool {
+    pub(crate) fn can_manage_members(self) -> bool {
         self.is_at_least(Role::Admin)
     }
 }
@@ -262,6 +263,14 @@ async fn create_org(
             .bind(&enc_org_key)
             .execute(&mut *tx)
             .await?;
+            audit::record_tx(
+                &mut tx,
+                &body.id,
+                &user.user_id,
+                "org.created",
+                audit::Context::default(),
+            )
+            .await?;
             tx.commit().await?;
             true
         } else {
@@ -333,17 +342,31 @@ async fn grant_org_key(
         ));
     }
     let enc_org_key = encoding::decode(&body.enc_org_key, "enc_org_key", MAX_ENC_NAME)?;
+    // Grant and its audit event commit together, so a failed audit can't leave an un-logged change.
+    let mut tx = state.pool.begin().await?;
     let updated = sqlx::query(
         "UPDATE organization_memberships SET enc_org_key = $3 WHERE org_id = $1 AND user_id = $2",
     )
     .bind(&org_id)
     .bind(&target)
     .bind(&enc_org_key)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
     if updated.rows_affected() == 0 {
         return Err(Error::NotFound("member not found".into()));
     }
+    audit::record_tx(
+        &mut tx,
+        &org_id,
+        &user.user_id,
+        "member.org_key_granted",
+        audit::Context {
+            target: Some(&target),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
     Ok(StatusCode::OK)
 }
 
@@ -415,6 +438,8 @@ async fn add_member(
         ));
     }
 
+    // Insert and audit commit together, so a failed audit can't leave an un-logged new member.
+    let mut tx = state.pool.begin().await?;
     let inserted: std::result::Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
         "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, $3) \
          ON CONFLICT (org_id, user_id) DO NOTHING RETURNING user_id",
@@ -422,11 +447,26 @@ async fn add_member(
     .bind(&org_id)
     .bind(&body.user_id)
     .bind(body.role.as_str())
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await;
 
     match inserted {
-        Ok(Some(_)) => Ok(StatusCode::CREATED),
+        Ok(Some(_)) => {
+            audit::record_tx(
+                &mut tx,
+                &org_id,
+                &user.user_id,
+                "member.added",
+                audit::Context {
+                    target: Some(&body.user_id),
+                    detail: Some(body.role.as_str()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(StatusCode::CREATED)
+        }
         // No row inserted, no error: the (org, user) pair already existed.
         Ok(None) => Err(Error::Conflict(
             "user is already a member; use update to change their role".into(),
@@ -467,17 +507,31 @@ async fn invite_member(
         _ => return Err(Error::Conflict("multiple users share that email".into())),
     };
 
+    // Insert and audit commit together, so a failed audit can't leave an un-logged new member.
+    let mut tx = state.pool.begin().await?;
     let inserted: Option<String> = sqlx::query_scalar(
         "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, 'member') \
          ON CONFLICT (org_id, user_id) DO NOTHING RETURNING user_id",
     )
     .bind(&org_id)
     .bind(&target_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?;
     if inserted.is_none() {
         return Err(Error::Conflict("user is already a member".into()));
     }
+    audit::record_tx(
+        &mut tx,
+        &org_id,
+        &user.user_id,
+        "member.invited",
+        audit::Context {
+            target: Some(&target_id),
+            ..Default::default()
+        },
+    )
+    .await?;
+    tx.commit().await?;
 
     Ok(Json(InviteResult {
         user_id: target_id,
@@ -554,6 +608,18 @@ async fn update_member(
         .bind(body.role.as_str())
         .execute(&mut *tx)
         .await?;
+    audit::record_tx(
+        &mut tx,
+        &org_id,
+        &user.user_id,
+        "member.role_changed",
+        audit::Context {
+            target: Some(&target),
+            detail: Some(body.role.as_str()),
+            ..Default::default()
+        },
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::OK)
 }
@@ -591,6 +657,17 @@ async fn remove_member(
         .bind(&target)
         .execute(&mut *tx)
         .await?;
+    audit::record_tx(
+        &mut tx,
+        &org_id,
+        &user.user_id,
+        "member.removed",
+        audit::Context {
+            target: Some(&target),
+            ..Default::default()
+        },
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }

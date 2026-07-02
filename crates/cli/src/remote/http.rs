@@ -280,6 +280,20 @@ impl SyncApi for HttpClient {
         Ok(envs.into_iter().map(|e| e.env_id).collect())
     }
 
+    fn org_audit(&self, org_id: &str, limit: Option<i64>) -> Result<Vec<super::api::AuditEvent>> {
+        let mut url = self.url(&format!("/orgs/{org_id}/audit"));
+        if let Some(limit) = limit {
+            url.push_str(&format!("?limit={limit}"));
+        }
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
     fn list_history(&self, env_id: &str) -> Result<Vec<super::api::HistoryRow>> {
         let resp = self
             .http

@@ -15,6 +15,7 @@
 //! - [`error`] — server error type
 
 pub mod account;
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod db;
@@ -37,6 +38,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .merge(auth::router())
+        .merge(audit::router())
         .merge(account::router())
         .merge(org::router())
         .merge(machine::router())

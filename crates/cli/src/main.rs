@@ -257,6 +257,13 @@ enum OrgCommand {
     Members { org_id: String },
     /// Remove a member and rotate every environment they could access.
     Remove { org_id: String, user_id: String },
+    /// Show the org audit log, newest first (admins/owners).
+    Audit {
+        org_id: String,
+        /// Maximum events to show (server caps at 500).
+        #[arg(long)]
+        limit: Option<i64>,
+    },
 }
 
 fn main() {
@@ -591,6 +598,21 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
                      who holds them to run `sotto rotate`: {}",
                     report.skipped.len(),
                     report.skipped.join(", ")
+                );
+            }
+            Ok(())
+        }
+        OrgCommand::Audit { org_id, limit } => {
+            for ev in remote::SyncApi::org_audit(&client, &org_id, limit)? {
+                let target = ev
+                    .target
+                    .map(|t| format!("  target={t}"))
+                    .unwrap_or_default();
+                let env = ev.env_id.map(|e| format!("  env={e}")).unwrap_or_default();
+                let detail = ev.detail.map(|d| format!("  ({d})")).unwrap_or_default();
+                println!(
+                    "{}  {}  {}{target}{env}{detail}",
+                    ev.at, ev.action, ev.actor
                 );
             }
             Ok(())

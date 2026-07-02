@@ -1,6 +1,15 @@
 import { useEffect, useState } from "react";
 
-import { fetchMembers, fetchOrgs, grantOrgKey, inviteMember, type Member, type Org } from "./api";
+import {
+  fetchAudit,
+  fetchMembers,
+  fetchOrgs,
+  grantOrgKey,
+  inviteMember,
+  type AuditEvent,
+  type Member,
+  type Org,
+} from "./api";
 import { decryptOrgName, openOrgKey, sealGrantTo } from "./vault";
 
 interface NamedOrg {
@@ -38,6 +47,7 @@ export function TeamPanel({
   const [orgs, setOrgs] = useState<NamedOrg[] | null>(null);
   const [openOrg, setOpenOrg] = useState<NamedOrg | null>(null);
   const [members, setMembers] = useState<Member[] | null>(null);
+  const [audit, setAudit] = useState<AuditEvent[] | null>(null);
   const [email, setEmail] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -58,8 +68,13 @@ export function TeamPanel({
     setNotice(null);
     setOpenOrg(no);
     setMembers(null);
+    setAudit(null);
     try {
       setMembers(await fetchMembers(no.org.id));
+      // The audit log is admin/owner-only; members simply don't get the section.
+      if (["owner", "admin"].includes(no.org.role)) {
+        setAudit(await fetchAudit(no.org.id));
+      }
     } catch (e) {
       setError(message(e));
     }
@@ -147,6 +162,25 @@ export function TeamPanel({
                 Invite
               </button>
             </form>
+          )}
+          {audit !== null && (
+            <>
+              <h3>Audit log</h3>
+              {audit.length === 0 ? (
+                <p>No events yet.</p>
+              ) : (
+                <ul>
+                  {audit.map((ev) => (
+                    <li key={ev.id}>
+                      <code>{ev.at}</code> {ev.action} — {ev.actor}
+                      {ev.target !== null ? ` → ${ev.target}` : ""}
+                      {ev.envId !== null ? ` (env ${ev.envId})` : ""}
+                      {ev.detail !== null ? ` — ${ev.detail}` : ""}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
           )}
         </>
       )}
