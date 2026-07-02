@@ -1,0 +1,98 @@
+# Tag-triggered releases: build the `sotto` CLI for macOS + Linux, package tarballs with shell
+# completions and the threat model, publish SHA256SUMS, and sign every artifact with Sigstore
+# cosign — *keyless*, via this workflow's GitHub OIDC identity, so there is no signing key to
+# store, leak, or rotate. Verification instructions live in SECURITY.md.
+#
+# Apple notarisation is a documented roadmap item (it needs a paid Developer ID certificate).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  # Publish the GitHub release.
+  contents: write
+  # Mint the OIDC token cosign exchanges for a short-lived signing certificate.
+  id-token: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      # A tag can point anywhere; never ship untested code. (DB-gated tests skip without Postgres.)
+      - name: Test before shipping
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --release -p sotto-cli --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          BIN=target/${{ matrix.target }}/release/sotto
+          STAGE=sotto-${{ github.ref_name }}-${{ matrix.target }}
+          mkdir -p "$STAGE/completions"
+          cp "$BIN" "$STAGE/"
+          cp THREAT-MODEL.md SECURITY.md "$STAGE/"
+          for shell in bash zsh fish; do
+            "$BIN" completions "$shell" > "$STAGE/completions/sotto.$shell"
+          done
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sotto-${{ matrix.target }}
+          path: sotto-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: sign + publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Checksums
+        run: sha256sum sotto-*.tar.gz > SHA256SUMS
+
+      - uses: sigstore/cosign-installer@v3
+
+      # Keyless: cosign exchanges this job's OIDC token for a short-lived certificate binding the
+      # signature to THIS workflow in THIS repository — verifiers pin that identity, not a key.
+      - name: Sign artifacts
+        run: |
+          set -euo pipefail
+          for f in sotto-*.tar.gz SHA256SUMS; do
+            cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
+          done
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --title "sotto ${{ github.ref_name }}" \
+            --generate-notes \
+            sotto-*.tar.gz SHA256SUMS ./*.sigstore.json

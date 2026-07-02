@@ -45,9 +45,27 @@ brute-forceable, because the secret key is never stored server-side.
   XSS in the served client is the primary residual web risk; we mitigate it and document the weaker
   posture rather than hide it.
 
+## Verifying releases
+
+Tagged releases ship tarballs, a `SHA256SUMS` file, and Sigstore signatures. Signing is
+**keyless**: each artifact's `.sigstore.json` bundle binds it to this repository's release
+workflow identity via GitHub OIDC — there is no long-lived signing key to steal. To verify:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+cosign verify-blob \
+  --bundle sotto-<version>-<target>.tar.gz.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/Maxerns/sotto/.github/workflows/release.yml/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  sotto-<version>-<target>.tar.gz
+```
+
+The full threat model — adversaries, guarantees, and explicit non-goals — is published in
+[THREAT-MODEL.md](./THREAT-MODEL.md).
+
 ## Not yet in place
 
-Signed/notarized releases, reproducible builds, key transparency for the server's public-key
+Apple notarization, reproducible builds, key transparency for the server's public-key
 distribution, and a third-party audit are on the roadmap, not shipped. Until then, trust decisions
 should reflect an unaudited pre-1.0 project.
 
