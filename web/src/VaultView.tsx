@@ -257,7 +257,7 @@ export function VaultView({
         version: h.version,
         encDataKey: rewrapDataKey(openEnv.vaultKey, newKey, openEnv.envId, h.secretId, h.version, h.encDataKey),
       }));
-      const grants = [];
+      const grants: { userId: string; encVaultKey: Uint8Array }[] = [];
       for (const holder of await fetchGrantHolders(openEnv.envId)) {
         const m = roster.find((mm) => mm.userId === holder);
         if (m === undefined || m.publicKey === null) {
