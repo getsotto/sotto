@@ -407,3 +407,63 @@ async fn rotate_personal_env_is_rejected() {
         StatusCode::BAD_REQUEST
     );
 }
+
+#[tokio::test]
+async fn rotate_rejects_a_grant_to_a_non_member() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e, s1) = ("rot-nm-o", "rot-nm-p", "rot-nm-e", "rot-nm-s1");
+    reset_orgs(&pool, &[o]).await;
+    let owner = fresh_session(&pool, "rot-nm-owner", "rot-nm-owner-s").await;
+    let rev = seed(&pool, &owner, o, p, e, "rot-nm-member", &[s1]).await;
+    // A user who exists but was never added to the org.
+    ensure_user(&pool, "rot-nm-stranger", "rot-nm-stranger-s").await;
+
+    // The rotation is otherwise valid — own grant present, all secrets covered — but names a
+    // non-member, so it is rejected rather than handing the env to someone outside the org.
+    assert_eq!(
+        post(
+            &pool,
+            &owner,
+            &format!("/environments/{e}/rotate"),
+            rotate_body(
+                rev,
+                &[("rot-nm-owner", b"new-grant"), ("rot-nm-stranger", b"k")],
+                &[(s1, b"new-dk")],
+            ),
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn rotate_rejects_duplicate_grantees() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e, s1) = ("rot-dup-o", "rot-dup-p", "rot-dup-e", "rot-dup-s1");
+    reset_orgs(&pool, &[o]).await;
+    let owner = fresh_session(&pool, "rot-dup-owner", "rot-dup-owner-s").await;
+    let rev = seed(&pool, &owner, o, p, e, "rot-dup-member", &[s1]).await;
+
+    // The same user listed twice would trip the environment_grants primary key mid-transaction; it
+    // must fail as a clean 400, not a 500.
+    assert_eq!(
+        post(
+            &pool,
+            &owner,
+            &format!("/environments/{e}/rotate"),
+            rotate_body(
+                rev,
+                &[("rot-dup-owner", b"g1"), ("rot-dup-owner", b"g2")],
+                &[(s1, b"new-dk")],
+            ),
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}

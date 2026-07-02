@@ -191,7 +191,8 @@ struct RotateResponse {
 /// only. In one transaction: verify `base_revision`, rewrap every secret's data key, replace the
 /// grant set (dropping anyone not re-granted), repoint the inline vault key at the caller's new
 /// grant, and bump the revision. Fails closed with 412 if a concurrent write moved the revision, or
-/// 400 if the data keys don't cover exactly the env's secrets or the caller omitted their own grant.
+/// 400 if the data keys don't cover exactly the env's secrets, the caller omitted their own grant,
+/// or the grant set names a non-member or a duplicate user.
 async fn rotate(
     State(state): State<AppState>,
     user: AuthUser,
@@ -212,7 +213,32 @@ async fn rotate(
     .bind(&env_id)
     .fetch_one(&state.pool)
     .await?;
-    org_id.ok_or_else(|| Error::BadRequest("environment is not in an organization".into()))?;
+    let org_id =
+        org_id.ok_or_else(|| Error::BadRequest("environment is not in an organization".into()))?;
+
+    // Every grantee must be a distinct member of that org — the same rule `create_grant` enforces.
+    // Without the membership check an admin could re-grant the env to a non-member; without the
+    // duplicate check a repeated user_id would trip the environment_grants PK mid-transaction and
+    // surface as a 500 instead of a clean 400.
+    let member_rows: Vec<String> =
+        sqlx::query_scalar("SELECT user_id FROM organization_memberships WHERE org_id = $1")
+            .bind(&org_id)
+            .fetch_all(&state.pool)
+            .await?;
+    let members: HashSet<&str> = member_rows.iter().map(String::as_str).collect();
+    let mut seen: HashSet<&str> = HashSet::with_capacity(req.grants.len());
+    for g in &req.grants {
+        if !seen.insert(g.user_id.as_str()) {
+            return Err(Error::BadRequest(
+                "duplicate user_id in the rotation grant set".into(),
+            ));
+        }
+        if !members.contains(g.user_id.as_str()) {
+            return Err(Error::BadRequest(
+                "a grant recipient is not a member of this organization".into(),
+            ));
+        }
+    }
 
     // Decode all blobs up front (bounds-checked), so a bad field fails before we touch anything.
     let mut grants = Vec::with_capacity(req.grants.len());
