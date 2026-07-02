@@ -196,12 +196,17 @@ export function VaultView({
     try {
       const sealed = sealGrantTo(member.publicKey, openEnv.vaultKey);
       await createGrant(openEnv.envId, member.userId, sealed);
-      // Whoever can decrypt the environment should read its display names too: upsert their
-      // org-key copy alongside the env grant (best-effort — needs our own copy).
+      // Whoever can decrypt the environment should read its display names too: upsert their org-key
+      // copy alongside the env grant (best-effort — needs our own copy, and is admin/owner-only
+      // server-side). A failure must not undo or mask the env share that already succeeded.
       const orgId = activeProject?.project.orgId ?? null;
       const orgKey = orgId !== null ? orgKeys.get(orgId) : undefined;
       if (orgId !== null && orgKey !== undefined) {
-        await grantOrgKey(orgId, member.userId, sealGrantTo(member.publicKey, orgKey));
+        try {
+          await grantOrgKey(orgId, member.userId, sealGrantTo(member.publicKey, orgKey));
+        } catch {
+          // Best-effort only; the member may just see the org id for names.
+        }
       }
       setNotice(`shared this environment with ${member.userId}`);
     } catch (e) {
