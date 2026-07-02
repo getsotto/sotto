@@ -124,7 +124,11 @@ async fn reset_replaces_material_and_deletes_grants() {
             "POST",
             "/orgs",
             &owner,
-            Some(format!(r#"{{"id":"rec-o","enc_name":"{}"}}"#, b64(b"org"))),
+            Some(format!(
+                r#"{{"id":"rec-o","enc_name":"{}","enc_org_key":"{}"}}"#,
+                b64(b"org"),
+                b64(b"owner-org-key"),
+            )),
         )
         .await,
     );
@@ -136,6 +140,18 @@ async fn reset_replaces_material_and_deletes_grants() {
             "/orgs/rec-o/members",
             &owner,
             Some(r#"{"user_id":"rec-member","role":"member"}"#.into()),
+        )
+        .await,
+    );
+    // Grant the member an org-key copy too, so the reset has one to clear.
+    expect_ok(
+        "grant org key",
+        send(
+            &pool,
+            "POST",
+            "/orgs/rec-o/members/rec-member/org-key",
+            &owner,
+            Some(format!(r#"{{"enc_org_key":"{}"}}"#, b64(b"member-org-key"))),
         )
         .await,
     );
@@ -216,6 +232,14 @@ async fn reset_replaces_material_and_deletes_grants() {
             .await
             .0,
         StatusCode::OK
+    );
+    // The org-key copy was sealed to the dead keypair: cleared by the reset (names fall back to
+    // ids until an admin re-grants it).
+    let (status, body) = send(&pool, "GET", "/orgs", &member, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains(&b64(b"member-org-key")),
+        "reset must clear the member's org-key copy"
     );
 }
 

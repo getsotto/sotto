@@ -75,12 +75,12 @@ enum Command {
         project_id: String,
         /// The environment id to clone.
         env_id: String,
-        /// Local name for the cloned environment (names aren't shared-readable yet).
-        #[arg(long = "as", default_value = "shared")]
-        as_name: String,
-        /// Local label for the project.
-        #[arg(long, default_value = "shared")]
-        name: String,
+        /// Local name for the cloned environment (defaults to its real name via the org key).
+        #[arg(long = "as")]
+        as_name: Option<String>,
+        /// Local label for the project (defaults to "shared").
+        #[arg(long)]
+        name: Option<String>,
         /// The owning organization id (from the grantor), so later pushes match the server.
         #[arg(long)]
         org: Option<String>,
@@ -294,8 +294,8 @@ fn run() -> Result<()> {
                 &cwd,
                 &project_id,
                 &env_id,
-                &name,
-                &as_name,
+                name.as_deref(),
+                as_name.as_deref(),
                 org.as_deref(),
             )
         }
@@ -478,7 +478,8 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
         OrgCommand::Create { name } => {
             ensure_unlocked(store, keychain)?;
             let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
-            let id = remote::team::create_org(&client, master.as_bytes(), &name)?;
+            let keypair = session::account_keypair(store, &master)?;
+            let id = remote::team::create_org(&client, &keypair, &name)?;
             eprintln!("created organization `{name}`");
             println!("{id}");
             Ok(())
@@ -486,13 +487,19 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
         OrgCommand::Ls => {
             ensure_unlocked(store, keychain)?;
             let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
-            for org in remote::team::list_orgs(&client, master.as_bytes())? {
+            let keypair = session::account_keypair(store, &master)?;
+            for org in remote::team::list_orgs(&client, &keypair)? {
                 println!("{}  {}  ({})", org.id, org.name, org.role);
             }
             Ok(())
         }
         OrgCommand::Invite { org_id, email } => {
-            let invited = remote::team::invite(&client, &org_id, &email)?;
+            // Inviting also grants the invitee the org key (sealed to their public key), so the
+            // caller must be unlocked to open their own copy.
+            ensure_unlocked(store, keychain)?;
+            let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
+            let keypair = session::account_keypair(store, &master)?;
+            let invited = remote::team::invite(&client, &keypair, &org_id, &email)?;
             let keys = if invited.public_key.is_some() {
                 "ready to receive shares"
             } else {
@@ -630,8 +637,8 @@ fn clone_env(
     cwd: &Path,
     project_id: &str,
     env_id: &str,
-    project_label: &str,
-    env_label: &str,
+    project_label: Option<&str>,
+    env_label: Option<&str>,
     org_id: Option<&str>,
 ) -> Result<()> {
     if cwd.join(config::CONFIG_FILE).exists() {

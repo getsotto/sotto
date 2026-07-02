@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 
-import { fetchMembers, fetchOrgs, inviteMember, type Member, type Org } from "./api";
-import { decryptOrgName } from "./vault";
+import { fetchMembers, fetchOrgs, grantOrgKey, inviteMember, type Member, type Org } from "./api";
+import { decryptOrgName, openOrgKey, sealGrantTo } from "./vault";
 
 interface NamedOrg {
   org: Org;
@@ -12,10 +12,29 @@ function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/// Best-effort org-name decryption via the caller's sealed org-key copy; the org id otherwise.
+function orgDisplayName(master: Uint8Array, encPrivateKeys: Uint8Array, org: Org): string {
+  if (org.encOrgKey === null) {
+    return org.id; // not granted the org key (yet): show the id
+  }
+  try {
+    const key = openOrgKey(master, encPrivateKeys, org.encOrgKey);
+    return decryptOrgName(key, org.id, org.encName);
+  } catch {
+    return org.id; // a pre-org-key name, or a copy sealed to keys we no longer hold
+  }
+}
+
 /// The team section: the caller's organizations, each expandable to its member list, with
-/// invite-by-email for admins/owners. Org names decrypt only for their creator (they're sealed
-/// under the creator's master key); everyone else sees the org id.
-export function TeamPanel({ master }: { master: Uint8Array }) {
+/// invite-by-email for admins/owners. Org names decrypt through the org key every member holds;
+/// an ungranted member sees the org id. Inviting also seals the org key to the invitee.
+export function TeamPanel({
+  master,
+  encPrivateKeys,
+}: {
+  master: Uint8Array;
+  encPrivateKeys: Uint8Array;
+}) {
   const [orgs, setOrgs] = useState<NamedOrg[] | null>(null);
   const [openOrg, setOpenOrg] = useState<NamedOrg | null>(null);
   const [members, setMembers] = useState<Member[] | null>(null);
@@ -27,22 +46,12 @@ export function TeamPanel({ master }: { master: Uint8Array }) {
     void (async () => {
       try {
         const rows = await fetchOrgs();
-        setOrgs(
-          rows.map((org) => {
-            let name = org.id;
-            try {
-              name = decryptOrgName(master, org.id, org.encName);
-            } catch {
-              // Not the creator: the name is sealed under someone else's master key.
-            }
-            return { org, name };
-          }),
-        );
+        setOrgs(rows.map((org) => ({ org, name: orgDisplayName(master, encPrivateKeys, org) })));
       } catch (e) {
         setError(message(e));
       }
     })();
-  }, [master]);
+  }, [master, encPrivateKeys]);
 
   async function selectOrg(no: NamedOrg) {
     setError(null);
@@ -60,8 +69,20 @@ export function TeamPanel({ master }: { master: Uint8Array }) {
     setError(null);
     setNotice(null);
     try {
-      const userId = await inviteMember(no.org.id, email.trim());
-      setNotice(`invited ${email.trim()} (${userId})`);
+      const invited = await inviteMember(no.org.id, email.trim());
+      // Grant the invitee the org key so display names decrypt for them (best-effort: needs their
+      // public key on file and our own org-key copy). A failure here — e.g. our copy is sealed to an
+      // old keypair after a reset, or the server rejects the grant — must not fail the invite, which
+      // has already succeeded; the invitee just sees the org id until someone re-grants the key.
+      if (invited.publicKey !== null && no.org.encOrgKey !== null) {
+        try {
+          const orgKey = openOrgKey(master, encPrivateKeys, no.org.encOrgKey);
+          await grantOrgKey(no.org.id, invited.userId, sealGrantTo(invited.publicKey, orgKey));
+        } catch {
+          // Best-effort only.
+        }
+      }
+      setNotice(`invited ${email.trim()} (${invited.userId})`);
       setEmail("");
       setMembers(await fetchMembers(no.org.id));
     } catch (e) {

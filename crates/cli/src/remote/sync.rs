@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use sotto_core::{aead, kdf};
+use sotto_core::{kdf, names};
 
 use crate::account;
 use crate::config::Config;
@@ -84,7 +84,8 @@ pub fn push(api: &dyn SyncApi, store: &Store, master: &[u8; 32], config: &Config
         .ok_or_else(|| Error::NotFound(format!("project `{}`", config.project_id)))?;
 
     ensure_account(api, store)?;
-    ensure_project_env(api, master, config.org_id.as_deref(), &project, &env)?;
+    let key = name_key(api, store, master, config.org_id.as_deref());
+    ensure_project_env(api, &key, config.org_id.as_deref(), &project, &env)?;
 
     for _ in 0..MAX_SYNC_ATTEMPTS {
         // Fast-forward from the latest snapshot, then diff against it.
@@ -151,8 +152,29 @@ fn ensure_account(api: &dyn SyncApi, store: &Store) -> Result<()> {
     }
 }
 
-/// Idempotently create the project + environment server-side (encrypting their names). `org_id`,
-/// when set, creates the project under that organization (the caller must be an admin+ of it).
+/// The key display names are encrypted under: the org key for an org project (when this account
+/// holds a copy), else the master key. Falling back to the master keeps pushes working for an org
+/// the caller has no org key for — the names are then creator-readable only, as before org keys.
+fn name_key(api: &dyn SyncApi, store: &Store, master: &[u8; 32], org_id: Option<&str>) -> [u8; 32] {
+    if let Some(org) = org_id {
+        if let Ok(keypair) = account_keypair(store, master) {
+            if let Ok(Some(key)) = super::team::org_key(api, &keypair, org) {
+                return key;
+            }
+        }
+    }
+    *master
+}
+
+/// Recover the account keypair from the local store's sealed private keys.
+fn account_keypair(store: &Store, master: &[u8; 32]) -> Result<sotto_core::wrap::Keypair> {
+    let keys = store.get_account_keys()?.ok_or(Error::NoIdentity)?;
+    sotto_core::vault::open_account_keypair(master, &keys.enc_private_keys).map_err(Into::into)
+}
+
+/// Idempotently create the project + environment server-side (encrypting their names under
+/// `key` — the org key for org projects, else the master key). `org_id`, when set, creates the
+/// project under that organization (the caller must be an admin+ of it).
 ///
 /// On an org-owned project a plain member lacks the admin+ rights these structural creates require,
 /// so the server answers 403 — but the member cloned an environment that already exists and may
@@ -161,7 +183,7 @@ fn ensure_account(api: &dyn SyncApi, store: &Store) -> Result<()> {
 /// later, as a 404 from the snapshot call.
 fn ensure_project_env(
     api: &dyn SyncApi,
-    master: &[u8; 32],
+    key: &[u8; 32],
     org_id: Option<&str>,
     project: &Project,
     env: &Environment,
@@ -169,10 +191,10 @@ fn ensure_project_env(
     tolerate_org_forbidden(
         api.create_project(&NewProject {
             id: project.id.clone(),
-            enc_name: b64encode(&encrypt_name(
-                master,
-                &project.name,
-                &project_name_aad(&project.id),
+            enc_name: b64encode(&names::encrypt_project_name(
+                key,
+                &project.id,
+                project.name.as_bytes(),
             )),
             org_id: org_id.map(str::to_string),
         }),
@@ -183,7 +205,7 @@ fn ensure_project_env(
             &project.id,
             &NewEnvironment {
                 id: env.id.clone(),
-                enc_name: b64encode(&encrypt_name(master, &env.name, &env_name_aad(&env.id))),
+                enc_name: b64encode(&names::encrypt_env_name(key, &env.id, env.name.as_bytes())),
                 enc_vault_key: b64encode(&env.enc_vault_key),
             },
         ),
@@ -271,18 +293,6 @@ fn set_change(local: SyncSecret) -> SecretChange {
     )
 }
 
-fn encrypt_name(master: &[u8; 32], name: &str, aad: &str) -> Vec<u8> {
-    aead::seal(master, name.as_bytes(), aad.as_bytes())
-}
-
-fn project_name_aad(project_id: &str) -> String {
-    format!("sotto/v1/project-name|id={project_id}")
-}
-
-fn env_name_aad(env_id: &str) -> String {
-    format!("sotto/v1/env-name|id={env_id}")
-}
-
 /// Reconstruct the local identity on a new device from a downloaded account bundle plus the pasted
 /// secret key and master password. Decodes the bundle and delegates to [`session::restore`].
 pub fn restore_account(
@@ -315,9 +325,11 @@ pub fn restore_account(
     )
 }
 
-/// Reconstruct the local project + environments from the server (decrypting env names under the
-/// master key). Existing local rows are left untouched. Run after [`restore_account`], before
-/// [`pull`], on a new device.
+/// Reconstruct the local project + environments from the server. Env names decrypt under the org
+/// key (org projects) or the master key (personal); an undecryptable name falls back to the env
+/// id. Environments the caller holds no grant for are skipped — they couldn't be opened anyway.
+/// Existing local rows are left untouched. Run after [`restore_account`], before [`pull`], on a
+/// new device.
 pub fn pull_environments(
     api: &dyn SyncApi,
     store: &Store,
@@ -327,24 +339,25 @@ pub fn pull_environments(
     if store.get_project(&config.project_id)?.is_none() {
         store.create_project_with_id(&config.project_id, &config.project)?;
     }
+    let key = name_key(api, store, master, config.org_id.as_deref());
     for env in api.list_environments(&config.project_id)? {
         if store.find_environment(&env.id)?.is_some() {
             continue;
         }
-        let name = decrypt_name(master, &b64decode(&env.enc_name)?, &env_name_aad(&env.id))?;
-        store.create_environment(
-            &env.id,
-            &config.project_id,
-            &name,
-            &b64decode(&env.enc_vault_key)?,
-        )?;
+        let Some(grant_b64) = &env.enc_vault_key else {
+            continue; // no grant for this env: nothing we could ever decrypt
+        };
+        // Try the resolved key, then the master (an org env pushed before the org key existed),
+        // then fall back to the id — a missing display name must not block reconstruction.
+        let enc_name = b64decode(&env.enc_name)?;
+        let name = names::decrypt_env_name(&key, &env.id, &enc_name)
+            .or_else(|_| names::decrypt_env_name(master, &env.id, &enc_name))
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_else(|| env.id.clone());
+        store.create_environment(&env.id, &config.project_id, &name, &b64decode(grant_b64)?)?;
     }
     Ok(())
-}
-
-fn decrypt_name(master: &[u8; 32], ciphertext: &[u8], aad: &str) -> Result<String> {
-    let bytes = aead::open(master, ciphertext, aad.as_bytes())?;
-    String::from_utf8(bytes).map_err(|_| Error::Crypto)
 }
 
 #[cfg(test)]
@@ -384,7 +397,6 @@ mod tests {
     struct EnvState {
         project_id: String,
         enc_name: String,
-        enc_vault_key: String,
         revision: i64,
         secrets: HashMap<String, ServerSecret>,
     }
@@ -392,6 +404,8 @@ mod tests {
     struct MemberRec {
         role: String,
         public_key: Option<Vec<u8>>,
+        /// The org key sealed to this member (base64), as the membership row carries it.
+        enc_org_key: Option<String>,
     }
 
     struct OrgState {
@@ -496,6 +510,8 @@ mod tests {
             for org in s.orgs.values_mut() {
                 if let Some(rec) = org.members.get_mut(&me) {
                     rec.public_key = Some(new_key.clone());
+                    // Mirror the server: the sealed org key was for the dead keypair — cleared.
+                    rec.enc_org_key = None;
                 }
             }
             Ok(())
@@ -519,7 +535,6 @@ mod tests {
                     EnvState {
                         project_id: project_id.to_string(),
                         enc_name: env.enc_name.clone(),
-                        enc_vault_key: env.enc_vault_key.clone(),
                         revision: 0,
                         secrets: HashMap::new(),
                     },
@@ -535,6 +550,8 @@ mod tests {
             &self,
             project_id: &str,
         ) -> Result<Vec<super::super::api::EnvironmentInfo>> {
+            // Mirror the server: each row carries the CALLER's own grant (or none).
+            let me = self.current_user();
             let s = self.state.borrow();
             let mut envs: Vec<_> = s
                 .envs
@@ -543,7 +560,7 @@ mod tests {
                 .map(|(id, e)| super::super::api::EnvironmentInfo {
                     id: id.clone(),
                     enc_name: e.enc_name.clone(),
-                    enc_vault_key: e.enc_vault_key.clone(),
+                    enc_vault_key: s.grants.get(&(id.clone(), me.clone())).cloned(),
                     revision: e.revision,
                 })
                 .collect();
@@ -654,6 +671,7 @@ mod tests {
                 MemberRec {
                     role: "owner".into(),
                     public_key,
+                    enc_org_key: Some(org.enc_org_key.clone()),
                 },
             );
             s.orgs.insert(
@@ -677,11 +695,26 @@ mod tests {
                         id: id.clone(),
                         enc_name: o.enc_name.clone(),
                         role: rec.role.clone(),
+                        enc_org_key: rec.enc_org_key.clone(),
                     })
                 })
                 .collect();
             orgs.sort_by(|a, b| a.id.cmp(&b.id));
             Ok(orgs)
+        }
+
+        fn grant_org_key(&self, org_id: &str, user_id: &str, enc_org_key: &str) -> Result<()> {
+            let mut s = self.state.borrow_mut();
+            let org = s
+                .orgs
+                .get_mut(org_id)
+                .ok_or_else(|| Error::NotFound("organization not found".into()))?;
+            let member = org
+                .members
+                .get_mut(user_id)
+                .ok_or_else(|| Error::NotFound("member not found".into()))?;
+            member.enc_org_key = Some(enc_org_key.to_string());
+            Ok(())
         }
 
         fn invite_member(&self, org_id: &str, email: &str) -> Result<super::super::api::Invited> {
@@ -698,6 +731,7 @@ mod tests {
             org.members.entry(user_id.clone()).or_insert(MemberRec {
                 role: "member".into(),
                 public_key: public_key.clone(),
+                enc_org_key: None,
             });
             Ok(super::super::api::Invited {
                 user_id,
@@ -772,7 +806,6 @@ mod tests {
             env_id: &str,
             req: &super::super::api::RotateRequest,
         ) -> Result<super::super::api::RotateResponse> {
-            let me = self.current_user();
             let mut s = self.state.borrow_mut();
             let new_rev = {
                 let env = s
@@ -797,12 +830,6 @@ mod tests {
                     (env_id.to_string(), g.user_id.clone()),
                     g.enc_vault_key.clone(),
                 );
-            }
-            // Point the inline vault key at the caller's new grant.
-            if let Some(mine) = req.grants.iter().find(|g| g.user_id == me) {
-                if let Some(env) = s.envs.get_mut(env_id) {
-                    env.enc_vault_key = mine.enc_vault_key.clone();
-                }
             }
             // Machine grants must cover exactly the env's active tokens (as the server enforces),
             // and each covered token's stored grant is re-sealed.
@@ -1141,9 +1168,9 @@ mod tests {
         let alice = device_keypair(&store_a, &master_a);
 
         // Alice creates an org, invites Bob, and marks her project org-owned.
-        let org_id = team::create_org(&api, &master_a, "acme").unwrap();
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
         assert_eq!(
-            team::invite(&api, &org_id, "bob@example.test")
+            team::invite(&api, &alice, &org_id, "bob@example.test")
                 .unwrap()
                 .user_id,
             "bob-user"
@@ -1170,8 +1197,8 @@ mod tests {
             &bob,
             &project.id,
             &env_id,
-            "acme",
-            "dev",
+            Some("acme"),
+            Some("dev"),
             Some(&org_id),
         )
         .unwrap();
@@ -1194,8 +1221,8 @@ mod tests {
             &carol,
             &project.id,
             &env_id,
-            "acme",
-            "dev",
+            Some("acme"),
+            Some("dev"),
             Some(&org_id)
         )
         .is_err());
@@ -1214,8 +1241,8 @@ mod tests {
         api.register_user("bob@example.test", "bob-user", &bob.public);
 
         // Alice sets up the org + shared env and gives Bob a grant; Bob clones and reads.
-        let org_id = team::create_org(&api, &master_a, "acme").unwrap();
-        team::invite(&api, &org_id, "bob@example.test").unwrap();
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
         let config = Config {
             org_id: Some(org_id.clone()),
             ..config0
@@ -1235,8 +1262,8 @@ mod tests {
             &bob,
             &project.id,
             &env_id,
-            "acme",
-            "dev",
+            Some("acme"),
+            Some("dev"),
             Some(&org_id),
         )
         .unwrap();
@@ -1308,8 +1335,8 @@ mod tests {
         api.register_user("bob@example.test", "bob-user", &bob.public);
 
         // Alice sets up the shared env, grants Bob, Bob clones it.
-        let org_id = team::create_org(&api, &master_a, "acme").unwrap();
-        team::invite(&api, &org_id, "bob@example.test").unwrap();
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
         let config = Config {
             org_id: Some(org_id.clone()),
             ..config0
@@ -1328,8 +1355,8 @@ mod tests {
             &bob,
             &project.id,
             &env_id,
-            "acme",
-            "dev",
+            Some("acme"),
+            Some("dev"),
             Some(&org_id),
         )
         .unwrap();
@@ -1366,7 +1393,7 @@ mod tests {
         let (store_a, master_a, _kit, project, config0) = real_device();
         let alice = device_keypair(&store_a, &master_a);
         api.register_user("alice@example.test", "test-user", &alice.public);
-        let org_id = team::create_org(&api, &master_a, "acme").unwrap();
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
         let config = Config {
             org_id: Some(org_id.clone()),
             ..config0
@@ -1448,8 +1475,8 @@ mod tests {
         let alice = device_keypair(&store_a, &master_a);
         let bob_old = sotto_core::wrap::generate_keypair();
         api.register_user("bob@example.test", "bob-user", &bob_old.public);
-        let org_id = team::create_org(&api, &master_a, "acme").unwrap();
-        team::invite(&api, &org_id, "bob@example.test").unwrap();
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
         let config = Config {
             org_id: Some(org_id.clone()),
             ..config0
@@ -1482,8 +1509,8 @@ mod tests {
             &bob_new,
             &project.id,
             &env_id,
-            "acme",
-            "dev",
+            Some("acme"),
+            Some("dev"),
             Some(&org_id)
         )
         .is_err());
@@ -1498,8 +1525,8 @@ mod tests {
             &bob_new,
             &project.id,
             &env_id,
-            "acme",
-            "dev",
+            Some("acme"),
+            Some("dev"),
             Some(&org_id),
         )
         .unwrap();
@@ -1513,6 +1540,74 @@ mod tests {
         // The old keypair stays locked out: it can't open the new grant.
         let new_grant = b64decode(&api.get_grant(&env_id).unwrap().unwrap()).unwrap();
         assert!(sotto_core::vault::open_vault_key(&bob_old, &new_grant).is_err());
+    }
+
+    #[test]
+    fn org_key_gives_members_readable_names() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        // Alice: an org project pushed, names encrypted under the org key.
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+        let org_id = team::create_org(&api, &alice, "acme-team").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("K", b"v")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+
+        // The creator reads the org name back through their sealed org key.
+        assert_eq!(team::list_orgs(&api, &alice).unwrap()[0].name, "acme-team");
+
+        // Invite grants Bob the org key: he reads the org name with NO key shared out of band.
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        api.as_user("bob-user");
+        assert_eq!(team::list_orgs(&api, &bob).unwrap()[0].name, "acme-team");
+
+        // Share + clone: the cloned env auto-labels with its REAL name — no `--as` needed.
+        api.as_user("test-user");
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+        api.as_user("bob-user");
+        let store_b = Store::open_in_memory().unwrap();
+        let bob_config = team::clone_env(
+            &api,
+            &store_b,
+            &bob,
+            &project.id,
+            &env_id,
+            None,
+            None,
+            Some(&org_id),
+        )
+        .unwrap();
+        assert_eq!(
+            bob_config.environment, "dev",
+            "env label decrypted via the org key"
+        );
+        assert_eq!(
+            Vault::open(&store_b, &bob, &project.id, "dev")
+                .unwrap()
+                .get("K")
+                .unwrap(),
+            b"v"
+        );
+
+        // An account reset clears Bob's org-key copy: names fall back to the org id.
+        api.reset_account(&AccountBundle {
+            public_key: b64encode(&sotto_core::wrap::generate_keypair().public),
+            enc_private_keys: b64encode(b"new-priv"),
+            kdf_params: b64encode(b"new-kdf"),
+            recovery_blob: b64encode(b"new-rec"),
+        })
+        .unwrap();
+        assert_eq!(team::list_orgs(&api, &bob).unwrap()[0].name, org_id);
     }
 
     // Uses the full MockApi (which stores uploaded share blobs) to exercise share creation.

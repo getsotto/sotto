@@ -1,16 +1,18 @@
 //! Team operations over the sync API: organizations, invites, and environment sharing.
 //!
-//! Organization names are encrypted under the master key (like project/environment names), so only
-//! server-opaque ciphertext leaves this device. Sharing an environment opens the caller's own
-//! vault-key grant, reseals the vault key to a member's public key, and uploads that grant — the
-//! vault key never leaves the process, and the server only ever holds sealed grants.
+//! Every org has an **org key** — a symmetric key sealed grant-style to each member's public key
+//! (stored on their membership row, server-opaque). It encrypts org/project/environment *display
+//! names* for org resources, so every member reads real names instead of record-id fallbacks.
+//! Metadata only: secret names/values are protected by the per-environment vault keys, which
+//! rotate on member removal. The org key does not rotate — a removed member remembering display
+//! names is an accepted, documented leak.
 //!
-//! NOTE: secret names/values are encrypted under the vault key, so a teammate who is granted an
-//! environment can read them. Project/environment *display* names are still under the creator's
-//! master key, so a teammate labels a cloned environment locally; shared-readable names await a
-//! per-org key (a documented follow-up).
+//! Sharing an environment opens the caller's own vault-key grant, reseals the vault key to a
+//! member's public key, and uploads that grant — keys never leave the process, and the server only
+//! ever holds sealed blobs. Invite and share flows also upsert the member's org-key copy, so
+//! whoever can decrypt an environment can also read its name.
 
-use sotto_core::{aead, vault, wrap};
+use sotto_core::{names, vault, wrap};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -20,7 +22,7 @@ use crate::store::Store;
 
 use super::api::{
     b64decode, b64encode, DataKeyEntry, GrantEntry, Invited, MachineGrantEntry, MemberInfo, NewOrg,
-    OrgInfo, RotateRequest, SyncApi,
+    RotateRequest, SyncApi,
 };
 
 /// Decode a base64 X25519 public key into its fixed-size array.
@@ -31,10 +33,6 @@ fn decode_public_key(b64: &str) -> Result<[u8; wrap::PUBLIC_KEY_LEN]> {
 /// Re-snapshot + retry budget when a concurrent write bumps the revision during a rotation.
 const ROTATE_ATTEMPTS: usize = 5;
 
-fn org_name_aad(id: &str) -> String {
-    format!("sotto/v1/org-name|id={id}")
-}
-
 /// An organization with its decrypted name and the caller's role in it.
 pub struct OrgListing {
     pub id: String,
@@ -42,23 +40,46 @@ pub struct OrgListing {
     pub role: String,
 }
 
-/// Create an organization (the caller becomes its owner); returns the new org id.
-pub fn create_org(api: &dyn SyncApi, master: &[u8; 32], name: &str) -> Result<String> {
+/// Create an organization (the caller becomes its owner); returns the new org id. Generates the
+/// org key, encrypts the name under it, and seals the creator's own copy to their public key.
+pub fn create_org(api: &dyn SyncApi, keypair: &wrap::Keypair, name: &str) -> Result<String> {
     let id = Uuid::new_v4().to_string();
-    let enc_name = aead::seal(master, name.as_bytes(), org_name_aad(&id).as_bytes());
+    let mut org_key = vault::generate_vault_key();
+    let enc_name = names::encrypt_org_name(&org_key, &id, name.as_bytes());
+    let enc_org_key = vault::grant_vault_key(&keypair.public, &org_key)?;
+    org_key.zeroize();
     api.create_org(&NewOrg {
         id: id.clone(),
         enc_name: b64encode(&enc_name),
+        enc_org_key: b64encode(&enc_org_key),
     })?;
     Ok(id)
 }
 
-/// List the caller's organizations, decrypting each name (falling back to the id if a name can't be
-/// decrypted — e.g. an org whose name was encrypted under a key this device doesn't hold).
-pub fn list_orgs(api: &dyn SyncApi, master: &[u8; 32]) -> Result<Vec<OrgListing>> {
+/// The caller's copy of an org's key, or `None` if they haven't been granted one (an org from
+/// before org keys existed, or their copy was cleared by an account reset).
+pub fn org_key(
+    api: &dyn SyncApi,
+    keypair: &wrap::Keypair,
+    org_id: &str,
+) -> Result<Option<[u8; 32]>> {
+    for org in api.list_orgs()? {
+        if org.id == org_id {
+            let Some(enc) = org.enc_org_key else {
+                return Ok(None);
+            };
+            return Ok(Some(vault::open_vault_key(keypair, &b64decode(&enc)?)?));
+        }
+    }
+    Ok(None)
+}
+
+/// List the caller's organizations, decrypting each name with its org key (falling back to the id
+/// when the caller holds no org key or the name predates org keys).
+pub fn list_orgs(api: &dyn SyncApi, keypair: &wrap::Keypair) -> Result<Vec<OrgListing>> {
     let mut listings = Vec::new();
     for org in api.list_orgs()? {
-        let name = decrypt_org_name(master, &org).unwrap_or_else(|_| org.id.clone());
+        let name = decrypt_org_listing_name(keypair, &org).unwrap_or_else(|| org.id.clone());
         listings.push(OrgListing {
             id: org.id,
             name,
@@ -68,18 +89,34 @@ pub fn list_orgs(api: &dyn SyncApi, master: &[u8; 32]) -> Result<Vec<OrgListing>
     Ok(listings)
 }
 
-fn decrypt_org_name(master: &[u8; 32], org: &OrgInfo) -> Result<String> {
-    let bytes = aead::open(
-        master,
-        &b64decode(&org.enc_name)?,
-        org_name_aad(&org.id).as_bytes(),
-    )?;
-    String::from_utf8(bytes).map_err(|_| Error::Crypto)
+/// Best-effort org-name decryption: open the caller's org key and decrypt, `None` on any failure.
+fn decrypt_org_listing_name(keypair: &wrap::Keypair, org: &super::api::OrgInfo) -> Option<String> {
+    let enc_org_key = b64decode(org.enc_org_key.as_deref()?).ok()?;
+    let mut key = vault::open_vault_key(keypair, &enc_org_key).ok()?;
+    let name = names::decrypt_org_name(&key, &org.id, &b64decode(&org.enc_name).ok()?).ok();
+    key.zeroize();
+    String::from_utf8(name?).ok()
 }
 
-/// Invite an existing user (by email) into an org as a member.
-pub fn invite(api: &dyn SyncApi, org_id: &str, email: &str) -> Result<Invited> {
-    api.invite_member(org_id, email)
+/// Invite an existing user (by email) into an org as a member, then grant them the org key (sealed
+/// to their public key) so display names decrypt for them. The key grant is best-effort: it needs
+/// the invitee's public key on file and the caller's own org-key copy; without either, the invite
+/// still succeeds and the member sees record ids until re-granted.
+pub fn invite(
+    api: &dyn SyncApi,
+    keypair: &wrap::Keypair,
+    org_id: &str,
+    email: &str,
+) -> Result<Invited> {
+    let invited = api.invite_member(org_id, email)?;
+    if let Some(public_key_b64) = &invited.public_key {
+        if let Some(mut org_key) = org_key(api, keypair, org_id)? {
+            let sealed = vault::grant_vault_key(&decode_public_key(public_key_b64)?, &org_key)?;
+            org_key.zeroize();
+            api.grant_org_key(org_id, &invited.user_id, &b64encode(&sealed))?;
+        }
+    }
+    Ok(invited)
 }
 
 /// List an org's members.
@@ -116,9 +153,7 @@ pub fn share_env(
                 .into(),
         )
     })?;
-    let public_key: [u8; wrap::PUBLIC_KEY_LEN] = b64decode(&public_key_b64)?
-        .try_into()
-        .map_err(|_| Error::Crypto)?;
+    let public_key = decode_public_key(&public_key_b64)?;
 
     // Open our own grant to recover the vault key, then reseal it to the member.
     let mut vault_key = vault::open_vault_key(keypair, &env.enc_vault_key)?;
@@ -126,12 +161,21 @@ pub fn share_env(
     vault_key.zeroize();
 
     api.create_grant(&env.id, member_user_id, &b64encode(&grant))?;
+
+    // Whoever can decrypt an environment should also read its display names: upsert the member's
+    // org-key copy too (best-effort — without our own copy there is nothing to grant).
+    if let Some(mut org_key) = org_key(api, keypair, org_id)? {
+        let sealed = vault::grant_vault_key(&public_key, &org_key)?;
+        org_key.zeroize();
+        api.grant_org_key(org_id, member_user_id, &b64encode(&sealed))?;
+    }
     Ok(env.id)
 }
 
 /// Clone a shared environment onto this device: fetch our own grant, reconstruct the project + env
-/// locally (with caller-supplied labels, since names aren't shared-readable yet), and pull its
-/// secrets. `org_id` — the owning org — is recorded in the config so later pushes match server-side.
+/// locally, and pull its secrets. Labels resolve in order: caller-supplied override → the real
+/// name decrypted with the org key → a generic fallback. `org_id` — the owning org — is recorded
+/// in the config so later pushes match server-side.
 #[allow(clippy::too_many_arguments)]
 pub fn clone_env(
     api: &dyn SyncApi,
@@ -139,8 +183,8 @@ pub fn clone_env(
     keypair: &wrap::Keypair,
     project_id: &str,
     env_id: &str,
-    project_label: &str,
-    env_label: &str,
+    project_label: Option<&str>,
+    env_label: Option<&str>,
     org_id: Option<&str>,
 ) -> Result<Config> {
     let grant_b64 = api.get_grant(env_id)?.ok_or_else(|| {
@@ -150,21 +194,51 @@ pub fn clone_env(
     // Prove the grant opens with our keypair before persisting anything (fail closed on a bad grant).
     vault::open_vault_key(keypair, &grant)?;
 
+    // Resolve display names with the org key when we can (share/invite granted us a copy).
+    let env_name = match env_label {
+        Some(label) => label.to_string(),
+        None => decrypted_env_name(api, keypair, project_id, env_id, org_id)
+            .unwrap_or_else(|| "shared".to_string()),
+    };
+    let project_name = project_label.unwrap_or("shared").to_string();
+
     if store.get_project(project_id)?.is_none() {
-        store.create_project_with_id(project_id, project_label)?;
+        store.create_project_with_id(project_id, &project_name)?;
     }
     if store.find_environment(env_id)?.is_none() {
-        store.create_environment(env_id, project_id, env_label, &grant)?;
+        store.create_environment(env_id, project_id, &env_name, &grant)?;
     }
 
     let config = Config {
         project_id: project_id.to_string(),
-        project: project_label.to_string(),
-        environment: env_label.to_string(),
+        project: project_name,
+        environment: env_name,
         org_id: org_id.map(str::to_string),
     };
     super::sync::pull(api, store, &config)?;
     Ok(config)
+}
+
+/// Best-effort: decrypt the environment's real display name with the caller's org key.
+fn decrypted_env_name(
+    api: &dyn SyncApi,
+    keypair: &wrap::Keypair,
+    project_id: &str,
+    env_id: &str,
+    org_id: Option<&str>,
+) -> Option<String> {
+    let mut key = org_key(api, keypair, org_id?).ok()??;
+    let name = api
+        .list_environments(project_id)
+        .ok()?
+        .into_iter()
+        .find(|e| e.id == env_id)
+        .and_then(|e| {
+            let ct = b64decode(&e.enc_name).ok()?;
+            names::decrypt_env_name(&key, env_id, &ct).ok()
+        });
+    key.zeroize();
+    String::from_utf8(name?).ok()
 }
 
 /// Rotate an environment's vault key: rewrap every data key and re-grant the current holders, minus

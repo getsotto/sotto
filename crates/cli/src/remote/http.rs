@@ -301,6 +301,17 @@ impl SyncApi for HttpClient {
         ok(resp)
     }
 
+    fn grant_org_key(&self, org_id: &str, user_id: &str, enc_org_key: &str) -> Result<()> {
+        let resp = self
+            .http
+            .post(self.url(&format!("/orgs/{org_id}/members/{user_id}/org-key")))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "enc_org_key": enc_org_key }))
+            .send()
+            .map_err(net)?;
+        ok(resp)
+    }
+
     fn create_machine_token(
         &self,
         env_id: &str,

@@ -282,13 +282,11 @@ async fn rotate(
     }
 
     // The caller must keep their own grant, or they'd lock themselves out of the env they just rekeyed.
-    let my_enc_vault_key = grants
-        .iter()
-        .find(|(uid, _)| *uid == user.user_id)
-        .map(|(_, key)| key.clone())
-        .ok_or_else(|| {
-            Error::BadRequest("you must include your own grant in the rotation".into())
-        })?;
+    if !grants.iter().any(|(uid, _)| *uid == user.user_id) {
+        return Err(Error::BadRequest(
+            "you must include your own grant in the rotation".into(),
+        ));
+    }
 
     let mut tx = state.pool.begin().await?;
 
@@ -367,9 +365,8 @@ async fn rotate(
     }
 
     let new_revision = current + 1;
-    sqlx::query("UPDATE environments SET enc_vault_key = $2, revision = $3 WHERE id = $1")
+    sqlx::query("UPDATE environments SET revision = $2 WHERE id = $1")
         .bind(&env_id)
-        .bind(&my_enc_vault_key)
         .bind(new_revision)
         .execute(&mut *tx)
         .await?;

@@ -252,7 +252,7 @@ fn env_sharing_and_removal_end_to_end_over_http() {
     let keypair_a = session::account_keypair(&store_a, &master_key_a).unwrap();
     let master_a = *master_key_a.as_bytes();
 
-    let org_id = remote::team::create_org(&alice, &master_a, "acme-team").unwrap();
+    let org_id = remote::team::create_org(&alice, &keypair_a, "acme-team").unwrap();
     let project = Vault::create_project(&store_a, &keypair_a, "acme").unwrap();
     let config = Config {
         project_id: project.id.clone(),
@@ -304,7 +304,7 @@ fn env_sharing_and_removal_end_to_end_over_http() {
     .unwrap();
 
     // --- Alice invites Bob by email and shares the dev environment with him. ---
-    let invited = remote::team::invite(&alice, &org_id, &bob_email).unwrap();
+    let invited = remote::team::invite(&alice, &keypair_a, &org_id, &bob_email).unwrap();
     assert!(
         invited.public_key.is_some(),
         "Bob's key should be on the server"
@@ -319,18 +319,23 @@ fn env_sharing_and_removal_end_to_end_over_http() {
     )
     .unwrap();
 
-    // --- Bob clones the shared environment and decrypts the same secret. ---
+    // --- Bob clones the shared environment and decrypts the same secret. No labels supplied:
+    // the env auto-labels with its real name, decrypted via the org key the invite granted him. ---
     let bob_config = remote::team::clone_env(
         &bob,
         &store_b,
         &keypair_b,
         &project.id,
         &env_id,
-        "acme",
-        "dev",
+        None,
+        None,
         Some(&org_id),
     )
     .unwrap();
+    assert_eq!(
+        bob_config.environment, "dev",
+        "env label decrypted via the org key"
+    );
     let value = Vault::open(
         &store_b,
         &keypair_b,
@@ -418,7 +423,7 @@ fn account_reset_recovery_end_to_end_over_http() {
     session::init(&store_a, &kc_a, b"pw", ttl).unwrap();
     let master_key_a = session::current_master_key(&kc_a).unwrap().unwrap();
     let keypair_a = session::account_keypair(&store_a, &master_key_a).unwrap();
-    let org_id = remote::team::create_org(&alice, master_key_a.as_bytes(), "acme-team").unwrap();
+    let org_id = remote::team::create_org(&alice, &keypair_a, "acme-team").unwrap();
     let project = Vault::create_project(&store_a, &keypair_a, "acme").unwrap();
     let config = Config {
         project_id: project.id.clone(),
@@ -464,7 +469,7 @@ fn account_reset_recovery_end_to_end_over_http() {
         recovery_blob: STANDARD.encode(&m.recovery_blob),
     })
     .unwrap();
-    let invited = remote::team::invite(&alice, &org_id, &bob_email).unwrap();
+    let invited = remote::team::invite(&alice, &keypair_a, &org_id, &bob_email).unwrap();
     let env_id = remote::team::share_env(
         &alice,
         &store_a,
@@ -482,8 +487,8 @@ fn account_reset_recovery_end_to_end_over_http() {
         &keypair_b,
         &project.id,
         &env_id,
-        "acme",
-        "dev",
+        Some("acme"),
+        Some("dev"),
         Some(&org_id),
     )
     .unwrap();
@@ -523,8 +528,8 @@ fn account_reset_recovery_end_to_end_over_http() {
         &keypair_b2,
         &project.id,
         &env_id,
-        "acme",
-        "dev",
+        Some("acme"),
+        Some("dev"),
         Some(&org_id),
     )
     .unwrap();

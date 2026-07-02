@@ -16,6 +16,7 @@ pub mod envelope;
 pub mod error;
 pub mod format;
 pub mod kdf;
+pub mod names;
 pub mod random;
 pub mod share;
 pub mod vault;
