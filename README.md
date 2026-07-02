@@ -178,6 +178,7 @@ The full adversary model, guarantees, and explicit non-goals are published in
 
 ## License
 
-No license has been selected yet, and all crates are marked `publish = false`.
-The intended model is open core, with a permissive license being considered for the
-client and crypto core and a separate decision pending for the server.
+Licensed under the [Apache License, Version 2.0](LICENSE) — all crates and the web client.
+You may not use this project except in compliance with the License. Unless required by
+applicable law or agreed to in writing, software distributed under the License is distributed
+on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND.
