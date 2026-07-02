@@ -105,6 +105,7 @@ export function VaultView({
     setOpenEnv(null);
     setRevealed(null);
     setMembers(null);
+    setShareTo(""); // drop a stale member pick so the next env's Share button starts disabled
     try {
       const rows = await fetchEnvironments(np.project.id);
       setEnvs(
@@ -121,6 +122,7 @@ export function VaultView({
     setOpenEnv(null);
     setRevealed(null);
     setMembers(null);
+    setShareTo(""); // the new env reloads its own members; don't carry a stale pick across
     try {
       // Open via our OWN grant, not the env's inline key — on a shared env the inline key is the
       // creator's grant, which our keypair can't open.
