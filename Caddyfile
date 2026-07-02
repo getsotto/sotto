@@ -16,8 +16,9 @@
 {$SOTTO_DOMAIN:localhost} {
 	encode gzip
 
-	# The server's API endpoints (the same paths the web client and CLI call).
-	@api path /health /auth/github/* /auth/me /auth/logout /account /projects /projects/* /environments/* /shares /shares/*
+	# The server's API endpoints (the same paths the web client and CLI call). Keep in sync with
+	# the routers merged in `crates/server/src/lib.rs`.
+	@api path /health /auth/github/* /auth/me /auth/logout /account /account/* /projects /projects/* /environments/* /orgs /orgs/* /machine/* /shares /shares/*
 	handle @api {
 		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
 	}
