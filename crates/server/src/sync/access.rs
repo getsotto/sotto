@@ -18,6 +18,8 @@ pub(crate) struct ProjectAccess {
     is_owner: bool,
     /// The caller's role in the owning org, for an org project.
     org_role: Option<Role>,
+    /// The owning org, for an org project (carried so callers — e.g. audit logging — don't re-query).
+    org_id: Option<String>,
 }
 
 impl ProjectAccess {
@@ -25,6 +27,11 @@ impl ProjectAccess {
     /// Reads and secret writes need no such check — a successful resolve already grants them.
     pub(crate) fn can_manage_structure(&self) -> bool {
         self.is_owner || self.org_role.is_some_and(|r| r.is_at_least(Role::Admin))
+    }
+
+    /// The owning organization's id, or `None` for a personal project.
+    pub(crate) fn org_id(&self) -> Option<&str> {
+        self.org_id.as_deref()
     }
 }
 
@@ -47,6 +54,7 @@ pub(crate) async fn project_access(
         None if owner_id == user_id => Ok(ProjectAccess {
             is_owner: true,
             org_role: None,
+            org_id: None,
         }),
         None => Err(Error::NotFound("project not found".into())),
         // Org project: authority is the caller's membership role, not `owner_id`.
@@ -54,6 +62,7 @@ pub(crate) async fn project_access(
             Some(role) => Ok(ProjectAccess {
                 is_owner: false,
                 org_role: Some(role),
+                org_id: Some(org),
             }),
             None => Err(Error::NotFound("project not found".into())),
         },

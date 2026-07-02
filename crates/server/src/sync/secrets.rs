@@ -10,6 +10,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Transaction};
 
+use crate::audit;
 use crate::auth::AuthUser;
 use crate::encoding;
 use crate::error::{Error, Result};
@@ -183,7 +184,7 @@ async fn write_secrets(
     }
 
     // Authorize before touching the environment; any member (or personal owner) may write secrets.
-    env_access(&state, &env_id, &user.user_id).await?;
+    let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
 
     let mut tx = state.pool.begin().await?;
 
@@ -215,6 +216,22 @@ async fn write_secrets(
         .bind(new_revision)
         .execute(&mut *tx)
         .await?;
+    // Team envs record batch writes ("who touched prod?"); personal envs have no org log.
+    if let Some(org) = access.org_id() {
+        let detail = format!("{} change(s), revision {new_revision}", req.changes.len());
+        audit::record_tx(
+            &mut tx,
+            org,
+            &user.user_id,
+            "secrets.written",
+            audit::Context {
+                env_id: Some(&env_id),
+                detail: Some(&detail),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     tx.commit().await?;
 
     let etag = format!("\"{new_revision}\"");

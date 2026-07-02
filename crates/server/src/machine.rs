@@ -17,6 +17,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::audit;
 use crate::auth::session;
 use crate::auth::AuthUser;
 use crate::encoding;
@@ -103,6 +104,7 @@ async fn create_token(
             "must be an admin or owner to create a machine token".into(),
         ));
     }
+    let audit_org = access.org_id().map(str::to_string);
 
     let token_id = uuid::Uuid::new_v4().to_string();
     let token = generate_token();
@@ -119,6 +121,21 @@ async fn create_token(
     .bind(&user.user_id)
     .execute(&state.pool)
     .await?;
+    // Personal environments have no org, hence no audit log to write to.
+    if let Some(org) = &audit_org {
+        audit::record(
+            &state.pool,
+            org,
+            &user.user_id,
+            "token.created",
+            audit::Context {
+                target: Some(&token_id),
+                env_id: Some(&env_id),
+                detail: Some(&body.name),
+            },
+        )
+        .await?;
+    }
 
     Ok((StatusCode::CREATED, Json(CreatedToken { token_id, token })))
 }
@@ -178,6 +195,20 @@ async fn revoke_token(
     .await?;
     if revoked.rows_affected() == 0 {
         return Err(Error::NotFound("machine token not found".into()));
+    }
+    if let Some(org) = access.org_id() {
+        audit::record(
+            &state.pool,
+            org,
+            &user.user_id,
+            "token.revoked",
+            audit::Context {
+                target: Some(&token_id),
+                env_id: Some(&env_id),
+                ..Default::default()
+            },
+        )
+        .await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }

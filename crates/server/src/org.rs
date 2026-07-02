@@ -18,6 +18,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Transaction};
 
+use crate::audit;
 use crate::auth::AuthUser;
 use crate::encoding;
 use crate::error::{Error, Result};
@@ -91,7 +92,7 @@ impl Role {
     }
 
     /// Whether this role may add, update, or remove members (owners and admins may; members may not).
-    fn can_manage_members(self) -> bool {
+    pub(crate) fn can_manage_members(self) -> bool {
         self.is_at_least(Role::Admin)
     }
 }
@@ -262,6 +263,14 @@ async fn create_org(
             .bind(&enc_org_key)
             .execute(&mut *tx)
             .await?;
+            audit::record_tx(
+                &mut tx,
+                &body.id,
+                &user.user_id,
+                "org.created",
+                audit::Context::default(),
+            )
+            .await?;
             tx.commit().await?;
             true
         } else {
@@ -344,6 +353,17 @@ async fn grant_org_key(
     if updated.rows_affected() == 0 {
         return Err(Error::NotFound("member not found".into()));
     }
+    audit::record(
+        &state.pool,
+        &org_id,
+        &user.user_id,
+        "member.org_key_granted",
+        audit::Context {
+            target: Some(&target),
+            ..Default::default()
+        },
+    )
+    .await?;
     Ok(StatusCode::OK)
 }
 
@@ -426,7 +446,21 @@ async fn add_member(
     .await;
 
     match inserted {
-        Ok(Some(_)) => Ok(StatusCode::CREATED),
+        Ok(Some(_)) => {
+            audit::record(
+                &state.pool,
+                &org_id,
+                &user.user_id,
+                "member.added",
+                audit::Context {
+                    target: Some(&body.user_id),
+                    detail: Some(body.role.as_str()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            Ok(StatusCode::CREATED)
+        }
         // No row inserted, no error: the (org, user) pair already existed.
         Ok(None) => Err(Error::Conflict(
             "user is already a member; use update to change their role".into(),
@@ -478,6 +512,17 @@ async fn invite_member(
     if inserted.is_none() {
         return Err(Error::Conflict("user is already a member".into()));
     }
+    audit::record(
+        &state.pool,
+        &org_id,
+        &user.user_id,
+        "member.invited",
+        audit::Context {
+            target: Some(&target_id),
+            ..Default::default()
+        },
+    )
+    .await?;
 
     Ok(Json(InviteResult {
         user_id: target_id,
@@ -554,6 +599,18 @@ async fn update_member(
         .bind(body.role.as_str())
         .execute(&mut *tx)
         .await?;
+    audit::record_tx(
+        &mut tx,
+        &org_id,
+        &user.user_id,
+        "member.role_changed",
+        audit::Context {
+            target: Some(&target),
+            detail: Some(body.role.as_str()),
+            ..Default::default()
+        },
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::OK)
 }
@@ -591,6 +648,17 @@ async fn remove_member(
         .bind(&target)
         .execute(&mut *tx)
         .await?;
+    audit::record_tx(
+        &mut tx,
+        &org_id,
+        &user.user_id,
+        "member.removed",
+        audit::Context {
+            target: Some(&target),
+            ..Default::default()
+        },
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -118,6 +118,19 @@ pub struct RotateRequest {
     pub history_keys: Vec<HistoryKeyEntry>,
 }
 
+/// One org audit event, newest-first from the server's log.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditEvent {
+    pub id: i64,
+    pub actor: String,
+    pub action: String,
+    pub target: Option<String>,
+    pub env_id: Option<String>,
+    pub detail: Option<String>,
+    /// RFC 3339 timestamp.
+    pub at: String,
+}
+
 /// One retained version of one secret, as the server's history endpoint returns it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HistoryRow {
@@ -305,6 +318,8 @@ pub trait SyncApi {
     fn rotate(&self, env_id: &str, req: &RotateRequest) -> Result<RotateResponse>;
     /// Every retained version of every secret in an environment (the complete history).
     fn list_history(&self, env_id: &str) -> Result<Vec<HistoryRow>>;
+    /// An org's audit events, newest first (admin+).
+    fn org_audit(&self, org_id: &str, limit: Option<i64>) -> Result<Vec<AuditEvent>>;
     /// Remove a member from an org (revokes their API access).
     fn remove_member(&self, org_id: &str, user_id: &str) -> Result<()>;
     /// Store (or replace) a member's sealed copy of the org key (display-name access).

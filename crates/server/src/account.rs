@@ -16,6 +16,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+use crate::audit;
 use crate::auth::AuthUser;
 use crate::error::{Error, Result};
 use crate::state::AppState;
@@ -140,6 +141,26 @@ async fn reset_account(
         .bind(&user.user_id)
         .execute(&mut *tx)
         .await?;
+    // Surface the reset in every org the user belongs to: their grants just vanished, and admins
+    // need to know to re-grant.
+    let orgs: Vec<String> =
+        sqlx::query_scalar("SELECT org_id FROM organization_memberships WHERE user_id = $1")
+            .bind(&user.user_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    for org in &orgs {
+        audit::record_tx(
+            &mut tx,
+            org,
+            &user.user_id,
+            "account.reset",
+            audit::Context {
+                target: Some(&user.user_id),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     tx.commit().await?;
     Ok(StatusCode::OK)
 }
