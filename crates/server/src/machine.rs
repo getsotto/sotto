@@ -108,6 +108,8 @@ async fn create_token(
 
     let token_id = uuid::Uuid::new_v4().to_string();
     let token = generate_token();
+    // Token row and its audit event commit together, so a failed audit can't leave one un-logged.
+    let mut tx = state.pool.begin().await?;
     sqlx::query(
         "INSERT INTO machine_tokens (id, env_id, name, token_hash, public_key, enc_vault_key, created_by) \
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -119,12 +121,12 @@ async fn create_token(
     .bind(&public_key)
     .bind(&enc_vault_key)
     .bind(&user.user_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
     // Personal environments have no org, hence no audit log to write to.
     if let Some(org) = &audit_org {
-        audit::record(
-            &state.pool,
+        audit::record_tx(
+            &mut tx,
             org,
             &user.user_id,
             "token.created",
@@ -136,6 +138,7 @@ async fn create_token(
         )
         .await?;
     }
+    tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(CreatedToken { token_id, token })))
 }
