@@ -8,6 +8,8 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -197,6 +199,23 @@ enum EnvCommand {
     Ls,
     /// Set the active environment for this project.
     Use { name: String },
+    /// Compare two environments key by key (presence + "differs" markers).
+    Diff {
+        left: String,
+        right: String,
+        /// Show the differing values, not just markers.
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Copy secrets from one environment to another (promotion). Dry-run by default;
+    /// adds and updates only — never deletes destination keys.
+    Copy {
+        src: String,
+        dst: String,
+        /// Actually apply the copy (otherwise only the plan is printed).
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -413,6 +432,20 @@ fn run() -> Result<()> {
                 Ok(())
             }
             EnvCommand::Use { name } => env_use(&store, &cwd, &name),
+            EnvCommand::Diff {
+                left,
+                right,
+                reveal,
+            } => {
+                let config = effective_config(&cwd, cli.env.as_deref())?;
+                ensure_unlocked(&store, &keychain)?;
+                env_diff(&app, &config, &left, &right, reveal)
+            }
+            EnvCommand::Copy { src, dst, confirm } => {
+                let config = effective_config(&cwd, cli.env.as_deref())?;
+                ensure_unlocked(&store, &keychain)?;
+                env_copy(&app, &config, &src, &dst, confirm)
+            }
         },
         Command::Completions { .. } => unreachable!("completions are handled before store init"),
     }
@@ -896,6 +929,76 @@ fn status(app: &App, cwd: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Render an environment diff: one line per key with a presence/difference marker; values only
+/// with `--reveal`.
+fn env_diff(app: &App, config: &Config, left: &str, right: &str, reveal: bool) -> Result<()> {
+    use sotto_cli::commands::DiffStatus;
+
+    let diff = app.env_diff(config, left, right)?;
+    if diff.is_empty() {
+        eprintln!("both environments are empty");
+        return Ok(());
+    }
+    if reveal {
+        eprintln!("warning: --reveal prints secret values in plaintext");
+    }
+    let mut differing = 0usize;
+    for entry in &diff {
+        let marker = match entry.status {
+            DiffStatus::Equal => "=",
+            DiffStatus::Differs => "!",
+            DiffStatus::OnlyLeft => "<",
+            DiffStatus::OnlyRight => ">",
+        };
+        let detail = match entry.status {
+            DiffStatus::Equal => String::new(),
+            DiffStatus::Differs if reveal => format!(
+                "  {} -> {}",
+                display_secret(entry.left.as_deref().unwrap_or_default()),
+                display_secret(entry.right.as_deref().unwrap_or_default()),
+            ),
+            DiffStatus::Differs => "  (differs)".into(),
+            DiffStatus::OnlyLeft => format!("  (only in {left})"),
+            DiffStatus::OnlyRight => format!("  (only in {right})"),
+        };
+        if entry.status != DiffStatus::Equal {
+            differing += 1;
+        }
+        println!("{marker} {}{detail}", entry.name);
+    }
+    eprintln!(
+        "{} key(s), {} difference(s) between {left} and {right}",
+        diff.len(),
+        differing
+    );
+    Ok(())
+}
+
+/// Render (and with --confirm, apply) an environment copy plan.
+fn env_copy(app: &App, config: &Config, src: &str, dst: &str, confirm: bool) -> Result<()> {
+    let plan = app.env_copy(config, src, dst, confirm)?;
+    for name in &plan.create {
+        println!("create {name}");
+    }
+    for name in &plan.update {
+        println!("update {name}");
+    }
+    let summary = format!(
+        "{} to create, {} to update, {} unchanged",
+        plan.create.len(),
+        plan.update.len(),
+        plan.unchanged.len()
+    );
+    if confirm {
+        eprintln!("copied {src} -> {dst}: {summary}");
+        eprintln!("run `sotto push --env {dst}` to sync the changes");
+    } else {
+        eprintln!("dry-run {src} -> {dst}: {summary}");
+        eprintln!("nothing written; re-run with --confirm to apply");
+    }
+    Ok(())
+}
+
 fn env_use(store: &Store, cwd: &Path, name: &str) -> Result<()> {
     let (mut config, dir) = Config::discover(cwd)?;
     if !store
@@ -1015,6 +1118,18 @@ fn write_value(value: &[u8], reveal: bool) -> Result<()> {
         out.write_all(b"\n").ok();
     }
     out.flush().map_err(|e| Error::Io(e.to_string()))
+}
+
+/// Render a secret value for the human `env diff --reveal` view. Secrets are arbitrary bytes (see
+/// [`write_value`]), so a raw `from_utf8_lossy` would both collapse distinct non-UTF-8 byte
+/// sequences to the same replacement glyph and let embedded control/ANSI sequences move the cursor
+/// or forge terminal output. Escape a valid-UTF-8 value (control characters become visible escapes,
+/// keeping it on one line) and show non-UTF-8 as unambiguous base64.
+fn display_secret(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.escape_debug().to_string(),
+        Err(_) => format!("base64:{}", STANDARD.encode(bytes)),
+    }
 }
 
 /// Decrypt all secrets as UTF-8 text pairs (for injection/export). Errors on non-UTF-8 values.
@@ -1159,4 +1274,35 @@ fn machine_run(token: &str, args: Vec<String>) -> Result<()> {
 /// `sotto export` in machine mode.
 fn machine_export(token: &str, format: ExportFormat, reveal: bool) -> Result<()> {
     export_with_entries(machine_entries(token)?, format, reveal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::display_secret;
+
+    #[test]
+    fn display_secret_keeps_plain_text() {
+        assert_eq!(display_secret(b"postgres://prod"), "postgres://prod");
+    }
+
+    #[test]
+    fn display_secret_escapes_control_and_ansi_sequences() {
+        // A newline can't split the diff line, and an ESC can't start a real ANSI sequence.
+        assert_eq!(display_secret(b"a\nb"), "a\\nb");
+        let rendered = display_secret(b"\x1b[31mred\x1b[0m");
+        assert!(
+            !rendered.contains('\x1b'),
+            "escape byte must not survive: {rendered}"
+        );
+        assert!(rendered.contains("\\u{1b}"));
+    }
+
+    #[test]
+    fn display_secret_base64_encodes_non_utf8() {
+        // Two distinct non-UTF-8 byte strings must render differently (no lossy collapsing).
+        let a = display_secret(&[0xff, 0x00]);
+        let b = display_secret(&[0xfe, 0x00]);
+        assert!(a.starts_with("base64:"));
+        assert_ne!(a, b);
+    }
 }
