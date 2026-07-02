@@ -342,19 +342,21 @@ async fn grant_org_key(
         ));
     }
     let enc_org_key = encoding::decode(&body.enc_org_key, "enc_org_key", MAX_ENC_NAME)?;
+    // Grant and its audit event commit together, so a failed audit can't leave an un-logged change.
+    let mut tx = state.pool.begin().await?;
     let updated = sqlx::query(
         "UPDATE organization_memberships SET enc_org_key = $3 WHERE org_id = $1 AND user_id = $2",
     )
     .bind(&org_id)
     .bind(&target)
     .bind(&enc_org_key)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await?;
     if updated.rows_affected() == 0 {
         return Err(Error::NotFound("member not found".into()));
     }
-    audit::record(
-        &state.pool,
+    audit::record_tx(
+        &mut tx,
         &org_id,
         &user.user_id,
         "member.org_key_granted",
@@ -364,6 +366,7 @@ async fn grant_org_key(
         },
     )
     .await?;
+    tx.commit().await?;
     Ok(StatusCode::OK)
 }
 
