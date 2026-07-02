@@ -129,8 +129,10 @@ async fn list_events(
 
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let rows: Vec<EventRow> = sqlx::query_as(
+        // `AT TIME ZONE 'UTC'` normalizes the timestamptz to UTC before formatting, so the trailing
+        // `Z` is truthful regardless of the DB session's time zone.
         "SELECT id, actor, action, target, env_id, detail, \
-                to_char(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
          FROM audit_events WHERE org_id = $1 ORDER BY id DESC LIMIT $2",
     )
     .bind(&org_id)
