@@ -69,8 +69,10 @@ export function TeamPanel({ master }: { master: Uint8Array }) {
     }
   }
 
-  if (orgs === null || orgs.length === 0) {
-    return null; // no team section for users without orgs
+  // A known-empty org list means no team section. While still loading, or after a load error, keep
+  // rendering so the error (or a loading state) stays visible instead of the panel vanishing.
+  if (orgs !== null && orgs.length === 0) {
+    return null;
   }
   const canInvite = openOrg !== null && ["owner", "admin"].includes(openOrg.org.role);
 
@@ -79,13 +81,16 @@ export function TeamPanel({ master }: { master: Uint8Array }) {
       <h2>Organizations</h2>
       {error !== null && <p role="alert">{error}</p>}
       {notice !== null && <p>{notice}</p>}
-      <ul>
-        {orgs.map((o) => (
-          <li key={o.org.id}>
-            <button onClick={() => void selectOrg(o)}>{o.name}</button> ({o.org.role})
-          </li>
-        ))}
-      </ul>
+      {orgs === null && error === null && <p>Loading…</p>}
+      {orgs !== null && (
+        <ul>
+          {orgs.map((o) => (
+            <li key={o.org.id}>
+              <button onClick={() => void selectOrg(o)}>{o.name}</button> ({o.org.role})
+            </li>
+          ))}
+        </ul>
+      )}
 
       {openOrg !== null && (
         <>
