@@ -12,7 +12,7 @@ use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::auth::AuthUser;
 use crate::error::{Error, Result};
@@ -63,15 +63,36 @@ pub async fn require_team(pool: &PgPool, org_id: &str, feature: &str) -> Result<
     }
 }
 
-/// Quota gate for adding a member (free tier: at most [`FREE_MAX_MEMBERS`]).
-pub async fn check_can_add_member(pool: &PgPool, org_id: &str) -> Result<()> {
-    if effective_tier(pool, org_id).await? == Tier::Team {
+/// Resolve the effective tier inside `tx`, taking a `FOR UPDATE` lock on the org row so a quota
+/// check and the write it guards are atomic against concurrent quota-affecting writes on the org.
+async fn effective_tier_locked(tx: &mut Transaction<'_, Postgres>, org_id: &str) -> Result<Tier> {
+    let row: Option<(String, bool)> = sqlx::query_as(
+        "SELECT tier, (trial_ends_at IS NOT NULL AND trial_ends_at > now()) \
+         FROM organizations WHERE id = $1 FOR UPDATE",
+    )
+    .bind(org_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let (tier, trial_active) =
+        row.ok_or_else(|| Error::NotFound("organization not found".into()))?;
+    if tier == "team" || trial_active {
+        Ok(Tier::Team)
+    } else {
+        Ok(Tier::Free)
+    }
+}
+
+/// Quota gate for adding a member (free tier: at most [`FREE_MAX_MEMBERS`]). Runs inside `tx` and
+/// locks the org row, so the count and the caller's insert commit atomically — two concurrent adds
+/// can't both pass the check and overshoot the limit.
+pub async fn check_can_add_member(tx: &mut Transaction<'_, Postgres>, org_id: &str) -> Result<()> {
+    if effective_tier_locked(tx, org_id).await? == Tier::Team {
         return Ok(());
     }
     let members: i64 =
         sqlx::query_scalar("SELECT count(*) FROM organization_memberships WHERE org_id = $1")
             .bind(org_id)
-            .fetch_one(pool)
+            .fetch_one(&mut **tx)
             .await?;
     if members >= FREE_MAX_MEMBERS {
         return Err(Error::Quota(format!(
