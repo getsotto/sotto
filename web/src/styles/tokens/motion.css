@@ -1,0 +1,24 @@
+/* Sotto — Sordino motion
+ *
+ * Motion is a whisper or it is absent. No bounce, no spring, no decorative
+ * loop, nothing that pulls the eye off the content. A revealed value simply
+ * appears; a state simply changes. Everything collapses to instant under
+ * prefers-reduced-motion.
+ */
+
+:root {
+  --duration-instant: 0ms; /* @kind other */
+  --duration-fast: 90ms; /* @kind other */
+  --duration: 140ms; /* @kind other */
+
+  /* A single, unshowy easing. hover/press feedback tops out at --duration (140ms). */
+  --ease: cubic-bezier(0.2, 0, 0, 1); /* @kind other */
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-instant: 0ms; /* @kind other */
+    --duration-fast:    0ms; /* @kind other */
+    --duration:         0ms; /* @kind other */
+  }
+}

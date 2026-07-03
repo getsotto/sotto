@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 
+import { Shell } from "./Shell";
+
 // After OAuth, the server has set the session cookie and redirected here with `?state=`. Verify it
 // matches the value we stored (CSRF), then go to the app, which detects the session via /auth/me.
 export function AuthCallback() {
@@ -17,9 +19,8 @@ export function AuthCallback() {
   }, []);
 
   return (
-    <main>
-      <h1>Sotto</h1>
-      {error !== null ? <p role="alert">{error}</p> : <p>Signing you in…</p>}
-    </main>
+    <Shell>
+      {error !== null ? <p role="alert">{error}</p> : <p className="muted">Signing you in…</p>}
+    </Shell>
   );
 }

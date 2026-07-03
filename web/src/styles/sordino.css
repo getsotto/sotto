@@ -1,0 +1,391 @@
+/* Sotto — the Sordino "paper" layer.
+ *
+ * The app's markup is plain semantic HTML that must stay legible with no
+ * stylesheet at all; everything here is progressive enhancement over those
+ * same elements. Styling is by element wherever possible — the few classes
+ * (.primary, .ghost, .items, .notice, .secret-value, …) exist only where two
+ * uses of the same element genuinely differ.
+ *
+ * The interface defers: the only loud things are a revealed value (bold mono)
+ * and an alert. Separation is whitespace + hairlines; there is no shadow, no
+ * imagery, no icon. Tokens live in ./tokens/ and are copied verbatim from the
+ * design system ("Sordino") — edit them there, not here.
+ */
+
+@import "./tokens/colors.css";
+@import "./tokens/typography.css";
+@import "./tokens/spacing.css";
+@import "./tokens/motion.css";
+
+/* ---- Page: a quiet document on warm paper -------------------------------- */
+
+:root {
+  color-scheme: light;
+}
+
+html {
+  background: var(--paper);
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-system);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  color: var(--text-body);
+  background: var(--paper);
+}
+
+main {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-6) var(--space-8);
+}
+
+/* The shared masthead: the typographic wordmark, and Log out when signed in. */
+main > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding-bottom: var(--space-4);
+  margin-bottom: var(--space-6);
+  border-bottom: var(--border-hairline);
+}
+
+.wordmark {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -0.02em;
+  line-height: 1;
+  color: var(--ink);
+}
+
+/* ---- Type ----------------------------------------------------------------- */
+
+h1 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-tight);
+  letter-spacing: var(--tracking-tight);
+}
+
+h2 {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-tight);
+  letter-spacing: var(--tracking-tight);
+}
+
+h3 {
+  margin: var(--space-5) 0 var(--space-3);
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
+}
+
+p {
+  margin: 0 0 var(--space-4);
+  max-width: var(--measure);
+}
+
+.muted {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+/* Bold 700 is reserved for the one loud value; <strong> stays semibold. */
+strong {
+  font-weight: var(--weight-semibold);
+}
+
+/* ---- Sections: hairline + whitespace, never a card shadow ----------------- */
+
+section {
+  max-width: var(--measure);
+  margin-top: var(--space-6);
+  padding-top: var(--space-5);
+  border-top: var(--border-hairline);
+}
+
+section ul {
+  margin: 0 0 var(--space-4);
+  padding-left: 1.2em;
+  max-width: var(--measure);
+}
+
+/* ---- Item lists: <ul class="items"><li><button>…</button></li></ul> -------- */
+
+ul.items {
+  list-style: none;
+  margin: 0 0 var(--space-4);
+  padding: 0;
+  border: var(--border-hairline);
+  border-radius: var(--radius);
+  max-width: var(--measure-narrow);
+}
+
+ul.items li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-top: var(--border-hairline);
+}
+
+ul.items li:first-child {
+  border-top: none;
+}
+
+/* A row that is a button carries its own padding. */
+ul.items li:has(> button) {
+  display: block;
+  padding: 0;
+}
+
+ul.items li > button {
+  display: flex;
+  align-items: baseline;
+  justify-content: flex-start;
+  gap: var(--space-3);
+  width: 100%;
+  text-align: left;
+  padding: var(--space-3) var(--space-4);
+  font: inherit;
+  font-weight: var(--weight-normal);
+  color: var(--text-body);
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease);
+}
+
+ul.items li > button:hover {
+  background: var(--paper-sunk);
+}
+
+/* The active row, echoing the CLI's `*` for the active environment. */
+ul.items li > button[aria-current="true"] {
+  background: var(--paper-sunk);
+}
+
+ul.items li > button[aria-current="true"]::before {
+  content: "* ";
+  font-family: var(--font-mono);
+  color: var(--text-meta);
+}
+
+.meta {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-meta);
+}
+
+/* ---- Controls: the platform's own, quieted -------------------------------- */
+
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: 7px 14px;
+  font-family: var(--font-system);
+  font-size: var(--text-base);
+  font-weight: var(--weight-medium);
+  line-height: var(--leading-snug);
+  color: var(--text-body);
+  background: var(--paper-raised);
+  border: var(--border-input);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease),
+    border-color var(--duration-fast) var(--ease);
+}
+
+button:hover {
+  background: var(--paper-sunk);
+}
+
+button:active {
+  background: var(--hairline);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* The one committing action on a page. */
+button.primary {
+  background: var(--ink);
+  color: var(--paper);
+  border-color: var(--ink);
+}
+
+button.primary:hover,
+button.primary:active {
+  background: #000000;
+  border-color: #000000;
+}
+
+button.ghost {
+  background: transparent;
+  color: var(--link);
+  border-color: transparent;
+}
+
+button.ghost:hover {
+  background: var(--paper-sunk);
+}
+
+button.ghost:active {
+  background: var(--hairline);
+}
+
+button.sm {
+  padding: 4px 10px;
+  font-size: var(--text-sm);
+}
+
+label {
+  display: block;
+  max-width: var(--measure-narrow);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+
+label > input,
+label > select {
+  margin-top: var(--space-2);
+}
+
+input,
+select {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 10px;
+  font-family: var(--font-system);
+  font-size: var(--text-base);
+  line-height: var(--leading-snug);
+  color: var(--text-body);
+  background: var(--paper-raised);
+  border: var(--border-input);
+  border-radius: var(--radius-sm);
+  transition:
+    border-color var(--duration-fast) var(--ease),
+    box-shadow var(--duration-fast) var(--ease);
+}
+
+/* Key material is mono, like everything that matters byte-for-byte. */
+input[type="password"] {
+  font-family: var(--font-mono);
+}
+
+input::placeholder {
+  color: var(--text-meta);
+}
+
+select {
+  cursor: pointer;
+}
+
+/* The focus ring is never removed; on fields it tightens onto the frame. */
+:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-offset);
+}
+
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  border-color: var(--focus);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus) 22%, transparent);
+}
+
+/* Inline forms (share, invite): controls on one line, button at the end. */
+form.row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin: 0 0 var(--space-4);
+}
+
+form.row label {
+  flex: 1 1 240px;
+  margin: 0;
+}
+
+/* Stacked forms (unlock): fields flow top to bottom. */
+form.stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-4);
+  margin: 0 0 var(--space-4);
+}
+
+form.stack label {
+  width: 100%;
+}
+
+/* ---- The one boxed thing: a revealed value, a share link ------------------ */
+
+textarea {
+  display: block;
+  width: 100%;
+  max-width: var(--measure);
+  box-sizing: border-box;
+  resize: vertical;
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  color: var(--ink);
+  background: var(--paper-sunk);
+  border: var(--border-input);
+  border-radius: var(--radius);
+}
+
+/* The one thing allowed to be loud: the value, byte-for-byte, in bold. */
+textarea.secret-value {
+  font-weight: var(--weight-bold);
+}
+
+textarea.share-link {
+  font-size: var(--text-sm);
+}
+
+/* ---- Feedback: real prose in the flow, not a toast ------------------------ */
+
+p[role="alert"] {
+  max-width: var(--measure);
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--alert);
+  background: var(--alert-bg);
+  border: 1px solid var(--alert-border);
+  border-radius: var(--radius-sm);
+}
+
+p.notice {
+  max-width: var(--measure);
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--ok);
+  background: var(--ok-bg);
+  border: 1px solid color-mix(in srgb, var(--ok) 25%, transparent);
+  border-radius: var(--radius-sm);
+}

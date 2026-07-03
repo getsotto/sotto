@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { fetchAccount, logout, me } from "./api";
+import { Shell } from "./Shell";
 import { deriveMasterKey } from "./vault";
 import { VaultView } from "./VaultView";
 
@@ -62,24 +63,28 @@ export function VaultApp() {
   switch (phase.kind) {
     case "checking":
       return (
-        <main>
-          <p>Loading…</p>
-        </main>
+        <Shell>
+          <p className="muted">Loading…</p>
+        </Shell>
       );
     case "error":
       return (
-        <main>
-          <h1>Sotto</h1>
+        <Shell>
           <p role="alert">{phase.message}</p>
-        </main>
+        </Shell>
       );
     case "loggedOut":
       return (
-        <main>
-          <h1>Sotto</h1>
-          <p>Log in to view your secrets in the browser.</p>
-          <button onClick={startLogin}>Log in with GitHub</button>
-        </main>
+        <Shell>
+          <h1>Log in to view your secrets in the browser.</h1>
+          <p className="muted">
+            The web client runs the same crypto core as the CLI, via WebAssembly. Your keys never
+            leave this browser.
+          </p>
+          <button className="primary" onClick={startLogin}>
+            Log in with GitHub
+          </button>
+        </Shell>
       );
     case "locked":
       return (
@@ -128,22 +133,31 @@ function UnlockForm({
   }
 
   return (
-    <main>
+    <Shell onLogout={onLogout}>
       <h1>Unlock your vault</h1>
-      <p>Your master password and secret key stay in this browser — the server never sees them.</p>
-      <label>
-        Master password
-        <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-      </label>
-      <label>
-        Secret key (SK1-…)
-        <input type="password" value={secretKey} onChange={(e) => setSecretKey(e.target.value)} />
-      </label>
-      <button onClick={() => void unlock()} disabled={busy}>
-        {busy ? "Deriving key…" : "Unlock"}
-      </button>
-      <button onClick={onLogout}>Log out</button>
+      <p className="muted">
+        Your master password and secret key stay in this browser — the server never sees them.
+      </p>
+      <form
+        className="stack"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void unlock();
+        }}
+      >
+        <label>
+          Master password
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        </label>
+        <label>
+          Secret key (SK1-…)
+          <input type="password" value={secretKey} onChange={(e) => setSecretKey(e.target.value)} />
+        </label>
+        <button className="primary" type="submit" disabled={busy}>
+          {busy ? "Deriving key…" : "Unlock"}
+        </button>
+      </form>
       {error !== null && <p role="alert">{error}</p>}
-    </main>
+    </Shell>
   );
 }
