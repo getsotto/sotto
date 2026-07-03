@@ -43,9 +43,14 @@ is installed — before installing to `~/.local/bin`. Prefer to look first? Grab
 sotto init                   # create your identity + first project — SAVE the printed Emergency Kit
 sotto set DATABASE_URL       # hidden prompt; encrypted locally before it ever touches disk
 sotto run -- npm start       # inject the environment's secrets into any command
-sotto login && sotto push    # optional: sync ciphertext through a server
+sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto share DATABASE_URL     # one-time, burn-after-reading link for a single secret
 ```
+
+`sotto login` uses the hosted instance at [getsotto.co.uk](https://getsotto.co.uk) unless you point
+it elsewhere with `--server <url>` (see [Deploying](deploy/README.md) to run your own). Either way
+the server only ever stores ciphertext — the web vault at the same address decrypts in your
+browser, with keys that never leave your devices.
 
 Working with a team:
 

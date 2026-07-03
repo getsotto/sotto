@@ -10,7 +10,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// No `sotto.toml` in this directory or any parent.
     #[error(
-        "no {} found in {} or any parent directory",
+        "no {} found in {} or any parent directory — run `sotto init` to create a project here",
         crate::config::CONFIG_FILE,
         .0.parent().unwrap_or_else(|| std::path::Path::new(".")).display()
     )]

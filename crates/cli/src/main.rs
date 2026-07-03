@@ -89,7 +89,8 @@ enum Command {
     },
     /// Log in to the sync server (opens a browser for OAuth).
     Login {
-        /// The sync server URL (persisted; required on first login).
+        /// The sync server URL for self-hosted instances (persisted; defaults to the hosted
+        /// instance at https://getsotto.co.uk).
         #[arg(long)]
         server: Option<String>,
         /// The web app origin, for building share links (defaults to the server URL).
@@ -892,11 +893,11 @@ fn login(
         .map(|w| w.trim_end_matches('/').to_string())
         .or(existing_web);
     remote::config::GlobalConfig {
-        server_url: server,
+        server_url: server.clone(),
         web_url,
     }
     .save_to(&config_path)?;
-    eprintln!("logged in (user {})", me.user_id);
+    eprintln!("logged in to {server} (user {})", me.user_id);
     Ok(())
 }
 
@@ -1358,14 +1359,15 @@ fn export_with_entries(
 // --- machine (SOTTO_TOKEN) mode ---
 
 /// Resolve the server URL for machine mode: `SOTTO_SERVER` (the CI-friendly path), else the global
-/// config written by `sotto login`.
+/// config written by `sotto login`. Deliberately no hosted-instance fallback — a token must only
+/// ever be sent to a server someone explicitly named.
 fn machine_server_url() -> Result<String> {
     if let Ok(server) = std::env::var("SOTTO_SERVER") {
         return Ok(server.trim_end_matches('/').to_string());
     }
     let config_path = sotto_cli::paths::config_path()?;
-    remote::config::server_url(None, &config_path)
-        .map_err(|_| Error::Input("set SOTTO_SERVER to your sync server URL".into()))
+    remote::config::explicit_server_url(None, &config_path)?
+        .ok_or_else(|| Error::Input("set SOTTO_SERVER to your sync server URL".into()))
 }
 
 /// Fetch + decrypt the token's environment in memory, as UTF-8 text pairs.
