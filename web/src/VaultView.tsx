@@ -20,6 +20,7 @@ import {
   type Project,
 } from "./api";
 import { bytesToUrlSafeB64 } from "./base64";
+import { Shell } from "./Shell";
 import { TeamPanel } from "./TeamPanel";
 import {
   decryptEnvName,
@@ -312,21 +313,30 @@ export function VaultView({
   }
 
   return (
-    <main>
+    <Shell onLogout={onLogout}>
       <h1>Your vault</h1>
-      <button onClick={onLogout}>Log out</button>
+      <p className="muted">
+        Everything you can decrypt on this device. Names are metadata; values stay sealed until you
+        reveal them.
+      </p>
       {error !== null && <p role="alert">{error}</p>}
-      {notice !== null && <p>{notice}</p>}
+      {notice !== null && <p className="notice">{notice}</p>}
 
       <section>
         <h2>Projects</h2>
         {projects === null ? (
-          <p>Loading…</p>
+          <p className="muted">Loading…</p>
         ) : (
-          <ul>
+          <ul className="items">
             {projects.map((p) => (
               <li key={p.project.id}>
-                <button onClick={() => void selectProject(p)}>{p.name}</button>
+                <button
+                  onClick={() => void selectProject(p)}
+                  aria-current={activeProject?.project.id === p.project.id ? "true" : undefined}
+                >
+                  {p.name}
+                  <span className="meta">{p.project.orgId !== null ? "org" : "personal"}</span>
+                </button>
               </li>
             ))}
           </ul>
@@ -336,10 +346,15 @@ export function VaultView({
       {envs !== null && (
         <section>
           <h2>Environments</h2>
-          <ul>
+          <ul className="items">
             {envs.map((e) => (
               <li key={e.env.id}>
-                <button onClick={() => void selectEnv(e)}>{e.name}</button>
+                <button
+                  onClick={() => void selectEnv(e)}
+                  aria-current={openEnv?.envId === e.env.id ? "true" : undefined}
+                >
+                  {e.name}
+                </button>
               </li>
             ))}
           </ul>
@@ -350,18 +365,24 @@ export function VaultView({
         <section>
           <h2>Secrets</h2>
           {openEnv.secrets.length === 0 ? (
-            <p>No secrets in this environment.</p>
+            <p className="muted">No secrets in this environment.</p>
           ) : (
-            <ul>
+            <ul className="items">
               {openEnv.secrets.map((s) => (
                 <li key={s.entry.id}>
-                  <button onClick={() => reveal(s)}>{s.name}</button>
+                  <button
+                    onClick={() => reveal(s)}
+                    aria-current={revealed?.name === s.name ? "true" : undefined}
+                  >
+                    {s.name}
+                  </button>
                 </li>
               ))}
             </ul>
           )}
           {members !== null && members.length > 0 && (
             <form
+              className="row"
               onSubmit={(e) => {
                 e.preventDefault();
                 void shareWithMember();
@@ -399,19 +420,33 @@ export function VaultView({
       {revealed !== null && (
         <section>
           <h2>{revealed.name}</h2>
-          <textarea readOnly value={revealed.value} rows={3} spellCheck={false} />
+          <textarea
+            className="secret-value"
+            readOnly
+            value={revealed.value}
+            rows={3}
+            spellCheck={false}
+          />
           {revealed.link === null ? (
-            <button onClick={() => void share(revealed)}>Create one-time share link</button>
+            <button className="ghost" onClick={() => void share(revealed)}>
+              Create one-time share link
+            </button>
           ) : (
             <>
-              <p>Share link (burns after one view):</p>
-              <textarea readOnly value={revealed.link} rows={2} spellCheck={false} />
+              <p className="muted">Share link (burns after one view):</p>
+              <textarea
+                className="share-link"
+                readOnly
+                value={revealed.link}
+                rows={2}
+                spellCheck={false}
+              />
             </>
           )}
         </section>
       )}
 
       <TeamPanel master={master} encPrivateKeys={encPrivateKeys} />
-    </main>
+    </Shell>
   );
 }

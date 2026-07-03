@@ -2,6 +2,7 @@ import { useState } from "react";
 
 import { fetchShare, ShareUnavailable } from "./api";
 import { urlSafeB64ToBytes } from "./base64";
+import { Shell } from "./Shell";
 import { loadWasm, share_open, share_passphrase_key } from "./wasm";
 
 type State =
@@ -54,33 +55,49 @@ export function RecipientPage({ token }: { token: string }) {
 
   if (state.kind === "revealed") {
     return (
-      <main>
+      <Shell>
         <h1>Shared secret</h1>
-        <p>This secret has now been viewed — copy it, it may not be available again.</p>
-        <textarea readOnly value={state.secret} rows={4} spellCheck={false} />
-      </main>
+        <p className="muted">
+          This secret has now been viewed — copy it, it may not be available again.
+        </p>
+        <textarea
+          className="secret-value"
+          readOnly
+          value={state.secret}
+          rows={4}
+          spellCheck={false}
+        />
+      </Shell>
     );
   }
 
   return (
-    <main>
+    <Shell>
       <h1>You&rsquo;ve received a secret</h1>
-      <p>
+      <p className="muted">
         It&rsquo;s end-to-end encrypted and may be one-time. Reveal it only when you&rsquo;re ready —
         opening it may consume the link.
       </p>
-      <label>
-        Passphrase (only if the sender set one)
-        <input
-          type="password"
-          value={passphrase}
-          onChange={(e) => setPassphrase(e.target.value)}
-        />
-      </label>
-      <button onClick={() => void reveal()} disabled={state.kind === "revealing"}>
-        {state.kind === "revealing" ? "Revealing…" : "Reveal secret"}
-      </button>
+      <form
+        className="stack"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void reveal();
+        }}
+      >
+        <label>
+          Passphrase (only if the sender set one)
+          <input
+            type="password"
+            value={passphrase}
+            onChange={(e) => setPassphrase(e.target.value)}
+          />
+        </label>
+        <button className="primary" type="submit" disabled={state.kind === "revealing"}>
+          {state.kind === "revealing" ? "Revealing…" : "Reveal secret"}
+        </button>
+      </form>
       {state.kind === "error" && <p role="alert">{state.message}</p>}
-    </main>
+    </Shell>
   );
 }

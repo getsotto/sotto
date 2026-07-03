@@ -1,0 +1,42 @@
+/* Sotto — Sordino spacing, edges, elevation
+ *
+ * Separation comes from whitespace and hairlines — never from shadow. There is
+ * no elevation system on purpose: nothing floats above the content. Radius is
+ * small; the surface is a document, not a set of pills.
+ */
+
+:root {
+  /* ---- Spacing scale (4px base) ---------------------------------------- */
+  --space-0:  0;
+  --space-1:  0.25rem; /*  4 */
+  --space-2:  0.5rem;  /*  8 */
+  --space-3:  0.75rem; /* 12 */
+  --space-4:  1rem;    /* 16 */
+  --space-5:  1.5rem;  /* 24 */
+  --space-6:  2rem;    /* 32 */
+  --space-7:  3rem;    /* 48 */
+  --space-8:  4rem;    /* 64 */
+  --space-9:  6rem;    /* 96 */
+
+  /* ---- Radius (quiet; hairlines do the real work) ---------------------- */
+  --radius-none: 0;
+  --radius-sm:   3px;  /* inputs, buttons */
+  --radius:      4px;  /* cards, boxes, the terminal window */
+  --radius-lg:   6px;  /* the outermost app frame, sparingly */
+
+  /* ---- Borders --------------------------------------------------------- */
+  --border-width: 1px;
+  --border-hairline: 1px solid var(--hairline);
+  --border-input:    1px solid var(--hairline-2);
+
+  /* ---- Focus ring (never removed) -------------------------------------- */
+  --focus-ring: 2px solid var(--focus);
+  --focus-offset: 2px;
+
+  /* ---- Elevation: there is none ---------------------------------------- */
+  --shadow-none: none;
+
+  /* ---- Layout ---------------------------------------------------------- */
+  --page-pad: var(--space-6);
+  --stack:    var(--space-4); /* default vertical rhythm between blocks */
+}

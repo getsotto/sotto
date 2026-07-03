@@ -125,13 +125,19 @@ export function TeamPanel({
     <section>
       <h2>Organizations</h2>
       {error !== null && <p role="alert">{error}</p>}
-      {notice !== null && <p>{notice}</p>}
-      {orgs === null && error === null && <p>Loading…</p>}
+      {notice !== null && <p className="notice">{notice}</p>}
+      {orgs === null && error === null && <p className="muted">Loading…</p>}
       {orgs !== null && (
-        <ul>
+        <ul className="items">
           {orgs.map((o) => (
             <li key={o.org.id}>
-              <button onClick={() => void selectOrg(o)}>{o.name}</button> ({o.org.role})
+              <button
+                onClick={() => void selectOrg(o)}
+                aria-current={openOrg?.org.id === o.org.id ? "true" : undefined}
+              >
+                {o.name}
+                <span className="meta">{o.org.role}</span>
+              </button>
             </li>
           ))}
         </ul>
@@ -152,18 +158,23 @@ export function TeamPanel({
           )}
           <h3>Members of {openOrg.name}</h3>
           {members === null ? (
-            <p>Loading…</p>
+            <p className="muted">Loading…</p>
           ) : (
-            <ul>
+            <ul className="items">
               {members.map((m) => (
                 <li key={m.userId}>
-                  {m.userId} ({m.role}){m.publicKey === null ? " — no keys yet" : ""}
+                  {m.userId}
+                  <span className="meta">
+                    {m.role}
+                    {m.publicKey === null ? " · no keys yet" : ""}
+                  </span>
                 </li>
               ))}
             </ul>
           )}
           {canInvite && (
             <form
+              className="row"
               onSubmit={(e) => {
                 e.preventDefault();
                 void invite(openOrg);
@@ -187,7 +198,7 @@ export function TeamPanel({
             <>
               <h3>Audit log</h3>
               {audit.length === 0 ? (
-                <p>No events yet.</p>
+                <p className="muted">No events yet.</p>
               ) : (
                 <ul>
                   {audit.map((ev) => (

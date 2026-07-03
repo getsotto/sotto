@@ -1,0 +1,47 @@
+/* Sotto — Sordino typography
+ *
+ * Two families, both from the platform. We never ship a webfont: type must be
+ * legible before any styling loads, on any machine, offline. system-ui is the
+ * app/doc voice; a monospace stack carries every byte that matters — secret
+ * values, keys, commands, ids, terminal output.
+ *
+ * There is no display face. Emphasis is size and space, not a second typeface.
+ */
+
+:root {
+  /* ---- Families -------------------------------------------------------- */
+  --font-system: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+                 Helvetica, Arial, sans-serif;
+  --font-mono:   ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+                 "Liberation Mono", monospace;
+
+  /* ---- Type scale (restrained; a quiet minor-third-ish ramp) ----------- */
+  --text-xs:    0.8125rem; /* 13px — meta, captions, audit rows */
+  --text-sm:    0.875rem;  /* 14px — help copy, secondary */
+  --text-base:  1rem;      /* 16px — body, controls */
+  --text-md:    1.125rem;  /* 18px — lead paragraph */
+  --text-lg:    1.375rem;  /* 22px — section heading (h2) */
+  --text-xl:    1.75rem;   /* 28px — page heading (h1) */
+  --text-2xl:   2.25rem;   /* 36px — the rare large moment */
+
+  /* ---- Weights (bold is reserved for the loud value) ------------------- */
+  --weight-normal:   400;
+  --weight-medium:   500;
+  --weight-semibold: 600;
+  --weight-bold:     700; /* a revealed secret, and almost nothing else */
+
+  /* ---- Line height ----------------------------------------------------- */
+  --leading-tight:   1.2;  /* headings */
+  --leading-snug:    1.35; /* controls, list items */
+  --leading-normal:  1.55; /* body */
+  --leading-relaxed: 1.7;  /* long help copy */
+
+  /* ---- Tracking -------------------------------------------------------- */
+  --tracking-tight:  -0.011em; /* large headings */
+  --tracking-normal: 0;
+  --tracking-wide:   0.02em;   /* small caps-ish labels */
+
+  /* ---- Measure --------------------------------------------------------- */
+  --measure:      66ch; /* body column — a comfortable reading width */
+  --measure-narrow: 46ch;
+}
