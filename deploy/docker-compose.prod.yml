@@ -2,7 +2,11 @@
 #
 #   cd deploy
 #   cp .env.example .env   # then fill it in
-#   docker compose -f docker-compose.prod.yml up -d --build
+#   docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d
+#
+# That pulls prebuilt multi-arch images from GHCR (published by .github/workflows/images.yml), so
+# the box never compiles anything — a 1 GB VM is enough. To build from source instead (e.g. to
+# deploy unreleased changes), use `up -d --build`. Pin a version with SOTTO_IMAGE_TAG=vX.Y.Z.
 #
 # See deploy/README.md for the full runbook (DNS, GitHub OAuth app, backups, upgrades).
 #
@@ -29,6 +33,7 @@ services:
       retries: 5
 
   server:
+    image: ghcr.io/getsotto/sotto-server:${SOTTO_IMAGE_TAG:-latest}
     build:
       context: ..
     restart: unless-stopped
@@ -46,6 +51,7 @@ services:
         condition: service_healthy
 
   caddy:
+    image: ghcr.io/getsotto/sotto-web:${SOTTO_IMAGE_TAG:-latest}
     build:
       context: ..
       dockerfile: deploy/Dockerfile.web

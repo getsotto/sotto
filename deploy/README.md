@@ -1,8 +1,9 @@
 # Deploying Sotto
 
 One command brings up a complete hosted instance: Postgres, the sync server, and Caddy serving
-the web app with automatic HTTPS. Everything is built from this repository — the host needs only
-Docker (with the compose plugin) and ports 80/443 open.
+the web app with automatic HTTPS. By default it pulls prebuilt multi-arch (amd64 + arm64) images
+from GHCR, so the host never compiles anything — a 1 GB free-tier VM with Docker and ports 80/443
+open is enough.
 
 ```text
 internet ──▶ caddy (80/443, web app + API reverse proxy)
@@ -35,12 +36,22 @@ git clone https://github.com/getsotto/sotto.git && cd sotto/deploy
 cp .env.example .env
 $EDITOR .env        # domain, a generated Postgres password, OAuth client id + secret
 
-docker compose -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
 ```
 
-The first build compiles the server and the WASM web client from source and takes several
-minutes; subsequent builds reuse Docker layer caching. Database migrations run automatically on
-server boot.
+Database migrations run automatically on server boot. Pin a released version with
+`SOTTO_IMAGE_TAG=vX.Y.Z` in `.env` (default: `latest`). To build everything from source instead —
+for unreleased changes, or if you'd rather not trust prebuilt images — use
+`up -d --build`; that needs ~4 GB of RAM and takes several minutes the first time.
+
+On a 1 GB host, give the kernel some headroom before the first start:
+
+```sh
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile
+sudo mkswap /swapfile && sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
 
 Smoke test:
 
@@ -54,8 +65,9 @@ instance with `sotto login --server https://<your-domain>`.
 ## Upgrading
 
 ```sh
-git pull
-docker compose -f docker-compose.prod.yml up -d --build
+git pull    # picks up compose/runbook changes
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
 ```
 
 Migrations are forward-only and applied on boot. Check the release notes for anything flagged as
@@ -83,8 +95,8 @@ docker compose -f docker-compose.prod.yml ps               # health at a glance
 
 - Postgres is **not** exposed outside the compose network; only Caddy publishes ports.
 - Certificates and Caddy state persist in the `caddy_data` volume; database data in `pgdata`.
-- The API route list lives in the repo-root [`Caddyfile`](../Caddyfile) (baked into the Caddy
-  image at build time) — rebuilding after `git pull` picks up route changes automatically.
+- The API route list lives in the repo-root [`Caddyfile`](../Caddyfile) (baked into the web
+  image at build time) — pulling the matching image version picks up route changes automatically.
 - To try it without a public domain, set `SOTTO_DOMAIN=localhost`: Caddy serves a self-signed
   certificate (`curl -k https://localhost/health`). GitHub login still requires a callback URL
   reachable by your browser.
