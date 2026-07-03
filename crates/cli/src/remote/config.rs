@@ -1,7 +1,9 @@
 //! Global (secret-free) CLI config: the sync server URL.
 //!
 //! Resolved by precedence: an explicit `--server` override → the `SOTTO_SERVER` environment
-//! variable → the saved `config.toml`. `login --server <url>` persists it for later commands.
+//! variable → the saved `config.toml` → the hosted instance. `login --server <url>` persists it
+//! for later commands. Machine mode deliberately skips the hosted fallback (see
+//! [`explicit_server_url`]): CI must name its server rather than send a token to a default one.
 
 use std::path::Path;
 
@@ -10,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 const SERVER_ENV: &str = "SOTTO_SERVER";
+
+/// The hosted Sotto instance, used when nothing else names a server. Self-hosters override via
+/// `login --server <url>`, `SOTTO_SERVER`, or the saved config.
+pub const DEFAULT_SERVER: &str = "https://getsotto.co.uk";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalConfig {
@@ -59,13 +65,22 @@ fn resolve(
         .or_else(|| configured.and_then(normalize))
 }
 
-/// Resolve the server URL (override → `SOTTO_SERVER` → saved config), or an actionable error.
+/// Resolve the server URL: override → `SOTTO_SERVER` → saved config → the hosted instance.
 pub fn server_url(override_url: Option<&str>, config_path: &Path) -> Result<String> {
+    Ok(explicit_server_url(override_url, config_path)?
+        .unwrap_or_else(|| DEFAULT_SERVER.to_string()))
+}
+
+/// Resolve an explicitly named server (override → `SOTTO_SERVER` → saved config), with NO hosted
+/// fallback — `None` means nothing named one. Machine mode uses this so a misconfigured CI job
+/// fails loudly instead of sending its bearer token to a server the token wasn't minted for.
+pub fn explicit_server_url(
+    override_url: Option<&str>,
+    config_path: &Path,
+) -> Result<Option<String>> {
     let env_url = std::env::var(SERVER_ENV).ok();
     let configured = GlobalConfig::load_from(config_path)?.map(|c| c.server_url);
-    resolve(override_url, env_url, configured).ok_or_else(|| {
-        Error::Input("no server configured; run `sotto login --server <url>`".into())
-    })
+    Ok(resolve(override_url, env_url, configured))
 }
 
 /// Resolve the web-app origin for share links: the configured `web_url` if set, else the server URL
@@ -127,6 +142,34 @@ mod tests {
         assert_eq!(
             resolve(Some(""), None, Some("https://c".into())),
             Some("https://c".into())
+        );
+    }
+
+    #[test]
+    fn default_server_is_normalized_https() {
+        // server_url returns DEFAULT_SERVER verbatim when nothing else resolves, so the constant
+        // itself must already satisfy the normalization invariants.
+        assert!(DEFAULT_SERVER.starts_with("https://"));
+        assert!(!DEFAULT_SERVER.ends_with('/'));
+        assert_eq!(DEFAULT_SERVER.trim(), DEFAULT_SERVER);
+    }
+
+    #[test]
+    fn saved_config_beats_the_hosted_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        GlobalConfig {
+            server_url: "https://self.hosted".into(),
+            web_url: None,
+        }
+        .save_to(&path)
+        .unwrap();
+        // (env-var precedence is covered by the pure `resolve` tests; mutating the real
+        // process environment here would race with parallel tests)
+        assert_eq!(server_url(None, &path).unwrap(), "https://self.hosted");
+        assert_eq!(
+            explicit_server_url(None, &path).unwrap(),
+            Some("https://self.hosted".into())
         );
     }
 }
