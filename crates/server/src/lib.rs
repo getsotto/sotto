@@ -8,6 +8,7 @@
 //! - [`auth`] — GitHub OAuth login, sessions, and the [`auth::AuthUser`] request extractor
 //! - [`account`] — account crypto-material sync (KDF params, public key, sealed private keys, …)
 //! - [`org`] — organizations, memberships, and roles (the team-RBAC substrate)
+//! - [`billing`] — Stripe checkout/portal/webhook, assigning the tier entitlements enforce
 //! - [`machine`] — per-environment machine tokens (CI / service access)
 //! - [`sync`] — projects, environments, and the secret snapshot/batch hot path
 //! - [`share`] — one-time / expiring share links (the viral funnel)
@@ -17,6 +18,7 @@
 pub mod account;
 pub mod audit;
 pub mod auth;
+pub mod billing;
 pub mod config;
 pub mod db;
 pub mod encoding;
@@ -43,6 +45,7 @@ pub fn app(state: AppState) -> Router {
         .merge(entitlements::router())
         .merge(account::router())
         .merge(org::router())
+        .merge(billing::router())
         .merge(machine::router())
         .merge(sync::router())
         .merge(share::router())

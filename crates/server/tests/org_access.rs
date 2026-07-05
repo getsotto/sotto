@@ -28,6 +28,7 @@ fn app(pool: PgPool) -> Router {
         pool,
         oauth: None,
         oauth_config: None,
+        billing: None,
     };
     Router::new()
         .merge(sotto_server::org::router())

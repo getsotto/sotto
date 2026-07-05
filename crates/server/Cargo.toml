@@ -34,9 +34,13 @@ async-trait = "0.1"
 url = "2"
 # Transport opaque account key material (public key, sealed private keys, …) as base64 in JSON.
 base64 = "0.22"
+# Stripe webhook signature verification: Stripe mandates HMAC-SHA256, which dryoc doesn't expose
+# (it has HMAC-SHA512-256). Both crates are already in the tree transitively via sqlx.
+hmac = "0.12"
+sha2 = "0.10"
+# Parse Stripe webhook events; also used by integration tests for response bodies.
+serde_json = "1"
 
 [dev-dependencies]
 # Drive the router in-process (ServiceExt::oneshot) for handler tests.
 tower = { version = "0.5", features = ["util"] }
-# Parse response bodies (e.g. a created machine token) in integration tests.
-serde_json = "1"

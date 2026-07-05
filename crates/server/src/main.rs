@@ -40,6 +40,7 @@ async fn run() -> Result<()> {
         pool,
         oauth,
         oauth_config: config.oauth.clone(),
+        billing: config.billing.clone(),
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)

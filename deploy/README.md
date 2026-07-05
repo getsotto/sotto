@@ -85,6 +85,22 @@ docker compose -f docker-compose.prod.yml exec postgres \
 Restore into a fresh instance with `psql -U sotto sotto < backup.sql` (via `exec -T postgres`).
 Run the dump on a cron schedule and ship it off the box.
 
+## Billing (optional)
+
+The server ships with Stripe billing dark: without the `STRIPE_*` variables, billing endpoints
+return 503 and orgs are tiered manually. To turn it on:
+
+1. In the Stripe dashboard: create a Product with one monthly Price (the flat per-org Team
+   subscription) and note the `price_…` id.
+2. Add a webhook endpoint for `https://<SOTTO_DOMAIN>/billing/webhook` subscribed to
+   `checkout.session.completed`, `customer.subscription.updated`, and
+   `customer.subscription.deleted`; note its `whsec_…` signing secret.
+3. Fill `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `STRIPE_PRICE_ID` in `.env`, then
+   `docker compose -f docker-compose.prod.yml up -d --force-recreate server`.
+
+Card data never touches the server — checkout and subscription management happen on
+Stripe-hosted pages, and the webhook only assigns the org's tier.
+
 ## Operations
 
 ```sh
