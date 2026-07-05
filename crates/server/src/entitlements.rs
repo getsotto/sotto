@@ -5,8 +5,8 @@
 //! members, creating org projects) and feature gates (the audit log) — never on reads of data a
 //! team already has, so an expired trial degrades but never locks anyone out of their secrets.
 //!
-//! Tier assignment is manual for now (an operator `UPDATE organizations SET tier = 'team'`);
-//! Stripe checkout becomes a thin later PR on top of this machinery.
+//! Tier assignment: [`crate::billing`] flips `tier` from verified Stripe webhooks when billing is
+//! configured; an operator `UPDATE organizations SET tier = 'team'` remains the manual fallback.
 
 use axum::extract::{Path, State};
 use axum::routing::get;

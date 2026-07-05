@@ -15,6 +15,25 @@ pub struct Config {
     pub bind_addr: String,
     /// GitHub OAuth configuration, present only when credentials are set in the environment.
     pub oauth: Option<OAuthConfig>,
+    /// Stripe billing configuration, present only when the `STRIPE_*` variables are set.
+    pub billing: Option<BillingConfig>,
+}
+
+/// Stripe billing credentials and the single subscription price.
+///
+/// All three come from the Stripe dashboard; the price id (not a number) lives here so pricing is
+/// an operational decision, never a code change. Billing endpoints return 503 when this is absent
+/// — the integration ships dark and is enabled by setting the environment variables.
+#[derive(Debug, Clone)]
+pub struct BillingConfig {
+    /// Secret API key (`sk_test_…` / `sk_live_…`).
+    pub secret_key: String,
+    /// Webhook signing secret (`whsec_…`) for `POST /billing/webhook`.
+    pub webhook_secret: String,
+    /// The Price id (`price_…`) of the flat per-org monthly Team subscription.
+    pub price_id: String,
+    /// Where Stripe-hosted pages send the browser back to (the web app origin).
+    pub return_url: String,
 }
 
 /// GitHub OAuth application credentials and the server's public origin.
@@ -53,22 +72,39 @@ impl Config {
     /// Load configuration from the environment.
     ///
     /// `DATABASE_URL` is required. OAuth is enabled only when both `GITHUB_CLIENT_ID` and
-    /// `GITHUB_CLIENT_SECRET` are set, so the server still boots (health, migrations) without them.
+    /// `GITHUB_CLIENT_SECRET` are set, and billing only when all three `STRIPE_*` variables are,
+    /// so the server still boots (health, migrations) without them. Empty values count as unset —
+    /// docker compose interpolation (`${VAR:-}`) exports empties for every blank `.env` line.
     pub fn from_env() -> Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| Error::Config("DATABASE_URL is not set".into()))?;
         let bind_addr = std::env::var("SOTTO_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
+        let public_base_url =
+            env_nonempty("SOTTO_PUBLIC_URL").unwrap_or_else(|| DEFAULT_PUBLIC_URL.to_string());
 
         let oauth = match (
-            std::env::var("GITHUB_CLIENT_ID"),
-            std::env::var("GITHUB_CLIENT_SECRET"),
+            env_nonempty("GITHUB_CLIENT_ID"),
+            env_nonempty("GITHUB_CLIENT_SECRET"),
         ) {
-            (Ok(github_client_id), Ok(github_client_secret)) => Some(OAuthConfig {
+            (Some(github_client_id), Some(github_client_secret)) => Some(OAuthConfig {
                 github_client_id,
                 github_client_secret,
-                public_base_url: std::env::var("SOTTO_PUBLIC_URL")
-                    .unwrap_or_else(|_| DEFAULT_PUBLIC_URL.to_string()),
-                web_origin: std::env::var("SOTTO_WEB_ORIGIN").ok(),
+                public_base_url: public_base_url.clone(),
+                web_origin: env_nonempty("SOTTO_WEB_ORIGIN"),
+            }),
+            _ => None,
+        };
+
+        let billing = match (
+            env_nonempty("STRIPE_SECRET_KEY"),
+            env_nonempty("STRIPE_WEBHOOK_SECRET"),
+            env_nonempty("STRIPE_PRICE_ID"),
+        ) {
+            (Some(secret_key), Some(webhook_secret), Some(price_id)) => Some(BillingConfig {
+                secret_key,
+                webhook_secret,
+                price_id,
+                return_url: public_base_url,
             }),
             _ => None,
         };
@@ -77,6 +113,15 @@ impl Config {
             database_url,
             bind_addr,
             oauth,
+            billing,
         })
     }
+}
+
+/// An environment variable, with empty/whitespace values treated as unset.
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }

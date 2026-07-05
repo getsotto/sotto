@@ -48,6 +48,7 @@ fn app(pool: PgPool, identity: Identity) -> Router {
             public_base_url: "http://localhost:8080".into(),
             web_origin: Some("https://app.sotto.test".into()),
         }),
+        billing: None,
     };
     Router::new().merge(auth::router()).with_state(state)
 }
