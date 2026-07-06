@@ -15,11 +15,15 @@ serde.workspace = true
 uuid.workspace = true
 # CSPRNG + BLAKE2b for session-token generation/hashing (reuses the vetted core crypto dep).
 dryoc.workspace = true
-# Postgres via sqlx. No TLS feature for now (local/dev is plaintext); a prod TLS backend is a
-# deliberate deploy-time choice. Runtime queries for now — no compile-time DB / offline cache.
-# TTL math stays in SQL (now() + interval, expires_at > now()), so no chrono/time type feature.
+# Postgres via sqlx. `tls-native-tls` (system TLS: Secure Transport on macOS, OpenSSL on Linux —
+# the same ring-free stack as reqwest below) so a remote/managed database can be reached with
+# `sslmode=require` in DATABASE_URL. It changes nothing for the default compose topology, where
+# Postgres is internal-only and the URL carries no sslmode (sqlx's `prefer` default falls back to
+# plaintext when the server offers no TLS). Runtime queries for now — no compile-time DB / offline
+# cache. TTL math stays in SQL (now() + interval, expires_at > now()), so no chrono/time feature.
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
+    "tls-native-tls",
     "postgres",
     "macros",
     "migrate",
