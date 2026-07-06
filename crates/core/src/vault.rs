@@ -229,6 +229,11 @@ fn unwrap_data_key(
     )
 }
 
+// The AADs below use `|` and `=` as delimiters around the `env`/`secret` ids. That encoding is
+// only unambiguous because those ids are constrained to `[A-Za-z0-9_-]` (no delimiter characters)
+// — the server enforces this in `sotto_server::sync::validate_id` at every id-creation point. If
+// that charset ever widens, switch these to a length-prefixed/structured encoding first, or the
+// location binding becomes forgeable by delimiter collision.
 fn data_key_aad(env_id: &str, secret_id: &str, version: i64) -> String {
     format!("sotto/v1/datakey|env={env_id}|secret={secret_id}|ver={version}")
 }
