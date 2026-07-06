@@ -85,6 +85,29 @@ docker compose -f docker-compose.prod.yml exec postgres \
 Restore into a fresh instance with `psql -U sotto sotto < backup.sql` (via `exec -T postgres`).
 Run the dump on a cron schedule and ship it off the box.
 
+## Database security
+
+The default `docker-compose.prod.yml` keeps Postgres on the **internal compose network only** — it
+is never published to a port, so the server↔database link never leaves the host and the plaintext
+connection (`DATABASE_URL` carries no `sslmode`) is not exposed. That is the recommended topology.
+
+If you instead point `DATABASE_URL` at a **remote or managed Postgres**, the link now crosses a
+network, so encrypt it. The server binary is built with system TLS (native-tls), so it is enough to
+ask for it in the connection string:
+
+```sh
+# require encryption:
+DATABASE_URL=postgres://user:pass@db.example.com:5432/sotto?sslmode=require
+# or verify the server certificate against a CA (strongest):
+DATABASE_URL=postgres://user:pass@db.example.com:5432/sotto?sslmode=verify-full&sslrootcert=/path/to/ca.pem
+```
+
+Even without TLS the database only ever holds ciphertext and the key-wrapping graph — secret names
+and values are encrypted client-side and are never decryptable server-side (see
+[THREAT-MODEL.md](../THREAT-MODEL.md)). TLS to the database protects the **metadata** (emails, the
+sharing graph, timestamps) in transit, and is a hard requirement for any deployment where that link
+is not a trusted private network.
+
 ## Billing (optional)
 
 The server ships with Stripe billing dark: without the `STRIPE_*` variables, billing endpoints
