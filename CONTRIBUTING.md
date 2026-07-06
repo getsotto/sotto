@@ -88,9 +88,25 @@ cargo deny check
 
 ## License
 
-No license has been selected for the workspace yet, and all crates are currently marked `publish = false`.
+Sotto is licensed under the [Apache License 2.0](LICENSE). By contributing, you agree that your contributions will be licensed under the same license.
 
-If you are contributing, be aware that the current repository does not have a finalized license. Contributions are accepted under the repository's current governance and will be subject to the final license decision.
+## Developer Certificate of Origin
+
+Every commit must be signed off under the [Developer Certificate of Origin](https://developercertificate.org) (DCO). Signing off certifies that you wrote the change or otherwise have the right to submit it under the project's license.
+
+Add a `Signed-off-by` line to each commit with the `-s` flag:
+
+```sh
+git commit -s
+```
+
+This appends a line like `Signed-off-by: Your Name <you@example.com>` using your git identity. If a branch already has unsigned commits, fix them with:
+
+```sh
+git rebase --signoff main
+```
+
+Pull requests with unsigned commits cannot be merged.
 
 ## Notes
 
