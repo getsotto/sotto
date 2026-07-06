@@ -9,6 +9,9 @@
 //! pattern). Zero-knowledge is unaffected — Stripe learns an org *id* and whatever the payer types
 //! into Stripe's own pages; org names, membership, and vault data never leave the server.
 
+use std::sync::OnceLock;
+use std::time::Duration;
+
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::routing::post;
@@ -146,13 +149,28 @@ async fn create_portal(
     }))
 }
 
+/// The process-wide Stripe HTTP client, built once and reused (reqwest pools connections behind an
+/// `Arc`, so cloning/sharing is cheap). Bounded by the same timeouts as the GitHub OAuth client
+/// (`auth::oauth`): a stalled Stripe — slow DNS/TLS, a hung connection — must not tie up the request
+/// task and its socket indefinitely.
+fn stripe_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest client with static config builds")
+    })
+}
+
 /// One form-encoded call to the Stripe API.
 async fn stripe_post(
     secret_key: &str,
     path: &str,
     form: &[(String, String)],
 ) -> Result<serde_json::Value> {
-    let response = reqwest::Client::new()
+    let response = stripe_client()
         .post(format!("https://api.stripe.com/v1/{path}"))
         .bearer_auth(secret_key)
         .form(form)
