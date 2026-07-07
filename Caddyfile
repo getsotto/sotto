@@ -12,13 +12,41 @@
 #
 # Register the GitHub OAuth app's callback as https://app.example.com/auth/github/callback (same
 # origin as the web app), matching SOTTO_PUBLIC_URL.
+#
+# NOTE: `rate_limit` (below) is the caddy-ratelimit plugin, not a standard directive. The deploy
+# image is an xcaddy build that bundles it (deploy/Dockerfile.web); a stock `caddy` binary will
+# reject this config.
+{
+	# rate_limit is a non-standard (plugin) directive, so its place in the handler chain must be
+	# declared — run it before the proxy so throttling happens before the request reaches the API.
+	order rate_limit before reverse_proxy
+}
 
 {$SOTTO_DOMAIN:localhost} {
 	encode gzip
 
-	# The server's API endpoints (the same paths the web client and CLI call). Keep in sync with
-	# the routers merged in `crates/server/src/lib.rs`.
-	@api path /health /auth/github/* /auth/me /auth/logout /account /account/* /projects /projects/* /environments/* /orgs /orgs/* /machine/* /shares /shares/* /billing/*
+	# Per-client-IP rate limits on the UNAUTHENTICATED endpoints — the only API surface with no
+	# credential wall: the OAuth login/callback (which writes a short-lived login-state row) and the
+	# public share fetch. Caddy is the edge here, so {remote_host} is the real client IP, not a
+	# proxied one. Authenticated sync (/account, /projects, /environments/*, /orgs, /machine/*, …) is
+	# deliberately NOT limited: it is bearer-gated and includes high-frequency CI polling that a
+	# per-IP cap could wrongly throttle when a whole team shares one office/NAT egress IP. The
+	# threshold is a generous starting point — raise it, or split into per-endpoint zones, to taste.
+	@ratelimited path /auth/github/* /shares /shares/*
+	handle @ratelimited {
+		rate_limit {
+			zone unauthenticated {
+				key {remote_host}
+				events 120
+				window 1m
+			}
+		}
+		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
+	}
+
+	# The rest of the server's API (bearer-authenticated). Together with @ratelimited above this must
+	# cover every path the routers in `crates/server/src/lib.rs` serve — keep the two in sync.
+	@api path /health /auth/me /auth/logout /account /account/* /projects /projects/* /environments/* /orgs /orgs/* /machine/* /billing/*
 	handle @api {
 		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
 	}

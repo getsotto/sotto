@@ -108,6 +108,26 @@ and values are encrypted client-side and are never decryptable server-side (see
 sharing graph, timestamps) in transit, and is a hard requirement for any deployment where that link
 is not a trusted private network.
 
+## Rate limiting & perimeter
+
+Abuse control lives at the edge, where the real client IP is visible. The deploy Caddy image is an
+[xcaddy](https://github.com/caddyserver/xcaddy) build bundling the
+[caddy-ratelimit](https://github.com/mholt/caddy-ratelimit) plugin (pinned in
+`deploy/Dockerfile.web`), and the `Caddyfile` applies a per-client-IP limit to the **unauthenticated**
+endpoints — the OAuth login/callback and the public share fetch, the only API surface with no
+credential wall. Authenticated sync is intentionally left unthrottled at the edge: it is bearer-gated
+and includes high-frequency CI polling that a per-IP cap could wrongly block when a whole team shares
+one office/NAT egress IP. Tune the threshold (or split it into per-endpoint zones) in the `Caddyfile`.
+
+Two honest limits, consistent with the [threat model](../THREAT-MODEL.md) (availability is an
+accepted residual risk, and self-hosting is the escape hatch):
+
+- **Per-IP, not global.** A distributed flood from many source addresses is not stopped by this;
+  put a CDN/WAF in front if you need volumetric protection.
+- **This lives in *this* Caddy.** If you front the server with your own proxy, or expose
+  `sotto-server` directly, the server does **not** self-throttle — supply equivalent rate limiting
+  at your own edge.
+
 ## Billing (optional)
 
 The server ships with Stripe billing dark: without the `STRIPE_*` variables, billing endpoints
