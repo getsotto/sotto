@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
@@ -64,15 +65,20 @@ struct PingResponse {
 }
 
 /// `POST /telemetry/v1/ping` — record that an instance exists (hosted only; 503 elsewhere).
+///
+/// The body arrives as a `Result` so a `Json` rejection can't preempt the ships-dark gate: a
+/// bare `Json<Ping>` extractor would answer malformed posts with its own 400/415/422 *before*
+/// this function runs, and a dark instance must answer 503 unconditionally.
 async fn ingest(
     State(state): State<AppState>,
-    Json(ping): Json<Ping>,
+    payload: std::result::Result<Json<Ping>, JsonRejection>,
 ) -> Result<Json<PingResponse>> {
     if !state.telemetry_ingest {
         return Err(Error::NotConfigured(
             "telemetry ingest is not enabled on this server".into(),
         ));
     }
+    let Json(ping) = payload.map_err(|_| Error::BadRequest("body must be a JSON ping".into()))?;
 
     // Requiring a parseable UUID (re-serialized, which lowercases) keeps arbitrary junk — and
     // therefore any smuggled PII — out of the table, and dedupes case variants of one id.

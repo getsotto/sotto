@@ -31,7 +31,7 @@ fn app(pool: PgPool, ingest: bool) -> Router {
         .with_state(state)
 }
 
-async fn post_ping(app: &Router, body: &serde_json::Value) -> (StatusCode, serde_json::Value) {
+async fn post_raw(app: &Router, body: String) -> (StatusCode, serde_json::Value) {
     let resp = app
         .clone()
         .oneshot(
@@ -39,7 +39,7 @@ async fn post_ping(app: &Router, body: &serde_json::Value) -> (StatusCode, serde
                 .method("POST")
                 .uri("/telemetry/v1/ping")
                 .header("content-type", "application/json")
-                .body(Body::from(body.to_string()))
+                .body(Body::from(body))
                 .unwrap(),
         )
         .await
@@ -50,6 +50,10 @@ async fn post_ping(app: &Router, body: &serde_json::Value) -> (StatusCode, serde
         .unwrap();
     let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, value)
+}
+
+async fn post_ping(app: &Router, body: &serde_json::Value) -> (StatusCode, serde_json::Value) {
+    post_raw(app, body.to_string()).await
 }
 
 fn ping_body(instance_id: &str, version: &str) -> serde_json::Value {
@@ -68,6 +72,11 @@ async fn ingest_ships_dark_without_the_flag() {
     };
     let app = app(pool, false);
     let (status, _) = post_ping(&app, &ping_body(&Uuid::new_v4().to_string(), "0.2.0")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    // The gate must answer before body parsing: even a malformed post gets the 503, never a
+    // JSON-extractor 400 (the contract in crates/server/src/telemetry.rs's module docs).
+    let (status, _) = post_raw(&app, "not json at all".into()).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
@@ -128,5 +137,9 @@ async fn ingest_rejects_malformed_payloads() {
     let mut body = ping_body(&Uuid::new_v4().to_string(), "0.2.0");
     body["os"] = serde_json::json!("");
     let (status, _) = post_ping(&app, &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // On an ingest-enabled instance, unparseable JSON is a plain 400 from the handler.
+    let (status, _) = post_raw(&app, "not json at all".into()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
