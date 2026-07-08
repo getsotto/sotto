@@ -65,6 +65,7 @@ impl TestServer {
                     .expect("issue session");
 
                 let state = sotto_server::state::AppState {
+                    telemetry_ingest: false,
                     pool,
                     oauth: None,
                     oauth_config: None,

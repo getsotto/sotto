@@ -25,6 +25,7 @@ async fn pool_or_skip() -> Option<PgPool> {
 /// Account endpoints don't use OAuth, so the provider/config can be absent.
 fn app(pool: PgPool) -> Router {
     let state = AppState {
+        telemetry_ingest: false,
         pool,
         oauth: None,
         oauth_config: None,

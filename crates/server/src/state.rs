@@ -17,4 +17,6 @@ pub struct AppState {
     pub oauth: Option<Arc<dyn OAuthProvider>>,
     pub oauth_config: Option<OAuthConfig>,
     pub billing: Option<BillingConfig>,
+    /// Whether this instance accepts telemetry pings (`SOTTO_TELEMETRY_INGEST=1`, hosted only).
+    pub telemetry_ingest: bool,
 }

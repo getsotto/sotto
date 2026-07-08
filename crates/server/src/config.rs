@@ -6,6 +6,8 @@ use crate::error::{Error, Result};
 const DEFAULT_BIND: &str = "127.0.0.1:8080";
 /// Default public base URL used to build the OAuth callback when `SOTTO_PUBLIC_URL` is unset.
 const DEFAULT_PUBLIC_URL: &str = "http://localhost:8080";
+/// Default endpoint the anonymous version ping reports to (the hosted instance).
+const DEFAULT_TELEMETRY_URL: &str = "https://getsotto.co.uk/telemetry/v1/ping";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -17,6 +19,21 @@ pub struct Config {
     pub oauth: Option<OAuthConfig>,
     /// Stripe billing configuration, present only when the `STRIPE_*` variables are set.
     pub billing: Option<BillingConfig>,
+    /// Anonymous version-ping telemetry (see [`crate::telemetry`] and the README).
+    pub telemetry: TelemetryConfig,
+}
+
+/// Anonymous version-ping telemetry settings (see [`crate::telemetry`]).
+#[derive(Debug, Clone)]
+pub struct TelemetryConfig {
+    /// Send the daily anonymous ping. Default **on**; `SOTTO_TELEMETRY=off` (also `0`/`false`/
+    /// `no`) or the cross-tool `DO_NOT_TRACK=1` turns it off before any request is ever made.
+    pub ping_enabled: bool,
+    /// Where the ping goes; `SOTTO_TELEMETRY_URL` overrides it (tests, private fleets).
+    pub endpoint: String,
+    /// Receive and count pings (`SOTTO_TELEMETRY_INGEST=1`) — set only on the hosted instance.
+    /// Everywhere else `POST /telemetry/v1/ping` returns 503 (the ships-dark pattern).
+    pub ingest_enabled: bool,
 }
 
 /// Stripe billing credentials and the single subscription price.
@@ -109,13 +126,44 @@ impl Config {
             _ => None,
         };
 
+        let telemetry = TelemetryConfig {
+            ping_enabled: telemetry_ping_enabled(
+                env_nonempty("SOTTO_TELEMETRY").as_deref(),
+                env_nonempty("DO_NOT_TRACK").as_deref(),
+            ),
+            endpoint: env_nonempty("SOTTO_TELEMETRY_URL")
+                .unwrap_or_else(|| DEFAULT_TELEMETRY_URL.to_string()),
+            ingest_enabled: env_nonempty("SOTTO_TELEMETRY_INGEST").as_deref() == Some("1"),
+        };
+
         Ok(Self {
             database_url,
             bind_addr,
             oauth,
             billing,
+            telemetry,
         })
     }
+}
+
+/// The telemetry opt-out decision, separated from env access so the matrix is unit-testable.
+/// Any opt-out signal wins: `SOTTO_TELEMETRY` set to an off-value, or `DO_NOT_TRACK` set to
+/// anything but `"0"` (the <https://consoledonottrack.com> convention).
+fn telemetry_ping_enabled(sotto_telemetry: Option<&str>, do_not_track: Option<&str>) -> bool {
+    if let Some(v) = sotto_telemetry {
+        if matches!(
+            v.to_ascii_lowercase().as_str(),
+            "off" | "0" | "false" | "no"
+        ) {
+            return false;
+        }
+    }
+    if let Some(v) = do_not_track {
+        if v != "0" {
+            return false;
+        }
+    }
+    true
 }
 
 /// An environment variable, with empty/whitespace values treated as unset.
@@ -124,4 +172,27 @@ fn env_nonempty(name: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::telemetry_ping_enabled;
+
+    #[test]
+    fn telemetry_defaults_on_and_every_opt_out_signal_wins() {
+        assert!(telemetry_ping_enabled(None, None)); // the default
+        assert!(telemetry_ping_enabled(Some("on"), None)); // explicit on
+        assert!(telemetry_ping_enabled(Some("anything-else"), None)); // unrecognized ≠ off
+        assert!(telemetry_ping_enabled(None, Some("0"))); // DNT explicitly cleared
+
+        assert!(!telemetry_ping_enabled(Some("off"), None));
+        assert!(!telemetry_ping_enabled(Some("OFF"), None));
+        assert!(!telemetry_ping_enabled(Some("0"), None));
+        assert!(!telemetry_ping_enabled(Some("false"), None));
+        assert!(!telemetry_ping_enabled(Some("no"), None));
+        assert!(!telemetry_ping_enabled(None, Some("1")));
+        assert!(!telemetry_ping_enabled(None, Some("true")));
+        // Opt-out beats an explicit opt-in — when signals disagree, privacy wins.
+        assert!(!telemetry_ping_enabled(Some("on"), Some("1")));
+    }
 }

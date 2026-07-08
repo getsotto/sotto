@@ -12,6 +12,7 @@
 //! - [`machine`] — per-environment machine tokens (CI / service access)
 //! - [`sync`] — projects, environments, and the secret snapshot/batch hot path
 //! - [`share`] — one-time / expiring share links (the viral funnel)
+//! - [`telemetry`] — anonymous opt-out version ping (sender + hosted ingest)
 //! - [`state`] — shared application state ([`state::AppState`])
 //! - [`error`] — server error type
 
@@ -29,6 +30,7 @@ pub mod org;
 pub mod share;
 pub mod state;
 pub mod sync;
+pub mod telemetry;
 
 use axum::routing::get;
 use axum::Router;
@@ -49,6 +51,7 @@ pub fn app(state: AppState) -> Router {
         .merge(machine::router())
         .merge(sync::router())
         .merge(share::router())
+        .merge(telemetry::router())
         .with_state(state)
 }
 

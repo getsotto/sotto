@@ -50,6 +50,9 @@ services:
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_PRICE_ID: ${STRIPE_PRICE_ID:-}
+      # Anonymous daily version ping (random instance uuid + version + os/arch, nothing else —
+      # README §Telemetry). On by default; set SOTTO_TELEMETRY=off in deploy/.env to opt out.
+      SOTTO_TELEMETRY: ${SOTTO_TELEMETRY:-}
     depends_on:
       postgres:
         condition: service_healthy

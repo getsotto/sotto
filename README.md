@@ -175,6 +175,29 @@ wasm-pack test --node crates/wasm
 
 The web build and its dependency audit run in CI (`.github/workflows/ci.yml`).
 
+## Telemetry
+
+The **server** sends one anonymous ping per day (the first 10–20 minutes after boot) to
+`https://getsotto.co.uk/telemetry/v1/ping`, so we can count active instances and see which
+versions are in the wild. The response names the latest release, and the server logs a line when
+it is running an outdated version. This is the **entire** payload — the sending code is
+[`crates/server/src/telemetry.rs`](crates/server/src/telemetry.rs), and a unit test pins the
+payload to exactly these four fields:
+
+```json
+{ "instance_id": "0d0972a6-…", "version": "0.2.0", "os": "linux", "arch": "x86_64" }
+```
+
+`instance_id` is a random UUID generated once and stored in your database — derived from nothing,
+so it identifies no hardware, host, or account; deleting it makes the instance a fresh anonymous
+counter. The ingest side stores no IP addresses and no derived location. There are no org, member,
+or secret counts, and no usage events. The **CLI, web client, and WASM never send anything**.
+
+Opt out with `SOTTO_TELEMETRY=off` (or the cross-tool
+[`DO_NOT_TRACK=1`](https://consoledonottrack.com)) — when disabled the task is never started and
+no request is ever made. `SOTTO_TELEMETRY_URL` redirects the ping (e.g. to aggregate a private
+fleet), and records idle for 12 months are purged from the hosted census.
+
 ## Security
 
 Sotto's model is zero-knowledge: plaintext secrets and usable decryption keys stay on client

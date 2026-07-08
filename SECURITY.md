@@ -28,6 +28,16 @@ your email and OAuth identity, the sharing/grant graph, approximate secret **siz
 and per-environment revisions. Names and values are never exposed. A full database theft is not
 brute-forceable, because the secret key is never stored server-side.
 
+## Telemetry
+
+A self-hosted **server** sends one anonymous version ping per day by default: a random instance
+UUID (generated once, derived from nothing), the server version, and OS/arch — nothing else, and
+never from the CLI, web client, or WASM. No IP addresses are stored on the receiving side. The
+exact payload and the opt-out (`SOTTO_TELEMETRY=off`, or `DO_NOT_TRACK=1`) are documented in the
+[README](README.md#telemetry); the complete implementation is
+[`crates/server/src/telemetry.rs`](crates/server/src/telemetry.rs), and a unit test pins the
+payload to exactly those four fields.
+
 ## Assurance surfaces
 
 - **CLI — high assurance.** A native binary with a minimal, `cargo-deny`-audited dependency set and
