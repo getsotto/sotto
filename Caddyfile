@@ -26,13 +26,14 @@
 	encode gzip
 
 	# Per-client-IP rate limits on the UNAUTHENTICATED endpoints — the only API surface with no
-	# credential wall: the OAuth login/callback (which writes a short-lived login-state row) and the
-	# public share fetch. Caddy is the edge here, so {remote_host} is the real client IP, not a
+	# credential wall: the OAuth login/callback (which writes a short-lived login-state row), the
+	# public share fetch, and the anonymous telemetry ping (a 503 no-op unless this instance sets
+	# SOTTO_TELEMETRY_INGEST=1). Caddy is the edge here, so {remote_host} is the real client IP, not a
 	# proxied one. Authenticated sync (/account, /projects, /environments/*, /orgs, /machine/*, …) is
 	# deliberately NOT limited: it is bearer-gated and includes high-frequency CI polling that a
 	# per-IP cap could wrongly throttle when a whole team shares one office/NAT egress IP. The
 	# threshold is a generous starting point — raise it, or split into per-endpoint zones, to taste.
-	@ratelimited path /auth/github/* /shares /shares/*
+	@ratelimited path /auth/github/* /shares /shares/* /telemetry/*
 	handle @ratelimited {
 		rate_limit {
 			zone unauthenticated {

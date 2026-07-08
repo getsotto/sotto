@@ -37,11 +37,21 @@ async fn run() -> Result<()> {
     }
 
     let state = AppState {
-        pool,
+        pool: pool.clone(),
         oauth,
         oauth_config: config.oauth.clone(),
         billing: config.billing.clone(),
+        telemetry_ingest: config.telemetry.ingest_enabled,
     };
+
+    // Default-on telemetry must never be a surprise: say so at boot, with the off switch.
+    if config.telemetry.ping_enabled && !config.telemetry.ingest_enabled {
+        println!(
+            "telemetry: daily anonymous version ping is on (random instance uuid + version + \
+             os/arch, nothing else) — set SOTTO_TELEMETRY=off to disable; see README §Telemetry"
+        );
+    }
+    sotto_server::telemetry::spawn(pool, config.telemetry.clone());
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await

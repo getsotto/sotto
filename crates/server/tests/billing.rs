@@ -26,6 +26,7 @@ async fn pool_or_skip() -> Option<PgPool> {
 
 fn app(pool: PgPool, configured: bool) -> Router {
     let state = AppState {
+        telemetry_ingest: false,
         pool,
         oauth: None,
         oauth_config: None,
