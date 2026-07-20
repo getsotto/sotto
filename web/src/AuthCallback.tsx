@@ -15,7 +15,7 @@ export function AuthCallback() {
       setError("Login could not be verified (state mismatch).");
       return;
     }
-    window.location.replace("/");
+    window.location.replace("/app");
   }, []);
 
   return (
