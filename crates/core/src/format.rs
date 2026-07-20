@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn alphabet_has_32_symbols_and_no_ambiguous_letters() {
         assert_eq!(CROCKFORD_ALPHABET.len(), 32);
-        for ambiguous in [b'I', b'L', b'O', b'U'] {
+        for ambiguous in *b"ILOU" {
             assert!(!CROCKFORD_ALPHABET.contains(&ambiguous));
         }
     }
