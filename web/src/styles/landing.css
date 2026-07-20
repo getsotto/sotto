@@ -1,0 +1,316 @@
+/* Sotto — the landing page.
+ *
+ * The same Sordino paper as the app: the landing page is a well-set document,
+ * not a SaaS splash. Every rule is scoped under `.landing` because Vite bundles
+ * all imported CSS globally — nothing here may leak into the vault app.
+ *
+ * The page keeps the system's discipline: one dark surface (the terminal, on
+ * the design system's terminal tokens), one moment of motion (the transcript
+ * revealing itself, once, on load), and one loud value (the share link it
+ * prints). The CSP allows no inline styles, so the animation timeline lives
+ * here as per-line classes rather than style attributes.
+ */
+
+/* ---- Links: the platform's blue, quieted (tokens from colors.css) --------- */
+
+.landing a {
+  color: var(--link);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+.landing a:visited {
+  color: var(--link-visited);
+}
+
+/* ---- Masthead: wordmark + a quiet nav ------------------------------------- */
+
+.landing header nav {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  font-size: var(--text-sm);
+}
+
+.landing header nav a {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.landing header nav a:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+
+.landing header nav a.login {
+  color: var(--link);
+}
+
+/* ---- Hero: the one rare large moment --------------------------------------- */
+
+.landing .hero {
+  border-top: none;
+  padding-top: var(--space-6);
+  margin-top: 0;
+}
+
+.landing h1 {
+  font-size: var(--text-2xl);
+  max-width: 22ch;
+}
+
+.landing .lead {
+  font-size: var(--text-md);
+  line-height: var(--leading-relaxed);
+  color: var(--text-muted);
+}
+
+/* The install one-liner is the page's committing action. */
+.landing .install {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  max-width: var(--measure);
+  margin: var(--space-5) 0 var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--paper-sunk);
+  border: var(--border-input);
+  border-radius: var(--radius);
+}
+
+.landing .install > code {
+  flex: 1 1 auto;
+  overflow-x: auto;
+  white-space: nowrap;
+  font-size: var(--text-xs);
+}
+
+.landing .install > button {
+  flex: 0 0 auto;
+}
+
+/* ---- Sections: hairline rhythm, full column ------------------------------- */
+
+.landing section {
+  max-width: none;
+}
+
+.landing section > p,
+.landing section > ul {
+  max-width: var(--measure);
+}
+
+.landing ol.steps {
+  margin: 0 0 var(--space-4);
+  padding-left: 1.4em;
+  max-width: var(--measure);
+}
+
+.landing ol.steps li {
+  margin-bottom: var(--space-3);
+}
+
+/* ---- Pricing: two hairline boxes, no theatrics ---------------------------- */
+
+.landing .plans {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-5);
+  margin: 0 0 var(--space-4);
+}
+
+.landing .plan {
+  padding: var(--space-5);
+  border: var(--border-hairline);
+  border-radius: var(--radius);
+}
+
+.landing .plan h3 {
+  margin: 0 0 var(--space-2);
+}
+
+.landing .plan .price {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
+  margin-bottom: var(--space-3);
+}
+
+.landing .plan .price .per {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-normal);
+  color: var(--text-muted);
+  letter-spacing: var(--tracking-normal);
+}
+
+.landing .plan ul {
+  margin: 0;
+  padding-left: 1.2em;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.landing .plan li {
+  margin-bottom: var(--space-2);
+}
+
+@media (max-width: 620px) {
+  .landing .plans {
+    grid-template-columns: 1fr;
+  }
+
+  .landing h1 {
+    font-size: var(--text-xl);
+  }
+}
+
+/* ---- The quick start: a quiet sunk block ---------------------------------- */
+
+.landing pre.quickstart {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-4);
+  overflow-x: auto;
+  background: var(--paper-sunk);
+  border: var(--border-input);
+  border-radius: var(--radius);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+
+/* ---- Footer ---------------------------------------------------------------- */
+
+.landing footer {
+  margin-top: var(--space-8);
+  padding-top: var(--space-5);
+  border-top: var(--border-hairline);
+}
+
+.landing footer nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+  font-size: var(--text-sm);
+}
+
+/* ---- The terminal: the page's signature ------------------------------------
+ *
+ * A transcript of a real session on the system's terminal tokens. It reveals
+ * itself once, line by line — output lines simply appear (terminals don't
+ * fade), command lines type themselves. With reduced motion the whole
+ * transcript is just there, a legible code block.
+ */
+
+.landing .term {
+  margin: var(--space-7) 0 0;
+  padding: var(--space-5);
+  overflow-x: auto;
+  background: var(--term-bg);
+  border-radius: var(--radius);
+  color: var(--term-fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: 1.6;
+}
+
+.landing .term ::selection {
+  background: var(--term-selection);
+}
+
+.landing .term .prompt {
+  color: var(--term-prompt);
+}
+
+.landing .term .dim {
+  color: var(--term-dim);
+}
+
+.landing .term .accent {
+  color: var(--term-accent);
+}
+
+/* The one loud thing on the page: the revealed share link. */
+.landing .term .value {
+  color: var(--term-value);
+  font-weight: var(--weight-bold);
+}
+
+.landing .term .line {
+  opacity: 0;
+  animation: sotto-appear 0s linear both;
+}
+
+/* Typing = a steps() clip-path reveal over the command's natural width. In a
+ * monospace face each equal slice is exactly one glyph — unlike a ch-based
+ * width animation, which clips when accumulated glyph advances round away
+ * from N*1ch (they do, and differently per platform's ui-monospace). */
+.landing .term .cmd {
+  display: inline-block;
+  white-space: nowrap;
+  vertical-align: bottom;
+  clip-path: inset(0 100% 0 0);
+  animation: sotto-type 0.6s steps(24, start) both;
+}
+
+@keyframes sotto-appear {
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes sotto-type {
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+
+/* The timeline. A prompt row appears, its command types (steps = its character
+ * count, so one step is one glyph), output follows. */
+.landing .term .l1 { animation-delay: 0.4s; }
+.landing .term .c1 { animation-timing-function: steps(10, start); animation-duration: 0.45s; animation-delay: 0.4s; }
+.landing .term .l2 { animation-delay: 1.2s; }
+.landing .term .l3 { animation-delay: 1.4s; }
+.landing .term .l4 { animation-delay: 1.7s; }
+.landing .term .l5 { animation-delay: 2.3s; }
+.landing .term .c2 { animation-timing-function: steps(22, start); animation-delay: 2.3s; }
+.landing .term .l6 { animation-delay: 3.2s; }
+.landing .term .l7 { animation-delay: 3.6s; }
+.landing .term .l8 { animation-delay: 4.2s; }
+.landing .term .c3 { animation-timing-function: steps(22, start); animation-delay: 4.2s; }
+.landing .term .l9 { animation-delay: 5.1s; }
+.landing .term .l10 { animation-delay: 5.7s; }
+.landing .term .c4 { animation-timing-function: steps(10, start); animation-duration: 0.45s; animation-delay: 5.7s; }
+.landing .term .l11 { animation-delay: 6.4s; }
+.landing .term .l12 { animation-delay: 7s; }
+.landing .term .c5 { animation-timing-function: steps(24, start); animation-delay: 7s; }
+.landing .term .l13 { animation-delay: 7.9s; }
+.landing .term .l14 { animation-delay: 8.2s; }
+.landing .term .l15 { animation-delay: 8.8s; }
+
+/* The resting cursor, blinking at the ready. */
+.landing .term .cursor {
+  display: inline-block;
+  width: 1ch;
+  height: 1.1em;
+  vertical-align: text-bottom;
+  background: var(--term-dim);
+  animation: sotto-blink 1.1s steps(1, end) infinite;
+}
+
+@keyframes sotto-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .landing .term .line,
+  .landing .term .cmd,
+  .landing .term .cursor {
+    animation: none;
+    opacity: 1;
+    clip-path: none;
+  }
+}
