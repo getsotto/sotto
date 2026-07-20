@@ -110,7 +110,7 @@ export function Landing() {
         <div className="plans">
           <div className="plan">
             <h3>Free</h3>
-            <p className="price">$0</p>
+            <p className="price">£0</p>
             <ul>
               <li>Personal projects: unlimited, free forever</li>
               <li>Organisations with up to 3 members and 1 shared project</li>
@@ -121,7 +121,7 @@ export function Landing() {
           <div className="plan">
             <h3>Team</h3>
             <p className="price">
-              $15<span className="per"> / month per organisation</span>
+              £15<span className="per"> / month per organisation</span>
             </p>
             <ul>
               <li>Unlimited members</li>
