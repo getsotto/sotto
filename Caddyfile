@@ -52,11 +52,19 @@
 		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
 	}
 
-	# Everything else is the SPA, including client-side routes (/, /s/:token, /auth/callback).
+	# Everything else is the SPA, including client-side routes (/, /app, /s/:token, /auth/callback).
 	handle {
 		root * ./web/dist
 		try_files {path} /index.html
 		file_server
+
+		# Caching: Vite's content-hashed assets never change under the same name, so they may be
+		# cached forever; everything else (index.html, favicons) must revalidate each load via the
+		# ETag, so a deploy is visible on the next refresh. Without this, browsers cache the SPA
+		# heuristically and keep showing a stale build after upgrades. `?` = set only if unset.
+		@hashed path /assets/*
+		header @hashed Cache-Control "public, max-age=31536000, immutable"
+		header ?Cache-Control "no-cache"
 	}
 
 	# Defense-in-depth headers. The CSP is also baked into index.html (build-time) as a fallback for
