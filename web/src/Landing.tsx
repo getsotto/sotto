@@ -31,16 +31,16 @@ export function Landing() {
         </h1>
         <p className="lead">
           Sotto syncs secrets across your team with end-to-end encryption. Values are encrypted on
-          your machine before they leave it and decrypted only on your teammates&rsquo; — the
-          server stores ciphertext it cannot read.
+          your machine before they leave it and decrypted only on your teammates&rsquo; machines.
+          The server stores ciphertext it cannot read.
         </p>
         <div className="install">
           <code>{INSTALL_CMD}</code>
           <CopyButton text={INSTALL_CMD} />
         </div>
         <p className="muted">
-          Signed binaries for macOS and Linux. The installer verifies the checksum — and the
-          Sigstore signature, when <code>cosign</code> is installed. Prefer to{" "}
+          Signed binaries for macOS and Linux. The installer verifies the checksum, and the
+          Sigstore signature when <code>cosign</code> is installed. Prefer to{" "}
           <a href={`${REPO}/blob/main/install.sh`}>read it first</a>? Or grab a tarball from{" "}
           <a href={`${REPO}/releases`}>releases</a>.
         </p>
@@ -57,18 +57,18 @@ export function Landing() {
           </li>
           <li>
             <strong>Sync ciphertext.</strong> The server stores and versions encrypted blobs. It
-            never receives a plaintext value or a usable key — there is nothing on it worth
+            never receives a plaintext value or a usable key, so there is nothing on it worth
             stealing.
           </li>
           <li>
             <strong>Decrypt on your devices.</strong> One Rust crypto core runs everywhere: the CLI
-            natively, the browser through WebAssembly — with golden vectors in CI proving both
+            natively, the browser through WebAssembly, with golden vectors in CI proving both
             produce identical bytes.
           </li>
         </ol>
         <p>
           Teams work the same way: sharing an environment grants its key to a member (an X25519
-          sealed box), so access is cryptographic — not a permission bit on the server. Removing a
+          sealed box), so access is cryptographic, not a permission bit on the server. Removing a
           member rotates the keys.
         </p>
       </section>
@@ -77,8 +77,8 @@ export function Landing() {
         <h2>Should you trust this?</h2>
         <p>
           Not blindly. Sotto is pre-1.0 and has <strong>not had a third-party cryptographic
-          audit</strong> yet — you should know that before putting anything important in it. What
-          you can verify yourself, today:
+          audit</strong> yet. You should know that before putting anything important in it. Here
+          is what you can verify yourself, today:
         </p>
         <ul>
           <li>
@@ -86,7 +86,7 @@ export function Landing() {
             explicit non-goals.
           </li>
           <li>
-            One shared crypto core — the CLI and the browser client run the same Rust code, held
+            One shared crypto core: the CLI and the browser client run the same Rust code, held
             to byte-for-byte golden vectors in CI.
           </li>
           <li>
@@ -112,8 +112,8 @@ export function Landing() {
             <h3>Free</h3>
             <p className="price">$0</p>
             <ul>
-              <li>Personal projects — unlimited, free forever</li>
-              <li>Organizations with up to 3 members and 1 shared project</li>
+              <li>Personal projects: unlimited, free forever</li>
+              <li>Organisations with up to 3 members and 1 shared project</li>
               <li>One-time, burn-after-reading share links</li>
               <li>Every new org starts a 14-day Team trial</li>
             </ul>
@@ -121,13 +121,13 @@ export function Landing() {
           <div className="plan">
             <h3>Team</h3>
             <p className="price">
-              $15<span className="per"> / month per organization</span>
+              $15<span className="per"> / month per organisation</span>
             </p>
             <ul>
               <li>Unlimited members</li>
               <li>Unlimited shared projects</li>
               <li>Audit log</li>
-              <li>Flat — the price doesn&rsquo;t scale with team size</li>
+              <li>Flat: the price doesn&rsquo;t scale with team size</li>
             </ul>
           </div>
         </div>
@@ -140,14 +140,14 @@ export function Landing() {
       <section id="start">
         <h2>Get started</h2>
         <pre className="quickstart">
-          <code>{`sotto init                   # create your identity — SAVE the Emergency Kit
+          <code>{`sotto init                   # create your identity; SAVE the Emergency Kit
 sotto set DATABASE_URL       # hidden prompt; encrypted before it touches disk
 sotto run -- npm start       # inject secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via getsotto.co.uk
 sotto share DATABASE_URL     # one-time link for a single secret`}</code>
         </pre>
         <p>
-          Sotto works fully offline until you <code>sotto login</code> — sync is a feature, not a
+          Sotto works fully offline until you <code>sotto login</code>. Sync is a feature, not a
           requirement. The web vault at this address decrypts in your browser, with keys that
           never leave your devices.
         </p>
@@ -163,7 +163,7 @@ sotto share DATABASE_URL     # one-time link for a single secret`}</code>
           <a href="/app">Log in</a>
         </nav>
         <p className="muted">
-          Sotto — from <em>sotto voce</em>: in a low voice, in confidence. Apache-2.0.
+          Sotto takes its name from <em>sotto voce</em>: in a low voice, in confidence. Apache-2.0.
         </p>
       </footer>
     </main>
