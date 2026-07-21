@@ -25,22 +25,28 @@ function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/// Consume the `?billing=success|cancelled` parameter Stripe Checkout returns with, cleaning it
-/// out of the URL so a reload doesn't repeat the banner. Runs once, at panel mount.
-function takeBillingOutcome(): "success" | "cancelled" | null {
+/// The `?billing=success|cancelled` parameter Stripe Checkout returns with. Pure — StrictMode
+/// double-invokes state initializers in development, so consuming the parameter here would eat
+/// it before the surviving render; the URL cleanup lives in an effect instead.
+function parseBillingOutcome(): "success" | "cancelled" | null {
+  const outcome = new URLSearchParams(window.location.search).get("billing");
+  return outcome === "success" || outcome === "cancelled" ? outcome : null;
+}
+
+/// Remove the consumed `billing` parameter so a reload doesn't repeat the banner, preserving any
+/// other query parameters and the fragment. Idempotent — safe under StrictMode's double effects.
+function clearBillingParam() {
   const params = new URLSearchParams(window.location.search);
-  const outcome = params.get("billing");
-  if (outcome !== "success" && outcome !== "cancelled") {
-    return null;
+  if (!params.has("billing")) {
+    return;
   }
   params.delete("billing");
   const query = params.toString();
   window.history.replaceState(
     null,
     "",
-    window.location.pathname + (query !== "" ? `?${query}` : ""),
+    window.location.pathname + (query !== "" ? `?${query}` : "") + window.location.hash,
   );
-  return outcome;
 }
 
 /// Best-effort org-name decryption via the caller's sealed org-key copy; the org id otherwise.
@@ -75,7 +81,13 @@ export function TeamPanel({
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [billingBusy, setBillingBusy] = useState(false);
-  const [billingOutcome] = useState(takeBillingOutcome);
+  const [billingOutcome] = useState(parseBillingOutcome);
+
+  useEffect(() => {
+    if (billingOutcome !== null) {
+      clearBillingParam();
+    }
+  }, [billingOutcome]);
 
   useEffect(() => {
     void (async () => {
