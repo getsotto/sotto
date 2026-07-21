@@ -151,6 +151,9 @@ struct EntitlementsView {
     trial_ends_at: Option<String>,
     /// The numeric limits in effect; `null` on the Team tier (unlimited).
     limits: Option<Limits>,
+    /// Whether this instance can take payment (the `STRIPE_*` variables are set). Clients hide
+    /// upgrade affordances when `false` — a self-hosted instance has no checkout to offer.
+    billing_enabled: bool,
 }
 
 /// `GET /orgs/{org_id}/entitlements` — the org's plan, visible to any member.
@@ -191,5 +194,6 @@ async fn get_entitlements(
                 max_org_projects: FREE_MAX_ORG_PROJECTS,
             }),
         },
+        billing_enabled: state.billing.is_some(),
     }))
 }

@@ -84,6 +84,7 @@ export default defineConfig({
       "/account": api,
       "/projects": api,
       "/environments": api,
+      "/orgs": api,
       "/shares": api,
     },
   },
