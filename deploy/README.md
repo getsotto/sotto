@@ -139,8 +139,9 @@ database — a backup that has never been restored is a hope, not a backup.
 
 Caddy writes JSON access logs to the `caddy_logs` volume (`/var/log/caddy/access.log` in the
 container), rotated at 50 MiB, 10 files kept, 90 days retained (the `log` block in the
-`Caddyfile`). Caddy redacts credential headers (`Cookie`, `Authorization`) by default; request
-paths and statuses are logged.
+`Caddyfile`). Credential headers (`Cookie`, `Authorization`, `Set-Cookie`) are **deleted from
+every entry by an explicit filter in the `Caddyfile`** — not left to Caddy's default redaction
+— so no session material ever reaches disk. Request paths and statuses are logged.
 
 The number that matters for a hosted instance — free-tier limit hits (HTTP 402, one per person
 who wanted more than the free tier allows):

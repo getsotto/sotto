@@ -27,15 +27,25 @@
 
 	# JSON access logs — ops forensics and the funnel's demand counter: a 402 in these logs is a
 	# free-tier limit hit. Written to the caddy_logs volume (deploy/docker-compose.prod.yml) and
-	# rotated by Caddy itself. Credential headers (Cookie, Authorization) are redacted by default;
-	# see deploy/README.md § Access logs for the reading commands.
+	# rotated by Caddy itself. Credential headers are DELETED from every entry by the filter
+	# below — enforced here in config, not left to Caddy's default redaction (which has masked
+	# these values since v2.5 but can be re-enabled with `log_credentials`). See
+	# deploy/README.md § Access logs for the reading commands.
 	log {
 		output file /var/log/caddy/access.log {
 			roll_size 50MiB
 			roll_keep 10
 			roll_keep_for 2160h
 		}
-		format json
+		format filter {
+			wrap json
+			fields {
+				request>headers>Cookie delete
+				request>headers>Authorization delete
+				request>headers>Proxy-Authorization delete
+				resp_headers>Set-Cookie delete
+			}
+		}
 	}
 
 	# Per-client-IP rate limits on the UNAUTHENTICATED endpoints — the only API surface with no
