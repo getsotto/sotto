@@ -165,6 +165,8 @@ async fn trial_grants_team_then_expiry_enforces_free_limits() {
     assert!(body.contains("\"tier\":\"free\""));
     assert!(body.contains("\"effective_tier\":\"team\""));
     assert!(body.contains("\"limits\":null"));
+    // This harness runs without STRIPE_* config, so the view must tell clients billing is off.
+    assert!(body.contains("\"billing_enabled\":false"));
     assert_eq!(
         send(&pool, "GET", &format!("/orgs/{o}/audit"), &owner, None)
             .await

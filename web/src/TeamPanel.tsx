@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 
 import {
+  createCheckout,
+  createPortal,
   fetchAudit,
   fetchEntitlements,
   fetchMembers,
@@ -21,6 +23,24 @@ interface NamedOrg {
 
 function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/// Consume the `?billing=success|cancelled` parameter Stripe Checkout returns with, cleaning it
+/// out of the URL so a reload doesn't repeat the banner. Runs once, at panel mount.
+function takeBillingOutcome(): "success" | "cancelled" | null {
+  const params = new URLSearchParams(window.location.search);
+  const outcome = params.get("billing");
+  if (outcome !== "success" && outcome !== "cancelled") {
+    return null;
+  }
+  params.delete("billing");
+  const query = params.toString();
+  window.history.replaceState(
+    null,
+    "",
+    window.location.pathname + (query !== "" ? `?${query}` : ""),
+  );
+  return outcome;
 }
 
 /// Best-effort org-name decryption via the caller's sealed org-key copy; the org id otherwise.
@@ -54,6 +74,8 @@ export function TeamPanel({
   const [email, setEmail] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [billingBusy, setBillingBusy] = useState(false);
+  const [billingOutcome] = useState(takeBillingOutcome);
 
   useEffect(() => {
     void (async () => {
@@ -114,16 +136,40 @@ export function TeamPanel({
     }
   }
 
+  /// Hand the browser to a Stripe-hosted page. `busy` stays set on success: the page is about to
+  /// navigate away, and re-enabling would invite a double click while it does.
+  async function goToStripe(fetchUrl: (orgId: string) => Promise<string>, orgId: string) {
+    setError(null);
+    setNotice(null);
+    setBillingBusy(true);
+    try {
+      window.location.assign(await fetchUrl(orgId));
+    } catch (e) {
+      setError(message(e));
+      setBillingBusy(false);
+    }
+  }
+
   // A known-empty org list means no team section. While still loading, or after a load error, keep
   // rendering so the error (or a loading state) stays visible instead of the panel vanishing.
   if (orgs !== null && orgs.length === 0) {
     return null;
   }
-  const canInvite = openOrg !== null && ["owner", "admin"].includes(openOrg.org.role);
+  // Admin/owner: the server's bar for both membership management and billing.
+  const canManage = openOrg !== null && ["owner", "admin"].includes(openOrg.org.role);
 
   return (
     <section>
       <h2>Organizations</h2>
+      {billingOutcome === "success" && (
+        <p className="notice">
+          Payment received. Your Team plan activates as soon as Stripe confirms, usually within
+          seconds.
+        </p>
+      )}
+      {billingOutcome === "cancelled" && (
+        <p className="muted">Checkout cancelled. Nothing was charged.</p>
+      )}
       {error !== null && <p role="alert">{error}</p>}
       {notice !== null && <p className="notice">{notice}</p>}
       {orgs === null && error === null && <p className="muted">Loading…</p>}
@@ -156,6 +202,26 @@ export function TeamPanel({
                 : ""}
             </p>
           )}
+          {plan !== null && canManage && plan.billingEnabled && (
+            <p>
+              {plan.tier !== "team" ? (
+                <button
+                  className="primary"
+                  disabled={billingBusy}
+                  onClick={() => void goToStripe(createCheckout, openOrg.org.id)}
+                >
+                  {billingBusy ? "Opening checkout…" : "Upgrade to Team"}
+                </button>
+              ) : (
+                <button
+                  disabled={billingBusy}
+                  onClick={() => void goToStripe(createPortal, openOrg.org.id)}
+                >
+                  {billingBusy ? "Opening portal…" : "Manage billing"}
+                </button>
+              )}
+            </p>
+          )}
           <h3>Members of {openOrg.name}</h3>
           {members === null ? (
             <p className="muted">Loading…</p>
@@ -172,7 +238,7 @@ export function TeamPanel({
               ))}
             </ul>
           )}
-          {canInvite && (
+          {canManage && (
             <form
               className="row"
               onSubmit={(e) => {

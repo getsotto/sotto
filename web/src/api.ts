@@ -142,6 +142,8 @@ export interface Entitlements {
   effectiveTier: string;
   trialEndsAt: string | null;
   limits: { maxMembers: number; maxOrgProjects: number } | null;
+  /// Whether this instance can take payment; upgrade controls are hidden when `false`.
+  billingEnabled: boolean;
 }
 
 /// The org's plan (tier, trial, limits), visible to any member.
@@ -151,6 +153,7 @@ export async function fetchEntitlements(orgId: string): Promise<Entitlements> {
     effective_tier: string;
     trial_ends_at: string | null;
     limits: { max_members: number; max_org_projects: number } | null;
+    billing_enabled: boolean;
   }>(`/orgs/${encodeURIComponent(orgId)}/entitlements`);
   return {
     tier: r.tier,
@@ -159,7 +162,51 @@ export async function fetchEntitlements(orgId: string): Promise<Entitlements> {
     limits: r.limits
       ? { maxMembers: r.limits.max_members, maxOrgProjects: r.limits.max_org_projects }
       : null,
+    billingEnabled: r.billing_enabled,
   };
+}
+
+/// Start a Team subscription checkout (admin/owner); returns the Stripe Checkout page URL for the
+/// browser to navigate to. The tier itself flips when the webhook confirms payment.
+export async function createCheckout(orgId: string): Promise<string> {
+  const resp = await fetch(`/orgs/${encodeURIComponent(orgId)}/billing/checkout`, {
+    method: "POST",
+    ...CREDS,
+  });
+  if (resp.status === 503) {
+    throw new Error("billing is not configured on this server");
+  }
+  if (resp.status === 403) {
+    throw new Error("managing billing requires the admin or owner role");
+  }
+  if (!resp.ok) {
+    throw new Error(`server error (${resp.status})`);
+  }
+  const body = (await resp.json()) as { url: string };
+  return body.url;
+}
+
+/// Open Stripe's customer portal (admin/owner) to manage or cancel the subscription; returns the
+/// portal URL for the browser to navigate to.
+export async function createPortal(orgId: string): Promise<string> {
+  const resp = await fetch(`/orgs/${encodeURIComponent(orgId)}/billing/portal`, {
+    method: "POST",
+    ...CREDS,
+  });
+  if (resp.status === 503) {
+    throw new Error("billing is not configured on this server");
+  }
+  if (resp.status === 403) {
+    throw new Error("managing billing requires the admin or owner role");
+  }
+  if (resp.status === 400) {
+    throw new Error("this organisation has no billing account yet");
+  }
+  if (!resp.ok) {
+    throw new Error(`server error (${resp.status})`);
+  }
+  const body = (await resp.json()) as { url: string };
+  return body.url;
 }
 
 export interface AuditEvent {

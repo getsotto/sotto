@@ -83,6 +83,7 @@ async fn create_checkout(
             .await?
             .flatten();
 
+    let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
     let mut form = vec![
         ("mode".to_string(), "subscription".to_string()),
         ("line_items[0][price]".to_string(), billing.price_id.clone()),
@@ -94,14 +95,8 @@ async fn create_checkout(
             "subscription_data[metadata][org_id]".to_string(),
             org_id.clone(),
         ),
-        (
-            "success_url".to_string(),
-            format!("{}/?billing=success", billing.return_url),
-        ),
-        (
-            "cancel_url".to_string(),
-            format!("{}/?billing=cancelled", billing.return_url),
-        ),
+        ("success_url".to_string(), success_url),
+        ("cancel_url".to_string(), cancel_url),
     ];
     if let Some(customer) = customer {
         form.push(("customer".to_string(), customer));
@@ -138,7 +133,7 @@ async fn create_portal(
 
     let form = vec![
         ("customer".to_string(), customer),
-        ("return_url".to_string(), billing.return_url.clone()),
+        ("return_url".to_string(), app_url(&billing.return_url)),
     ];
     let session = stripe_post(&billing.secret_key, "billing_portal/sessions", &form).await?;
     let url = session["url"]
@@ -147,6 +142,21 @@ async fn create_portal(
     Ok(Json(RedirectView {
         url: url.to_string(),
     }))
+}
+
+/// The vault app's address: the site root serves the marketing page, the app lives under `/app`.
+fn app_url(base: &str) -> String {
+    format!("{}/app", base.trim_end_matches('/'))
+}
+
+/// Where the browser lands after Stripe Checkout. Both land in the vault app, which reads the
+/// `billing` query parameter to explain the outcome (the tier itself flips via the webhook).
+fn checkout_return_urls(base: &str) -> (String, String) {
+    let app = app_url(base);
+    (
+        format!("{app}?billing=success"),
+        format!("{app}?billing=cancelled"),
+    )
 }
 
 /// The process-wide Stripe HTTP client, built once and reused (reqwest pools connections behind an
@@ -406,6 +416,20 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The vault app moved behind `/app` when the site root became the marketing page; a payer
+    /// must land back in the app, never on the landing page. This pins that contract.
+    #[test]
+    fn stripe_return_urls_target_the_vault_app() {
+        let (success, cancel) = checkout_return_urls("https://getsotto.test");
+        assert_eq!(success, "https://getsotto.test/app?billing=success");
+        assert_eq!(cancel, "https://getsotto.test/app?billing=cancelled");
+        // A configured base with a trailing slash must not produce a `//app` path.
+        assert_eq!(
+            app_url("https://getsotto.test/"),
+            "https://getsotto.test/app"
+        );
+    }
 
     fn sign(secret: &str, t: i64, payload: &str) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
