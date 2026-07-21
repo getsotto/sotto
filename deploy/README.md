@@ -75,15 +75,87 @@ a compatibility break before upgrading past a minor version.
 
 ## Backups
 
-Postgres holds only ciphertext and metadata, but losing it loses your users' synced vaults:
+Postgres holds only ciphertext and metadata, but losing it loses your users' synced vaults.
+[`backup.sh`](./backup.sh) takes a custom-format `pg_dump` inside the container, **verifies the
+archive** (`pg_restore --list`) before anything leaves the box, and uploads it to whatever
+object storage `SOTTO_BACKUP_BUCKET` names — the scheme picks the tool:
+
+| `SOTTO_BACKUP_BUCKET` | Uploads with | Works for |
+|---|---|---|
+| `gs://<bucket>` | `gsutil` | Google Cloud Storage |
+| `s3://<bucket>` | `aws s3 cp` | S3 and S3-compatibles |
+| `<remote>:<path>` | `rclone` | 40+ backends: B2, SFTP, a NAS, … |
+
+One-time setup, any provider:
+
+1. **A bucket that deletes objects after ~30 days.**
+
+   ```sh
+   # Google Cloud:
+   gcloud storage buckets create gs://<bucket> --location=<region>
+   printf '{"rule":[{"action":{"type":"Delete"},"condition":{"age":30}}]}' > /tmp/lifecycle.json
+   gcloud storage buckets update gs://<bucket> --lifecycle-file=/tmp/lifecycle.json
+
+   # AWS:
+   aws s3 mb s3://<bucket> --region <region>
+   aws s3api put-bucket-lifecycle-configuration --bucket <bucket> --lifecycle-configuration \
+     '{"Rules":[{"ID":"expire","Status":"Enabled","Filter":{},"Expiration":{"Days":30}}]}'
+   ```
+
+2. **Write-only credentials for the host.** The box should be able to add backups but never
+   read or delete them — a compromised host then can't destroy your history. On GCS that is
+   `roles/storage.objectCreator` for the VM's service account; on AWS, an IAM policy allowing
+   only `s3:PutObject` on the bucket.
+
+   ```sh
+   # Google Cloud:
+   gcloud storage buckets add-iam-policy-binding gs://<bucket> \
+     --member="serviceAccount:<vm-service-account>" --role="roles/storage.objectCreator"
+   ```
+
+3. **Point the script at it** (`deploy/.env`): `SOTTO_BACKUP_BUCKET=gs://<bucket>` (or the
+   `s3://` / rclone form).
+
+4. **Nightly cron**, with failures landing in a log you can check:
+
+   ```sh
+   crontab -e     # add:
+   # 17 2 * * * cd $HOME/sotto/deploy && ./backup.sh >> $HOME/sotto-backup.log 2>&1
+   ```
+
+**Restore** (into a running instance; drops and recreates objects from the dump). Fetch the
+dump with your provider's tool (`gsutil cp` / `aws s3 cp` / `rclone copyto`), then:
 
 ```sh
-docker compose -f docker-compose.prod.yml exec postgres \
-  pg_dump -U sotto sotto > "sotto-$(date +%F).sql"
+docker compose -f docker-compose.prod.yml exec -T postgres \
+  pg_restore -U sotto -d sotto --clean --if-exists < sotto-<stamp>.dump
+docker compose -f docker-compose.prod.yml restart server
 ```
 
-Restore into a fresh instance with `psql -U sotto sotto < backup.sql` (via `exec -T postgres`).
-Run the dump on a cron schedule and ship it off the box.
+Run one backup by hand now (`./backup.sh`) and rehearse the restore once against a scratch
+database — a backup that has never been restored is a hope, not a backup.
+
+## Access logs
+
+Caddy writes JSON access logs to the `caddy_logs` volume (`/var/log/caddy/access.log` in the
+container), rotated at 50 MiB, 10 files kept, 90 days retained (the `log` block in the
+`Caddyfile`). Credential headers (`Cookie`, `Authorization`, `Set-Cookie`) are **deleted from
+every entry by an explicit filter in the `Caddyfile`** — not left to Caddy's default redaction
+— so no session material ever reaches disk. Request paths and statuses are logged.
+
+The number that matters for a hosted instance — free-tier limit hits (HTTP 402, one per person
+who wanted more than the free tier allows):
+
+```sh
+docker compose -f docker-compose.prod.yml exec caddy \
+  sh -c 'grep -c "\"status\":402" /var/log/caddy/access.log'
+```
+
+## Uptime monitoring
+
+`GET /health` returns `ok` with no auth and no rate limit — point any external checker at
+`https://<SOTTO_DOMAIN>/health` (e.g. a free UptimeRobot monitor, 5-minute interval, keyword
+`ok`). Alerting from *outside* the box is the point: a dead VM cannot report itself.
 
 ## Database security
 

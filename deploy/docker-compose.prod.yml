@@ -74,6 +74,8 @@ services:
       # Persist certificates and Caddy state across restarts (avoids re-issuing on every deploy).
       - caddy_data:/data
       - caddy_config:/config
+      # JSON access logs (rotated by Caddy — see the Caddyfile's log block).
+      - caddy_logs:/var/log/caddy
     depends_on:
       - server
 
@@ -81,3 +83,4 @@ volumes:
   pgdata:
   caddy_data:
   caddy_config:
+  caddy_logs:
