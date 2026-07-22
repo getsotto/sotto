@@ -1,7 +1,7 @@
 //! The committed, secret-free project config (`sotto.toml`).
 //!
 //! Binds a directory to a local project + default environment so `sotto run`/`get`/… know which
-//! secrets to use. Contains **no secrets** — only identifiers — so it's safe to commit. (Forward
+//! secrets to use. Contains **no secrets** - only identifiers - so it's safe to commit. (Forward
 //! compatible with M3, where `project_id` becomes a server id.)
 
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ pub struct Config {
     pub project: String,
     /// Default environment for this directory (e.g. `dev`).
     pub environment: String,
-    /// Owning organization id, when this project is shared with a team. Absent = personal project.
+    /// Owning organisation id, when this project is shared with a team. Absent = personal project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_id: Option<String>,
 }

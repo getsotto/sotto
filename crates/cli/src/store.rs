@@ -2,7 +2,7 @@
 //!
 //! Holds ciphertext blobs (secret names/values/data-keys are opaque here) plus structural
 //! metadata. The schema mirrors the server's so M3 sync is additive. Secrets are addressed by a
-//! stable id, not by name — names are encrypted, so the vault layer resolves name→id by
+//! stable id, not by name - names are encrypted, so the vault layer resolves name→id by
 //! decrypting (the store never sees plaintext).
 
 use std::path::Path;
@@ -94,7 +94,7 @@ pub struct Environment {
     pub enc_vault_key: Vec<u8>,
 }
 
-/// A stored secret row — all payload fields are opaque ciphertext.
+/// A stored secret row - all payload fields are opaque ciphertext.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretRow {
     pub id: String,
@@ -132,7 +132,7 @@ pub struct Identity {
     pub enc_verifier: Vec<u8>,
 }
 
-/// Account key material — the server-opaque blobs a new device fetches after login.
+/// Account key material - the server-opaque blobs a new device fetches after login.
 /// `public_key` is the shareable X25519 key; `enc_private_keys` is the X25519 private key sealed
 /// under the master key; `recovery_blob` is the master key sealed under the recovery key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,7 +356,7 @@ impl Store {
     }
 
     /// List tombstoned (soft-deleted) secret rows for an environment. The vault uses this to
-    /// resurrect a secret when a deleted name is set again — names are opaque ciphertext here,
+    /// resurrect a secret when a deleted name is set again - names are opaque ciphertext here,
     /// so only the vault can match name→row by decrypting.
     pub fn list_deleted_secrets(&self, env_id: &str) -> Result<Vec<SecretRow>> {
         self.secret_rows(env_id, true)

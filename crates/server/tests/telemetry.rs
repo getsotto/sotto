@@ -93,8 +93,8 @@ async fn ping_upserts_one_census_row_and_names_the_latest_version() {
     // The ingest host's own version is the fleet's update reference.
     assert_eq!(body["latest_version"], env!("CARGO_PKG_VERSION"));
 
-    // A later ping from the same instance — sent with an UPPERCASED id to prove ids are
-    // normalized, not duplicated — updates the row in place.
+    // A later ping from the same instance - sent with an UPPERCASED id to prove ids are
+    // normalised, not duplicated - updates the row in place.
     let (status, _) = post_ping(&app, &ping_body(&id.to_uppercase(), "0.2.0")).await;
     assert_eq!(status, StatusCode::OK);
 

@@ -1,7 +1,7 @@
 //! Anonymous, opt-out version-ping telemetry: the sending task every server runs by default,
 //! and the ingest endpoint only the hosted instance enables.
 //!
-//! **The entire payload is [`Ping`]** — a random instance UUID (generated once, stored in
+//! **The entire payload is [`Ping`]** - a random instance UUID (generated once, stored in
 //! Postgres, derived from nothing), the server version, and compile-time OS/arch. The ingest
 //! side stores no IPs, no hostnames, no org/member/secret counts, and no usage events; the CLI,
 //! web client, and WASM never send anything. The README's Telemetry section documents the
@@ -10,7 +10,7 @@
 //! Opt out with `SOTTO_TELEMETRY=off` or the cross-tool `DO_NOT_TRACK=1`
 //! (<https://consoledonottrack.com>): the task is then never spawned, so no request is ever
 //! made. In return the ping's response names the latest release, which is logged when this
-//! server is behind — for a secrets server, knowing you're unpatched is worth one line a day.
+//! server is behind - for a secrets server, knowing you're unpatched is worth one line a day.
 //!
 //! Ingest ships dark like OAuth/billing: `POST /telemetry/v1/ping` returns 503 unless
 //! `SOTTO_TELEMETRY_INGEST=1` (set only on the hosted deployment).
@@ -29,16 +29,16 @@ use crate::config::TelemetryConfig;
 use crate::error::{Error, Result};
 use crate::state::AppState;
 
-/// This build's version — what the ping reports, and what ingest returns as `latest_version`
+/// This build's version - what the ping reports, and what ingest returns as `latest_version`
 /// (the hosted instance runs the newest release, so its own version is the fleet's reference).
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Base startup delay before the first ping; the per-instance offset stretches it to a 10–20
+/// Base startup delay before the first ping; the per-instance offset stretches it to a 10-20
 /// minute window, so crash-looping instances never register and a fleet's pings don't align.
 const INITIAL_DELAY_SECS: u64 = 600;
 /// One ping (and, on the ingest host, one purge pass) per day.
 const PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
-/// Ingest-side cap per payload field — the real payload's fields are all far shorter.
+/// Ingest-side cap per payload field - the real payload's fields are all far shorter.
 const MAX_FIELD_LEN: usize = 64;
 
 pub fn router() -> Router<AppState> {
@@ -49,7 +49,7 @@ pub fn router() -> Router<AppState> {
 /// reflected in the README's Telemetry section and SECURITY.md in the same commit.
 #[derive(Debug, Serialize, Deserialize)]
 struct Ping {
-    /// Random UUID from `telemetry_instance` — the only identifier, derived from nothing.
+    /// Random UUID from `telemetry_instance` - the only identifier, derived from nothing.
     instance_id: String,
     /// Sender's `CARGO_PKG_VERSION`.
     version: String,
@@ -64,7 +64,7 @@ struct PingResponse {
     latest_version: String,
 }
 
-/// `POST /telemetry/v1/ping` — record that an instance exists (hosted only; 503 elsewhere).
+/// `POST /telemetry/v1/ping` - record that an instance exists (hosted only; 503 elsewhere).
 ///
 /// The body arrives as a `Result` so a `Json` rejection can't preempt the ships-dark gate: a
 /// bare `Json<Ping>` extractor would answer malformed posts with its own 400/415/422 *before*
@@ -80,8 +80,8 @@ async fn ingest(
     }
     let Json(ping) = payload.map_err(|_| Error::BadRequest("body must be a JSON ping".into()))?;
 
-    // Requiring a parseable UUID (re-serialized, which lowercases) keeps arbitrary junk — and
-    // therefore any smuggled PII — out of the table, and dedupes case variants of one id.
+    // Requiring a parseable UUID (re-serialised, which lowercases) keeps arbitrary junk - and
+    // therefore any smuggled PII - out of the table, and dedupes case variants of one id.
     let instance_id = Uuid::parse_str(ping.instance_id.trim())
         .map_err(|_| Error::BadRequest("instance_id must be a UUID".into()))?
         .to_string();
@@ -92,7 +92,7 @@ async fn ingest(
     ] {
         if value.is_empty() || value.len() > MAX_FIELD_LEN {
             return Err(Error::BadRequest(format!(
-                "{name} must be 1–{MAX_FIELD_LEN} bytes"
+                "{name} must be 1-{MAX_FIELD_LEN} bytes"
             )));
         }
     }
@@ -116,16 +116,16 @@ async fn ingest(
 }
 
 /// Start this instance's background telemetry work: the daily ping (the default), nothing at
-/// all (opted out), or — on the ingest host — the daily retention purge.
+/// all (opted out), or - on the ingest host - the daily retention purge.
 pub fn spawn(pool: PgPool, config: TelemetryConfig) {
     if config.ingest_enabled {
-        // The ingest host doesn't ping itself — it *is* the census, and its own version is the
+        // The ingest host doesn't ping itself - it *is* the census, and its own version is the
         // fleet's update reference. It owns retention instead.
         tokio::spawn(purge_loop(pool));
         return;
     }
     if !config.ping_enabled {
-        // Opted out: no task, no HTTP client, no request — ever.
+        // Opted out: no task, no HTTP client, no request - ever.
         return;
     }
     tokio::spawn(ping_loop(pool, config.endpoint));
@@ -160,7 +160,7 @@ async fn ping_loop(pool: PgPool, endpoint: String) {
         if let Ok(response) = ping_once(&client, &endpoint, &instance_id).await {
             if is_newer(&response.latest_version, VERSION) {
                 println!(
-                    "sotto-server {} is available (running {VERSION}) — \
+                    "sotto-server {} is available (running {VERSION}) - \
                      https://github.com/getsotto/sotto/releases",
                     response.latest_version
                 );

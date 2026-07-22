@@ -72,7 +72,7 @@ pub fn server_url(override_url: Option<&str>, config_path: &Path) -> Result<Stri
 }
 
 /// Resolve an explicitly named server (override → `SOTTO_SERVER` → saved config), with NO hosted
-/// fallback — `None` means nothing named one. Machine mode uses this so a misconfigured CI job
+/// fallback - `None` means nothing named one. Machine mode uses this so a misconfigured CI job
 /// fails loudly instead of sending its bearer token to a server the token wasn't minted for.
 pub fn explicit_server_url(
     override_url: Option<&str>,
@@ -148,7 +148,7 @@ mod tests {
     #[test]
     fn default_server_is_normalized_https() {
         // server_url returns DEFAULT_SERVER verbatim when nothing else resolves, so the constant
-        // itself must already satisfy the normalization invariants.
+        // itself must already satisfy the normalisation invariants.
         assert!(DEFAULT_SERVER.starts_with("https://"));
         assert!(!DEFAULT_SERVER.ends_with('/'));
         assert_eq!(DEFAULT_SERVER.trim(), DEFAULT_SERVER);

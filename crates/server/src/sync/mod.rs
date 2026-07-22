@@ -1,7 +1,7 @@
 //! Zero-knowledge sync API: projects, environments, and the secret snapshot/batch hot path.
 //!
 //! The server stores opaque ciphertext (`enc_*`) plus structural metadata, and enforces ownership
-//! on every request (defense in depth — cryptography is not access control). Sync is full-snapshot
+//! on every request (defence in depth - cryptography is not access control). Sync is full-snapshot
 //! pull keyed by a monotonic per-environment `revision` (the ETag, and the anti-rollback signal),
 //! with atomic batch writes guarded by optimistic concurrency on that revision.
 
@@ -31,7 +31,7 @@ pub(crate) const MAX_ENC_KEY: usize = 1024;
 /// This is a **crypto-relevant invariant**, not mere hygiene: the client binds every secret to its
 /// location with an AAD of the form `…|env={env_id}|secret={secret_id}|ver=…` (see
 /// [`sotto_core::vault`]). Because `|` and `=` are the AAD's delimiters, allowing them inside an id
-/// would make that encoding ambiguous — two different `(env, secret)` pairs could serialize to the
+/// would make that encoding ambiguous - two different `(env, secret)` pairs could serialise to the
 /// same AAD string, weakening the substitution/relocation binding. Forbidding delimiter characters
 /// here keeps the AAD unambiguous. Keep the two in sync.
 pub(crate) fn validate_id(id: &str, field: &str) -> Result<()> {

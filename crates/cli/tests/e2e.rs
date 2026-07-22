@@ -1,9 +1,9 @@
 //! End-to-end test over real HTTP + Postgres.
 //!
-//! Device A initializes, sets a secret, and pushes; device B (a fresh store) reconstructs its
+//! Device A initialises, sets a secret, and pushes; device B (a fresh store) reconstructs its
 //! identity + environment from the server using the Emergency Kit, pulls, and decrypts the same
-//! value. This exercises the real wire — the CLI's blocking HTTP client against the actual axum
-//! server and Postgres — that the mock-based engine tests stand in for.
+//! value. This exercises the real wire - the CLI's blocking HTTP client against the actual axum
+//! server and Postgres - that the mock-based engine tests stand in for.
 //!
 //! DB-gated: runs only when `SOTTO_RUN_DB_TESTS=1` and `DATABASE_URL` points at a local Postgres
 //! (it applies migrations and writes rows, so it must never touch a non-local database). A session
@@ -230,7 +230,7 @@ fn share_link_end_to_end_over_http() {
 
 /// The full team lifecycle over real HTTP: Alice creates an org + org-owned project, invites Bob by
 /// email, and shares an environment; Bob (a distinct user + session) clones it and decrypts the same
-/// secret, and writes back. Then Alice removes Bob — which rotates the environment's vault key — and
+/// secret, and writes back. Then Alice removes Bob - which rotates the environment's vault key - and
 /// Bob's access and grant are both gone while Alice keeps working under the new key. Exercises the
 /// CLI's org/invite/grant/rotate HTTP methods and the cross-user crypto against the real server.
 #[test]
@@ -404,7 +404,7 @@ fn env_sharing_and_removal_end_to_end_over_http() {
 }
 
 /// Org-admin recovery over real HTTP: Bob (a member with a shared env) loses his Emergency Kit,
-/// resets his account (fresh keys; the server deletes his dead grants), and the admin re-grants —
+/// resets his account (fresh keys; the server deletes his dead grants), and the admin re-grants -
 /// after which Bob decrypts the shared secret again under his new keypair.
 #[test]
 fn account_reset_recovery_end_to_end_over_http() {
@@ -439,7 +439,7 @@ fn account_reset_recovery_end_to_end_over_http() {
         .unwrap();
     remote::sync::push(&alice, &store_a, master_key_a.as_bytes(), &config).unwrap();
 
-    // Bob: second user with an initialized account, invited and granted the env.
+    // Bob: second user with an initialised account, invited and granted the env.
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (bob_token, bob_email) = rt.block_on(async {
         let pool = sotto_server::db::connect(&database_url).await.unwrap();
@@ -543,7 +543,7 @@ fn account_reset_recovery_end_to_end_over_http() {
 }
 
 /// The machine (CI) loop over real HTTP: create a machine token for a personal environment, then
-/// decrypt the secrets with nothing but the SOTTO_TOKEN string — no store, keychain, or password —
+/// decrypt the secrets with nothing but the SOTTO_TOKEN string - no store, keychain, or password -
 /// and verify revocation kills access immediately.
 #[test]
 fn machine_token_end_to_end_over_http() {

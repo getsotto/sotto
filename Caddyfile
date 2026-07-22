@@ -1,4 +1,4 @@
-# Sotto — same-origin deployment.
+# Sotto - same-origin deployment.
 #
 # Serves the built web app and reverse-proxies the API through ONE origin, so the session cookie
 # and CSP `connect-src 'self'` stay simple, and no CORS is needed. Caddy provisions HTTPS
@@ -18,17 +18,17 @@
 # reject this config.
 {
 	# rate_limit is a non-standard (plugin) directive, so its place in the handler chain must be
-	# declared — run it before the proxy so throttling happens before the request reaches the API.
+	# declared - run it before the proxy so throttling happens before the request reaches the API.
 	order rate_limit before reverse_proxy
 }
 
 {$SOTTO_DOMAIN:localhost} {
 	encode gzip
 
-	# JSON access logs — ops forensics and the funnel's demand counter: a 402 in these logs is a
+	# JSON access logs - ops forensics and the funnel's demand counter: a 402 in these logs is a
 	# free-tier limit hit. Written to the caddy_logs volume (deploy/docker-compose.prod.yml) and
 	# rotated by Caddy itself. Credential headers are DELETED from every entry by the filter
-	# below — enforced here in config, not left to Caddy's default redaction (which has masked
+	# below - enforced here in config, not left to Caddy's default redaction (which has masked
 	# these values since v2.5 but can be re-enabled with `log_credentials`). See
 	# deploy/README.md § Access logs for the reading commands.
 	log {
@@ -48,14 +48,14 @@
 		}
 	}
 
-	# Per-client-IP rate limits on the UNAUTHENTICATED endpoints — the only API surface with no
+	# Per-client-IP rate limits on the UNAUTHENTICATED endpoints - the only API surface with no
 	# credential wall: the OAuth login/callback (which writes a short-lived login-state row), the
 	# public share fetch, and the anonymous telemetry ping (a 503 no-op unless this instance sets
 	# SOTTO_TELEMETRY_INGEST=1). Caddy is the edge here, so {remote_host} is the real client IP, not a
 	# proxied one. Authenticated sync (/account, /projects, /environments/*, /orgs, /machine/*, …) is
 	# deliberately NOT limited: it is bearer-gated and includes high-frequency CI polling that a
 	# per-IP cap could wrongly throttle when a whole team shares one office/NAT egress IP. The
-	# threshold is a generous starting point — raise it, or split into per-endpoint zones, to taste.
+	# threshold is a generous starting point - raise it, or split into per-endpoint zones, to taste.
 	@ratelimited path /auth/github/* /shares /shares/* /telemetry/*
 	handle @ratelimited {
 		rate_limit {
@@ -69,7 +69,7 @@
 	}
 
 	# The rest of the server's API (bearer-authenticated). Together with @ratelimited above this must
-	# cover every path the routers in `crates/server/src/lib.rs` serve — keep the two in sync.
+	# cover every path the routers in `crates/server/src/lib.rs` serve - keep the two in sync.
 	@api path /health /auth/me /auth/logout /account /account/* /projects /projects/* /environments/* /orgs /orgs/* /machine/* /billing/*
 	handle @api {
 		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
@@ -90,7 +90,7 @@
 		header ?Cache-Control "no-cache"
 	}
 
-	# Defense-in-depth headers. The CSP is also baked into index.html (build-time) as a fallback for
+	# Defence-in-depth headers. The CSP is also baked into index.html (build-time) as a fallback for
 	# hosts that don't set headers; the header here is authoritative when present.
 	header {
 		Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"

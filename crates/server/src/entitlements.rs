@@ -2,7 +2,7 @@
 //!
 //! The org is the paid unit. The *effective* tier is `Team` while `tier = 'team'` or the trial is
 //! still running; otherwise the free limits apply. Enforcement happens at creation points (adding
-//! members, creating org projects) and feature gates (the audit log) — never on reads of data a
+//! members, creating org projects) and feature gates (the audit log) - never on reads of data a
 //! team already has, so an expired trial degrades but never locks anyone out of their secrets.
 //!
 //! Tier assignment: [`crate::billing`] flips `tier` from verified Stripe webhooks when billing is
@@ -19,9 +19,9 @@ use crate::error::{Error, Result};
 use crate::org;
 use crate::state::AppState;
 
-/// Free-tier quota: members per organization (including the owner).
+/// Free-tier quota: members per organisation (including the owner).
 pub const FREE_MAX_MEMBERS: i64 = 3;
-/// Free-tier quota: projects per organization.
+/// Free-tier quota: projects per organisation.
 pub const FREE_MAX_ORG_PROJECTS: i64 = 1;
 
 pub fn router() -> Router<AppState> {
@@ -45,7 +45,7 @@ pub async fn effective_tier(pool: &PgPool, org_id: &str) -> Result<Tier> {
     .fetch_optional(pool)
     .await?;
     let (tier, trial_active) =
-        row.ok_or_else(|| Error::NotFound("organization not found".into()))?;
+        row.ok_or_else(|| Error::NotFound("organisation not found".into()))?;
     if tier == "team" || trial_active {
         Ok(Tier::Team)
     } else {
@@ -58,7 +58,7 @@ pub async fn require_team(pool: &PgPool, org_id: &str, feature: &str) -> Result<
     match effective_tier(pool, org_id).await? {
         Tier::Team => Ok(()),
         Tier::Free => Err(Error::Quota(format!(
-            "{feature} is a Team feature; upgrade the organization to keep using it"
+            "{feature} is a Team feature; upgrade the organisation to keep using it"
         ))),
     }
 }
@@ -74,7 +74,7 @@ async fn effective_tier_locked(tx: &mut Transaction<'_, Postgres>, org_id: &str)
     .fetch_optional(&mut **tx)
     .await?;
     let (tier, trial_active) =
-        row.ok_or_else(|| Error::NotFound("organization not found".into()))?;
+        row.ok_or_else(|| Error::NotFound("organisation not found".into()))?;
     if tier == "team" || trial_active {
         Ok(Tier::Team)
     } else {
@@ -83,7 +83,7 @@ async fn effective_tier_locked(tx: &mut Transaction<'_, Postgres>, org_id: &str)
 }
 
 /// Quota gate for adding a member (free tier: at most [`FREE_MAX_MEMBERS`]). Runs inside `tx` and
-/// locks the org row, so the count and the caller's insert commit atomically — two concurrent adds
+/// locks the org row, so the count and the caller's insert commit atomically - two concurrent adds
 /// can't both pass the check and overshoot the limit.
 pub async fn check_can_add_member(tx: &mut Transaction<'_, Postgres>, org_id: &str) -> Result<()> {
     if effective_tier_locked(tx, org_id).await? == Tier::Team {
@@ -96,14 +96,14 @@ pub async fn check_can_add_member(tx: &mut Transaction<'_, Postgres>, org_id: &s
             .await?;
     if members >= FREE_MAX_MEMBERS {
         return Err(Error::Quota(format!(
-            "the free tier allows {FREE_MAX_MEMBERS} members per organization; upgrade to add more"
+            "the free tier allows {FREE_MAX_MEMBERS} members per organisation; upgrade to add more"
         )));
     }
     Ok(())
 }
 
 /// Quota gate for creating an org project (free tier: at most [`FREE_MAX_ORG_PROJECTS`]). Runs
-/// inside `tx` and locks the org row, so the count and the caller's insert commit atomically — two
+/// inside `tx` and locks the org row, so the count and the caller's insert commit atomically - two
 /// concurrent creates can't both pass the check and overshoot the limit. The quota applies only to a
 /// genuinely new `project_id`: an idempotent re-create of one that already exists always passes (so
 /// re-sent `push` creates keep working for an org already at the limit), and that check runs under
@@ -129,7 +129,7 @@ pub async fn check_can_create_org_project(
         .await?;
     if projects >= FREE_MAX_ORG_PROJECTS {
         return Err(Error::Quota(format!(
-            "the free tier allows {FREE_MAX_ORG_PROJECTS} project per organization; upgrade to add more"
+            "the free tier allows {FREE_MAX_ORG_PROJECTS} project per organisation; upgrade to add more"
         )));
     }
     Ok(())
@@ -152,11 +152,11 @@ struct EntitlementsView {
     /// The numeric limits in effect; `null` on the Team tier (unlimited).
     limits: Option<Limits>,
     /// Whether this instance can take payment (the `STRIPE_*` variables are set). Clients hide
-    /// upgrade affordances when `false` — a self-hosted instance has no checkout to offer.
+    /// upgrade affordances when `false` - a self-hosted instance has no checkout to offer.
     billing_enabled: bool,
 }
 
-/// `GET /orgs/{org_id}/entitlements` — the org's plan, visible to any member.
+/// `GET /orgs/{org_id}/entitlements` - the org's plan, visible to any member.
 async fn get_entitlements(
     State(state): State<AppState>,
     user: AuthUser,
@@ -166,11 +166,11 @@ async fn get_entitlements(
         .await?
         .is_none()
     {
-        return Err(Error::NotFound("organization not found".into()));
+        return Err(Error::NotFound("organisation not found".into()));
     }
 
     let (tier, trial_ends_at): (String, Option<String>) = sqlx::query_as(
-        // `AT TIME ZONE 'UTC'` normalizes the timestamptz to UTC before formatting, so the trailing
+        // `AT TIME ZONE 'UTC'` normalises the timestamptz to UTC before formatting, so the trailing
         // `Z` is truthful regardless of the DB session's time zone.
         "SELECT tier, to_char(trial_ends_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
          FROM organizations WHERE id = $1",

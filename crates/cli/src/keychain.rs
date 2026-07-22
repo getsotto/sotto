@@ -65,7 +65,7 @@ impl Keychain for OsKeychain {
     }
 }
 
-/// An in-memory keychain for tests. Not for production use — it offers no at-rest protection.
+/// An in-memory keychain for tests. Not for production use - it offers no at-rest protection.
 #[derive(Default)]
 pub struct MemoryKeychain {
     items: std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,

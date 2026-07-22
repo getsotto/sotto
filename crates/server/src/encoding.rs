@@ -1,7 +1,7 @@
 //! Base64 transport helpers for opaque ciphertext fields.
 //!
 //! Ciphertext travels as base64 in JSON. Decoding rejects oversize input *before* allocating, so a
-//! large field can't force a big allocation only to be rejected afterward.
+//! large field can't force a big allocation only to be rejected afterwards.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;

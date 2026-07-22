@@ -3,7 +3,7 @@
 //! All fields are opaque to the server. [`KdfParams`] carries the (non-secret) Argon2id parameters
 //! plus salt so a new device can re-derive the master key; the rest are ciphertext. The HTTP
 //! upload/download lives in the sync engine (PR5b); this module just assembles the material from
-//! the local store and (de)serializes the KDF parameters.
+//! the local store and (de)serialises the KDF parameters.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +12,7 @@ use sotto_core::kdf;
 use crate::error::{Error, Result};
 use crate::store::Store;
 
-/// Argon2id parameters + salt, serialized into the opaque `kdf_params` blob.
+/// Argon2id parameters + salt, serialised into the opaque `kdf_params` blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KdfParams {
     /// KDF algorithm identifier (currently always `argon2id`).
@@ -54,7 +54,7 @@ pub struct AccountMaterial {
     pub recovery_blob: Vec<u8>,
 }
 
-/// Assemble the local account material for upload. Errors if the identity isn't initialized.
+/// Assemble the local account material for upload. Errors if the identity isn't initialised.
 pub fn material(store: &Store) -> Result<AccountMaterial> {
     let identity = store.get_identity()?.ok_or(Error::NoIdentity)?;
     let keys = store.get_account_keys()?.ok_or(Error::NoIdentity)?;

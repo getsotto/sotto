@@ -1,11 +1,11 @@
-# Sotto — production deployment: Postgres + API server + Caddy (web app, HTTPS) in one command.
+# Sotto - production deployment: Postgres + API server + Caddy (web app, HTTPS) in one command.
 #
 #   cd deploy
 #   cp .env.example .env   # then fill it in
 #   docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d
 #
 # That pulls prebuilt multi-arch images from GHCR (published by .github/workflows/images.yml), so
-# the box never compiles anything — a 1 GB VM is enough. To build from source instead (e.g. to
+# the box never compiles anything - a 1 GB VM is enough. To build from source instead (e.g. to
 # deploy unreleased changes), use `up -d --build`. Pin a version with SOTTO_IMAGE_TAG=vX.Y.Z.
 #
 # See deploy/README.md for the full runbook (DNS, GitHub OAuth app, backups, upgrades).
@@ -38,7 +38,7 @@ services:
       context: ..
     restart: unless-stopped
     environment:
-      # The password is interpolated into a URL — keep it URL-safe (see .env.example).
+      # The password is interpolated into a URL - keep it URL-safe (see .env.example).
       DATABASE_URL: postgres://sotto:${POSTGRES_PASSWORD}@postgres:5432/sotto
       SOTTO_PUBLIC_URL: https://${SOTTO_DOMAIN:?set SOTTO_DOMAIN in deploy/.env}
       SOTTO_WEB_ORIGIN: https://${SOTTO_DOMAIN}
@@ -50,7 +50,7 @@ services:
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_PRICE_ID: ${STRIPE_PRICE_ID:-}
-      # Anonymous daily version ping (random instance uuid + version + os/arch, nothing else —
+      # Anonymous daily version ping (random instance uuid + version + os/arch, nothing else -
       # README §Telemetry). On by default; set SOTTO_TELEMETRY=off in deploy/.env to opt out.
       SOTTO_TELEMETRY: ${SOTTO_TELEMETRY:-}
     depends_on:
@@ -74,7 +74,7 @@ services:
       # Persist certificates and Caddy state across restarts (avoids re-issuing on every deploy).
       - caddy_data:/data
       - caddy_config:/config
-      # JSON access logs (rotated by Caddy — see the Caddyfile's log block).
+      # JSON access logs (rotated by Caddy - see the Caddyfile's log block).
       - caddy_logs:/var/log/caddy
     depends_on:
       - server

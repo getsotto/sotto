@@ -17,7 +17,7 @@ const CSP = [
   "frame-ancestors 'none'",
 ].join("; ");
 
-// Inject the CSP into the *production* HTML only — the dev server needs inline HMR + a WebSocket,
+// Inject the CSP into the *production* HTML only - the dev server needs inline HMR + a WebSocket,
 // which a strict policy would block. Production hosting will also set this as a real header (PR7).
 function cspPlugin(): Plugin {
   return {
@@ -33,7 +33,7 @@ function cspPlugin(): Plugin {
 }
 
 // Add Subresource Integrity to every emitted <script>/<link> so the browser verifies each asset's
-// bytes against a pinned hash — a compromised host/CDN can't swap in tampered code undetected. Runs
+// bytes against a pinned hash - a compromised host/CDN can't swap in tampered code undetected. Runs
 // post-build, hashing the final bundle output. (Vite already adds `crossorigin` to module scripts.)
 function sriPlugin(): Plugin {
   return {
@@ -69,7 +69,7 @@ function sriPlugin(): Plugin {
 
 // Dev only: proxy the API endpoints so the browser talks to a single origin (keeps CSP
 // `connect-src 'self'` and the session cookie same-origin). Production serves the web app and API
-// from one origin (a reverse proxy). `/auth/callback` is intentionally NOT proxied — it's the SPA's
+// from one origin (a reverse proxy). `/auth/callback` is intentionally NOT proxied - it's the SPA's
 // post-login page, whereas `/auth/github/*` are the server's OAuth endpoints.
 const api = { target: "http://localhost:8080", changeOrigin: true };
 

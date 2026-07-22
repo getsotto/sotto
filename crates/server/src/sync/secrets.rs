@@ -50,7 +50,7 @@ struct HistoryRow {
     enc_data_key: String,
 }
 
-/// `GET /environments/{env_id}/history` — every retained version of every secret (server-side
+/// `GET /environments/{env_id}/history` - every retained version of every secret (server-side
 /// history is the complete record; local stores only hold the versions they happened to sync).
 /// Rotation keeps these rows decryptable by rewrapping their data keys, so any member with the
 /// current vault key can read any version.
@@ -127,7 +127,7 @@ struct BatchResponse {
     revision: i64,
 }
 
-/// `GET /environments/{env_id}/secrets` — full snapshot (including tombstones). Returns 304 when
+/// `GET /environments/{env_id}/secrets` - full snapshot (including tombstones). Returns 304 when
 /// the caller's `If-None-Match` already matches the current revision.
 async fn snapshot(
     State(state): State<AppState>,
@@ -169,7 +169,7 @@ async fn snapshot(
     Ok(([(ETAG, etag)], Json(Snapshot { revision, secrets })).into_response())
 }
 
-/// `POST /environments/{env_id}/secrets` — apply a batch of changes atomically. Optimistic
+/// `POST /environments/{env_id}/secrets` - apply a batch of changes atomically. Optimistic
 /// concurrency: 412 if `base_revision` no longer matches. One batch = one monotonic revision bump.
 async fn write_secrets(
     State(state): State<AppState>,
@@ -183,12 +183,12 @@ async fn write_secrets(
         ));
     }
 
-    // Authorize before touching the environment; any member (or personal owner) may write secrets.
+    // Authorise before touching the environment; any member (or personal owner) may write secrets.
     let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
 
     let mut tx = state.pool.begin().await?;
 
-    // Lock the environment row so concurrent batches serialize on its revision.
+    // Lock the environment row so concurrent batches serialise on its revision.
     let current: Option<i64> =
         sqlx::query_scalar("SELECT revision FROM environments WHERE id = $1 FOR UPDATE")
             .bind(&env_id)
@@ -323,7 +323,7 @@ async fn apply_delete(
     Ok(())
 }
 
-/// Look up an environment's current revision. The caller must already be authorized via
+/// Look up an environment's current revision. The caller must already be authorised via
 /// [`env_access`]; this only reads the revision the ETag is built from.
 async fn env_revision(state: &AppState, env_id: &str) -> Result<i64> {
     let revision: Option<i64> =

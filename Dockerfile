@@ -1,4 +1,4 @@
-# Sotto sync server — multi-stage build.
+# Sotto sync server - multi-stage build.
 #
 #   docker build -t sotto-server .
 #   docker run --rm -p 8080:8080 \

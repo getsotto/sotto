@@ -1,7 +1,7 @@
 //! The sync engine: pull-rebase-push reconciliation of one environment's secrets.
 //!
 //! Secrets are opaque ciphertext whose AAD binds the (matching) `env_id`, secret id, and version,
-//! so reconciliation moves blobs verbatim — never re-encrypting. `pull` applies the server snapshot
+//! so reconciliation moves blobs verbatim - never re-encrypting. `pull` applies the server snapshot
 //! to the local store (server wins on a newer version, or an equal-version server-side tombstone);
 //! `push` fast-forwards from a fresh snapshot, diffs local-vs-server, writes the batch at that
 //! `base_revision`, and retries on a concurrency conflict (412). Project/environment names are the
@@ -68,7 +68,7 @@ fn adopt_rotation(
 
 /// Whether our grant for `env_id` differs from `local_grant` (without adopting it). A missing grant
 /// (404) counts as changed: a rotation dropped us from the grant set, so our local key is stale and
-/// pushing under it would upload secrets the team can no longer decrypt — fail closed.
+/// pushing under it would upload secrets the team can no longer decrypt - fail closed.
 fn grant_changed(api: &dyn SyncApi, env_id: &str, local_grant: &[u8]) -> Result<bool> {
     match api.get_grant(env_id)? {
         Some(grant_b64) => Ok(b64decode(&grant_b64)? != local_grant),
@@ -105,7 +105,7 @@ pub fn push(api: &dyn SyncApi, store: &Store, master: &[u8; 32], config: &Config
             return Ok(snapshot.revision);
         }
 
-        // We have local changes. If the env was rotated, they're encrypted under the old vault key —
+        // We have local changes. If the env was rotated, they're encrypted under the old vault key -
         // refuse rather than upload data the team can no longer decrypt.
         if config.org_id.is_some() && grant_changed(api, &env.id, &env.enc_vault_key)? {
             return Err(Error::Conflict(
@@ -122,7 +122,7 @@ pub fn push(api: &dyn SyncApi, store: &Store, master: &[u8; 32], config: &Config
                 store.set_synced_revision(&env.id, resp.revision)?;
                 return Ok(resp.revision);
             }
-            // Someone else advanced the revision between our snapshot and write — re-pull and retry.
+            // Someone else advanced the revision between our snapshot and write - re-pull and retry.
             Err(Error::Conflict(_)) => continue,
             Err(e) => return Err(e),
         }
@@ -138,7 +138,7 @@ fn resolve_env(store: &Store, config: &Config) -> Result<Environment> {
         .ok_or_else(|| Error::NotFound(format!("environment `{}`", config.environment)))
 }
 
-/// Upload account crypto material on first push; a 409 means it's already initialized (fine).
+/// Upload account crypto material on first push; a 409 means it's already initialised (fine).
 fn ensure_account(api: &dyn SyncApi, store: &Store) -> Result<()> {
     let material = account::material(store)?;
     let bundle = AccountBundle {
@@ -155,7 +155,7 @@ fn ensure_account(api: &dyn SyncApi, store: &Store) -> Result<()> {
 
 /// The key display names are encrypted under: the org key for an org project (when this account
 /// holds a copy), else the master key. Falling back to the master keeps pushes working for an org
-/// the caller has no org key for — the names are then creator-readable only, as before org keys.
+/// the caller has no org key for - the names are then creator-readable only, as before org keys.
 fn name_key(api: &dyn SyncApi, store: &Store, master: &[u8; 32], org_id: Option<&str>) -> [u8; 32] {
     if let Some(org) = org_id {
         if let Ok(keypair) = account_keypair(store, master) {
@@ -174,11 +174,11 @@ fn account_keypair(store: &Store, master: &[u8; 32]) -> Result<sotto_core::wrap:
 }
 
 /// Idempotently create the project + environment server-side (encrypting their names under
-/// `key` — the org key for org projects, else the master key). `org_id`, when set, creates the
-/// project under that organization (the caller must be an admin+ of it).
+/// `key` - the org key for org projects, else the master key). `org_id`, when set, creates the
+/// project under that organisation (the caller must be an admin+ of it).
 ///
 /// On an org-owned project a plain member lacks the admin+ rights these structural creates require,
-/// so the server answers 403 — but the member cloned an environment that already exists and may
+/// so the server answers 403 - but the member cloned an environment that already exists and may
 /// still write its secrets, so that 403 is expected and non-fatal. Any other error, or a 403 on a
 /// personal project, stays fatal. A member whose env genuinely doesn't exist server-side still fails
 /// later, as a 404 from the snapshot call.
@@ -225,7 +225,7 @@ fn tolerate_org_forbidden(res: Result<()>, org_id: Option<&str>) -> Result<()> {
 
 /// Apply a server snapshot to the local store: server wins on a strictly newer version, or on an
 /// equal-version tombstone the server introduced. `force` overrides the version gate to overwrite
-/// every secret — used after a key rotation, where the data keys were rewrapped in place (same
+/// every secret - used after a key rotation, where the data keys were rewrapped in place (same
 /// version) and would otherwise be missed.
 fn apply_snapshot(store: &Store, env_id: &str, snapshot: &Snapshot, force: bool) -> Result<()> {
     for remote in &snapshot.secrets {
@@ -298,13 +298,13 @@ fn set_change(local: SyncSecret) -> SecretChange {
 pub struct HistoryVersion {
     pub version: i64,
     /// The decrypted value, or `None` when this row doesn't authenticate under the current vault
-    /// key (it predates a rotation this device hasn't caught up with — `sotto pull` first).
+    /// key (it predates a rotation this device hasn't caught up with - `sotto pull` first).
     pub value: Option<Vec<u8>>,
 }
 
 /// The server-side version history of one secret, newest first, decrypted under the current vault
-/// key. The server is the source of truth for history — local stores only hold the versions they
-/// happened to sync — and rotation rewraps history keys, so every row should decrypt.
+/// key. The server is the source of truth for history - local stores only hold the versions they
+/// happened to sync - and rotation rewraps history keys, so every row should decrypt.
 pub fn history(
     api: &dyn SyncApi,
     store: &Store,
@@ -342,7 +342,7 @@ pub fn history(
 }
 
 /// Roll a secret back: decrypt `version`'s value from the server history and set it as a NEW
-/// version through the normal set path (monotonic versions, normal sync — nothing is rewritten).
+/// version through the normal set path (monotonic versions, normal sync - nothing is rewritten).
 /// The change is local until the next `push`. Returns the restored value's byte length.
 pub fn rollback(
     api: &dyn SyncApi,
@@ -426,7 +426,7 @@ pub fn restore_account(
 
 /// Reconstruct the local project + environments from the server. Env names decrypt under the org
 /// key (org projects) or the master key (personal); an undecryptable name falls back to the env
-/// id. Environments the caller holds no grant for are skipped — they couldn't be opened anyway.
+/// id. Environments the caller holds no grant for are skipped - they couldn't be opened anyway.
 /// Existing local rows are left untouched. Run after [`restore_account`], before [`pull`], on a
 /// new device.
 pub fn pull_environments(
@@ -447,7 +447,7 @@ pub fn pull_environments(
             continue; // no grant for this env: nothing we could ever decrypt
         };
         // Try the resolved key, then the master (an org env pushed before the org key existed),
-        // then fall back to the id — a missing display name must not block reconstruction.
+        // then fall back to the id - a missing display name must not block reconstruction.
         let enc_name = b64decode(&env.enc_name)?;
         let name = names::decrypt_env_name(&key, &env.id, &enc_name)
             .or_else(|_| names::decrypt_env_name(master, &env.id, &enc_name))
@@ -501,7 +501,7 @@ mod tests {
         enc_name: String,
         revision: i64,
         secrets: HashMap<String, ServerSecret>,
-        /// `(secret_id, version)` → `(enc_name, enc_value, enc_data_key)` — the retained history.
+        /// `(secret_id, version)` → `(enc_name, enc_value, enc_data_key)` - the retained history.
         history: HashMap<(String, i64), HistoryRec>,
     }
 
@@ -589,7 +589,7 @@ mod tests {
         fn put_account(&self, bundle: &AccountBundle) -> Result<()> {
             let mut s = self.state.borrow_mut();
             if s.account.is_some() {
-                return Err(Error::Conflict("account already initialized".into()));
+                return Err(Error::Conflict("account already initialised".into()));
             }
             s.account = Some(bundle.clone());
             Ok(())
@@ -599,7 +599,7 @@ mod tests {
             let me = self.current_user();
             let mut s = self.state.borrow_mut();
             if s.account.is_none() {
-                return Err(Error::NotFound("account is not initialized".into()));
+                return Err(Error::NotFound("account is not initialised".into()));
             }
             s.account = Some(bundle.clone());
             // Mirror the server: the caller's now-dead grants are deleted with the reset, and
@@ -614,7 +614,7 @@ mod tests {
             for org in s.orgs.values_mut() {
                 if let Some(rec) = org.members.get_mut(&me) {
                     rec.public_key = Some(new_key.clone());
-                    // Mirror the server: the sealed org key was for the dead keypair — cleared.
+                    // Mirror the server: the sealed org key was for the dead keypair - cleared.
                     rec.enc_org_key = None;
                 }
             }
@@ -821,7 +821,7 @@ mod tests {
             let org = s
                 .orgs
                 .get_mut(org_id)
-                .ok_or_else(|| Error::NotFound("organization not found".into()))?;
+                .ok_or_else(|| Error::NotFound("organisation not found".into()))?;
             let member = org
                 .members
                 .get_mut(user_id)
@@ -840,7 +840,7 @@ mod tests {
             let org = s
                 .orgs
                 .get_mut(org_id)
-                .ok_or_else(|| Error::NotFound("organization not found".into()))?;
+                .ok_or_else(|| Error::NotFound("organisation not found".into()))?;
             org.members.entry(user_id.clone()).or_insert(MemberRec {
                 role: "member".into(),
                 public_key: public_key.clone(),
@@ -857,7 +857,7 @@ mod tests {
             let org = s
                 .orgs
                 .get(org_id)
-                .ok_or_else(|| Error::NotFound("organization not found".into()))?;
+                .ok_or_else(|| Error::NotFound("organisation not found".into()))?;
             let mut members: Vec<_> = org
                 .members
                 .iter()
@@ -916,7 +916,7 @@ mod tests {
 
         fn org_entitlements(&self, _org_id: &str) -> Result<super::super::api::Entitlements> {
             // Like the audit log, plans are a server-side concern with no client crypto; the
-            // server DB tests own the behavior.
+            // server DB tests own the behaviour.
             Ok(super::super::api::Entitlements {
                 tier: "free".into(),
                 effective_tier: "team".into(),
@@ -930,7 +930,7 @@ mod tests {
             _org_id: &str,
             _limit: Option<i64>,
         ) -> Result<Vec<super::super::api::AuditEvent>> {
-            // Audit is a server-side ledger with no client crypto; its behavior is covered by the
+            // Audit is a server-side ledger with no client crypto; its behaviour is covered by the
             // server DB tests, so the mock has nothing to prove and returns an empty log.
             Ok(Vec::new())
         }
@@ -1094,7 +1094,7 @@ mod tests {
         }
     }
 
-    /// A store with an initialized account + a project (dev/staging/prod) and its config.
+    /// A store with an initialised account + a project (dev/staging/prod) and its config.
     fn device() -> (Store, Project, Config) {
         let store = Store::open_in_memory().unwrap();
         let kc = crate::keychain::MemoryKeychain::default();
@@ -1113,7 +1113,7 @@ mod tests {
     /// as a real new device would after environment sync.
     fn mirror(src: &Store, project: &Project) -> Store {
         let store = Store::open_in_memory().unwrap();
-        // A real second device has its own initialized identity/account material (its push's
+        // A real second device has its own initialised identity/account material (its push's
         // duplicate account upload is ignored by the server). The vault still uses MASTER directly.
         let kc = crate::keychain::MemoryKeychain::default();
         crate::session::init(&store, &kc, b"pw", std::time::Duration::from_secs(3600)).unwrap();
@@ -1247,7 +1247,7 @@ mod tests {
     }
 
     /// A real device whose vault uses the *derived* master key (not the `MASTER` constant), so the
-    /// account material is consistent with the secrets — required to test reconstruction.
+    /// account material is consistent with the secrets - required to test reconstruction.
     fn real_device() -> (
         Store,
         [u8; 32],
@@ -1490,7 +1490,7 @@ mod tests {
         let (store_a, master_a, _kit, project, config0) = real_device();
         let alice = device_keypair(&store_a, &master_a);
 
-        // Bob is his own initialized device; his account keypair is what grants seal to.
+        // Bob is his own initialised device; his account keypair is what grants seal to.
         let store_b = Store::open_in_memory().unwrap();
         let kc_b = crate::keychain::MemoryKeychain::default();
         crate::session::init(
@@ -1626,7 +1626,7 @@ mod tests {
         .unwrap();
         assert_eq!(value, b"s3cr3t");
 
-        // A revoked token drops out of rotation coverage: revoke, rotate again — still succeeds.
+        // A revoked token drops out of rotation coverage: revoke, rotate again - still succeeds.
         let token_id = api
             .state
             .borrow()
@@ -1753,7 +1753,7 @@ mod tests {
             ]
         );
 
-        // Rotate, adopt the new key, and history STILL decrypts — the rotation rewrapped it.
+        // Rotate, adopt the new key, and history STILL decrypts - the rotation rewrapped it.
         let env = store.get_environment(&project.id, "dev").unwrap().unwrap();
         team::rotate_env(&api, &alice, &org_id, &env.id, None)
             .unwrap()
@@ -1811,7 +1811,7 @@ mod tests {
         api.as_user("bob-user");
         assert_eq!(team::list_orgs(&api, &bob).unwrap()[0].name, "acme-team");
 
-        // Share + clone: the cloned env auto-labels with its REAL name — no `--as` needed.
+        // Share + clone: the cloned env auto-labels with its REAL name - no `--as` needed.
         api.as_user("test-user");
         let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
         api.as_user("bob-user");

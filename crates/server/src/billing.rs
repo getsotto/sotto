@@ -2,11 +2,11 @@
 //!
 //! Deliberately thin: entitlements ([`crate::entitlements`]) already gate everything on
 //! `organizations.tier`, so this module's only real job is flipping that column in response to
-//! **signature-verified** Stripe webhooks. Checkout and the portal are Stripe-hosted pages — the
+//! **signature-verified** Stripe webhooks. Checkout and the portal are Stripe-hosted pages - the
 //! server hands the browser a redirect URL and never touches card data.
 //!
 //! Ships dark: without the `STRIPE_*` environment variables every endpoint returns 503 (the OAuth
-//! pattern). Zero-knowledge is unaffected — Stripe learns an org *id* and whatever the payer types
+//! pattern). Zero-knowledge is unaffected - Stripe learns an org *id* and whatever the payer types
 //! into Stripe's own pages; org names, membership, and vault data never leave the server.
 
 use std::sync::OnceLock;
@@ -30,7 +30,7 @@ use crate::{audit, org};
 /// Reject webhook timestamps further than this from now (replay protection).
 const SIGNATURE_TOLERANCE_SECS: i64 = 300;
 /// Subscription statuses that keep the Team tier. `past_due` stays paid while Stripe retries the
-/// card (dunning) — losing entitlements over a bounced payment is the wrong first touch.
+/// card (dunning) - losing entitlements over a bounced payment is the wrong first touch.
 const ACTIVE_STATUSES: [&str; 3] = ["active", "trialing", "past_due"];
 
 pub fn router() -> Router<AppState> {
@@ -54,7 +54,7 @@ async fn require_billing_admin(pool: &PgPool, org_id: &str, user_id: &str) -> Re
         Some(_) => Err(Error::Forbidden(
             "managing billing requires the admin or owner role".into(),
         )),
-        None => Err(Error::NotFound("organization not found".into())),
+        None => Err(Error::NotFound("organisation not found".into())),
     }
 }
 
@@ -64,7 +64,7 @@ struct RedirectView {
     url: String,
 }
 
-/// `POST /orgs/{org_id}/billing/checkout` — start a Team subscription (admin+). Returns the URL of
+/// `POST /orgs/{org_id}/billing/checkout` - start a Team subscription (admin+). Returns the URL of
 /// a Stripe Checkout page; the tier flips when the `checkout.session.completed` webhook arrives.
 async fn create_checkout(
     State(state): State<AppState>,
@@ -111,7 +111,7 @@ async fn create_checkout(
     }))
 }
 
-/// `POST /orgs/{org_id}/billing/portal` — manage/cancel the subscription (admin+) via Stripe's
+/// `POST /orgs/{org_id}/billing/portal` - manage/cancel the subscription (admin+) via Stripe's
 /// hosted customer portal.
 async fn create_portal(
     State(state): State<AppState>,
@@ -128,7 +128,7 @@ async fn create_portal(
             .await?
             .flatten();
     let customer = customer.ok_or_else(|| {
-        Error::BadRequest("this organization has no billing account yet — subscribe first".into())
+        Error::BadRequest("this organisation has no billing account yet - subscribe first".into())
     })?;
 
     let form = vec![
@@ -161,7 +161,7 @@ fn checkout_return_urls(base: &str) -> (String, String) {
 
 /// The process-wide Stripe HTTP client, built once and reused (reqwest pools connections behind an
 /// `Arc`, so cloning/sharing is cheap). Bounded by the same timeouts as the GitHub OAuth client
-/// (`auth::oauth`): a stalled Stripe — slow DNS/TLS, a hung connection — must not tie up the request
+/// (`auth::oauth`): a stalled Stripe - slow DNS/TLS, a hung connection - must not tie up the request
 /// task and its socket indefinitely.
 fn stripe_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -216,7 +216,7 @@ struct EventData {
     object: serde_json::Value,
 }
 
-/// `POST /billing/webhook` — Stripe's event delivery. Signature-verified against the endpoint's
+/// `POST /billing/webhook` - Stripe's event delivery. Signature-verified against the endpoint's
 /// signing secret; unhandled event types are acknowledged and ignored (so the endpoint can be
 /// subscribed broadly in the dashboard without breaking).
 async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String) -> Result<()> {
@@ -244,7 +244,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     }
 }
 
-/// A paid checkout: record the Stripe ids and grant the Team tier. Idempotent — a redelivered
+/// A paid checkout: record the Stripe ids and grant the Team tier. Idempotent - a redelivered
 /// event changes no rows and writes no duplicate audit entry.
 async fn checkout_completed(pool: &PgPool, object: &serde_json::Value) -> Result<()> {
     // Sessions this server creates always carry the org id; anything else isn't ours to act on.
@@ -322,7 +322,7 @@ async fn subscription_updated(pool: &PgPool, object: &serde_json::Value) -> Resu
     Ok(())
 }
 
-/// The subscription ended for good: back to the free tier (existing data stays readable — the
+/// The subscription ended for good: back to the free tier (existing data stays readable - the
 /// entitlement gates are creation-time only).
 async fn subscription_deleted(pool: &PgPool, object: &serde_json::Value) -> Result<()> {
     let Some(org_id) = org_for_subscription(pool, object).await? else {

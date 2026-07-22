@@ -1,7 +1,7 @@
 //! Entitlements (M6 PR5): the 14-day Team trial, free-tier quotas, and the Team feature gate.
 //!
 //! New orgs trial the Team tier; expiry drops them to the (deliberately tight) free limits;
-//! a manual upgrade lifts everything. Enforcement is creation-time + feature-gate only — an
+//! a manual upgrade lifts everything. Enforcement is creation-time + feature-gate only - an
 //! expired trial never blocks reading or syncing what a team already has. DB-gated like the rest.
 
 use axum::body::Body;
@@ -152,7 +152,7 @@ async fn trial_grants_team_then_expiry_enforces_free_limits() {
     }
     send(&pool, "POST", "/orgs", &owner, Some(org_body(o))).await;
 
-    // On trial: effectively Team — no limits reported, audit readable, many members fine.
+    // On trial: effectively Team - no limits reported, audit readable, many members fine.
     let (status, body) = send(
         &pool,
         "GET",
@@ -201,7 +201,7 @@ async fn trial_grants_team_then_expiry_enforces_free_limits() {
         StatusCode::CREATED
     );
 
-    // Trial over: the org drops to free — audit gated, both quotas enforced with 402s.
+    // Trial over: the org drops to free - audit gated, both quotas enforced with 402s.
     expire_trial(&pool, o).await;
     let (_, body) = send(
         &pool,

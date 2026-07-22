@@ -1,7 +1,7 @@
 //! The org audit log: append-only recording of team state changes, and its read endpoint.
 //!
 //! Handlers call [`record`] (or [`record_tx`] inside a transaction, so the event commits or rolls
-//! back with the change it describes). An audit insert failure fails the operation — a log with
+//! back with the change it describes). An audit insert failure fails the operation - a log with
 //! silent gaps is worse than a failed request. Reads are admin+-only and newest-first.
 
 use axum::extract::{Path, Query, State};
@@ -31,7 +31,7 @@ pub struct Context<'a> {
     pub target: Option<&'a str>,
     /// The affected environment.
     pub env_id: Option<&'a str>,
-    /// Small human-readable context (a role, a change count) — metadata only.
+    /// Small human-readable context (a role, a change count) - metadata only.
     pub detail: Option<&'a str>,
 }
 
@@ -110,7 +110,7 @@ type EventRow = (
     String,
 );
 
-/// `GET /orgs/{org_id}/audit?limit=N` — the org's events, newest first (admin+).
+/// `GET /orgs/{org_id}/audit?limit=N` - the org's events, newest first (admin+).
 async fn list_events(
     State(state): State<AppState>,
     user: AuthUser,
@@ -124,14 +124,14 @@ async fn list_events(
                 "must be an admin or owner to read the audit log".into(),
             ))
         }
-        None => return Err(Error::NotFound("organization not found".into())),
+        None => return Err(Error::NotFound("organisation not found".into())),
     }
     // The audit log is the flagship Team feature; the trial covers it, expiry gates it.
     crate::entitlements::require_team(&state.pool, &org_id, "the audit log").await?;
 
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let rows: Vec<EventRow> = sqlx::query_as(
-        // `AT TIME ZONE 'UTC'` normalizes the timestamptz to UTC before formatting, so the trailing
+        // `AT TIME ZONE 'UTC'` normalises the timestamptz to UTC before formatting, so the trailing
         // `Z` is truthful regardless of the DB session's time zone.
         "SELECT id, actor, action, target, env_id, detail, \
                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \

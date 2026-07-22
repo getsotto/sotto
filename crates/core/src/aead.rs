@@ -6,7 +6,7 @@
 //! field`).
 //!
 //! Why RustCrypto here and dryoc elsewhere: dryoc's secretstream uses `usize::to_le_bytes()`
-//! for its length fields, which is 4 bytes on wasm32 and panics — broken in the browser. This
+//! for its length fields, which is 4 bytes on wasm32 and panics - broken in the browser. This
 //! is the one place we step outside dryoc, for a wasm32-safe, textbook one-shot AEAD.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -45,7 +45,7 @@ pub fn seal(key: &[u8; KEY_LEN], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
 /// Decrypt a versioned envelope under `key`, verifying `aad`.
 ///
 /// Returns [`Error::Crypto`] on any authentication failure (wrong key, tampered ciphertext, or
-/// mismatched `aad`) — deliberately without distinguishing the cause.
+/// mismatched `aad`) - deliberately without distinguishing the cause.
 pub fn open(key: &[u8; KEY_LEN], envelope: &[u8], aad: &[u8]) -> Result<Vec<u8>, Error> {
     if envelope.len() < 2 + NONCE_LEN {
         return Err(Error::Malformed("envelope too short"));

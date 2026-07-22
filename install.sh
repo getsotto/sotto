@@ -28,7 +28,7 @@ case "$os/$arch" in
 Darwin/arm64) target="aarch64-apple-darwin" ;;
 Darwin/x86_64) target="x86_64-apple-darwin" ;;
 Linux/x86_64) target="x86_64-unknown-linux-gnu" ;;
-*) fail "no prebuilt binary for $os/$arch — build from source: cargo build --release -p sotto-cli" ;;
+*) fail "no prebuilt binary for $os/$arch - build from source: cargo build --release -p sotto-cli" ;;
 esac
 
 # --- resolve the version -------------------------------------------------------------------------
@@ -57,18 +57,18 @@ curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" || fail "download failed: $ba
     else
         shasum -a 256 -c asset.sum >/dev/null
     fi
-) || fail "checksum verification FAILED — refusing to install"
+) || fail "checksum verification FAILED - refusing to install"
 say "checksum verified"
 
-# Signature check: keyless Sigstore signatures bind the artifact to the release workflow's
-# identity. Opportunistic — run when cosign is available; SECURITY.md has the manual steps.
+# Signature check: keyless Sigstore signatures bind the artefact to the release workflow's
+# identity. Opportunistic - run when cosign is available; SECURITY.md has the manual steps.
 if command -v cosign >/dev/null 2>&1; then
     if curl -fsSL -o "$tmp/$asset.sigstore.json" "$base/$asset.sigstore.json"; then
         cosign verify-blob \
             --bundle "$tmp/$asset.sigstore.json" \
             --certificate-identity-regexp "^https://github.com/$REPO/.github/workflows/release.yml@refs/tags/v" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            "$tmp/$asset" >/dev/null 2>&1 || fail "Sigstore verification FAILED — refusing to install"
+            "$tmp/$asset" >/dev/null 2>&1 || fail "Sigstore verification FAILED - refusing to install"
         say "signature verified (Sigstore)"
     else
         say "note: no signature bundle found for this release; checksum-only install"
@@ -85,7 +85,7 @@ install -m 755 "$tmp/sotto-$version-$target/sotto" "$INSTALL_DIR/sotto"
 say "installed $INSTALL_DIR/sotto"
 case ":$PATH:" in
 *":$INSTALL_DIR:"*) ;;
-*) say "note: $INSTALL_DIR is not on your PATH — add: export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
+*) say "note: $INSTALL_DIR is not on your PATH - add: export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
 esac
 say "shell completions: sotto completions bash|zsh|fish (also bundled in the release tarball)"
 say "get started: sotto init"

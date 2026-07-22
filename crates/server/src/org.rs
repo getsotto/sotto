@@ -1,14 +1,14 @@
-//! Organizations, memberships, and roles — the team-RBAC substrate.
+//! Organisations, memberships, and roles - the team-RBAC substrate.
 //!
 //! Authority lives in `organization_memberships`: a caller's [`Role`] in an org decides what they
 //! may do. Managing members needs `admin` or higher; only an `owner` may grant/modify the `owner`
 //! role or delete the org; an org can never be left with zero owners. To avoid leaking which orgs
-//! exist, a non-member is answered with `404` (not `403`) — `403` is reserved for a member who is
+//! exist, a non-member is answered with `404` (not `403`) - `403` is reserved for a member who is
 //! in the org but lacks the role for the action.
 //!
-//! This is the authorization layer. Resource access is resolved from membership in
+//! This is the authorisation layer. Resource access is resolved from membership in
 //! [`crate::sync::access`], and the crypto grants that let members actually *decrypt* live in
-//! [`crate::sync::grants`] — cryptography is not access control, so both layers check. `enc_name`
+//! [`crate::sync::grants`] - cryptography is not access control, so both layers check. `enc_name`
 //! here is server-opaque ciphertext, exactly like `projects.enc_name`.
 
 use axum::extract::{Path, State};
@@ -45,7 +45,7 @@ pub fn router() -> Router<AppState> {
         .route("/orgs/{org_id}/invites", post(invite_member))
 }
 
-/// A member's role in an organization. Ordered `member < admin < owner`; the numeric [`Role::rank`]
+/// A member's role in an organisation. Ordered `member < admin < owner`; the numeric [`Role::rank`]
 /// backs every capability check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,7 +64,7 @@ impl Role {
         }
     }
 
-    /// Parse a role from its stored text. Unknown values mean the DB and this enum disagree — a bug,
+    /// Parse a role from its stored text. Unknown values mean the DB and this enum disagree - a bug,
     /// not client input (a `CHECK` constraint keeps the column to the three known values).
     pub(crate) fn from_db(s: &str) -> Result<Role> {
         match s {
@@ -97,7 +97,7 @@ impl Role {
     }
 }
 
-/// The caller's role in `org_id` if they are a member, else `None` — a non-erroring lookup for the
+/// The caller's role in `org_id` if they are a member, else `None` - a non-erroring lookup for the
 /// sync layer's access checks (which turn "not a member" into a resource `404`, not an org error).
 pub(crate) async fn role_of(
     pool: &sqlx::PgPool,
@@ -121,7 +121,7 @@ struct CreateOrg {
     id: String,
     /// The org name, encrypted under the org key (client-generated).
     enc_name: String,
-    /// The org key sealed to the creator's public key — their own copy, stored on their membership.
+    /// The org key sealed to the creator's public key - their own copy, stored on their membership.
     enc_org_key: String,
 }
 
@@ -131,7 +131,7 @@ struct OrgView {
     enc_name: String,
     /// The caller's own role in this org.
     role: Role,
-    /// The org key sealed to the caller (base64), or `null` if they haven't been granted it —
+    /// The org key sealed to the caller (base64), or `null` if they haven't been granted it -
     /// without it, clients show record ids instead of names.
     enc_org_key: Option<String>,
 }
@@ -171,14 +171,14 @@ struct Invite {
 struct InviteResult {
     /// The resolved user's id, now a `member` of the org.
     user_id: String,
-    /// Their public key (base64) if set — lets the inviter seal env grants immediately.
+    /// Their public key (base64) if set - lets the inviter seal env grants immediately.
     public_key: Option<String>,
 }
 
-// --- authorization helpers ---------------------------------------------------------------------
+// --- authorisation helpers ---------------------------------------------------------------------
 
 /// The caller's role in `org_id`, or `404` if they are not a member (which also covers "org does
-/// not exist" — the two are indistinguishable to a non-member on purpose).
+/// not exist" - the two are indistinguishable to a non-member on purpose).
 async fn caller_role(state: &AppState, org_id: &str, user_id: &str) -> Result<Role> {
     let role: Option<String> = sqlx::query_scalar(
         "SELECT role FROM organization_memberships WHERE org_id = $1 AND user_id = $2",
@@ -189,7 +189,7 @@ async fn caller_role(state: &AppState, org_id: &str, user_id: &str) -> Result<Ro
     .await?;
     match role {
         Some(r) => Role::from_db(&r),
-        None => Err(Error::NotFound("organization not found".into())),
+        None => Err(Error::NotFound("organisation not found".into())),
     }
 }
 
@@ -213,7 +213,7 @@ where
 }
 
 /// Lock every owner row of `org_id` for the rest of `tx`, returning how many there are. Holding
-/// these row locks serializes concurrent demotions and removals: without it two owners can each
+/// these row locks serialises concurrent demotions and removals: without it two owners can each
 /// observe "more than one owner", both proceed, and leave the org with zero owners.
 async fn lock_owner_count(tx: &mut Transaction<'_, Postgres>, org_id: &str) -> Result<usize> {
     let owners: Vec<String> = sqlx::query_scalar(
@@ -228,7 +228,7 @@ async fn lock_owner_count(tx: &mut Transaction<'_, Postgres>, org_id: &str) -> R
 
 // --- handlers ----------------------------------------------------------------------------------
 
-/// `POST /orgs` — create an org; the creator becomes its first `owner`. Idempotent: re-creating one
+/// `POST /orgs` - create an org; the creator becomes its first `owner`. Idempotent: re-creating one
 /// the caller already owns returns 200; an id already in use by another org returns 409.
 async fn create_org(
     State(state): State<AppState>,
@@ -294,14 +294,14 @@ async fn create_org(
     .await?;
     match existing.as_deref() {
         Some("owner") => Ok(StatusCode::OK),
-        _ => Err(Error::Conflict("organization id already in use".into())),
+        _ => Err(Error::Conflict("organisation id already in use".into())),
     }
 }
 
 /// Org listing row: `(id, enc_name, role, enc_org_key)`.
 type OrgRow = (String, Vec<u8>, String, Option<Vec<u8>>);
 
-/// `GET /orgs` — the orgs the caller belongs to, each with the caller's own role and (when granted)
+/// `GET /orgs` - the orgs the caller belongs to, each with the caller's own role and (when granted)
 /// their sealed copy of the org key.
 async fn list_orgs(State(state): State<AppState>, user: AuthUser) -> Result<Json<Vec<OrgView>>> {
     let rows: Vec<OrgRow> = sqlx::query_as(
@@ -327,7 +327,7 @@ async fn list_orgs(State(state): State<AppState>, user: AuthUser) -> Result<Json
     Ok(Json(orgs))
 }
 
-/// `POST /orgs/{org_id}/members/{user_id}/org-key` — store (or replace) a member's sealed copy of
+/// `POST /orgs/{org_id}/members/{user_id}/org-key` - store (or replace) a member's sealed copy of
 /// the org key (admin+). Invites and env-sharing upsert this so members can read display names;
 /// it also re-grants a member whose account reset NULLed their copy.
 async fn grant_org_key(
@@ -371,7 +371,7 @@ async fn grant_org_key(
     Ok(StatusCode::OK)
 }
 
-/// `DELETE /orgs/{org_id}` — delete an org (owner only). Cascades to its memberships.
+/// `DELETE /orgs/{org_id}` - delete an org (owner only). Cascades to its memberships.
 async fn delete_org(
     State(state): State<AppState>,
     user: AuthUser,
@@ -379,7 +379,7 @@ async fn delete_org(
 ) -> Result<StatusCode> {
     if caller_role(&state, &org_id, &user.user_id).await? != Role::Owner {
         return Err(Error::Forbidden(
-            "only an owner can delete the organization".into(),
+            "only an owner can delete the organisation".into(),
         ));
     }
     sqlx::query("DELETE FROM organizations WHERE id = $1")
@@ -389,7 +389,7 @@ async fn delete_org(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /orgs/{org_id}/members` — list members (any member of the org may).
+/// `GET /orgs/{org_id}/members` - list members (any member of the org may).
 async fn list_members(
     State(state): State<AppState>,
     user: AuthUser,
@@ -419,7 +419,7 @@ async fn list_members(
     Ok(Json(members))
 }
 
-/// `POST /orgs/{org_id}/members` — add an existing user (admin+). Granting `owner` requires the
+/// `POST /orgs/{org_id}/members` - add an existing user (admin+). Granting `owner` requires the
 /// caller to be an owner. 409 if already a member; 404 if the user does not exist.
 async fn add_member(
     State(state): State<AppState>,
@@ -481,7 +481,7 @@ async fn add_member(
     }
 }
 
-/// `POST /orgs/{org_id}/invites` — invite an existing Sotto user by email (admin+). The email must
+/// `POST /orgs/{org_id}/invites` - invite an existing Sotto user by email (admin+). The email must
 /// resolve to exactly one existing user, who is added as a `member`; returns their id + public key
 /// so the inviter can seal env grants right away. 404 if no such user, 409 if ambiguous or already a
 /// member. (Existing-users-only: there is no pending-invite/onboarding flow yet.)
@@ -550,7 +550,7 @@ struct EnvGrantRef {
     env_id: String,
 }
 
-/// `GET /orgs/{org_id}/members/{user_id}/grants` — the ids of this org's environments that `user_id`
+/// `GET /orgs/{org_id}/members/{user_id}/grants` - the ids of this org's environments that `user_id`
 /// currently holds a grant to (admin+). The removal flow uses this to enumerate what to re-key.
 async fn member_env_grants(
     State(state): State<AppState>,
@@ -579,7 +579,7 @@ async fn member_env_grants(
     ))
 }
 
-/// `POST /orgs/{org_id}/members/{user_id}` — change a member's role (admin+). Changing to or from
+/// `POST /orgs/{org_id}/members/{user_id}` - change a member's role (admin+). Changing to or from
 /// `owner` requires the caller to be an owner; the last owner cannot be demoted.
 async fn update_member(
     State(state): State<AppState>,
@@ -594,7 +594,7 @@ async fn update_member(
         ));
     }
     // Lock the org's owner set for the rest of the transaction so the last-owner guard and the
-    // write commit atomically; two owners demoting each other concurrently serialize here.
+    // write commit atomically; two owners demoting each other concurrently serialise here.
     let mut tx = state.pool.begin().await?;
     let owners = lock_owner_count(&mut tx, &org_id).await?;
     let current = member_role(&mut *tx, &org_id, &target).await?;
@@ -630,7 +630,7 @@ async fn update_member(
     Ok(StatusCode::OK)
 }
 
-/// `DELETE /orgs/{org_id}/members/{user_id}` — remove a member (admin+). Removing an owner requires
+/// `DELETE /orgs/{org_id}/members/{user_id}` - remove a member (admin+). Removing an owner requires
 /// the caller to be an owner; the last owner cannot be removed.
 async fn remove_member(
     State(state): State<AppState>,
@@ -644,7 +644,7 @@ async fn remove_member(
         ));
     }
     // Lock the org's owner set for the rest of the transaction so the last-owner guard and the
-    // delete commit atomically; two owners removing each other concurrently serialize here.
+    // delete commit atomically; two owners removing each other concurrently serialise here.
     let mut tx = state.pool.begin().await?;
     let owners = lock_owner_count(&mut tx, &org_id).await?;
     let current = member_role(&mut *tx, &org_id, &target).await?;
@@ -678,7 +678,7 @@ async fn remove_member(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// True only for the `user_id` foreign-key violation — the referenced user does not exist. Scoped
+/// True only for the `user_id` foreign-key violation - the referenced user does not exist. Scoped
 /// to that one constraint by name so an unrelated FK failure (e.g. a racing org deletion breaking
 /// the `org_id` reference) isn't misreported as "user not found".
 fn is_user_fk_violation(e: &sqlx::Error) -> bool {

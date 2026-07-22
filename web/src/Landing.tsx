@@ -7,7 +7,7 @@ const INSTALL_CMD =
   "curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh";
 
 // The marketing page an anonymous visitor gets at `/`. The vault app lives at /app; this page's
-// job is the top of the funnel: see it → install it. Everything is real, selectable text — the
+// job is the top of the funnel: see it → install it. Everything is real, selectable text - the
 // terminal below is a transcript of actual CLI output, not an image.
 export function Landing() {
   return (
@@ -194,7 +194,7 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-// A transcript of a real session — the strings match what the CLI actually prints. CSS reveals it
+// A transcript of a real session - the strings match what the CLI actually prints. CSS reveals it
 // line by line on load (see landing.css); with reduced motion, or once finished, it is simply a
 // static, selectable code block. The share link is the page's one loud value.
 function Terminal() {
@@ -206,14 +206,14 @@ function Terminal() {
           <span className="cmd c1">sotto init</span>
         </span>
         {"\n"}
-        <span className="line l2 dim">{"  Save your Emergency Kit — these cannot be recovered:"}</span>
+        <span className="line l2 dim">{"  Save your Emergency Kit - these cannot be recovered:"}</span>
         {"\n"}
         <span className="line l3 dim">
           {"    Secret Key:   "}
           <span className="accent">SK1-9FKQ-XXXX-XXXX-XXXX</span>
         </span>
         {"\n"}
-        <span className="line l4 dim">{"initialized `acme-api` (dev)"}</span>
+        <span className="line l4 dim">{"initialised `acme-api` (dev)"}</span>
         {"\n\n"}
         <span className="line l5">
           <span className="prompt">$ </span>
@@ -236,14 +236,14 @@ function Terminal() {
           <span className="cmd c4">sotto push</span>
         </span>
         {"\n"}
-        <span className="line l11 dim">pushed acme-api/dev — revision 1</span>
+        <span className="line l11 dim">pushed acme-api/dev - revision 1</span>
         {"\n\n"}
         <span className="line l12">
           <span className="prompt">$ </span>
           <span className="cmd c5">sotto share DATABASE_URL</span>
         </span>
         {"\n"}
-        <span className="line l13 dim">{"share link (acme-api/dev) — burns after 1 view(s):"}</span>
+        <span className="line l13 dim">{"share link (acme-api/dev) - burns after 1 view(s):"}</span>
         {"\n"}
         <span className="line l14 value">{"https://getsotto.co.uk/s/9fK2xQ#k=Vq3TzEjm…"}</span>
         {"\n\n"}

@@ -9,7 +9,7 @@
 //!   clears it.
 //!
 //! The master key is cached (with an expiry) in the keychain so we don't re-run 256 MiB Argon2
-//! on every command. Passwords are passed in as bytes — prompting is the command layer's job.
+//! on every command. Passwords are passed in as bytes - prompting is the command layer's job.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -70,7 +70,7 @@ pub fn init(
     reinit(store, keychain, password, ttl)
 }
 
-/// Create a **fresh** identity, overwriting any existing one — the account-reset path for a user
+/// Create a **fresh** identity, overwriting any existing one - the account-reset path for a user
 /// who lost their Emergency Kit. Everything sealed to the old keys (local or remote) becomes
 /// permanently unreadable; callers must warn loudly before invoking this.
 pub fn reinit(
@@ -97,11 +97,11 @@ pub fn reinit(
         recovery_blob: wrap::wrap_key(&recovery_key, master_key.as_bytes(), RECOVERY_AAD),
     };
 
-    // Persist the secret key before marking the store initialized. If we wrote the identity row
-    // first and the keychain write then failed, the store would look initialized with no
+    // Persist the secret key before marking the store initialised. If we wrote the identity row
+    // first and the keychain write then failed, the store would look initialised with no
     // recoverable secret key (future `init` is rejected, `unlock` can't re-derive). Writing the
     // key first lets us roll it back if the store write fails, so a failed init leaves no
-    // half-initialized state.
+    // half-initialised state.
     keychain.set(KC_SECRET_KEY, &secret_key)?;
     if let Err(e) = store.put_identity_with_keys(
         &Identity {

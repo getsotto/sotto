@@ -13,4 +13,4 @@ assert.strictEqual(
   EXPECTED_SCHEME,
   `scheme_version() returned ${version}, expected ${EXPECTED_SCHEME}`,
 );
-console.log(`WASM smoke OK — crypto core loaded, scheme v${version}`);
+console.log(`WASM smoke OK - crypto core loaded, scheme v${version}`);

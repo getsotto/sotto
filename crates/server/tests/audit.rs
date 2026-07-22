@@ -272,7 +272,7 @@ async fn team_state_changes_are_audited_in_order() {
         .unwrap()
         .contains("2 member grant(s)"));
 
-    // The limit is honored.
+    // The limit is honoured.
     let (_, body) = send(
         &pool,
         "GET",

@@ -1,5 +1,5 @@
-# cargo-deny config — supply-chain baseline (advisories, bans, licenses, sources).
-# First run may surface dependency licenses to add to `allow` below — that's normal;
+# cargo-deny config - supply-chain baseline (advisories, bans, licences, sources).
+# First run may surface dependency licences to add to `allow` below - that's normal;
 # `cargo deny check licenses` prints exactly which ones (e.g. from the dryoc tree).
 
 [advisories]
@@ -10,7 +10,7 @@ multiple-versions = "warn"
 
 [licenses]
 # Our own workspace crates are `publish = false` and intentionally unlicensed for now
-# (license decision pending — see README). Don't enforce license policy on them.
+# (licence decision pending - see README). Don't enforce licence policy on them.
 private = { ignore = true }
 allow = [
     "MIT",
@@ -18,7 +18,7 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-3-Clause",
     "Unicode-3.0",
-    "Zlib",        # foldhash (via sqlx's hashbrown) — permissive, OSI-approved
+    "Zlib",        # foldhash (via sqlx's hashbrown) - permissive, OSI-approved
 ]
 confidence-threshold = 0.9
 

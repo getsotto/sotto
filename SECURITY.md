@@ -12,7 +12,7 @@ your secret names or values.
 
 - **Key hierarchy:** `master key = Argon2id(password, salt) combined with the secret key` → seals
   your account **X25519 keypair** → opens per-environment **vault-key grants** (the vault key
-  sealed to each member's — or machine token's — public key) → the vault key wraps a per-secret
+  sealed to each member's - or machine token's - public key) → the vault key wraps a per-secret
   **data key** → encrypts the name and value. Sharing seals the vault key to a teammate's public
   key; removing a member rotates the vault key and rewraps the data keys.
 - **One audited implementation:** the crypto lives in `sotto-core` (Rust) and runs identically in
@@ -31,7 +31,7 @@ brute-forceable, because the secret key is never stored server-side.
 ## Telemetry
 
 A self-hosted **server** sends one anonymous version ping per day by default: a random instance
-UUID (generated once, derived from nothing), the server version, and OS/arch — nothing else, and
+UUID (generated once, derived from nothing), the server version, and OS/arch - nothing else, and
 never from the CLI, web client, or WASM. No IP addresses are stored on the receiving side. The
 exact payload and the opt-out (`SOTTO_TELEMETRY=off`, or `DO_NOT_TRACK=1`) are documented in the
 [README](README.md#telemetry); the complete implementation is
@@ -40,14 +40,14 @@ payload to exactly those four fields.
 
 ## Assurance surfaces
 
-- **CLI — high assurance.** A native binary with a minimal, `cargo-deny`-audited dependency set and
+- **CLI - high assurance.** A native binary with a minimal, `cargo-deny`-audited dependency set and
   keys held in the OS keychain / process memory. This is the recommended surface for sensitive use.
-- **Web — convenience, weaker.** The web client is **re-fetched from the server on every load**, so
+- **Web - convenience, weaker.** The web client is **re-fetched from the server on every load**, so
   a server or host compromise can serve tampered code. It is hardened but is not the high-assurance
   path:
   - Strict **Content-Security-Policy** (no inline scripts, no third-party origins) and
     **Subresource Integrity** on all emitted assets.
-  - The session is an **httpOnly, `Secure`, `SameSite=Lax` cookie** — not readable by JavaScript,
+  - The session is an **httpOnly, `Secure`, `SameSite=Lax` cookie** - not readable by JavaScript,
     so XSS cannot exfiltrate it (and it grants only ciphertext access regardless).
   - The master key and decryption keys exist **only in memory** for the tab's lifetime; nothing
     secret is written to `localStorage`.
@@ -58,8 +58,8 @@ payload to exactly those four fields.
 ## Verifying releases
 
 Tagged releases ship tarballs, a `SHA256SUMS` file, and Sigstore signatures. Signing is
-**keyless**: each artifact's `.sigstore.json` bundle binds it to this repository's release
-workflow identity via GitHub OIDC — there is no long-lived signing key to steal. To verify:
+**keyless**: each artefact's `.sigstore.json` bundle binds it to this repository's release
+workflow identity via GitHub OIDC - there is no long-lived signing key to steal. To verify:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
@@ -70,12 +70,12 @@ cosign verify-blob \
   sotto-<version>-<target>.tar.gz
 ```
 
-The full threat model — adversaries, guarantees, and explicit non-goals — is published in
+The full threat model - adversaries, guarantees, and explicit non-goals - is published in
 [THREAT-MODEL.md](./THREAT-MODEL.md).
 
 ## Not yet in place
 
-Apple notarization, reproducible builds, key transparency for the server's public-key
+Apple notarisation, reproducible builds, key transparency for the server's public-key
 distribution, and a third-party audit are on the roadmap, not shipped. Until then, trust decisions
 should reflect an unaudited pre-1.0 project.
 

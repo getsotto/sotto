@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 # The Rust wasm target now emits bulk-memory ops (`memory.copy`/`memory.fill`) by default, but the
 # `wasm-opt` bundled with wasm-pack validates without that feature and aborts the release build (the
-# `web` CI job's "Generate WASM bindings" step). Keep the `-O` optimization but enable the feature so
+# `web` CI job's "Generate WASM bindings" step). Keep the `-O` optimisation but enable the feature so
 # wasm-opt accepts the input; bulk memory is supported by every browser this app targets.
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ['-O', '--enable-bulk-memory']

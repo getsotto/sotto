@@ -81,7 +81,7 @@ pub fn authorize(server: &str) -> Result<String> {
     let state = random_state();
     let url = authorize_url(server, port, &state)?;
 
-    eprintln!("Opening your browser to authorize Sotto…");
+    eprintln!("Opening your browser to authorise Sotto…");
     eprintln!("If it doesn't open, visit:\n  {url}\n");
     open_browser(&url);
 
@@ -110,7 +110,7 @@ fn accept_callback(listener: &TcpListener, expected_state: &str) -> Result<Strin
     let (status, body) = match result {
         Ok(_) => (
             "200 OK",
-            "<html><body>Sotto: login complete — you can close this tab.</body></html>",
+            "<html><body>Sotto: login complete - you can close this tab.</body></html>",
         ),
         Err(_) => (
             "400 Bad Request",

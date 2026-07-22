@@ -58,7 +58,7 @@ export function RecipientPage({ token }: { token: string }) {
       <Shell>
         <h1>Shared secret</h1>
         <p className="muted">
-          This secret has now been viewed — copy it, it may not be available again.
+          This secret has now been viewed - copy it, it may not be available again.
         </p>
         <textarea
           className="secret-value"
@@ -75,7 +75,7 @@ export function RecipientPage({ token }: { token: string }) {
     <Shell>
       <h1>You&rsquo;ve received a secret</h1>
       <p className="muted">
-        It&rsquo;s end-to-end encrypted and may be one-time. Reveal it only when you&rsquo;re ready —
+        It&rsquo;s end-to-end encrypted and may be one-time. Reveal it only when you&rsquo;re ready -
         opening it may consume the link.
       </p>
       <form

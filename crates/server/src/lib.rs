@@ -3,18 +3,18 @@
 //! The server is **zero-knowledge**: it stores ciphertext (secret names/values/data-keys, wrapped
 //! vault keys) plus structural metadata, and never sees plaintext or keys.
 //!
-//! - [`config`] — server configuration from the environment
-//! - [`db`] — Postgres connection pool + migrations
-//! - [`auth`] — GitHub OAuth login, sessions, and the [`auth::AuthUser`] request extractor
-//! - [`account`] — account crypto-material sync (KDF params, public key, sealed private keys, …)
-//! - [`org`] — organizations, memberships, and roles (the team-RBAC substrate)
-//! - [`billing`] — Stripe checkout/portal/webhook, assigning the tier entitlements enforce
-//! - [`machine`] — per-environment machine tokens (CI / service access)
-//! - [`sync`] — projects, environments, and the secret snapshot/batch hot path
-//! - [`share`] — one-time / expiring share links (the viral funnel)
-//! - [`telemetry`] — anonymous opt-out version ping (sender + hosted ingest)
-//! - [`state`] — shared application state ([`state::AppState`])
-//! - [`error`] — server error type
+//! - [`config`] - server configuration from the environment
+//! - [`db`] - Postgres connection pool + migrations
+//! - [`auth`] - GitHub OAuth login, sessions, and the [`auth::AuthUser`] request extractor
+//! - [`account`] - account crypto-material sync (KDF params, public key, sealed private keys, …)
+//! - [`org`] - organisations, memberships, and roles (the team-RBAC substrate)
+//! - [`billing`] - Stripe checkout/portal/webhook, assigning the tier entitlements enforce
+//! - [`machine`] - per-environment machine tokens (CI / service access)
+//! - [`sync`] - projects, environments, and the secret snapshot/batch hot path
+//! - [`share`] - one-time / expiring share links (the viral funnel)
+//! - [`telemetry`] - anonymous opt-out version ping (sender + hosted ingest)
+//! - [`state`] - shared application state ([`state::AppState`])
+//! - [`error`] - server error type
 
 pub mod account;
 pub mod audit;

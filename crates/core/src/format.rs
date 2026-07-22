@@ -6,7 +6,7 @@
 
 use crate::error::Error;
 
-/// Crockford base32 alphabet — excludes the ambiguous letters I, L, O, and U.
+/// Crockford base32 alphabet - excludes the ambiguous letters I, L, O, and U.
 pub const CROCKFORD_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// Encode bytes as Crockford base32 (uppercase, no padding).

@@ -1,4 +1,4 @@
-//! The environment key hierarchy and secret encryption — one audited implementation shared by the
+//! The environment key hierarchy and secret encryption - one audited implementation shared by the
 //! CLI (native) and the web client (WASM).
 //!
 //! A per-environment **vault key** is shared to each member as a **grant**: it is sealed (X25519
@@ -9,7 +9,7 @@
 //! relocated, or mixed across secrets, environments, or versions. Grants themselves carry no AAD
 //! (sealed boxes are anonymous); a grant substituted onto the wrong environment fails closed
 //! because that environment's data keys are wrapped under a different vault key. (AAD binding does
-//! not detect a rollback of a whole row to an earlier consistent version — that needs separate
+//! not detect a rollback of a whole row to an earlier consistent version - that needs separate
 //! freshness / monotonic-version tracking, handled at the sync layer.)
 
 use zeroize::Zeroize;
@@ -51,7 +51,7 @@ pub fn open_account_keypair(
     Ok(keypair)
 }
 
-/// Seal a vault key to a grantee's public key — a **grant**. The recipient opens it with their
+/// Seal a vault key to a grantee's public key - a **grant**. The recipient opens it with their
 /// account keypair. (Sealed boxes are anonymous, so the sender is not revealed and there is no AAD.)
 pub fn grant_vault_key(
     recipient_public: &[u8; wrap::PUBLIC_KEY_LEN],
@@ -71,7 +71,7 @@ pub fn open_vault_key(keypair: &wrap::Keypair, grant: &[u8]) -> Result<[u8; KEY_
     key
 }
 
-/// Recover the account keypair from `enc_private_keys`, then open a vault-key grant — the whole
+/// Recover the account keypair from `enc_private_keys`, then open a vault-key grant - the whole
 /// path from master key + stored key material to a usable vault key (used by the web binding).
 pub fn open_vault_grant(
     master_key: &[u8; KEY_LEN],
@@ -191,7 +191,7 @@ pub fn decrypt_secret(
     }
 }
 
-/// Rewrap a secret's data key from `old_vault_key` to `new_vault_key` — the heart of key rotation.
+/// Rewrap a secret's data key from `old_vault_key` to `new_vault_key` - the heart of key rotation.
 ///
 /// The data key itself and the name/value ciphertext are unchanged; only the wrapping key changes,
 /// so rotation is cheap and never re-encrypts secret values. The `(env, secret, version)` binding is
@@ -231,7 +231,7 @@ fn unwrap_data_key(
 
 // The AADs below use `|` and `=` as delimiters around the `env`/`secret` ids. That encoding is
 // only unambiguous because those ids are constrained to `[A-Za-z0-9_-]` (no delimiter characters)
-// — the server enforces this in `sotto_server::sync::validate_id` at every id-creation point. If
+// - the server enforces this in `sotto_server::sync::validate_id` at every id-creation point. If
 // that charset ever widens, switch these to a length-prefixed/structured encoding first, or the
 // location binding becomes forgeable by delimiter collision.
 fn data_key_aad(env_id: &str, secret_id: &str, version: i64) -> String {

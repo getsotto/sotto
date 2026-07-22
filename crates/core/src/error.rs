@@ -23,7 +23,7 @@ pub enum Error {
 
     /// An underlying cryptographic operation failed (e.g. authentication).
     ///
-    /// Intentionally opaque — we never leak why an authenticated decryption failed.
+    /// Intentionally opaque - we never leak why an authenticated decryption failed.
     #[error("cryptographic operation failed")]
     Crypto,
 }

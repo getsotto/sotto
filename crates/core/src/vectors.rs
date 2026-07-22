@@ -2,7 +2,7 @@
 //!
 //! [`verify_cross_impl`] recomputes the crypto core's behaviour and checks it against pinned
 //! golden values. The SAME function is run by a native unit test (below) and by the WASM
-//! `wasm-bindgen-test` in `crates/wasm` — so the two builds are proven to agree.
+//! `wasm-bindgen-test` in `crates/wasm` - so the two builds are proven to agree.
 //!
 //! The crypto core is pure Rust (dryoc plus RustCrypto's `chacha20poly1305` for AEAD), so native
 //! and WASM run identical code; the gate primarily proves the WASM build + runtime integration
@@ -123,7 +123,7 @@ pub fn verify_cross_impl() -> Result<(), &'static str> {
         return Err("keystring mismatch");
     }
 
-    // A live round-trip — proves the runtime, including the CSPRNG, works in this build.
+    // A live round-trip - proves the runtime, including the CSPRNG, works in this build.
     let expected: &[u8] = b"roundtrip";
     let env = aead::seal(&AEAD_KEY, expected, b"ctx");
     if aead::open(&AEAD_KEY, &env, b"ctx")

@@ -1,4 +1,4 @@
-//! Authentication: GitHub OAuth login, sessions, and request authorization.
+//! Authentication: GitHub OAuth login, sessions, and request authorisation.
 
 pub mod oauth;
 pub mod routes;

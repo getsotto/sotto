@@ -1,15 +1,15 @@
-/* Sotto — the Sordino "paper" layer.
+/* Sotto - the Sordino "paper" layer.
  *
  * The app's markup is plain semantic HTML that must stay legible with no
  * stylesheet at all; everything here is progressive enhancement over those
- * same elements. Styling is by element wherever possible — the few classes
+ * same elements. Styling is by element wherever possible - the few classes
  * (.primary, .ghost, .items, .notice, .secret-value, …) exist only where two
  * uses of the same element genuinely differ.
  *
  * The interface defers: the only loud things are a revealed value (bold mono)
  * and an alert. Separation is whitespace + hairlines; there is no shadow, no
  * imagery, no icon. Tokens live in ./tokens/ and are copied verbatim from the
- * design system ("Sordino") — edit them there, not here.
+ * design system ("Sordino") - edit them there, not here.
  */
 
 @import "./tokens/colors.css";

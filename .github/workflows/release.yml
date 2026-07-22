@@ -1,6 +1,6 @@
 # Tag-triggered releases: build the `sotto` CLI for macOS + Linux, package tarballs with shell
-# completions and the threat model, publish SHA256SUMS, and sign every artifact with Sigstore
-# cosign — *keyless*, via this workflow's GitHub OIDC identity, so there is no signing key to
+# completions and the threat model, publish SHA256SUMS, and sign every artefact with Sigstore
+# cosign - *keyless*, via this workflow's GitHub OIDC identity, so there is no signing key to
 # store, leak, or rotate. Verification instructions live in SECURITY.md.
 #
 # Apple notarisation is a documented roadmap item (it needs a paid Developer ID certificate).
@@ -78,8 +78,8 @@ jobs:
       - uses: sigstore/cosign-installer@v3
 
       # Keyless: cosign exchanges this job's OIDC token for a short-lived certificate binding the
-      # signature to THIS workflow in THIS repository — verifiers pin that identity, not a key.
-      - name: Sign artifacts
+      # signature to THIS workflow in THIS repository - verifiers pin that identity, not a key.
+      - name: Sign artefacts
         run: |
           set -euo pipefail
           for f in sotto-*.tar.gz SHA256SUMS; do

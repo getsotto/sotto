@@ -1,4 +1,4 @@
-//! Organization / membership / role integration tests.
+//! Organisation / membership / role integration tests.
 //!
 //! DB-gated like the other server tests. Each test uses fixed, test-scoped ids so parallel runs
 //! don't collide, and pre-cleans by deleting its orgs (cascading memberships) and re-minting its

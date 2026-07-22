@@ -33,7 +33,7 @@ async fn run() -> Result<()> {
         )) as Arc<dyn OAuthProvider>
     });
     if oauth.is_none() {
-        eprintln!("warning: GITHUB_CLIENT_ID/SECRET unset — OAuth endpoints will return 503");
+        eprintln!("warning: GITHUB_CLIENT_ID/SECRET unset - OAuth endpoints will return 503");
     }
 
     let state = AppState {
@@ -48,7 +48,7 @@ async fn run() -> Result<()> {
     if config.telemetry.ping_enabled && !config.telemetry.ingest_enabled {
         println!(
             "telemetry: daily anonymous version ping is on (random instance uuid + version + \
-             os/arch, nothing else) — set SOTTO_TELEMETRY=off to disable; see README §Telemetry"
+             os/arch, nothing else) - set SOTTO_TELEMETRY=off to disable; see README §Telemetry"
         );
     }
     sotto_server::telemetry::spawn(pool, config.telemetry.clone());

@@ -1,7 +1,7 @@
 //! A faithful `.env` parser for `sotto import`.
 //!
 //! Unlike shell / dotenvy semantics, values are **not** variable-expanded and inline comments
-//! are **not** stripped — a `$` or `#` inside a value is never mangled. Supported syntax:
+//! are **not** stripped - a `$` or `#` inside a value is never mangled. Supported syntax:
 //! - `KEY=value` and `export KEY=value`
 //! - `#` comment lines and blank lines (skipped)
 //! - single-quoted values (literal) and double-quoted values (interpret `\n \r \t \\ \"`)

@@ -1,9 +1,9 @@
 //! Key wrapping for the key hierarchy.
 //!
-//! - **Public-key wrapping** ([`seal_to_public`] / [`open_sealed`]) — X25519 sealed boxes:
+//! - **Public-key wrapping** ([`seal_to_public`] / [`open_sealed`]) - X25519 sealed boxes:
 //!   encrypt a key (e.g. an env vault key) to a recipient's public key so only they can
 //!   recover it. Anonymous (ephemeral sender), exactly what sharing a vault key needs.
-//! - **Symmetric wrapping** ([`wrap_key`] / [`unwrap_key`]) — wrap a key under another key
+//! - **Symmetric wrapping** ([`wrap_key`] / [`unwrap_key`]) - wrap a key under another key
 //!   (e.g. a per-secret data key under the vault key, or a user's private key under the master
 //!   key) using the AEAD, binding a context as `aad`.
 
@@ -26,7 +26,7 @@ pub struct Keypair {
     /// Public key (safe to share / store in the clear).
     #[zeroize(skip)]
     pub public: [u8; PUBLIC_KEY_LEN],
-    /// Secret key — keep private; zeroized on drop.
+    /// Secret key - keep private; zeroized on drop.
     pub secret: [u8; SECRET_KEY_LEN],
 }
 
@@ -34,7 +34,7 @@ pub struct Keypair {
 pub fn generate_keypair() -> Keypair {
     let kp = StackKeyPair::generate();
     // Copy straight into the returned `Keypair` so the only raw secret buffer here is the one
-    // zeroized on drop — copying via a stack-local `[u8; 32]` (which is `Copy`) would leave a
+    // zeroized on drop - copying via a stack-local `[u8; 32]` (which is `Copy`) would leave a
     // stray, un-zeroized duplicate of the secret behind on the stack.
     let mut out = Keypair {
         public: [0u8; PUBLIC_KEY_LEN],
@@ -85,7 +85,7 @@ pub fn wrap_key(kek: &[u8; KEY_LEN], key: &[u8; KEY_LEN], aad: &[u8]) -> Vec<u8>
 /// Unwrap a key wrapped under `kek`, verifying `aad`.
 pub fn unwrap_key(kek: &[u8; KEY_LEN], wrapped: &[u8], aad: &[u8]) -> Result<[u8; KEY_LEN], Error> {
     let mut pt = aead::open(kek, wrapped, aad)?;
-    // Zeroize the decrypted plaintext on every path, including the wrong-length error — `pt`
+    // Zeroize the decrypted plaintext on every path, including the wrong-length error - `pt`
     // holds secret material and a plain `Vec<u8>` is not zeroized on drop.
     let key: Result<[u8; KEY_LEN], Error> = pt
         .as_slice()

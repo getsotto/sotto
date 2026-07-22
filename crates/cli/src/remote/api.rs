@@ -33,12 +33,12 @@ pub struct AccountBundle {
 pub struct NewProject {
     pub id: String,
     pub enc_name: String,
-    /// Owning organization, when creating a shared project; omitted for a personal one.
+    /// Owning organisation, when creating a shared project; omitted for a personal one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub org_id: Option<String>,
 }
 
-/// An organization to create: name ciphertext + the org key sealed to the creator.
+/// An organisation to create: name ciphertext + the org key sealed to the creator.
 #[derive(Debug, Clone, Serialize)]
 pub struct NewOrg {
     pub id: String,
@@ -46,7 +46,7 @@ pub struct NewOrg {
     pub enc_org_key: String,
 }
 
-/// An organization the caller belongs to, with their own role and (if granted) sealed org key.
+/// An organisation the caller belongs to, with their own role and (if granted) sealed org key.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrgInfo {
     pub id: String,
@@ -63,7 +63,7 @@ pub struct Invited {
     pub public_key: Option<String>,
 }
 
-/// A member of an organization.
+/// A member of an organisation.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemberInfo {
     pub user_id: String,
@@ -298,7 +298,7 @@ pub trait SyncApi {
     /// Replace the account's crypto material with fresh keys (Emergency-Kit-lost recovery). The
     /// server also deletes the user's now-dead environment grants.
     fn reset_account(&self, bundle: &AccountBundle) -> Result<()>;
-    /// Download account crypto material, or `None` if the account isn't initialized.
+    /// Download account crypto material, or `None` if the account isn't initialised.
     fn get_account(&self) -> Result<Option<AccountBundle>>;
     fn create_project(&self, project: &NewProject) -> Result<()>;
     fn create_environment(&self, project_id: &str, env: &NewEnvironment) -> Result<()>;
@@ -311,11 +311,11 @@ pub trait SyncApi {
     /// Create a share link; returns the public token.
     fn create_share(&self, share: &NewShare) -> Result<CreatedShare>;
 
-    // --- teams: organizations, invites, and environment vault-key grants ---
+    // --- teams: organisations, invites, and environment vault-key grants ---
 
-    /// Create an organization (the caller becomes its owner).
+    /// Create an organisation (the caller becomes its owner).
     fn create_org(&self, org: &NewOrg) -> Result<()>;
-    /// List the organizations the caller belongs to.
+    /// List the organisations the caller belongs to.
     fn list_orgs(&self) -> Result<Vec<OrgInfo>>;
     /// Invite an existing user (by email) into an org as a member; returns their id + public key.
     fn invite_member(&self, org_id: &str, email: &str) -> Result<Invited>;

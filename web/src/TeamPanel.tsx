@@ -25,8 +25,8 @@ function message(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/// The `?billing=success|cancelled` parameter Stripe Checkout returns with. Pure — StrictMode
-/// double-invokes state initializers in development, so consuming the parameter here would eat
+/// The `?billing=success|cancelled` parameter Stripe Checkout returns with. Pure - StrictMode
+/// double-invokes state initialisers in development, so consuming the parameter here would eat
 /// it before the surviving render; the URL cleanup lives in an effect instead.
 function parseBillingOutcome(): "success" | "cancelled" | null {
   const outcome = new URLSearchParams(window.location.search).get("billing");
@@ -34,7 +34,7 @@ function parseBillingOutcome(): "success" | "cancelled" | null {
 }
 
 /// Remove the consumed `billing` parameter so a reload doesn't repeat the banner, preserving any
-/// other query parameters and the fragment. Idempotent — safe under StrictMode's double effects.
+/// other query parameters and the fragment. Idempotent - safe under StrictMode's double effects.
 function clearBillingParam() {
   const params = new URLSearchParams(window.location.search);
   if (!params.has("billing")) {
@@ -62,7 +62,7 @@ function orgDisplayName(master: Uint8Array, encPrivateKeys: Uint8Array, org: Org
   }
 }
 
-/// The team section: the caller's organizations, each expandable to its member list, with
+/// The team section: the caller's organisations, each expandable to its member list, with
 /// invite-by-email for admins/owners. Org names decrypt through the org key every member holds;
 /// an ungranted member sees the org id. Inviting also seals the org key to the invitee.
 export function TeamPanel({
@@ -129,8 +129,8 @@ export function TeamPanel({
     try {
       const invited = await inviteMember(no.org.id, email.trim());
       // Grant the invitee the org key so display names decrypt for them (best-effort: needs their
-      // public key on file and our own org-key copy). A failure here — e.g. our copy is sealed to an
-      // old keypair after a reset, or the server rejects the grant — must not fail the invite, which
+      // public key on file and our own org-key copy). A failure here - e.g. our copy is sealed to an
+      // old keypair after a reset, or the server rejects the grant - must not fail the invite, which
       // has already succeeded; the invitee just sees the org id until someone re-grants the key.
       if (invited.publicKey !== null && no.org.encOrgKey !== null) {
         try {
@@ -172,7 +172,7 @@ export function TeamPanel({
 
   return (
     <section>
-      <h2>Organizations</h2>
+      <h2>Organisations</h2>
       {billingOutcome === "success" && (
         <p className="notice">
           Payment received. Your Team plan activates as soon as Stripe confirms, usually within
@@ -210,7 +210,7 @@ export function TeamPanel({
                 ? ` (trial ends ${plan.trialEndsAt})`
                 : ""}
               {plan.limits !== null
-                ? ` — up to ${plan.limits.maxMembers} members, ${plan.limits.maxOrgProjects} project(s)`
+                ? ` - up to ${plan.limits.maxMembers} members, ${plan.limits.maxOrgProjects} project(s)`
                 : ""}
             </p>
           )}
@@ -281,10 +281,10 @@ export function TeamPanel({
                 <ul>
                   {audit.map((ev) => (
                     <li key={ev.id}>
-                      <code>{ev.at}</code> {ev.action} — {ev.actor}
+                      <code>{ev.at}</code> {ev.action} - {ev.actor}
                       {ev.target !== null ? ` → ${ev.target}` : ""}
                       {ev.envId !== null ? ` (env ${ev.envId})` : ""}
-                      {ev.detail !== null ? ` — ${ev.detail}` : ""}
+                      {ev.detail !== null ? ` - ${ev.detail}` : ""}
                     </li>
                   ))}
                 </ul>
