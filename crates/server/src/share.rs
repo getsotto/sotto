@@ -1,4 +1,4 @@
-//! Share links — one-time / expiring links for sending a single secret to a non-user.
+//! Share links - one-time / expiring links for sending a single secret to a non-user.
 //!
 //! Zero-knowledge: the server stores ciphertext (`enc_blob`) + metadata only; the decryption key
 //! lives in the URL fragment and never reaches the server. Creation/revocation are session-gated;
@@ -32,7 +32,7 @@ pub fn router() -> Router<AppState> {
 
 #[derive(Deserialize)]
 struct CreateShare {
-    /// Ciphertext (base64) — the sealed secret. Opaque to the server.
+    /// Ciphertext (base64) - the sealed secret. Opaque to the server.
     enc_blob: String,
     /// How many times the link may be fetched before it burns.
     max_views: i32,
@@ -51,7 +51,7 @@ struct CreatedShare {
     expires_at: Option<String>,
 }
 
-/// `POST /shares` — create a share link (session required). Returns the public token.
+/// `POST /shares` - create a share link (session required). Returns the public token.
 async fn create_share(
     State(state): State<AppState>,
     user: AuthUser,
@@ -97,8 +97,8 @@ struct FetchedShare {
     passphrase_salt: Option<String>,
 }
 
-/// `GET /shares/:token` — fetch the ciphertext (public). Atomically claims a view; once the link is
-/// revoked, expired, or exhausted it 404s — uniformly, so the response is no existence oracle.
+/// `GET /shares/:token` - fetch the ciphertext (public). Atomically claims a view; once the link is
+/// revoked, expired, or exhausted it 404s - uniformly, so the response is no existence oracle.
 async fn fetch_share(
     State(state): State<AppState>,
     Path(token): Path<String>,
@@ -122,7 +122,7 @@ async fn fetch_share(
     }))
 }
 
-/// `DELETE /shares/:token` — revoke a link (owner only). 404 if it isn't yours or doesn't exist.
+/// `DELETE /shares/:token` - revoke a link (owner only). 404 if it isn't yours or doesn't exist.
 async fn revoke_share(
     State(state): State<AppState>,
     user: AuthUser,

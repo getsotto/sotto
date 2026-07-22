@@ -22,7 +22,7 @@ pub fn router() -> Router<AppState> {
 struct CreateProject {
     id: String,
     enc_name: String,
-    /// Owning organization; omitted creates a personal project owned by the caller.
+    /// Owning organisation; omitted creates a personal project owned by the caller.
     #[serde(default)]
     org_id: Option<String>,
 }
@@ -31,12 +31,12 @@ struct CreateProject {
 struct ProjectView {
     id: String,
     enc_name: String,
-    /// Owning organization, or `null` for a personal project. Structural metadata (not secret);
+    /// Owning organisation, or `null` for a personal project. Structural metadata (not secret);
     /// the web client uses it to offer team actions (share, members) on org projects.
     org_id: Option<String>,
 }
 
-/// `POST /projects` — create a project. Personal (no `org_id`) is owned by the caller; an org
+/// `POST /projects` - create a project. Personal (no `org_id`) is owned by the caller; an org
 /// project requires the caller to be an admin+ of that org. Idempotent: re-creating one of the same
 /// shape the caller can reach returns 200; an id already in use otherwise returns 409.
 async fn create_project(
@@ -53,10 +53,10 @@ async fn create_project(
             Some(role) if role.is_at_least(Role::Admin) => {}
             Some(_) => {
                 return Err(Error::Forbidden(
-                    "must be an admin or owner to create a project in this organization".into(),
+                    "must be an admin or owner to create a project in this organisation".into(),
                 ))
             }
-            None => return Err(Error::NotFound("organization not found".into())),
+            None => return Err(Error::NotFound("organisation not found".into())),
         }
     }
 
@@ -101,7 +101,7 @@ async fn create_project(
     }
 }
 
-/// `GET /projects` — list the projects the caller can reach: their own personal projects plus every
+/// `GET /projects` - list the projects the caller can reach: their own personal projects plus every
 /// project of an org they belong to.
 async fn list_projects(
     State(state): State<AppState>,

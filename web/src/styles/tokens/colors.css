@@ -1,12 +1,12 @@
-/* Sotto — Sordino color system
+/* Sotto - Sordino colour system
  *
  * Two honest contexts, one philosophy: the interface defers.
- *   · PAPER  — the web app and docs. Warm near-white, near-black ink, hairlines.
- *              Not a dark-mode vault; a quiet document. The only color that ever
+ *   · PAPER  - the web app and docs. Warm near-white, near-black ink, hairlines.
+ *              Not a dark-mode vault; a quiet document. The only colour that ever
  *              raises its voice is the alert red on role="alert".
- *   · TERMINAL — the CLI. Sparing ANSI: dim for diagnostics (stderr), red for
+ *   · TERMINAL - the CLI. Sparing ANSI: dim for diagnostics (stderr), red for
  *              error/warning, green for a confirmation, bright+bold for the one
- *              loud thing — a revealed value. Everything honors NO_COLOR.
+ *              loud thing - a revealed value. Everything honours NO_COLOR.
  *
  * A token is added only to QUIET something, never to decorate it.
  */
@@ -16,10 +16,10 @@
   --paper:        #fbfaf8; /* app / page background */
   --paper-raised: #ffffff; /* the rare lifted surface (a field) */
   --paper-sunk:   #f4f2ed; /* the one boxed thing: a code block, a secret box */
-  --ink:          #1a1917; /* primary text — near-black, warm */
+  --ink:          #1a1917; /* primary text - near-black, warm */
   --ink-2:        #57544e; /* secondary text, help copy */
   --ink-3:        #8a867d; /* meta, placeholders, disabled */
-  --hairline:     #e4e0d8; /* borders, rules — separation without weight */
+  --hairline:     #e4e0d8; /* borders, rules - separation without weight */
   --hairline-2:   #d3cec4; /* a slightly firmer edge (inputs) */
 
   /* ---- Platform voice: links + focus ----------------------------------- */
@@ -27,10 +27,10 @@
      don't repaint it. */
   --link:         #2f5fb0;
   --link-visited: #5a4a8f;
-  --focus:        #2f5fb0; /* focus ring — always visible, never removed */
+  --focus:        #2f5fb0; /* focus ring - always visible, never removed */
 
   /* ---- Semantic: the two things allowed to be loud ---------------------- */
-  --alert:        #b23a2e; /* role="alert" — an error the user must see */
+  --alert:        #b23a2e; /* role="alert" - an error the user must see */
   --alert-bg:     #fbf0ee;
   --alert-border: #e6c3bd;
   --ok:           #2f7a4d; /* a quiet confirmation (a notice) */
@@ -44,7 +44,7 @@
   --term-prompt:  #6f6a5a; /* the $ */
   --term-error:   #e0705f; /* error: / warning: */
   --term-ok:      #86b57e; /* a success confirmation */
-  --term-value:   #f4efe2; /* a revealed secret — the loud byte-for-byte value */
+  --term-value:   #f4efe2; /* a revealed secret - the loud byte-for-byte value */
   --term-accent:  #c7b47e; /* a key name / id echoed to stdout */
   --term-selection: #3a3628;
 
@@ -59,8 +59,8 @@
   --border-strong: var(--hairline-2);
 }
 
-/* NO_COLOR / high-contrast honored: a plain monochrome terminal, no ANSI.
-   Mirrors the CLI honoring the NO_COLOR env var — color is never required. */
+/* NO_COLOR / high-contrast honoured: a plain monochrome terminal, no ANSI.
+   Mirrors the CLI honouring the NO_COLOR env var - colour is never required. */
 [data-no-color] {
   --term-dim:    #b8b3a4;
   --term-prompt: #b8b3a4;

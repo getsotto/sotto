@@ -1,4 +1,4 @@
-// In-browser vault crypto — the same operations the CLI runs, via the WASM core.
+// In-browser vault crypto - the same operations the CLI runs, via the WASM core.
 //
 // The master key is derived from the password + pasted secret key + account salt (Argon2id in
 // WASM), held only in memory. It recovers the account keypair, which opens a per-environment
@@ -97,7 +97,7 @@ export function openOrgKey(
   return vault_open_grant(master, encPrivateKeys, encOrgKey);
 }
 
-/// Seal an environment's vault key to a member's public key — the grant uploaded when sharing.
+/// Seal an environment's vault key to a member's public key - the grant uploaded when sharing.
 export function sealGrantTo(memberPublicKey: Uint8Array, vaultKey: Uint8Array): Uint8Array {
   return vault_grant_key(memberPublicKey, vaultKey);
 }

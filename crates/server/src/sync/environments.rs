@@ -38,7 +38,7 @@ struct EnvironmentView {
     revision: i64,
 }
 
-/// `POST /projects/{project_id}/environments` — create an environment. Creating one is a structural
+/// `POST /projects/{project_id}/environments` - create an environment. Creating one is a structural
 /// change, so the caller must be the personal owner or an admin+ of the project's org. Idempotent on
 /// re-create of the same id; 409 if the id is taken under a different project.
 async fn create_environment(
@@ -58,7 +58,7 @@ async fn create_environment(
     }
 
     // The environment and the creator's vault-key grant land together (the caller sealed
-    // `enc_vault_key` to their own public key). The grant row is the only storage — there is no
+    // `enc_vault_key` to their own public key). The grant row is the only storage - there is no
     // inline copy on the environment row.
     let created = {
         let mut tx = state.pool.begin().await?;
@@ -105,7 +105,7 @@ async fn create_environment(
     }
 }
 
-/// `GET /projects/{project_id}/environments` — list environments in a project the caller can
+/// `GET /projects/{project_id}/environments` - list environments in a project the caller can
 /// reach, each with the caller's OWN vault-key grant (null when they hold none).
 async fn list_environments(
     State(state): State<AppState>,

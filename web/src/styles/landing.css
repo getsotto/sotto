@@ -1,8 +1,8 @@
-/* Sotto — the landing page.
+/* Sotto - the landing page.
  *
  * The same Sordino paper as the app: the landing page is a well-set document,
  * not a SaaS splash. Every rule is scoped under `.landing` because Vite bundles
- * all imported CSS globally — nothing here may leak into the vault app.
+ * all imported CSS globally - nothing here may leak into the vault app.
  *
  * The page keeps the system's discipline: one dark surface (the terminal, on
  * the design system's terminal tokens), one moment of motion (the transcript
@@ -198,7 +198,7 @@
 /* ---- The terminal: the page's signature ------------------------------------
  *
  * A transcript of a real session on the system's terminal tokens. It reveals
- * itself once, line by line — output lines simply appear (terminals don't
+ * itself once, line by line - output lines simply appear (terminals don't
  * fade), command lines type themselves. With reduced motion the whole
  * transcript is just there, a legible code block.
  */
@@ -243,7 +243,7 @@
 }
 
 /* Typing = a steps() clip-path reveal over the command's natural width. In a
- * monospace face each equal slice is exactly one glyph — unlike a ch-based
+ * monospace face each equal slice is exactly one glyph - unlike a ch-based
  * width animation, which clips when accumulated glyph advances round away
  * from N*1ch (they do, and differently per platform's ui-monospace). */
 .landing .term .cmd {

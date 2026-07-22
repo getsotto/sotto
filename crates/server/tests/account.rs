@@ -36,7 +36,7 @@ fn app(pool: PgPool) -> Router {
         .with_state(state)
 }
 
-/// Create a fresh, uninitialized user and return a valid session token for it.
+/// Create a fresh, uninitialised user and return a valid session token for it.
 async fn fresh_session(pool: &PgPool, user_id: &str, subject: &str) -> String {
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user_id)

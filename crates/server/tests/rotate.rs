@@ -2,7 +2,7 @@
 //!
 //! Rotation replaces an env's grant set (dropping a removed member) and rewraps every secret's data
 //! key, in one transaction guarded by optimistic concurrency on the revision. The server treats the
-//! crypto as opaque bytes — these tests exercise the DB mechanics (grant swap, data-key update,
+//! crypto as opaque bytes - these tests exercise the DB mechanics (grant swap, data-key update,
 //! revision bump, auth, coverage, atomicity); the crypto itself is covered in `sotto-core`.
 
 use axum::body::Body;
@@ -176,7 +176,7 @@ fn rotate_body(base: i64, grants: &[(&str, &[u8])], data_keys: &[(&str, &[u8])])
         .collect::<Vec<_>>()
         .join(",");
     // Every test secret is set exactly once (version 1), so its single history row is covered by
-    // a rewrapped key at version 1 — rotation requires exact history coverage.
+    // a rewrapped key at version 1 - rotation requires exact history coverage.
     let hist = data_keys
         .iter()
         .map(|(s, k)| {
@@ -377,7 +377,7 @@ async fn rotate_requires_the_callers_own_grant() {
     ensure_user(&pool, "rot-self-member", "rot-self-member-s").await;
     let rev = seed(&pool, &owner, o, p, e, "rot-self-member", &[s1]).await;
 
-    // Omitting the caller's own grant would lock them out — rejected.
+    // Omitting the caller's own grant would lock them out - rejected.
     assert_eq!(
         post(
             &pool,
@@ -494,7 +494,7 @@ async fn rotate_rejects_a_grant_to_a_non_member() {
     // A user who exists but was never added to the org.
     ensure_user(&pool, "rot-nm-stranger", "rot-nm-stranger-s").await;
 
-    // The rotation is otherwise valid — own grant present, all secrets covered — but names a
+    // The rotation is otherwise valid - own grant present, all secrets covered - but names a
     // non-member, so it is rejected rather than handing the env to someone outside the org.
     assert_eq!(
         post(

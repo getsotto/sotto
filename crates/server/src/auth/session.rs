@@ -15,7 +15,7 @@ use crate::state::AppState;
 
 /// Bytes of randomness in a session token (256 bits).
 const TOKEN_BYTES: usize = 32;
-/// Human-recognizable prefix on the opaque bearer token.
+/// Human-recognisable prefix on the opaque bearer token.
 const TOKEN_PREFIX: &str = "st_";
 /// Session lifetime, expressed as a Postgres interval (TTL math stays in SQL).
 const SESSION_TTL: &str = "30 days";

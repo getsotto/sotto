@@ -66,7 +66,7 @@ fn server_error(resp: Response) -> Error {
         StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
             Error::Conflict(format!("{status}: {body}"))
         }
-        StatusCode::UNAUTHORIZED => Error::Server("unauthorized — run `sotto login`".into()),
+        StatusCode::UNAUTHORIZED => Error::Server("unauthorised - run `sotto login`".into()),
         StatusCode::FORBIDDEN => Error::Forbidden(format!("{status}: {body}")),
         // A quota / Team-feature gate: the server message says exactly what to do.
         StatusCode::PAYMENT_REQUIRED => Error::Input(body),

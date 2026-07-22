@@ -1,7 +1,7 @@
 //! OAuth identity providers.
 //!
 //! The provider is abstracted behind [`OAuthProvider`] so handlers depend on the trait, not on
-//! GitHub specifically — production wires up [`GithubOAuth`], tests inject a mock.
+//! GitHub specifically - production wires up [`GithubOAuth`], tests inject a mock.
 
 use std::time::Duration;
 
@@ -15,14 +15,14 @@ use crate::error::{Error, Result};
 pub struct Identity {
     /// Provider name, e.g. `"github"`.
     pub provider: String,
-    /// Stable, provider-assigned account id (GitHub's numeric user id — never the username, which
+    /// Stable, provider-assigned account id (GitHub's numeric user id - never the username, which
     /// can be renamed).
     pub subject: String,
     /// Primary verified email, if the provider exposes one.
     pub email: Option<String>,
 }
 
-/// Exchanges an OAuth authorization code for a verified [`Identity`].
+/// Exchanges an OAuth authorisation code for a verified [`Identity`].
 #[async_trait]
 pub trait OAuthProvider: Send + Sync {
     async fn exchange_code(&self, code: &str) -> Result<Identity>;

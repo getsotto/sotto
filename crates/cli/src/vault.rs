@@ -1,14 +1,14 @@
-//! Crypto orchestration — sotto-core over the local [`Store`].
+//! Crypto orchestration - sotto-core over the local [`Store`].
 //!
 //! The key hierarchy: the account keypair (from the session layer) opens an environment's **vault
 //! key** grant; each write generates a fresh per-secret **data key** wrapped under the vault
 //! key; names and values are sealed under the data key with associated data binding their
 //! location (`env`, `secret`, `version`, `field`) so the store can't swap, relocate, or mix
 //! blobs across secrets, environments, or versions. (AAD binding alone does not detect a
-//! rollback of a whole row to an earlier consistent version — that needs separate freshness /
+//! rollback of a whole row to an earlier consistent version - that needs separate freshness /
 //! monotonic-version tracking.)
 //!
-//! Secret names are encrypted, so name→row resolution decrypts each row and matches — the store
+//! Secret names are encrypted, so name→row resolution decrypts each row and matches - the store
 //! never sees plaintext.
 
 use sotto_core::vault as core_vault;
@@ -90,8 +90,8 @@ impl<'a> Vault<'a> {
 
     /// Set (insert or update) a secret by name.
     ///
-    /// If the name belongs to a deleted (tombstoned) secret, it is resurrected in place — the
-    /// same secret id and version history continue — rather than starting a fresh secret at
+    /// If the name belongs to a deleted (tombstoned) secret, it is resurrected in place - the
+    /// same secret id and version history continue - rather than starting a fresh secret at
     /// version 1, so versions stay monotonic per name and there are no duplicate same-name rows.
     pub fn set(&self, name: &str, value: &[u8]) -> Result<()> {
         // Prefer a live secret, then fall back to a tombstoned one to resurrect it.
@@ -155,7 +155,7 @@ impl<'a> Vault<'a> {
     }
 
     /// Resolve a secret's id by name, checking live rows first, then tombstones (so history and
-    /// rollback still work for a deleted secret — rolling it back resurrects it).
+    /// rollback still work for a deleted secret - rolling it back resurrects it).
     pub fn find_id_by_name(&self, name: &str) -> Result<Option<String>> {
         if let Some(row) = self.find_by_name(name)? {
             return Ok(Some(row.id));
@@ -168,7 +168,7 @@ impl<'a> Vault<'a> {
         &self.env_id
     }
 
-    /// Decrypt one value with this vault's key at an explicit `(secret_id, version)` binding —
+    /// Decrypt one value with this vault's key at an explicit `(secret_id, version)` binding -
     /// used for history rows, whose AAD is pinned to their original version.
     pub fn decrypt_at(
         &self,

@@ -1,8 +1,8 @@
-//! Resolving a caller's access to a project — and thus its environments and secrets.
+//! Resolving a caller's access to a project - and thus its environments and secrets.
 //!
 //! A project is either *personal* (`org_id IS NULL`, governed by `owner_id`) or *org-owned*
 //! (governed by the caller's membership role). A successful resolve means the caller may read and
-//! write secrets — any member is a collaborator. Structural changes (creating projects and
+//! write secrets - any member is a collaborator. Structural changes (creating projects and
 //! environments) additionally require [`ProjectAccess::can_manage_structure`] (admin+ or the
 //! personal owner). A caller with no access is answered `404`, never leaking that the resource
 //! exists.
@@ -11,25 +11,25 @@ use crate::error::{Error, Result};
 use crate::org::{self, Role};
 use crate::state::AppState;
 
-/// A resolved grant of access to a project. Merely holding one authorizes reads and secret writes;
+/// A resolved grant of access to a project. Merely holding one authorises reads and secret writes;
 /// the methods gate the more privileged operations.
 pub(crate) struct ProjectAccess {
     /// The caller is the personal owner of a non-org project.
     is_owner: bool,
     /// The caller's role in the owning org, for an org project.
     org_role: Option<Role>,
-    /// The owning org, for an org project (carried so callers — e.g. audit logging — don't re-query).
+    /// The owning org, for an org project (carried so callers - e.g. audit logging - don't re-query).
     org_id: Option<String>,
 }
 
 impl ProjectAccess {
     /// Whether the caller may make structural changes (create environments, or projects in the org).
-    /// Reads and secret writes need no such check — a successful resolve already grants them.
+    /// Reads and secret writes need no such check - a successful resolve already grants them.
     pub(crate) fn can_manage_structure(&self) -> bool {
         self.is_owner || self.org_role.is_some_and(|r| r.is_at_least(Role::Admin))
     }
 
-    /// The owning organization's id, or `None` for a personal project.
+    /// The owning organisation's id, or `None` for a personal project.
     pub(crate) fn org_id(&self) -> Option<&str> {
         self.org_id.as_deref()
     }

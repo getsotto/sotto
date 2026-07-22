@@ -69,7 +69,7 @@ export async function fetchAccount(): Promise<Account | null> {
 export interface Project {
   id: string;
   encName: Uint8Array;
-  /// Owning organization, or `null` for a personal project (team actions apply only when set).
+  /// Owning organisation, or `null` for a personal project (team actions apply only when set).
   orgId: string | null;
 }
 
@@ -296,7 +296,7 @@ export async function inviteMember(orgId: string, email: string): Promise<Invite
     ...CREDS,
   });
   if (resp.status === 404) {
-    throw new Error("no Sotto user with that email — they must sign up first");
+    throw new Error("no Sotto user with that email - they must sign up first");
   }
   if (resp.status === 409) {
     throw new Error("that user is already a member");
@@ -372,7 +372,7 @@ export interface HistoryRow {
   encDataKey: Uint8Array;
 }
 
-/// Every retained history version's (secret, version, data key) — rotation must rewrap them all.
+/// Every retained history version's (secret, version, data key) - rotation must rewrap them all.
 export async function fetchHistory(envId: string): Promise<HistoryRow[]> {
   const rows = await authedJson<{ secret_id: string; version: number; enc_data_key: string }[]>(
     `/environments/${encodeURIComponent(envId)}/history`,
@@ -446,7 +446,7 @@ export async function postRotate(envId: string, payload: RotatePayload): Promise
     ...CREDS,
   });
   if (resp.status === 412) {
-    throw new Error("the environment changed while rotating — try again");
+    throw new Error("the environment changed while rotating - try again");
   }
   if (resp.status === 403) {
     throw new Error("only an admin or owner can rotate this environment");

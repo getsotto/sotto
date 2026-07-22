@@ -110,7 +110,7 @@ async fn reset_replaces_material_and_deletes_grants() {
     let owner = fresh_session(&pool, "rec-owner", "rec-owner-s").await;
     let member = fresh_session(&pool, "rec-member", "rec-member-s").await;
 
-    // Both users initialize accounts; the owner stands up an org env and grants the member.
+    // Both users initialise accounts; the owner stands up an org env and grants the member.
     for (token, tag) in [(&owner, "own"), (&member, "old")] {
         let (status, body) = send(&pool, "PUT", "/account", token, Some(bundle_body(tag))).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -118,7 +118,7 @@ async fn reset_replaces_material_and_deletes_grants() {
     // Assert each setup step succeeds, so a later auth/validation/schema change surfaces here with a
     // clear status + body rather than as a confusing failure in the reset assertions below.
     let expect_ok = |label: &str, (status, body): (StatusCode, String)| {
-        assert!(status.is_success(), "{label} failed: {status} — {body}");
+        assert!(status.is_success(), "{label} failed: {status} - {body}");
     };
     expect_ok(
         "create org",
@@ -229,7 +229,7 @@ async fn reset_replaces_material_and_deletes_grants() {
         StatusCode::NOT_FOUND,
         "dead grants are deleted by the reset"
     );
-    // Membership itself survives — the admin re-grants rather than re-invites.
+    // Membership itself survives - the admin re-grants rather than re-invites.
     assert_eq!(
         send(&pool, "GET", "/orgs/rec-o/members", &member, None)
             .await

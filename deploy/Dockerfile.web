@@ -1,13 +1,13 @@
-# Web client + Caddy — multi-stage build (context: the repository root).
+# Web client + Caddy - multi-stage build (context: the repository root).
 #
 # The web build is not a plain npm build: `npm run build` first compiles the Rust crypto core to
 # WebAssembly with wasm-pack, so the builder needs Node AND a Rust toolchain. The final image is a
-# Caddy (built with the caddy-ratelimit plugin — see the Caddyfile) serving the built SPA with the
+# Caddy (built with the caddy-ratelimit plugin - see the Caddyfile) serving the built SPA with the
 # repo Caddyfile baked in; Caddy provisions HTTPS automatically for the domain in SOTTO_DOMAIN.
 
 FROM node:22-bookworm AS build
 
-# Rust toolchain (rustup honors the repo's rust-toolchain.toml) + prebuilt wasm-pack. The
+# Rust toolchain (rustup honours the repo's rust-toolchain.toml) + prebuilt wasm-pack. The
 # wasm-pack installer needs rustup on PATH, so it runs in a separate layer after ENV PATH.
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal \
     --default-toolchain stable --target wasm32-unknown-unknown

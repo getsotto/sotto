@@ -3,7 +3,7 @@
 **/*.rs.bk
 *.pdb
 
-# Cargo.lock IS committed for this workspace (binaries) — do not ignore it.
+# Cargo.lock IS committed for this workspace (binaries) - do not ignore it.
 
 # Real secrets must never be committed.
 .env
@@ -11,7 +11,7 @@
 !.env.example
 # NOTE: `.secrets.yaml` written by `sotto init` is meant to be COMMITTED (no secrets in it).
 
-# WASM build artifacts
+# WASM build artefacts
 /crates/wasm/pkg
 
 # OS / editor
@@ -20,5 +20,5 @@
 .idea/
 .vscode/
 
-# Internal planning docs — kept out of the public open-core repo.
+# Internal planning docs - kept out of the public open-core repo.
 docs/

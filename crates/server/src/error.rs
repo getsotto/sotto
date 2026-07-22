@@ -25,7 +25,7 @@ pub enum Error {
     Io(String),
 
     /// The request lacked a valid session (missing/expired/unknown bearer token).
-    #[error("unauthorized")]
+    #[error("unauthorised")]
     Unauthorized,
 
     /// The caller is authenticated but lacks the role/permission for this action.
@@ -40,11 +40,11 @@ pub enum Error {
     #[error("bad request: {0}")]
     BadRequest(String),
 
-    /// The requested resource does not exist (e.g. an uninitialized account).
+    /// The requested resource does not exist (e.g. an uninitialised account).
     #[error("not found: {0}")]
     NotFound(String),
 
-    /// The request conflicts with current state (e.g. re-initializing an account).
+    /// The request conflicts with current state (e.g. re-initialising an account).
     #[error("conflict: {0}")]
     Conflict(String),
 
@@ -64,7 +64,7 @@ pub enum Error {
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let (status, message) = match &self {
-            Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
+            Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorised".to_string()),
             Error::Forbidden(m) => (StatusCode::FORBIDDEN, m.clone()),
             Error::Quota(m) => (StatusCode::PAYMENT_REQUIRED, m.clone()),
             Error::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),

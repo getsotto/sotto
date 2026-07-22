@@ -1,6 +1,6 @@
-//! Property tests: invariants the crypto core guarantees, over randomized inputs.
+//! Property tests: invariants the crypto core guarantees, over randomised inputs.
 //!
-//! Argon2id master-key derivation is intentionally excluded — at 256 MiB it's ~seconds per
+//! Argon2id master-key derivation is intentionally excluded - at 256 MiB it's ~seconds per
 //! call, so hundreds of cases would take minutes. It's deterministic and covered by a
 //! known-answer test in `vectors.rs`.
 
@@ -88,7 +88,7 @@ proptest! {
         prop_assert_ne!(a, b);
     }
 
-    /// Rotation: rewrapping a data key moves a secret from the old vault key to the new one — the
+    /// Rotation: rewrapping a data key moves a secret from the old vault key to the new one - the
     /// unchanged name/value ciphertext decrypts under the new key, and the old key is locked out.
     #[test]
     fn rewrap_moves_secret_between_vault_keys(

@@ -1,14 +1,14 @@
-//! Team operations over the sync API: organizations, invites, and environment sharing.
+//! Team operations over the sync API: organisations, invites, and environment sharing.
 //!
-//! Every org has an **org key** — a symmetric key sealed grant-style to each member's public key
+//! Every org has an **org key** - a symmetric key sealed grant-style to each member's public key
 //! (stored on their membership row, server-opaque). It encrypts org/project/environment *display
 //! names* for org resources, so every member reads real names instead of record-id fallbacks.
 //! Metadata only: secret names/values are protected by the per-environment vault keys, which
-//! rotate on member removal. The org key does not rotate — a removed member remembering display
+//! rotate on member removal. The org key does not rotate - a removed member remembering display
 //! names is an accepted, documented leak.
 //!
 //! Sharing an environment opens the caller's own vault-key grant, reseals the vault key to a
-//! member's public key, and uploads that grant — keys never leave the process, and the server only
+//! member's public key, and uploads that grant - keys never leave the process, and the server only
 //! ever holds sealed blobs. Invite and share flows also upsert the member's org-key copy, so
 //! whoever can decrypt an environment can also read its name.
 
@@ -33,14 +33,14 @@ fn decode_public_key(b64: &str) -> Result<[u8; wrap::PUBLIC_KEY_LEN]> {
 /// Re-snapshot + retry budget when a concurrent write bumps the revision during a rotation.
 const ROTATE_ATTEMPTS: usize = 5;
 
-/// An organization with its decrypted name and the caller's role in it.
+/// An organisation with its decrypted name and the caller's role in it.
 pub struct OrgListing {
     pub id: String,
     pub name: String,
     pub role: String,
 }
 
-/// Create an organization (the caller becomes its owner); returns the new org id. Generates the
+/// Create an organisation (the caller becomes its owner); returns the new org id. Generates the
 /// org key, encrypts the name under it, and seals the creator's own copy to their public key.
 pub fn create_org(api: &dyn SyncApi, keypair: &wrap::Keypair, name: &str) -> Result<String> {
     let id = Uuid::new_v4().to_string();
@@ -74,7 +74,7 @@ pub fn org_key(
     Ok(None)
 }
 
-/// List the caller's organizations, decrypting each name with its org key (falling back to the id
+/// List the caller's organisations, decrypting each name with its org key (falling back to the id
 /// when the caller holds no org key or the name predates org keys).
 pub fn list_orgs(api: &dyn SyncApi, keypair: &wrap::Keypair) -> Result<Vec<OrgListing>> {
     let mut listings = Vec::new();
@@ -143,12 +143,12 @@ pub fn share_env(
         .find(|m| m.user_id == member_user_id)
         .ok_or_else(|| {
             Error::Input(format!(
-                "`{member_user_id}` is not a member of this organization"
+                "`{member_user_id}` is not a member of this organisation"
             ))
         })?;
     let public_key_b64 = member.public_key.ok_or_else(|| {
         Error::Input(
-            "that member hasn't set up their account keys yet — they must log in and \
+            "that member hasn't set up their account keys yet - they must log in and \
              run `sotto setup` first"
                 .into(),
         )
@@ -163,7 +163,7 @@ pub fn share_env(
     api.create_grant(&env.id, member_user_id, &b64encode(&grant))?;
 
     // Whoever can decrypt an environment should also read its display names: upsert the member's
-    // org-key copy too (best-effort — without our own copy there is nothing to grant).
+    // org-key copy too (best-effort - without our own copy there is nothing to grant).
     if let Some(mut org_key) = org_key(api, keypair, org_id)? {
         let sealed = vault::grant_vault_key(&public_key, &org_key)?;
         org_key.zeroize();
@@ -174,7 +174,7 @@ pub fn share_env(
 
 /// Clone a shared environment onto this device: fetch our own grant, reconstruct the project + env
 /// locally, and pull its secrets. Labels resolve in order: caller-supplied override → the real
-/// name decrypted with the org key → a generic fallback. `org_id` — the owning org — is recorded
+/// name decrypted with the org key → a generic fallback. `org_id` - the owning org - is recorded
 /// in the config so later pushes match server-side.
 #[allow(clippy::too_many_arguments)]
 pub fn clone_env(
@@ -243,7 +243,7 @@ fn decrypted_env_name(
 
 /// Rotate an environment's vault key: rewrap every data key and re-grant the current holders, minus
 /// `revoke`. Returns `Some(new_revision)`, or `None` if the caller holds no grant to this env (so
-/// can't open it to re-key) — the caller reports that as skipped. Retries when a concurrent write
+/// can't open it to re-key) - the caller reports that as skipped. Retries when a concurrent write
 /// moves the revision.
 pub fn rotate_env(
     api: &dyn SyncApi,
@@ -324,7 +324,7 @@ pub fn rotate_env(
             });
         }
 
-        // Re-seal to every active machine token too — the server rejects a rotation that would
+        // Re-seal to every active machine token too - the server rejects a rotation that would
         // strand CI on the old key.
         let mut machine_grants = Vec::new();
         for token in api.list_machine_tokens(env_id)? {
@@ -347,7 +347,7 @@ pub fn rotate_env(
         };
         match api.rotate(env_id, &req) {
             Ok(resp) => return Ok(Some(resp.revision)),
-            // A concurrent write bumped the revision between our snapshot and rotate — retry.
+            // A concurrent write bumped the revision between our snapshot and rotate - retry.
             Err(Error::Conflict(_)) => continue,
             Err(e) => return Err(e),
         }

@@ -37,7 +37,7 @@ export function VaultApp() {
         if (account === null) {
           setPhase({
             kind: "error",
-            message: "No account found — set up Sotto with the CLI first.",
+            message: "No account found - set up Sotto with the CLI first.",
           });
           return;
         }
@@ -54,7 +54,7 @@ export function VaultApp() {
         await logout();
         setPhase({ kind: "loggedOut" });
       } catch (e) {
-        // The server couldn't clear the session — don't pretend we're logged out.
+        // The server couldn't clear the session - don't pretend we're logged out.
         setPhase({ kind: "error", message: e instanceof Error ? e.message : String(e) });
       }
     })();
@@ -127,7 +127,7 @@ function UnlockForm({
     try {
       onUnlock(await deriveMasterKey(password, secretKey, salt));
     } catch {
-      setError("Couldn't unlock — check your master password and secret key.");
+      setError("Couldn't unlock - check your master password and secret key.");
       setBusy(false);
     }
   }
@@ -136,7 +136,7 @@ function UnlockForm({
     <Shell onLogout={onLogout}>
       <h1>Unlock your vault</h1>
       <p className="muted">
-        Your master password and secret key stay in this browser — the server never sees them.
+        Your master password and secret key stay in this browser - the server never sees them.
       </p>
       <form
         className="stack"

@@ -1,6 +1,6 @@
 //! WASM bindings to the Sotto crypto core for the web client.
 //!
-//! The browser runs the SAME crypto core as the CLI, compiled to WASM — one implementation,
+//! The browser runs the SAME crypto core as the CLI, compiled to WASM - one implementation,
 //! one audit surface. The cross-implementation gate (`tests/cross_impl.rs`) proves this build
 //! decrypts native-produced ciphertext byte-for-byte.
 
@@ -97,7 +97,7 @@ pub fn vault_open_grant(
         .map_err(|e| JsError::new(&e.to_string()))
 }
 
-/// Rewrap a secret's data key from the old vault key to a new one — the browser side of key
+/// Rewrap a secret's data key from the old vault key to a new one - the browser side of key
 /// rotation. Ciphertext is untouched; only the wrapping changes (same `(env, secret, version)`
 /// binding), exactly as the CLI does it.
 #[wasm_bindgen]
@@ -215,7 +215,7 @@ pub fn format_decode_key(prefix: &str, version: u8, s: &str) -> Result<Vec<u8>, 
 
 // --- metadata display names (single-source scheme in `sotto_core::names`) ---
 
-/// Decrypt an organization's name (org key for shared orgs; older orgs used the creator's master).
+/// Decrypt an organisation's name (org key for shared orgs; older orgs used the creator's master).
 #[wasm_bindgen]
 pub fn name_decrypt_org(key: &[u8], org_id: &str, ciphertext: &[u8]) -> Result<Vec<u8>, JsError> {
     sotto_core::names::decrypt_org_name(&key32(key)?, org_id, ciphertext)

@@ -199,7 +199,7 @@ async fn creator_has_a_grant_others_do_not_until_shared() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(&b64(b"owner-grant")));
 
-    // The member has access (PR3a) but no grant yet — cannot decrypt.
+    // The member has access (PR3a) but no grant yet - cannot decrypt.
     assert_eq!(
         get(&pool, &member, &grant_uri).await.0,
         StatusCode::NOT_FOUND

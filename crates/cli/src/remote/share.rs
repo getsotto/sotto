@@ -1,6 +1,6 @@
 //! Client-side share creation: seal a secret, upload the ciphertext, and build the shareable link.
 //!
-//! The fragment key never leaves the client — it goes only in the URL fragment (`#…`), which the
+//! The fragment key never leaves the client - it goes only in the URL fragment (`#…`), which the
 //! browser keeps out of requests. With a passphrase, the AEAD key is derived from the fragment key
 //! + passphrase, so neither the link nor the server can decrypt alone.
 

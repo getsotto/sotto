@@ -31,7 +31,7 @@ pub struct TelemetryConfig {
     pub ping_enabled: bool,
     /// Where the ping goes; `SOTTO_TELEMETRY_URL` overrides it (tests, private fleets).
     pub endpoint: String,
-    /// Receive and count pings (`SOTTO_TELEMETRY_INGEST=1`) — set only on the hosted instance.
+    /// Receive and count pings (`SOTTO_TELEMETRY_INGEST=1`) - set only on the hosted instance.
     /// Everywhere else `POST /telemetry/v1/ping` returns 503 (the ships-dark pattern).
     pub ingest_enabled: bool,
 }
@@ -40,7 +40,7 @@ pub struct TelemetryConfig {
 ///
 /// All three come from the Stripe dashboard; the price id (not a number) lives here so pricing is
 /// an operational decision, never a code change. Billing endpoints return 503 when this is absent
-/// — the integration ships dark and is enabled by setting the environment variables.
+/// - the integration ships dark and is enabled by setting the environment variables.
 #[derive(Debug, Clone)]
 pub struct BillingConfig {
     /// Secret API key (`sk_test_…` / `sk_live_…`).
@@ -90,7 +90,7 @@ impl Config {
     ///
     /// `DATABASE_URL` is required. OAuth is enabled only when both `GITHUB_CLIENT_ID` and
     /// `GITHUB_CLIENT_SECRET` are set, and billing only when all three `STRIPE_*` variables are,
-    /// so the server still boots (health, migrations) without them. Empty values count as unset —
+    /// so the server still boots (health, migrations) without them. Empty values count as unset -
     /// docker compose interpolation (`${VAR:-}`) exports empties for every blank `.env` line.
     pub fn from_env() -> Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
@@ -182,7 +182,7 @@ mod tests {
     fn telemetry_defaults_on_and_every_opt_out_signal_wins() {
         assert!(telemetry_ping_enabled(None, None)); // the default
         assert!(telemetry_ping_enabled(Some("on"), None)); // explicit on
-        assert!(telemetry_ping_enabled(Some("anything-else"), None)); // unrecognized ≠ off
+        assert!(telemetry_ping_enabled(Some("anything-else"), None)); // unrecognised ≠ off
         assert!(telemetry_ping_enabled(None, Some("0"))); // DNT explicitly cleared
 
         assert!(!telemetry_ping_enabled(Some("off"), None));
@@ -192,7 +192,7 @@ mod tests {
         assert!(!telemetry_ping_enabled(Some("no"), None));
         assert!(!telemetry_ping_enabled(None, Some("1")));
         assert!(!telemetry_ping_enabled(None, Some("true")));
-        // Opt-out beats an explicit opt-in — when signals disagree, privacy wins.
+        // Opt-out beats an explicit opt-in - when signals disagree, privacy wins.
         assert!(!telemetry_ping_enabled(Some("on"), Some("1")));
     }
 }

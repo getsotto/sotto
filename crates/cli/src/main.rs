@@ -1,4 +1,4 @@
-//! The `sotto` CLI — local, end-to-end-encrypted secret management.
+//! The `sotto` CLI - local, end-to-end-encrypted secret management.
 //!
 //! This binary is the IO layer: it parses arguments, resolves paths and config, prompts for the
 //! master password (hidden, or `SOTTO_PASSWORD`), enforces TTY-safe output, and renders results.
@@ -50,16 +50,16 @@ enum Command {
         /// Project name (defaults to the directory name).
         #[arg(long)]
         name: Option<String>,
-        /// Create the project inside an organization (shareable with that team).
+        /// Create the project inside an organisation (shareable with that team).
         #[arg(long)]
         org: Option<String>,
     },
-    /// Manage organizations (teams).
+    /// Manage organisations (teams).
     Org {
         #[command(subcommand)]
         command: OrgCommand,
     },
-    /// Share the active environment with an organization member (by their user id).
+    /// Share the active environment with an organisation member (by their user id).
     Grant {
         /// The member's user id (from `sotto org invite` or `sotto org members`).
         user_id: String,
@@ -83,7 +83,7 @@ enum Command {
         /// Local label for the project (defaults to "shared").
         #[arg(long)]
         name: Option<String>,
-        /// The owning organization id (from the grantor), so later pushes match the server.
+        /// The owning organisation id (from the grantor), so later pushes match the server.
         #[arg(long)]
         org: Option<String>,
     },
@@ -222,7 +222,7 @@ enum EnvCommand {
         reveal: bool,
     },
     /// Copy secrets from one environment to another (promotion). Dry-run by default;
-    /// adds and updates only — never deletes destination keys.
+    /// adds and updates only - never deletes destination keys.
     Copy {
         src: String,
         dst: String,
@@ -248,9 +248,9 @@ enum TokenCommand {
 
 #[derive(Subcommand)]
 enum OrgCommand {
-    /// Create an organization; prints its id.
+    /// Create an organisation; prints its id.
     Create { name: String },
-    /// List your organizations.
+    /// List your organisations.
     Ls,
     /// Invite an existing Sotto user into an org by email; prints their user id.
     Invite { org_id: String, email: String },
@@ -279,13 +279,13 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // Completions need neither the store nor the keychain — handle before touching either.
+    // Completions need neither the store nor the keychain - handle before touching either.
     if let Command::Completions { shell } = &cli.command {
         clap_complete::generate(*shell, &mut Cli::command(), "sotto", &mut io::stdout());
         return Ok(());
     }
 
-    // Machine mode: with SOTTO_TOKEN set, `run`/`export` decrypt entirely in memory — no store,
+    // Machine mode: with SOTTO_TOKEN set, `run`/`export` decrypt entirely in memory - no store,
     // keychain, config, or password. This is the CI path.
     if let Ok(token) = std::env::var("SOTTO_TOKEN") {
         match &cli.command {
@@ -364,7 +364,7 @@ fn run() -> Result<()> {
             let client = sync_client(&keychain)?;
             let revision = remote::sync::push(&client, &store, master.as_bytes(), &config)?;
             eprintln!(
-                "pushed {}/{} — revision {revision}",
+                "pushed {}/{} - revision {revision}",
                 config.project, config.environment
             );
             Ok(())
@@ -374,7 +374,7 @@ fn run() -> Result<()> {
             let client = sync_client(&keychain)?;
             let revision = remote::sync::pull(&client, &store, &config)?;
             eprintln!(
-                "pulled {}/{} — revision {revision}",
+                "pulled {}/{} - revision {revision}",
                 config.project, config.environment
             );
             Ok(())
@@ -504,7 +504,7 @@ fn init(
         password.zeroize();
         let kit = kit?;
         eprintln!();
-        eprintln!("  Save your Emergency Kit — these cannot be recovered:");
+        eprintln!("  Save your Emergency Kit - these cannot be recovered:");
         eprintln!("    Secret Key:   {}", kit.secret_key);
         eprintln!("    Recovery Key: {}", kit.recovery_key);
         eprintln!();
@@ -529,15 +529,15 @@ fn init(
     config.save_to(cwd)?;
     match &config.org_id {
         Some(org) => eprintln!(
-            "initialized `{}` ({}) in organization {org}",
+            "initialised `{}` ({}) in organisation {org}",
             config.project, config.environment
         ),
-        None => eprintln!("initialized `{}` ({})", config.project, config.environment),
+        None => eprintln!("initialised `{}` ({})", config.project, config.environment),
     }
     Ok(())
 }
 
-/// Organization management: create/list orgs, invite members, list members.
+/// Organisation management: create/list orgs, invite members, list members.
 fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> Result<()> {
     let client = sync_client(keychain)?;
     match command {
@@ -546,7 +546,7 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
             let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
             let keypair = session::account_keypair(store, &master)?;
             let id = remote::team::create_org(&client, &keypair, &name)?;
-            eprintln!("created organization `{name}`");
+            eprintln!("created organisation `{name}`");
             println!("{id}");
             Ok(())
         }
@@ -569,9 +569,9 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
             let keys = if invited.public_key.is_some() {
                 "ready to receive shares"
             } else {
-                "no account keys yet — they must log in and set up before you can share"
+                "no account keys yet - they must log in and set up before you can share"
             };
-            eprintln!("invited {email} — {keys}");
+            eprintln!("invited {email} - {keys}");
             println!("{}", invited.user_id);
             Ok(())
         }
@@ -597,7 +597,7 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
             );
             if !report.skipped.is_empty() {
                 eprintln!(
-                    "warning: {} environment(s) you can't open were not rotated — ask a member \
+                    "warning: {} environment(s) you can't open were not rotated - ask a member \
                      who holds them to run `sotto rotate`: {}",
                     report.skipped.len(),
                     report.skipped.join(", ")
@@ -658,7 +658,7 @@ fn token_command(
             let token =
                 remote::team::create_machine_token(&client, store, &keypair, config, &name)?;
             eprintln!(
-                "machine token `{name}` for {}/{} — save it now; it is never shown again:",
+                "machine token `{name}` for {}/{} - save it now; it is never shown again:",
                 config.project, config.environment
             );
             println!("{token}");
@@ -681,7 +681,7 @@ fn token_command(
 /// Rotate the active environment's vault key, then pull to adopt the new key locally.
 fn rotate_active(store: &Store, keychain: &dyn Keychain, config: &Config) -> Result<()> {
     let org_id = config.org_id.as_deref().ok_or_else(|| {
-        Error::Input("rotation only applies to environments in an organization".into())
+        Error::Input("rotation only applies to environments in an organisation".into())
     })?;
     let env = store
         .get_environment(&config.project_id, &config.environment)?
@@ -694,7 +694,7 @@ fn rotate_active(store: &Store, keychain: &dyn Keychain, config: &Config) -> Res
             // Adopt the new key + rewrapped data keys into the local store.
             remote::sync::pull(&client, store, config)?;
             eprintln!(
-                "rotated {}/{} — revision {rev}",
+                "rotated {}/{} - revision {rev}",
                 config.project, config.environment
             );
             Ok(())
@@ -709,7 +709,7 @@ fn rotate_active(store: &Store, keychain: &dyn Keychain, config: &Config) -> Res
 fn grant_env(store: &Store, keychain: &dyn Keychain, config: &Config, user_id: &str) -> Result<()> {
     let org_id = config.org_id.as_deref().ok_or_else(|| {
         Error::Input(
-            "this project is not in an organization; create one with `sotto org create` and \
+            "this project is not in an organisation; create one with `sotto org create` and \
              `sotto init --org <id>`"
                 .into(),
         )
@@ -795,7 +795,7 @@ fn setup(store: &Store, keychain: &dyn Keychain, cwd: &Path) -> Result<()> {
     remote::sync::pull_environments(&client, store, master.as_bytes(), &config)?;
     let revision = remote::sync::pull(&client, store, &config)?;
     eprintln!(
-        "set up {} ({}) from the server — revision {revision}",
+        "set up {} ({}) from the server - revision {revision}",
         config.project, config.environment
     );
     Ok(())
@@ -803,7 +803,7 @@ fn setup(store: &Store, keychain: &dyn Keychain, cwd: &Path) -> Result<()> {
 
 /// Reset the account with fresh keys (the lost-Emergency-Kit path): generate a new identity
 /// locally, replace the server-side account material, and print the new kit. Everything encrypted
-/// under the old keys — local personal data included — becomes permanently unreadable.
+/// under the old keys - local personal data included - becomes permanently unreadable.
 fn reset(store: &Store, keychain: &dyn Keychain, yes: bool) -> Result<()> {
     // Require a working login first, so we don't destroy local state and then fail to upload.
     let client = sync_client(keychain)?;
@@ -841,7 +841,7 @@ fn reset(store: &Store, keychain: &dyn Keychain, yes: bool) -> Result<()> {
     )?;
 
     eprintln!();
-    eprintln!("  Account reset. Save your NEW Emergency Kit — the old one is void:");
+    eprintln!("  Account reset. Save your NEW Emergency Kit - the old one is void:");
     eprintln!("    Secret Key:   {}", kit.secret_key);
     eprintln!("    Recovery Key: {}", kit.recovery_key);
     eprintln!();
@@ -933,7 +933,7 @@ fn share(
     let link = result?;
 
     eprintln!(
-        "share link ({}/{}) — burns after {views} view(s):",
+        "share link ({}/{}) - burns after {views} view(s):",
         config.project, config.environment
     );
     println!("{link}");
@@ -1015,7 +1015,7 @@ fn history(
                 println!("v{}  {}", v.version, String::from_utf8_lossy(value))
             }
             (Some(value), false) => println!("v{}  ({} bytes)", v.version, value.len()),
-            (None, _) => println!("v{}  (unreadable — run `sotto pull` first)", v.version),
+            (None, _) => println!("v{}  (unreadable - run `sotto pull` first)", v.version),
         }
         // Zeroize each decrypted plaintext as soon as it's printed, so the whole history isn't left
         // resident in memory for the rest of the command.
@@ -1267,7 +1267,7 @@ fn text_entries(app: &App, config: &Config) -> Result<Vec<(String, String)>> {
 
 /// A secret name is usable as an environment variable only if it's a POSIX identifier
 /// (`[A-Za-z_][A-Za-z0-9_]*`). Anything looser (spaces, newlines, shell metacharacters like
-/// `;` or `$`) is rejected — otherwise it could change the meaning of `export --format shell`
+/// `;` or `$`) is rejected - otherwise it could change the meaning of `export --format shell`
 /// output that a user `eval`s or `source`s.
 fn validate_env_key(key: &str) -> Result<()> {
     let mut chars = key.chars();
@@ -1359,7 +1359,7 @@ fn export_with_entries(
 // --- machine (SOTTO_TOKEN) mode ---
 
 /// Resolve the server URL for machine mode: `SOTTO_SERVER` (the CI-friendly path), else the global
-/// config written by `sotto login`. Deliberately no hosted-instance fallback — a token must only
+/// config written by `sotto login`. Deliberately no hosted-instance fallback - a token must only
 /// ever be sent to a server someone explicitly named.
 fn machine_server_url() -> Result<String> {
     if let Ok(server) = std::env::var("SOTTO_SERVER") {

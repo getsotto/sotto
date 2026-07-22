@@ -2,7 +2,7 @@
 //!
 //! A machine token binds exactly one environment and carries its own grant (the env vault key
 //! sealed to the machine's X25519 public key, both generated client-side). The server stores only
-//! the API token's hash, the public key, and the sealed grant — it authenticates machines but can
+//! the API token's hash, the public key, and the sealed grant - it authenticates machines but can
 //! never decrypt. The raw token (`smt_<hex>`) is returned to the creator exactly once; the CLI
 //! combines it with the machine's private key into the `SOTTO_TOKEN` string.
 //!
@@ -28,7 +28,7 @@ use crate::sync::{validate_id, MAX_ENC_KEY};
 
 /// Bytes of randomness in a machine token (256 bits).
 const TOKEN_BYTES: usize = 32;
-/// Machine-token prefix — a distinct namespace from `st_` sessions, so neither kind of bearer
+/// Machine-token prefix - a distinct namespace from `st_` sessions, so neither kind of bearer
 /// works where the other is expected.
 const TOKEN_PREFIX: &str = "smt_";
 /// X25519 public key length, in bytes.
@@ -58,7 +58,7 @@ struct CreateToken {
     name: String,
     /// The machine's X25519 public key (generated client-side; base64).
     public_key: String,
-    /// The env vault key sealed to that public key (base64) — the machine's grant.
+    /// The env vault key sealed to that public key (base64) - the machine's grant.
     enc_vault_key: String,
 }
 
@@ -73,11 +73,11 @@ struct CreatedToken {
 struct TokenView {
     token_id: String,
     name: String,
-    /// The machine's public key (base64) — rotation re-seals the new vault key to this.
+    /// The machine's public key (base64) - rotation re-seals the new vault key to this.
     public_key: String,
 }
 
-/// `POST /environments/{env_id}/tokens` — create a machine token for this environment (admin+ or
+/// `POST /environments/{env_id}/tokens` - create a machine token for this environment (admin+ or
 /// the personal owner). Returns the raw API token once.
 async fn create_token(
     State(state): State<AppState>,
@@ -143,7 +143,7 @@ async fn create_token(
     Ok((StatusCode::CREATED, Json(CreatedToken { token_id, token })))
 }
 
-/// `GET /environments/{env_id}/tokens` — the environment's *active* machine tokens (admin+). A
+/// `GET /environments/{env_id}/tokens` - the environment's *active* machine tokens (admin+). A
 /// rotation uses these public keys to re-seal every machine's grant.
 async fn list_tokens(
     State(state): State<AppState>,
@@ -174,7 +174,7 @@ async fn list_tokens(
     ))
 }
 
-/// `DELETE /environments/{env_id}/tokens/{token_id}` — revoke a machine token (admin+). Its API
+/// `DELETE /environments/{env_id}/tokens/{token_id}` - revoke a machine token (admin+). Its API
 /// access dies immediately; rotate the environment as well to invalidate any cached vault key.
 async fn revoke_token(
     State(state): State<AppState>,
@@ -253,7 +253,7 @@ struct MachineGrant {
     enc_vault_key: String,
 }
 
-/// `GET /machine/grant` — the calling machine's environment id + its own current vault-key grant
+/// `GET /machine/grant` - the calling machine's environment id + its own current vault-key grant
 /// (re-read per request, so a rotation's re-sealed grant is picked up immediately).
 async fn machine_grant(
     State(state): State<AppState>,
@@ -293,7 +293,7 @@ struct MachineSnapshot {
 /// Snapshot row: `(id, enc_name, enc_value, enc_data_key, version, deleted)`.
 type SecretRow = (String, Vec<u8>, Vec<u8>, Vec<u8>, i64, bool);
 
-/// `GET /machine/secrets` — the full secret snapshot of the machine's environment (same shape as
+/// `GET /machine/secrets` - the full secret snapshot of the machine's environment (same shape as
 /// the user snapshot endpoint, minus the ETag machinery: CI fetches once per run).
 async fn machine_secrets(
     State(state): State<AppState>,

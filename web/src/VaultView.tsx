@@ -88,7 +88,7 @@ export function VaultView({
   // Org members of the active project (loaded when an org env is opened), for the share picker.
   const [members, setMembers] = useState<Member[] | null>(null);
   const [shareTo, setShareTo] = useState("");
-  // Opened org keys by org id — org project/env names decrypt under these.
+  // Opened org keys by org id - org project/env names decrypt under these.
   const [orgKeys, setOrgKeys] = useState<Map<string, Uint8Array>>(new Map());
   // The caller's role per org id (rotation is admin/owner-only).
   const [orgRoles, setOrgRoles] = useState<Map<string, string>>(new Map());
@@ -163,11 +163,11 @@ export function VaultView({
     setMembers(null);
     setShareTo(""); // the new env reloads its own members; don't carry a stale pick across
     try {
-      // Open via our OWN grant, not the env's inline key — on a shared env the inline key is the
+      // Open via our OWN grant, not the env's inline key - on a shared env the inline key is the
       // creator's grant, which our keypair can't open.
       const grant = await fetchMyGrant(ne.env.id);
       if (grant === null) {
-        setError("you have no key for this environment — ask an admin to share it with you");
+        setError("you have no key for this environment - ask an admin to share it with you");
         return;
       }
       const vaultKey = openEnvGrant(master, encPrivateKeys, grant);
@@ -202,14 +202,14 @@ export function VaultView({
       return;
     }
     if (member.publicKey === null) {
-      setError("that member has no account keys yet — they must finish setup first");
+      setError("that member has no account keys yet - they must finish setup first");
       return;
     }
     try {
       const sealed = sealGrantTo(member.publicKey, openEnv.vaultKey);
       await createGrant(openEnv.envId, member.userId, sealed);
       // Whoever can decrypt the environment should read its display names too: upsert their org-key
-      // copy alongside the env grant (best-effort — needs our own copy, and is admin/owner-only
+      // copy alongside the env grant (best-effort - needs our own copy, and is admin/owner-only
       // server-side). A failure must not undo or mask the env share that already succeeded.
       const orgId = activeProject?.project.orgId ?? null;
       const orgKey = orgId !== null ? orgKeys.get(orgId) : undefined;
@@ -242,7 +242,7 @@ export function VaultView({
       if (roster === null) {
         const orgId = activeProject?.project.orgId;
         if (!orgId) {
-          throw new Error("this environment is not in an organization; nothing to rotate");
+          throw new Error("this environment is not in an organisation; nothing to rotate");
         }
         roster = await fetchMembers(orgId);
         setMembers(roster);
@@ -391,7 +391,7 @@ export function VaultView({
               <label>
                 Share this environment with
                 <select value={shareTo} onChange={(e) => setShareTo(e.target.value)}>
-                  <option value="">— pick a member —</option>
+                  <option value="">- pick a member -</option>
                   {members.map((m) => (
                     <option key={m.userId} value={m.userId}>
                       {m.userId} ({m.role})

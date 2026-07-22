@@ -2,7 +2,7 @@
 
 One command brings up a complete hosted instance: Postgres, the sync server, and Caddy serving
 the web app with automatic HTTPS. By default it pulls prebuilt multi-arch (amd64 + arm64) images
-from GHCR, so the host never compiles anything — a 1 GB free-tier VM with Docker and ports 80/443
+from GHCR, so the host never compiles anything - a 1 GB free-tier VM with Docker and ports 80/443
 open is enough.
 
 ```text
@@ -14,7 +14,7 @@ internet ──▶ caddy (80/443, web app + API reverse proxy)
 
 The web app and API share **one origin** (`https://<SOTTO_DOMAIN>`), so the session cookie and
 CSP stay same-origin and no CORS is involved. The server stores only ciphertext plus minimal
-metadata — see [THREAT-MODEL.md](../THREAT-MODEL.md) — so the box hosts nothing that can decrypt
+metadata - see [THREAT-MODEL.md](../THREAT-MODEL.md) - so the box hosts nothing that can decrypt
 your secrets; still, treat it as production infrastructure.
 
 ## Prerequisites
@@ -41,8 +41,8 @@ docker compose -f docker-compose.prod.yml up -d
 ```
 
 Database migrations run automatically on server boot. Pin a released version with
-`SOTTO_IMAGE_TAG=vX.Y.Z` in `.env` (default: `latest`). To build everything from source instead —
-for unreleased changes, or if you'd rather not trust prebuilt images — use
+`SOTTO_IMAGE_TAG=vX.Y.Z` in `.env` (default: `latest`). To build everything from source instead -
+for unreleased changes, or if you'd rather not trust prebuilt images - use
 `up -d --build`; that needs ~4 GB of RAM and takes several minutes the first time.
 
 On a 1 GB host, give the kernel some headroom before the first start:
@@ -78,7 +78,7 @@ a compatibility break before upgrading past a minor version.
 Postgres holds only ciphertext and metadata, but losing it loses your users' synced vaults.
 [`backup.sh`](./backup.sh) takes a custom-format `pg_dump` inside the container, **verifies the
 archive** (`pg_restore --list`) before anything leaves the box, and uploads it to whatever
-object storage `SOTTO_BACKUP_BUCKET` names — the scheme picks the tool:
+object storage `SOTTO_BACKUP_BUCKET` names - the scheme picks the tool:
 
 | `SOTTO_BACKUP_BUCKET` | Uploads with | Works for |
 |---|---|---|
@@ -103,7 +103,7 @@ One-time setup, any provider:
    ```
 
 2. **Write-only credentials for the host.** The box should be able to add backups but never
-   read or delete them — a compromised host then can't destroy your history. On GCS that is
+   read or delete them - a compromised host then can't destroy your history. On GCS that is
    `roles/storage.objectCreator` for the VM's service account; on AWS, an IAM policy allowing
    only `s3:PutObject` on the bucket.
 
@@ -133,17 +133,17 @@ docker compose -f docker-compose.prod.yml restart server
 ```
 
 Run one backup by hand now (`./backup.sh`) and rehearse the restore once against a scratch
-database — a backup that has never been restored is a hope, not a backup.
+database - a backup that has never been restored is a hope, not a backup.
 
 ## Access logs
 
 Caddy writes JSON access logs to the `caddy_logs` volume (`/var/log/caddy/access.log` in the
 container), rotated at 50 MiB, 10 files kept, 90 days retained (the `log` block in the
 `Caddyfile`). Credential headers (`Cookie`, `Authorization`, `Set-Cookie`) are **deleted from
-every entry by an explicit filter in the `Caddyfile`** — not left to Caddy's default redaction
-— so no session material ever reaches disk. Request paths and statuses are logged.
+every entry by an explicit filter in the `Caddyfile`** - not left to Caddy's default redaction
+- so no session material ever reaches disk. Request paths and statuses are logged.
 
-The number that matters for a hosted instance — free-tier limit hits (HTTP 402, one per person
+The number that matters for a hosted instance - free-tier limit hits (HTTP 402, one per person
 who wanted more than the free tier allows):
 
 ```sh
@@ -153,13 +153,13 @@ docker compose -f docker-compose.prod.yml exec caddy \
 
 ## Uptime monitoring
 
-`GET /health` returns `ok` with no auth and no rate limit — point any external checker at
+`GET /health` returns `ok` with no auth and no rate limit - point any external checker at
 `https://<SOTTO_DOMAIN>/health` (e.g. a free UptimeRobot monitor, 5-minute interval, keyword
 `ok`). Alerting from *outside* the box is the point: a dead VM cannot report itself.
 
 ## Database security
 
-The default `docker-compose.prod.yml` keeps Postgres on the **internal compose network only** — it
+The default `docker-compose.prod.yml` keeps Postgres on the **internal compose network only** - it
 is never published to a port, so the server↔database link never leaves the host and the plaintext
 connection (`DATABASE_URL` carries no `sslmode`) is not exposed. That is the recommended topology.
 
@@ -174,7 +174,7 @@ DATABASE_URL=postgres://user:pass@db.example.com:5432/sotto?sslmode=require
 DATABASE_URL=postgres://user:pass@db.example.com:5432/sotto?sslmode=verify-full&sslrootcert=/path/to/ca.pem
 ```
 
-Even without TLS the database only ever holds ciphertext and the key-wrapping graph — secret names
+Even without TLS the database only ever holds ciphertext and the key-wrapping graph - secret names
 and values are encrypted client-side and are never decryptable server-side (see
 [THREAT-MODEL.md](../THREAT-MODEL.md)). TLS to the database protects the **metadata** (emails, the
 sharing graph, timestamps) in transit, and is a hard requirement for any deployment where that link
@@ -186,7 +186,7 @@ Abuse control lives at the edge, where the real client IP is visible. The deploy
 [xcaddy](https://github.com/caddyserver/xcaddy) build bundling the
 [caddy-ratelimit](https://github.com/mholt/caddy-ratelimit) plugin (pinned in
 `deploy/Dockerfile.web`), and the `Caddyfile` applies a per-client-IP limit to the **unauthenticated**
-endpoints — the OAuth login/callback and the public share fetch, the only API surface with no
+endpoints - the OAuth login/callback and the public share fetch, the only API surface with no
 credential wall. Authenticated sync is intentionally left unthrottled at the edge: it is bearer-gated
 and includes high-frequency CI polling that a per-IP cap could wrongly block when a whole team shares
 one office/NAT egress IP. Tune the threshold (or split it into per-endpoint zones) in the `Caddyfile`.
@@ -197,7 +197,7 @@ accepted residual risk, and self-hosting is the escape hatch):
 - **Per-IP, not global.** A distributed flood from many source addresses is not stopped by this;
   put a CDN/WAF in front if you need volumetric protection.
 - **This lives in *this* Caddy.** If you front the server with your own proxy, or expose
-  `sotto-server` directly, the server does **not** self-throttle — supply equivalent rate limiting
+  `sotto-server` directly, the server does **not** self-throttle - supply equivalent rate limiting
   at your own edge.
 
 ## Billing (optional)
@@ -213,7 +213,7 @@ return 503 and orgs are tiered manually. To turn it on:
 3. Fill `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, and `STRIPE_PRICE_ID` in `.env`, then
    `docker compose -f docker-compose.prod.yml up -d --force-recreate server`.
 
-Card data never touches the server — checkout and subscription management happen on
+Card data never touches the server - checkout and subscription management happen on
 Stripe-hosted pages, and the webhook only assigns the org's tier.
 
 ## Operations
@@ -227,7 +227,7 @@ docker compose -f docker-compose.prod.yml ps               # health at a glance
 - Postgres is **not** exposed outside the compose network; only Caddy publishes ports.
 - Certificates and Caddy state persist in the `caddy_data` volume; database data in `pgdata`.
 - The API route list lives in the repo-root [`Caddyfile`](../Caddyfile) (baked into the web
-  image at build time) — pulling the matching image version picks up route changes automatically.
+  image at build time) - pulling the matching image version picks up route changes automatically.
 - To try it without a public domain, set `SOTTO_DOMAIN=localhost`: Caddy serves a self-signed
   certificate (`curl -k https://localhost/health`). GitHub login still requires a callback URL
   reachable by your browser.

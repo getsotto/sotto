@@ -86,7 +86,7 @@ fn json(entries: &[(String, String)]) -> String {
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
-    serde_json::to_string_pretty(&map).expect("serializing a string map cannot fail")
+    serde_json::to_string_pretty(&map).expect("serialising a string map cannot fail")
 }
 
 #[cfg(test)]

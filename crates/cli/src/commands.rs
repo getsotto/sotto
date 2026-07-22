@@ -1,4 +1,4 @@
-//! The command layer — secret operations over the store, vault, and session.
+//! The command layer - secret operations over the store, vault, and session.
 //!
 //! These methods hold **no IO**: no prompting, no printing. The binary resolves inputs (config,
 //! password) and renders results; this layer is the testable core (driven with a mock keychain
@@ -40,7 +40,7 @@ pub struct CopyPlan {
     pub create: Vec<String>,
     /// Keys whose destination value differs and gets overwritten.
     pub update: Vec<String>,
-    /// Keys already equal — never rewritten (no pointless version bumps).
+    /// Keys already equal - never rewritten (no pointless version bumps).
     pub unchanged: Vec<String>,
 }
 
@@ -132,9 +132,9 @@ impl<'a> App<'a> {
             .collect())
     }
 
-    /// Plan (and with `apply`, perform) a copy of `src`'s secrets onto `dst` — the promotion flow.
+    /// Plan (and with `apply`, perform) a copy of `src`'s secrets onto `dst` - the promotion flow.
     /// Add/update only: keys equal in both are skipped, and keys present only in `dst` are never
-    /// deleted (no pruning — that's the prod-overwrite footgun this design avoids). Values are
+    /// deleted (no pruning - that's the prod-overwrite footgun this design avoids). Values are
     /// re-encrypted under `dst`'s vault key through the normal set path, so versions and history
     /// behave as if each secret had been set by hand.
     pub fn env_copy(&self, config: &Config, src: &str, dst: &str, apply: bool) -> Result<CopyPlan> {

@@ -13,7 +13,7 @@ use crate::auth::Identity;
 use crate::error::{Error, Result};
 use crate::state::AppState;
 
-/// GitHub's authorization endpoint and the scopes we request (read-only identity + email).
+/// GitHub's authorisation endpoint and the scopes we request (read-only identity + email).
 const GITHUB_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
 const GITHUB_SCOPE: &str = "read:user user:email";
 /// How long an in-flight login may sit before its CSRF state is rejected.
@@ -27,7 +27,7 @@ pub struct LoginParams {
     state: String,
 }
 
-/// `GET /auth/github/login` — begin the flow: record CSRF state, redirect the browser to GitHub.
+/// `GET /auth/github/login` - begin the flow: record CSRF state, redirect the browser to GitHub.
 pub async fn login(
     State(state): State<AppState>,
     Query(params): Query<LoginParams>,
@@ -73,7 +73,7 @@ pub struct CallbackParams {
     state: String,
 }
 
-/// `GET /auth/github/callback` — GitHub redirects here. Verify state, exchange the code, upsert the
+/// `GET /auth/github/callback` - GitHub redirects here. Verify state, exchange the code, upsert the
 /// user, mint a session, and hand it back: a web login (redirect matches the web origin) gets an
 /// httpOnly cookie; a CLI login (loopback) gets the token in the redirect URL.
 pub async fn callback(
@@ -125,7 +125,7 @@ pub async fn callback(
     }
 }
 
-/// `POST /auth/logout` — delete the session and clear the web cookie. Works for either transport.
+/// `POST /auth/logout` - delete the session and clear the web cookie. Works for either transport.
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response> {
     if let Some(token) = session::token_from_headers(&headers) {
         session::revoke(&state.pool, &token).await?;
@@ -146,7 +146,7 @@ pub struct MeResponse {
     user_id: String,
 }
 
-/// `GET /auth/me` — returns the authenticated user; exercises the [`AuthUser`] extractor.
+/// `GET /auth/me` - returns the authenticated user; exercises the [`AuthUser`] extractor.
 pub async fn me(user: AuthUser) -> Json<MeResponse> {
     Json(MeResponse {
         user_id: user.user_id,
@@ -180,7 +180,7 @@ fn random_state() -> String {
 }
 
 /// Reject any redirect target that is neither an `http` loopback address (CLI) nor the configured
-/// web origin (web) — otherwise a crafted `redirect_uri` could exfiltrate the session.
+/// web origin (web) - otherwise a crafted `redirect_uri` could exfiltrate the session.
 fn validate_redirect(redirect_uri: &str, web_origin: Option<&str>) -> Result<()> {
     let url = Url::parse(redirect_uri)
         .map_err(|_| Error::BadRequest("redirect_uri is not a valid URL".into()))?;
@@ -193,7 +193,7 @@ fn validate_redirect(redirect_uri: &str, web_origin: Option<&str>) -> Result<()>
     }
 }
 
-/// An `http` loopback address (`127.0.0.0/8`, `::1`, or `localhost`) — the CLI's local listener.
+/// An `http` loopback address (`127.0.0.0/8`, `::1`, or `localhost`) - the CLI's local listener.
 fn is_loopback(url: &Url) -> bool {
     if url.scheme() != "http" {
         return false;

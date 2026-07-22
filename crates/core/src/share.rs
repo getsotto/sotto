@@ -2,8 +2,8 @@
 //!
 //! A share is a secret sealed under a random 256-bit key that travels in the URL **fragment** and
 //! never reaches the server. An optional passphrase adds a second factor: the AEAD key becomes the
-//! combination of the fragment key with Argon2id(passphrase, salt) — the same construction as the
-//! master key — so neither the link alone (fragment key, no passphrase) nor the server (salt +
+//! combination of the fragment key with Argon2id(passphrase, salt) - the same construction as the
+//! master key - so neither the link alone (fragment key, no passphrase) nor the server (salt +
 //! ciphertext, no fragment key) can decrypt.
 
 use crate::error::Error;

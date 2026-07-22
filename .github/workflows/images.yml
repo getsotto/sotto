@@ -1,10 +1,10 @@
 # Prebuilt Docker images: build the server and web (Caddy + SPA) images for amd64 + arm64 and
-# publish them to GHCR, so a deployment box only pulls — it never needs the RAM or toolchain to
+# publish them to GHCR, so a deployment box only pulls - it never needs the RAM or toolchain to
 # compile Rust/WASM from source (a 1 GB free-tier VM can host Sotto).
 #
 # Runs on release tags (published as :vX.Y.Z and :latest) and manually via workflow_dispatch
 # (published as :latest from the chosen ref). Each architecture builds NATIVELY (GitHub's arm64
-# runners) — no QEMU emulation, which would make the Rust release build take hours — then a
+# runners) - no QEMU emulation, which would make the Rust release build take hours - then a
 # multi-arch manifest stitches the two together.
 
 name: images

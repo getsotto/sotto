@@ -3,7 +3,7 @@
 //! Wire layout:
 //! `[ scheme: u8 ][ alg: u8 ][ nonce: 24 ][ ciphertext ‖ Poly1305 tag ]`
 //!
-//! Fixed layout per scheme (no algorithm negotiation — avoids downgrade attacks). New schemes
+//! Fixed layout per scheme (no algorithm negotiation - avoids downgrade attacks). New schemes
 //! append; algorithm ids are never reused.
 
 /// Current envelope scheme.

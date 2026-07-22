@@ -1,8 +1,8 @@
-/* Sotto — Sordino typography
+/* Sotto - Sordino typography
  *
  * Two families, both from the platform. We never ship a webfont: type must be
  * legible before any styling loads, on any machine, offline. system-ui is the
- * app/doc voice; a monospace stack carries every byte that matters — secret
+ * app/doc voice; a monospace stack carries every byte that matters - secret
  * values, keys, commands, ids, terminal output.
  *
  * There is no display face. Emphasis is size and space, not a second typeface.
@@ -16,13 +16,13 @@
                  "Liberation Mono", monospace;
 
   /* ---- Type scale (restrained; a quiet minor-third-ish ramp) ----------- */
-  --text-xs:    0.8125rem; /* 13px — meta, captions, audit rows */
-  --text-sm:    0.875rem;  /* 14px — help copy, secondary */
-  --text-base:  1rem;      /* 16px — body, controls */
-  --text-md:    1.125rem;  /* 18px — lead paragraph */
-  --text-lg:    1.375rem;  /* 22px — section heading (h2) */
-  --text-xl:    1.75rem;   /* 28px — page heading (h1) */
-  --text-2xl:   2.25rem;   /* 36px — the rare large moment */
+  --text-xs:    0.8125rem; /* 13px - meta, captions, audit rows */
+  --text-sm:    0.875rem;  /* 14px - help copy, secondary */
+  --text-base:  1rem;      /* 16px - body, controls */
+  --text-md:    1.125rem;  /* 18px - lead paragraph */
+  --text-lg:    1.375rem;  /* 22px - section heading (h2) */
+  --text-xl:    1.75rem;   /* 28px - page heading (h1) */
+  --text-2xl:   2.25rem;   /* 36px - the rare large moment */
 
   /* ---- Weights (bold is reserved for the loud value) ------------------- */
   --weight-normal:   400;
@@ -42,6 +42,6 @@
   --tracking-wide:   0.02em;   /* small caps-ish labels */
 
   /* ---- Measure --------------------------------------------------------- */
-  --measure:      66ch; /* body column — a comfortable reading width */
+  --measure:      66ch; /* body column - a comfortable reading width */
   --measure-narrow: 46ch;
 }

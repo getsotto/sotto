@@ -56,7 +56,7 @@ async fn seed_user(pool: &PgPool, user_id: &str) -> String {
     session::issue(pool, user_id).await.expect("issue session")
 }
 
-/// An org with the given tier and one membership. `enc_name` is opaque bytes — the server never
+/// An org with the given tier and one membership. `enc_name` is opaque bytes - the server never
 /// reads it, so a fixed placeholder is fine.
 async fn seed_org(pool: &PgPool, org_id: &str, tier: &str, user_id: &str, role: &str) {
     sqlx::query("DELETE FROM organizations WHERE id = $1")
@@ -327,7 +327,7 @@ async fn subscription_deleted_downgrades_via_stored_id() {
         .expect("link subscription");
     let app = app(pool.clone(), true);
 
-    // No metadata on this event — the org must be found via the stored subscription id.
+    // No metadata on this event - the org must be found via the stored subscription id.
     let payload = serde_json::json!({
         "type": "customer.subscription.deleted",
         "data": { "object": { "id": "sub_test_del" } }
@@ -389,7 +389,7 @@ async fn checkout_requires_the_admin_role() {
     let app = app(pool, true);
 
     // Plain members can't touch billing; non-members can't see the org exists. (The owner path
-    // isn't exercised end-to-end here — it would call the real Stripe API.)
+    // isn't exercised end-to-end here - it would call the real Stripe API.)
     let status = post_authed(
         &app,
         "/orgs/billing-org-roles/billing/checkout",

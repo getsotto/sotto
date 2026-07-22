@@ -1,4 +1,4 @@
-//! Per-member environment vault-key grants — the crypto capability to *decrypt* a shared
+//! Per-member environment vault-key grants - the crypto capability to *decrypt* a shared
 //! environment (PR3a's access only gates seeing the ciphertext).
 //!
 //! A grant is the env vault key sealed to a member's public key: server-opaque bytes the recipient
@@ -57,7 +57,7 @@ struct GrantHolder {
     user_id: String,
 }
 
-/// `GET /environments/{env_id}/grants` — the user ids currently granted this environment (admin+),
+/// `GET /environments/{env_id}/grants` - the user ids currently granted this environment (admin+),
 /// so a rotation knows who to re-grant.
 async fn list_grant_holders(
     State(state): State<AppState>,
@@ -83,8 +83,8 @@ async fn list_grant_holders(
     ))
 }
 
-/// `POST /environments/{env_id}/grants` — share an environment by storing a grant for a member.
-/// Admin+/owner only; the environment must belong to an organization and the target must be a
+/// `POST /environments/{env_id}/grants` - share an environment by storing a grant for a member.
+/// Admin+/owner only; the environment must belong to an organisation and the target must be a
 /// member of it. Idempotent: re-granting (e.g. after a key rotation) overwrites the stored grant.
 async fn create_grant(
     State(state): State<AppState>,
@@ -110,14 +110,14 @@ async fn create_grant(
     .fetch_one(&state.pool)
     .await?;
     let org_id = org_id.ok_or_else(|| {
-        Error::BadRequest("environment is not in an organization; nothing to share".into())
+        Error::BadRequest("environment is not in an organisation; nothing to share".into())
     })?;
     if org::role_of(&state.pool, &org_id, &body.user_id)
         .await?
         .is_none()
     {
         return Err(Error::BadRequest(
-            "target user is not a member of this organization".into(),
+            "target user is not a member of this organisation".into(),
         ));
     }
 
@@ -151,7 +151,7 @@ async fn create_grant(
     Ok(StatusCode::OK)
 }
 
-/// `GET /environments/{env_id}/grant` — the caller's own vault-key grant for the environment. `404`
+/// `GET /environments/{env_id}/grant` - the caller's own vault-key grant for the environment. `404`
 /// if the caller has no grant, even when org access otherwise lets them see the ciphertext.
 async fn get_grant(
     State(state): State<AppState>,
@@ -224,7 +224,7 @@ struct RotateResponse {
     revision: i64,
 }
 
-/// `POST /environments/{env_id}/rotate` — re-key an environment. Admin+/owner only, org-owned envs
+/// `POST /environments/{env_id}/rotate` - re-key an environment. Admin+/owner only, org-owned envs
 /// only. In one transaction: verify `base_revision`, rewrap every secret's data key, replace the
 /// grant set (dropping anyone not re-granted), repoint the inline vault key at the caller's new
 /// grant, and bump the revision. Fails closed with 412 if a concurrent write moved the revision, or
@@ -251,9 +251,9 @@ async fn rotate(
     .fetch_one(&state.pool)
     .await?;
     let org_id =
-        org_id.ok_or_else(|| Error::BadRequest("environment is not in an organization".into()))?;
+        org_id.ok_or_else(|| Error::BadRequest("environment is not in an organisation".into()))?;
 
-    // Every grantee must be a distinct member of that org — the same rule `create_grant` enforces.
+    // Every grantee must be a distinct member of that org - the same rule `create_grant` enforces.
     // Without the membership check an admin could re-grant the env to a non-member; without the
     // duplicate check a repeated user_id would trip the environment_grants PK mid-transaction and
     // surface as a 500 instead of a clean 400.
@@ -272,7 +272,7 @@ async fn rotate(
         }
         if !members.contains(g.user_id.as_str()) {
             return Err(Error::BadRequest(
-                "a grant recipient is not a member of this organization".into(),
+                "a grant recipient is not a member of this organisation".into(),
             ));
         }
     }
@@ -332,7 +332,7 @@ async fn rotate(
 
     let mut tx = state.pool.begin().await?;
 
-    // Lock the environment row so the rotation serializes against concurrent secret writes.
+    // Lock the environment row so the rotation serialises against concurrent secret writes.
     let current: Option<i64> =
         sqlx::query_scalar("SELECT revision FROM environments WHERE id = $1 FOR UPDATE")
             .bind(&env_id)
@@ -345,11 +345,11 @@ async fn rotate(
         ));
     }
 
-    // The rewrapped data keys must cover exactly the env's secrets — none left under the old key, and
+    // The rewrapped data keys must cover exactly the env's secrets - none left under the old key, and
     // none for a secret that isn't here (a mismatch means the client rewrapped a stale snapshot).
     verify_covers_all_secrets(&mut tx, &env_id, &data_keys).await?;
 
-    // History must be covered exactly too — a version left under the old key would silently become
+    // History must be covered exactly too - a version left under the old key would silently become
     // unreadable, and a row that isn't there means the client rewrapped a stale view.
     let existing_history: Vec<(String, i64)> = sqlx::query_as(
         "SELECT sv.secret_id, sv.version FROM secret_versions sv \

@@ -10,7 +10,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// No `sotto.toml` in this directory or any parent.
     #[error(
-        "no {} found in {} or any parent directory — run `sotto init` to create a project here",
+        "no {} found in {} or any parent directory - run `sotto init` to create a project here",
         crate::config::CONFIG_FILE,
         .0.parent().unwrap_or_else(|| std::path::Path::new(".")).display()
     )]
@@ -25,7 +25,7 @@ pub enum Error {
     NotFound(String),
 
     /// The store is locked; the user must unlock first.
-    #[error("locked — run `sotto unlock` first")]
+    #[error("locked - run `sotto unlock` first")]
     Locked,
 
     /// A storage-layer (SQLite) error.
@@ -45,11 +45,11 @@ pub enum Error {
     Conflict(String),
 
     /// `init` was run but an identity already exists.
-    #[error("already initialized — an identity already exists")]
+    #[error("already initialised - an identity already exists")]
     AlreadyInitialized,
 
     /// No identity has been set up yet.
-    #[error("no identity — run `sotto init` first")]
+    #[error("no identity - run `sotto init` first")]
     NoIdentity,
 
     /// The OS keychain could not be read or written.
@@ -64,7 +64,7 @@ pub enum Error {
     #[error("server error: {0}")]
     Server(String),
 
-    /// The server authenticated the caller but refused the action (HTTP 403) — e.g. a plain org
+    /// The server authenticated the caller but refused the action (HTTP 403) - e.g. a plain org
     /// member attempting a structural change that needs admin+.
     #[error("forbidden: {0}")]
     Forbidden(String),
@@ -96,7 +96,7 @@ impl From<rusqlite::Error> for Error {
 
 impl From<sotto_core::Error> for Error {
     fn from(_: sotto_core::Error) -> Self {
-        // Stay opaque — never leak why an authenticated decryption failed.
+        // Stay opaque - never leak why an authenticated decryption failed.
         Error::Crypto
     }
 }

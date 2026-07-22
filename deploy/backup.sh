@@ -19,7 +19,7 @@ cd "$(dirname "$0")"
 
 BUCKET="${SOTTO_BACKUP_BUCKET:-$(sed -n 's/^SOTTO_BACKUP_BUCKET=//p' .env 2>/dev/null)}"
 if [ -z "$BUCKET" ]; then
-    echo "error: SOTTO_BACKUP_BUCKET is not set — add it to deploy/.env (e.g. gs://sotto-backups)" >&2
+    echo "error: SOTTO_BACKUP_BUCKET is not set - add it to deploy/.env (e.g. gs://sotto-backups)" >&2
     exit 1
 fi
 # Reject an unusable destination now, before the (comparatively expensive) dump.
