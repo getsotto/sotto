@@ -1,7 +1,8 @@
-# Tag-triggered releases: build the `sotto` CLI for macOS + Linux, package tarballs with shell
-# completions and the threat model, publish SHA256SUMS, and sign every artefact with Sigstore
-# cosign - *keyless*, via this workflow's GitHub OIDC identity, so there is no signing key to
-# store, leak, or rotate. Verification instructions live in SECURITY.md.
+# Tag-triggered releases: build the `sotto` CLI for macOS + Linux + Windows, package archives
+# (tarballs everywhere except Windows, which gets a .zip) with shell completions and the threat
+# model, publish SHA256SUMS, and sign every artefact with Sigstore cosign - *keyless*, via this
+# workflow's GitHub OIDC identity, so there is no signing key to store, leak, or rotate.
+# Verification instructions live in SECURITY.md.
 #
 # Apple notarisation is a documented roadmap item (it needs a paid Developer ID certificate).
 
@@ -29,6 +30,8 @@ jobs:
             os: macos-14
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -45,9 +48,16 @@ jobs:
         run: cargo build --release -p sotto-cli --target ${{ matrix.target }}
 
       - name: Package
+        # bash everywhere, including windows-latest (Git Bash) - one script, not a second dialect
+        # for the Windows leg.
+        shell: bash
         run: |
           set -euo pipefail
-          BIN=target/${{ matrix.target }}/release/sotto
+          case "${{ matrix.target }}" in
+          *windows*) EXT=".exe" ;;
+          *) EXT="" ;;
+          esac
+          BIN="target/${{ matrix.target }}/release/sotto$EXT"
           STAGE=sotto-${{ github.ref_name }}-${{ matrix.target }}
           mkdir -p "$STAGE/completions"
           cp "$BIN" "$STAGE/"
@@ -55,12 +65,18 @@ jobs:
           for shell in bash zsh fish; do
             "$BIN" completions "$shell" > "$STAGE/completions/sotto.$shell"
           done
-          tar -czf "$STAGE.tar.gz" "$STAGE"
+          "$BIN" completions powershell > "$STAGE/completions/sotto.ps1"
+          case "${{ matrix.target }}" in
+          *windows*) 7z a "$STAGE.zip" "$STAGE" >/dev/null ;;
+          *) tar -czf "$STAGE.tar.gz" "$STAGE" ;;
+          esac
 
       - uses: actions/upload-artifact@v4
         with:
           name: sotto-${{ matrix.target }}
-          path: sotto-*.tar.gz
+          path: |
+            sotto-*.tar.gz
+            sotto-*.zip
           if-no-files-found: error
 
   release:
@@ -73,7 +89,7 @@ jobs:
           merge-multiple: true
 
       - name: Checksums
-        run: sha256sum sotto-*.tar.gz > SHA256SUMS
+        run: sha256sum sotto-*.tar.gz sotto-*.zip > SHA256SUMS
 
       - uses: sigstore/cosign-installer@v3
 
@@ -82,7 +98,7 @@ jobs:
       - name: Sign artefacts
         run: |
           set -euo pipefail
-          for f in sotto-*.tar.gz SHA256SUMS; do
+          for f in sotto-*.tar.gz sotto-*.zip SHA256SUMS; do
             cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
           done
 
@@ -95,4 +111,4 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "sotto ${{ github.ref_name }}" \
             --generate-notes \
-            sotto-*.tar.gz SHA256SUMS ./*.sigstore.json
+            sotto-*.tar.gz sotto-*.zip SHA256SUMS ./*.sigstore.json

@@ -57,9 +57,10 @@ payload to exactly those four fields.
 
 ## Verifying releases
 
-Tagged releases ship tarballs, a `SHA256SUMS` file, and Sigstore signatures. Signing is
-**keyless**: each artefact's `.sigstore.json` bundle binds it to this repository's release
-workflow identity via GitHub OIDC - there is no long-lived signing key to steal. To verify:
+Tagged releases ship archives (tarballs for macOS/Linux, a `.zip` for Windows), a `SHA256SUMS`
+file, and Sigstore signatures. Signing is **keyless**: each artefact's `.sigstore.json` bundle
+binds it to this repository's release workflow identity via GitHub OIDC - there is no long-lived
+signing key to steal. To verify, on macOS/Linux:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
@@ -69,6 +70,21 @@ cosign verify-blob \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   sotto-<version>-<target>.tar.gz
 ```
+
+On Windows (PowerShell), the same checks against the `.zip` archive:
+
+```powershell
+(Get-FileHash -Algorithm SHA256 sotto-<version>-x86_64-pc-windows-msvc.zip).Hash
+# compare against the matching line in SHA256SUMS
+cosign verify-blob `
+  --bundle sotto-<version>-x86_64-pc-windows-msvc.zip.sigstore.json `
+  --certificate-identity-regexp '^https://github.com/getsotto/sotto/.github/workflows/release.yml@refs/tags/v' `
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com `
+  sotto-<version>-x86_64-pc-windows-msvc.zip
+```
+
+`install.sh` and `install.ps1` (Windows) both do this automatically - checksum always, Sigstore
+signature when `cosign` is on `PATH` - before installing anything.
 
 The full threat model - adversaries, guarantees, and explicit non-goals - is published in
 [THREAT-MODEL.md](./THREAT-MODEL.md).
