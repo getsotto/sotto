@@ -26,7 +26,8 @@ and lost-key account recovery.
 
 ## Install
 
-Prebuilt, signed binaries for macOS (Apple Silicon + Intel), Linux x86_64, and Windows x86_64:
+Prebuilt, signed binaries for macOS (Apple Silicon + Intel), Linux (x86_64 + ARM64), and
+Windows x86_64:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh
