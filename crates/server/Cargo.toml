@@ -48,3 +48,10 @@ serde_json = "1"
 [dev-dependencies]
 # Drive the router in-process (ServiceExt::oneshot) for handler tests.
 tower = { version = "0.5", features = ["util"] }
+
+[features]
+# Compiles in a mock OAuthProvider that `main.rs` wires up instead of GithubOAuth, so an external
+# browser (Playwright) can complete a login without touching real GitHub. Off by default - never
+# enabled in release.yml or the production Dockerfile, so this code does not exist in any binary
+# a user runs. See docs/adr/0001-continuous-deploy-during-launch-waves.md.
+e2e-mock-oauth = []

@@ -1,9 +1,13 @@
 //! Authentication: GitHub OAuth login, sessions, and request authorisation.
 
+#[cfg(feature = "e2e-mock-oauth")]
+pub mod mock_oauth;
 pub mod oauth;
 pub mod routes;
 pub mod session;
 
+#[cfg(feature = "e2e-mock-oauth")]
+pub use mock_oauth::MockOAuth;
 pub use oauth::{GithubOAuth, Identity, OAuthProvider};
 pub use session::AuthUser;
 
