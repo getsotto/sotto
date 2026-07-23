@@ -61,7 +61,8 @@
             Fail "download failed: $Base/$Asset ($_)"
         }
 
-        $ExpectedLine = Select-String -Path $SumsPath -Pattern "  $Asset$"
+        $ExpectedLine = Select-String -Path $SumsPath -Pattern "  $([regex]::Escape($Asset))`$" |
+            Select-Object -First 1
         if (-not $ExpectedLine) {
             Fail "$Asset is not listed in SHA256SUMS"
         }
