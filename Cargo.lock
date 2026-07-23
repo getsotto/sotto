@@ -2545,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "sotto-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "base64",
@@ -2570,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "sotto-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "chacha20poly1305",
  "dryoc",
@@ -2581,7 +2581,7 @@ dependencies = [
 
 [[package]]
 name = "sotto-server"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2602,7 +2602,7 @@ dependencies = [
 
 [[package]]
 name = "sotto-wasm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "getrandom 0.4.3",
  "sotto-core",
