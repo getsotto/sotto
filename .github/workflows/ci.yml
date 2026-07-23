@@ -158,7 +158,11 @@ jobs:
         if: failure()
         with:
           name: playwright-report
-          path: web/playwright-report/
+          # test-results has the raw trace.zip/screenshots (trace: "retain-on-failure"), not just
+          # the html report shell - without it a failure is much harder to actually debug.
+          path: |
+            web/playwright-report/
+            web/test-results/
           retention-days: 7
 
   supply-chain:
