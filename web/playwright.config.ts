@@ -38,20 +38,20 @@ export default defineConfig({
       // flag changed since the last build (a full sotto-server + its deps rebuild).
       timeout: 180_000,
       env: {
+        ...process.env,
         SOTTO_BIND: `127.0.0.1:${SERVER_PORT}`,
         SOTTO_PUBLIC_URL: `http://127.0.0.1:${SERVER_PORT}`,
         SOTTO_WEB_ORIGIN: `http://127.0.0.1:${WEB_PORT}`,
         GITHUB_CLIENT_ID: "e2e-mock",
         GITHUB_CLIENT_SECRET: "e2e-mock",
         SOTTO_TELEMETRY: "off",
-        ...process.env,
       },
     },
     {
       command: `npm run preview -- --port ${WEB_PORT} --strictPort --host 127.0.0.1`,
       url: `http://127.0.0.1:${WEB_PORT}`,
       reuseExistingServer: !process.env.CI,
-      env: { SOTTO_API_URL: `http://127.0.0.1:${SERVER_PORT}`, ...process.env },
+      env: { ...process.env, SOTTO_API_URL: `http://127.0.0.1:${SERVER_PORT}` },
     },
   ],
 });
