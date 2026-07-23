@@ -26,14 +26,19 @@ and lost-key account recovery.
 
 ## Install
 
-Prebuilt, signed binaries for macOS (Apple Silicon + Intel) and Linux x86_64:
+Prebuilt, signed binaries for macOS (Apple Silicon + Intel), Linux x86_64, and Windows x86_64:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh
 ```
 
-The installer verifies the tarball's SHA-256 checksum - and its Sigstore signature, when `cosign`
-is installed - before installing to `~/.local/bin`. Prefer to look first? Grab a tarball from the
+```powershell
+irm https://raw.githubusercontent.com/getsotto/sotto/main/install.ps1 | iex
+```
+
+The installer verifies the archive's SHA-256 checksum - and its Sigstore signature, when `cosign`
+is installed - before installing (`~/.local/bin` on macOS/Linux, `%LOCALAPPDATA%\sotto\bin` on
+Windows). Prefer to look first? Grab an archive from the
 [releases page](https://github.com/getsotto/sotto/releases) and verify it manually per
 [SECURITY.md](SECURITY.md), or build from source (see [Developing](#developing)).
 
