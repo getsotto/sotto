@@ -97,6 +97,74 @@ jobs:
       - name: Server + end-to-end tests (with Postgres)
         run: cargo test -p sotto-server -p sotto-cli
 
+  funnel-e2e:
+    name: funnel regression suite (Launch gate 4)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sotto
+          POSTGRES_PASSWORD: sotto
+          POSTGRES_DB: sotto
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sotto"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://sotto:sotto@localhost:5432/sotto
+      # Test-mode only, if provisioned - see web/e2e/README.md § The Stripe checkout leg. Absent,
+      # the spec skips that one leg with a clear reason rather than failing.
+      STRIPE_SECRET_KEY: ${{ secrets.STRIPE_TEST_SECRET_KEY }}
+      STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_TEST_WEBHOOK_SECRET }}
+      STRIPE_PRICE_ID: ${{ secrets.STRIPE_TEST_PRICE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the mock-OAuth server and the seed fixture
+        run: |
+          cargo build -p sotto-server --features e2e-mock-oauth
+          cargo build -p sotto-cli --example e2e_seed
+
+      - name: Build the web app
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Playwright's chromium browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      - name: Funnel regression suite
+        working-directory: web
+        run: npm run e2e
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          # test-results has the raw trace.zip/screenshots (trace: "retain-on-failure"), not just
+          # the html report shell - without it a failure is much harder to actually debug.
+          path: |
+            web/playwright-report/
+            web/test-results/
+          retention-days: 7
+
   supply-chain:
     runs-on: ubuntu-latest
     steps:

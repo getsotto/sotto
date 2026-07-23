@@ -6,7 +6,9 @@
 
 use std::sync::Arc;
 
-use sotto_server::auth::{GithubOAuth, OAuthProvider};
+#[cfg(not(feature = "e2e-mock-oauth"))]
+use sotto_server::auth::GithubOAuth;
+use sotto_server::auth::OAuthProvider;
 use sotto_server::config::Config;
 use sotto_server::db;
 use sotto_server::error::{Error, Result};
@@ -26,11 +28,23 @@ async fn run() -> Result<()> {
     db::migrate(&pool).await?;
 
     let oauth: Option<Arc<dyn OAuthProvider>> = config.oauth.as_ref().map(|o| {
-        Arc::new(GithubOAuth::new(
-            o.github_client_id.clone(),
-            o.github_client_secret.clone(),
-            o.callback_url(),
-        )) as Arc<dyn OAuthProvider>
+        #[cfg(feature = "e2e-mock-oauth")]
+        {
+            eprintln!(
+                "warning: built with `e2e-mock-oauth` - GitHub logins are FAKE (any code \
+                 authenticates as its own literal value). Never deploy this build."
+            );
+            let _ = o; // the mock needs no credentials
+            Arc::new(sotto_server::auth::MockOAuth) as Arc<dyn OAuthProvider>
+        }
+        #[cfg(not(feature = "e2e-mock-oauth"))]
+        {
+            Arc::new(GithubOAuth::new(
+                o.github_client_id.clone(),
+                o.github_client_secret.clone(),
+                o.callback_url(),
+            )) as Arc<dyn OAuthProvider>
+        }
     });
     if oauth.is_none() {
         eprintln!("warning: GITHUB_CLIENT_ID/SECRET unset - OAuth endpoints will return 503");

@@ -71,21 +71,30 @@ function sriPlugin(): Plugin {
 // `connect-src 'self'` and the session cookie same-origin). Production serves the web app and API
 // from one origin (a reverse proxy). `/auth/callback` is intentionally NOT proxied - it's the SPA's
 // post-login page, whereas `/auth/github/*` are the server's OAuth endpoints.
-const api = { target: "http://localhost:8080", changeOrigin: true };
+// `SOTTO_API_URL` overrides the target (the funnel regression suite runs its own server instance
+// on a non-default port so it can't collide with one a developer already has running locally).
+const api = {
+  target: process.env.SOTTO_API_URL ?? "http://localhost:8080",
+  changeOrigin: true,
+};
+
+const apiProxy = {
+  "/auth/github": api,
+  "/auth/me": api,
+  "/auth/logout": api,
+  "/account": api,
+  "/projects": api,
+  "/environments": api,
+  "/orgs": api,
+  "/shares": api,
+};
 
 export default defineConfig({
   plugins: [react(), cspPlugin(), sriPlugin()],
   build: { target: "es2022" },
-  server: {
-    proxy: {
-      "/auth/github": api,
-      "/auth/me": api,
-      "/auth/logout": api,
-      "/account": api,
-      "/projects": api,
-      "/environments": api,
-      "/orgs": api,
-      "/shares": api,
-    },
-  },
+  server: { proxy: apiProxy },
+  // Same proxy for `vite preview` (the built production bundle, not dev-server HMR) - the funnel
+  // regression suite drives this against a real server, and needs the same single-origin
+  // cookie/CSP behaviour production's Caddy topology provides, without standing up Caddy itself.
+  preview: { proxy: apiProxy },
 });
