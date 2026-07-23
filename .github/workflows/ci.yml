@@ -34,7 +34,12 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-pack
+        # Pinned: the action's "latest" resolution isn't reliably semver-aware - it picked
+        # v0.9.1 over the real latest (v0.15.0) on a run during this same session, which reads
+        # like a lexicographic string comparison bug ("9" > "1" as characters), not a semver one.
         uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: "v0.15.0"
       - name: Build WASM core
         run: cargo build -p sotto-wasm --target wasm32-unknown-unknown
       - name: Cross-impl gate (native-produced vectors decrypt in WASM)
@@ -52,7 +57,12 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-pack
+        # Pinned: the action's "latest" resolution isn't reliably semver-aware - it picked
+        # v0.9.1 over the real latest (v0.15.0) on a run during this same session, which reads
+        # like a lexicographic string comparison bug ("9" > "1" as characters), not a semver one.
         uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: "v0.15.0"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -128,7 +138,12 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-pack
+        # Pinned: the action's "latest" resolution isn't reliably semver-aware - it picked
+        # v0.9.1 over the real latest (v0.15.0) on a run during this same session, which reads
+        # like a lexicographic string comparison bug ("9" > "1" as characters), not a semver one.
         uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: "v0.15.0"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
