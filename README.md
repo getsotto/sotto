@@ -43,6 +43,30 @@ Windows). Prefer to look first? Grab an archive from the
 [releases page](https://github.com/getsotto/sotto/releases) and verify it manually per
 [SECURITY.md](SECURITY.md), or build from source (see [Developing](#developing)).
 
+### GitHub Actions
+
+For GitHub Actions, use the [Sotto Setup action](https://github.com/getsotto/sotto-action) to
+install an exact CLI release and verify its checksum and Sigstore bundles before making `sotto`
+available to later steps:
+
+```yaml
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: getsotto/sotto-action@v1.1.0
+        with:
+          sotto-version: v0.4.0
+      - run: sotto run -- npm test
+        env:
+          SOTTO_TOKEN: ${{ secrets.SOTTO_TOKEN }}
+```
+
+The action ref and `sotto-version` are independent. Use a full commit SHA for the action when you
+want the strongest workflow pinning, and keep `sotto-version` as an exact `vX.Y.Z` release. See the
+[action documentation](https://github.com/getsotto/sotto-action#readme) for matrix, Windows, and
+reusable-workflow examples.
+
 ## Quick start
 
 ```sh
