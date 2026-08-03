@@ -33,6 +33,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     env:
+      # Keep the consumer check on the newest published CLI release; update this after each release.
       SOTTO_TEST_VERSION: v0.4.0
     steps:
       - uses: actions/checkout@v4
