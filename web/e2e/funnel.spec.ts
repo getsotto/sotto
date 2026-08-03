@@ -7,7 +7,7 @@ import { expect, test } from "@playwright/test";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // The funnel regression suite (Launch gate 4): login → unlock → TeamPanel invite → Upgrade →
-// Stripe checkout → return. See docs/OUTREACH.md and
+// checkout handoff → return. See docs/OUTREACH.md and
 // docs/adr/0001-continuous-deploy-during-launch-waves.md for why this suite exists, and
 // e2e/README.md for how to run it locally. Asserts on observable UI state only - text, URL,
 // visible elements - never component internals.
@@ -65,80 +65,80 @@ async function loginAs(page: import("@playwright/test").Page, loginCode: string)
   await context.unroute("**/auth/github/login**");
 }
 
-test("login, unlock, invite, and upgrade", async ({ page }) => {
-  await page.goto("/app");
-
-  // --- Login ---
-  await expect(page.getByRole("button", { name: "Log in with GitHub" })).toBeVisible();
-  await loginAs(page, fixture.owner_login_code);
-
-  // --- Unlock ---
+async function unlockCurrentPage(page: import("@playwright/test").Page) {
   await expect(page.getByRole("heading", { name: "Unlock your vault" })).toBeVisible();
   await page.getByLabel("Master password").fill(fixture.owner_password);
   await page.getByLabel("Secret key (SK1-…)").fill(fixture.owner_secret_key);
   await page.getByRole("button", { name: "Unlock" }).click();
   await expect(page.getByRole("heading", { name: "Your vault" })).toBeVisible();
   await expect(page.getByRole("alert")).toHaveCount(0);
+}
+
+async function loginAndUnlock(page: import("@playwright/test").Page) {
+  await page.goto("/app");
+  await expect(page.getByRole("button", { name: "Log in with GitHub" })).toBeVisible();
+  await loginAs(page, fixture.owner_login_code);
+  await unlockCurrentPage(page);
+}
+
+async function selectOwnerOrganisation(page: import("@playwright/test").Page) {
+  await expect(page.getByRole("heading", { name: "Organisations" })).toBeVisible();
+  await page.getByRole("button", { name: /E2E Org/ }).click();
+  await expect(page.getByRole("heading", { name: /^Members of/ })).toBeVisible();
+}
+
+test("login, unlock, invite, and checkout", async ({ page }) => {
+  await loginAndUnlock(page);
 
   // The seeded project is visible - proves the browser decrypted real, server-synced data, not
   // just that the unlock form accepted input.
   await expect(page.getByRole("button", { name: new RegExp(fixture.project_name) })).toBeVisible();
 
-  // --- TeamPanel: select the org, invite the seeded invitee by email ---
-  await expect(page.getByRole("heading", { name: "Organisations" })).toBeVisible();
-  await page.getByRole("button", { name: /E2E Org/ }).click();
-  await expect(page.getByRole("heading", { name: /^Members of/ })).toBeVisible();
+  await selectOwnerOrganisation(page);
 
-  await page.getByLabel("Invite by email").fill(fixture.invitee_email);
-  await page.getByRole("button", { name: "Invite" }).click();
-
-  await expect(page.getByText(`invited ${fixture.invitee_email}`, { exact: false })).toBeVisible();
   // The member row (keyed by user id, not email - TeamPanel renders `m.userId`) has no
   // "no keys yet" marker: the invitee's public key (pushed by the seed fixture) resolved, so the
-  // org-key grant went through cleanly, not just the bare invite.
+  // org-key grant went through cleanly, not just the bare invite. Reusing an existing row makes a
+  // CI retry safe if the first attempt completed the invite before a later assertion failed.
+  // Wait for the member fetch to settle before deciding whether the row already exists; otherwise
+  // a retry can mistake the loading state for an absent invite and submit a duplicate.
+  const memberLoading = page
+    .getByRole("heading", { name: /^Members of/ })
+    .locator("xpath=following-sibling::p[normalize-space()='Loading…']");
+  await expect(memberLoading).toHaveCount(0);
   const invitedRow = page.getByRole("listitem").filter({ hasText: fixture.invitee_user_id });
+  if (!(await invitedRow.isVisible().catch(() => false))) {
+    await page.getByLabel("Invite by email").fill(fixture.invitee_email);
+    await page.getByRole("button", { name: "Invite" }).click();
+    await expect(
+      page.getByText(`invited ${fixture.invitee_email}`, { exact: false }),
+    ).toBeVisible();
+  }
+  await expect(invitedRow).toBeVisible();
   await expect(invitedRow).not.toContainText("no keys yet");
 
-  // --- Upgrade → Stripe checkout (test mode) → return ---
-  // Needs STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET/STRIPE_PRICE_ID (test-mode) in the environment
-  // this suite runs under - the server ships checkout dark otherwise (billingEnabled: false) and
-  // the button never renders. Provision these as CI secrets to enable this leg.
+  // The seeded organisation is still free because the test billing adapter does not emit a
+  // webhook. That keeps the Team upgrade control available for the rest of this linear funnel.
   const upgrade = page.getByRole("button", { name: "Upgrade to Team" });
-  if (!(await upgrade.isVisible().catch(() => false))) {
-    test.skip(true, "STRIPE_* test-mode credentials not configured in this environment");
-  }
-
-  await Promise.all([page.waitForURL(/checkout\.stripe\.com/), upgrade.click()]);
-
-  // Stripe's own hosted Checkout page - stable, Stripe-documented test-mode UI, not ours.
-  await page.getByPlaceholder("1234 1234 1234 1234").fill("4242424242424242");
-  await page.getByPlaceholder("MM / YY").fill("12/34");
-  await page.getByPlaceholder("CVC").fill("123");
-  await page.getByLabel("Cardholder name").fill("E2E Test");
-  await page.getByTestId("hosted-payment-submit-button").click();
+  await expect(upgrade).toBeVisible();
+  await Promise.all([page.waitForURL(/\/e2e\/billing\/checkout/), upgrade.click()]);
+  await page.getByRole("link", { name: "Complete payment" }).click();
 
   await page.waitForURL(/billing=success/);
+  await unlockCurrentPage(page);
   await expect(page.getByText("Payment received.")).toBeVisible();
 });
 
-// The cancelled return leg doesn't need a live Stripe session to verify: Stripe's own redirect is
-// just a fresh page load carrying `?billing=cancelled`, and what's actually under test is the
-// app's own handling of that outcome (TeamPanel.tsx's `parseBillingOutcome`/`clearBillingParam`),
-// not Stripe's checkout UI. So this runs unconditionally, unlike the success leg above.
 test("checkout cancelled return is handled", async ({ page }) => {
-  await page.goto("/app");
-  await loginAs(page, fixture.owner_login_code);
-  await page.getByLabel("Master password").fill(fixture.owner_password);
-  await page.getByLabel("Secret key (SK1-…)").fill(fixture.owner_secret_key);
-  await page.getByRole("button", { name: "Unlock" }).click();
-  await expect(page.getByRole("heading", { name: "Your vault" })).toBeVisible();
+  await loginAndUnlock(page);
+  await selectOwnerOrganisation(page);
+  const upgrade = page.getByRole("button", { name: "Upgrade to Team" });
+  await expect(upgrade).toBeVisible();
+  await Promise.all([page.waitForURL(/\/e2e\/billing\/checkout/), upgrade.click()]);
+  await page.getByRole("link", { name: "Cancel payment" }).click();
 
-  // Simulate Stripe's redirect back after a cancelled checkout: a fresh load carrying the outcome.
-  await page.goto("/app?billing=cancelled");
-  await page.getByLabel("Master password").fill(fixture.owner_password);
-  await page.getByLabel("Secret key (SK1-…)").fill(fixture.owner_secret_key);
-  await page.getByRole("button", { name: "Unlock" }).click();
-
+  await page.waitForURL(/billing=cancelled/);
+  await unlockCurrentPage(page);
   await expect(page.getByText("Checkout cancelled. Nothing was charged.")).toBeVisible();
   // The consumed `billing` param is stripped so a reload doesn't repeat the banner.
   await expect(page).not.toHaveURL(/billing=cancelled/);

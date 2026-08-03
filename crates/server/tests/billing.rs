@@ -11,6 +11,7 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 
 use sotto_server::auth::session;
+use sotto_server::billing::BillingState;
 use sotto_server::config::BillingConfig;
 use sotto_server::db;
 use sotto_server::state::AppState;
@@ -30,11 +31,13 @@ fn app(pool: PgPool, configured: bool) -> Router {
         pool,
         oauth: None,
         oauth_config: None,
-        billing: configured.then(|| BillingConfig {
-            secret_key: "sk_test_never_called".into(),
-            webhook_secret: WEBHOOK_SECRET.into(),
-            price_id: "price_test".into(),
-            return_url: "https://app.sotto.test".into(),
+        billing: configured.then(|| {
+            BillingState::from_config(BillingConfig {
+                secret_key: "sk_test_never_called".into(),
+                webhook_secret: WEBHOOK_SECRET.into(),
+                price_id: "price_test".into(),
+                return_url: "https://app.sotto.test".into(),
+            })
         }),
     };
     Router::new()

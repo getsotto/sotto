@@ -55,3 +55,6 @@ tower = { version = "0.5", features = ["util"] }
 # enabled in release.yml or the production Dockerfile, so this code does not exist in any binary
 # a user runs. See docs/adr/0001-continuous-deploy-during-launch-waves.md.
 e2e-mock-oauth = []
+# Uses a local checkout page instead of Stripe so the browser gate does not need secrets or
+# depend on an external provider. Off by default - never enabled in release.yml or production.
+e2e-mock-billing = []

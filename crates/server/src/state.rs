@@ -5,7 +5,8 @@ use std::sync::Arc;
 use sqlx::PgPool;
 
 use crate::auth::OAuthProvider;
-use crate::config::{BillingConfig, OAuthConfig};
+use crate::billing::BillingState;
+use crate::config::OAuthConfig;
 
 /// Cloneable handle to the resources every request needs.
 ///
@@ -16,7 +17,7 @@ pub struct AppState {
     pub pool: PgPool,
     pub oauth: Option<Arc<dyn OAuthProvider>>,
     pub oauth_config: Option<OAuthConfig>,
-    pub billing: Option<BillingConfig>,
+    pub billing: Option<BillingState>,
     /// Whether this instance accepts telemetry pings (`SOTTO_TELEMETRY_INGEST=1`, hosted only).
     pub telemetry_ingest: bool,
 }
