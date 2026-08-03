@@ -36,15 +36,15 @@ jobs:
       SOTTO_TEST_VERSION: v0.4.0
     steps:
       - uses: actions/checkout@v4
-      # Exercise the published release rather than the moving major tag.
+      # Exercise the moving major tag after the release workflow validates it.
       - id: sotto
         name: Install Sotto action
-        uses: getsotto/sotto-action@v1.1.0
+        uses: getsotto/sotto-action@v1
         with:
           sotto-version: ${{ env.SOTTO_TEST_VERSION }}
       - id: missing-version
         name: Reject missing sotto-version
-        uses: getsotto/sotto-action@v1.1.0
+        uses: getsotto/sotto-action@v1
         continue-on-error: true
       - name: Verify missing version is rejected (Linux/macOS)
         if: always() && runner.os != 'Windows'
