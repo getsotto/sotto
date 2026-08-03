@@ -137,6 +137,7 @@ jobs:
             exit 1
           fi
 
+          printf '::add-mask::%s\n' "$webhook_secret"
           export STRIPE_WEBHOOK_SECRET="$webhook_secret"
           npm run e2e -- --config=playwright.stripe.config.ts
 
