@@ -15,8 +15,12 @@ concurrency:
 jobs:
   stripe-smoke:
     name: stripe test-mode smoke
+    # Only the canonical repository main branch may use the credentialed environment. This keeps
+    # fork and pull-request workflow runs from reaching the Stripe test account.
     if: github.repository == 'getsotto/sotto' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # The environment approval is the second gate: its secrets are unavailable until a maintainer
+    # approves this manually dispatched job.
     environment:
       name: stripe-smoke
     services:
@@ -48,8 +52,11 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - uses: Swatinem/rust-cache@v2
+
       # The web build invokes wasm-pack directly, so install the same pinned tool used by the
-      # required web CI job instead of relying on runner-global tooling.
+      # required web CI job instead of relying on runner-global tooling. Pinning matters because
+      # the action's "latest" resolution has selected v0.9.1 over v0.15.0 lexicographically.
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
         with:
@@ -82,6 +89,11 @@ jobs:
         run: |
           set -euo pipefail
           cargo build -p sotto-cli --example e2e_seed
+
+      - name: Build the smoke server
+        run: |
+          set -euo pipefail
+          cargo build -p sotto-server --features e2e-mock-oauth
 
       - name: Build the web app
         working-directory: web

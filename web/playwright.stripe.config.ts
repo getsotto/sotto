@@ -29,11 +29,15 @@ export default defineConfig({
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: [
     {
+      // `cargo run`, not a bare path to the debug binary: a plain `cargo build -p sotto-server`
+      // can overwrite the binary without e2e-mock-oauth, and the suite would then silently try
+      // to authenticate against real GitHub. `cargo run` re-links when the feature set differs.
       // Do not include e2e-mock-billing here. The smoke must exercise StripeBilling and its real
       // Checkout redirect, with the webhook listener supplying STRIPE_WEBHOOK_SECRET.
       command: "cargo run -p sotto-server --features e2e-mock-oauth",
       url: `http://127.0.0.1:${SERVER_PORT}/health`,
       reuseExistingServer: false,
+      // The first feature-specific cargo run can rebuild the server and its dependencies.
       timeout: 180_000,
       env: {
         ...process.env,
