@@ -199,11 +199,8 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://sotto:sotto@localhost:5432/sotto
-      # Test-mode only, if provisioned - see web/e2e/README.md § The Stripe checkout leg. Absent,
-      # the spec skips that one leg with a clear reason rather than failing.
-      STRIPE_SECRET_KEY: ${{ secrets.STRIPE_TEST_SECRET_KEY }}
-      STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_TEST_WEBHOOK_SECRET }}
-      STRIPE_PRICE_ID: ${{ secrets.STRIPE_TEST_PRICE_ID }}
+      # The Playwright config supplies non-secret values so the feature-gated local billing adapter
+      # is enabled. It never calls Stripe and keeps this required gate safe for forked pull requests.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -225,7 +222,7 @@ jobs:
 
       - name: Build the mock-OAuth server and the seed fixture
         run: |
-          cargo build -p sotto-server --features e2e-mock-oauth
+          cargo build -p sotto-server --features e2e-mock-oauth,e2e-mock-billing
           cargo build -p sotto-cli --example e2e_seed
 
       - name: Build the web app
@@ -241,6 +238,11 @@ jobs:
       - name: Funnel regression suite
         working-directory: web
         run: npm run e2e
+
+      - name: Reject skipped funnel tests
+        working-directory: web
+        run: |
+          node -e 'const report = require("./test-results/playwright.json"); const skipped = report.stats?.skipped ?? 0; if (skipped !== 0) { console.error(`funnel suite skipped ${skipped} test(s)`); process.exit(1); }'
 
       - uses: actions/upload-artifact@v4
         if: failure()

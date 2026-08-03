@@ -22,8 +22,8 @@ DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto npm run e2e
 ```
 
 `playwright.config.ts` starts the server and `vite preview` for you. The server's `command` is
-`cargo run -p sotto-server --features e2e-mock-oauth`, deliberately - not a bare path to the
-debug binary - because a plain `cargo build -p sotto-server` run for any unrelated reason
+`cargo run -p sotto-server --features e2e-mock-oauth,e2e-mock-billing`, deliberately - not a bare
+path to the debug binary - because a plain `cargo build -p sotto-server` run for any unrelated reason
 overwrites that same binary path *without* the feature, and the suite would then silently try to
 authenticate against real GitHub (a confusing timeout, not an obvious "wrong build" error).
 `cargo run` re-links whenever the feature set differs from the last build, so this is safe
@@ -65,10 +65,13 @@ authenticate as. No real GitHub involved, and the login/callback handlers themse
 untouched. (An earlier attempt intercepted the cross-origin redirect to `github.com` directly;
 that isn't reliably interceptable mid-navigation, hence the same-origin approach instead.)
 
-## The Stripe checkout leg
+## The checkout leg
 
-The "Upgrade to Team" → Stripe Checkout (test mode) → return leg needs `STRIPE_SECRET_KEY`,
-`STRIPE_WEBHOOK_SECRET`, and `STRIPE_PRICE_ID` (test-mode values) in the environment this suite
-runs under - without them the server ships checkout dark (`billingEnabled: false`) and the
-"Upgrade to Team" button never renders, so the spec skips that leg with a clear reason rather
-than failing. Provision test-mode Stripe credentials as CI secrets to enable full coverage.
+The "Upgrade to Team" → checkout → return leg uses the feature-gated `e2e-mock-billing` provider.
+It serves a local page with Complete and Cancel controls, so the browser still exercises the real
+billing endpoint, redirect handoff, and return handling without exposing Stripe credentials to pull
+requests or depending on a hosted provider. The adapter is off by default and is never included in
+release or production builds.
+
+The production adapter remains Stripe-backed. A separate real-Stripe smoke run can be added later,
+but it is deliberately not part of this required merge gate.

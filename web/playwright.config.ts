@@ -2,9 +2,10 @@ import { defineConfig, devices } from "@playwright/test";
 
 // The funnel regression suite (Launch gate 4 - see docs/OUTREACH.md and
 // docs/adr/0001-continuous-deploy-during-launch-waves.md). Runs against a real, already-built
-// web app and a real `sotto-server` process (built with `--features e2e-mock-oauth`, see
-// crates/server/src/auth/mock_oauth.rs) - both started here, against a Postgres the caller must
-// already have running (`DATABASE_URL` in the environment; see e2e/README.md).
+// web app and a real `sotto-server` process (built with the test-only OAuth and billing adapters,
+// see crates/server/src/auth/mock_oauth.rs and crates/server/src/billing.rs) - both started here,
+// against a Postgres the caller must already have running (`DATABASE_URL` in the environment; see
+// e2e/README.md).
 //
 // `vite preview` serves the actual production bundle (`vite build` must have already run), not
 // dev-server HMR, so this exercises the same asset pipeline production does.
@@ -17,7 +18,13 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   workers: 1,
-  reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : "list",
+  reporter: process.env.CI
+    ? [
+        ["github"],
+        ["json", { outputFile: "test-results/playwright.json" }],
+        ["html", { open: "never" }],
+      ]
+    : "list",
   globalSetup: "./e2e/global-setup.ts",
   use: {
     baseURL: `http://127.0.0.1:${WEB_PORT}`,
@@ -31,7 +38,8 @@ export default defineConfig({
       // binary path without the `e2e-mock-oauth` feature, and the suite would then silently try
       // to authenticate against real GitHub - a confusing timeout, not an obvious "wrong build"
       // error. `cargo run` re-links whenever the feature set differs from the last build.
-      command: "cargo run -p sotto-server --features e2e-mock-oauth",
+      command:
+        "cargo run -p sotto-server --features e2e-mock-oauth,e2e-mock-billing",
       url: `http://127.0.0.1:${SERVER_PORT}/health`,
       reuseExistingServer: !process.env.CI,
       // `cargo run`'s cold-compile path can comfortably exceed the 60s default when the feature
@@ -44,6 +52,10 @@ export default defineConfig({
         SOTTO_WEB_ORIGIN: `http://127.0.0.1:${WEB_PORT}`,
         GITHUB_CLIENT_ID: "e2e-mock",
         GITHUB_CLIENT_SECRET: "e2e-mock",
+        // These values only turn billing on; e2e-mock-billing prevents any network call to Stripe.
+        STRIPE_SECRET_KEY: "e2e-mock",
+        STRIPE_WEBHOOK_SECRET: "e2e-mock",
+        STRIPE_PRICE_ID: "e2e-mock",
         SOTTO_TELEMETRY: "off",
       },
     },
