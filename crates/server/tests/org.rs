@@ -194,7 +194,7 @@ async fn non_member_cannot_see_or_manage() {
     post(&pool, &owner, "/orgs", org_body(org)).await;
 
     let members_uri = format!("/orgs/{org}/members");
-    // A non-member gets 404 (the org's existence is not leaked), for both read and write.
+    // A non-member gets 404 (the org's existence is not leaked) for member reads and writes.
     assert_eq!(
         get(&pool, Some(&intruder), &members_uri).await.0,
         StatusCode::NOT_FOUND
@@ -454,34 +454,44 @@ async fn update_then_remove_member() {
 }
 
 #[tokio::test]
-async fn only_owner_can_delete_org() {
+async fn org_deletion_is_not_exposed() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
     let org = "org-del-o";
     reset_orgs(&pool, &[org]).await;
     let owner = fresh_session(&pool, "org-del-owner", "org-del-owner-s").await;
-    let admin = fresh_session(&pool, "org-del-admin", "org-del-admin-s").await;
-    post(&pool, &owner, "/orgs", org_body(org)).await;
-    post(
-        &pool,
-        &owner,
-        &format!("/orgs/{org}/members"),
-        member_body("org-del-admin", "admin"),
+    assert_eq!(
+        post(&pool, &owner, "/orgs", org_body(org)).await.0,
+        StatusCode::CREATED
+    );
+
+    sqlx::query(
+        "UPDATE organizations SET stripe_customer_id = 'cus_org_del', \
+         stripe_subscription_id = 'sub_org_del' WHERE id = $1",
     )
-    .await;
+    .bind(org)
+    .execute(&pool)
+    .await
+    .expect("set billing linkage");
 
     assert_eq!(
-        delete(&pool, &admin, &format!("/orgs/{org}")).await.0,
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
         delete(&pool, &owner, &format!("/orgs/{org}")).await.0,
-        StatusCode::NO_CONTENT
+        StatusCode::NOT_FOUND
     );
-    // The org (and its memberships) are gone.
+
+    let (customer_id, subscription_id): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT stripe_customer_id, stripe_subscription_id FROM organizations WHERE id = $1",
+    )
+    .bind(org)
+    .fetch_one(&pool)
+    .await
+    .expect("organisation remains");
+    assert_eq!(customer_id.as_deref(), Some("cus_org_del"));
+    assert_eq!(subscription_id.as_deref(), Some("sub_org_del"));
+
     let (_, body) = get(&pool, Some(&owner), "/orgs").await;
-    assert!(!body.contains(org));
+    assert!(body.contains(org));
 }
 
 #[tokio::test]
