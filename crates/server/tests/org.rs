@@ -466,10 +466,29 @@ async fn org_deletion_is_not_exposed() {
         StatusCode::CREATED
     );
 
+    sqlx::query(
+        "UPDATE organizations SET stripe_customer_id = 'cus_org_del', \
+         stripe_subscription_id = 'sub_org_del' WHERE id = $1",
+    )
+    .bind(org)
+    .execute(&pool)
+    .await
+    .expect("set billing linkage");
+
     assert_eq!(
         delete(&pool, &owner, &format!("/orgs/{org}")).await.0,
         StatusCode::NOT_FOUND
     );
+
+    let (customer_id, subscription_id): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT stripe_customer_id, stripe_subscription_id FROM organizations WHERE id = $1",
+    )
+    .bind(org)
+    .fetch_one(&pool)
+    .await
+    .expect("organisation remains");
+    assert_eq!(customer_id.as_deref(), Some("cus_org_del"));
+    assert_eq!(subscription_id.as_deref(), Some("sub_org_del"));
 
     let (_, body) = get(&pool, Some(&owner), "/orgs").await;
     assert!(body.contains(org));
