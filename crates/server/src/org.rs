@@ -1,9 +1,10 @@
 //! Organisations, memberships, and roles - the team-RBAC substrate.
 //!
 //! Authority lives in `organization_memberships`: a caller's [`Role`] in an org decides what they
-//! may do. Managing members needs `admin` or higher; only an `owner` may grant/modify the `owner`
-//! role or delete the org; an org can never be left with zero owners. To avoid leaking which orgs
-//! exist, a non-member is answered with `404` (not `403`) - `403` is reserved for a member who is
+//! may do. Managing members needs `admin` or higher; only an `owner` may grant or modify the
+//! `owner` role; an org can never be left with zero owners. Organisation deletion is not exposed
+//! because it must coordinate billing and preserve audit history. To avoid leaking which orgs
+//! exist, a non-member is answered with `404` (not `403`); `403` is reserved for a member who is
 //! in the org but lacks the role for the action.
 //!
 //! This is the authorisation layer. Resource access is resolved from membership in
@@ -28,7 +29,7 @@ use crate::sync::{validate_id, MAX_ENC_NAME};
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/orgs", get(list_orgs).post(create_org))
-        .route("/orgs/{org_id}", axum::routing::delete(delete_org))
+        // TODO: revisit DELETE /orgs/{org_id} with a billing-aware, auditable, recoverable design.
         .route("/orgs/{org_id}/members", get(list_members).post(add_member))
         .route(
             "/orgs/{org_id}/members/{user_id}",
@@ -369,24 +370,6 @@ async fn grant_org_key(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::OK)
-}
-
-/// `DELETE /orgs/{org_id}` - delete an org (owner only). Cascades to its memberships.
-async fn delete_org(
-    State(state): State<AppState>,
-    user: AuthUser,
-    Path(org_id): Path<String>,
-) -> Result<StatusCode> {
-    if caller_role(&state, &org_id, &user.user_id).await? != Role::Owner {
-        return Err(Error::Forbidden(
-            "only an owner can delete the organisation".into(),
-        ));
-    }
-    sqlx::query("DELETE FROM organizations WHERE id = $1")
-        .bind(&org_id)
-        .execute(&state.pool)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /orgs/{org_id}/members` - list members (any member of the org may).
