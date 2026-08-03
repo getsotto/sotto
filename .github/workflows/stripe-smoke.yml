@@ -148,21 +148,51 @@ jobs:
           # the only real-Stripe test.
           node -e 'const report = require("./test-results/stripe-playwright.json"); const skipped = report.stats?.skipped ?? 0; if (skipped !== 0) { console.error(`Stripe smoke skipped ${skipped} test(s)`); process.exit(1); }'
 
-      - name: Cancel smoke subscription
+      - name: Clean up smoke subscriptions
         if: always()
         working-directory: web
         run: |
           set -euo pipefail
           fixture="e2e/.fixture.json"
-          if [ ! -f "$fixture" ] || ! command -v psql >/dev/null 2>&1; then
+          if [ ! -f "$fixture" ]; then
             exit 0
           fi
           org_id="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("e2e/.fixture.json", "utf8")).org_id)')"
-          subscription_id="$(psql "$DATABASE_URL" -Atqc "SELECT stripe_subscription_id FROM organizations WHERE id = '$org_id'")"
-          if [ -n "$subscription_id" ]; then
-            curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
-              --request DELETE "https://api.stripe.com/v1/subscriptions/$subscription_id" \
-              >/dev/null
+          subscriptions_file="$RUNNER_TEMP/stripe-subscriptions.json"
+          curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+            --get "https://api.stripe.com/v1/subscriptions" \
+            --data-urlencode "status=all" \
+            --data-urlencode "limit=100" \
+            --output "$subscriptions_file"
+
+          # Search Stripe metadata as well as Postgres: a webhook can fail after Checkout creates a
+          # subscription but before the server stores its id. The subscription metadata is written
+          # by StripeBilling from the seeded org id, so this remains bounded to this smoke run.
+          matches="$(node - "$org_id" "$subscriptions_file" <<'NODE'
+          const fs = require("node:fs");
+          const [orgId, file] = process.argv.slice(2);
+          const payload = JSON.parse(fs.readFileSync(file, "utf8"));
+          for (const subscription of payload.data ?? []) {
+            if (subscription.metadata?.org_id !== orgId || subscription.status === "canceled") continue;
+            const customer = typeof subscription.customer === "string" ? subscription.customer : "";
+            process.stdout.write(`${subscription.id}\\t${customer}\\n`);
+          }
+          NODE
+          )"
+          if [ -n "$matches" ]; then
+            while IFS="$(printf '\t')" read -r subscription_id customer_id; do
+              [ -n "$subscription_id" ] || continue
+              curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+                --request DELETE "https://api.stripe.com/v1/subscriptions/$subscription_id" \
+                >/dev/null
+              if [ -n "$customer_id" ]; then
+                curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+                  --request DELETE "https://api.stripe.com/v1/customers/$customer_id" \
+                  >/dev/null
+              fi
+            done <<EOF
+          $matches
+          EOF
           fi
 
       - uses: actions/upload-artifact@v4
