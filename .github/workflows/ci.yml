@@ -9,6 +9,34 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  action-consumer:
+    name: Test published Sotto action
+    runs-on: ubuntu-latest
+    env:
+      SOTTO_TEST_VERSION: v0.4.0
+    steps:
+      - uses: actions/checkout@v4
+      # Exercise the published release rather than the moving major tag.
+      - id: sotto
+        name: Install Sotto action
+        uses: getsotto/sotto-action@v1.1.0
+        with:
+          sotto-version: ${{ env.SOTTO_TEST_VERSION }}
+      - name: Verify installed release
+        shell: bash
+        env:
+          OUTPUT_VERSION: ${{ steps.sotto.outputs.version }}
+          OUTPUT_TARGET: ${{ steps.sotto.outputs.target }}
+          OUTPUT_BINARY_PATH: ${{ steps.sotto.outputs.binary-path }}
+        run: |
+          set -euo pipefail
+          actual="$(sotto --version)"
+          expected="sotto ${SOTTO_TEST_VERSION#v}"
+          test "$actual" = "$expected"
+          test "$OUTPUT_VERSION" = "$SOTTO_TEST_VERSION"
+          test "$OUTPUT_TARGET" = "x86_64-unknown-linux-gnu"
+          test -x "$OUTPUT_BINARY_PATH"
+
   test:
     runs-on: ubuntu-latest
     steps:
