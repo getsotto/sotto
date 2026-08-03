@@ -317,15 +317,25 @@ fn e2e_provider_page(
 ) -> String {
     format!(
         "<!doctype html><html><head><title>{}</title></head><body>\
-         <h1>{}</h1><a href=\"{}\">{}</a><a href=\"{}\">{}</a>\
+         <h1>{}</h1><p><a href=\"{}\">{}</a></p><p><a href=\"{}\">{}</a></p>\
          </body></html>",
         escape_html(title),
         escape_html(title),
-        escape_html(primary_url),
+        safe_href(primary_url),
         escape_html(primary_label),
-        escape_html(secondary_url),
+        safe_href(secondary_url),
         escape_html(secondary_label),
     )
+}
+
+#[cfg(feature = "e2e-mock-billing")]
+fn safe_href(value: &str) -> String {
+    // Query parameters become links in this test-only page, so reject script/data schemes if a
+    // mock-billing build is ever exposed outside its intended local environment.
+    match Url::parse(value) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => escape_html(value),
+        _ => "#".into(),
+    }
 }
 
 #[cfg(feature = "e2e-mock-billing")]
@@ -678,6 +688,21 @@ mod tests {
         .await;
         assert!(page.contains("Test billing portal"));
         assert!(page.contains("Return to app"));
+    }
+
+    #[cfg(feature = "e2e-mock-billing")]
+    #[test]
+    fn e2e_provider_page_rejects_unsafe_link_schemes() {
+        let page = e2e_provider_page(
+            "Test checkout",
+            "Complete payment",
+            "javascript:alert(1)",
+            "Cancel payment",
+            "data:text/html,unsafe",
+        );
+        assert!(page.contains("href=\"#\""));
+        assert!(!page.contains("javascript:"));
+        assert!(!page.contains("data:text"));
     }
 
     fn sign(secret: &str, t: i64, payload: &str) -> String {
