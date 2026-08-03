@@ -69,12 +69,15 @@ test("real Stripe Checkout completes and applies the Team tier", async ({ page }
             credentials: "include",
           });
           if (!response.ok) return `status:${response.status}`;
-          const body = (await response.json()) as { tier: string };
-          return body.tier;
+          const body = (await response.json()) as {
+            tier: string;
+            effective_tier: string;
+          };
+          return body.tier === "team" && body.effective_tier === "team";
         }, fixture.org_id),
       { intervals: [2_000], timeout: 60_000 },
     )
-    .toBe("team");
+    .toBe(true);
 
   await page.reload();
   await unlockCurrentPage(page);
