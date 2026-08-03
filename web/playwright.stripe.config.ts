@@ -13,6 +13,7 @@ export default defineConfig({
   forbidOnly: true,
   retries: 0,
   workers: 1,
+  // The workflow reads the JSON report after Playwright exits to reject a silently skipped smoke.
   reporter: process.env.CI
     ? [
         ["github"],

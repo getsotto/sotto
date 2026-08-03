@@ -69,7 +69,7 @@ jobs:
           esac
           test -n "$STRIPE_PRICE_ID"
 
-      - name: Build the server and seed fixture
+      - name: Build the seed fixture
         run: |
           set -euo pipefail
           cargo build -p sotto-cli --example e2e_seed
@@ -103,6 +103,8 @@ jobs:
           }
           trap cleanup EXIT INT TERM
 
+          # Stripe CLI exposes the per-listener signing secret only in its human-readable log. Read
+          # it before Playwright starts because the server must verify forwarded webhook signatures.
           webhook_secret=""
           for _ in $(seq 1 30); do
             if [ -f "$listener_log" ]; then
@@ -112,12 +114,15 @@ jobs:
               break
             fi
             if ! kill -0 "$listener_pid" 2>/dev/null; then
+              # The listener log is useful for diagnosing startup failures, but never expose its
+              # signing secret in the Actions log.
               sed -E 's/whsec_[A-Za-z0-9_-]+/<redacted>/g' "$listener_log" >&2 || true
               exit 1
             fi
             sleep 1
           done
           if [ -z "$webhook_secret" ]; then
+            # Keep the timeout failure actionable without leaking the temporary signing secret.
             sed -E 's/whsec_[A-Za-z0-9_-]+/<redacted>/g' "$listener_log" >&2 || true
             echo "error: Stripe CLI did not provide a webhook signing secret" >&2
             exit 1
@@ -130,6 +135,8 @@ jobs:
         working-directory: web
         run: |
           set -euo pipefail
+          # The JSON report is retained so this credentialed run cannot pass by silently skipping
+          # the only real-Stripe test.
           node -e 'const report = require("./test-results/stripe-playwright.json"); const skipped = report.stats?.skipped ?? 0; if (skipped !== 0) { console.error(`Stripe smoke skipped ${skipped} test(s)`); process.exit(1); }'
 
       - name: Cancel smoke subscription
