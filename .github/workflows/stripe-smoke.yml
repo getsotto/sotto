@@ -175,7 +175,7 @@ jobs:
           for (const subscription of payload.data ?? []) {
             if (subscription.metadata?.org_id !== orgId || subscription.status === "canceled") continue;
             const customer = typeof subscription.customer === "string" ? subscription.customer : "";
-            process.stdout.write(`${subscription.id}\\t${customer}\\n`);
+            process.stdout.write(`${subscription.id}\t${customer}\n`);
           }
           NODE
           )"
