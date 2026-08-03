@@ -1,0 +1,159 @@
+name: Stripe smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A Stripe test account is still a credentialed external system. Serialise runs so cleanup and
+# webhook delivery cannot race another checkout, and keep this workflow out of pull-request CI.
+concurrency:
+  group: stripe-smoke
+  cancel-in-progress: false
+
+jobs:
+  stripe-smoke:
+    name: stripe test-mode smoke
+    if: github.repository == 'getsotto/sotto' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: stripe-smoke
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sotto
+          POSTGRES_PASSWORD: sotto
+          POSTGRES_DB: sotto
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sotto"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://sotto:sotto@localhost:5432/sotto
+      STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+      STRIPE_PRICE_ID: ${{ secrets.STRIPE_TEST_PRICE_ID }}
+      SOTTO_BIND: 127.0.0.1:8099
+      SOTTO_PUBLIC_URL: http://127.0.0.1:8099
+      SOTTO_WEB_ORIGIN: http://127.0.0.1:5199
+      SOTTO_TELEMETRY: off
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Stripe CLI
+        env:
+          STRIPE_CLI_BIN_DIR: ${{ runner.temp }}/stripe-cli
+        run: |
+          set -euo pipefail
+          ./.github/scripts/install-stripe-cli.sh
+          echo "$STRIPE_CLI_BIN_DIR" >> "$GITHUB_PATH"
+
+      - name: Validate test-mode billing configuration
+        run: |
+          set -euo pipefail
+          case "$STRIPE_SECRET_KEY" in
+            sk_test_*) ;;
+            *) echo "error: STRIPE_SECRET_KEY must be a Stripe test-mode key" >&2; exit 1 ;;
+          esac
+          test -n "$STRIPE_PRICE_ID"
+
+      - name: Build the server and seed fixture
+        run: |
+          set -euo pipefail
+          cargo build -p sotto-cli --example e2e_seed
+
+      - name: Build the web app
+        working-directory: web
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Install Playwright's chromium browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      - name: Run real Stripe Checkout smoke
+        working-directory: web
+        run: |
+          set -euo pipefail
+          listener_log="$RUNNER_TEMP/stripe-listen.log"
+          stripe listen \
+            --api-key "$STRIPE_SECRET_KEY" \
+            --events checkout.session.completed,customer.subscription.updated,customer.subscription.deleted \
+            --forward-to "http://127.0.0.1:8099/billing/webhook" \
+            >"$listener_log" 2>&1 &
+          listener_pid=$!
+
+          cleanup() {
+            kill "$listener_pid" 2>/dev/null || true
+            wait "$listener_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT INT TERM
+
+          webhook_secret=""
+          for _ in $(seq 1 30); do
+            if [ -f "$listener_log" ]; then
+              webhook_secret="$(sed -nE "s/.*webhook signing secret is '?(whsec_[A-Za-z0-9_-]+)'?.*/\\1/p" "$listener_log" | head -n1)"
+            fi
+            if [ -n "$webhook_secret" ]; then
+              break
+            fi
+            if ! kill -0 "$listener_pid" 2>/dev/null; then
+              sed -E 's/whsec_[A-Za-z0-9_-]+/<redacted>/g' "$listener_log" >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ -z "$webhook_secret" ]; then
+            sed -E 's/whsec_[A-Za-z0-9_-]+/<redacted>/g' "$listener_log" >&2 || true
+            echo "error: Stripe CLI did not provide a webhook signing secret" >&2
+            exit 1
+          fi
+
+          export STRIPE_WEBHOOK_SECRET="$webhook_secret"
+          npm run e2e -- --config=playwright.stripe.config.ts
+
+      - name: Reject skipped Stripe smoke tests
+        working-directory: web
+        run: |
+          set -euo pipefail
+          node -e 'const report = require("./test-results/stripe-playwright.json"); const skipped = report.stats?.skipped ?? 0; if (skipped !== 0) { console.error(`Stripe smoke skipped ${skipped} test(s)`); process.exit(1); }'
+
+      - name: Cancel smoke subscription
+        if: always()
+        working-directory: web
+        run: |
+          set -euo pipefail
+          fixture="e2e/.fixture.json"
+          if [ ! -f "$fixture" ] || ! command -v psql >/dev/null 2>&1; then
+            exit 0
+          fi
+          org_id="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("e2e/.fixture.json", "utf8")).org_id)')"
+          subscription_id="$(psql "$DATABASE_URL" -Atqc "SELECT stripe_subscription_id FROM organizations WHERE id = '$org_id'")"
+          if [ -n "$subscription_id" ]; then
+            curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+              --request DELETE "https://api.stripe.com/v1/subscriptions/$subscription_id" \
+              >/dev/null
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: stripe-smoke-playwright-report
+          path: |
+            web/playwright-report/
+            web/test-results/
+          retention-days: 7
