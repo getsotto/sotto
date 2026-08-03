@@ -98,8 +98,9 @@ To run it, open **Actions -> Stripe smoke**, choose **Run workflow** on `main`, 
 starts `sotto-server` with `e2e-mock-oauth` only, and starts a pinned Stripe CLI. The CLI forwards
 Checkout and subscription events to the local webhook and supplies a temporary signing secret.
 Playwright completes Stripe-hosted Checkout with a test card, then waits for the verified webhook
-to assign the Team tier. Matching test subscriptions and their generated customers are cancelled
-and removed at the end, including when webhook processing failed before Postgres stored an id.
+to assign the Team tier. Matching test subscriptions are cancelled at the end, including when
+webhook processing failed before Postgres stored an id. A generated customer is removed only when
+it has no active subscription for another organisation.
 
 For a local run, use a fresh Postgres database and the same test-mode values. Start Stripe CLI in
 one shell:
