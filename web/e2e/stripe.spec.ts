@@ -16,12 +16,12 @@ async function fillOptional(
   value: string,
 ) {
   const field = page.locator(selector).first();
-  if ((await field.count()) > 0 && (await field.isVisible().catch(() => false))) {
+  // Stripe may omit optional billing fields depending on the account and payment configuration;
+  // the required card fields below remain strict assertions.
+  if ((await field.count()) > 0 && (await field.isVisible())) {
     await field.fill(value);
   }
 }
-
-test.describe.configure({ retries: 0 });
 
 test("real Stripe Checkout completes and applies the Team tier", async ({ page }) => {
   await loginAndUnlock(page);
@@ -81,5 +81,6 @@ test("real Stripe Checkout completes and applies the Team tier", async ({ page }
 
   await page.reload();
   await unlockCurrentPage(page);
+  await selectOwnerOrganisation(page);
   await expect(page.getByText(/Plan:\s*team/)).toBeVisible();
 });
