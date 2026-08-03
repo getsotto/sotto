@@ -160,16 +160,33 @@ jobs:
           fi
           org_id="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("e2e/.fixture.json", "utf8")).org_id)')"
           subscriptions_file="$RUNNER_TEMP/stripe-subscriptions.json"
-          curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
-            --get "https://api.stripe.com/v1/subscriptions" \
-            --data-urlencode "status=all" \
-            --data-urlencode "limit=100" \
-            --output "$subscriptions_file"
+          matches_file="$RUNNER_TEMP/stripe-subscription-matches.tsv"
+          customers_file="$RUNNER_TEMP/stripe-customers.txt"
+          : > "$matches_file"
+          : > "$customers_file"
+          starting_after=""
 
           # Search Stripe metadata as well as Postgres: a webhook can fail after Checkout creates a
           # subscription but before the server stores its id. The subscription metadata is written
           # by StripeBilling from the seeded org id, so this remains bounded to this smoke run.
-          matches="$(node - "$org_id" "$subscriptions_file" <<'NODE'
+          # Follow every API page so old smoke runs cannot accumulate beyond the first 100 records.
+          while :; do
+            if [ -n "$starting_after" ]; then
+              curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+                --get "https://api.stripe.com/v1/subscriptions" \
+                --data-urlencode "status=all" \
+                --data-urlencode "limit=100" \
+                --data-urlencode "starting_after=$starting_after" \
+                --output "$subscriptions_file"
+            else
+              curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+                --get "https://api.stripe.com/v1/subscriptions" \
+                --data-urlencode "status=all" \
+                --data-urlencode "limit=100" \
+                --output "$subscriptions_file"
+            fi
+
+            node - "$org_id" "$subscriptions_file" <<'NODE' >> "$matches_file"
           const fs = require("node:fs");
           const [orgId, file] = process.argv.slice(2);
           const payload = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -179,21 +196,39 @@ jobs:
             process.stdout.write(`${subscription.id}\t${customer}\n`);
           }
           NODE
-          )"
-          if [ -n "$matches" ]; then
-            while IFS="$(printf '\t')" read -r subscription_id customer_id; do
-              [ -n "$subscription_id" ] || continue
+
+            has_more="$(node - "$subscriptions_file" <<'NODE'
+          const fs = require("node:fs");
+          const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          process.stdout.write(payload.has_more ? "true" : "false");
+          NODE
+            )"
+            [ "$has_more" = "true" ] || break
+            starting_after="$(node - "$subscriptions_file" <<'NODE'
+          const fs = require("node:fs");
+          const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          process.stdout.write(payload.data?.at(-1)?.id ?? "");
+          NODE
+            )"
+            [ -n "$starting_after" ] || break
+          done
+
+          while IFS="$(printf '\t')" read -r subscription_id customer_id; do
+            [ -n "$subscription_id" ] || continue
+            curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+              --request DELETE "https://api.stripe.com/v1/subscriptions/$subscription_id" \
+              >/dev/null
+            if [ -n "$customer_id" ]; then
+              printf '%s\n' "$customer_id" >> "$customers_file"
+            fi
+          done < "$matches_file"
+
+          if [ -s "$customers_file" ]; then
+            sort -u "$customers_file" | while read -r customer_id; do
               curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
-                --request DELETE "https://api.stripe.com/v1/subscriptions/$subscription_id" \
+                --request DELETE "https://api.stripe.com/v1/customers/$customer_id" \
                 >/dev/null
-              if [ -n "$customer_id" ]; then
-                curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
-                  --request DELETE "https://api.stripe.com/v1/customers/$customer_id" \
-                  >/dev/null
-              fi
-            done <<EOF
-          $matches
-          EOF
+            done
           fi
 
       - uses: actions/upload-artifact@v4
