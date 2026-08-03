@@ -100,6 +100,12 @@ test("login, unlock, invite, and checkout", async ({ page }) => {
   // "no keys yet" marker: the invitee's public key (pushed by the seed fixture) resolved, so the
   // org-key grant went through cleanly, not just the bare invite. Reusing an existing row makes a
   // CI retry safe if the first attempt completed the invite before a later assertion failed.
+  // Wait for the member fetch to settle before deciding whether the row already exists; otherwise
+  // a retry can mistake the loading state for an absent invite and submit a duplicate.
+  const memberLoading = page
+    .getByRole("heading", { name: /^Members of/ })
+    .locator("xpath=following-sibling::p[normalize-space()='Loading…']");
+  await expect(memberLoading).toHaveCount(0);
   const invitedRow = page.getByRole("listitem").filter({ hasText: fixture.invitee_user_id });
   if (!(await invitedRow.isVisible().catch(() => false))) {
     await page.getByLabel("Invite by email").fill(fixture.invitee_email);
