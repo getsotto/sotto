@@ -98,6 +98,7 @@ impl Config {
         let bind_addr = std::env::var("SOTTO_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
         let public_base_url =
             env_nonempty("SOTTO_PUBLIC_URL").unwrap_or_else(|| DEFAULT_PUBLIC_URL.to_string());
+        let web_origin = env_nonempty("SOTTO_WEB_ORIGIN");
 
         let oauth = match (
             env_nonempty("GITHUB_CLIENT_ID"),
@@ -107,7 +108,7 @@ impl Config {
                 github_client_id,
                 github_client_secret,
                 public_base_url: public_base_url.clone(),
-                web_origin: env_nonempty("SOTTO_WEB_ORIGIN"),
+                web_origin: web_origin.clone(),
             }),
             _ => None,
         };
@@ -121,7 +122,7 @@ impl Config {
                 secret_key,
                 webhook_secret,
                 price_id,
-                return_url: public_base_url,
+                return_url: billing_return_url(&public_base_url, web_origin.as_deref()),
             }),
             _ => None,
         };
@@ -144,6 +145,12 @@ impl Config {
             telemetry,
         })
     }
+}
+
+/// Return users to the browser application's origin when it is deployed separately from the API.
+/// A shared origin remains the fallback for the hosted reverse-proxy layout and existing installs.
+fn billing_return_url(public_base_url: &str, web_origin: Option<&str>) -> String {
+    web_origin.unwrap_or(public_base_url).to_string()
 }
 
 /// The telemetry opt-out decision, separated from env access so the matrix is unit-testable.
@@ -176,7 +183,19 @@ fn env_nonempty(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::telemetry_ping_enabled;
+    use super::{billing_return_url, telemetry_ping_enabled};
+
+    #[test]
+    fn billing_returns_to_the_web_origin_when_configured() {
+        assert_eq!(
+            billing_return_url("https://api.sotto.test", Some("https://app.sotto.test")),
+            "https://app.sotto.test"
+        );
+        assert_eq!(
+            billing_return_url("https://sotto.test", None),
+            "https://sotto.test"
+        );
+    }
 
     #[test]
     fn telemetry_defaults_on_and_every_opt_out_signal_wins() {
