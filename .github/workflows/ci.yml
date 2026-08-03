@@ -9,8 +9,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
   action-consumer:
-    name: Test published Sotto action
+    name: action consumer
     runs-on: ubuntu-latest
     env:
       SOTTO_TEST_VERSION: v0.4.0
@@ -36,22 +52,6 @@ jobs:
           test "$OUTPUT_VERSION" = "$SOTTO_TEST_VERSION"
           test "$OUTPUT_TARGET" = "x86_64-unknown-linux-gnu"
           test -x "$OUTPUT_BINARY_PATH"
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace
 
   wasm:
     runs-on: ubuntu-latest
