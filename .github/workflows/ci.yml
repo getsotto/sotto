@@ -42,6 +42,20 @@ jobs:
         uses: getsotto/sotto-action@v1.1.0
         with:
           sotto-version: ${{ env.SOTTO_TEST_VERSION }}
+      - id: missing-version
+        name: Reject missing sotto-version
+        uses: getsotto/sotto-action@v1.1.0
+        continue-on-error: true
+      - name: Verify missing version is rejected (Linux/macOS)
+        if: always() && runner.os != 'Windows'
+        run: test "${{ steps.missing-version.outcome }}" = failure
+      - name: Verify missing version is rejected (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ('${{ steps.missing-version.outcome }}' -ne 'failure') {
+            throw "missing sotto-version was accepted"
+          }
       - name: Verify installed release (Linux/macOS)
         if: runner.os != 'Windows'
         env:
