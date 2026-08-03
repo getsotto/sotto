@@ -26,8 +26,12 @@ jobs:
         run: cargo test --workspace
 
   action-consumer:
-    name: action consumer
-    runs-on: ubuntu-latest
+    name: action consumer (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     env:
       SOTTO_TEST_VERSION: v0.4.0
     steps:
@@ -38,20 +42,46 @@ jobs:
         uses: getsotto/sotto-action@v1.1.0
         with:
           sotto-version: ${{ env.SOTTO_TEST_VERSION }}
-      - name: Verify installed release
-        shell: bash
+      - name: Verify installed release (Linux/macOS)
+        if: runner.os != 'Windows'
         env:
           OUTPUT_VERSION: ${{ steps.sotto.outputs.version }}
           OUTPUT_TARGET: ${{ steps.sotto.outputs.target }}
           OUTPUT_BINARY_PATH: ${{ steps.sotto.outputs.binary-path }}
         run: |
-          set -euo pipefail
           actual="$(sotto --version)"
           expected="sotto ${SOTTO_TEST_VERSION#v}"
           test "$actual" = "$expected"
           test "$OUTPUT_VERSION" = "$SOTTO_TEST_VERSION"
-          test "$OUTPUT_TARGET" = "x86_64-unknown-linux-gnu"
+          case "$(uname -s):$(uname -m)" in
+            Linux:x86_64) expected_target=x86_64-unknown-linux-gnu ;;
+            Linux:aarch64|Linux:arm64) expected_target=aarch64-unknown-linux-gnu ;;
+            Darwin:x86_64) expected_target=x86_64-apple-darwin ;;
+            Darwin:arm64) expected_target=aarch64-apple-darwin ;;
+            *) echo "error: unsupported runner $(uname -s):$(uname -m)" >&2; exit 1 ;;
+          esac
+          test "$OUTPUT_TARGET" = "$expected_target"
           test -x "$OUTPUT_BINARY_PATH"
+      - name: Verify installed release (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          OUTPUT_VERSION: ${{ steps.sotto.outputs.version }}
+          OUTPUT_TARGET: ${{ steps.sotto.outputs.target }}
+          OUTPUT_BINARY_PATH: ${{ steps.sotto.outputs.binary-path }}
+        run: |
+          $actual = (& sotto --version).Trim()
+          $expected = "sotto $($env:SOTTO_TEST_VERSION.Substring(1))"
+          if ($actual -ne $expected) { throw "expected '$actual' to equal '$expected'" }
+          if ($env:OUTPUT_VERSION -ne $env:SOTTO_TEST_VERSION) { throw "unexpected action version output" }
+          $expectedTarget = switch ($env:PROCESSOR_ARCHITECTURE) {
+            AMD64 { "x86_64-pc-windows-msvc" }
+            default { throw "unsupported Windows architecture: $env:PROCESSOR_ARCHITECTURE" }
+          }
+          if ($env:OUTPUT_TARGET -ne $expectedTarget) { throw "unexpected action target output" }
+          if (-not (Test-Path -LiteralPath $env:OUTPUT_BINARY_PATH -PathType Leaf)) {
+            throw "installed binary was not found"
+          }
 
   wasm:
     runs-on: ubuntu-latest
