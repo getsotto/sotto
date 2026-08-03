@@ -126,7 +126,7 @@ test("login, unlock, invite, and checkout", async ({ page }) => {
 
   await page.waitForURL(/billing=success/);
   await unlockCurrentPage(page);
-  await expect(page.getByText("Payment received.")).toBeVisible();
+  await expect(page.getByText("Payment received. (deliberate gate failure)")).toBeVisible();
 });
 
 test("checkout cancelled return is handled", async ({ page }) => {
