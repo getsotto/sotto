@@ -18,6 +18,7 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   workers: 1,
+  // The CI job reads this report to turn any skipped test into a hard failure.
   reporter: process.env.CI
     ? [
         ["github"],

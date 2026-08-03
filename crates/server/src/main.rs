@@ -58,6 +58,9 @@ async fn run() -> Result<()> {
                 "warning: built with `e2e-mock-billing` - checkout pages are local test fixtures. \
                  Never deploy this build."
             );
+            // The browser leaves the Vite preview for this provider page, so use the API origin
+            // already used by the E2E OAuth adapter. The fallback only covers a feature-only local
+            // server run where no public OAuth origin has been configured.
             let provider_origin = config
                 .oauth
                 .as_ref()

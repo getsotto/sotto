@@ -651,6 +651,35 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "e2e-mock-billing")]
+    #[tokio::test]
+    async fn e2e_provider_builds_and_serves_a_local_portal_url() {
+        let provider = E2eBilling {
+            provider_origin: "http://127.0.0.1:8099/".into(),
+        };
+        let url = provider
+            .create_portal("cus-test", "http://127.0.0.1:5199/app")
+            .await
+            .unwrap();
+        let parsed = Url::parse(&url).unwrap();
+        assert_eq!(parsed.path(), "/e2e/billing/portal");
+        assert_eq!(
+            parsed
+                .query_pairs()
+                .find(|(key, _)| key == "return_url")
+                .unwrap()
+                .1,
+            "http://127.0.0.1:5199/app"
+        );
+
+        let Html(page) = e2e_portal(Query(E2ePortalQuery {
+            return_url: "http://127.0.0.1:5199/app".into(),
+        }))
+        .await;
+        assert!(page.contains("Test billing portal"));
+        assert!(page.contains("Return to app"));
+    }
+
     fn sign(secret: &str, t: i64, payload: &str) -> String {
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(format!("{t}.{payload}").as_bytes());

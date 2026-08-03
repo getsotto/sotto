@@ -87,7 +87,7 @@ async function selectOwnerOrganisation(page: import("@playwright/test").Page) {
   await expect(page.getByRole("heading", { name: /^Members of/ })).toBeVisible();
 }
 
-test("login, unlock, and invite", async ({ page }) => {
+test("login, unlock, invite, and checkout", async ({ page }) => {
   await loginAndUnlock(page);
 
   // The seeded project is visible - proves the browser decrypted real, server-synced data, not
@@ -96,21 +96,23 @@ test("login, unlock, and invite", async ({ page }) => {
 
   await selectOwnerOrganisation(page);
 
-  await page.getByLabel("Invite by email").fill(fixture.invitee_email);
-  await page.getByRole("button", { name: "Invite" }).click();
-
-  await expect(page.getByText(`invited ${fixture.invitee_email}`, { exact: false })).toBeVisible();
   // The member row (keyed by user id, not email - TeamPanel renders `m.userId`) has no
   // "no keys yet" marker: the invitee's public key (pushed by the seed fixture) resolved, so the
-  // org-key grant went through cleanly, not just the bare invite.
+  // org-key grant went through cleanly, not just the bare invite. Reusing an existing row makes a
+  // CI retry safe if the first attempt completed the invite before a later assertion failed.
   const invitedRow = page.getByRole("listitem").filter({ hasText: fixture.invitee_user_id });
+  if (!(await invitedRow.isVisible().catch(() => false))) {
+    await page.getByLabel("Invite by email").fill(fixture.invitee_email);
+    await page.getByRole("button", { name: "Invite" }).click();
+    await expect(
+      page.getByText(`invited ${fixture.invitee_email}`, { exact: false }),
+    ).toBeVisible();
+  }
+  await expect(invitedRow).toBeVisible();
   await expect(invitedRow).not.toContainText("no keys yet");
-});
 
-test("checkout completion return is handled", async ({ page }) => {
-  await loginAndUnlock(page);
-  await selectOwnerOrganisation(page);
-
+  // The seeded organisation is still free because the test billing adapter does not emit a
+  // webhook. That keeps the Team upgrade control available for the rest of this linear funnel.
   const upgrade = page.getByRole("button", { name: "Upgrade to Team" });
   await expect(upgrade).toBeVisible();
   await Promise.all([page.waitForURL(/\/e2e\/billing\/checkout/), upgrade.click()]);

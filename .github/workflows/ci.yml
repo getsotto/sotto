@@ -239,6 +239,8 @@ jobs:
         working-directory: web
         run: npm run e2e
 
+      # Keep this paired with the JSON reporter in web/playwright.config.ts. A skipped test must
+      # not make the required browser gate look green.
       - name: Reject skipped funnel tests
         working-directory: web
         run: |
