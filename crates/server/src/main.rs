@@ -9,6 +9,7 @@ use std::sync::Arc;
 #[cfg(not(feature = "e2e-mock-oauth"))]
 use sotto_server::auth::GithubOAuth;
 use sotto_server::auth::OAuthProvider;
+use sotto_server::billing::BillingState;
 use sotto_server::config::Config;
 use sotto_server::db;
 use sotto_server::error::{Error, Result};
@@ -50,11 +51,31 @@ async fn run() -> Result<()> {
         eprintln!("warning: GITHUB_CLIENT_ID/SECRET unset - OAuth endpoints will return 503");
     }
 
+    let billing = config.billing.clone().map(|billing| {
+        #[cfg(feature = "e2e-mock-billing")]
+        {
+            eprintln!(
+                "warning: built with `e2e-mock-billing` - checkout pages are local test fixtures. \
+                 Never deploy this build."
+            );
+            let provider_origin = config
+                .oauth
+                .as_ref()
+                .map(|oauth| oauth.public_base_url.clone())
+                .unwrap_or_else(|| "http://127.0.0.1:8080".into());
+            BillingState::with_e2e_provider(billing, provider_origin)
+        }
+        #[cfg(not(feature = "e2e-mock-billing"))]
+        {
+            BillingState::from_config(billing)
+        }
+    });
+
     let state = AppState {
         pool: pool.clone(),
         oauth,
         oauth_config: config.oauth.clone(),
-        billing: config.billing.clone(),
+        billing,
         telemetry_ingest: config.telemetry.ingest_enabled,
     };
 

@@ -9,17 +9,27 @@
 //! pattern). Zero-knowledge is unaffected - Stripe learns an org *id* and whatever the payer types
 //! into Stripe's own pages; org names, membership, and vault data never leave the server.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use async_trait::async_trait;
+#[cfg(feature = "e2e-mock-billing")]
+use axum::extract::Query;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
+#[cfg(feature = "e2e-mock-billing")]
+use axum::response::Html;
+#[cfg(feature = "e2e-mock-billing")]
+use axum::routing::get;
 use axum::routing::post;
 use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use sqlx::PgPool;
+
+#[cfg(feature = "e2e-mock-billing")]
+use url::Url;
 
 use crate::auth::AuthUser;
 use crate::config::BillingConfig;
@@ -33,14 +43,158 @@ const SIGNATURE_TOLERANCE_SECS: i64 = 300;
 /// card (dunning) - losing entitlements over a bounced payment is the wrong first touch.
 const ACTIVE_STATUSES: [&str; 3] = ["active", "trialing", "past_due"];
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/orgs/{org_id}/billing/checkout", post(create_checkout))
-        .route("/orgs/{org_id}/billing/portal", post(create_portal))
-        .route("/billing/webhook", post(webhook))
+/// The small interface between billing handlers and an external payment provider.
+#[async_trait]
+pub trait BillingProvider: Send + Sync {
+    async fn create_checkout(
+        &self,
+        org_id: &str,
+        customer: Option<&str>,
+        success_url: &str,
+        cancel_url: &str,
+    ) -> Result<String>;
+
+    async fn create_portal(&self, customer: &str, return_url: &str) -> Result<String>;
 }
 
-fn billing_config(state: &AppState) -> Result<&BillingConfig> {
+/// Billing resources shared by handlers. The provider is swappable for the browser E2E build,
+/// while webhook verification keeps its own secret regardless of which checkout adapter runs.
+#[derive(Clone)]
+pub struct BillingState {
+    provider: Arc<dyn BillingProvider>,
+    webhook_secret: String,
+    return_url: String,
+}
+
+impl BillingState {
+    pub fn from_config(config: BillingConfig) -> Self {
+        let provider = StripeBilling {
+            secret_key: config.secret_key.clone(),
+            price_id: config.price_id,
+        };
+        Self {
+            provider: Arc::new(provider),
+            webhook_secret: config.webhook_secret,
+            return_url: config.return_url,
+        }
+    }
+
+    #[cfg(feature = "e2e-mock-billing")]
+    pub fn with_e2e_provider(config: BillingConfig, provider_origin: String) -> Self {
+        Self {
+            provider: Arc::new(E2eBilling { provider_origin }),
+            webhook_secret: config.webhook_secret,
+            return_url: config.return_url,
+        }
+    }
+}
+
+struct StripeBilling {
+    secret_key: String,
+    price_id: String,
+}
+
+#[async_trait]
+impl BillingProvider for StripeBilling {
+    async fn create_checkout(
+        &self,
+        org_id: &str,
+        customer: Option<&str>,
+        success_url: &str,
+        cancel_url: &str,
+    ) -> Result<String> {
+        let mut form = vec![
+            ("mode".to_string(), "subscription".to_string()),
+            ("line_items[0][price]".to_string(), self.price_id.clone()),
+            ("line_items[0][quantity]".to_string(), "1".to_string()),
+            ("client_reference_id".to_string(), org_id.to_string()),
+            // Mirrored onto the subscription so its lifecycle webhooks name the org even if they
+            // arrive before (or without) the checkout-completed event.
+            (
+                "subscription_data[metadata][org_id]".to_string(),
+                org_id.to_string(),
+            ),
+            ("success_url".to_string(), success_url.to_string()),
+            ("cancel_url".to_string(), cancel_url.to_string()),
+        ];
+        if let Some(customer) = customer {
+            form.push(("customer".to_string(), customer.to_string()));
+        }
+
+        let session = stripe_post(&self.secret_key, "checkout/sessions", &form).await?;
+        session["url"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| Error::Upstream("stripe checkout session had no url".into()))
+    }
+
+    async fn create_portal(&self, customer: &str, return_url: &str) -> Result<String> {
+        let form = vec![
+            ("customer".to_string(), customer.to_string()),
+            ("return_url".to_string(), return_url.to_string()),
+        ];
+        let session = stripe_post(&self.secret_key, "billing_portal/sessions", &form).await?;
+        session["url"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| Error::Upstream("stripe portal session had no url".into()))
+    }
+}
+
+#[cfg(feature = "e2e-mock-billing")]
+struct E2eBilling {
+    provider_origin: String,
+}
+
+#[cfg(feature = "e2e-mock-billing")]
+#[async_trait]
+impl BillingProvider for E2eBilling {
+    async fn create_checkout(
+        &self,
+        _org_id: &str,
+        _customer: Option<&str>,
+        success_url: &str,
+        cancel_url: &str,
+    ) -> Result<String> {
+        self.page_url(
+            "checkout",
+            &[("success_url", success_url), ("cancel_url", cancel_url)],
+        )
+    }
+
+    async fn create_portal(&self, _customer: &str, return_url: &str) -> Result<String> {
+        self.page_url("portal", &[("return_url", return_url)])
+    }
+}
+
+#[cfg(feature = "e2e-mock-billing")]
+impl E2eBilling {
+    fn page_url(&self, page: &str, params: &[(&str, &str)]) -> Result<String> {
+        let base = format!(
+            "{}/e2e/billing/{page}",
+            self.provider_origin.trim_end_matches('/')
+        );
+        let mut url = Url::parse(&base).map_err(|e| Error::Config(e.to_string()))?;
+        url.query_pairs_mut().extend_pairs(params.iter().copied());
+        Ok(url.to_string())
+    }
+}
+
+pub fn router() -> Router<AppState> {
+    let router = Router::new()
+        .route("/orgs/{org_id}/billing/checkout", post(create_checkout))
+        .route("/orgs/{org_id}/billing/portal", post(create_portal))
+        .route("/billing/webhook", post(webhook));
+
+    #[cfg(feature = "e2e-mock-billing")]
+    let router = router
+        .route("/e2e/billing/checkout", get(e2e_checkout))
+        .route("/e2e/billing/portal", get(e2e_portal));
+
+    router
+}
+
+fn billing_config(state: &AppState) -> Result<&BillingState> {
     state
         .billing
         .as_ref()
@@ -58,14 +212,14 @@ async fn require_billing_admin(pool: &PgPool, org_id: &str, user_id: &str) -> Re
     }
 }
 
-/// A Stripe-hosted page for the browser to navigate to.
+/// A provider-hosted page for the browser to navigate to.
 #[derive(Serialize)]
 struct RedirectView {
     url: String,
 }
 
 /// `POST /orgs/{org_id}/billing/checkout` - start a Team subscription (admin+). Returns the URL of
-/// a Stripe Checkout page; the tier flips when the `checkout.session.completed` webhook arrives.
+/// a checkout page; the tier flips when the `checkout.session.completed` webhook arrives.
 async fn create_checkout(
     State(state): State<AppState>,
     user: AuthUser,
@@ -84,31 +238,11 @@ async fn create_checkout(
             .flatten();
 
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
-    let mut form = vec![
-        ("mode".to_string(), "subscription".to_string()),
-        ("line_items[0][price]".to_string(), billing.price_id.clone()),
-        ("line_items[0][quantity]".to_string(), "1".to_string()),
-        ("client_reference_id".to_string(), org_id.clone()),
-        // Mirrored onto the subscription so its lifecycle webhooks name the org even if they
-        // arrive before (or without) the checkout-completed event.
-        (
-            "subscription_data[metadata][org_id]".to_string(),
-            org_id.clone(),
-        ),
-        ("success_url".to_string(), success_url),
-        ("cancel_url".to_string(), cancel_url),
-    ];
-    if let Some(customer) = customer {
-        form.push(("customer".to_string(), customer));
-    }
-
-    let session = stripe_post(&billing.secret_key, "checkout/sessions", &form).await?;
-    let url = session["url"]
-        .as_str()
-        .ok_or_else(|| Error::Upstream("stripe checkout session had no url".into()))?;
-    Ok(Json(RedirectView {
-        url: url.to_string(),
-    }))
+    let url = billing
+        .provider
+        .create_checkout(&org_id, customer.as_deref(), &success_url, &cancel_url)
+        .await?;
+    Ok(Json(RedirectView { url }))
 }
 
 /// `POST /orgs/{org_id}/billing/portal` - manage/cancel the subscription (admin+) via Stripe's
@@ -131,17 +265,76 @@ async fn create_portal(
         Error::BadRequest("this organisation has no billing account yet - subscribe first".into())
     })?;
 
-    let form = vec![
-        ("customer".to_string(), customer),
-        ("return_url".to_string(), app_url(&billing.return_url)),
-    ];
-    let session = stripe_post(&billing.secret_key, "billing_portal/sessions", &form).await?;
-    let url = session["url"]
-        .as_str()
-        .ok_or_else(|| Error::Upstream("stripe portal session had no url".into()))?;
-    Ok(Json(RedirectView {
-        url: url.to_string(),
-    }))
+    let url = billing
+        .provider
+        .create_portal(&customer, &app_url(&billing.return_url))
+        .await?;
+    Ok(Json(RedirectView { url }))
+}
+
+#[cfg(feature = "e2e-mock-billing")]
+#[derive(Deserialize)]
+struct E2eCheckoutQuery {
+    success_url: String,
+    cancel_url: String,
+}
+
+#[cfg(feature = "e2e-mock-billing")]
+#[derive(Deserialize)]
+struct E2ePortalQuery {
+    return_url: String,
+}
+
+#[cfg(feature = "e2e-mock-billing")]
+async fn e2e_checkout(Query(query): Query<E2eCheckoutQuery>) -> Html<String> {
+    Html(e2e_provider_page(
+        "Test checkout",
+        "Complete payment",
+        &query.success_url,
+        "Cancel payment",
+        &query.cancel_url,
+    ))
+}
+
+#[cfg(feature = "e2e-mock-billing")]
+async fn e2e_portal(Query(query): Query<E2ePortalQuery>) -> Html<String> {
+    Html(e2e_provider_page(
+        "Test billing portal",
+        "Return to app",
+        &query.return_url,
+        "Return to app",
+        &query.return_url,
+    ))
+}
+
+#[cfg(feature = "e2e-mock-billing")]
+fn e2e_provider_page(
+    title: &str,
+    primary_label: &str,
+    primary_url: &str,
+    secondary_label: &str,
+    secondary_url: &str,
+) -> String {
+    format!(
+        "<!doctype html><html><head><title>{}</title></head><body>\
+         <h1>{}</h1><a href=\"{}\">{}</a><a href=\"{}\">{}</a>\
+         </body></html>",
+        escape_html(title),
+        escape_html(title),
+        escape_html(primary_url),
+        escape_html(primary_label),
+        escape_html(secondary_url),
+        escape_html(secondary_label),
+    )
+}
+
+#[cfg(feature = "e2e-mock-billing")]
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// The vault app's address: the site root serves the marketing page, the app lives under `/app`.
@@ -428,6 +621,33 @@ mod tests {
         assert_eq!(
             app_url("https://getsotto.test/"),
             "https://getsotto.test/app"
+        );
+    }
+
+    #[cfg(feature = "e2e-mock-billing")]
+    #[tokio::test]
+    async fn e2e_provider_builds_a_local_checkout_url() {
+        let provider = E2eBilling {
+            provider_origin: "http://127.0.0.1:8099/".into(),
+        };
+        let url = provider
+            .create_checkout(
+                "org-1",
+                None,
+                "http://127.0.0.1:5199/app?billing=success",
+                "http://127.0.0.1:5199/app?billing=cancelled",
+            )
+            .await
+            .unwrap();
+        let parsed = Url::parse(&url).unwrap();
+        assert_eq!(parsed.path(), "/e2e/billing/checkout");
+        assert_eq!(
+            parsed
+                .query_pairs()
+                .find(|(key, _)| key == "success_url")
+                .unwrap()
+                .1,
+            "http://127.0.0.1:5199/app?billing=success"
         );
     }
 
