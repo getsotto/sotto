@@ -14,6 +14,7 @@ const WEB_PORT = 5199;
 
 export default defineConfig({
   testDir: "./e2e",
+  testMatch: /funnel\.spec\.ts/,
   fullyParallel: false, // shared server + Postgres state; the funnel is one linear story
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,

@@ -1,0 +1,281 @@
+name: Stripe smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A Stripe test account is still a credentialed external system. Serialise runs so cleanup and
+# webhook delivery cannot race another checkout, and keep this workflow out of pull-request CI.
+concurrency:
+  group: stripe-smoke
+  cancel-in-progress: false
+
+jobs:
+  stripe-smoke:
+    name: stripe test-mode smoke
+    # Only the canonical repository main branch may use the credentialed environment. This keeps
+    # fork and pull-request workflow runs from reaching the Stripe test account.
+    if: github.repository == 'getsotto/sotto' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # The environment approval is the second gate: its secrets are unavailable until a maintainer
+    # approves this manually dispatched job.
+    environment:
+      name: stripe-smoke
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sotto
+          POSTGRES_PASSWORD: sotto
+          POSTGRES_DB: sotto
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sotto"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://sotto:sotto@localhost:5432/sotto
+      STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+      STRIPE_PRICE_ID: ${{ secrets.STRIPE_TEST_PRICE_ID }}
+      SOTTO_BIND: 127.0.0.1:8099
+      SOTTO_PUBLIC_URL: http://127.0.0.1:8099
+      SOTTO_WEB_ORIGIN: http://127.0.0.1:5199
+      SOTTO_TELEMETRY: off
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The web build invokes wasm-pack directly, so install the same pinned tool used by the
+      # required web CI job instead of relying on runner-global tooling. Pinning matters because
+      # the action's "latest" resolution has selected v0.9.1 over v0.15.0 lexicographically.
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@v0.4.0
+        with:
+          version: "v0.15.0"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Stripe CLI
+        env:
+          STRIPE_CLI_BIN_DIR: ${{ runner.temp }}/stripe-cli
+        run: |
+          set -euo pipefail
+          ./.github/scripts/install-stripe-cli.sh
+          echo "$STRIPE_CLI_BIN_DIR" >> "$GITHUB_PATH"
+
+      - name: Validate test-mode billing configuration
+        run: |
+          set -euo pipefail
+          case "$STRIPE_SECRET_KEY" in
+            sk_test_*) ;;
+            *) echo "error: STRIPE_SECRET_KEY must be a Stripe test-mode key" >&2; exit 1 ;;
+          esac
+          test -n "$STRIPE_PRICE_ID"
+
+      - name: Build the seed fixture
+        run: |
+          set -euo pipefail
+          cargo build -p sotto-cli --example e2e_seed
+
+      - name: Build the smoke server
+        run: |
+          set -euo pipefail
+          cargo build -p sotto-server --features e2e-mock-oauth
+
+      - name: Build the web app
+        working-directory: web
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Install Playwright's chromium browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+
+      - name: Run real Stripe Checkout smoke
+        working-directory: web
+        run: |
+          set -euo pipefail
+          listener_log="$RUNNER_TEMP/stripe-listen.log"
+          stripe listen \
+            --api-key "$STRIPE_SECRET_KEY" \
+            --events checkout.session.completed,customer.subscription.updated,customer.subscription.deleted \
+            --forward-to "http://127.0.0.1:8099/billing/webhook" \
+            >"$listener_log" 2>&1 &
+          listener_pid=$!
+
+          cleanup() {
+            kill "$listener_pid" 2>/dev/null || true
+            wait "$listener_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT INT TERM
+
+          # Stripe CLI exposes the per-listener signing secret only in its human-readable log. Read
+          # it before Playwright starts because the server must verify forwarded webhook signatures.
+          webhook_secret=""
+          for _ in $(seq 1 30); do
+            if [ -f "$listener_log" ]; then
+              webhook_secret="$(sed -nE "s/.*webhook signing secret is '?(whsec_[A-Za-z0-9_-]+)'?.*/\\1/p" "$listener_log" | head -n1)"
+            fi
+            if [ -n "$webhook_secret" ]; then
+              break
+            fi
+            if ! kill -0 "$listener_pid" 2>/dev/null; then
+              # The listener log is useful for diagnosing startup failures, but never expose its
+              # signing secret in the Actions log.
+              sed -E 's/whsec_[A-Za-z0-9_-]+/<redacted>/g' "$listener_log" >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [ -z "$webhook_secret" ]; then
+            # Keep the timeout failure actionable without leaking the temporary signing secret.
+            sed -E 's/whsec_[A-Za-z0-9_-]+/<redacted>/g' "$listener_log" >&2 || true
+            echo "error: Stripe CLI did not provide a webhook signing secret" >&2
+            exit 1
+          fi
+
+          printf '::add-mask::%s\n' "$webhook_secret"
+          export STRIPE_WEBHOOK_SECRET="$webhook_secret"
+          npm run e2e -- --config=playwright.stripe.config.ts
+
+      - name: Reject skipped Stripe smoke tests
+        working-directory: web
+        run: |
+          set -euo pipefail
+          # The JSON report is retained so this credentialed run cannot pass by silently skipping
+          # the only real-Stripe test.
+          node -e 'const report = require("./test-results/stripe-playwright.json"); const expected = report.stats?.expected ?? 0; const skipped = report.stats?.skipped ?? 0; if (expected < 1 || skipped !== 0) { console.error(`Stripe smoke expected at least one test and no skips (expected=${expected}, skipped=${skipped})`); process.exit(1); }'
+
+      - name: Clean up smoke subscriptions
+        if: always()
+        working-directory: web
+        run: |
+          set -euo pipefail
+          fixture="e2e/.fixture.json"
+          if [ ! -f "$fixture" ]; then
+            exit 0
+          fi
+          org_id="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("e2e/.fixture.json", "utf8")).org_id)')"
+          subscriptions_file="$RUNNER_TEMP/stripe-subscriptions.json"
+          matches_file="$RUNNER_TEMP/stripe-subscription-matches.tsv"
+          all_subscriptions_file="$RUNNER_TEMP/stripe-all-subscriptions.tsv"
+          customers_file="$RUNNER_TEMP/stripe-customers.txt"
+          : > "$matches_file"
+          : > "$all_subscriptions_file"
+          : > "$customers_file"
+          starting_after=""
+
+          # Search Stripe metadata as well as Postgres: a webhook can fail after Checkout creates a
+          # subscription but before the server stores its id. The subscription metadata is written
+          # by StripeBilling from the seeded org id, so this remains bounded to this smoke run.
+          # Follow every API page so a reused test organisation cannot leave a match beyond the
+          # first 100 records.
+          while :; do
+            if [ -n "$starting_after" ]; then
+              curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+                --get "https://api.stripe.com/v1/subscriptions" \
+                --data-urlencode "status=all" \
+                --data-urlencode "limit=100" \
+                --data-urlencode "starting_after=$starting_after" \
+                --output "$subscriptions_file"
+            else
+              curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+                --get "https://api.stripe.com/v1/subscriptions" \
+                --data-urlencode "status=all" \
+                --data-urlencode "limit=100" \
+                --output "$subscriptions_file"
+            fi
+
+            node - "$org_id" "$subscriptions_file" "$matches_file" "$all_subscriptions_file" <<'NODE'
+          const fs = require("node:fs");
+          const [orgId, file, matchesFile, allFile] = process.argv.slice(2);
+          const payload = JSON.parse(fs.readFileSync(file, "utf8"));
+          for (const subscription of payload.data ?? []) {
+            if (subscription.status === "canceled") continue;
+            const customer = typeof subscription.customer === "string" ? subscription.customer : "";
+            const subscriptionOrg = subscription.metadata?.org_id ?? "";
+            if (customer) {
+              fs.appendFileSync(allFile, `${subscription.id}\t${customer}\t${subscriptionOrg}\n`);
+            }
+            if (subscriptionOrg === orgId) {
+              fs.appendFileSync(matchesFile, `${subscription.id}\t${customer}\n`);
+            }
+          }
+          NODE
+
+            has_more="$(node - "$subscriptions_file" <<'NODE'
+          const fs = require("node:fs");
+          const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          process.stdout.write(payload.has_more ? "true" : "false");
+          NODE
+            )"
+            [ "$has_more" = "true" ] || break
+            starting_after="$(node - "$subscriptions_file" <<'NODE'
+          const fs = require("node:fs");
+          const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+          process.stdout.write(payload.data?.at(-1)?.id ?? "");
+          NODE
+            )"
+            [ -n "$starting_after" ] || break
+          done
+
+          cleanup_failed=0
+          while IFS="$(printf '\t')" read -r subscription_id customer_id; do
+            [ -n "$subscription_id" ] || continue
+            if ! curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+              --request DELETE "https://api.stripe.com/v1/subscriptions/$subscription_id" \
+              >/dev/null; then
+              echo "warning: could not cancel Stripe subscription $subscription_id" >&2
+              cleanup_failed=1
+            fi
+            if [ -n "$customer_id" ]; then
+              printf '%s\n' "$customer_id" >> "$customers_file"
+            fi
+          done < "$matches_file"
+
+          if [ -s "$customers_file" ]; then
+            while read -r customer_id; do
+              # Customer deletion cancels every active subscription on that customer. Skip a
+              # customer with another organisation's active subscription instead of affecting it.
+              if awk -F '\t' -v customer="$customer_id" -v org="$org_id" \
+                '$2 == customer && $3 != org { found = 1; exit } END { exit found ? 0 : 1 }' \
+                "$all_subscriptions_file"; then
+                echo "warning: leaving shared Stripe customer $customer_id in place" >&2
+                continue
+              fi
+              if ! curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+                --request DELETE "https://api.stripe.com/v1/customers/$customer_id" \
+                >/dev/null; then
+                echo "warning: could not remove Stripe customer $customer_id" >&2
+                cleanup_failed=1
+              fi
+            done < <(sort -u "$customers_file")
+          fi
+          if [ "$cleanup_failed" -ne 0 ]; then
+            echo "error: one or more Stripe cleanup requests failed" >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: stripe-smoke-playwright-report
+          path: |
+            web/playwright-report/
+            web/test-results/
+          retention-days: 7

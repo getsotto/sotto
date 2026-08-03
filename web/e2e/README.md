@@ -73,5 +73,55 @@ billing endpoint, redirect handoff, and return handling without exposing Stripe 
 requests or depending on a hosted provider. The adapter is off by default and is never included in
 release or production builds.
 
-The production adapter remains Stripe-backed. A separate real-Stripe smoke run can be added later,
-but it is deliberately not part of this required merge gate.
+The production adapter remains Stripe-backed. A separate real-Stripe smoke run is deliberately not
+part of this required merge gate.
+
+## Real Stripe smoke
+
+The real-Stripe workflow checks the production billing adapter against a Stripe test account. It
+runs manually against `main` with an approved `stripe-smoke` environment and never runs on forked
+pull requests.
+
+Create the `stripe-smoke` repository environment and require maintainer approval before jobs can
+access it. Add these environment secrets:
+
+| Secret | Value |
+| --- | --- |
+| `STRIPE_SECRET_KEY` | A Stripe test-mode secret key beginning with `sk_test_` |
+| `STRIPE_TEST_PRICE_ID` | A recurring test-mode Price id used by Sotto Checkout |
+
+The Price must belong to the same Stripe test account as the secret key. Do not add live keys or
+real payment details. The workflow rejects a key that does not begin with `sk_test_`.
+
+To run it, open **Actions -> Stripe smoke**, choose **Run workflow** on `main`, and approve the
+`stripe-smoke` environment when prompted. The workflow starts fresh Postgres, builds the web app,
+starts `sotto-server` with `e2e-mock-oauth` only, and starts a pinned Stripe CLI. The CLI forwards
+Checkout and subscription events to the local webhook and supplies a temporary signing secret.
+Playwright completes Stripe-hosted Checkout with a test card, then waits for the verified webhook
+to assign the Team tier. Matching test subscriptions are cancelled at the end, including when
+webhook processing failed before Postgres stored an id. A generated customer is removed only when
+it has no active subscription for another organisation.
+
+For a local run, use a fresh Postgres database and the same test-mode values. Start Stripe CLI in
+one shell:
+
+```sh
+stripe listen --api-key "$STRIPE_SECRET_KEY" \
+  --events checkout.session.completed,customer.subscription.updated,customer.subscription.deleted \
+  --forward-to http://127.0.0.1:8099/billing/webhook
+```
+
+Then, from `web/`, run the smoke config with the signing secret printed by Stripe CLI:
+
+```sh
+CI=1 \
+DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto \
+STRIPE_SECRET_KEY=sk_test_... \
+STRIPE_WEBHOOK_SECRET=whsec_... \
+STRIPE_PRICE_ID=price_... \
+npm run e2e -- --config=playwright.stripe.config.ts
+```
+
+The smoke config never enables `e2e-mock-billing`. The only mocked part is GitHub OAuth, so the
+browser can authenticate without a GitHub credential while the billing path remains real. A failed
+run is advisory and does not block ordinary pull requests or merges.
