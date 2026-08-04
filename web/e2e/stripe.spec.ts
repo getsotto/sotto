@@ -52,7 +52,7 @@ test("real Stripe Checkout completes and applies the Team tier", async ({ page }
     .first()
     .fill("123");
   await fillOptional(page, 'input[name="billingName"]', "Sotto E2E");
-  await fillOptional(page, 'input[name="billingPostalCode"]', "SW1A 1AA");
+  await fillOptional(page, 'input[name="billingPostalCode"]', "94107");
 
   await page.getByRole("button", { name: /Pay|Subscribe|Start trial/i }).click();
   await page.waitForURL(/billing=success/, { timeout: 60_000 });
