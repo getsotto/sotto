@@ -198,6 +198,9 @@ CREATE TABLE organization_deletions (
     subscription_id TEXT,
     last_billing_state TEXT,
     billing_checked_at TIMESTAMPTZ,
+    billing_observation_source TEXT,
+    billing_observed_by TEXT,
+    billing_observation_reason TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TIMESTAMPTZ,
     last_error_code TEXT,
@@ -282,6 +285,18 @@ follows:
 | `rate_limit_error`, `api_error`, HTTP `429` or `5xx`, transport failure, or timeout | Unknown; use the retry ladder |
 | Anything unrecognised | Unknown; use the retry ladder |
 
+An operator may record an authoritative manual billing observation when the configured provider is
+unavailable, so a self-hoster is not permanently blocked by a historical subscription ID. This is
+an operator-only command, not a public endpoint or bypass flag. It requires the exact organisation
+and subscription IDs, the observed Stripe status, observation time, actor, reason, and an evidence
+reference such as a Stripe Dashboard request or subscription URL. It writes the same billing-result
+fields used by the provider adapter plus an audit event with `source = 'operator'`.
+
+A manual observation follows the same exhaustive status mapping and must be no more than 15 minutes
+old when purge begins. A stale, mismatched, non-terminal, or unaudited observation does not satisfy
+the gate. The operator must therefore recheck Stripe immediately before an overdue purge, just as
+the automated path performs a fresh lookup.
+
 Stripe cancellation is immediate rather than `cancel_at_period_end`. The adapter first looks up the
 subscription and only sends `DELETE` for a `Blocking` observation. It passes the deletion operation
 ID as a stable provider idempotency key where supported. If cancellation fails or times out, the
@@ -332,7 +347,8 @@ deletion rows:
 - the current subscription ID is either the snapshot ID or `NULL` after its confirmed cancellation;
   any different non-null ID blocks purge;
 - the most recent authoritative billing result is inactive or absent and is newer than the final
-  reconciliation request.
+  reconciliation request. It may come from the provider adapter or a fresh, audited operator
+  observation through the same stored mechanism.
 
 It then deletes organisation-owned primary data in this order:
 
@@ -412,9 +428,9 @@ Alert when an operation reaches `failed`, remains in `cancelling_billing` beyond
 purge but has not advanced, or loses repeated worker leases.
 
 The runbook must cover inspecting a sanitised operation, retrying its recorded resume state,
-confirming Stripe status independently, cancelling before purge, handling a failed purge, and the
-isolated restore procedure. No runbook command may bypass the billing precondition or directly
-delete an `organizations` row.
+recording a fresh operator billing observation when provider credentials are unavailable,
+cancelling before purge, handling a failed purge, and the isolated restore procedure. No runbook
+command may skip the billing observation mechanism or directly delete an `organizations` row.
 
 ## 11. Verification
 
@@ -429,6 +445,8 @@ delete an `organizations` row.
   after purge starts fails.
 - Recovery racing an in-flight provider cancellation settles to the provider's final tier.
 - Recovery after provider cancellation restores the free tier.
+- A fresh, audited operator observation can satisfy the same terminal-state gate; stale,
+  mismatched, non-terminal, and unaudited observations cannot.
 
 ### Database and API tests
 
