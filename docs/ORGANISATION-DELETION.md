@@ -331,9 +331,21 @@ Team restores Team, while Free or `Missing` restores free. A provider error leav
 write-frozen and retries recovery.
 
 The first implementation cancels the linked subscription but does not delete the Stripe customer.
-Stripe retains invoices and other billing records under its own retention obligations. The final
-purge clears Sotto's customer ID, and the confirmation and privacy documentation must distinguish
-that local purge from provider-held billing records.
+The cancellation request writes the deleted organisation ID to the subscription's
+`cancellation_details.comment`, giving support a durable path from the retained customer and
+subscription to Sotto's tombstone. It does not update customer metadata because that would require
+Customers write and weaken the restricted key boundary.
+
+Stripe retains the customer, invoices, and other billing records under its own retention
+obligations. The final purge clears Sotto's customer ID, so a later, unrelated organisation creates
+a new Stripe customer rather than reusing the orphaned one. This deliberate trade-off can accumulate
+orphaned customers in Stripe; support uses the cancellation comment and subscription relationship
+to trace them.
+
+Organisation deletion is not personal data erasure. A retained Stripe customer can still hold an
+email address, name, postal address, and payment-method metadata. A data-subject erasure request is
+a separate operational and provider process. The owner confirmation and privacy documentation must
+distinguish Sotto's local purge, Stripe's retained billing records, and that separate erasure path.
 
 Relevant webhook event IDs and their Stripe `created` timestamps are persisted. Event ID uniqueness
 rejects redelivery; it does not establish order. A per-subscription watermark rejects an event older
