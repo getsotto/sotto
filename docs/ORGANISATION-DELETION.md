@@ -156,14 +156,21 @@ rows. The worker calls `advance` and has no independent transition logic.
 Provider-specific cancellation sits behind this port:
 
 ```text
-SubscriptionProvider.cancel(subscription_id) -> CancellationResult
-SubscriptionProvider.status(subscription_id) -> Active | Inactive | Missing
+SubscriptionProvider.cancel(subscription_id, operation_key) -> CancellationResult
+SubscriptionProvider.status(subscription_id) -> SubscriptionObservation
+
+SubscriptionObservation {
+    purge_gate: Blocking | Terminal | Missing,
+    entitlement: Team | Free,
+}
 ```
 
-Transport, authentication, timeout, and unknown-status errors are errors, not `Inactive`. Stripe is
-the production adapter. A deterministic in-memory adapter controls successes, failures, and
-out-of-order observations in tests. The existing checkout and portal behaviour may continue behind
-its current interface; deletion must not reach into Stripe HTTP helpers directly.
+Purge safety and Sotto entitlement are separate decisions. For example, an unpaid Stripe
+subscription blocks purge because it can still create invoices, but maps to Sotto's free tier.
+Transport, authentication, timeout, and unknown-status errors are errors, not `Terminal` or
+`Missing`. Stripe is the production adapter. A deterministic in-memory adapter controls successes,
+failures, and out-of-order observations in tests. The existing checkout and portal behaviour may
+continue behind its current interface; deletion must not reach into Stripe HTTP helpers directly.
 
 The data purger is an internal adapter. Its only public operation accepts a leased deletion attempt
 whose billing precondition has already been checked. It rechecks that precondition in the database
@@ -233,20 +240,56 @@ to cancel.
 For a linked subscription:
 
 1. The worker asks the provider for current status.
-2. `Inactive` or `Missing` satisfies the billing gate.
-3. `Active` causes an immediate cancellation request, followed by another status lookup.
-4. A timeout, authentication error, unexpected response, or unrecognised status is unknown and
-   schedules a retry without changing organisation data.
+2. `Terminal` or `Missing` satisfies the billing gate.
+3. `Blocking` causes an immediate cancellation request, followed by another status lookup.
+4. A timeout, unexpected response, or unrecognised status is unknown and schedules a retry without
+   changing organisation data. An authentication or permission error fails immediately as
+   `billing_unavailable` and alerts an operator.
 5. A fresh status lookup is repeated immediately before the transition to `purging`.
 
-Stripe cancellation is immediate rather than `cancel_at_period_end`; the confirmation explicitly
-warns the owner. Calling cancellation for an already cancelled subscription must be harmless.
+The Stripe adapter maps statuses exhaustively, without a wildcard arm:
+
+| Stripe result | Purge gate | Sotto entitlement |
+|---|---|---|
+| `active`, `trialing`, `past_due` | `Blocking` | Team |
+| `incomplete`, `paused`, `unpaid` | `Blocking` | Free |
+| `canceled`, `incomplete_expired` | `Terminal` | Free |
+| `resource_missing` from lookup of the exact subscription ID | `Missing` | Free |
+
+Any new or unrecognised Stripe status is unknown and blocks purge until the adapter is deliberately
+updated. `pause_collection` does not need a separate rule: Stripe leaves the subscription status
+unchanged when collection is paused, so the exhaustive status mapping still gives the right gate.
+This mapping must not reuse the entitlement-only `ACTIVE_STATUSES` constant.
+
+The Stripe HTTP helper must preserve the response status and `error.code` instead of collapsing all
+non-success responses into an opaque upstream error. The adapter classifies lookup results as
+follows:
+
+| Stripe result | Deletion outcome |
+|---|---|
+| `resource_missing` for the exact subscription lookup | `Missing`; satisfies the gate |
+| HTTP `401` or `403`, including an expired, invalid, or under-permissioned key | `failed` immediately with `billing_unavailable`; alert an operator |
+| `rate_limit_error`, `api_error`, HTTP `429` or `5xx`, transport failure, or timeout | Unknown; use the retry ladder |
+| Anything unrecognised | Unknown; use the retry ladder |
+
+Stripe cancellation is immediate rather than `cancel_at_period_end`. The adapter first looks up the
+subscription and only sends `DELETE` for a `Blocking` observation. It passes the deletion operation
+ID as a stable provider idempotency key where supported. If cancellation fails or times out, the
+adapter looks up the subscription again; only the fresh observation can satisfy the gate. This
+makes an already cancelled subscription harmless without assuming what a second Stripe `DELETE`
+returns.
+
+Cancellation explicitly sends `invoice_now=false` and `prorate=false`, even though those are the
+current Stripe defaults. It creates no final invoice or automatic credit or refund for unused time,
+and Stripe stops automatic collection of the customer's already-finalised invoices. The owner
+confirmation must state these consequences in those terms. Neither the application nor the runbook
+may resume automatic collection after the organisation has been purged.
 
 Cancellation of the deletion changes `state_version` and enters `recovering`. This invalidates an
 in-flight worker result, but the provider call may already have happened, so recovery never guesses
-from local state. It queries the snapshotted subscription: `Active` restores Team, while `Inactive`
-or `Missing` restores free. A provider error leaves the organisation write-frozen and retries
-recovery.
+from local state. It queries the snapshotted subscription and applies the observation's entitlement:
+Team restores Team, while Free or `Missing` restores free. A provider error leaves the organisation
+write-frozen and retries recovery.
 
 The first implementation cancels the linked subscription but does not delete the Stripe customer.
 Stripe retains invoices and other billing records under its own retention obligations. The final
