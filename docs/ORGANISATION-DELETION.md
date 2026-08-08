@@ -235,30 +235,6 @@ comments where necessary.
 
 ## 6. Billing rules
 
-All Stripe requests must send `Stripe-Version: 2026-07-29.dahlia`. The version is a source constant,
-not the Stripe account default, because a Dashboard change must not alter payloads that gate data
-destruction. The Stripe webhook endpoint must be configured to emit the same version. The generic
-webhook parser checks the event's `api_version` before reading its object; a mismatch fails closed,
-alerts an operator, and does not change billing or deletion state.
-
-An API-version upgrade changes the request constant, webhook endpoint, response parser, fixtures,
-and credentialed smoke test together in one reviewed change. Workbench must show the pinned version
-for both application requests and webhook deliveries before that change is enabled.
-
-Hosted and production deployments use a restricted Stripe API key (`rk_`), supplied as
-`STRIPE_API_KEY`, instead of an unrestricted `STRIPE_SECRET_KEY`. The intended permissions are
-Checkout Sessions write, Billing Portal write, Subscriptions write, and Customers read, with every
-other resource set to none. Subscriptions write is required for cancellation; Customers write is
-deliberately excluded because this workflow retains the customer. Workbench request logs are the
-final authority for the exact permission names and any implicit dependency.
-
-Each environment has its own key and webhook secret. Both live in the hosting platform's secrets
-vault, never a committed environment file. Migration starts with cataloguing existing calls in
-Workbench, creates a test-mode restricted key with the intended permissions, runs the complete
-billing and deletion suites while watching `stripe logs tail` for `403` responses, then swaps the
-production secret and rotates the old unrestricted key. Permissions are widened only for a
-reviewed, observed call.
-
 The deletion request snapshots the linked subscription ID while holding the organisation row lock.
 If there is no subscription ID, the worker can enter `retention` without Stripe. A Team tier without
 a subscription ID is treated as manually managed entitlement and also has no external subscription
@@ -335,6 +311,10 @@ The cancellation request writes the deleted organisation ID to the subscription'
 `cancellation_details.comment`, giving support a durable path from the retained customer and
 subscription to Sotto's tombstone. It does not update customer metadata because that would require
 Customers write and weaken the restricted key boundary.
+
+If the lookup returns `resource_missing`, there is no subscription on which to write that comment.
+Support must instead use the deletion audit event and provider request logs to trace the retained
+customer. This is the accepted traceability limit while the restricted key excludes Customers write.
 
 Stripe retains the customer, invoices, and other billing records under its own retention
 obligations. The final purge clears Sotto's customer ID, so a later, unrelated organisation creates
@@ -435,7 +415,38 @@ ordinary access resolves as not found.
 - Webhook redelivery is deduplicated by provider event ID. Webhook order cannot bypass a provider
   lookup or the final database preconditions.
 
-## 10. Audit, monitoring, and operations
+## 10. Operations, credentials, and monitoring
+
+### Stripe API version and credentials
+
+All Stripe requests must send `Stripe-Version: 2026-07-29.dahlia`. The version is a source constant,
+not the Stripe account default, because a Dashboard change must not alter payloads that gate data
+destruction. The Stripe webhook endpoint must be configured to emit the same version. The generic
+webhook parser checks the event's `api_version` before reading its object; a mismatch fails closed,
+alerts an operator, and does not change billing or deletion state.
+
+An API-version upgrade changes the request constant, webhook endpoint, response parser, fixtures,
+and credentialed smoke test together in one reviewed change. Stripe Workbench, the Dashboard's
+request-log and API-version view, must show the pinned version for both application requests and
+webhook deliveries before that change is enabled. Rollout pins the endpoint first, deploys the
+matching parser, verifies delivered events, and only then enables deletion. After enablement, a
+version mismatch is an operator incident and remains fail closed rather than becoming a retry.
+
+Hosted and production deployments use a restricted Stripe API key (`rk_`), supplied as
+`STRIPE_API_KEY`, instead of an unrestricted `STRIPE_SECRET_KEY`. The intended permissions are
+Checkout Sessions write, Billing Portal write, Subscriptions write, and Customers read, with every
+other resource set to none. Subscriptions write is required for cancellation; Customers write is
+deliberately excluded because this workflow retains the customer. Workbench request logs are the
+final authority for the exact permission names and any implicit dependency.
+
+Each environment has its own key and webhook secret. Both live in the hosting platform's secrets
+vault, never a committed environment file. Migration starts with cataloguing existing calls in
+Workbench, creates a test-mode restricted key with the intended permissions, runs the complete
+billing and deletion suites while watching `stripe logs tail` for `403` responses, then swaps the
+production secret and rotates the old unrestricted key. Permissions are widened only for a
+reviewed, observed call. The existing checkout implementation still names its key
+`STRIPE_SECRET_KEY`; the implementation PR must rename that configuration and its deployment
+examples atomically before enabling `STRIPE_API_KEY`.
 
 Record user-visible audit events for request, recovery, billing cancellation confirmation,
 terminal failure, purge start, and completion. Retry noise belongs in structured operational logs
