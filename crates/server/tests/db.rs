@@ -70,7 +70,7 @@ async fn migrations_apply_and_user_round_trips() {
 }
 
 #[tokio::test]
-async fn organisation_deletion_schema_enforces_tombstones_and_operations() {
+async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     let Ok(database_url) = std::env::var("DATABASE_URL") else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
