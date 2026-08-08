@@ -232,6 +232,16 @@ comments where necessary.
 
 ## 6. Billing rules
 
+All Stripe requests must send `Stripe-Version: 2026-07-29.dahlia`. The version is a source constant,
+not the Stripe account default, because a Dashboard change must not alter payloads that gate data
+destruction. The Stripe webhook endpoint must be configured to emit the same version. The generic
+webhook parser checks the event's `api_version` before reading its object; a mismatch fails closed,
+alerts an operator, and does not change billing or deletion state.
+
+An API-version upgrade changes the request constant, webhook endpoint, response parser, fixtures,
+and credentialed smoke test together in one reviewed change. Workbench must show the pinned version
+for both application requests and webhook deliveries before that change is enabled.
+
 The deletion request snapshots the linked subscription ID while holding the organisation row lock.
 If there is no subscription ID, the worker can enter `retention` without Stripe. A Team tier without
 a subscription ID is treated as manually managed entitlement and also has no external subscription
