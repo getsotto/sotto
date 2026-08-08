@@ -82,7 +82,7 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     let pool = db::connect(&database_url).await.expect("connect");
     db::migrate(&pool).await.expect("migrate");
 
-    let org_id = "test-organisation-deletion-schema";
+    let org_id = "test-organization-deletion-schema";
     let active_operation_id = "00000000-0000-0000-0000-000000000015";
     let cancelled_operation_id = "00000000-0000-0000-0000-000000000016";
     let invalid_state_operation_id = "00000000-0000-0000-0000-000000000017";
