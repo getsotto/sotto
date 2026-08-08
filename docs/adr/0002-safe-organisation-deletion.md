@@ -36,8 +36,9 @@ request. If billing was already cancelled, recovery restores the organisation on
 requires a new checkout for paid access.
 
 Billing cancellation will sit behind a small `SubscriptionProvider` interface with production
-Stripe and deterministic test adapters. A linked subscription must be authoritatively inactive or
-absent before retention can advance to purge. Provider timeouts, authentication failures, unknown
+Stripe and deterministic test adapters. A linked subscription must be authoritatively terminal or
+absent before retention can advance to purge. This is a billing-safety decision, not merely an
+entitlement state that Sotto treats as free. Provider timeouts, authentication failures, unknown
 statuses, and exhausted retries leave the organisation intact and write-frozen. Webhooks only wake
 reconciliation; their arrival order is never treated as proof of the current subscription state.
 

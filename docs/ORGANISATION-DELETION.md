@@ -9,8 +9,8 @@ enablement step.
 
 Every implementation PR must preserve these properties:
 
-1. Organisation data is never purged while a linked subscription is active or its state is
-   unknown.
+1. Organisation data is never purged while a linked subscription can still bill or resume, or its
+   state is unknown.
 2. Provider failure, worker failure, stale webhook delivery, and concurrency all fail closed with
    the organisation data retained.
 3. The request is owner-only, explicitly confirmed, idempotent, and recoverable until purge starts.
@@ -78,9 +78,9 @@ POST /orgs/{org_id}/deletion/cancel
 Cancellation is allowed from `requested`, `cancelling_billing`, `retention`, or `failed`. It is
 idempotent and returns `202 Accepted` while the operation moves through `recovering`. It returns
 `409 Conflict` after `purging` begins because data removal may already be in progress. The recovery
-worker performs a fresh billing lookup before restoring writes. An active subscription restores the
-Team tier; an inactive or missing subscription restores the organisation as `free` and the owner
-must start a new checkout to regain the Team tier.
+worker performs a fresh billing lookup before restoring writes. The exhaustive provider mapping
+restores Team for `active`, `trialing`, or `past_due`, and restores free for every other recognised
+status or a missing subscription. A free restoration requires a new checkout to regain Team.
 
 ### Errors and ordinary organisation access
 
@@ -122,7 +122,7 @@ flowchart LR
 |---|---|---|
 | `requested` | The database accepted the confirmed request and froze writes. | `cancelling_billing`, `recovering` |
 | `cancelling_billing` | Cancellation or authoritative reconciliation is due. | `retention`, `failed`, `recovering` |
-| `retention` | Billing is confirmed inactive and the recovery deadline has not passed. | `purging`, `recovering` |
+| `retention` | The billing gate is confirmed `Terminal` or `Missing` and the recovery deadline has not passed. | `purging`, `recovering` |
 | `purging` | A worker owns the final database purge. Recovery is no longer possible. | `completed`, `failed` |
 | `recovering` | An owner cancelled deletion; billing is being reconciled before writes return. | `cancelled`, `failed` |
 | `failed` | Automatic attempts stopped after a sanitised, recorded failure. Data remains intact and write-frozen. | The recorded resume state, or `recovering` |
@@ -372,7 +372,7 @@ deletion rows:
 - the organisation is still `deleting`;
 - the current subscription ID is either the snapshot ID or `NULL` after its confirmed cancellation;
   any different non-null ID blocks purge;
-- the most recent authoritative billing result is inactive or absent and is newer than the final
+- the most recent authoritative billing result is `Terminal` or `Missing` and is newer than the final
   reconciliation request. It may come from the provider adapter or a fresh, audited operator
   observation through the same stored mechanism.
 
@@ -463,8 +463,8 @@ command may skip the billing observation mechanism or directly delete an `organi
 ### State-machine tests
 
 - Free organisation reaches retention without calling the provider.
-- Active paid subscription is cancelled and then confirmed inactive.
-- Missing subscription is treated as inactive; unknown status is not.
+- A blocking paid subscription is cancelled and then confirmed terminal.
+- A missing subscription satisfies the gate; an unknown status does not.
 - Each provider failure schedules the documented retry and retry exhaustion enters `failed`.
 - Repeating a request or retry does not create a second active operation or extend retention.
 - Cancellation from every allowed state reconciles billing before restoring access; cancellation
