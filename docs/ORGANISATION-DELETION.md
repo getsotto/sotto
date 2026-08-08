@@ -476,7 +476,8 @@ command may skip the billing observation mechanism or directly delete an `organi
 - Free organisation reaches retention without calling the provider.
 - A blocking paid subscription is cancelled and then confirmed terminal.
 - A missing subscription satisfies the gate; an unknown status does not.
-- Each provider failure schedules the documented retry and retry exhaustion enters `failed`.
+- Each retryable provider failure schedules the documented retry; authentication and permission
+  failures enter `failed` immediately.
 - Repeating a request or retry does not create a second active operation or extend retention.
 - Cancellation from every allowed state reconciles billing before restoring access; cancellation
   after purge starts fails.
