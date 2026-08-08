@@ -245,6 +245,20 @@ An API-version upgrade changes the request constant, webhook endpoint, response 
 and credentialed smoke test together in one reviewed change. Workbench must show the pinned version
 for both application requests and webhook deliveries before that change is enabled.
 
+Hosted and production deployments use a restricted Stripe API key (`rk_`), supplied as
+`STRIPE_API_KEY`, instead of an unrestricted `STRIPE_SECRET_KEY`. The intended permissions are
+Checkout Sessions write, Billing Portal write, Subscriptions write, and Customers read, with every
+other resource set to none. Subscriptions write is required for cancellation; Customers write is
+deliberately excluded because this workflow retains the customer. Workbench request logs are the
+final authority for the exact permission names and any implicit dependency.
+
+Each environment has its own key and webhook secret. Both live in the hosting platform's secrets
+vault, never a committed environment file. Migration starts with cataloguing existing calls in
+Workbench, creates a test-mode restricted key with the intended permissions, runs the complete
+billing and deletion suites while watching `stripe logs tail` for `403` responses, then swaps the
+production secret and rotates the old unrestricted key. Permissions are widened only for a
+reviewed, observed call.
+
 The deletion request snapshots the linked subscription ID while holding the organisation row lock.
 If there is no subscription ID, the worker can enter `retention` without Stripe. A Team tier without
 a subscription ID is treated as manually managed entitlement and also has no external subscription
