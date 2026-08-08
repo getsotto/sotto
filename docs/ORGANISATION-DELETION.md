@@ -486,12 +486,24 @@ command may skip the billing observation mechanism or directly delete an `organi
 
 ### Billing race tests
 
+- The Stripe adapter table-tests all eight documented subscription statuses and an unknown future
+  status. Only `canceled`, `incomplete_expired`, and exact-resource `resource_missing` satisfy the
+  purge gate.
+- Provider tests distinguish `resource_missing`, HTTP `401/403`, HTTP `429/5xx`, transport timeout,
+  `api_error`, and an unrecognised error without parsing human-readable messages.
+- Every Stripe request carries `Stripe-Version: 2026-07-29.dahlia`; a webhook with a different or
+  absent `api_version` changes no state.
+- Cancellation looks up first, sends explicit `invoice_now=false` and `prorate=false`, and looks up
+  again after success, timeout, and provider error. A terminal or missing subscription never needs
+  a second destructive call.
 - Duplicate and out-of-order updated/deleted webhooks cannot move the lifecycle forwards alone.
 - An older subscription event cannot overwrite a newer ordinary entitlement decision; equal-time
   events reconcile against current provider state.
 - An active webhook after cancellation causes reconciliation and blocks purge.
 - A stale checkout webhook cannot reactivate a deleting or deleted organisation.
 - Provider failure between cancellation and confirmation retains all organisation data.
+- Every billing webhook handler is exercised against `active`, `deleting`, and `deleted` rows so a
+  missing lifecycle predicate fails a test.
 
 ### Client and operational tests
 
@@ -499,8 +511,21 @@ command may skip the billing observation mechanism or directly delete an `organi
   recover before purge.
 - The CLI reports the write conflict clearly and continues to support read/export during retention.
 - A deterministic end-to-end test covers free deletion and recovery.
-- A credentialed Stripe smoke test covers cancellation and webhook reconciliation without running
-  on forks.
+- A Stripe Test Clock advances a subscription through a renewal during the recovery window while
+  the injected Sotto clock independently advances retention. The renewal must block purge until the
+  adapter cancels and refetches the subscription.
+- The external smoke test provisions an isolated anonymous sandbox with
+  `stripe sandbox create --non-interactive`, captures and masks its temporary key before use, and
+  does not depend on a shared long-lived test key. If anonymous sandbox automation proves
+  unreliable, the fallback is a dedicated environment-specific sandbox with a restricted key,
+  never a shared unrestricted account key.
+- `stripe listen` forwards to the real local webhook path and supplies its temporary signing
+  secret; `stripe trigger customer.subscription.deleted` uses the pinned API version and fixture
+  overrides needed to name the test organisation. This exercises signature verification rather
+  than posting a hand-signed fixture directly.
+- The credentialed adapter smoke cancels a real sandbox subscription, runs the adapter again, and
+  asserts one effective cancellation, terminal reconciliation, cancellation context, and no final
+  invoice or automatic proration credit. It never runs on forks.
 - A backup restore drill proves tombstones are reconciled before traffic and that an overdue purge
   resumes safely.
 
