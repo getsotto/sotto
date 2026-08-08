@@ -306,11 +306,20 @@ Stripe retains invoices and other billing records under its own retention obliga
 purge clears Sotto's customer ID, and the confirmation and privacy documentation must distinguish
 that local purge from provider-held billing records.
 
-Relevant webhook event IDs are persisted for deduplication. During an active deletion, webhook
-payloads may update the observed billing state and wake the worker, but they do not advance the
-workflow by themselves. The worker performs a fresh provider lookup, so event order is immaterial.
-Checkout and subscription webhooks must ignore a `deleted` tombstone and must not restore Team
-entitlements while an organisation is `deleting`.
+Relevant webhook event IDs and their Stripe `created` timestamps are persisted. Event ID uniqueness
+rejects redelivery; it does not establish order. A per-subscription watermark rejects an event older
+than the last applied event. Two distinct events with the same timestamp trigger a fresh provider
+lookup rather than using arrival order. This ordering guard also applies to the ordinary entitlement
+path, so an old `customer.subscription.updated` event cannot overwrite a newer tier decision.
+
+During an active deletion, webhook payloads may update the observed billing state and wake the
+worker, but they do not advance the workflow by themselves. The worker performs a fresh provider
+lookup, so event order is immaterial to purge. The three existing webhook updates in
+`checkout_completed`, `subscription_updated`, and `subscription_deleted` must each include
+`AND lifecycle_state = 'active'` in the `UPDATE organizations` predicate. Webhooks have no user
+actor, so this database predicate is separate from the actor-scoped access lookup. A late checkout
+or subscription event can therefore neither restore Team while an organisation is deleting nor
+repopulate a deleted tombstone's billing identifiers.
 
 ## 7. Purge and retention boundary
 
@@ -361,6 +370,9 @@ different read and write behaviour. Introduce one shared organisation access loo
 the role and lifecycle state. All org-scoped modules, including sync access, entitlements, audit,
 billing, memberships, grants, and project creation, must use it. Tests must enumerate every
 mutating route so adding a new route without the guard is visible in review.
+
+Provider webhooks are the deliberate exception to this actor-scoped lookup. They enforce lifecycle
+inside every guarded SQL update as described in section 6, because no user role exists on that path.
 
 Machine tokens inherit the lifecycle check through environment access. Reads continue in
 `deleting`; writes return the same conflict as session-authenticated writes. In `deleted`, all
@@ -431,6 +443,8 @@ delete an `organizations` row.
 ### Billing race tests
 
 - Duplicate and out-of-order updated/deleted webhooks cannot move the lifecycle forwards alone.
+- An older subscription event cannot overwrite a newer ordinary entitlement decision; equal-time
+  events reconcile against current provider state.
 - An active webhook after cancellation causes reconciliation and blocks purge.
 - A stale checkout webhook cannot reactivate a deleting or deleted organisation.
 - Provider failure between cancellation and confirmation retains all organisation data.
