@@ -88,6 +88,12 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     let invalid_state_operation_id = "00000000-0000-0000-0000-000000000017";
     let invalid_timestamp_operation_id = "00000000-0000-0000-0000-000000000018";
     let invalid_observation_operation_id = "00000000-0000-0000-0000-000000000019";
+    let invalid_lease_operation_id = "00000000-0000-0000-0000-000000000020";
+    let invalid_billing_operation_id = "00000000-0000-0000-0000-000000000021";
+    let invalid_completed_operation_id = "00000000-0000-0000-0000-000000000022";
+    let provider_operation_id = "00000000-0000-0000-0000-000000000023";
+    let operator_operation_id = "00000000-0000-0000-0000-000000000024";
+    let completed_operation_id = "00000000-0000-0000-0000-000000000025";
     sqlx::query("DELETE FROM organization_deletions WHERE org_id = $1")
         .bind(org_id)
         .execute(&pool)
@@ -162,6 +168,15 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     assert_eq!(attempt_count, 0);
     assert_eq!(state_version, 0);
 
+    sqlx::query(
+        "UPDATE organization_deletions SET state = 'failed', resume_state = 'cancelling_billing' \
+         WHERE id = $1::uuid",
+    )
+    .bind(active_operation_id)
+    .execute(&pool)
+    .await
+    .expect("record failed operation resume state");
+
     let invalid_state = sqlx::query(
         "INSERT INTO organization_deletions \
          (id, org_id, state, requested_by, requested_at, purge_after) \
@@ -176,7 +191,8 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     let invalid_timestamp = sqlx::query(
         "INSERT INTO organization_deletions \
          (id, org_id, state, requested_by, requested_at, purge_after, cancelled_at) \
-         VALUES ($1::uuid, $2, 'cancelled', 'test-owner', now(), now() - interval '1 day', now())",
+         VALUES ($1::uuid, $2, 'cancelled', 'test-owner', now(), now() + interval '30 days', \
+                 now() - interval '1 day')",
     )
     .bind(invalid_timestamp_operation_id)
     .bind(org_id)
@@ -197,10 +213,36 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .await;
     assert!(invalid_observation.is_err());
 
+    let invalid_lease = sqlx::query(
+        "INSERT INTO organization_deletions \
+         (id, org_id, state, requested_by, requested_at, purge_after, cancelled_at, lease_owner) \
+         VALUES ($1::uuid, $2, 'cancelled', 'test-owner', now(), now() + interval '30 days', \
+                 now(), 'worker-1')",
+    )
+    .bind(invalid_lease_operation_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await;
+    assert!(invalid_lease.is_err());
+
+    let invalid_billing = sqlx::query(
+        "INSERT INTO organization_deletions \
+         (id, org_id, state, requested_by, requested_at, purge_after, cancelled_at, \
+          billing_observation_source, last_billing_state) \
+         VALUES ($1::uuid, $2, 'cancelled', 'test-owner', now(), now() + interval '30 days', \
+                 now(), 'provider', 'terminal')",
+    )
+    .bind(invalid_billing_operation_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await;
+    assert!(invalid_billing.is_err());
+
     let duplicate_active = sqlx::query(
         "INSERT INTO organization_deletions \
-         (id, org_id, state, requested_by, requested_at, purge_after) \
-         VALUES ($1::uuid, $2, 'failed', 'test-owner', now(), now() + interval '30 days')",
+         (id, org_id, state, requested_by, requested_at, purge_after, resume_state) \
+         VALUES ($1::uuid, $2, 'failed', 'test-owner', now(), now() + interval '30 days', \
+                 'cancelling_billing')",
     )
     .bind(cancelled_operation_id)
     .bind(org_id)
@@ -218,6 +260,55 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .execute(&pool)
     .await
     .expect("allow a terminal replacement operation");
+
+    sqlx::query(
+        "INSERT INTO organization_deletions \
+         (id, org_id, state, requested_by, requested_at, purge_after, cancelled_at, \
+          billing_observation_source, last_billing_state, billing_checked_at) \
+         VALUES ($1::uuid, $2, 'cancelled', 'test-owner', now(), now() + interval '30 days', \
+                 now(), 'provider', 'terminal', now())",
+    )
+    .bind(provider_operation_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("record a provider observation");
+
+    sqlx::query(
+        "INSERT INTO organization_deletions \
+         (id, org_id, state, requested_by, requested_at, purge_after, cancelled_at, \
+          billing_observation_source, last_billing_state, billing_checked_at, \
+          billing_observed_by, billing_observation_reason) \
+         VALUES ($1::uuid, $2, 'cancelled', 'test-owner', now(), now() + interval '30 days', \
+                 now(), 'operator', 'missing', now(), 'operator-1', 'verified in Workbench')",
+    )
+    .bind(operator_operation_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("record an operator observation");
+
+    let invalid_completed = sqlx::query(
+        "INSERT INTO organization_deletions \
+         (id, org_id, state, requested_by, requested_at, purge_after) \
+         VALUES ($1::uuid, $2, 'completed', 'test-owner', now(), now() + interval '30 days')",
+    )
+    .bind(invalid_completed_operation_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await;
+    assert!(invalid_completed.is_err());
+
+    sqlx::query(
+        "INSERT INTO organization_deletions \
+         (id, org_id, state, requested_by, requested_at, purge_after, completed_at) \
+         VALUES ($1::uuid, $2, 'completed', 'test-owner', now(), now() + interval '30 days', now())",
+    )
+    .bind(completed_operation_id)
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("record completed operation");
 
     sqlx::query("DELETE FROM organization_deletions WHERE org_id = $1")
         .bind(org_id)

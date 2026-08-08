@@ -64,12 +64,20 @@ CREATE TABLE organization_deletions (
     managed_backup_expiry_by TIMESTAMPTZ,
     CONSTRAINT organization_deletions_purge_after_check
         CHECK (purge_after >= requested_at),
+    CONSTRAINT organization_deletions_resume_state_check
+        CHECK ((state = 'failed') = (resume_state IS NOT NULL)),
     CONSTRAINT organization_deletions_billing_result_pair_check
         CHECK ((last_billing_state IS NULL) = (billing_checked_at IS NULL)),
     CONSTRAINT organization_deletions_billing_checked_at_check
         CHECK (billing_checked_at IS NULL OR billing_checked_at >= requested_at),
     CONSTRAINT organization_deletions_lease_pair_check
         CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL)),
+    CONSTRAINT organization_deletions_lease_expires_at_check
+        CHECK (lease_expires_at IS NULL OR lease_expires_at >= requested_at),
+    CONSTRAINT organization_deletions_next_attempt_at_check
+        CHECK (next_attempt_at IS NULL OR next_attempt_at >= requested_at),
+    CONSTRAINT organization_deletions_backup_expiry_check
+        CHECK (managed_backup_expiry_by IS NULL OR managed_backup_expiry_by >= purge_after),
     CONSTRAINT organization_deletions_terminal_timestamp_check
         CHECK (
             (state = 'cancelled') = (cancelled_at IS NOT NULL)
@@ -96,6 +104,19 @@ CREATE TABLE organization_deletions (
                 billing_observation_source = 'operator'
                 AND billing_observed_by IS NOT NULL
                 AND billing_observation_reason IS NOT NULL
+            )
+        ),
+    CONSTRAINT organization_deletions_observation_result_check
+        CHECK (
+            (
+                billing_observation_source IS NULL
+                AND last_billing_state IS NULL
+                AND billing_checked_at IS NULL
+            )
+            OR (
+                billing_observation_source IS NOT NULL
+                AND last_billing_state IS NOT NULL
+                AND billing_checked_at IS NOT NULL
             )
         )
 );
