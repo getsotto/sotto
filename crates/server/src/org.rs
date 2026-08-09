@@ -791,7 +791,7 @@ fn is_user_fk_violation(e: &sqlx::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::Role;
+    use super::{LifecycleState, Role};
 
     #[test]
     fn role_ordering_gates_management() {
@@ -808,5 +808,30 @@ mod tests {
             assert_eq!(Role::from_db(role.as_str()).unwrap(), role);
         }
         assert!(Role::from_db("root").is_err());
+    }
+
+    #[test]
+    fn lifecycle_states_fail_closed_for_writes() {
+        assert_eq!(
+            LifecycleState::from_db("active").unwrap(),
+            LifecycleState::Active
+        );
+        assert_eq!(
+            LifecycleState::from_db("deleting").unwrap(),
+            LifecycleState::Deleting
+        );
+        assert_eq!(
+            LifecycleState::from_db("deleted").unwrap(),
+            LifecycleState::Deleted
+        );
+        assert!(matches!(
+            LifecycleState::Deleting.require_write(),
+            Err(crate::error::Error::Conflict(_))
+        ));
+        assert!(matches!(
+            LifecycleState::Deleted.require_write(),
+            Err(crate::error::Error::NotFound(_))
+        ));
+        assert!(LifecycleState::from_db("archived").is_err());
     }
 }
