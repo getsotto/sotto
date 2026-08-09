@@ -64,7 +64,7 @@ CREATE TABLE organization_deletions (
     managed_backup_expiry_by TIMESTAMPTZ,
     CONSTRAINT organization_deletions_purge_after_check
         CHECK (purge_after >= requested_at),
-    CONSTRAINT organization_deletions_resume_state_check
+    CONSTRAINT organization_deletions_failed_resume_state_check
         CHECK ((state = 'failed') = (resume_state IS NOT NULL)),
     CONSTRAINT organization_deletions_billing_result_pair_check
         CHECK ((last_billing_state IS NULL) = (billing_checked_at IS NULL)),
