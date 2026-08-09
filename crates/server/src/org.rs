@@ -154,21 +154,19 @@ impl Role {
     }
 }
 
-/// A target member's role, if present. Caller access must use [`access`] so lifecycle rules are not
-/// bypassed; this narrow lookup is only for validating grant recipients.
-pub(crate) async fn member_role_of(
-    pool: &sqlx::PgPool,
-    org_id: &str,
-    user_id: &str,
-) -> Result<Option<Role>> {
-    let role: Option<String> = sqlx::query_scalar(
-        "SELECT role FROM organization_memberships WHERE org_id = $1 AND user_id = $2",
+/// Check whether `target` is still a member using the caller's transaction snapshot.
+pub(crate) async fn member_exists<'e, E>(exec: E, org_id: &str, target: &str) -> Result<bool>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let exists: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM organization_memberships WHERE org_id = $1 AND user_id = $2",
     )
     .bind(org_id)
-    .bind(user_id)
-    .fetch_optional(pool)
+    .bind(target)
+    .fetch_optional(exec)
     .await?;
-    role.map(|r| Role::from_db(&r)).transpose()
+    Ok(exists.is_some())
 }
 
 /// Resolve a caller's membership and lifecycle state. A missing membership, missing organisation,
