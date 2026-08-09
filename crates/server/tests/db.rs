@@ -159,6 +159,19 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
             .await;
     assert_constraint(invalid_lifecycle, "organizations_lifecycle_state_check");
 
+    // Deleted rows require a deletion timestamp in the same atomic transition.
+    let invalid_deleted_at = sqlx::query(
+        "UPDATE organizations SET lifecycle_state = 'deleted', deleted_at = NULL, \
+         enc_name = NULL WHERE id = $1",
+    )
+    .bind(org_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(
+        invalid_deleted_at,
+        "organizations_lifecycle_deleted_at_check",
+    );
+
     sqlx::query(
         "UPDATE organizations SET lifecycle_state = 'deleted', deleted_at = now(), \
          enc_name = NULL WHERE id = $1",
@@ -243,6 +256,19 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .await
     .expect("check lease index");
     assert!(lease_index_exists);
+
+    // A failed operation must record where recovery resumes.
+    let invalid_failed_resume = sqlx::query(
+        "UPDATE organization_deletions SET state = 'failed', resume_state = NULL \
+         WHERE id = $1::uuid",
+    )
+    .bind(active_operation_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(
+        invalid_failed_resume,
+        "organization_deletions_failed_resume_state_check",
+    );
 
     sqlx::query(
         "UPDATE organization_deletions SET state = 'failed', resume_state = 'cancelling_billing' \
