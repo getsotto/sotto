@@ -365,7 +365,10 @@ It then deletes organisation-owned primary data in this order:
    versions, environment grants, and machine tokens;
 2. organisation memberships, removing every wrapped organisation key;
 3. any future share links with explicit source-organisation attribution;
-4. billing identifiers, encrypted organisation name, creator, and trial metadata.
+4. billing identifiers, encrypted organisation name, creator, and trial metadata, using one
+   `UPDATE organizations` that also sets `lifecycle_state = 'deleted'` and `deleted_at`. The
+   tombstone checks are immediate, so clearing those fields and changing the lifecycle state must
+   be atomic.
 
 The transaction sets the retained organisation row to `deleted`, records `org.deletion.completed`,
 and marks the deletion attempt `completed`. It does not delete `audit_events` or the deletion record.
