@@ -94,6 +94,7 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     let provider_operation_id = "00000000-0000-0000-0000-000000000023";
     let operator_operation_id = "00000000-0000-0000-0000-000000000024";
     let completed_operation_id = "00000000-0000-0000-0000-000000000025";
+    let enc_name = b"encrypted-name";
     sqlx::query("DELETE FROM organization_deletions WHERE org_id = $1")
         .bind(org_id)
         .execute(&pool)
@@ -106,15 +107,22 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
         .expect("cleanup organisation");
 
     let (lifecycle_state, no_deleted_at): (String, bool) = sqlx::query_as(
-        "INSERT INTO organizations (id, enc_name) VALUES ($1, NULL) \
+        "INSERT INTO organizations (id, enc_name) VALUES ($1, $2) \
          RETURNING lifecycle_state, deleted_at IS NULL",
     )
     .bind(org_id)
+    .bind(enc_name.as_slice())
     .fetch_one(&pool)
     .await
-    .expect("insert tombstone-capable organisation");
+    .expect("insert organisation fixture");
     assert_eq!(lifecycle_state, "active");
     assert!(no_deleted_at);
+
+    let invalid_active_name = sqlx::query("UPDATE organizations SET enc_name = NULL WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await;
+    assert!(invalid_active_name.is_err());
 
     let invalid_lifecycle =
         sqlx::query("UPDATE organizations SET lifecycle_state = 'deleted' WHERE id = $1")
@@ -124,14 +132,16 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     assert!(invalid_lifecycle.is_err());
 
     sqlx::query(
-        "UPDATE organizations SET lifecycle_state = 'deleted', deleted_at = now() WHERE id = $1",
+        "UPDATE organizations SET lifecycle_state = 'deleted', deleted_at = now(), \
+         enc_name = NULL WHERE id = $1",
     )
     .bind(org_id)
     .execute(&pool)
     .await
     .expect("mark organisation deleted");
-    let (lifecycle_state, has_deleted_at): (String, bool) = sqlx::query_as(
-        "SELECT lifecycle_state, deleted_at IS NOT NULL FROM organizations WHERE id = $1",
+    let (lifecycle_state, has_deleted_at, no_enc_name): (String, bool, bool) = sqlx::query_as(
+        "SELECT lifecycle_state, deleted_at IS NOT NULL, enc_name IS NULL \
+         FROM organizations WHERE id = $1",
     )
     .bind(org_id)
     .fetch_one(&pool)
@@ -139,11 +149,21 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .expect("read deleted organisation");
     assert_eq!(lifecycle_state, "deleted");
     assert!(has_deleted_at);
+    assert!(no_enc_name);
+
+    let invalid_deleted_name = sqlx::query("UPDATE organizations SET enc_name = $2 WHERE id = $1")
+        .bind(org_id)
+        .bind(enc_name.as_slice())
+        .execute(&pool)
+        .await;
+    assert!(invalid_deleted_name.is_err());
 
     sqlx::query(
-        "UPDATE organizations SET lifecycle_state = 'active', deleted_at = NULL WHERE id = $1",
+        "UPDATE organizations SET lifecycle_state = 'active', deleted_at = NULL, \
+         enc_name = $2 WHERE id = $1",
     )
     .bind(org_id)
+    .bind(enc_name.as_slice())
     .execute(&pool)
     .await
     .expect("restore organisation fixture");
