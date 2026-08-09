@@ -44,6 +44,8 @@ ALTER TABLE organizations
 CREATE TABLE organization_deletions (
     id UUID PRIMARY KEY,
     -- RESTRICT preserves the organisation tombstone and its operation history as one unit.
+    -- This supersedes the earlier audit-only cascade assumption: deletion records must survive
+    -- until the retention and recovery workflow has finished.
     org_id TEXT NOT NULL
         CONSTRAINT organization_deletions_org_fk REFERENCES organizations (id) ON DELETE RESTRICT,
     -- State is the worker's durable phase; resume_state records where a failed attempt restarts.
