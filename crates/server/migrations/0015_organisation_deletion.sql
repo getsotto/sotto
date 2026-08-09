@@ -69,6 +69,7 @@ CREATE TABLE organization_deletions (
         )),
     billing_observed_by TEXT,
     billing_observation_reason TEXT,
+    billing_observation_evidence TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     next_attempt_at TIMESTAMPTZ,
     last_error_code TEXT,
@@ -110,16 +111,19 @@ CREATE TABLE organization_deletions (
                 billing_observation_source IS NULL
                 AND billing_observed_by IS NULL
                 AND billing_observation_reason IS NULL
+                AND billing_observation_evidence IS NULL
             )
             OR (
                 billing_observation_source = 'provider'
                 AND billing_observed_by IS NULL
                 AND billing_observation_reason IS NULL
+                AND billing_observation_evidence IS NULL
             )
             OR (
                 billing_observation_source = 'operator'
                 AND billing_observed_by IS NOT NULL
                 AND billing_observation_reason IS NOT NULL
+                AND billing_observation_evidence IS NOT NULL
             )
         ),
     CONSTRAINT organization_deletions_observation_result_check
