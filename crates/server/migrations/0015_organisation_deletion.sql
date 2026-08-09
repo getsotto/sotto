@@ -44,7 +44,8 @@ ALTER TABLE organizations
 CREATE TABLE organization_deletions (
     id UUID PRIMARY KEY,
     -- RESTRICT preserves the organisation tombstone and its operation history as one unit.
-    org_id TEXT NOT NULL REFERENCES organizations (id) ON DELETE RESTRICT,
+    org_id TEXT NOT NULL
+        CONSTRAINT organization_deletions_org_fk REFERENCES organizations (id) ON DELETE RESTRICT,
     -- State is the worker's durable phase; resume_state records where a failed attempt restarts.
     -- The explicit list makes an unknown workflow phase fail closed at the database boundary.
     state TEXT NOT NULL
