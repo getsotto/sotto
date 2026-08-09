@@ -150,6 +150,11 @@ CREATE INDEX organization_deletions_retry_idx
     ON organization_deletions (next_attempt_at, id)
     WHERE state IN ('requested', 'cancelling_billing', 'recovering', 'failed');
 
+-- Workers reclaim expired leases, including purging work left behind by a crashed worker.
+CREATE INDEX organization_deletions_lease_idx
+    ON organization_deletions (lease_expires_at, id)
+    WHERE lease_expires_at IS NOT NULL;
+
 -- Retention work is due from the fixed purge deadline, not the retry schedule.
 CREATE INDEX organization_deletions_retention_idx
     ON organization_deletions (purge_after, id)
