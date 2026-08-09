@@ -23,7 +23,11 @@ fn should_run_db_tests(database_url: &str) -> bool {
     true
 }
 
-fn assert_constraint(error: sqlx::Error, expected: &str) {
+fn assert_constraint<T>(result: Result<T, sqlx::Error>, expected: &str) {
+    let error = match result {
+        Ok(_) => panic!("expected PostgreSQL constraint {expected} to reject the query"),
+        Err(error) => error,
+    };
     let sqlx::Error::Database(database_error) = error else {
         panic!("expected PostgreSQL constraint {expected}, got {error}");
     };
