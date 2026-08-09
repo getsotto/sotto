@@ -117,14 +117,14 @@ async fn list_events(
     Path(org_id): Path<String>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<EventView>>> {
-    match org::role_of(&state.pool, &org_id, &user.user_id).await? {
-        Some(role) if role.can_manage_members() => {}
-        Some(_) => {
+    let access = org::access(&state.pool, &org_id, &user.user_id).await?;
+    match access.role() {
+        role if role.can_manage_members() => {}
+        _ => {
             return Err(Error::Forbidden(
                 "must be an admin or owner to read the audit log".into(),
             ))
         }
-        None => return Err(Error::NotFound("organisation not found".into())),
     }
     // The audit log is the flagship Team feature; the trial covers it, expiry gates it.
     crate::entitlements::require_team(&state.pool, &org_id, "the audit log").await?;

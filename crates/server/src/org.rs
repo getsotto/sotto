@@ -56,6 +56,62 @@ pub enum Role {
     Member,
 }
 
+/// The lifecycle state that governs ordinary organisation access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LifecycleState {
+    Active,
+    Deleting,
+    Deleted,
+}
+
+impl LifecycleState {
+    /// Parse a lifecycle state from its stored text. Unknown values fail closed because they mean
+    /// the application and database schema disagree about whether access is safe.
+    pub(crate) fn from_db(s: &str) -> Result<Self> {
+        match s {
+            "active" => Ok(Self::Active),
+            "deleting" => Ok(Self::Deleting),
+            "deleted" => Ok(Self::Deleted),
+            other => Err(Error::Config(format!(
+                "unknown organisation lifecycle state in db: {other}"
+            ))),
+        }
+    }
+
+    /// Require an organisation to accept a user-scoped write.
+    pub(crate) fn require_write(self) -> Result<()> {
+        match self {
+            Self::Active => Ok(()),
+            Self::Deleting => Err(Error::Conflict(
+                "organisation deletion is in progress".into(),
+            )),
+            Self::Deleted => Err(Error::NotFound("organisation not found".into())),
+        }
+    }
+}
+
+/// A caller's role together with the lifecycle state of the organisation they reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OrgAccess {
+    role: Role,
+    lifecycle: LifecycleState,
+}
+
+impl OrgAccess {
+    pub(crate) fn role(self) -> Role {
+        self.role
+    }
+
+    pub(crate) fn lifecycle(self) -> LifecycleState {
+        self.lifecycle
+    }
+
+    /// Reject a user-scoped organisation write while retaining reads during deletion.
+    pub(crate) fn require_write(self) -> Result<()> {
+        self.lifecycle.require_write()
+    }
+}
+
 impl Role {
     fn as_str(self) -> &'static str {
         match self {
@@ -113,6 +169,68 @@ pub(crate) async fn role_of(
     .fetch_optional(pool)
     .await?;
     role.map(|r| Role::from_db(&r)).transpose()
+}
+
+/// Resolve a caller's membership and lifecycle state. A missing membership, unknown organisation,
+/// and deleted organisation all return the same `404` to avoid leaking organisation existence.
+pub(crate) async fn access(pool: &sqlx::PgPool, org_id: &str, user_id: &str) -> Result<OrgAccess> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT m.role, o.lifecycle_state \
+         FROM organizations o JOIN organization_memberships m ON m.org_id = o.id \
+         WHERE o.id = $1 AND m.user_id = $2",
+    )
+    .bind(org_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    access_from_row(row)
+}
+
+/// Resolve and lock an organisation before a user-scoped write. The lock closes the gap between
+/// an initial authorisation check and the mutation transaction.
+pub(crate) async fn access_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: &str,
+    user_id: &str,
+) -> Result<OrgAccess> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT m.role, o.lifecycle_state \
+         FROM organizations o JOIN organization_memberships m ON m.org_id = o.id \
+         WHERE o.id = $1 AND m.user_id = $2 FOR UPDATE OF o",
+    )
+    .bind(org_id)
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    access_from_row(row)
+}
+
+/// Lock an organisation row for a write whose detailed role check happened earlier.
+pub(crate) async fn require_write_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: &str,
+) -> Result<()> {
+    let lifecycle: Option<String> =
+        sqlx::query_scalar("SELECT lifecycle_state FROM organizations WHERE id = $1 FOR UPDATE")
+            .bind(org_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let lifecycle = lifecycle
+        .ok_or_else(|| Error::NotFound("organisation not found".into()))
+        .and_then(|state| LifecycleState::from_db(&state))?;
+    lifecycle.require_write()
+}
+
+fn access_from_row(row: Option<(String, String)>) -> Result<OrgAccess> {
+    let (role, lifecycle) = row.ok_or_else(|| Error::NotFound("organisation not found".into()))?;
+    let lifecycle = LifecycleState::from_db(&lifecycle)?;
+    if lifecycle == LifecycleState::Deleted {
+        return Err(Error::NotFound("organisation not found".into()));
+    }
+    Ok(OrgAccess {
+        role: Role::from_db(&role)?,
+        lifecycle,
+    })
 }
 
 // --- request/response shapes -------------------------------------------------------------------
@@ -174,24 +292,6 @@ struct InviteResult {
     user_id: String,
     /// Their public key (base64) if set - lets the inviter seal env grants immediately.
     public_key: Option<String>,
-}
-
-// --- authorisation helpers ---------------------------------------------------------------------
-
-/// The caller's role in `org_id`, or `404` if they are not a member (which also covers "org does
-/// not exist" - the two are indistinguishable to a non-member on purpose).
-async fn caller_role(state: &AppState, org_id: &str, user_id: &str) -> Result<Role> {
-    let role: Option<String> = sqlx::query_scalar(
-        "SELECT role FROM organization_memberships WHERE org_id = $1 AND user_id = $2",
-    )
-    .bind(org_id)
-    .bind(user_id)
-    .fetch_optional(&state.pool)
-    .await?;
-    match role {
-        Some(r) => Role::from_db(&r),
-        None => Err(Error::NotFound("organisation not found".into())),
-    }
 }
 
 /// The current role of `target` in `org_id`, or `404` if they are not a member. Generic over the
@@ -308,7 +408,7 @@ async fn list_orgs(State(state): State<AppState>, user: AuthUser) -> Result<Json
     let rows: Vec<OrgRow> = sqlx::query_as(
         "SELECT o.id, o.enc_name, m.role, m.enc_org_key \
          FROM organizations o JOIN organization_memberships m ON o.id = m.org_id \
-         WHERE m.user_id = $1 ORDER BY o.id",
+         WHERE m.user_id = $1 AND o.lifecycle_state <> 'deleted' ORDER BY o.id",
     )
     .bind(&user.user_id)
     .fetch_all(&state.pool)
@@ -337,7 +437,10 @@ async fn grant_org_key(
     Path((org_id, target)): Path<(String, String)>,
     Json(body): Json<GrantOrgKey>,
 ) -> Result<StatusCode> {
-    let caller = caller_role(&state, &org_id, &user.user_id).await?;
+    let mut tx = state.pool.begin().await?;
+    let caller = access_for_update(&mut tx, &org_id, &user.user_id).await?;
+    caller.require_write()?;
+    let caller = caller.role();
     if !caller.can_manage_members() {
         return Err(Error::Forbidden(
             "must be an admin or owner to grant the org key".into(),
@@ -345,7 +448,6 @@ async fn grant_org_key(
     }
     let enc_org_key = encoding::decode(&body.enc_org_key, "enc_org_key", MAX_ENC_NAME)?;
     // Grant and its audit event commit together, so a failed audit can't leave an un-logged change.
-    let mut tx = state.pool.begin().await?;
     let updated = sqlx::query(
         "UPDATE organization_memberships SET enc_org_key = $3 WHERE org_id = $1 AND user_id = $2",
     )
@@ -378,7 +480,7 @@ async fn list_members(
     user: AuthUser,
     Path(org_id): Path<String>,
 ) -> Result<Json<Vec<MemberView>>> {
-    caller_role(&state, &org_id, &user.user_id).await?;
+    access(&state.pool, &org_id, &user.user_id).await?;
 
     let rows: Vec<(String, String, Option<Vec<u8>>)> = sqlx::query_as(
         "SELECT m.user_id, m.role, u.public_key \
@@ -410,7 +512,9 @@ async fn add_member(
     Path(org_id): Path<String>,
     Json(body): Json<AddMember>,
 ) -> Result<StatusCode> {
-    let caller = caller_role(&state, &org_id, &user.user_id).await?;
+    let caller = access(&state.pool, &org_id, &user.user_id).await?;
+    caller.require_write()?;
+    let caller = caller.role();
     if !caller.can_manage_members() {
         return Err(Error::Forbidden(
             "must be an admin or owner to add members".into(),
@@ -426,6 +530,7 @@ async fn add_member(
     // and the insert are atomic against concurrent adds; a failed audit can't leave an un-logged
     // member either.
     let mut tx = state.pool.begin().await?;
+    require_write_tx(&mut tx, &org_id).await?;
     crate::entitlements::check_can_add_member(&mut tx, &org_id).await?;
     let inserted: std::result::Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
         "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, $3) \
@@ -474,7 +579,9 @@ async fn invite_member(
     Path(org_id): Path<String>,
     Json(body): Json<Invite>,
 ) -> Result<Json<InviteResult>> {
-    let caller = caller_role(&state, &org_id, &user.user_id).await?;
+    let caller = access(&state.pool, &org_id, &user.user_id).await?;
+    caller.require_write()?;
+    let caller = caller.role();
     if !caller.can_manage_members() {
         return Err(Error::Forbidden(
             "must be an admin or owner to invite members".into(),
@@ -497,6 +604,7 @@ async fn invite_member(
     // and the insert are atomic against concurrent invites; a failed audit can't leave an un-logged
     // member either.
     let mut tx = state.pool.begin().await?;
+    require_write_tx(&mut tx, &org_id).await?;
     crate::entitlements::check_can_add_member(&mut tx, &org_id).await?;
     let inserted: Option<String> = sqlx::query_scalar(
         "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, 'member') \
@@ -540,7 +648,7 @@ async fn member_env_grants(
     user: AuthUser,
     Path((org_id, target)): Path<(String, String)>,
 ) -> Result<Json<Vec<EnvGrantRef>>> {
-    let caller = caller_role(&state, &org_id, &user.user_id).await?;
+    let caller = access(&state.pool, &org_id, &user.user_id).await?.role();
     if !caller.can_manage_members() {
         return Err(Error::Forbidden(
             "must be an admin or owner to list a member's grants".into(),
@@ -570,7 +678,9 @@ async fn update_member(
     Path((org_id, target)): Path<(String, String)>,
     Json(body): Json<UpdateMember>,
 ) -> Result<StatusCode> {
-    let caller = caller_role(&state, &org_id, &user.user_id).await?;
+    let caller = access(&state.pool, &org_id, &user.user_id).await?;
+    caller.require_write()?;
+    let caller = caller.role();
     if !caller.can_manage_members() {
         return Err(Error::Forbidden(
             "must be an admin or owner to change roles".into(),
@@ -579,6 +689,8 @@ async fn update_member(
     // Lock the org's owner set for the rest of the transaction so the last-owner guard and the
     // write commit atomically; two owners demoting each other concurrently serialise here.
     let mut tx = state.pool.begin().await?;
+    let locked = access_for_update(&mut tx, &org_id, &user.user_id).await?;
+    locked.require_write()?;
     let owners = lock_owner_count(&mut tx, &org_id).await?;
     let current = member_role(&mut *tx, &org_id, &target).await?;
 
@@ -620,7 +732,9 @@ async fn remove_member(
     user: AuthUser,
     Path((org_id, target)): Path<(String, String)>,
 ) -> Result<StatusCode> {
-    let caller = caller_role(&state, &org_id, &user.user_id).await?;
+    let caller = access(&state.pool, &org_id, &user.user_id).await?;
+    caller.require_write()?;
+    let caller = caller.role();
     if !caller.can_manage_members() {
         return Err(Error::Forbidden(
             "must be an admin or owner to remove members".into(),
@@ -629,6 +743,8 @@ async fn remove_member(
     // Lock the org's owner set for the rest of the transaction so the last-owner guard and the
     // delete commit atomically; two owners removing each other concurrently serialise here.
     let mut tx = state.pool.begin().await?;
+    let locked = access_for_update(&mut tx, &org_id, &user.user_id).await?;
+    locked.require_write()?;
     let owners = lock_owner_count(&mut tx, &org_id).await?;
     let current = member_role(&mut *tx, &org_id, &target).await?;
 

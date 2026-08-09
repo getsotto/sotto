@@ -8,7 +8,7 @@
 //! exists.
 
 use crate::error::{Error, Result};
-use crate::org::{self, Role};
+use crate::org::{self, LifecycleState, Role};
 use crate::state::AppState;
 
 /// A resolved grant of access to a project. Merely holding one authorises reads and secret writes;
@@ -20,6 +20,8 @@ pub(crate) struct ProjectAccess {
     org_role: Option<Role>,
     /// The owning org, for an org project (carried so callers - e.g. audit logging - don't re-query).
     org_id: Option<String>,
+    /// The owning organisation's lifecycle state, when this is an org project.
+    org_lifecycle: Option<LifecycleState>,
 }
 
 impl ProjectAccess {
@@ -32,6 +34,23 @@ impl ProjectAccess {
     /// The owning organisation's id, or `None` for a personal project.
     pub(crate) fn org_id(&self) -> Option<&str> {
         self.org_id.as_deref()
+    }
+
+    /// Reject a write to a project or environment while its organisation is being deleted.
+    pub(crate) fn require_write(&self) -> Result<()> {
+        if let Some(lifecycle) = self.org_lifecycle {
+            lifecycle.require_write()?
+        }
+        Ok(())
+    }
+
+    /// Require both a live organisation and the admin/owner role for a structural mutation.
+    pub(crate) fn require_manage_structure(&self, message: &str) -> Result<()> {
+        self.require_write()?;
+        if !self.can_manage_structure() {
+            return Err(Error::Forbidden(message.into()));
+        }
+        Ok(())
     }
 }
 
@@ -55,16 +74,19 @@ pub(crate) async fn project_access(
             is_owner: true,
             org_role: None,
             org_id: None,
+            org_lifecycle: None,
         }),
         None => Err(Error::NotFound("project not found".into())),
         // Org project: authority is the caller's membership role, not `owner_id`.
-        Some(org) => match org::role_of(&state.pool, &org, user_id).await? {
-            Some(role) => Ok(ProjectAccess {
+        Some(org) => match org::access(&state.pool, &org, user_id).await {
+            Ok(org_access) => Ok(ProjectAccess {
                 is_owner: false,
-                org_role: Some(role),
+                org_role: Some(org_access.role()),
                 org_id: Some(org),
+                org_lifecycle: Some(org_access.lifecycle()),
             }),
-            None => Err(Error::NotFound("project not found".into())),
+            Err(Error::NotFound(_)) => Err(Error::NotFound("project not found".into())),
+            Err(error) => Err(error),
         },
     }
 }

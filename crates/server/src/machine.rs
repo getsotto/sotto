@@ -99,17 +99,16 @@ async fn create_token(
     let enc_vault_key = encoding::decode(&body.enc_vault_key, "enc_vault_key", MAX_ENC_KEY)?;
 
     let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
-    if !access.can_manage_structure() {
-        return Err(Error::Forbidden(
-            "must be an admin or owner to create a machine token".into(),
-        ));
-    }
+    access.require_manage_structure("must be an admin or owner to create a machine token")?;
     let audit_org = access.org_id().map(str::to_string);
 
     let token_id = uuid::Uuid::new_v4().to_string();
     let token = generate_token();
     // Token row and its audit event commit together, so a failed audit can't leave one un-logged.
     let mut tx = state.pool.begin().await?;
+    if let Some(org_id) = access.org_id() {
+        crate::org::require_write_tx(&mut tx, org_id).await?;
+    }
     sqlx::query(
         "INSERT INTO machine_tokens (id, env_id, name, token_hash, public_key, enc_vault_key, created_by) \
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -183,13 +182,12 @@ async fn revoke_token(
 ) -> Result<StatusCode> {
     validate_id(&token_id, "token_id")?;
     let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
-    if !access.can_manage_structure() {
-        return Err(Error::Forbidden(
-            "must be an admin or owner to revoke a machine token".into(),
-        ));
-    }
+    access.require_manage_structure("must be an admin or owner to revoke a machine token")?;
     // Revoke and its audit event commit together, so a failed audit can't leave one un-logged.
     let mut tx = state.pool.begin().await?;
+    if let Some(org_id) = access.org_id() {
+        crate::org::require_write_tx(&mut tx, org_id).await?;
+    }
     let revoked = sqlx::query(
         "UPDATE machine_tokens SET revoked_at = now() \
          WHERE id = $1 AND env_id = $2 AND revoked_at IS NULL",
@@ -236,7 +234,12 @@ impl FromRequestParts<AppState> for MachineAuth {
             return Err(Error::Unauthorized);
         }
         let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT id, env_id FROM machine_tokens WHERE token_hash = $1 AND revoked_at IS NULL",
+            "SELECT mt.id, mt.env_id FROM machine_tokens mt \
+             JOIN environments e ON e.id = mt.env_id \
+             JOIN projects p ON p.id = e.project_id \
+             LEFT JOIN organizations o ON o.id = p.org_id \
+             WHERE mt.token_hash = $1 AND mt.revoked_at IS NULL \
+               AND (o.id IS NULL OR o.lifecycle_state <> 'deleted')",
         )
         .bind(session::hash_token(&token))
         .fetch_optional(&state.pool)

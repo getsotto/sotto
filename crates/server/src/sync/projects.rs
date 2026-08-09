@@ -49,14 +49,19 @@ async fn create_project(
 
     // Creating a project inside an org is a structural change: admin+ (404 hides non-membership).
     if let Some(org_id) = &body.org_id {
-        match org::role_of(&state.pool, org_id, &user.user_id).await? {
-            Some(role) if role.is_at_least(Role::Admin) => {}
-            Some(_) => {
-                return Err(Error::Forbidden(
-                    "must be an admin or owner to create a project in this organisation".into(),
-                ))
+        match org::access(&state.pool, org_id, &user.user_id).await {
+            Ok(access) => {
+                access.require_write()?;
+                if !access.role().is_at_least(Role::Admin) {
+                    return Err(Error::Forbidden(
+                        "must be an admin or owner to create a project in this organisation".into(),
+                    ));
+                }
             }
-            None => return Err(Error::NotFound("organisation not found".into())),
+            Err(Error::NotFound(_)) => {
+                return Err(Error::NotFound("organisation not found".into()))
+            }
+            Err(error) => return Err(error),
         }
     }
 
@@ -112,7 +117,9 @@ async fn list_projects(
          WHERE (p.org_id IS NULL AND p.owner_id = $1) \
             OR (p.org_id IS NOT NULL AND EXISTS ( \
                    SELECT 1 FROM organization_memberships m \
-                   WHERE m.org_id = p.org_id AND m.user_id = $1)) \
+                   JOIN organizations o ON o.id = m.org_id \
+                   WHERE m.org_id = p.org_id AND m.user_id = $1 \
+                     AND o.lifecycle_state <> 'deleted')) \
          ORDER BY id",
     )
     .bind(&user.user_id)

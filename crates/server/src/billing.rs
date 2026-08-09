@@ -203,12 +203,13 @@ fn billing_config(state: &AppState) -> Result<&BillingState> {
 
 /// Billing is admin+: the same bar as membership management, and a non-member sees a 404.
 async fn require_billing_admin(pool: &PgPool, org_id: &str, user_id: &str) -> Result<()> {
-    match org::role_of(pool, org_id, user_id).await? {
-        Some(role) if role.can_manage_members() => Ok(()),
-        Some(_) => Err(Error::Forbidden(
+    let access = org::access(pool, org_id, user_id).await?;
+    access.require_write()?;
+    match access.role() {
+        role if role.can_manage_members() => Ok(()),
+        _ => Err(Error::Forbidden(
             "managing billing requires the admin or owner role".into(),
         )),
-        None => Err(Error::NotFound("organisation not found".into())),
     }
 }
 

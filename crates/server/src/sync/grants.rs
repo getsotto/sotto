@@ -95,11 +95,7 @@ async fn create_grant(
     let enc_vault_key = encoding::decode(&body.enc_vault_key, "enc_vault_key", MAX_ENC_KEY)?;
 
     let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
-    if !access.can_manage_structure() {
-        return Err(Error::Forbidden(
-            "must be an admin or owner to share an environment".into(),
-        ));
-    }
+    access.require_manage_structure("must be an admin or owner to share an environment")?;
 
     // Sharing is an org operation: the env must be org-owned, and the recipient a member of that org
     // (a grant to someone who can't reach the env would be dead weight).
@@ -123,6 +119,7 @@ async fn create_grant(
 
     // Grant and its audit event commit together, so a failed audit can't leave an un-logged share.
     let mut tx = state.pool.begin().await?;
+    org::require_write_tx(&mut tx, &org_id).await?;
     sqlx::query(
         "INSERT INTO environment_grants (env_id, user_id, enc_vault_key, granted_by) \
          VALUES ($1, $2, $3, $4) \
@@ -237,11 +234,7 @@ async fn rotate(
     Json(req): Json<RotateRequest>,
 ) -> Result<Json<RotateResponse>> {
     let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
-    if !access.can_manage_structure() {
-        return Err(Error::Forbidden(
-            "must be an admin or owner to rotate an environment".into(),
-        ));
-    }
+    access.require_manage_structure("must be an admin or owner to rotate an environment")?;
 
     // Rotation re-grants org members, so the env must be org-owned.
     let org_id: Option<String> = sqlx::query_scalar(
@@ -331,6 +324,8 @@ async fn rotate(
     }
 
     let mut tx = state.pool.begin().await?;
+
+    org::require_write_tx(&mut tx, &org_id).await?;
 
     // Lock the environment row so the rotation serialises against concurrent secret writes.
     let current: Option<i64> =
