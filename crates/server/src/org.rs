@@ -694,6 +694,11 @@ async fn update_member(
     let locked = access_for_update(&mut tx, &org_id, &user.user_id).await?;
     locked.require_write()?;
     let caller = locked.role();
+    if !caller.can_manage_members() {
+        return Err(Error::Forbidden(
+            "must be an admin or owner to change roles".into(),
+        ));
+    }
     let owners = lock_owner_count(&mut tx, &org_id).await?;
     let current = member_role(&mut *tx, &org_id, &target).await?;
 
@@ -749,6 +754,11 @@ async fn remove_member(
     let locked = access_for_update(&mut tx, &org_id, &user.user_id).await?;
     locked.require_write()?;
     let caller = locked.role();
+    if !caller.can_manage_members() {
+        return Err(Error::Forbidden(
+            "must be an admin or owner to remove members".into(),
+        ));
+    }
     let owners = lock_owner_count(&mut tx, &org_id).await?;
     let current = member_role(&mut *tx, &org_id, &target).await?;
 
