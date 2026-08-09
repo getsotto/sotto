@@ -15,6 +15,17 @@ ALTER TABLE organizations
         CHECK (
             (lifecycle_state = 'deleted' AND enc_name IS NULL)
             OR (lifecycle_state <> 'deleted' AND enc_name IS NOT NULL)
+        ),
+    CONSTRAINT organizations_lifecycle_tombstone_check
+        CHECK (
+            lifecycle_state <> 'deleted'
+            OR (
+                created_by IS NULL
+                AND tier = 'free'
+                AND trial_ends_at IS NULL
+                AND stripe_customer_id IS NULL
+                AND stripe_subscription_id IS NULL
+            )
         );
 
 -- A deleted organisation is a tombstone, so its encrypted name is cleared at final purge.
