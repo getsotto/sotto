@@ -201,6 +201,7 @@ CREATE TABLE organization_deletions (
     billing_observation_source TEXT,
     billing_observed_by TEXT,
     billing_observation_reason TEXT,
+    billing_observation_evidence TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TIMESTAMPTZ,
     last_error_code TEXT,
@@ -214,15 +215,17 @@ CREATE TABLE organization_deletions (
 ```
 
 The migration must add check constraints for timestamps and legal state fields, an index for due
-work, and a partial unique index allowing only one non-terminal deletion per `org_id`. Exact SQL is
-left to the data PR so its constraints can be tested directly.
+work and expired leases, and a partial unique index allowing only one non-terminal deletion per
+`org_id`. Operator billing observations must include an evidence reference. Exact SQL is left to the
+data PR so its constraints can be tested directly.
 
 `organizations.lifecycle_state` is the hot access-control flag; `organization_deletions.state` is
 the workflow phase. They change together in one database transaction. A cancelled attempt restores
 `active`; final purge sets `deleted`. This is intentional separation, not duplicated workflow
 state.
 
-The retained `organizations` row is the permanent tombstone. At completion it contains only:
+The retained `organizations` row is the permanent tombstone. Database constraints enforce that at
+completion it contains only:
 
 - `id`, `created_at`, `lifecycle_state = 'deleted'`, and `deleted_at`;
 - no encrypted name or creator;
