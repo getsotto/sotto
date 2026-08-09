@@ -503,7 +503,7 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     let invalid_resume_state = sqlx::query(
         "UPDATE organization_deletions SET resume_state = 'future' WHERE id = $1::uuid",
     )
-    .bind(completed_operation_id)
+    .bind(active_operation_id)
     .execute(&pool)
     .await;
     assert_constraint(
