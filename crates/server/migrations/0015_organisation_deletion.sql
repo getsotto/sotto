@@ -16,7 +16,7 @@ ALTER TABLE organizations
             (lifecycle_state = 'deleted' AND enc_name IS NULL)
             OR (lifecycle_state <> 'deleted' AND enc_name IS NOT NULL)
         ),
-    CONSTRAINT organizations_lifecycle_tombstone_check
+    ADD CONSTRAINT organizations_lifecycle_tombstone_check
         CHECK (
             lifecycle_state <> 'deleted'
             OR (
