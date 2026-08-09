@@ -189,9 +189,7 @@ async fn write_secrets(
 
     let mut tx = state.pool.begin().await?;
 
-    if let Some(org_id) = access.org_id() {
-        crate::org::require_write_tx(&mut tx, org_id).await?;
-    }
+    access.require_write_tx(&mut tx).await?;
 
     // Lock the environment row so concurrent batches serialise on its revision.
     let current: Option<i64> =

@@ -154,9 +154,9 @@ impl Role {
     }
 }
 
-/// The caller's role in `org_id` if they are a member, else `None` - a non-erroring lookup for the
-/// sync layer's access checks (which turn "not a member" into a resource `404`, not an org error).
-pub(crate) async fn role_of(
+/// A target member's role, if present. Caller access must use [`access`] so lifecycle rules are not
+/// bypassed; this narrow lookup is only for validating grant recipients.
+pub(crate) async fn member_role_of(
     pool: &sqlx::PgPool,
     org_id: &str,
     user_id: &str,
@@ -203,22 +203,6 @@ pub(crate) async fn access_for_update(
     .fetch_optional(&mut **tx)
     .await?;
     access_from_row(row)
-}
-
-/// Lock an organisation row for a write whose detailed role check happened earlier.
-pub(crate) async fn require_write_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    org_id: &str,
-) -> Result<()> {
-    let lifecycle: Option<String> =
-        sqlx::query_scalar("SELECT lifecycle_state FROM organizations WHERE id = $1 FOR UPDATE")
-            .bind(org_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let lifecycle = lifecycle
-        .ok_or_else(|| Error::NotFound("organisation not found".into()))
-        .and_then(|state| LifecycleState::from_db(&state))?;
-    lifecycle.require_write()
 }
 
 fn access_from_row(row: Option<(String, String)>) -> Result<OrgAccess> {
@@ -530,7 +514,19 @@ async fn add_member(
     // and the insert are atomic against concurrent adds; a failed audit can't leave an un-logged
     // member either.
     let mut tx = state.pool.begin().await?;
-    require_write_tx(&mut tx, &org_id).await?;
+    let locked = access_for_update(&mut tx, &org_id, &user.user_id).await?;
+    locked.require_write()?;
+    let caller = locked.role();
+    if !caller.can_manage_members() {
+        return Err(Error::Forbidden(
+            "must be an admin or owner to add members".into(),
+        ));
+    }
+    if body.role == Role::Owner && caller != Role::Owner {
+        return Err(Error::Forbidden(
+            "only an owner can grant the owner role".into(),
+        ));
+    }
     crate::entitlements::check_can_add_member(&mut tx, &org_id).await?;
     let inserted: std::result::Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
         "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, $3) \
@@ -604,7 +600,13 @@ async fn invite_member(
     // and the insert are atomic against concurrent invites; a failed audit can't leave an un-logged
     // member either.
     let mut tx = state.pool.begin().await?;
-    require_write_tx(&mut tx, &org_id).await?;
+    let locked = access_for_update(&mut tx, &org_id, &user.user_id).await?;
+    locked.require_write()?;
+    if !locked.role().can_manage_members() {
+        return Err(Error::Forbidden(
+            "must be an admin or owner to invite members".into(),
+        ));
+    }
     crate::entitlements::check_can_add_member(&mut tx, &org_id).await?;
     let inserted: Option<String> = sqlx::query_scalar(
         "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, 'member') \
@@ -691,6 +693,7 @@ async fn update_member(
     let mut tx = state.pool.begin().await?;
     let locked = access_for_update(&mut tx, &org_id, &user.user_id).await?;
     locked.require_write()?;
+    let caller = locked.role();
     let owners = lock_owner_count(&mut tx, &org_id).await?;
     let current = member_role(&mut *tx, &org_id, &target).await?;
 
@@ -745,6 +748,7 @@ async fn remove_member(
     let mut tx = state.pool.begin().await?;
     let locked = access_for_update(&mut tx, &org_id, &user.user_id).await?;
     locked.require_write()?;
+    let caller = locked.role();
     let owners = lock_owner_count(&mut tx, &org_id).await?;
     let current = member_role(&mut *tx, &org_id, &target).await?;
 

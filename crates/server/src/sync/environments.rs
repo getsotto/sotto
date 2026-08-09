@@ -58,9 +58,12 @@ async fn create_environment(
     // inline copy on the environment row.
     let created = {
         let mut tx = state.pool.begin().await?;
-        if let Some(org_id) = access.org_id() {
-            crate::org::require_write_tx(&mut tx, org_id).await?;
-        }
+        access
+            .require_manage_structure_tx(
+                &mut tx,
+                "must be an admin or owner to create an environment",
+            )
+            .await?;
         let created: Option<String> = sqlx::query_scalar(
             "INSERT INTO environments (id, project_id, enc_name) \
              VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING RETURNING id",

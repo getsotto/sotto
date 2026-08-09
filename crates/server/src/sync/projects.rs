@@ -69,6 +69,13 @@ async fn create_project(
     // insert are atomic against concurrent creates that would otherwise both slip past the limit.
     let mut tx = state.pool.begin().await?;
     if let Some(org_id) = &body.org_id {
+        let access = org::access_for_update(&mut tx, org_id, &user.user_id).await?;
+        access.require_write()?;
+        if !access.role().is_at_least(Role::Admin) {
+            return Err(Error::Forbidden(
+                "must be an admin or owner to create a project in this organisation".into(),
+            ));
+        }
         crate::entitlements::check_can_create_org_project(&mut tx, org_id, &body.id).await?;
     }
     let created: Option<String> = sqlx::query_scalar(

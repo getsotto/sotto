@@ -10,6 +10,7 @@
 use crate::error::{Error, Result};
 use crate::org::{self, LifecycleState, Role};
 use crate::state::AppState;
+use sqlx::{Postgres, Transaction};
 
 /// A resolved grant of access to a project. Merely holding one authorises reads and secret writes;
 /// the methods gate the more privileged operations.
@@ -22,6 +23,8 @@ pub(crate) struct ProjectAccess {
     org_id: Option<String>,
     /// The owning organisation's lifecycle state, when this is an org project.
     org_lifecycle: Option<LifecycleState>,
+    /// The caller whose membership was resolved.
+    user_id: String,
 }
 
 impl ProjectAccess {
@@ -52,6 +55,34 @@ impl ProjectAccess {
         }
         Ok(())
     }
+
+    /// Recheck membership and lifecycle while holding the organisation lock for a write.
+    pub(crate) async fn require_write_tx(&self, tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+        if let Some(org_id) = &self.org_id {
+            org::access_for_update(tx, org_id, &self.user_id)
+                .await?
+                .require_write()?;
+        }
+        Ok(())
+    }
+
+    /// Recheck the admin/owner role and lifecycle while holding the organisation lock.
+    pub(crate) async fn require_manage_structure_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        message: &str,
+    ) -> Result<()> {
+        if let Some(org_id) = &self.org_id {
+            let access = org::access_for_update(tx, org_id, &self.user_id).await?;
+            access.require_write()?;
+            if !access.role().is_at_least(Role::Admin) {
+                return Err(Error::Forbidden(message.into()));
+            }
+        } else if !self.can_manage_structure() {
+            return Err(Error::Forbidden(message.into()));
+        }
+        Ok(())
+    }
 }
 
 /// Resolve the caller's access to `project_id`, or `404` if it does not exist or they cannot reach
@@ -75,6 +106,7 @@ pub(crate) async fn project_access(
             org_role: None,
             org_id: None,
             org_lifecycle: None,
+            user_id: user_id.to_string(),
         }),
         None => Err(Error::NotFound("project not found".into())),
         // Org project: authority is the caller's membership role, not `owner_id`.
@@ -84,6 +116,7 @@ pub(crate) async fn project_access(
                 org_role: Some(org_access.role()),
                 org_id: Some(org),
                 org_lifecycle: Some(org_access.lifecycle()),
+                user_id: user_id.to_string(),
             }),
             Err(Error::NotFound(_)) => Err(Error::NotFound("project not found".into())),
             Err(error) => Err(error),

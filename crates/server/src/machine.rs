@@ -106,9 +106,12 @@ async fn create_token(
     let token = generate_token();
     // Token row and its audit event commit together, so a failed audit can't leave one un-logged.
     let mut tx = state.pool.begin().await?;
-    if let Some(org_id) = access.org_id() {
-        crate::org::require_write_tx(&mut tx, org_id).await?;
-    }
+    access
+        .require_manage_structure_tx(
+            &mut tx,
+            "must be an admin or owner to create a machine token",
+        )
+        .await?;
     sqlx::query(
         "INSERT INTO machine_tokens (id, env_id, name, token_hash, public_key, enc_vault_key, created_by) \
          VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -185,9 +188,12 @@ async fn revoke_token(
     access.require_manage_structure("must be an admin or owner to revoke a machine token")?;
     // Revoke and its audit event commit together, so a failed audit can't leave one un-logged.
     let mut tx = state.pool.begin().await?;
-    if let Some(org_id) = access.org_id() {
-        crate::org::require_write_tx(&mut tx, org_id).await?;
-    }
+    access
+        .require_manage_structure_tx(
+            &mut tx,
+            "must be an admin or owner to revoke a machine token",
+        )
+        .await?;
     let revoked = sqlx::query(
         "UPDATE machine_tokens SET revoked_at = now() \
          WHERE id = $1 AND env_id = $2 AND revoked_at IS NULL",

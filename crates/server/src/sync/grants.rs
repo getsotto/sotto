@@ -108,7 +108,7 @@ async fn create_grant(
     let org_id = org_id.ok_or_else(|| {
         Error::BadRequest("environment is not in an organisation; nothing to share".into())
     })?;
-    if org::role_of(&state.pool, &org_id, &body.user_id)
+    if org::member_role_of(&state.pool, &org_id, &body.user_id)
         .await?
         .is_none()
     {
@@ -119,7 +119,9 @@ async fn create_grant(
 
     // Grant and its audit event commit together, so a failed audit can't leave an un-logged share.
     let mut tx = state.pool.begin().await?;
-    org::require_write_tx(&mut tx, &org_id).await?;
+    access
+        .require_manage_structure_tx(&mut tx, "must be an admin or owner to share an environment")
+        .await?;
     sqlx::query(
         "INSERT INTO environment_grants (env_id, user_id, enc_vault_key, granted_by) \
          VALUES ($1, $2, $3, $4) \
@@ -325,7 +327,12 @@ async fn rotate(
 
     let mut tx = state.pool.begin().await?;
 
-    org::require_write_tx(&mut tx, &org_id).await?;
+    access
+        .require_manage_structure_tx(
+            &mut tx,
+            "must be an admin or owner to rotate an environment",
+        )
+        .await?;
 
     // Lock the environment row so the rotation serialises against concurrent secret writes.
     let current: Option<i64> =
