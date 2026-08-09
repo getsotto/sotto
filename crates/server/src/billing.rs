@@ -26,7 +26,7 @@ use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 #[cfg(feature = "e2e-mock-billing")]
 use url::Url;
@@ -202,8 +202,12 @@ fn billing_config(state: &AppState) -> Result<&BillingState> {
 }
 
 /// Billing is admin+: the same bar as membership management, and a non-member sees a 404.
-async fn require_billing_admin(pool: &PgPool, org_id: &str, user_id: &str) -> Result<()> {
-    let access = org::access(pool, org_id, user_id).await?;
+async fn require_billing_admin(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: &str,
+    user_id: &str,
+) -> Result<()> {
+    let access = org::access_for_update(tx, org_id, user_id).await?;
     access.require_write()?;
     match access.role() {
         role if role.can_manage_members() => Ok(()),
@@ -227,14 +231,17 @@ async fn create_checkout(
     Path(org_id): Path<String>,
 ) -> Result<Json<RedirectView>> {
     let billing = billing_config(&state)?;
-    require_billing_admin(&state.pool, &org_id, &user.user_id).await?;
+    let mut tx = state.pool.begin().await?;
+    // Keep the organisation lock through provider session creation so deletion cannot transition
+    // between the lifecycle check and this billing side effect.
+    require_billing_admin(&mut tx, &org_id, &user.user_id).await?;
 
     // Reuse the org's Stripe customer if one exists, so a cancel/resubscribe doesn't fork billing
     // history; otherwise Checkout creates one and the webhook records it.
     let customer: Option<String> =
         sqlx::query_scalar("SELECT stripe_customer_id FROM organizations WHERE id = $1")
             .bind(&org_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&mut *tx)
             .await?
             .flatten();
 
@@ -243,6 +250,7 @@ async fn create_checkout(
         .provider
         .create_checkout(&org_id, customer.as_deref(), &success_url, &cancel_url)
         .await?;
+    tx.commit().await?;
     Ok(Json(RedirectView { url }))
 }
 
@@ -254,12 +262,15 @@ async fn create_portal(
     Path(org_id): Path<String>,
 ) -> Result<Json<RedirectView>> {
     let billing = billing_config(&state)?;
-    require_billing_admin(&state.pool, &org_id, &user.user_id).await?;
+    let mut tx = state.pool.begin().await?;
+    // Keep the organisation lock through provider session creation so deletion cannot transition
+    // between the lifecycle check and this billing side effect.
+    require_billing_admin(&mut tx, &org_id, &user.user_id).await?;
 
     let customer: Option<String> =
         sqlx::query_scalar("SELECT stripe_customer_id FROM organizations WHERE id = $1")
             .bind(&org_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&mut *tx)
             .await?
             .flatten();
     let customer = customer.ok_or_else(|| {
@@ -270,6 +281,7 @@ async fn create_portal(
         .provider
         .create_portal(&customer, &app_url(&billing.return_url))
         .await?;
+    tx.commit().await?;
     Ok(Json(RedirectView { url }))
 }
 
