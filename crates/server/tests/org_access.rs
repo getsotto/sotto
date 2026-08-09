@@ -444,6 +444,20 @@ async fn deleting_org_keeps_reads_and_freezes_every_org_write() {
     let member = fresh_session(&pool, "acc-life-member", "acc-life-member-s").await;
     seed_org_project(&pool, &owner, o, p, e, "acc-life-owner", "acc-life-member").await;
 
+    let (status, body) = post(
+        &pool,
+        &owner,
+        &format!("/environments/{e}/tokens"),
+        machine_token_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let machine_token = serde_json::from_str::<serde_json::Value>(&body)
+        .expect("machine token response")["token"]
+        .as_str()
+        .expect("raw machine token")
+        .to_string();
+
     sqlx::query("UPDATE organizations SET lifecycle_state = 'deleting' WHERE id = $1")
         .bind(o)
         .execute(&pool)
@@ -471,6 +485,18 @@ async fn deleting_org_keeps_reads_and_freezes_every_org_write() {
             "read route should remain available during retention: {uri}"
         );
     }
+    assert_eq!(
+        request(&pool, "GET", "/machine/grant", Some(&machine_token), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&pool, "GET", "/machine/secrets", Some(&machine_token), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
 
     // Every session-authenticated org write is frozen with the same conflict response.
     let writes = [
