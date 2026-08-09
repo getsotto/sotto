@@ -1,19 +1,19 @@
 //! Resolving a caller's access to a project - and thus its environments and secrets.
 //!
 //! A project is either *personal* (`org_id IS NULL`, governed by `owner_id`) or *org-owned*
-//! (governed by the caller's membership role). A successful resolve means the caller may read and
-//! write secrets - any member is a collaborator. Structural changes (creating projects and
-//! environments) additionally require [`ProjectAccess::can_manage_structure`] (admin+ or the
-//! personal owner). A caller with no access is answered `404`, never leaking that the resource
-//! exists.
+//! (governed by the caller's membership role). A successful resolve always permits reads; active
+//! organisation members may also write secrets, while retention permits reads only. Structural
+//! changes (creating projects and environments) additionally require
+//! [`ProjectAccess::can_manage_structure`] (admin+ or the personal owner). A caller with no access
+//! is answered `404`, never leaking that the resource exists.
 
 use crate::error::{Error, Result};
 use crate::org::{self, LifecycleState, Role};
 use crate::state::AppState;
 use sqlx::{Postgres, Transaction};
 
-/// A resolved grant of access to a project. Merely holding one authorises reads and secret writes;
-/// the methods gate the more privileged operations.
+/// A resolved grant of access to a project. Holding one authorises reads; active organisation
+/// members may write secrets, and the methods gate lifecycle and structural permissions.
 pub(crate) struct ProjectAccess {
     /// The caller is the personal owner of a non-org project.
     is_owner: bool,

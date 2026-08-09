@@ -171,7 +171,7 @@ pub(crate) async fn member_role_of(
     role.map(|r| Role::from_db(&r)).transpose()
 }
 
-/// Resolve a caller's membership and lifecycle state. A missing membership, unknown organisation,
+/// Resolve a caller's membership and lifecycle state. A missing membership, missing organisation,
 /// and deleted organisation all return the same `404` to avoid leaking organisation existence.
 pub(crate) async fn access(pool: &sqlx::PgPool, org_id: &str, user_id: &str) -> Result<OrgAccess> {
     let row: Option<(String, String)> = sqlx::query_as(
