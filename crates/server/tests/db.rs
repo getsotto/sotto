@@ -23,6 +23,13 @@ fn should_run_db_tests(database_url: &str) -> bool {
     true
 }
 
+fn assert_constraint(error: sqlx::Error, expected: &str) {
+    let sqlx::Error::Database(database_error) = error else {
+        panic!("expected PostgreSQL constraint {expected}, got {error}");
+    };
+    assert_eq!(database_error.constraint(), Some(expected));
+}
+
 #[tokio::test]
 async fn migrations_apply_and_user_round_trips() {
     let Ok(database_url) = std::env::var("DATABASE_URL") else {
@@ -118,18 +125,35 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     assert_eq!(lifecycle_state, "active");
     assert!(no_deleted_at);
 
+    // A deleted row cannot retain billing or trial data that a stale webhook could later use.
+    let invalid_tombstone = sqlx::query(
+        "UPDATE organizations SET lifecycle_state = 'deleted', deleted_at = now(), \
+         enc_name = NULL, tier = 'team', trial_ends_at = now(), \
+         stripe_customer_id = 'cus-tombstone', stripe_subscription_id = 'sub-tombstone' \
+         WHERE id = $1",
+    )
+    .bind(org_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(invalid_tombstone, "organizations_lifecycle_tombstone_check");
+
+    // Active rows must retain their encrypted name until the final tombstone transition.
     let invalid_active_name = sqlx::query("UPDATE organizations SET enc_name = NULL WHERE id = $1")
         .bind(org_id)
         .execute(&pool)
         .await;
-    assert!(invalid_active_name.is_err());
+    assert_constraint(
+        invalid_active_name,
+        "organizations_lifecycle_enc_name_check",
+    );
 
+    // Unknown lifecycle states must be rejected rather than treated as active or deleted.
     let invalid_lifecycle =
-        sqlx::query("UPDATE organizations SET lifecycle_state = 'deleted' WHERE id = $1")
+        sqlx::query("UPDATE organizations SET lifecycle_state = 'archived' WHERE id = $1")
             .bind(org_id)
             .execute(&pool)
             .await;
-    assert!(invalid_lifecycle.is_err());
+    assert_constraint(invalid_lifecycle, "organizations_lifecycle_state_check");
 
     sqlx::query(
         "UPDATE organizations SET lifecycle_state = 'deleted', deleted_at = now(), \
@@ -139,8 +163,18 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .execute(&pool)
     .await
     .expect("mark organisation deleted");
-    let (lifecycle_state, has_deleted_at, no_enc_name): (String, bool, bool) = sqlx::query_as(
-        "SELECT lifecycle_state, deleted_at IS NOT NULL, enc_name IS NULL \
+    let (
+        lifecycle_state,
+        has_deleted_at,
+        no_enc_name,
+        no_creator,
+        is_free,
+        no_trial,
+        no_billing_ids,
+    ): (String, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT lifecycle_state, deleted_at IS NOT NULL, enc_name IS NULL, \
+         created_by IS NULL, tier = 'free', trial_ends_at IS NULL, \
+         stripe_customer_id IS NULL AND stripe_subscription_id IS NULL \
          FROM organizations WHERE id = $1",
     )
     .bind(org_id)
@@ -150,13 +184,21 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     assert_eq!(lifecycle_state, "deleted");
     assert!(has_deleted_at);
     assert!(no_enc_name);
+    assert!(no_creator);
+    assert!(is_free);
+    assert!(no_trial);
+    assert!(no_billing_ids);
 
+    // Tombstones cannot regain encrypted names after the purge transition.
     let invalid_deleted_name = sqlx::query("UPDATE organizations SET enc_name = $2 WHERE id = $1")
         .bind(org_id)
         .bind(enc_name.as_slice())
         .execute(&pool)
         .await;
-    assert!(invalid_deleted_name.is_err());
+    assert_constraint(
+        invalid_deleted_name,
+        "organizations_lifecycle_enc_name_check",
+    );
 
     sqlx::query(
         "UPDATE organizations SET lifecycle_state = 'active', deleted_at = NULL, \
@@ -188,6 +230,16 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     assert_eq!(attempt_count, 0);
     assert_eq!(state_version, 0);
 
+    // Expired leases must be discoverable without scanning all deletion history.
+    let lease_index_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+         WHERE schemaname = current_schema() AND indexname = 'organization_deletions_lease_idx')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("check lease index");
+    assert!(lease_index_exists);
+
     sqlx::query(
         "UPDATE organization_deletions SET state = 'failed', resume_state = 'cancelling_billing' \
          WHERE id = $1::uuid",
@@ -197,6 +249,7 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .await
     .expect("record failed operation resume state");
 
+    // Workflow states are a closed set so workers fail closed on a new or misspelled value.
     let invalid_state = sqlx::query(
         "INSERT INTO organization_deletions \
          (id, org_id, state, requested_by, requested_at, purge_after) \
@@ -206,8 +259,9 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .bind(org_id)
     .execute(&pool)
     .await;
-    assert!(invalid_state.is_err());
+    assert_constraint(invalid_state, "organization_deletions_state_check");
 
+    // A cancelled timestamp must not predate the deletion request.
     let invalid_timestamp = sqlx::query(
         "INSERT INTO organization_deletions \
          (id, org_id, state, requested_by, requested_at, purge_after, cancelled_at) \
@@ -218,21 +272,29 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .bind(org_id)
     .execute(&pool)
     .await;
-    assert!(invalid_timestamp.is_err());
+    assert_constraint(
+        invalid_timestamp,
+        "organization_deletions_terminal_timestamp_check",
+    );
 
+    // Operator observations must include an actor, reason, and evidence reference.
     let invalid_observation = sqlx::query(
         "INSERT INTO organization_deletions \
          (id, org_id, state, requested_by, requested_at, purge_after, cancelled_at, \
-          billing_observation_source) \
+          billing_observation_source, billing_observed_by, billing_observation_reason) \
          VALUES ($1::uuid, $2, 'cancelled', 'test-owner', now(), now() + interval '30 days', \
-                 now(), 'operator')",
+                 now(), 'operator', 'operator-1', 'manual check')",
     )
     .bind(invalid_observation_operation_id)
     .bind(org_id)
     .execute(&pool)
     .await;
-    assert!(invalid_observation.is_err());
+    assert_constraint(
+        invalid_observation,
+        "organization_deletions_observation_actor_check",
+    );
 
+    // A lease owner without an expiry cannot be reclaimed safely after a worker crash.
     let invalid_lease = sqlx::query(
         "INSERT INTO organization_deletions \
          (id, org_id, state, requested_by, requested_at, purge_after, cancelled_at, lease_owner) \
@@ -243,8 +305,9 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .bind(org_id)
     .execute(&pool)
     .await;
-    assert!(invalid_lease.is_err());
+    assert_constraint(invalid_lease, "organization_deletions_lease_pair_check");
 
+    // Provider billing results always carry the time of the observation.
     let invalid_billing = sqlx::query(
         "INSERT INTO organization_deletions \
          (id, org_id, state, requested_by, requested_at, purge_after, cancelled_at, \
@@ -256,7 +319,10 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .bind(org_id)
     .execute(&pool)
     .await;
-    assert!(invalid_billing.is_err());
+    assert_constraint(
+        invalid_billing,
+        "organization_deletions_billing_result_pair_check",
+    );
 
     let duplicate_active = sqlx::query(
         "INSERT INTO organization_deletions \
@@ -268,7 +334,7 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .bind(org_id)
     .execute(&pool)
     .await;
-    assert!(duplicate_active.is_err());
+    assert_constraint(duplicate_active, "organization_deletions_active_org_idx");
 
     sqlx::query(
         "INSERT INTO organization_deletions \
@@ -298,9 +364,10 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
         "INSERT INTO organization_deletions \
          (id, org_id, state, requested_by, requested_at, purge_after, cancelled_at, \
           billing_observation_source, last_billing_state, billing_checked_at, \
-          billing_observed_by, billing_observation_reason) \
+          billing_observed_by, billing_observation_reason, billing_observation_evidence) \
          VALUES ($1::uuid, $2, 'cancelled', 'test-owner', now(), now() + interval '30 days', \
-                 now(), 'operator', 'missing', now(), 'operator-1', 'verified in Workbench')",
+                 now(), 'operator', 'missing', now(), 'operator-1', 'verified in Workbench', \
+                 'https://dashboard.stripe.com/test/workbench/evt_123')",
     )
     .bind(operator_operation_id)
     .bind(org_id)
@@ -308,6 +375,7 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .await
     .expect("record an operator observation");
 
+    // A completed operation must record when the purge finished.
     let invalid_completed = sqlx::query(
         "INSERT INTO organization_deletions \
          (id, org_id, state, requested_by, requested_at, purge_after) \
@@ -317,7 +385,10 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .bind(org_id)
     .execute(&pool)
     .await;
-    assert!(invalid_completed.is_err());
+    assert_constraint(
+        invalid_completed,
+        "organization_deletions_completed_timestamp_check",
+    );
 
     sqlx::query(
         "INSERT INTO organization_deletions \
