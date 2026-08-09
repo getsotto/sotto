@@ -401,6 +401,168 @@ async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     .await
     .expect("record completed operation");
 
+    // The retry, retention, and lease indexes cover every class of due work.
+    let due_index_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema() \
+         AND indexname IN ('organization_deletions_retry_idx', \
+                           'organization_deletions_retention_idx', \
+                           'organization_deletions_lease_idx')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("check deletion indexes");
+    assert_eq!(due_index_count, 3);
+
+    // Derived deadlines cannot move before their source timestamps.
+    let invalid_purge_after = sqlx::query(
+        "UPDATE organization_deletions SET purge_after = requested_at - interval '1 second' \
+         WHERE id = $1::uuid",
+    )
+    .bind(completed_operation_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(
+        invalid_purge_after,
+        "organization_deletions_purge_after_check",
+    );
+
+    let invalid_backup_expiry = sqlx::query(
+        "UPDATE organization_deletions SET managed_backup_expiry_by = requested_at \
+         WHERE id = $1::uuid",
+    )
+    .bind(completed_operation_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(
+        invalid_backup_expiry,
+        "organization_deletions_backup_expiry_check",
+    );
+
+    let invalid_billing_timestamp = sqlx::query(
+        "UPDATE organization_deletions SET billing_checked_at = requested_at - interval '1 second', \
+         last_billing_state = 'terminal' WHERE id = $1::uuid",
+    )
+    .bind(completed_operation_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(
+        invalid_billing_timestamp,
+        "organization_deletions_billing_checked_at_check",
+    );
+
+    let invalid_lease_expiry = sqlx::query(
+        "UPDATE organization_deletions SET lease_owner = 'worker-1', \
+         lease_expires_at = requested_at - interval '1 second' WHERE id = $1::uuid",
+    )
+    .bind(completed_operation_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(
+        invalid_lease_expiry,
+        "organization_deletions_lease_expires_at_check",
+    );
+
+    let invalid_next_attempt = sqlx::query(
+        "UPDATE organization_deletions SET next_attempt_at = requested_at - interval '1 second' \
+         WHERE id = $1::uuid",
+    )
+    .bind(completed_operation_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(
+        invalid_next_attempt,
+        "organization_deletions_next_attempt_at_check",
+    );
+
+    // Retry counters and optimistic-concurrency versions cannot be negative.
+    let invalid_attempt_count =
+        sqlx::query("UPDATE organization_deletions SET attempt_count = -1 WHERE id = $1::uuid")
+            .bind(completed_operation_id)
+            .execute(&pool)
+            .await;
+    assert_constraint(
+        invalid_attempt_count,
+        "organization_deletions_attempt_count_check",
+    );
+
+    let invalid_state_version =
+        sqlx::query("UPDATE organization_deletions SET state_version = -1 WHERE id = $1::uuid")
+            .bind(completed_operation_id)
+            .execute(&pool)
+            .await;
+    assert_constraint(
+        invalid_state_version,
+        "organization_deletions_state_version_check",
+    );
+
+    // Enum fields reject values that the worker does not know how to reconcile.
+    let invalid_resume_state = sqlx::query(
+        "UPDATE organization_deletions SET resume_state = 'future' WHERE id = $1::uuid",
+    )
+    .bind(completed_operation_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(
+        invalid_resume_state,
+        "organization_deletions_resume_state_check",
+    );
+
+    let invalid_billing_state = sqlx::query(
+        "UPDATE organization_deletions SET last_billing_state = 'future', \
+         billing_checked_at = now() WHERE id = $1::uuid",
+    )
+    .bind(completed_operation_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(
+        invalid_billing_state,
+        "organization_deletions_last_billing_state_check",
+    );
+
+    let invalid_observation_source = sqlx::query(
+        "UPDATE organization_deletions SET billing_observation_source = 'future', \
+         last_billing_state = 'terminal', billing_checked_at = now() WHERE id = $1::uuid",
+    )
+    .bind(completed_operation_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(
+        invalid_observation_source,
+        "organization_deletions_billing_observation_source_check",
+    );
+
+    // A provider observation must include the result fields as one atomic record.
+    let invalid_observation_result = sqlx::query(
+        "UPDATE organization_deletions SET billing_observation_source = 'provider', \
+         last_billing_state = NULL, billing_checked_at = NULL WHERE id = $1::uuid",
+    )
+    .bind(completed_operation_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(
+        invalid_observation_result,
+        "organization_deletions_observation_result_check",
+    );
+
+    let invalid_completed_timestamp = sqlx::query(
+        "UPDATE organization_deletions SET completed_at = requested_at - interval '1 second' \
+         WHERE id = $1::uuid",
+    )
+    .bind(completed_operation_id)
+    .execute(&pool)
+    .await;
+    assert_constraint(
+        invalid_completed_timestamp,
+        "organization_deletions_completed_timestamp_check",
+    );
+
+    // Deletion history keeps the organisation tombstone addressable, so the foreign key is RESTRICT.
+    let invalid_organisation_delete = sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await;
+    assert_constraint(invalid_organisation_delete, "organization_deletions_org_fk");
+
     sqlx::query("DELETE FROM organization_deletions WHERE org_id = $1")
         .bind(org_id)
         .execute(&pool)
