@@ -10,6 +10,11 @@ ALTER TABLE organizations
         CHECK (
             (lifecycle_state = 'deleted' AND deleted_at IS NOT NULL)
             OR (lifecycle_state <> 'deleted' AND deleted_at IS NULL)
+        ),
+    ADD CONSTRAINT organizations_lifecycle_enc_name_check
+        CHECK (
+            (lifecycle_state = 'deleted' AND enc_name IS NULL)
+            OR (lifecycle_state <> 'deleted' AND enc_name IS NOT NULL)
         );
 
 -- A deleted organisation is a tombstone, so its encrypted name is cleared at final purge.
