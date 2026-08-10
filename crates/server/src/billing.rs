@@ -209,12 +209,12 @@ async fn require_billing_admin(
 ) -> Result<()> {
     let access = org::access_for_update(tx, org_id, user_id).await?;
     access.require_write()?;
-    match access.role() {
-        role if role.can_manage_members() => Ok(()),
-        _ => Err(Error::Forbidden(
+    if !access.role().can_manage_members() {
+        return Err(Error::Forbidden(
             "managing billing requires the admin or owner role".into(),
-        )),
+        ));
     }
+    Ok(())
 }
 
 /// A provider-hosted page for the browser to navigate to.
