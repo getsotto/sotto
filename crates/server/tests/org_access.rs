@@ -29,12 +29,21 @@ fn app(pool: PgPool) -> Router {
         pool,
         oauth: None,
         oauth_config: None,
-        billing: None,
+        billing: Some(sotto_server::billing::BillingState::from_config(
+            sotto_server::config::BillingConfig {
+                secret_key: "sk_test_never_called".into(),
+                webhook_secret: "whsec_test".into(),
+                price_id: "price_test".into(),
+                return_url: "https://app.sotto.test".into(),
+            },
+        )),
     };
     Router::new()
+        .merge(sotto_server::account::router())
         .merge(sotto_server::org::router())
         .merge(sotto_server::audit::router())
         .merge(sotto_server::entitlements::router())
+        .merge(sotto_server::billing::router())
         .merge(sotto_server::machine::router())
         .merge(sotto_server::sync::router())
         .with_state(state)
@@ -163,6 +172,16 @@ fn machine_token_body() -> String {
         r#"{{"name":"ci","public_key":"{}","enc_vault_key":"{}"}}"#,
         b64(&[7; 32]),
         b64(b"vault-key")
+    )
+}
+
+fn account_bundle_body(tag: &str) -> String {
+    format!(
+        r#"{{"public_key":"{}","enc_private_keys":"{}","kdf_params":"{}","recovery_blob":"{}"}}"#,
+        b64(&[0xAB; 32]),
+        b64(format!("{tag}-private").as_bytes()),
+        b64(format!("{tag}-kdf").as_bytes()),
+        b64(format!("{tag}-recovery").as_bytes()),
     )
 }
 
@@ -498,8 +517,15 @@ async fn deleting_org_keeps_reads_and_freezes_every_org_write() {
         StatusCode::OK
     );
 
+    // Keep this explicit inventory beside the merged routers: every new organisation-scoped
+    // mutation must add a case here so an omitted lifecycle guard is visible in review.
     // Every session-authenticated org write is frozen with the same conflict response.
     let writes = [
+        (
+            "POST",
+            "/account/reset".into(),
+            account_bundle_body("lifecycle-reset"),
+        ),
         (
             "POST",
             format!("/orgs/{o}/members"),
@@ -523,6 +549,16 @@ async fn deleting_org_keeps_reads_and_freezes_every_org_write() {
         (
             "DELETE",
             format!("/orgs/{o}/members/acc-life-member"),
+            String::new(),
+        ),
+        (
+            "POST",
+            format!("/orgs/{o}/billing/checkout"),
+            String::new(),
+        ),
+        (
+            "POST",
+            format!("/orgs/{o}/billing/portal"),
             String::new(),
         ),
         (

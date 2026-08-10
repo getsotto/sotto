@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit;
 use crate::auth::AuthUser;
 use crate::error::{Error, Result};
+use crate::org::LifecycleState;
 use crate::state::AppState;
 
 /// Row shape for the four account blobs: `(public_key, enc_private_keys, kdf_params, recovery_blob)`.
@@ -113,6 +114,19 @@ async fn reset_account(
     let recovery_blob = decode(&bundle.recovery_blob, "recovery_blob")?;
 
     let mut tx = state.pool.begin().await?;
+    // Reset changes grants and organisation keys for every membership, so lock each organisation
+    // and apply the same lifecycle write gate before changing any account material.
+    let org_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT o.id, o.lifecycle_state \
+         FROM organizations o JOIN organization_memberships m ON m.org_id = o.id \
+         WHERE m.user_id = $1 FOR UPDATE OF o",
+    )
+    .bind(&user.user_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (_, lifecycle) in &org_rows {
+        LifecycleState::from_db(lifecycle)?.require_write()?;
+    }
     let reset: Option<String> = sqlx::query_scalar(
         "UPDATE users \
          SET public_key = $2, enc_private_keys = $3, kdf_params = $4, recovery_blob = $5 \
@@ -143,12 +157,7 @@ async fn reset_account(
         .await?;
     // Surface the reset in every org the user belongs to: their grants just vanished, and admins
     // need to know to re-grant.
-    let orgs: Vec<String> =
-        sqlx::query_scalar("SELECT org_id FROM organization_memberships WHERE user_id = $1")
-            .bind(&user.user_id)
-            .fetch_all(&mut *tx)
-            .await?;
-    for org in &orgs {
+    for (org, _) in &org_rows {
         audit::record_tx(
             &mut tx,
             org,
