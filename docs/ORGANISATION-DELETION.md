@@ -411,8 +411,11 @@ ordinary access resolves as not found.
 - The partial unique index and locked organisation row make simultaneous initial requests converge
   on one active operation.
 - Workers claim due rows with `FOR UPDATE SKIP LOCKED`, a bounded lease, and a unique worker ID.
-- No database lock is held during a Stripe network call. The worker records the expected
-  `state_version`, calls the provider, then applies a compare-and-set transition.
+- Deletion workers do not hold a database lock during a Stripe network call. They record the
+  expected `state_version`, call the provider, then apply a compare-and-set transition. The
+  user-facing checkout and portal session calls are the deliberate bounded exception: they keep
+  the organisation row lock while Stripe responds so a deletion transition cannot race the billing
+  side effect. That briefly pins a pool connection and serialises writes for that organisation.
 - A lost worker can be replaced after its lease expires. A late worker result with an old version
   is discarded.
 - Provider cancellation is invoked idempotently and status is reconciled afterwards.

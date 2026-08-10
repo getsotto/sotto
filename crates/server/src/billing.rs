@@ -233,7 +233,9 @@ async fn create_checkout(
     let billing = billing_config(&state)?;
     let mut tx = state.pool.begin().await?;
     // Keep the organisation lock through provider session creation so deletion cannot transition
-    // between the lifecycle check and this billing side effect.
+    // between the lifecycle check and this billing side effect. The bounded provider timeout
+    // briefly pins a pool connection and serialises this organisation's writes; that is the
+    // deliberate trade-off for closing the race.
     require_billing_admin(&mut tx, &org_id, &user.user_id).await?;
 
     // Reuse the org's Stripe customer if one exists, so a cancel/resubscribe doesn't fork billing
@@ -264,7 +266,9 @@ async fn create_portal(
     let billing = billing_config(&state)?;
     let mut tx = state.pool.begin().await?;
     // Keep the organisation lock through provider session creation so deletion cannot transition
-    // between the lifecycle check and this billing side effect.
+    // between the lifecycle check and this billing side effect. The bounded provider timeout
+    // briefly pins a pool connection and serialises this organisation's writes; that is the
+    // deliberate trade-off for closing the race.
     require_billing_admin(&mut tx, &org_id, &user.user_id).await?;
 
     let customer: Option<String> =
