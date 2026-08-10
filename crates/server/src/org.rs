@@ -56,62 +56,6 @@ pub enum Role {
     Member,
 }
 
-/// The lifecycle state that governs ordinary organisation access.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LifecycleState {
-    Active,
-    Deleting,
-    Deleted,
-}
-
-impl LifecycleState {
-    /// Parse a lifecycle state from its stored text. Unknown values fail closed because they mean
-    /// the application and database schema disagree about whether access is safe.
-    pub(crate) fn from_db(s: &str) -> Result<Self> {
-        match s {
-            "active" => Ok(Self::Active),
-            "deleting" => Ok(Self::Deleting),
-            "deleted" => Ok(Self::Deleted),
-            other => Err(Error::Config(format!(
-                "unknown organisation lifecycle state in db: {other}"
-            ))),
-        }
-    }
-
-    /// Require an organisation to accept a user-scoped write.
-    pub(crate) fn require_write(self) -> Result<()> {
-        match self {
-            Self::Active => Ok(()),
-            Self::Deleting => Err(Error::Conflict(
-                "organisation deletion is in progress".into(),
-            )),
-            Self::Deleted => Err(Error::NotFound("organisation not found".into())),
-        }
-    }
-}
-
-/// A caller's role together with the lifecycle state of the organisation they reached.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OrgAccess {
-    role: Role,
-    lifecycle: LifecycleState,
-}
-
-impl OrgAccess {
-    pub(crate) fn role(self) -> Role {
-        self.role
-    }
-
-    pub(crate) fn lifecycle(self) -> LifecycleState {
-        self.lifecycle
-    }
-
-    /// Reject a user-scoped organisation write while retaining reads during deletion.
-    pub(crate) fn require_write(self) -> Result<()> {
-        self.lifecycle.require_write()
-    }
-}
-
 impl Role {
     fn as_str(self) -> &'static str {
         match self {
@@ -151,6 +95,64 @@ impl Role {
     /// Whether this role may add, update, or remove members (owners and admins may; members may not).
     pub(crate) fn can_manage_members(self) -> bool {
         self.is_at_least(Role::Admin)
+    }
+}
+
+/// The lifecycle state that governs ordinary organisation access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LifecycleState {
+    Active,
+    Deleting,
+    Deleted,
+}
+
+impl LifecycleState {
+    /// Parse a lifecycle state from its stored text. Unknown values fail closed because they mean
+    /// the application and database schema disagree about whether access is safe.
+    pub(crate) fn from_db(s: &str) -> Result<Self> {
+        match s {
+            "active" => Ok(Self::Active),
+            "deleting" => Ok(Self::Deleting),
+            "deleted" => Ok(Self::Deleted),
+            other => Err(Error::Config(format!(
+                "unknown organisation lifecycle state in db: {other}"
+            ))),
+        }
+    }
+
+    /// Require an organisation to accept a user-scoped write.
+    pub(crate) fn require_write(self) -> Result<()> {
+        match self {
+            Self::Active => Ok(()),
+            // Members need a retryable conflict while retention is active; a deleted tombstone is
+            // deliberately hidden behind the same not-found response as any missing organisation.
+            Self::Deleting => Err(Error::Conflict(
+                "organisation deletion is in progress".into(),
+            )),
+            Self::Deleted => Err(Error::NotFound("organisation not found".into())),
+        }
+    }
+}
+
+/// A caller's role together with the lifecycle state of the organisation they reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OrgAccess {
+    role: Role,
+    lifecycle: LifecycleState,
+}
+
+impl OrgAccess {
+    pub(crate) fn role(self) -> Role {
+        self.role
+    }
+
+    pub(crate) fn lifecycle(self) -> LifecycleState {
+        self.lifecycle
+    }
+
+    /// Reject a user-scoped organisation write while retaining reads during deletion.
+    pub(crate) fn require_write(self) -> Result<()> {
+        self.lifecycle.require_write()
     }
 }
 
@@ -512,6 +514,8 @@ async fn add_member(
     // and the insert are atomic against concurrent adds; a failed audit can't leave an un-logged
     // member either.
     let mut tx = state.pool.begin().await?;
+    // Recheck under the organisation lock: the initial role lookup may become stale while this
+    // request waits, so the current role must authorise the mutation too.
     let locked = access_for_update(&mut tx, &org_id, &user.user_id).await?;
     locked.require_write()?;
     let caller = locked.role();
@@ -598,6 +602,8 @@ async fn invite_member(
     // and the insert are atomic against concurrent invites; a failed audit can't leave an un-logged
     // member either.
     let mut tx = state.pool.begin().await?;
+    // Recheck under the organisation lock: the initial role lookup may become stale while this
+    // request waits, so the current role must authorise the mutation too.
     let locked = access_for_update(&mut tx, &org_id, &user.user_id).await?;
     locked.require_write()?;
     if !locked.role().can_manage_members() {
@@ -689,6 +695,8 @@ async fn update_member(
     // Lock the org's owner set for the rest of the transaction so the last-owner guard and the
     // write commit atomically; two owners demoting each other concurrently serialise here.
     let mut tx = state.pool.begin().await?;
+    // Recheck under the organisation lock: a concurrent demotion must not leave a stale admin
+    // authorised to change another member's role.
     let locked = access_for_update(&mut tx, &org_id, &user.user_id).await?;
     locked.require_write()?;
     let caller = locked.role();
@@ -749,6 +757,8 @@ async fn remove_member(
     // Lock the org's owner set for the rest of the transaction so the last-owner guard and the
     // delete commit atomically; two owners removing each other concurrently serialise here.
     let mut tx = state.pool.begin().await?;
+    // Recheck under the organisation lock: a concurrent demotion must not leave a stale admin
+    // authorised to remove another member.
     let locked = access_for_update(&mut tx, &org_id, &user.user_id).await?;
     locked.require_write()?;
     let caller = locked.role();
