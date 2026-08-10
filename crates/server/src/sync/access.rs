@@ -62,7 +62,7 @@ impl ProjectAccess {
             let access = org::access_for_update(tx, org_id, &self.user_id)
                 .await
                 .map_err(map_project_access_error)?;
-            access.require_write()?;
+            access.require_write().map_err(map_project_access_error)?;
         }
         Ok(())
     }
@@ -77,7 +77,7 @@ impl ProjectAccess {
             let access = org::access_for_update(tx, org_id, &self.user_id)
                 .await
                 .map_err(map_project_access_error)?;
-            access.require_write()?;
+            access.require_write().map_err(map_project_access_error)?;
             if !access.role().is_at_least(Role::Admin) {
                 return Err(Error::Forbidden(message.into()));
             }
