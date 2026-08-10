@@ -511,6 +511,8 @@ async fn deleting_org_keeps_reads_and_freezes_every_org_write() {
 
     // Keep this explicit inventory beside the merged routers: every new organisation-scoped
     // mutation must add a case here so an omitted lifecycle guard is visible in review.
+    // User-only account initialisation, share links, and provider/webhook routes are outside this
+    // lifecycle gate and are intentionally not listed.
     // Every session-authenticated org write is frozen with the same conflict response.
     let writes = [
         (
