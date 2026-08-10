@@ -6,7 +6,6 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use sqlx::PgPool;
@@ -38,15 +37,7 @@ fn app(pool: PgPool) -> Router {
             },
         )),
     };
-    Router::new()
-        .merge(sotto_server::account::router())
-        .merge(sotto_server::org::router())
-        .merge(sotto_server::audit::router())
-        .merge(sotto_server::entitlements::router())
-        .merge(sotto_server::billing::router())
-        .merge(sotto_server::machine::router())
-        .merge(sotto_server::sync::router())
-        .with_state(state)
+    sotto_server::app(state)
 }
 
 async fn reset_orgs(pool: &PgPool, orgs: &[&str]) {
