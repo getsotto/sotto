@@ -246,7 +246,9 @@ async fn rotate(
 
     // Every grantee must be a distinct member of that org - the same rule `create_grant` enforces.
     // The membership set is checked again inside the locked transaction below so a concurrent
-    // removal cannot make this rotation recreate a former member's grant.
+    // removal cannot make this rotation recreate a former member's grant. The duplicate check
+    // remains outside the transaction because a repeated user_id would otherwise trip the
+    // environment_grants primary key mid-transaction and surface as a 500 instead of a clean 400.
     let mut seen: HashSet<&str> = HashSet::with_capacity(req.grants.len());
     for g in &req.grants {
         if !seen.insert(g.user_id.as_str()) {
