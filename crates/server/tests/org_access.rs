@@ -551,16 +551,8 @@ async fn deleting_org_keeps_reads_and_freezes_every_org_write() {
             format!("/orgs/{o}/members/acc-life-member"),
             String::new(),
         ),
-        (
-            "POST",
-            format!("/orgs/{o}/billing/checkout"),
-            String::new(),
-        ),
-        (
-            "POST",
-            format!("/orgs/{o}/billing/portal"),
-            String::new(),
-        ),
+        ("POST", format!("/orgs/{o}/billing/checkout"), String::new()),
+        ("POST", format!("/orgs/{o}/billing/portal"), String::new()),
         (
             "POST",
             "/projects".into(),
