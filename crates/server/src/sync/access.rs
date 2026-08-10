@@ -59,9 +59,10 @@ impl ProjectAccess {
     /// Recheck membership and lifecycle while holding the organisation lock for a write.
     pub(crate) async fn require_write_tx(&self, tx: &mut Transaction<'_, Postgres>) -> Result<()> {
         if let Some(org_id) = &self.org_id {
-            org::access_for_update(tx, org_id, &self.user_id)
-                .await?
-                .require_write()?;
+            let access = org::access_for_update(tx, org_id, &self.user_id)
+                .await
+                .map_err(map_project_access_error)?;
+            access.require_write()?;
         }
         Ok(())
     }
@@ -73,7 +74,9 @@ impl ProjectAccess {
         message: &str,
     ) -> Result<()> {
         if let Some(org_id) = &self.org_id {
-            let access = org::access_for_update(tx, org_id, &self.user_id).await?;
+            let access = org::access_for_update(tx, org_id, &self.user_id)
+                .await
+                .map_err(map_project_access_error)?;
             access.require_write()?;
             if !access.role().is_at_least(Role::Admin) {
                 return Err(Error::Forbidden(message.into()));
@@ -82,6 +85,13 @@ impl ProjectAccess {
             return Err(Error::Forbidden(message.into()));
         }
         Ok(())
+    }
+}
+
+fn map_project_access_error(error: Error) -> Error {
+    match error {
+        Error::NotFound(_) => Error::NotFound("project not found".into()),
+        other => other,
     }
 }
 
