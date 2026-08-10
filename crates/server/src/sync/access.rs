@@ -1,18 +1,19 @@
 //! Resolving a caller's access to a project - and thus its environments and secrets.
 //!
 //! A project is either *personal* (`org_id IS NULL`, governed by `owner_id`) or *org-owned*
-//! (governed by the caller's membership role). A successful resolve means the caller may read and
-//! write secrets - any member is a collaborator. Structural changes (creating projects and
-//! environments) additionally require [`ProjectAccess::can_manage_structure`] (admin+ or the
-//! personal owner). A caller with no access is answered `404`, never leaking that the resource
-//! exists.
+//! (governed by the caller's membership role). A successful resolve always permits reads; active
+//! organisation members may also write secrets, while retention permits reads only. Structural
+//! changes (creating projects and environments) additionally require
+//! [`ProjectAccess::can_manage_structure`] (admin+ or the personal owner). A caller with no access
+//! is answered `404`, never leaking that the resource exists.
 
 use crate::error::{Error, Result};
-use crate::org::{self, Role};
+use crate::org::{self, LifecycleState, Role};
 use crate::state::AppState;
+use sqlx::{Postgres, Transaction};
 
-/// A resolved grant of access to a project. Merely holding one authorises reads and secret writes;
-/// the methods gate the more privileged operations.
+/// A resolved grant of access to a project. Holding one authorises reads; active organisation
+/// members may write secrets, and the methods gate lifecycle and structural permissions.
 pub(crate) struct ProjectAccess {
     /// The caller is the personal owner of a non-org project.
     is_owner: bool,
@@ -20,6 +21,10 @@ pub(crate) struct ProjectAccess {
     org_role: Option<Role>,
     /// The owning org, for an org project (carried so callers - e.g. audit logging - don't re-query).
     org_id: Option<String>,
+    /// The owning organisation's lifecycle state, when this is an org project.
+    org_lifecycle: Option<LifecycleState>,
+    /// The caller whose membership was resolved.
+    user_id: String,
 }
 
 impl ProjectAccess {
@@ -32,6 +37,61 @@ impl ProjectAccess {
     /// The owning organisation's id, or `None` for a personal project.
     pub(crate) fn org_id(&self) -> Option<&str> {
         self.org_id.as_deref()
+    }
+
+    /// Reject a write to a project or environment while its organisation is being deleted.
+    pub(crate) fn require_write(&self) -> Result<()> {
+        if let Some(lifecycle) = self.org_lifecycle {
+            lifecycle.require_write()?
+        }
+        Ok(())
+    }
+
+    /// Require both a live organisation and the admin/owner role for a structural mutation.
+    pub(crate) fn require_manage_structure(&self, message: &str) -> Result<()> {
+        self.require_write()?;
+        if !self.can_manage_structure() {
+            return Err(Error::Forbidden(message.into()));
+        }
+        Ok(())
+    }
+
+    /// Recheck membership and lifecycle while holding the organisation lock for a write.
+    pub(crate) async fn require_write_tx(&self, tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+        if let Some(org_id) = &self.org_id {
+            let access = org::access_for_update(tx, org_id, &self.user_id)
+                .await
+                .map_err(map_project_access_error)?;
+            access.require_write().map_err(map_project_access_error)?;
+        }
+        Ok(())
+    }
+
+    /// Recheck the admin/owner role and lifecycle while holding the organisation lock.
+    pub(crate) async fn require_manage_structure_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        message: &str,
+    ) -> Result<()> {
+        if let Some(org_id) = &self.org_id {
+            let access = org::access_for_update(tx, org_id, &self.user_id)
+                .await
+                .map_err(map_project_access_error)?;
+            access.require_write().map_err(map_project_access_error)?;
+            if !access.role().is_at_least(Role::Admin) {
+                return Err(Error::Forbidden(message.into()));
+            }
+        } else if !self.can_manage_structure() {
+            return Err(Error::Forbidden(message.into()));
+        }
+        Ok(())
+    }
+}
+
+fn map_project_access_error(error: Error) -> Error {
+    match error {
+        Error::NotFound(_) => Error::NotFound("project not found".into()),
+        other => other,
     }
 }
 
@@ -55,16 +115,21 @@ pub(crate) async fn project_access(
             is_owner: true,
             org_role: None,
             org_id: None,
+            org_lifecycle: None,
+            user_id: user_id.to_string(),
         }),
         None => Err(Error::NotFound("project not found".into())),
         // Org project: authority is the caller's membership role, not `owner_id`.
-        Some(org) => match org::role_of(&state.pool, &org, user_id).await? {
-            Some(role) => Ok(ProjectAccess {
+        Some(org) => match org::access(&state.pool, &org, user_id).await {
+            Ok(org_access) => Ok(ProjectAccess {
                 is_owner: false,
-                org_role: Some(role),
+                org_role: Some(org_access.role()),
                 org_id: Some(org),
+                org_lifecycle: Some(org_access.lifecycle()),
+                user_id: user_id.to_string(),
             }),
-            None => Err(Error::NotFound("project not found".into())),
+            Err(Error::NotFound(_)) => Err(Error::NotFound("project not found".into())),
+            Err(error) => Err(error),
         },
     }
 }

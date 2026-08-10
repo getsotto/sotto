@@ -176,6 +176,32 @@ async fn billing_endpoints_are_503_when_unconfigured() {
 }
 
 #[tokio::test]
+async fn billing_writes_are_frozen_during_organisation_deletion() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let org_id = "billing-org-deleting";
+    let user_id = "billing-user-deleting";
+    let token = seed_user(&pool, user_id).await;
+    seed_org(&pool, org_id, "team", user_id, "owner").await;
+    sqlx::query("UPDATE organizations SET lifecycle_state = 'deleting' WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("mark org deleting");
+    let app = app(pool, true);
+
+    assert_eq!(
+        post_authed(&app, &format!("/orgs/{org_id}/billing/checkout"), &token,).await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        post_authed(&app, &format!("/orgs/{org_id}/billing/portal"), &token,).await,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
 async fn webhook_rejects_missing_and_invalid_signatures() {
     let Some(pool) = pool_or_skip().await else {
         return;

@@ -66,15 +66,16 @@ pub async fn require_team(pool: &PgPool, org_id: &str, feature: &str) -> Result<
 /// Resolve the effective tier inside `tx`, taking a `FOR UPDATE` lock on the org row so a quota
 /// check and the write it guards are atomic against concurrent quota-affecting writes on the org.
 async fn effective_tier_locked(tx: &mut Transaction<'_, Postgres>, org_id: &str) -> Result<Tier> {
-    let row: Option<(String, bool)> = sqlx::query_as(
-        "SELECT tier, (trial_ends_at IS NOT NULL AND trial_ends_at > now()) \
+    let row: Option<(String, bool, String)> = sqlx::query_as(
+        "SELECT tier, (trial_ends_at IS NOT NULL AND trial_ends_at > now()), lifecycle_state \
          FROM organizations WHERE id = $1 FOR UPDATE",
     )
     .bind(org_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let (tier, trial_active) =
+    let (tier, trial_active, lifecycle) =
         row.ok_or_else(|| Error::NotFound("organisation not found".into()))?;
+    crate::org::LifecycleState::from_db(&lifecycle)?.require_write()?;
     if tier == "team" || trial_active {
         Ok(Tier::Team)
     } else {
@@ -162,12 +163,7 @@ async fn get_entitlements(
     user: AuthUser,
     Path(org_id): Path<String>,
 ) -> Result<Json<EntitlementsView>> {
-    if org::role_of(&state.pool, &org_id, &user.user_id)
-        .await?
-        .is_none()
-    {
-        return Err(Error::NotFound("organisation not found".into()));
-    }
+    org::access(&state.pool, &org_id, &user.user_id).await?;
 
     let (tier, trial_ends_at): (String, Option<String>) = sqlx::query_as(
         // `AT TIME ZONE 'UTC'` normalises the timestamptz to UTC before formatting, so the trailing

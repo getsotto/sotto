@@ -29,12 +29,16 @@ fn app(pool: PgPool) -> Router {
         pool,
         oauth: None,
         oauth_config: None,
-        billing: None,
+        billing: Some(sotto_server::billing::BillingState::from_config(
+            sotto_server::config::BillingConfig {
+                secret_key: "sk_test_never_called".into(),
+                webhook_secret: "whsec_test".into(),
+                price_id: "price_test".into(),
+                return_url: "https://app.sotto.test".into(),
+            },
+        )),
     };
-    Router::new()
-        .merge(sotto_server::org::router())
-        .merge(sotto_server::sync::router())
-        .with_state(state)
+    sotto_server::app(state)
 }
 
 async fn reset_orgs(pool: &PgPool, orgs: &[&str]) {
@@ -141,6 +145,35 @@ fn set_body(base: i64, secret_id: &str, version: i64) -> String {
         b64(b"name"),
         b64(b"value"),
         b64(b"data-key"),
+    )
+}
+
+fn grant_body(user_id: &str) -> String {
+    format!(
+        r#"{{"user_id":"{user_id}","enc_vault_key":"{}"}}"#,
+        b64(b"vault-key")
+    )
+}
+
+fn rotate_body() -> String {
+    r#"{"base_revision":0,"grants":[],"data_keys":[]}"#.into()
+}
+
+fn machine_token_body() -> String {
+    format!(
+        r#"{{"name":"ci","public_key":"{}","enc_vault_key":"{}"}}"#,
+        b64(&[7; 32]),
+        b64(b"vault-key")
+    )
+}
+
+fn account_bundle_body(tag: &str) -> String {
+    format!(
+        r#"{{"public_key":"{}","enc_private_keys":"{}","kdf_params":"{}","recovery_blob":"{}"}}"#,
+        b64(&[0xAB; 32]),
+        b64(format!("{tag}-private").as_bytes()),
+        b64(format!("{tag}-kdf").as_bytes()),
+        b64(format!("{tag}-recovery").as_bytes()),
     )
 }
 
@@ -407,6 +440,225 @@ async fn personal_projects_stay_owner_only() {
         get(&pool, &other, &format!("/environments/{e}/secrets"))
             .await
             .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn deleting_org_keeps_reads_and_freezes_every_org_write() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("acc-life-o", "acc-life-p", "acc-life-e");
+    reset_orgs(&pool, &[o]).await;
+    let owner = fresh_session(&pool, "acc-life-owner", "acc-life-owner-s").await;
+    let member = fresh_session(&pool, "acc-life-member", "acc-life-member-s").await;
+    seed_org_project(&pool, &owner, o, p, e, "acc-life-owner", "acc-life-member").await;
+
+    let (status, body) = post(
+        &pool,
+        &owner,
+        &format!("/environments/{e}/tokens"),
+        machine_token_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let machine_token = serde_json::from_str::<serde_json::Value>(&body)
+        .expect("machine token response")["token"]
+        .as_str()
+        .expect("raw machine token")
+        .to_string();
+
+    sqlx::query("UPDATE organizations SET lifecycle_state = 'deleting' WHERE id = $1")
+        .bind(o)
+        .execute(&pool)
+        .await
+        .expect("mark org deleting");
+
+    // Retention is readable so an owner can inspect and recover the organisation.
+    for uri in [
+        "/orgs",
+        "/projects",
+        &format!("/projects/{p}/environments"),
+        &format!("/environments/{e}/secrets"),
+        &format!("/environments/{e}/history"),
+        &format!("/environments/{e}/grants"),
+        &format!("/environments/{e}/grant"),
+        &format!("/orgs/{o}/members"),
+        &format!("/orgs/{o}/members/acc-life-member/grants"),
+        &format!("/orgs/{o}/entitlements"),
+        &format!("/orgs/{o}/audit"),
+        &format!("/environments/{e}/tokens"),
+    ] {
+        assert_eq!(
+            get(&pool, &owner, uri).await.0,
+            StatusCode::OK,
+            "read route should remain available during retention: {uri}"
+        );
+    }
+    assert_eq!(
+        request(&pool, "GET", "/machine/grant", Some(&machine_token), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&pool, "GET", "/machine/secrets", Some(&machine_token), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    // Keep this explicit inventory beside the merged routers: every new organisation-scoped
+    // mutation must add a case here so an omitted lifecycle guard is visible in review.
+    // User-only account initialisation, share links, and provider/webhook routes are outside this
+    // lifecycle gate and are intentionally not listed.
+    // Every session-authenticated org write is frozen with the same conflict response.
+    let writes = [
+        (
+            "POST",
+            "/account/reset".into(),
+            account_bundle_body("lifecycle-reset"),
+        ),
+        (
+            "POST",
+            format!("/orgs/{o}/members"),
+            member_body("acc-life-new", "member"),
+        ),
+        (
+            "POST",
+            format!("/orgs/{o}/invites"),
+            r#"{"email":"new@example.com"}"#.into(),
+        ),
+        (
+            "POST",
+            format!("/orgs/{o}/members/acc-life-member/org-key"),
+            format!(r#"{{"enc_org_key":"{}"}}"#, b64(b"sealed")),
+        ),
+        (
+            "POST",
+            format!("/orgs/{o}/members/acc-life-member"),
+            r#"{"role":"member"}"#.into(),
+        ),
+        (
+            "DELETE",
+            format!("/orgs/{o}/members/acc-life-member"),
+            String::new(),
+        ),
+        ("POST", format!("/orgs/{o}/billing/checkout"), String::new()),
+        ("POST", format!("/orgs/{o}/billing/portal"), String::new()),
+        (
+            "POST",
+            "/projects".into(),
+            org_project_body("acc-life-p2", o),
+        ),
+        (
+            "POST",
+            format!("/projects/{p}/environments"),
+            env_body("acc-life-e2"),
+        ),
+        (
+            "POST",
+            format!("/environments/{e}/secrets"),
+            set_body(0, "acc-life-s1", 1),
+        ),
+        (
+            "POST",
+            format!("/environments/{e}/grants"),
+            grant_body("acc-life-member"),
+        ),
+        ("POST", format!("/environments/{e}/rotate"), rotate_body()),
+        (
+            "POST",
+            format!("/environments/{e}/tokens"),
+            machine_token_body(),
+        ),
+        (
+            "DELETE",
+            format!("/environments/{e}/tokens/missing-token"),
+            String::new(),
+        ),
+    ];
+    for (method, uri, body) in writes {
+        assert_eq!(
+            request(&pool, method, &uri, Some(&owner), Some(body))
+                .await
+                .0,
+            StatusCode::CONFLICT,
+            "write route should be frozen during retention: {method} {uri}"
+        );
+    }
+
+    // A member is frozen too; this is not a role check that can accidentally become a 403.
+    assert_eq!(
+        post(
+            &pool,
+            &member,
+            "/projects",
+            org_project_body("acc-life-member-project", o)
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn deleted_org_is_not_reachable_even_while_rows_remain() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("acc-deleted-o", "acc-deleted-p", "acc-deleted-e");
+    reset_orgs(&pool, &[o]).await;
+    let owner = fresh_session(&pool, "acc-deleted-owner", "acc-deleted-owner-s").await;
+    seed_org_project(
+        &pool,
+        &owner,
+        o,
+        p,
+        e,
+        "acc-deleted-owner",
+        "acc-deleted-owner",
+    )
+    .await;
+
+    sqlx::query(
+        "UPDATE organizations SET lifecycle_state = 'deleted', deleted_at = now(), \
+         enc_name = NULL, created_by = NULL, tier = 'free', trial_ends_at = NULL, \
+         stripe_customer_id = NULL, stripe_subscription_id = NULL WHERE id = $1",
+    )
+    .bind(o)
+    .execute(&pool)
+    .await
+    .expect("mark org deleted");
+
+    assert_eq!(get(&pool, &owner, "/orgs").await.0, StatusCode::OK);
+    assert!(!get(&pool, &owner, "/orgs").await.1.contains(o));
+    assert_eq!(
+        get(&pool, &owner, &format!("/projects/{p}/environments"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(&pool, &owner, &format!("/orgs/{o}/members")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get(&pool, &owner, &format!("/orgs/{o}/entitlements"))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        post(
+            &pool,
+            &owner,
+            "/projects",
+            org_project_body("acc-deleted-p2", o)
+        )
+        .await
+        .0,
         StatusCode::NOT_FOUND
     );
 }

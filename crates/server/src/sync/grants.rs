@@ -95,11 +95,7 @@ async fn create_grant(
     let enc_vault_key = encoding::decode(&body.enc_vault_key, "enc_vault_key", MAX_ENC_KEY)?;
 
     let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
-    if !access.can_manage_structure() {
-        return Err(Error::Forbidden(
-            "must be an admin or owner to share an environment".into(),
-        ));
-    }
+    access.require_manage_structure("must be an admin or owner to share an environment")?;
 
     // Sharing is an org operation: the env must be org-owned, and the recipient a member of that org
     // (a grant to someone who can't reach the env would be dead weight).
@@ -112,17 +108,16 @@ async fn create_grant(
     let org_id = org_id.ok_or_else(|| {
         Error::BadRequest("environment is not in an organisation; nothing to share".into())
     })?;
-    if org::role_of(&state.pool, &org_id, &body.user_id)
-        .await?
-        .is_none()
-    {
+    // Grant and its audit event commit together, so a failed audit can't leave an un-logged share.
+    let mut tx = state.pool.begin().await?;
+    access
+        .require_manage_structure_tx(&mut tx, "must be an admin or owner to share an environment")
+        .await?;
+    if !org::member_exists(&mut *tx, &org_id, &body.user_id).await? {
         return Err(Error::BadRequest(
             "target user is not a member of this organisation".into(),
         ));
     }
-
-    // Grant and its audit event commit together, so a failed audit can't leave an un-logged share.
-    let mut tx = state.pool.begin().await?;
     sqlx::query(
         "INSERT INTO environment_grants (env_id, user_id, enc_vault_key, granted_by) \
          VALUES ($1, $2, $3, $4) \
@@ -237,11 +232,7 @@ async fn rotate(
     Json(req): Json<RotateRequest>,
 ) -> Result<Json<RotateResponse>> {
     let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
-    if !access.can_manage_structure() {
-        return Err(Error::Forbidden(
-            "must be an admin or owner to rotate an environment".into(),
-        ));
-    }
+    access.require_manage_structure("must be an admin or owner to rotate an environment")?;
 
     // Rotation re-grants org members, so the env must be org-owned.
     let org_id: Option<String> = sqlx::query_scalar(
@@ -254,25 +245,15 @@ async fn rotate(
         org_id.ok_or_else(|| Error::BadRequest("environment is not in an organisation".into()))?;
 
     // Every grantee must be a distinct member of that org - the same rule `create_grant` enforces.
-    // Without the membership check an admin could re-grant the env to a non-member; without the
-    // duplicate check a repeated user_id would trip the environment_grants PK mid-transaction and
-    // surface as a 500 instead of a clean 400.
-    let member_rows: Vec<String> =
-        sqlx::query_scalar("SELECT user_id FROM organization_memberships WHERE org_id = $1")
-            .bind(&org_id)
-            .fetch_all(&state.pool)
-            .await?;
-    let members: HashSet<&str> = member_rows.iter().map(String::as_str).collect();
+    // The membership set is checked again inside the locked transaction below so a concurrent
+    // removal cannot make this rotation recreate a former member's grant. The duplicate check
+    // remains outside the transaction because a repeated user_id would otherwise trip the
+    // environment_grants primary key mid-transaction and surface as a 500 instead of a clean 400.
     let mut seen: HashSet<&str> = HashSet::with_capacity(req.grants.len());
     for g in &req.grants {
         if !seen.insert(g.user_id.as_str()) {
             return Err(Error::BadRequest(
                 "duplicate user_id in the rotation grant set".into(),
-            ));
-        }
-        if !members.contains(g.user_id.as_str()) {
-            return Err(Error::BadRequest(
-                "a grant recipient is not a member of this organisation".into(),
             ));
         }
     }
@@ -331,6 +312,27 @@ async fn rotate(
     }
 
     let mut tx = state.pool.begin().await?;
+
+    access
+        .require_manage_structure_tx(
+            &mut tx,
+            "must be an admin or owner to rotate an environment",
+        )
+        .await?;
+
+    let member_rows: Vec<String> =
+        sqlx::query_scalar("SELECT user_id FROM organization_memberships WHERE org_id = $1")
+            .bind(&org_id)
+            .fetch_all(&mut *tx)
+            .await?;
+    let members: HashSet<&str> = member_rows.iter().map(String::as_str).collect();
+    for (user_id, _) in &grants {
+        if !members.contains(user_id.as_str()) {
+            return Err(Error::BadRequest(
+                "a grant recipient is not a member of this organisation".into(),
+            ));
+        }
+    }
 
     // Lock the environment row so the rotation serialises against concurrent secret writes.
     let current: Option<i64> =

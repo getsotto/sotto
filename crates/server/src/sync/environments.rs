@@ -51,17 +51,19 @@ async fn create_environment(
     let enc_name = encoding::decode(&body.enc_name, "enc_name", MAX_ENC_NAME)?;
     let enc_vault_key = encoding::decode(&body.enc_vault_key, "enc_vault_key", MAX_ENC_KEY)?;
     let access = access::project_access(&state, &project_id, &user.user_id).await?;
-    if !access.can_manage_structure() {
-        return Err(Error::Forbidden(
-            "must be an admin or owner to create an environment".into(),
-        ));
-    }
+    access.require_manage_structure("must be an admin or owner to create an environment")?;
 
     // The environment and the creator's vault-key grant land together (the caller sealed
     // `enc_vault_key` to their own public key). The grant row is the only storage - there is no
     // inline copy on the environment row.
     let created = {
         let mut tx = state.pool.begin().await?;
+        access
+            .require_manage_structure_tx(
+                &mut tx,
+                "must be an admin or owner to create an environment",
+            )
+            .await?;
         let created: Option<String> = sqlx::query_scalar(
             "INSERT INTO environments (id, project_id, enc_name) \
              VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING RETURNING id",

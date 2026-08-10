@@ -185,8 +185,11 @@ async fn write_secrets(
 
     // Authorise before touching the environment; any member (or personal owner) may write secrets.
     let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
+    access.require_write()?;
 
     let mut tx = state.pool.begin().await?;
+
+    access.require_write_tx(&mut tx).await?;
 
     // Lock the environment row so concurrent batches serialise on its revision.
     let current: Option<i64> =
