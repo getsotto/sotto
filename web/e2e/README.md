@@ -87,7 +87,7 @@ access it. Add these environment secrets:
 
 | Secret | Value |
 | --- | --- |
-| `STRIPE_SECRET_KEY` | A Stripe test-mode secret key beginning with `sk_test_` |
+| `STRIPE_API_KEY` | A Stripe test-mode restricted key beginning with `rk_test_` |
 | `STRIPE_TEST_PRICE_ID` | A recurring test-mode Price id used by Sotto Checkout |
 
 The Price must belong to the same Stripe test account as the secret key. Do not add live keys or
@@ -106,7 +106,7 @@ For a local run, use a fresh Postgres database and the same test-mode values. St
 one shell:
 
 ```sh
-stripe listen --api-key "$STRIPE_SECRET_KEY" \
+stripe listen --api-key "$STRIPE_API_KEY" \
   --events checkout.session.completed,customer.subscription.updated,customer.subscription.deleted \
   --forward-to http://127.0.0.1:8099/billing/webhook
 ```
@@ -116,7 +116,7 @@ Then, from `web/`, run the smoke config with the signing secret printed by Strip
 ```sh
 CI=1 \
 DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto \
-STRIPE_SECRET_KEY=sk_test_... \
+STRIPE_API_KEY=rk_test_... \
 STRIPE_WEBHOOK_SECRET=whsec_... \
 STRIPE_PRICE_ID=price_... \
 npm run e2e -- --config=playwright.stripe.config.ts

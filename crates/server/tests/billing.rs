@@ -33,7 +33,7 @@ fn app(pool: PgPool, configured: bool) -> Router {
         oauth_config: None,
         billing: configured.then(|| {
             BillingState::from_config(BillingConfig {
-                secret_key: "sk_test_never_called".into(),
+                api_key: "rk_test_never_called".into(),
                 webhook_secret: WEBHOOK_SECRET.into(),
                 price_id: "price_test".into(),
                 return_url: "https://app.sotto.test".into(),

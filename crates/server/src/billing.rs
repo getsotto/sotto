@@ -69,7 +69,7 @@ pub struct BillingState {
 impl BillingState {
     pub fn from_config(config: BillingConfig) -> Self {
         let provider = StripeBilling {
-            secret_key: config.secret_key.clone(),
+            api_key: config.api_key.clone(),
             price_id: config.price_id,
         };
         Self {
@@ -90,7 +90,7 @@ impl BillingState {
 }
 
 struct StripeBilling {
-    secret_key: String,
+    api_key: String,
     price_id: String,
 }
 
@@ -121,7 +121,7 @@ impl BillingProvider for StripeBilling {
             form.push(("customer".to_string(), customer.to_string()));
         }
 
-        let session = stripe_post(&self.secret_key, "checkout/sessions", &form).await?;
+        let session = stripe_post(&self.api_key, "checkout/sessions", &form).await?;
         session["url"]
             .as_str()
             .map(str::to_string)
@@ -133,7 +133,7 @@ impl BillingProvider for StripeBilling {
             ("customer".to_string(), customer.to_string()),
             ("return_url".to_string(), return_url.to_string()),
         ];
-        let session = stripe_post(&self.secret_key, "billing_portal/sessions", &form).await?;
+        let session = stripe_post(&self.api_key, "billing_portal/sessions", &form).await?;
         session["url"]
             .as_str()
             .map(str::to_string)

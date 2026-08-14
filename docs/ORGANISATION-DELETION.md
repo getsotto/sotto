@@ -453,9 +453,8 @@ vault, never a committed environment file. Migration starts with cataloguing exi
 Workbench, creates a test-mode restricted key with the intended permissions, runs the complete
 billing and deletion suites while watching `stripe logs tail` for `403` responses, then swaps the
 production secret and rotates the old unrestricted key. Permissions are widened only for a
-reviewed, observed call. The existing checkout implementation still names its key
-`STRIPE_SECRET_KEY`; the implementation PR must rename that configuration and its deployment
-examples atomically before enabling `STRIPE_API_KEY`.
+reviewed, observed call. The checkout and portal implementation use `STRIPE_API_KEY`, and the
+deployment examples pass that restricted key before billing is enabled.
 
 Record user-visible audit events for request, recovery, billing cancellation confirmation,
 terminal failure, purge start, and completion. Retry noise belongs in structured operational logs
@@ -558,7 +557,7 @@ Each item is an independently reviewable PR. The route remains absent through it
 2. **Access:** add the shared lifecycle-aware access lookup and freeze every org-scoped write, with
    route-inventory tests.
 3. **Billing:** add `SubscriptionProvider`, pin `Stripe-Version`, preserve structured provider
-   errors, rename `STRIPE_SECRET_KEY` to the restricted `STRIPE_API_KEY`, and add the Stripe
+   errors, use the restricted `STRIPE_API_KEY`, and add the Stripe
    cancellation and status adapter, webhook deduplication, and race tests. Do not expose an
    endpoint.
 4. **Lifecycle:** add request, cancel, leasing, retries, reconciliation, and purge behind internal

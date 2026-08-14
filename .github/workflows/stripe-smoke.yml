@@ -39,7 +39,7 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://sotto:sotto@localhost:5432/sotto
-      STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+      STRIPE_API_KEY: ${{ secrets.STRIPE_API_KEY }}
       STRIPE_PRICE_ID: ${{ secrets.STRIPE_TEST_PRICE_ID }}
       SOTTO_BIND: 127.0.0.1:8099
       SOTTO_PUBLIC_URL: http://127.0.0.1:8099
@@ -79,9 +79,9 @@ jobs:
       - name: Validate test-mode billing configuration
         run: |
           set -euo pipefail
-          case "$STRIPE_SECRET_KEY" in
-            sk_test_*) ;;
-            *) echo "error: STRIPE_SECRET_KEY must be a Stripe test-mode key" >&2; exit 1 ;;
+          case "$STRIPE_API_KEY" in
+            rk_test_*) ;;
+            *) echo "error: STRIPE_API_KEY must be a restricted Stripe test-mode key" >&2; exit 1 ;;
           esac
           test -n "$STRIPE_PRICE_ID"
 
@@ -112,7 +112,7 @@ jobs:
           set -euo pipefail
           listener_log="$RUNNER_TEMP/stripe-listen.log"
           stripe listen \
-            --api-key "$STRIPE_SECRET_KEY" \
+            --api-key "$STRIPE_API_KEY" \
             --events checkout.session.completed,customer.subscription.updated,customer.subscription.deleted \
             --forward-to "http://127.0.0.1:8099/billing/webhook" \
             >"$listener_log" 2>&1 &
@@ -187,14 +187,14 @@ jobs:
           # first 100 records.
           while :; do
             if [ -n "$starting_after" ]; then
-              curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+              curl --fail --silent --show-error --user "$STRIPE_API_KEY:" \
                 --get "https://api.stripe.com/v1/subscriptions" \
                 --data-urlencode "status=all" \
                 --data-urlencode "limit=100" \
                 --data-urlencode "starting_after=$starting_after" \
                 --output "$subscriptions_file"
             else
-              curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+              curl --fail --silent --show-error --user "$STRIPE_API_KEY:" \
                 --get "https://api.stripe.com/v1/subscriptions" \
                 --data-urlencode "status=all" \
                 --data-urlencode "limit=100" \
@@ -237,7 +237,7 @@ jobs:
           cleanup_failed=0
           while IFS="$(printf '\t')" read -r subscription_id customer_id; do
             [ -n "$subscription_id" ] || continue
-            if ! curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+            if ! curl --fail --silent --show-error --user "$STRIPE_API_KEY:" \
               --request DELETE "https://api.stripe.com/v1/subscriptions/$subscription_id" \
               >/dev/null; then
               echo "warning: could not cancel Stripe subscription $subscription_id" >&2
@@ -258,7 +258,7 @@ jobs:
                 echo "warning: leaving shared Stripe customer $customer_id in place" >&2
                 continue
               fi
-              if ! curl --fail --silent --show-error --user "$STRIPE_SECRET_KEY:" \
+              if ! curl --fail --silent --show-error --user "$STRIPE_API_KEY:" \
                 --request DELETE "https://api.stripe.com/v1/customers/$customer_id" \
                 >/dev/null; then
                 echo "warning: could not remove Stripe customer $customer_id" >&2
