@@ -9,6 +9,7 @@
 //! pattern). Zero-knowledge is unaffected - Stripe learns an org *id* and whatever the payer types
 //! into Stripe's own pages; org names, membership, and vault data never leave the server.
 
+use std::fmt;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Postgres, Transaction};
 
 #[cfg(feature = "e2e-mock-billing")]
 use url::Url;
@@ -42,26 +43,200 @@ const SIGNATURE_TOLERANCE_SECS: i64 = 300;
 /// Subscription statuses that keep the Team tier. `past_due` stays paid while Stripe retries the
 /// card (dunning) - losing entitlements over a bounced payment is the wrong first touch.
 const ACTIVE_STATUSES: [&str; 3] = ["active", "trialing", "past_due"];
+/// Every Stripe request and webhook fixture uses the same version so response shapes cannot drift
+/// underneath billing or deletion decisions.
+pub const STRIPE_API_VERSION: &str = "2026-07-29.dahlia";
+
+/// Provider failures retain the machine-readable classification needed by retry and deletion
+/// policy. Human-readable provider text never crosses the HTTP or persistence boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderErrorKind {
+    Authentication,
+    ResourceMissing,
+    Retryable,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderError {
+    pub status: Option<u16>,
+    pub code: Option<String>,
+    pub kind: ProviderErrorKind,
+}
+
+impl ProviderError {
+    fn http(status: u16, code: Option<String>) -> Self {
+        let kind = if matches!(status, 401 | 403) {
+            ProviderErrorKind::Authentication
+        } else if code.as_deref() == Some("resource_missing") {
+            ProviderErrorKind::ResourceMissing
+        } else if status == 429
+            || status >= 500
+            || matches!(code.as_deref(), Some("rate_limit_error" | "api_error"))
+        {
+            ProviderErrorKind::Retryable
+        } else {
+            ProviderErrorKind::Unknown
+        };
+        Self {
+            status: Some(status),
+            code,
+            kind,
+        }
+    }
+
+    fn transport() -> Self {
+        Self {
+            status: None,
+            code: Some("transport_error".into()),
+            kind: ProviderErrorKind::Retryable,
+        }
+    }
+
+    fn malformed_response() -> Self {
+        Self {
+            status: None,
+            code: Some("malformed_response".into()),
+            kind: ProviderErrorKind::Unknown,
+        }
+    }
+
+    #[cfg(feature = "e2e-mock-billing")]
+    fn unsupported(operation: &str) -> Self {
+        Self {
+            status: None,
+            code: Some(format!("unsupported_{operation}")),
+            kind: ProviderErrorKind::Unknown,
+        }
+    }
+
+    fn into_error(self) -> Error {
+        let detail = self.code.unwrap_or_else(|| "unknown_error".into());
+        Error::Upstream(format!("stripe provider error: {detail}"))
+    }
+}
+
+impl fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = self.code.as_deref().unwrap_or("unknown_error");
+        match self.status {
+            Some(status) => write!(f, "stripe {status} {code}"),
+            None => write!(f, "stripe {code}"),
+        }
+    }
+}
+
+pub type ProviderResult<T> = std::result::Result<T, ProviderError>;
+
+/// Stripe subscription states are deliberately separate from entitlement states. A status that is
+/// free for the product can still be resumable at Stripe and therefore must block a purge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubscriptionStatus {
+    Active,
+    Trialing,
+    PastDue,
+    Incomplete,
+    Paused,
+    Unpaid,
+    Canceled,
+    IncompleteExpired,
+    Unknown(String),
+}
+
+impl SubscriptionStatus {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "active" => Self::Active,
+            "trialing" => Self::Trialing,
+            "past_due" => Self::PastDue,
+            "incomplete" => Self::Incomplete,
+            "paused" => Self::Paused,
+            "unpaid" => Self::Unpaid,
+            "canceled" => Self::Canceled,
+            "incomplete_expired" => Self::IncompleteExpired,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+
+    pub fn purge_gate(&self) -> PurgeGate {
+        match self {
+            Self::Canceled | Self::IncompleteExpired => PurgeGate::Terminal,
+            Self::Unknown(_) => PurgeGate::Unknown,
+            _ => PurgeGate::Blocking,
+        }
+    }
+
+    fn entitlement_tier(&self) -> &'static str {
+        match self {
+            Self::Active | Self::Trialing | Self::PastDue => "team",
+            _ => "free",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PurgeGate {
+    Blocking,
+    Terminal,
+    Missing,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionSnapshot {
+    pub id: String,
+    pub status: SubscriptionStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubscriptionObservation {
+    Current(SubscriptionSnapshot),
+    Missing,
+}
+
+impl SubscriptionObservation {
+    pub fn purge_gate(&self) -> PurgeGate {
+        match self {
+            Self::Current(snapshot) => snapshot.status.purge_gate(),
+            Self::Missing => PurgeGate::Missing,
+        }
+    }
+}
 
 /// The small interface between billing handlers and an external payment provider.
 #[async_trait]
-pub trait BillingProvider: Send + Sync {
+pub trait SubscriptionProvider: Send + Sync {
     async fn create_checkout(
         &self,
         org_id: &str,
         customer: Option<&str>,
         success_url: &str,
         cancel_url: &str,
-    ) -> Result<String>;
+    ) -> ProviderResult<String>;
 
-    async fn create_portal(&self, customer: &str, return_url: &str) -> Result<String>;
+    async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String>;
+
+    async fn get_subscription(
+        &self,
+        subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation>;
+
+    async fn cancel_subscription(
+        &self,
+        subscription_id: &str,
+        operation_id: &str,
+        organisation_id: &str,
+    ) -> ProviderResult<SubscriptionObservation>;
 }
+
+/// Compatibility name for code that only needs checkout and portal billing.
+pub use SubscriptionProvider as BillingProvider;
 
 /// Billing resources shared by handlers. The provider is swappable for the browser E2E build,
 /// while webhook verification keeps its own secret regardless of which checkout adapter runs.
 #[derive(Clone)]
 pub struct BillingState {
-    provider: Arc<dyn BillingProvider>,
+    provider: Arc<dyn SubscriptionProvider>,
     webhook_secret: String,
     return_url: String,
 }
@@ -76,6 +251,18 @@ impl BillingState {
             provider: Arc::new(provider),
             webhook_secret: config.webhook_secret,
             return_url: config.return_url,
+        }
+    }
+
+    pub fn with_provider(
+        provider: Arc<dyn SubscriptionProvider>,
+        webhook_secret: String,
+        return_url: String,
+    ) -> Self {
+        Self {
+            provider,
+            webhook_secret,
+            return_url,
         }
     }
 
@@ -95,14 +282,14 @@ struct StripeBilling {
 }
 
 #[async_trait]
-impl BillingProvider for StripeBilling {
+impl SubscriptionProvider for StripeBilling {
     async fn create_checkout(
         &self,
         org_id: &str,
         customer: Option<&str>,
         success_url: &str,
         cancel_url: &str,
-    ) -> Result<String> {
+    ) -> ProviderResult<String> {
         let mut form = vec![
             ("mode".to_string(), "subscription".to_string()),
             ("line_items[0][price]".to_string(), self.price_id.clone()),
@@ -125,10 +312,10 @@ impl BillingProvider for StripeBilling {
         session["url"]
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| Error::Upstream("stripe checkout session had no url".into()))
+            .ok_or_else(ProviderError::malformed_response)
     }
 
-    async fn create_portal(&self, customer: &str, return_url: &str) -> Result<String> {
+    async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String> {
         let form = vec![
             ("customer".to_string(), customer.to_string()),
             ("return_url".to_string(), return_url.to_string()),
@@ -137,7 +324,62 @@ impl BillingProvider for StripeBilling {
         session["url"]
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| Error::Upstream("stripe portal session had no url".into()))
+            .ok_or_else(ProviderError::malformed_response)
+    }
+
+    async fn get_subscription(
+        &self,
+        subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        let path = format!("subscriptions/{subscription_id}");
+        match stripe_get(&self.api_key, &path).await {
+            Ok(subscription) => Ok(SubscriptionObservation::Current(subscription_snapshot(
+                &subscription,
+                subscription_id,
+            )?)),
+            Err(error) if error.kind == ProviderErrorKind::ResourceMissing => {
+                Ok(SubscriptionObservation::Missing)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn cancel_subscription(
+        &self,
+        subscription_id: &str,
+        operation_id: &str,
+        organisation_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        let current = self.get_subscription(subscription_id).await?;
+        let SubscriptionObservation::Current(snapshot) = current else {
+            return Ok(SubscriptionObservation::Missing);
+        };
+        if matches!(snapshot.status.purge_gate(), PurgeGate::Terminal) {
+            return Ok(SubscriptionObservation::Current(snapshot));
+        }
+
+        let form = cancellation_form(organisation_id);
+        let cancellation = stripe_delete(
+            &self.api_key,
+            &format!("subscriptions/{subscription_id}"),
+            operation_id,
+            &form,
+        )
+        .await;
+        let fresh = self.get_subscription(subscription_id).await;
+        match fresh {
+            Ok(observation) => {
+                if matches!(
+                    observation.purge_gate(),
+                    PurgeGate::Terminal | PurgeGate::Missing
+                ) {
+                    Ok(observation)
+                } else {
+                    cancellation.map(|_| observation)
+                }
+            }
+            Err(error) => Err(cancellation.err().unwrap_or(error)),
+        }
     }
 }
 
@@ -148,33 +390,49 @@ struct E2eBilling {
 
 #[cfg(feature = "e2e-mock-billing")]
 #[async_trait]
-impl BillingProvider for E2eBilling {
+impl SubscriptionProvider for E2eBilling {
     async fn create_checkout(
         &self,
         _org_id: &str,
         _customer: Option<&str>,
         success_url: &str,
         cancel_url: &str,
-    ) -> Result<String> {
+    ) -> ProviderResult<String> {
         self.page_url(
             "checkout",
             &[("success_url", success_url), ("cancel_url", cancel_url)],
         )
     }
 
-    async fn create_portal(&self, _customer: &str, return_url: &str) -> Result<String> {
+    async fn create_portal(&self, _customer: &str, return_url: &str) -> ProviderResult<String> {
         self.page_url("portal", &[("return_url", return_url)])
+    }
+
+    async fn get_subscription(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Err(ProviderError::unsupported("subscription_lookup"))
+    }
+
+    async fn cancel_subscription(
+        &self,
+        _subscription_id: &str,
+        _operation_id: &str,
+        _organisation_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Err(ProviderError::unsupported("subscription_cancellation"))
     }
 }
 
 #[cfg(feature = "e2e-mock-billing")]
 impl E2eBilling {
-    fn page_url(&self, page: &str, params: &[(&str, &str)]) -> Result<String> {
+    fn page_url(&self, page: &str, params: &[(&str, &str)]) -> ProviderResult<String> {
         let base = format!(
             "{}/e2e/billing/{page}",
             self.provider_origin.trim_end_matches('/')
         );
-        let mut url = Url::parse(&base).map_err(|e| Error::Config(e.to_string()))?;
+        let mut url = Url::parse(&base).map_err(|_| ProviderError::malformed_response())?;
         url.query_pairs_mut().extend_pairs(params.iter().copied());
         Ok(url.to_string())
     }
@@ -251,7 +509,8 @@ async fn create_checkout(
     let url = billing
         .provider
         .create_checkout(&org_id, customer.as_deref(), &success_url, &cancel_url)
-        .await?;
+        .await
+        .map_err(ProviderError::into_error)?;
     tx.commit().await?;
     Ok(Json(RedirectView { url }))
 }
@@ -284,7 +543,8 @@ async fn create_portal(
     let url = billing
         .provider
         .create_portal(&customer, &app_url(&billing.return_url))
-        .await?;
+        .await
+        .map_err(ProviderError::into_error)?;
     tx.commit().await?;
     Ok(Json(RedirectView { url }))
 }
@@ -396,29 +656,90 @@ fn stripe_client() -> &'static reqwest::Client {
 
 /// One form-encoded call to the Stripe API.
 async fn stripe_post(
-    secret_key: &str,
+    api_key: &str,
     path: &str,
     form: &[(String, String)],
-) -> Result<serde_json::Value> {
+) -> ProviderResult<serde_json::Value> {
     let response = stripe_client()
         .post(format!("https://api.stripe.com/v1/{path}"))
-        .bearer_auth(secret_key)
+        .bearer_auth(api_key)
+        .header("Stripe-Version", STRIPE_API_VERSION)
         .form(form)
         .send()
         .await
-        .map_err(|e| Error::Upstream(format!("stripe: {e}")))?;
-    let status = response.status();
-    let body: serde_json::Value = response
-        .json()
+        .map_err(|_| ProviderError::transport())?;
+    stripe_response(response).await
+}
+
+async fn stripe_get(api_key: &str, path: &str) -> ProviderResult<serde_json::Value> {
+    let response = stripe_client()
+        .get(format!("https://api.stripe.com/v1/{path}"))
+        .bearer_auth(api_key)
+        .header("Stripe-Version", STRIPE_API_VERSION)
+        .send()
         .await
-        .map_err(|e| Error::Upstream(format!("stripe: {e}")))?;
-    if !status.is_success() {
-        let message = body["error"]["message"]
-            .as_str()
-            .unwrap_or("request failed");
-        return Err(Error::Upstream(format!("stripe {path}: {message}")));
+        .map_err(|_| ProviderError::transport())?;
+    stripe_response(response).await
+}
+
+async fn stripe_delete(
+    api_key: &str,
+    path: &str,
+    idempotency_key: &str,
+    form: &[(String, String)],
+) -> ProviderResult<serde_json::Value> {
+    let response = stripe_client()
+        .delete(format!("https://api.stripe.com/v1/{path}"))
+        .bearer_auth(api_key)
+        .header("Stripe-Version", STRIPE_API_VERSION)
+        .header("Idempotency-Key", idempotency_key)
+        .form(form)
+        .send()
+        .await
+        .map_err(|_| ProviderError::transport())?;
+    stripe_response(response).await
+}
+
+async fn stripe_response(response: reqwest::Response) -> ProviderResult<serde_json::Value> {
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .await
+        .map_err(|_| ProviderError::transport())?;
+    let value = if body.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&body).map_err(|_| ProviderError::malformed_response())?
+    };
+    if status >= 400 {
+        let code = value["error"]["code"].as_str().map(str::to_string);
+        return Err(ProviderError::http(status, code));
     }
-    Ok(body)
+    Ok(value)
+}
+
+fn subscription_snapshot(
+    object: &serde_json::Value,
+    requested_id: &str,
+) -> ProviderResult<SubscriptionSnapshot> {
+    let status = object["status"]
+        .as_str()
+        .ok_or_else(ProviderError::malformed_response)?;
+    Ok(SubscriptionSnapshot {
+        id: object["id"].as_str().unwrap_or(requested_id).to_string(),
+        status: SubscriptionStatus::parse(status),
+    })
+}
+
+fn cancellation_form(organisation_id: &str) -> Vec<(String, String)> {
+    vec![
+        ("invoice_now".into(), "false".into()),
+        ("prorate".into(), "false".into()),
+        (
+            "cancellation_details[comment]".into(),
+            format!("Sotto organisation {organisation_id} deleted"),
+        ),
+    ]
 }
 
 // --- webhook -------------------------------------------------------------------------------------
@@ -426,6 +747,9 @@ async fn stripe_post(
 /// The slice of a Stripe event we act on; everything else in the payload is ignored.
 #[derive(Deserialize)]
 struct Event {
+    id: String,
+    created: i64,
+    api_version: String,
     #[serde(rename = "type")]
     kind: String,
     data: EventData,
@@ -455,18 +779,127 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
 
     let event: Event =
         serde_json::from_str(&body).map_err(|_| Error::BadRequest("malformed event".into()))?;
+    if event.api_version != STRIPE_API_VERSION {
+        return Err(Error::Config("stripe webhook api version mismatch".into()));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let disposition = record_webhook_event(&mut tx, &event).await?;
+    if disposition == EventDisposition::Ignore {
+        tx.commit().await?;
+        return Ok(());
+    }
+
     let object = &event.data.object;
+    let subscription_id = event_subscription_id(&event);
+    match disposition {
+        EventDisposition::Apply => match event.kind.as_str() {
+            "checkout.session.completed" => checkout_completed(&mut tx, object).await?,
+            "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
+            "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
+            _ => {}
+        },
+        EventDisposition::Reconcile => {
+            if let Some(subscription_id) = subscription_id.as_deref() {
+                reconcile_subscription(
+                    &mut tx,
+                    billing.provider.as_ref(),
+                    subscription_id,
+                    object["metadata"]["org_id"].as_str(),
+                )
+                .await?;
+            }
+        }
+        EventDisposition::Ignore => unreachable!(),
+    }
+    if let Some(subscription_id) = subscription_id {
+        update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventDisposition {
+    Apply,
+    Reconcile,
+    Ignore,
+}
+
+async fn record_webhook_event(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &Event,
+) -> Result<EventDisposition> {
+    let subscription_id = event_subscription_id(event);
+    let inserted = sqlx::query(
+        "INSERT INTO stripe_webhook_events (event_id, event_type, stripe_created, subscription_id) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (event_id) DO NOTHING",
+    )
+    .bind(&event.id)
+    .bind(&event.kind)
+    .bind(event.created)
+    .bind(&subscription_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        return Ok(EventDisposition::Ignore);
+    }
+
+    let Some(subscription_id) = subscription_id else {
+        return Ok(EventDisposition::Apply);
+    };
+    let watermark: Option<(i64, String)> = sqlx::query_as(
+        "SELECT stripe_created, event_id FROM stripe_subscription_watermarks \
+         WHERE subscription_id = $1 FOR UPDATE",
+    )
+    .bind(&subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(match watermark {
+        Some((created, _)) if event.created < created => EventDisposition::Ignore,
+        Some((created, _)) if event.created == created => EventDisposition::Reconcile,
+        _ => EventDisposition::Apply,
+    })
+}
+
+async fn update_subscription_watermark(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &Event,
+    subscription_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO stripe_subscription_watermarks (subscription_id, stripe_created, event_id) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (subscription_id) DO UPDATE SET stripe_created = EXCLUDED.stripe_created, \
+         event_id = EXCLUDED.event_id, updated_at = now()",
+    )
+    .bind(subscription_id)
+    .bind(event.created)
+    .bind(&event.id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn event_subscription_id(event: &Event) -> Option<String> {
     match event.kind.as_str() {
-        "checkout.session.completed" => checkout_completed(&state.pool, object).await,
-        "customer.subscription.updated" => subscription_updated(&state.pool, object).await,
-        "customer.subscription.deleted" => subscription_deleted(&state.pool, object).await,
-        _ => Ok(()),
+        "checkout.session.completed" => event.data.object["subscription"]
+            .as_str()
+            .map(str::to_string),
+        "customer.subscription.updated" | "customer.subscription.deleted" => {
+            event.data.object["id"].as_str().map(str::to_string)
+        }
+        _ => None,
     }
 }
 
 /// A paid checkout: record the Stripe ids and grant the Team tier. Idempotent - a redelivered
 /// event changes no rows and writes no duplicate audit entry.
-async fn checkout_completed(pool: &PgPool, object: &serde_json::Value) -> Result<()> {
+async fn checkout_completed(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<()> {
     // Sessions this server creates always carry the org id; anything else isn't ours to act on.
     let Some(org_id) = object["client_reference_id"].as_str() else {
         return Ok(());
@@ -474,23 +907,22 @@ async fn checkout_completed(pool: &PgPool, object: &serde_json::Value) -> Result
     let customer = object["customer"].as_str();
     let subscription = object["subscription"].as_str();
 
-    let mut tx = pool.begin().await?;
     let changed = sqlx::query(
         "UPDATE organizations \
          SET tier = 'team', stripe_customer_id = $2, stripe_subscription_id = $3 \
-         WHERE id = $1 AND (tier <> 'team' \
+         WHERE id = $1 AND lifecycle_state = 'active' AND (tier <> 'team' \
             OR stripe_customer_id IS DISTINCT FROM $2 \
             OR stripe_subscription_id IS DISTINCT FROM $3)",
     )
     .bind(org_id)
     .bind(customer)
     .bind(subscription)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if changed > 0 {
         audit::record_tx(
-            &mut tx,
+            &mut *tx,
             org_id,
             "stripe",
             "billing.subscribed",
@@ -501,14 +933,16 @@ async fn checkout_completed(pool: &PgPool, object: &serde_json::Value) -> Result
         )
         .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
 /// A subscription lifecycle change: the status decides the tier. Handles late/failed payments
 /// (`unpaid` → free) and recoveries (`active` again → team).
-async fn subscription_updated(pool: &PgPool, object: &serde_json::Value) -> Result<()> {
-    let Some(org_id) = org_for_subscription(pool, object).await? else {
+async fn subscription_updated(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<()> {
+    let Some(org_id) = org_for_subscription(tx, object).await? else {
         return Ok(());
     };
     let status = object["status"].as_str().unwrap_or_default();
@@ -518,16 +952,18 @@ async fn subscription_updated(pool: &PgPool, object: &serde_json::Value) -> Resu
         "free"
     };
 
-    let mut tx = pool.begin().await?;
-    let changed = sqlx::query("UPDATE organizations SET tier = $2 WHERE id = $1 AND tier <> $2")
-        .bind(&org_id)
-        .bind(tier)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    let changed = sqlx::query(
+        "UPDATE organizations SET tier = $2 WHERE id = $1 AND lifecycle_state = 'active' \
+         AND tier <> $2",
+    )
+    .bind(&org_id)
+    .bind(tier)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
     if changed > 0 {
         audit::record_tx(
-            &mut tx,
+            &mut *tx,
             &org_id,
             "stripe",
             "billing.updated",
@@ -538,28 +974,30 @@ async fn subscription_updated(pool: &PgPool, object: &serde_json::Value) -> Resu
         )
         .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
 /// The subscription ended for good: back to the free tier (existing data stays readable - the
 /// entitlement gates are creation-time only).
-async fn subscription_deleted(pool: &PgPool, object: &serde_json::Value) -> Result<()> {
-    let Some(org_id) = org_for_subscription(pool, object).await? else {
+async fn subscription_deleted(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<()> {
+    let Some(org_id) = org_for_subscription(tx, object).await? else {
         return Ok(());
     };
-    let mut tx = pool.begin().await?;
     let changed = sqlx::query(
         "UPDATE organizations SET tier = 'free', stripe_subscription_id = NULL \
-         WHERE id = $1 AND (tier <> 'free' OR stripe_subscription_id IS NOT NULL)",
+         WHERE id = $1 AND lifecycle_state = 'active' \
+           AND (tier <> 'free' OR stripe_subscription_id IS NOT NULL)",
     )
     .bind(&org_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if changed > 0 {
         audit::record_tx(
-            &mut tx,
+            &mut *tx,
             &org_id,
             "stripe",
             "billing.cancelled",
@@ -570,13 +1008,72 @@ async fn subscription_deleted(pool: &PgPool, object: &serde_json::Value) -> Resu
         )
         .await?;
     }
-    tx.commit().await?;
+    Ok(())
+}
+
+/// Equal-timestamp events cannot be ordered by delivery time. Reconcile against Stripe's current
+/// object instead of letting arrival order decide the entitlement.
+async fn reconcile_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    provider: &dyn SubscriptionProvider,
+    subscription_id: &str,
+    org_hint: Option<&str>,
+) -> Result<()> {
+    let org_id = match org_hint {
+        Some(org_id) => Some(org_id.to_string()),
+        None => {
+            sqlx::query_scalar("SELECT id FROM organizations WHERE stripe_subscription_id = $1")
+                .bind(subscription_id)
+                .fetch_optional(&mut **tx)
+                .await?
+        }
+    };
+    let Some(org_id) = org_id else {
+        return Ok(());
+    };
+    let observation = provider
+        .get_subscription(subscription_id)
+        .await
+        .map_err(ProviderError::into_error)?;
+    let (tier, linked_subscription) = match observation {
+        SubscriptionObservation::Current(snapshot) => {
+            (snapshot.status.entitlement_tier(), Some(snapshot.id))
+        }
+        SubscriptionObservation::Missing => ("free", None),
+    };
+    let changed = sqlx::query(
+        "UPDATE organizations SET tier = $2, stripe_subscription_id = $3 \
+         WHERE id = $1 AND lifecycle_state = 'active' \
+           AND (tier <> $2 OR stripe_subscription_id IS DISTINCT FROM $3)",
+    )
+    .bind(&org_id)
+    .bind(tier)
+    .bind(linked_subscription.as_deref())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if changed > 0 {
+        audit::record_tx(
+            &mut *tx,
+            &org_id,
+            "stripe",
+            "billing.reconciled",
+            audit::Context {
+                detail: Some("equal-timestamp webhook reconciled with provider"),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     Ok(())
 }
 
 /// Name the org for a subscription event: the metadata stamped at checkout, else the stored
 /// subscription id (covers subscriptions relinked by Stripe support), else not ours.
-async fn org_for_subscription(pool: &PgPool, object: &serde_json::Value) -> Result<Option<String>> {
+async fn org_for_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<Option<String>> {
     if let Some(org_id) = object["metadata"]["org_id"].as_str() {
         return Ok(Some(org_id.to_string()));
     }
@@ -586,7 +1083,7 @@ async fn org_for_subscription(pool: &PgPool, object: &serde_json::Value) -> Resu
     Ok(
         sqlx::query_scalar("SELECT id FROM organizations WHERE stripe_subscription_id = $1")
             .bind(subscription_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut **tx)
             .await?,
     )
 }
