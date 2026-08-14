@@ -81,6 +81,74 @@ async fn migrations_apply_and_user_round_trips() {
 }
 
 #[tokio::test]
+async fn billing_webhook_tables_keep_event_ids_and_watermarks() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    if !should_run_db_tests(&database_url) {
+        return;
+    }
+
+    let pool = db::connect(&database_url).await.expect("connect");
+    db::migrate(&pool).await.expect("migrate");
+    sqlx::query(
+        "DELETE FROM stripe_subscription_watermarks WHERE subscription_id = 'sub-db-order'",
+    )
+    .execute(&pool)
+    .await
+    .expect("cleanup subscription watermark");
+    sqlx::query(
+        "DELETE FROM stripe_webhook_events WHERE event_id IN ('evt-db-order-a', 'evt-db-order-b')",
+    )
+    .execute(&pool)
+    .await
+    .expect("cleanup webhook events");
+
+    let inserted = sqlx::query(
+        "INSERT INTO stripe_webhook_events (event_id, event_type, stripe_created, subscription_id) \
+         VALUES ('evt-db-order-a', 'customer.subscription.updated', 10, 'sub-db-order') \
+         ON CONFLICT (event_id) DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert webhook event");
+    assert_eq!(inserted.rows_affected(), 1);
+    let duplicate = sqlx::query(
+        "INSERT INTO stripe_webhook_events (event_id, event_type, stripe_created, subscription_id) \
+         VALUES ('evt-db-order-a', 'customer.subscription.updated', 10, 'sub-db-order') \
+         ON CONFLICT (event_id) DO NOTHING",
+    )
+    .execute(&pool)
+    .await
+    .expect("deduplicate webhook event");
+    assert_eq!(duplicate.rows_affected(), 0);
+
+    sqlx::query(
+        "INSERT INTO stripe_webhook_events (event_id, event_type, stripe_created, subscription_id) \
+         VALUES ('evt-db-order-b', 'customer.subscription.updated', 11, 'sub-db-order')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert newer webhook event");
+    sqlx::query(
+        "INSERT INTO stripe_subscription_watermarks (subscription_id, stripe_created, event_id) \
+         VALUES ('sub-db-order', 11, 'evt-db-order-b')",
+    )
+    .execute(&pool)
+    .await
+    .expect("insert subscription watermark");
+    let watermark: (i64, String) = sqlx::query_as(
+        "SELECT stripe_created, event_id FROM stripe_subscription_watermarks \
+         WHERE subscription_id = 'sub-db-order'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read subscription watermark");
+    assert_eq!(watermark, (11, "evt-db-order-b".into()));
+}
+
+#[tokio::test]
 async fn organization_deletion_schema_enforces_tombstones_and_operations() {
     let Ok(database_url) = std::env::var("DATABASE_URL") else {
         eprintln!("skipping: DATABASE_URL not set");
