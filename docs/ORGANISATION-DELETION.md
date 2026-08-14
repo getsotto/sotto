@@ -431,8 +431,9 @@ ordinary access resolves as not found.
 All Stripe requests must send `Stripe-Version: 2026-07-29.dahlia`. The version is a source constant,
 not the Stripe account default, because a Dashboard change must not alter payloads that gate data
 destruction. The Stripe webhook endpoint must be configured to emit the same version. The generic
-webhook parser checks the event's `api_version` before reading its object; a mismatch fails closed,
-alerts an operator, and does not change billing or deletion state.
+webhook parser records and acknowledges a mismatched `api_version` without reading or applying its
+object, then alerts an operator. This fails closed for billing and deletion state without causing
+Stripe to retry the same incompatible event forever.
 
 An API-version upgrade changes the request constant, webhook endpoint, response parser, fixtures,
 and credentialed smoke test together in one reviewed change. Stripe Workbench, the Dashboard's

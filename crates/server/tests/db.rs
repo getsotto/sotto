@@ -106,8 +106,9 @@ async fn billing_webhook_tables_keep_event_ids_and_watermarks() {
     .expect("cleanup webhook events");
 
     let inserted = sqlx::query(
-        "INSERT INTO stripe_webhook_events (event_id, event_type, stripe_created, subscription_id) \
-         VALUES ('evt-db-order-a', 'customer.subscription.updated', 10, 'sub-db-order') \
+        "INSERT INTO stripe_webhook_events \
+         (event_id, event_type, api_version, stripe_created, subscription_id) \
+         VALUES ('evt-db-order-a', 'customer.subscription.updated', '2026-07-29.dahlia', 10, 'sub-db-order') \
          ON CONFLICT (event_id) DO NOTHING",
     )
     .execute(&pool)
@@ -115,8 +116,9 @@ async fn billing_webhook_tables_keep_event_ids_and_watermarks() {
     .expect("insert webhook event");
     assert_eq!(inserted.rows_affected(), 1);
     let duplicate = sqlx::query(
-        "INSERT INTO stripe_webhook_events (event_id, event_type, stripe_created, subscription_id) \
-         VALUES ('evt-db-order-a', 'customer.subscription.updated', 10, 'sub-db-order') \
+        "INSERT INTO stripe_webhook_events \
+         (event_id, event_type, api_version, stripe_created, subscription_id) \
+         VALUES ('evt-db-order-a', 'customer.subscription.updated', '2026-07-29.dahlia', 10, 'sub-db-order') \
          ON CONFLICT (event_id) DO NOTHING",
     )
     .execute(&pool)
@@ -125,8 +127,9 @@ async fn billing_webhook_tables_keep_event_ids_and_watermarks() {
     assert_eq!(duplicate.rows_affected(), 0);
 
     sqlx::query(
-        "INSERT INTO stripe_webhook_events (event_id, event_type, stripe_created, subscription_id) \
-         VALUES ('evt-db-order-b', 'customer.subscription.updated', 11, 'sub-db-order')",
+        "INSERT INTO stripe_webhook_events \
+         (event_id, event_type, api_version, stripe_created, subscription_id) \
+         VALUES ('evt-db-order-b', 'customer.subscription.updated', '2026-07-29.dahlia', 11, 'sub-db-order')",
     )
     .execute(&pool)
     .await

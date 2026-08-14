@@ -644,7 +644,7 @@ async fn webhooks_cannot_change_deleting_or_deleted_organisations() {
 }
 
 #[tokio::test]
-async fn webhook_api_version_mismatch_fails_closed() {
+async fn webhook_api_version_mismatch_is_recorded_and_ignored() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -672,12 +672,20 @@ async fn webhook_api_version_mismatch_fails_closed() {
     .to_string();
     assert_eq!(
         post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
-        StatusCode::INTERNAL_SERVER_ERROR
+        StatusCode::OK
     );
     assert_eq!(
         org_billing_state(&pool, "billing-org-version").await,
         ("free".into(), None, None)
     );
+    let processed: bool = sqlx::query_scalar(
+        "SELECT processed_at IS NOT NULL FROM stripe_webhook_events \
+         WHERE event_id = 'evt_version_mismatch'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read mismatched webhook receipt");
+    assert!(processed);
 }
 
 #[tokio::test]

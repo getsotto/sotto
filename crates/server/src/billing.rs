@@ -782,7 +782,17 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     let event: Event =
         serde_json::from_str(&body).map_err(|_| Error::BadRequest("malformed event".into()))?;
     if event.api_version != STRIPE_API_VERSION {
-        return Err(Error::Config("stripe webhook api version mismatch".into()));
+        let mut tx = state.pool.begin().await?;
+        let inserted = record_webhook_receipt(&mut tx, &event).await?;
+        mark_webhook_event_processed(&mut tx, &event.id).await?;
+        tx.commit().await?;
+        if inserted {
+            eprintln!(
+                "warning: ignored Stripe webhook {} with API version {}",
+                event.id, event.api_version
+            );
+        }
+        return Ok(());
     }
 
     let mut tx = state.pool.begin().await?;
@@ -874,18 +884,8 @@ async fn record_webhook_event(
     if let Some(subscription_id) = subscription_id.as_deref() {
         lock_subscription(tx, subscription_id).await?;
     }
-    let inserted = sqlx::query(
-        "INSERT INTO stripe_webhook_events (event_id, event_type, stripe_created, subscription_id) \
-         VALUES ($1, $2, $3, $4) ON CONFLICT (event_id) DO NOTHING",
-    )
-    .bind(&event.id)
-    .bind(&event.kind)
-    .bind(event.created)
-    .bind(&subscription_id)
-    .execute(&mut **tx)
-    .await?
-    .rows_affected();
-    if inserted == 0 {
+    let inserted = record_webhook_receipt(tx, event).await?;
+    if !inserted {
         let processed: bool = sqlx::query_scalar(
             "SELECT processed_at IS NOT NULL FROM stripe_webhook_events WHERE event_id = $1",
         )
@@ -915,6 +915,25 @@ async fn record_webhook_event(
         Some(created) if event.created == created => EventDisposition::Reconcile,
         _ => EventDisposition::Apply,
     })
+}
+
+async fn record_webhook_receipt(tx: &mut Transaction<'_, Postgres>, event: &Event) -> Result<bool> {
+    let subscription_id = event_subscription_id(event);
+    let inserted = sqlx::query(
+        "INSERT INTO stripe_webhook_events \
+         (event_id, event_type, api_version, stripe_created, subscription_id) \
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING",
+    )
+    .bind(&event.id)
+    .bind(&event.kind)
+    .bind(&event.api_version)
+    .bind(event.created)
+    .bind(&subscription_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1;
+    Ok(inserted)
 }
 
 async fn lock_subscription(
