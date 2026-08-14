@@ -354,7 +354,7 @@ impl SubscriptionProvider for StripeBilling {
         let SubscriptionObservation::Current(snapshot) = current else {
             return Ok(SubscriptionObservation::Missing);
         };
-        if matches!(snapshot.status.purge_gate(), PurgeGate::Terminal) {
+        if !matches!(snapshot.status.purge_gate(), PurgeGate::Blocking) {
             return Ok(SubscriptionObservation::Current(snapshot));
         }
 
@@ -805,7 +805,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                     &mut tx,
                     billing.provider.as_ref(),
                     subscription_id,
-                    object["metadata"]["org_id"].as_str(),
+                    event_org_hint(&event),
                 )
                 .await?;
             }
@@ -889,6 +889,16 @@ fn event_subscription_id(event: &Event) -> Option<String> {
             .map(str::to_string),
         "customer.subscription.updated" | "customer.subscription.deleted" => {
             event.data.object["id"].as_str().map(str::to_string)
+        }
+        _ => None,
+    }
+}
+
+fn event_org_hint(event: &Event) -> Option<&str> {
+    match event.kind.as_str() {
+        "checkout.session.completed" => event.data.object["client_reference_id"].as_str(),
+        "customer.subscription.updated" | "customer.subscription.deleted" => {
+            event.data.object["metadata"]["org_id"].as_str()
         }
         _ => None,
     }

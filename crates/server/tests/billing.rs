@@ -2,16 +2,21 @@
 //! the configuration/role gates. DB-gated like the other server tests; no test ever calls the
 //! real Stripe API (the only handler paths exercised return before any outbound request).
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use sqlx::PgPool;
+use std::sync::Arc;
 use tower::ServiceExt;
 
 use sotto_server::auth::session;
-use sotto_server::billing::{BillingState, STRIPE_API_VERSION};
+use sotto_server::billing::{
+    BillingState, ProviderResult, SubscriptionObservation, SubscriptionProvider,
+    SubscriptionSnapshot, SubscriptionStatus, STRIPE_API_VERSION,
+};
 use sotto_server::config::BillingConfig;
 use sotto_server::db;
 use sotto_server::state::AppState;
@@ -39,6 +44,60 @@ fn app(pool: PgPool, configured: bool) -> Router {
                 return_url: "https://app.sotto.test".into(),
             })
         }),
+    };
+    Router::new()
+        .merge(sotto_server::billing::router())
+        .with_state(state)
+}
+
+struct TestProvider {
+    observation: SubscriptionObservation,
+}
+
+#[async_trait]
+impl SubscriptionProvider for TestProvider {
+    async fn create_checkout(
+        &self,
+        _org_id: &str,
+        _customer: Option<&str>,
+        _success_url: &str,
+        _cancel_url: &str,
+    ) -> ProviderResult<String> {
+        Ok("https://stripe.test/checkout".into())
+    }
+
+    async fn create_portal(&self, _customer: &str, _return_url: &str) -> ProviderResult<String> {
+        Ok("https://stripe.test/portal".into())
+    }
+
+    async fn get_subscription(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Ok(self.observation.clone())
+    }
+
+    async fn cancel_subscription(
+        &self,
+        _subscription_id: &str,
+        _operation_id: &str,
+        _organisation_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Ok(self.observation.clone())
+    }
+}
+
+fn app_with_provider(pool: PgPool, provider: Arc<dyn SubscriptionProvider>) -> Router {
+    let state = AppState {
+        telemetry_ingest: false,
+        pool,
+        oauth: None,
+        oauth_config: None,
+        billing: Some(BillingState::with_provider(
+            provider,
+            WEBHOOK_SECRET.into(),
+            "https://app.sotto.test".into(),
+        )),
     };
     Router::new()
         .merge(sotto_server::billing::router())
@@ -342,6 +401,108 @@ async fn subscription_status_governs_tier() {
 }
 
 #[tokio::test]
+async fn older_subscription_events_cannot_overwrite_newer_tier_state() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    seed_user(&pool, "billing-user-order").await;
+    seed_org(
+        &pool,
+        "billing-org-order",
+        "free",
+        "billing-user-order",
+        "owner",
+    )
+    .await;
+    let app = app(pool.clone(), true);
+    let event = |id: &str, created: i64, status: &str| {
+        serde_json::json!({
+            "id": id,
+            "created": created,
+            "api_version": STRIPE_API_VERSION,
+            "type": "customer.subscription.updated",
+            "data": { "object": {
+                "id": "sub_test_order",
+                "status": status,
+                "metadata": { "org_id": "billing-org-order" },
+            }}
+        })
+        .to_string()
+    };
+
+    let newer = event("evt_order_new", 200, "active");
+    assert_eq!(
+        post_webhook(&app, &newer, Some(&stripe_signature(&newer))).await,
+        StatusCode::OK
+    );
+    let older = event("evt_order_old", 100, "unpaid");
+    assert_eq!(
+        post_webhook(&app, &older, Some(&stripe_signature(&older))).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        org_billing_state(&pool, "billing-org-order").await.0,
+        "team"
+    );
+}
+
+#[tokio::test]
+async fn equal_timestamp_events_reconcile_with_the_provider() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    seed_user(&pool, "billing-user-equal").await;
+    seed_org(
+        &pool,
+        "billing-org-equal",
+        "free",
+        "billing-user-equal",
+        "owner",
+    )
+    .await;
+    let provider = Arc::new(TestProvider {
+        observation: SubscriptionObservation::Current(SubscriptionSnapshot {
+            id: "sub_test_equal".into(),
+            status: SubscriptionStatus::Canceled,
+        }),
+    });
+    let app = app_with_provider(pool.clone(), provider);
+    let event = |id: &str, status: &str| {
+        serde_json::json!({
+            "id": id,
+            "created": 100,
+            "api_version": STRIPE_API_VERSION,
+            "type": "customer.subscription.updated",
+            "data": { "object": {
+                "id": "sub_test_equal",
+                "status": status,
+                "metadata": { "org_id": "billing-org-equal" },
+            }}
+        })
+        .to_string()
+    };
+
+    let first = event("evt_equal_first", "active");
+    assert_eq!(
+        post_webhook(&app, &first, Some(&stripe_signature(&first))).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        org_billing_state(&pool, "billing-org-equal").await.0,
+        "team"
+    );
+    let second = event("evt_equal_second", "active");
+    assert_eq!(
+        post_webhook(&app, &second, Some(&stripe_signature(&second))).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        org_billing_state(&pool, "billing-org-equal").await.0,
+        "free"
+    );
+}
+
+#[tokio::test]
 async fn subscription_deleted_downgrades_via_stored_id() {
     let Some(pool) = pool_or_skip().await else {
         return;
@@ -381,6 +542,141 @@ async fn subscription_deleted_downgrades_via_stored_id() {
     assert_eq!(
         audit_count(&pool, "billing-org-del", "billing.cancelled").await,
         1
+    );
+}
+
+#[tokio::test]
+async fn webhooks_cannot_change_deleting_or_deleted_organisations() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    seed_user(&pool, "billing-user-lifecycle").await;
+    seed_org(
+        &pool,
+        "billing-org-lifecycle",
+        "free",
+        "billing-user-lifecycle",
+        "owner",
+    )
+    .await;
+    sqlx::query(
+        "UPDATE organizations SET lifecycle_state = 'deleting', \
+         stripe_subscription_id = 'sub_test_lifecycle' WHERE id = $1",
+    )
+    .bind("billing-org-lifecycle")
+    .execute(&pool)
+    .await
+    .expect("mark org deleting");
+    let app = app(pool.clone(), true);
+
+    let checkout = serde_json::json!({
+        "id": "evt_lifecycle_checkout",
+        "created": 100,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "client_reference_id": "billing-org-lifecycle",
+            "customer": "cus_lifecycle_new",
+            "subscription": "sub_lifecycle_new"
+        }}
+    })
+    .to_string();
+    let updated = serde_json::json!({
+        "id": "evt_lifecycle_updated",
+        "created": 101,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.updated",
+        "data": { "object": {
+            "id": "sub_test_lifecycle",
+            "status": "active",
+            "metadata": { "org_id": "billing-org-lifecycle" }
+        }}
+    })
+    .to_string();
+    let deleted = serde_json::json!({
+        "id": "evt_lifecycle_deleted",
+        "created": 102,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.deleted",
+        "data": { "object": { "id": "sub_test_lifecycle" } }
+    })
+    .to_string();
+    for payload in [&checkout, &updated, &deleted] {
+        assert_eq!(
+            post_webhook(&app, payload, Some(&stripe_signature(payload))).await,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        org_billing_state(&pool, "billing-org-lifecycle").await,
+        ("free".into(), None, Some("sub_test_lifecycle".into()))
+    );
+
+    sqlx::query(
+        "UPDATE organizations SET lifecycle_state = 'deleted', deleted_at = now(), \
+         enc_name = NULL, tier = 'free', stripe_customer_id = NULL, \
+         stripe_subscription_id = NULL WHERE id = $1",
+    )
+    .bind("billing-org-lifecycle")
+    .execute(&pool)
+    .await
+    .expect("mark org deleted");
+    let late = serde_json::json!({
+        "id": "evt_lifecycle_late",
+        "created": 103,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "client_reference_id": "billing-org-lifecycle",
+            "customer": "cus_late",
+            "subscription": "sub_late"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &late, Some(&stripe_signature(&late))).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        org_billing_state(&pool, "billing-org-lifecycle").await,
+        ("free".into(), None, None)
+    );
+}
+
+#[tokio::test]
+async fn webhook_api_version_mismatch_fails_closed() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    seed_user(&pool, "billing-user-version").await;
+    seed_org(
+        &pool,
+        "billing-org-version",
+        "free",
+        "billing-user-version",
+        "owner",
+    )
+    .await;
+    let app = app(pool.clone(), true);
+    let payload = serde_json::json!({
+        "id": "evt_version_mismatch",
+        "created": 100,
+        "api_version": "2025-01-01",
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "client_reference_id": "billing-org-version",
+            "customer": "cus_version",
+            "subscription": "sub_version"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        org_billing_state(&pool, "billing-org-version").await,
+        ("free".into(), None, None)
     );
 }
 
