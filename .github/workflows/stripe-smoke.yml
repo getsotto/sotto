@@ -173,11 +173,7 @@ jobs:
           org_id="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("e2e/.fixture.json", "utf8")).org_id)')"
           subscriptions_file="$RUNNER_TEMP/stripe-subscriptions.json"
           matches_file="$RUNNER_TEMP/stripe-subscription-matches.tsv"
-          all_subscriptions_file="$RUNNER_TEMP/stripe-all-subscriptions.tsv"
-          customers_file="$RUNNER_TEMP/stripe-customers.txt"
           : > "$matches_file"
-          : > "$all_subscriptions_file"
-          : > "$customers_file"
           starting_after=""
 
           # Search Stripe metadata as well as Postgres: a webhook can fail after Checkout creates a
@@ -201,19 +197,15 @@ jobs:
                 --output "$subscriptions_file"
             fi
 
-            node - "$org_id" "$subscriptions_file" "$matches_file" "$all_subscriptions_file" <<'NODE'
+            node - "$org_id" "$subscriptions_file" "$matches_file" <<'NODE'
           const fs = require("node:fs");
-          const [orgId, file, matchesFile, allFile] = process.argv.slice(2);
+          const [orgId, file, matchesFile] = process.argv.slice(2);
           const payload = JSON.parse(fs.readFileSync(file, "utf8"));
           for (const subscription of payload.data ?? []) {
             if (subscription.status === "canceled") continue;
-            const customer = typeof subscription.customer === "string" ? subscription.customer : "";
             const subscriptionOrg = subscription.metadata?.org_id ?? "";
-            if (customer) {
-              fs.appendFileSync(allFile, `${subscription.id}\t${customer}\t${subscriptionOrg}\n`);
-            }
             if (subscriptionOrg === orgId) {
-              fs.appendFileSync(matchesFile, `${subscription.id}\t${customer}\n`);
+              fs.appendFileSync(matchesFile, `${subscription.id}\n`);
             }
           }
           NODE
@@ -235,7 +227,7 @@ jobs:
           done
 
           cleanup_failed=0
-          while IFS="$(printf '\t')" read -r subscription_id customer_id; do
+          while read -r subscription_id; do
             [ -n "$subscription_id" ] || continue
             if ! curl --fail --silent --show-error --user "$STRIPE_API_KEY:" \
               --request DELETE "https://api.stripe.com/v1/subscriptions/$subscription_id" \
@@ -243,29 +235,10 @@ jobs:
               echo "warning: could not cancel Stripe subscription $subscription_id" >&2
               cleanup_failed=1
             fi
-            if [ -n "$customer_id" ]; then
-              printf '%s\n' "$customer_id" >> "$customers_file"
-            fi
           done < "$matches_file"
-
-          if [ -s "$customers_file" ]; then
-            while read -r customer_id; do
-              # Customer deletion cancels every active subscription on that customer. Skip a
-              # customer with another organisation's active subscription instead of affecting it.
-              if awk -F '\t' -v customer="$customer_id" -v org="$org_id" \
-                '$2 == customer && $3 != org { found = 1; exit } END { exit found ? 0 : 1 }' \
-                "$all_subscriptions_file"; then
-                echo "warning: leaving shared Stripe customer $customer_id in place" >&2
-                continue
-              fi
-              if ! curl --fail --silent --show-error --user "$STRIPE_API_KEY:" \
-                --request DELETE "https://api.stripe.com/v1/customers/$customer_id" \
-                >/dev/null; then
-                echo "warning: could not remove Stripe customer $customer_id" >&2
-                cleanup_failed=1
-              fi
-            done < <(sort -u "$customers_file")
-          fi
+          # The restricted production key deliberately has Customers read but not write access.
+          # Keep generated customers as the billing contract requires; only subscriptions are
+          # cancelled by this cleanup.
           if [ "$cleanup_failed" -ne 0 ]; then
             echo "error: one or more Stripe cleanup requests failed" >&2
             exit 1
