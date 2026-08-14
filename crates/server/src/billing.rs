@@ -706,15 +706,17 @@ async fn stripe_response(response: reqwest::Response) -> ProviderResult<serde_js
         .text()
         .await
         .map_err(|_| ProviderError::transport())?;
+    if status >= 400 {
+        let code = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value["error"]["code"].as_str().map(str::to_string));
+        return Err(ProviderError::http(status, code));
+    }
     let value = if body.trim().is_empty() {
         serde_json::Value::Null
     } else {
         serde_json::from_str(&body).map_err(|_| ProviderError::malformed_response())?
     };
-    if status >= 400 {
-        let code = value["error"]["code"].as_str().map(str::to_string);
-        return Err(ProviderError::http(status, code));
-    }
     Ok(value)
 }
 
@@ -792,6 +794,53 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
 
     let object = &event.data.object;
     let subscription_id = event_subscription_id(&event);
+    if disposition == EventDisposition::Reconcile {
+        tx.commit().await?;
+        let subscription_id = subscription_id.ok_or_else(|| {
+            Error::Config("stripe reconciliation event has no subscription id".into())
+        })?;
+        let observation = billing
+            .provider
+            .get_subscription(&subscription_id)
+            .await
+            .map_err(ProviderError::into_error)?;
+
+        let mut tx = state.pool.begin().await?;
+        lock_subscription(&mut tx, &subscription_id).await?;
+        let processed: bool = sqlx::query_scalar(
+            "SELECT processed_at IS NOT NULL FROM stripe_webhook_events WHERE event_id = $1",
+        )
+        .bind(&event.id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if processed {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let watermark: Option<i64> = sqlx::query_scalar(
+            "SELECT stripe_created FROM stripe_subscription_watermarks \
+             WHERE subscription_id = $1",
+        )
+        .bind(&subscription_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if watermark.is_some_and(|created| created > event.created) {
+            mark_webhook_event_processed(&mut tx, &event.id).await?;
+        } else {
+            reconcile_subscription(
+                &mut tx,
+                observation,
+                &subscription_id,
+                event_org_hint(&event),
+            )
+            .await?;
+            update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+            mark_webhook_event_processed(&mut tx, &event.id).await?;
+        }
+        tx.commit().await?;
+        return Ok(());
+    }
+
     match disposition {
         EventDisposition::Apply => match event.kind.as_str() {
             "checkout.session.completed" => checkout_completed(&mut tx, object).await?,
@@ -799,22 +848,13 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
             _ => {}
         },
-        EventDisposition::Reconcile => {
-            if let Some(subscription_id) = subscription_id.as_deref() {
-                reconcile_subscription(
-                    &mut tx,
-                    billing.provider.as_ref(),
-                    subscription_id,
-                    event_org_hint(&event),
-                )
-                .await?;
-            }
-        }
+        EventDisposition::Reconcile => unreachable!(),
         EventDisposition::Ignore => unreachable!(),
     }
     if let Some(subscription_id) = subscription_id {
         update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
     }
+    mark_webhook_event_processed(&mut tx, &event.id).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -831,6 +871,9 @@ async fn record_webhook_event(
     event: &Event,
 ) -> Result<EventDisposition> {
     let subscription_id = event_subscription_id(event);
+    if let Some(subscription_id) = subscription_id.as_deref() {
+        lock_subscription(tx, subscription_id).await?;
+    }
     let inserted = sqlx::query(
         "INSERT INTO stripe_webhook_events (event_id, event_type, stripe_created, subscription_id) \
          VALUES ($1, $2, $3, $4) ON CONFLICT (event_id) DO NOTHING",
@@ -843,24 +886,57 @@ async fn record_webhook_event(
     .await?
     .rows_affected();
     if inserted == 0 {
-        return Ok(EventDisposition::Ignore);
+        let processed: bool = sqlx::query_scalar(
+            "SELECT processed_at IS NOT NULL FROM stripe_webhook_events WHERE event_id = $1",
+        )
+        .bind(&event.id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if processed {
+            return Ok(EventDisposition::Ignore);
+        }
     }
 
     let Some(subscription_id) = subscription_id else {
         return Ok(EventDisposition::Apply);
     };
-    let watermark: Option<(i64, String)> = sqlx::query_as(
-        "SELECT stripe_created, event_id FROM stripe_subscription_watermarks \
+    let watermark: Option<i64> = sqlx::query_scalar(
+        "SELECT stripe_created FROM stripe_subscription_watermarks \
          WHERE subscription_id = $1 FOR UPDATE",
     )
     .bind(&subscription_id)
     .fetch_optional(&mut **tx)
     .await?;
     Ok(match watermark {
-        Some((created, _)) if event.created < created => EventDisposition::Ignore,
-        Some((created, _)) if event.created == created => EventDisposition::Reconcile,
+        Some(created) if event.created < created => {
+            mark_webhook_event_processed(tx, &event.id).await?;
+            EventDisposition::Ignore
+        }
+        Some(created) if event.created == created => EventDisposition::Reconcile,
         _ => EventDisposition::Apply,
     })
+}
+
+async fn lock_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    subscription_id: &str,
+) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(subscription_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn mark_webhook_event_processed(
+    tx: &mut Transaction<'_, Postgres>,
+    event_id: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE stripe_webhook_events SET processed_at = now() WHERE event_id = $1")
+        .bind(event_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 async fn update_subscription_watermark(
@@ -955,11 +1031,17 @@ async fn subscription_updated(
     let Some(org_id) = org_for_subscription(tx, object).await? else {
         return Ok(());
     };
-    let status = object["status"].as_str().unwrap_or_default();
+    let status = object["status"]
+        .as_str()
+        .ok_or_else(|| Error::Config("stripe subscription event has no status".into()))?;
+    let parsed_status = SubscriptionStatus::parse(status);
+    if matches!(&parsed_status, SubscriptionStatus::Unknown(_)) {
+        return Err(Error::Config("unknown stripe subscription status".into()));
+    }
     let tier = if ACTIVE_STATUSES.contains(&status) {
         "team"
     } else {
-        "free"
+        parsed_status.entitlement_tier()
     };
 
     let changed = sqlx::query(
@@ -1025,7 +1107,7 @@ async fn subscription_deleted(
 /// object instead of letting arrival order decide the entitlement.
 async fn reconcile_subscription(
     tx: &mut Transaction<'_, Postgres>,
-    provider: &dyn SubscriptionProvider,
+    observation: SubscriptionObservation,
     subscription_id: &str,
     org_hint: Option<&str>,
 ) -> Result<()> {
@@ -1041,10 +1123,6 @@ async fn reconcile_subscription(
     let Some(org_id) = org_id else {
         return Ok(());
     };
-    let observation = provider
-        .get_subscription(subscription_id)
-        .await
-        .map_err(ProviderError::into_error)?;
     let (tier, linked_subscription) = match observation {
         SubscriptionObservation::Current(snapshot) => {
             (snapshot.status.entitlement_tier(), Some(snapshot.id))
