@@ -24,3 +24,8 @@ CREATE TABLE stripe_subscription_watermarks (
         REFERENCES stripe_webhook_events (event_id) ON DELETE RESTRICT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Pruning uses processed_at while preserving rows referenced by the ordering watermark.
+CREATE INDEX stripe_webhook_events_processed_idx
+    ON stripe_webhook_events (processed_at)
+    WHERE processed_at IS NOT NULL;

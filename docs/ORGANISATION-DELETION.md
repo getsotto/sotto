@@ -441,6 +441,9 @@ request-log and API-version view, must show the pinned version for both applicat
 webhook deliveries before that change is enabled. Rollout pins the endpoint first, deploys the
 matching parser, verifies delivered events, and only then enables deletion. After enablement, a
 version mismatch is an operator incident and remains fail closed rather than becoming a retry.
+Processed webhook receipts are retained for 30 days; daily request-time pruning deletes older
+processed rows unless an ordering watermark still references them. The `processed_at` index keeps
+this bounded cleanup from scanning pending receipts.
 
 Hosted and production deployments use a restricted Stripe API key (`rk_`), supplied as
 `STRIPE_API_KEY`, instead of an unrestricted `STRIPE_SECRET_KEY`. The intended permissions are

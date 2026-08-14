@@ -796,6 +796,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     }
 
     let mut tx = state.pool.begin().await?;
+    prune_webhook_events(&mut tx).await?;
     let disposition = record_webhook_event(&mut tx, &event).await?;
     if disposition == EventDisposition::Ignore {
         tx.commit().await?;
@@ -934,6 +935,19 @@ async fn record_webhook_receipt(tx: &mut Transaction<'_, Postgres>, event: &Even
     .rows_affected()
         == 1;
     Ok(inserted)
+}
+
+async fn prune_webhook_events(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM stripe_webhook_events e
+         WHERE e.processed_at < now() - interval '30 days'
+           AND NOT EXISTS (
+               SELECT 1 FROM stripe_subscription_watermarks w WHERE w.event_id = e.event_id
+           )",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn lock_subscription(
