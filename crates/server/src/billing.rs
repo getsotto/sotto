@@ -1271,4 +1271,73 @@ mod tests {
         let header = format!("t=1000,v1={}", "zz".repeat(32)); // non-hex
         assert!(!verify_signature("whsec_x", &header, "{}", 1000));
     }
+
+    #[test]
+    fn subscription_statuses_use_the_deletion_gate_not_entitlement_status() {
+        let statuses = [
+            ("active", PurgeGate::Blocking),
+            ("trialing", PurgeGate::Blocking),
+            ("past_due", PurgeGate::Blocking),
+            ("incomplete", PurgeGate::Blocking),
+            ("paused", PurgeGate::Blocking),
+            ("unpaid", PurgeGate::Blocking),
+            ("canceled", PurgeGate::Terminal),
+            ("incomplete_expired", PurgeGate::Terminal),
+            ("future_status", PurgeGate::Unknown),
+        ];
+        for (status, expected) in statuses {
+            assert_eq!(SubscriptionStatus::parse(status).purge_gate(), expected);
+        }
+        assert_eq!(
+            SubscriptionStatus::parse("unpaid").entitlement_tier(),
+            "free"
+        );
+        assert_eq!(
+            SubscriptionStatus::parse("past_due").entitlement_tier(),
+            "team"
+        );
+    }
+
+    #[test]
+    fn provider_errors_keep_status_and_code_for_retry_policy() {
+        let cases = [
+            (401, None, ProviderErrorKind::Authentication),
+            (
+                403,
+                Some("invalid_api_key"),
+                ProviderErrorKind::Authentication,
+            ),
+            (
+                404,
+                Some("resource_missing"),
+                ProviderErrorKind::ResourceMissing,
+            ),
+            (429, Some("rate_limit_error"), ProviderErrorKind::Retryable),
+            (500, Some("api_error"), ProviderErrorKind::Retryable),
+            (
+                400,
+                Some("invalid_request_error"),
+                ProviderErrorKind::Unknown,
+            ),
+        ];
+        for (status, code, kind) in cases {
+            let error = ProviderError::http(status, code.map(str::to_string));
+            assert_eq!(error.status, Some(status));
+            assert_eq!(error.kind, kind);
+        }
+        assert_eq!(
+            ProviderError::transport().kind,
+            ProviderErrorKind::Retryable
+        );
+    }
+
+    #[test]
+    fn cancellation_form_is_explicit_and_traceable() {
+        let form = cancellation_form("org-123");
+        assert!(form.contains(&("invoice_now".into(), "false".into())));
+        assert!(form.contains(&("prorate".into(), "false".into())));
+        assert!(form.iter().any(|(key, value)| {
+            key == "cancellation_details[comment]" && value.contains("org-123")
+        }));
+    }
 }

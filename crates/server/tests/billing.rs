@@ -11,7 +11,7 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 
 use sotto_server::auth::session;
-use sotto_server::billing::BillingState;
+use sotto_server::billing::{BillingState, STRIPE_API_VERSION};
 use sotto_server::config::BillingConfig;
 use sotto_server::db;
 use sotto_server::state::AppState;
@@ -234,6 +234,9 @@ async fn checkout_completed_grants_team_and_audits_once() {
     let app = app(pool.clone(), true);
 
     let payload = serde_json::json!({
+        "id": "evt_checkout_1",
+        "created": 100,
+        "api_version": STRIPE_API_VERSION,
         "type": "checkout.session.completed",
         "data": { "object": {
             "client_reference_id": "billing-org-co",
@@ -284,8 +287,11 @@ async fn subscription_status_governs_tier() {
     .await;
     let app = app(pool.clone(), true);
 
-    let event = |status: &str| {
+    let event = |id: &str, created: i64, status: &str| {
         serde_json::json!({
+            "id": id,
+            "created": created,
+            "api_version": STRIPE_API_VERSION,
             "type": "customer.subscription.updated",
             "data": { "object": {
                 "id": "sub_test_status",
@@ -296,7 +302,7 @@ async fn subscription_status_governs_tier() {
         .to_string()
     };
 
-    let active = event("active");
+    let active = event("evt_status_active", 100, "active");
     assert_eq!(
         post_webhook(&app, &active, Some(&stripe_signature(&active))).await,
         StatusCode::OK
@@ -307,7 +313,7 @@ async fn subscription_status_governs_tier() {
     );
 
     // Dunning keeps the lights on…
-    let past_due = event("past_due");
+    let past_due = event("evt_status_past_due", 101, "past_due");
     assert_eq!(
         post_webhook(&app, &past_due, Some(&stripe_signature(&past_due))).await,
         StatusCode::OK
@@ -318,7 +324,7 @@ async fn subscription_status_governs_tier() {
     );
 
     // …but a lost subscription does not.
-    let unpaid = event("unpaid");
+    let unpaid = event("evt_status_unpaid", 102, "unpaid");
     assert_eq!(
         post_webhook(&app, &unpaid, Some(&stripe_signature(&unpaid))).await,
         StatusCode::OK
@@ -358,6 +364,9 @@ async fn subscription_deleted_downgrades_via_stored_id() {
 
     // No metadata on this event - the org must be found via the stored subscription id.
     let payload = serde_json::json!({
+        "id": "evt_deleted_1",
+        "created": 100,
+        "api_version": STRIPE_API_VERSION,
         "type": "customer.subscription.deleted",
         "data": { "object": { "id": "sub_test_del" } }
     })
@@ -382,6 +391,9 @@ async fn unhandled_events_are_acknowledged() {
     };
     let app = app(pool, true);
     let payload = serde_json::json!({
+        "id": "evt_invoice_1",
+        "created": 100,
+        "api_version": STRIPE_API_VERSION,
         "type": "invoice.created",
         "data": { "object": {} }
     })
