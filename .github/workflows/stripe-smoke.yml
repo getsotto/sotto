@@ -236,7 +236,7 @@ jobs:
               cleanup_failed=1
             fi
           done < "$matches_file"
-          # The restricted production key deliberately has Customers read but not write access.
+          # The restricted test key deliberately has Customers read but not write access.
           # Keep generated customers as the billing contract requires; only subscriptions are
           # cancelled by this cleanup.
           if [ "$cleanup_failed" -ne 0 ]; then

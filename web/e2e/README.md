@@ -90,8 +90,8 @@ access it. Add these environment secrets:
 | `STRIPE_API_KEY` | A Stripe test-mode restricted key beginning with `rk_test_` |
 | `STRIPE_TEST_PRICE_ID` | A recurring test-mode Price id used by Sotto Checkout |
 
-The Price must belong to the same Stripe test account as the secret key. Do not add live keys or
-real payment details. The workflow rejects a key that does not begin with `sk_test_`.
+The Price must belong to the same Stripe test account as the API key. Do not add live keys or
+real payment details. The workflow rejects a key that does not begin with `rk_test_`.
 
 To run it, open **Actions -> Stripe smoke**, choose **Run workflow** on `main`, and approve the
 `stripe-smoke` environment when prompted. The workflow starts fresh Postgres, builds the web app,
