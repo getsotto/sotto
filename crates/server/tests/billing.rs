@@ -1,6 +1,6 @@
 //! Billing integration tests: webhook signature enforcement, tier assignment, idempotency, and
-//! the configuration/role gates. DB-gated like the other server tests; no test ever calls the
-//! real Stripe API (the only handler paths exercised return before any outbound request).
+//! the configuration/role gates. DB-gated like the other server tests; provider calls use the
+//! in-memory adapter and no test calls the real Stripe API.
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -686,6 +686,130 @@ async fn webhook_api_version_mismatch_is_recorded_and_ignored() {
     .await
     .expect("read mismatched webhook receipt");
     assert!(processed);
+}
+
+#[tokio::test]
+async fn webhook_missing_api_version_is_recorded_and_ignored() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    seed_user(&pool, "billing-user-missing-version").await;
+    seed_org(
+        &pool,
+        "billing-org-missing-version",
+        "free",
+        "billing-user-missing-version",
+        "owner",
+    )
+    .await;
+    let app = app(pool.clone(), true);
+    let payload = serde_json::json!({
+        "id": "evt_missing_version",
+        "created": 100,
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "client_reference_id": "billing-org-missing-version",
+            "customer": "cus_missing_version",
+            "subscription": "sub_missing_version"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        org_billing_state(&pool, "billing-org-missing-version").await,
+        ("free".into(), None, None)
+    );
+    let receipt: (String, bool) = sqlx::query_as(
+        "SELECT api_version, processed_at IS NOT NULL FROM stripe_webhook_events \
+         WHERE event_id = 'evt_missing_version'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read missing-version receipt");
+    assert_eq!(receipt, ("missing".into(), true));
+}
+
+#[tokio::test]
+async fn unknown_subscription_status_is_acknowledged_without_downgrade() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    seed_user(&pool, "billing-user-unknown-status").await;
+    seed_org(
+        &pool,
+        "billing-org-unknown-status",
+        "team",
+        "billing-user-unknown-status",
+        "owner",
+    )
+    .await;
+    let app = app(pool.clone(), true);
+    let payload = serde_json::json!({
+        "id": "evt_unknown_status",
+        "created": 100,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.updated",
+        "data": { "object": {
+            "id": "sub_unknown_status",
+            "status": "future_status",
+            "metadata": { "org_id": "billing-org-unknown-status" }
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        org_billing_state(&pool, "billing-org-unknown-status")
+            .await
+            .0,
+        "team"
+    );
+}
+
+#[tokio::test]
+async fn webhook_prunes_expired_receipts() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id IN ('evt_old_receipt', 'evt_prune_trigger')")
+        .execute(&pool)
+        .await
+        .expect("clean old receipt fixtures");
+    sqlx::query(
+        "INSERT INTO stripe_webhook_events \
+         (event_id, event_type, api_version, stripe_created, received_at, processed_at) \
+         VALUES ('evt_old_receipt', 'invoice.created', $1, 1, now() - interval '31 days', \
+                 now() - interval '31 days')",
+    )
+    .bind(STRIPE_API_VERSION)
+    .execute(&pool)
+    .await
+    .expect("insert expired receipt");
+    let app = app(pool.clone(), true);
+    let payload = serde_json::json!({
+        "id": "evt_prune_trigger",
+        "created": 100,
+        "api_version": STRIPE_API_VERSION,
+        "type": "invoice.created",
+        "data": { "object": {} }
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::OK
+    );
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM stripe_webhook_events WHERE event_id = 'evt_old_receipt')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("check expired receipt");
+    assert!(!exists);
 }
 
 #[tokio::test]

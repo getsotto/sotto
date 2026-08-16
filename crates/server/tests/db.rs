@@ -4,6 +4,7 @@
 //! (the CI `server` job's Postgres service, or a local `docker compose up`); otherwise it skips,
 //! so `cargo test --workspace` stays DB-free.
 
+use sotto_server::billing::STRIPE_API_VERSION;
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
 use std::str::FromStr;
@@ -108,9 +109,10 @@ async fn billing_webhook_tables_keep_event_ids_and_watermarks() {
     let inserted = sqlx::query(
         "INSERT INTO stripe_webhook_events \
          (event_id, event_type, api_version, stripe_created, subscription_id) \
-         VALUES ('evt-db-order-a', 'customer.subscription.updated', '2026-07-29.dahlia', 10, 'sub-db-order') \
+         VALUES ('evt-db-order-a', 'customer.subscription.updated', $1, 10, 'sub-db-order') \
          ON CONFLICT (event_id) DO NOTHING",
     )
+    .bind(STRIPE_API_VERSION)
     .execute(&pool)
     .await
     .expect("insert webhook event");
@@ -118,9 +120,10 @@ async fn billing_webhook_tables_keep_event_ids_and_watermarks() {
     let duplicate = sqlx::query(
         "INSERT INTO stripe_webhook_events \
          (event_id, event_type, api_version, stripe_created, subscription_id) \
-         VALUES ('evt-db-order-a', 'customer.subscription.updated', '2026-07-29.dahlia', 10, 'sub-db-order') \
+         VALUES ('evt-db-order-a', 'customer.subscription.updated', $1, 10, 'sub-db-order') \
          ON CONFLICT (event_id) DO NOTHING",
     )
+    .bind(STRIPE_API_VERSION)
     .execute(&pool)
     .await
     .expect("deduplicate webhook event");
@@ -129,8 +132,9 @@ async fn billing_webhook_tables_keep_event_ids_and_watermarks() {
     sqlx::query(
         "INSERT INTO stripe_webhook_events \
          (event_id, event_type, api_version, stripe_created, subscription_id) \
-         VALUES ('evt-db-order-b', 'customer.subscription.updated', '2026-07-29.dahlia', 11, 'sub-db-order')",
+         VALUES ('evt-db-order-b', 'customer.subscription.updated', $1, 11, 'sub-db-order')",
     )
+    .bind(STRIPE_API_VERSION)
     .execute(&pool)
     .await
     .expect("insert newer webhook event");
