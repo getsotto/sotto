@@ -111,9 +111,10 @@ jobs:
         run: |
           set -euo pipefail
           listener_log="$RUNNER_TEMP/stripe-listen.log"
+          # Load the registered endpoint so forwarded events use its pinned API version.
           stripe listen \
             --api-key "$STRIPE_API_KEY" \
-            --events checkout.session.completed,customer.subscription.updated,customer.subscription.deleted \
+            --use-configured-webhooks \
             --forward-to "http://127.0.0.1:8099/billing/webhook" \
             >"$listener_log" 2>&1 &
           listener_pid=$!

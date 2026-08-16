@@ -102,12 +102,13 @@ to assign the Team tier. Matching test subscriptions are cancelled at the end, i
 webhook processing failed before Postgres stored an id. Generated customers are retained because
 the restricted key grants Customers read access only.
 
-For a local run, use a fresh Postgres database and the same test-mode values. Start Stripe CLI in
-one shell:
+For a local run, use a fresh Postgres database and the same test-mode values. Pin the registered
+test webhook endpoint to Stripe API version `2026-07-29.dahlia`, then start Stripe CLI in one
+shell using that configured endpoint:
 
 ```sh
 stripe listen --api-key "$STRIPE_API_KEY" \
-  --events checkout.session.completed,customer.subscription.updated,customer.subscription.deleted \
+  --use-configured-webhooks \
   --forward-to http://127.0.0.1:8099/billing/webhook
 ```
 
