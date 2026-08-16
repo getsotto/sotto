@@ -431,9 +431,9 @@ ordinary access resolves as not found.
 All Stripe requests must send `Stripe-Version: 2026-07-29.dahlia`. The version is a source constant,
 not the Stripe account default, because a Dashboard change must not alter payloads that gate data
 destruction. The Stripe webhook endpoint must be configured to emit the same version. The generic
-webhook parser records and acknowledges a mismatched `api_version` without reading or applying its
-object, then alerts an operator. This fails closed for billing and deletion state without causing
-Stripe to retry the same incompatible event forever.
+webhook parser records and acknowledges a mismatched or absent `api_version` without reading or
+applying its object, then logs an operator warning. This fails closed for billing and deletion state
+without causing Stripe to retry the same incompatible event forever.
 
 An API-version upgrade changes the request constant, webhook endpoint, response parser, fixtures,
 and credentialed smoke test together in one reviewed change. Stripe Workbench, the Dashboard's
@@ -441,9 +441,10 @@ request-log and API-version view, must show the pinned version for both applicat
 webhook deliveries before that change is enabled. Rollout pins the endpoint first, deploys the
 matching parser, verifies delivered events, and only then enables deletion. After enablement, a
 version mismatch is an operator incident and remains fail closed rather than becoming a retry.
-Processed webhook receipts are retained for 30 days; request-time pruning deletes older
-processed rows unless an ordering watermark still references them. The `processed_at` index keeps
-this bounded cleanup from scanning pending receipts.
+Processed webhook receipts are retained for 30 days; request-time pruning deletes up to 500 older
+processed rows unless an ordering watermark still references them. Failed reconciliation receipts
+remain eligible after a one-day retry grace period. The processed and pending indexes keep this
+bounded cleanup from scanning unrelated rows.
 
 Hosted and production deployments use a restricted Stripe API key (`rk_`), supplied as
 `STRIPE_API_KEY`, instead of an unrestricted `STRIPE_SECRET_KEY`. The intended permissions are
@@ -457,7 +458,7 @@ vault, never a committed environment file. Migration starts with cataloguing exi
 Workbench, creates a test-mode restricted key with the intended permissions, runs the complete
 billing and deletion suites while watching `stripe logs tail` for `403` responses, then swaps the
 production secret and rotates the old unrestricted key. Permissions are widened only for a
-reviewed, observed call. The checkout and portal implementation use `STRIPE_API_KEY`, and the
+reviewed, observed call. The checkout and portal implementation uses `STRIPE_API_KEY`, and the
 deployment examples pass that restricted key before billing is enabled.
 
 Record user-visible audit events for request, recovery, billing cancellation confirmation,
@@ -561,9 +562,8 @@ Each item is an independently reviewable PR. The route remains absent through it
 2. **Access:** add the shared lifecycle-aware access lookup and freeze every org-scoped write, with
    route-inventory tests.
 3. **Billing:** add `SubscriptionProvider`, pin `Stripe-Version`, preserve structured provider
-   errors, use the restricted `STRIPE_API_KEY`, and add the Stripe
-   cancellation and status adapter, webhook deduplication, and race tests. Do not expose an
-   endpoint.
+   errors, use the restricted `STRIPE_API_KEY`, and add the Stripe cancellation and status adapter,
+   webhook deduplication, and race tests. Do not expose an endpoint.
 4. **Lifecycle:** add request, cancel, leasing, retries, reconciliation, and purge behind internal
    functions with deterministic state-machine and database tests.
 5. **API:** add handlers and response types without registering their routes in the production
