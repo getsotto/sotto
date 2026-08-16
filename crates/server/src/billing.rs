@@ -833,50 +833,27 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     let object = &event.data.object;
     let subscription_id = event_subscription_id(&event);
     if disposition == EventDisposition::Reconcile {
-        tx.commit().await?;
         let subscription_id = subscription_id.ok_or_else(|| {
             Error::Config("stripe reconciliation event has no subscription id".into())
         })?;
+        // Equal-timestamp events must not fetch snapshots concurrently: a slower, older lookup
+        // could otherwise overwrite a newer provider observation after the event tie-break.
+        // Holding this short transaction's advisory lock across the bounded provider call trades
+        // one pool connection for a cross-instance ordering guarantee.
         let observation = billing
             .provider
             .get_subscription(&subscription_id)
             .await
             .map_err(ProviderError::into_error)?;
-
-        let mut tx = state.pool.begin().await?;
-        lock_subscription(&mut tx, &subscription_id).await?;
-        let processed: bool = sqlx::query_scalar(
-            "SELECT processed_at IS NOT NULL FROM stripe_webhook_events WHERE event_id = $1",
+        reconcile_subscription(
+            &mut tx,
+            observation,
+            &subscription_id,
+            event_org_hint(&event),
         )
-        .bind(&event.id)
-        .fetch_one(&mut *tx)
         .await?;
-        if processed {
-            tx.commit().await?;
-            return Ok(());
-        }
-        let watermark: Option<(i64, String)> = sqlx::query_as(
-            "SELECT stripe_created, event_id FROM stripe_subscription_watermarks \
-             WHERE subscription_id = $1",
-        )
-        .bind(&subscription_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if watermark.is_some_and(|(created, event_id)| {
-            created > event.created || (created == event.created && event_id > event.id)
-        }) {
-            mark_webhook_event_processed(&mut tx, &event.id).await?;
-        } else {
-            reconcile_subscription(
-                &mut tx,
-                observation,
-                &subscription_id,
-                event_org_hint(&event),
-            )
-            .await?;
-            update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
-            mark_webhook_event_processed(&mut tx, &event.id).await?;
-        }
+        update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+        mark_webhook_event_processed(&mut tx, &event.id).await?;
         tx.commit().await?;
         return Ok(());
     }

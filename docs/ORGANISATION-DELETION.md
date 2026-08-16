@@ -413,9 +413,11 @@ ordinary access resolves as not found.
 - Workers claim due rows with `FOR UPDATE SKIP LOCKED`, a bounded lease, and a unique worker ID.
 - Deletion workers do not hold a database lock during a Stripe network call. They record the
   expected `state_version`, call the provider, then apply a compare-and-set transition. The
-  user-facing checkout and portal session calls are the deliberate bounded exception: they keep
-  the organisation row lock while Stripe responds so a deletion transition cannot race the billing
-  side effect. That briefly pins a pool connection and serialises writes for that organisation.
+  user-facing checkout and portal session calls are deliberate bounded exceptions: they keep the
+  organisation row lock while Stripe responds so a deletion transition cannot race the billing
+  side effect. Equal-timestamp webhook reconciliation is another exception; it keeps a per-
+  subscription advisory lock while fetching Stripe so concurrent snapshots cannot overwrite one
+  another. These calls briefly pin a pool connection and serialise the affected writes.
 - A lost worker can be replaced after its lease expires. A late worker result with an old version
   is discarded.
 - Provider cancellation is invoked idempotently and status is reconciled afterwards.
