@@ -103,12 +103,12 @@ webhook processing failed before Postgres stored an id. Generated customers are 
 the restricted key grants Customers read access only.
 
 For a local run, use a fresh Postgres database and the same test-mode values. Pin the registered
-test webhook endpoint to Stripe API version `2026-07-29.dahlia`, then start Stripe CLI in one
-shell using that configured endpoint:
+test webhook endpoint and the Stripe test account's default API version to
+`2026-07-29.dahlia`, then start Stripe CLI in one shell:
 
 ```sh
 stripe listen --api-key "$STRIPE_API_KEY" \
-  --use-configured-webhooks \
+  --events checkout.session.completed,customer.subscription.updated,customer.subscription.deleted \
   --forward-to http://127.0.0.1:8099/billing/webhook
 ```
 

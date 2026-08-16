@@ -111,10 +111,11 @@ jobs:
         run: |
           set -euo pipefail
           listener_log="$RUNNER_TEMP/stripe-listen.log"
-          # Load the registered endpoint so forwarded events use its pinned API version.
+          # The Stripe test account default API version is pinned to 2026-07-29.dahlia in
+          # Dashboard configuration; the restricted key must not read webhook endpoint settings.
           stripe listen \
             --api-key "$STRIPE_API_KEY" \
-            --use-configured-webhooks \
+            --events checkout.session.completed,customer.subscription.updated,customer.subscription.deleted \
             --forward-to "http://127.0.0.1:8099/billing/webhook" \
             >"$listener_log" 2>&1 &
           listener_pid=$!
