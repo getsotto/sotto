@@ -674,6 +674,19 @@ async fn finish_retention_reconciliation(
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
+    if row.is_some() && state == DeletionState::Purging {
+        audit::record_tx(
+            &mut tx,
+            &lease.org_id,
+            &lease.worker_id,
+            "org.deletion.purge_started",
+            audit::Context {
+                target: Some(&lease.id),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     tx.commit().await?;
     row.map(|row| view_from_row(&lease.id, row)).transpose()
 }
@@ -692,6 +705,19 @@ async fn enter_purging(pool: &PgPool, lease: &DeletionLease) -> Result<Option<De
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
+    if row.is_some() {
+        audit::record_tx(
+            &mut tx,
+            &lease.org_id,
+            &lease.worker_id,
+            "org.deletion.purge_started",
+            audit::Context {
+                target: Some(&lease.id),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     tx.commit().await?;
     row.map(|row| view_from_row(&lease.id, row)).transpose()
 }
@@ -721,6 +747,20 @@ async fn finish_billing(
         .bind(&lease.worker_id)
         .fetch_optional(&mut *tx)
         .await?;
+        if row.is_some() {
+            audit::record_tx(
+                &mut tx,
+                &lease.org_id,
+                &lease.worker_id,
+                "org.deletion.billing_cancelled",
+                audit::Context {
+                    target: Some(&lease.id),
+                    detail: Some(billing_state),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
         tx.commit().await?;
         return row.map(|row| view_from_row(&lease.id, row)).transpose();
     }
@@ -784,6 +824,18 @@ async fn finish_recovery(
         .bind(tier)
         .bind(&lease.org_id)
         .execute(&mut *tx)
+        .await?;
+        audit::record_tx(
+            &mut tx,
+            &lease.org_id,
+            &lease.worker_id,
+            "org.deletion.recovery_completed",
+            audit::Context {
+                target: Some(&lease.id),
+                detail: Some(tier),
+                ..Default::default()
+            },
+        )
         .await?;
     }
     tx.commit().await?;
@@ -859,6 +911,20 @@ async fn fail_attempt(
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
+    if row.is_some() {
+        audit::record_tx(
+            &mut tx,
+            &lease.org_id,
+            &lease.worker_id,
+            "org.deletion.failed",
+            audit::Context {
+                target: Some(&lease.id),
+                detail: Some(code),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     tx.commit().await?;
     row.map(|row| view_from_row(&lease.id, row)).transpose()
 }
