@@ -715,7 +715,8 @@ async fn enter_purging(pool: &PgPool, lease: &DeletionLease) -> Result<Option<De
     // rather than the thirty-day-old billing check that made the operation eligible for purge.
     let row: Option<(String, String)> = sqlx::query_as(
         "UPDATE organization_deletions SET state = 'purging', attempt_count = 0, \
-         billing_checked_at = now(), next_attempt_at = NULL, \
+         billing_checked_at = CASE WHEN subscription_id IS NULL THEN now() ELSE billing_checked_at END, \
+         next_attempt_at = NULL, \
          lease_owner = NULL, lease_expires_at = NULL, state_version = state_version + 1 \
          WHERE id = $1::uuid AND state = 'retention' AND purge_after <= now() \
            AND state_version = $2 AND lease_owner = $3 \
