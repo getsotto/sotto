@@ -163,7 +163,7 @@ impl SubscriptionStatus {
         }
     }
 
-    fn entitlement_tier(&self) -> &'static str {
+    pub(crate) fn entitlement_tier(&self) -> &'static str {
         match self {
             Self::Active | Self::Trialing | Self::PastDue => "team",
             _ => "free",

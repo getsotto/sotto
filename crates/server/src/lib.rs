@@ -27,6 +27,9 @@ pub mod entitlements;
 pub mod error;
 pub mod machine;
 pub mod org;
+// The lifecycle seam is intentionally staged before its worker loop and routes are enabled.
+#[allow(dead_code)]
+pub(crate) mod org_deletion;
 pub mod share;
 pub mod state;
 pub mod sync;
