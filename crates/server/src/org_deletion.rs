@@ -549,12 +549,15 @@ pub(crate) async fn record_operator_observation(
     operator: &str,
     observation: OperatorObservation<'_>,
 ) -> Result<DeletionView> {
-    if observation.subscription_id.is_empty()
+    if operator.is_empty()
+        || observation.subscription_id.is_empty()
+        || observation.observed_status.is_empty()
+        || observation.observed_at.is_empty()
         || observation.reason.is_empty()
         || observation.evidence.is_empty()
     {
         return Err(Error::BadRequest(
-            "subscription, reason, and evidence are required".into(),
+            "operator, subscription, status, observed_at, reason, and evidence are required".into(),
         ));
     }
     let gate = if observation.observed_status == "resource_missing" {
@@ -1359,6 +1362,27 @@ mod tests {
             .expect("record unavailable provider")
             .expect("failed transition");
         assert_eq!(failed.state, DeletionState::Failed);
+
+        for (operator, observed_status, observed_at) in [
+            ("", "canceled", "now"),
+            ("operator-1", "", "now"),
+            ("operator-1", "canceled", ""),
+        ] {
+            let result = record_operator_observation(
+                &pool,
+                &org_id,
+                operator,
+                OperatorObservation {
+                    subscription_id: &subscription_id,
+                    observed_status,
+                    observed_at,
+                    reason: "provider credentials are being rotated",
+                    evidence: "stripe-dashboard-request-1",
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(Error::BadRequest(_))));
+        }
 
         let observed = record_operator_observation(
             &pool,
