@@ -376,7 +376,7 @@ pub(crate) async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<D
         "SELECT id::text FROM organization_deletions \
          WHERE (lease_expires_at IS NULL OR lease_expires_at <= now()) \
            AND (\
-             state = 'purging' \
+             (state = 'purging' AND purge_after <= now()) \
              OR (state = 'retention' AND purge_after <= now() \
                  AND (next_attempt_at IS NULL OR next_attempt_at <= now())) \
              OR (state IN ('requested', 'cancelling_billing', 'recovering') \
@@ -398,7 +398,9 @@ pub(crate) async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<D
          SET lease_owner = $1, lease_expires_at = now() + interval '5 minutes', \
              state_version = state_version + 1, \
              attempt_count = attempt_count + CASE \
-                 WHEN state IN ('cancelling_billing', 'recovering') THEN 1 ELSE 0 END \
+                 WHEN state IN ('cancelling_billing', 'recovering') \
+                      OR (state = 'retention' AND subscription_id IS NOT NULL) \
+                 THEN 1 ELSE 0 END \
          WHERE id = $2::uuid \
          RETURNING org_id, state, subscription_id, state_version, attempt_count",
     )
