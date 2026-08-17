@@ -1041,6 +1041,20 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
         .bind(&lease.worker_id)
         .fetch_optional(&mut *tx)
         .await?;
+        if let Some(failed_org_id) = failed.as_deref() {
+            audit::record_tx(
+                &mut tx,
+                failed_org_id,
+                &lease.worker_id,
+                "org.deletion.failed",
+                audit::Context {
+                    target: Some(&lease.id),
+                    detail: Some("purge_precondition_failed"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
         tx.commit().await?;
         return Ok(failed.map(|org_id| DeletionView {
             id: lease.id.clone(),
