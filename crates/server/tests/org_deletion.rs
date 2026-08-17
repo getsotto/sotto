@@ -317,6 +317,10 @@ async fn worker_reconciles_free_deletion_and_purges_tombstone() {
     .await
     .expect("read tombstone");
     assert_eq!(tombstone, ("deleted".into(), true, true));
+    assert_eq!(
+        status(&pool, &org_id, &owner_id).await.unwrap().state,
+        DeletionState::Completed
+    );
     cleanup(&pool, &org_id, &owner_id).await;
 }
 

@@ -270,11 +270,15 @@ pub async fn request(
 
 /// Return an owner's current active deletion attempt without changing its state.
 pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<DeletionView> {
-    let access = org::access(pool, org_id, actor).await?;
-    if access.role() != Role::Owner {
-        return Err(Error::Forbidden(
-            "only an organisation owner may inspect deletion".into(),
-        ));
+    match org::access(pool, org_id, actor).await {
+        Ok(access) if access.role() == Role::Owner => {}
+        Ok(_) => {
+            return Err(Error::Forbidden(
+                "only an organisation owner may inspect deletion".into(),
+            ));
+        }
+        Err(Error::NotFound(_)) => {}
+        Err(error) => return Err(error),
     }
     let row: Option<(String, String)> = sqlx::query_as(
         "SELECT id::text, state FROM organization_deletions \
@@ -284,6 +288,20 @@ pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
     .bind(org_id)
     .fetch_optional(pool)
     .await?;
+    let row = match row {
+        Some(row) => Some(row),
+        None => {
+            sqlx::query_as(
+                "SELECT id::text, state FROM organization_deletions \
+             WHERE org_id = $1 AND requested_by = $2 AND state IN ('cancelled', 'completed') \
+             ORDER BY requested_at DESC LIMIT 1",
+            )
+            .bind(org_id)
+            .bind(actor)
+            .fetch_optional(pool)
+            .await?
+        }
+    };
     let Some((id, state)) = row else {
         return Err(Error::NotFound("deletion not found".into()));
     };
