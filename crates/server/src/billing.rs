@@ -731,7 +731,7 @@ fn subscription_snapshot(
 ) -> ProviderResult<SubscriptionSnapshot> {
     let id = object["id"]
         .as_str()
-        .filter(|id| *id == requested_id)
+        .filter(|&id| id == requested_id)
         .ok_or_else(ProviderError::malformed_response)?;
     let status = object["status"]
         .as_str()
