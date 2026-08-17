@@ -43,8 +43,8 @@ pub struct TelemetryConfig {
 /// - the integration ships dark and is enabled by setting the environment variables.
 #[derive(Debug, Clone)]
 pub struct BillingConfig {
-    /// Secret API key (`sk_test_…` / `sk_live_…`).
-    pub secret_key: String,
+    /// Restricted API key (`rk_test_…` / `rk_live_…`).
+    pub api_key: String,
     /// Webhook signing secret (`whsec_…`) for `POST /billing/webhook`.
     pub webhook_secret: String,
     /// The Price id (`price_…`) of the flat per-org monthly Team subscription.
@@ -114,12 +114,12 @@ impl Config {
         };
 
         let billing = match (
-            env_nonempty("STRIPE_SECRET_KEY"),
+            env_nonempty("STRIPE_API_KEY"),
             env_nonempty("STRIPE_WEBHOOK_SECRET"),
             env_nonempty("STRIPE_PRICE_ID"),
         ) {
-            (Some(secret_key), Some(webhook_secret), Some(price_id)) => Some(BillingConfig {
-                secret_key,
+            (Some(api_key), Some(webhook_secret), Some(price_id)) => Some(BillingConfig {
+                api_key,
                 webhook_secret,
                 price_id,
                 return_url: billing_return_url(&public_base_url, web_origin.as_deref()),

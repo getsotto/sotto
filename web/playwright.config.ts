@@ -55,7 +55,7 @@ export default defineConfig({
         GITHUB_CLIENT_ID: "e2e-mock",
         GITHUB_CLIENT_SECRET: "e2e-mock",
         // These values only turn billing on; e2e-mock-billing prevents any network call to Stripe.
-        STRIPE_SECRET_KEY: "e2e-mock",
+        STRIPE_API_KEY: "rk_test_e2e_mock",
         STRIPE_WEBHOOK_SECRET: "e2e-mock",
         STRIPE_PRICE_ID: "e2e-mock",
         SOTTO_TELEMETRY: "off",

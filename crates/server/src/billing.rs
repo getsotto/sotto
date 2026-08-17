@@ -9,6 +9,7 @@
 //! pattern). Zero-knowledge is unaffected - Stripe learns an org *id* and whatever the payer types
 //! into Stripe's own pages; org names, membership, and vault data never leave the server.
 
+use std::fmt;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{Postgres, Transaction};
 
 #[cfg(feature = "e2e-mock-billing")]
 use url::Url;
@@ -39,29 +40,200 @@ use crate::{audit, org};
 
 /// Reject webhook timestamps further than this from now (replay protection).
 const SIGNATURE_TOLERANCE_SECS: i64 = 300;
-/// Subscription statuses that keep the Team tier. `past_due` stays paid while Stripe retries the
-/// card (dunning) - losing entitlements over a bounced payment is the wrong first touch.
-const ACTIVE_STATUSES: [&str; 3] = ["active", "trialing", "past_due"];
+/// Every Stripe request and webhook fixture uses the same version so response shapes cannot drift
+/// underneath billing or deletion decisions.
+pub const STRIPE_API_VERSION: &str = "2026-07-29.dahlia";
+
+/// Provider failures retain the machine-readable classification needed by retry and deletion
+/// policy. Human-readable provider text never crosses the HTTP or persistence boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderErrorKind {
+    Authentication,
+    ResourceMissing,
+    Retryable,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderError {
+    pub status: Option<u16>,
+    pub code: Option<String>,
+    pub kind: ProviderErrorKind,
+}
+
+impl ProviderError {
+    fn http(status: u16, code: Option<String>) -> Self {
+        let kind = if matches!(status, 401 | 403) {
+            ProviderErrorKind::Authentication
+        } else if code.as_deref() == Some("resource_missing") {
+            ProviderErrorKind::ResourceMissing
+        } else if status == 429
+            || status >= 500
+            || matches!(code.as_deref(), Some("rate_limit_error" | "api_error"))
+        {
+            ProviderErrorKind::Retryable
+        } else {
+            ProviderErrorKind::Unknown
+        };
+        Self {
+            status: Some(status),
+            code,
+            kind,
+        }
+    }
+
+    fn transport() -> Self {
+        Self {
+            status: None,
+            code: Some("transport_error".into()),
+            kind: ProviderErrorKind::Retryable,
+        }
+    }
+
+    fn malformed_response() -> Self {
+        Self {
+            status: None,
+            code: Some("malformed_response".into()),
+            kind: ProviderErrorKind::Unknown,
+        }
+    }
+
+    #[cfg(feature = "e2e-mock-billing")]
+    fn unsupported(operation: &str) -> Self {
+        Self {
+            status: None,
+            code: Some(format!("unsupported_{operation}")),
+            kind: ProviderErrorKind::Unknown,
+        }
+    }
+
+    fn into_error(self) -> Error {
+        let detail = self.code.unwrap_or_else(|| "unknown_error".into());
+        Error::Upstream(format!("stripe provider error: {detail}"))
+    }
+}
+
+impl fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let code = self.code.as_deref().unwrap_or("unknown_error");
+        match self.status {
+            Some(status) => write!(f, "stripe {status} {code}"),
+            None => write!(f, "stripe {code}"),
+        }
+    }
+}
+
+pub type ProviderResult<T> = std::result::Result<T, ProviderError>;
+
+/// Stripe subscription states are deliberately separate from entitlement states. A status that is
+/// free for the product can still be resumable at Stripe and therefore must block a purge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubscriptionStatus {
+    Active,
+    Trialing,
+    PastDue,
+    Incomplete,
+    Paused,
+    Unpaid,
+    Canceled,
+    IncompleteExpired,
+    Unknown(String),
+}
+
+impl SubscriptionStatus {
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "active" => Self::Active,
+            "trialing" => Self::Trialing,
+            "past_due" => Self::PastDue,
+            "incomplete" => Self::Incomplete,
+            "paused" => Self::Paused,
+            "unpaid" => Self::Unpaid,
+            "canceled" => Self::Canceled,
+            "incomplete_expired" => Self::IncompleteExpired,
+            other => Self::Unknown(other.to_string()),
+        }
+    }
+
+    pub fn purge_gate(&self) -> PurgeGate {
+        match self {
+            Self::Canceled | Self::IncompleteExpired => PurgeGate::Terminal,
+            Self::Unknown(_) => PurgeGate::Unknown,
+            _ => PurgeGate::Blocking,
+        }
+    }
+
+    fn entitlement_tier(&self) -> &'static str {
+        match self {
+            Self::Active | Self::Trialing | Self::PastDue => "team",
+            _ => "free",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PurgeGate {
+    Blocking,
+    Terminal,
+    Missing,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionSnapshot {
+    pub id: String,
+    pub status: SubscriptionStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubscriptionObservation {
+    Current(SubscriptionSnapshot),
+    Missing,
+}
+
+impl SubscriptionObservation {
+    pub fn purge_gate(&self) -> PurgeGate {
+        match self {
+            Self::Current(snapshot) => snapshot.status.purge_gate(),
+            Self::Missing => PurgeGate::Missing,
+        }
+    }
+}
 
 /// The small interface between billing handlers and an external payment provider.
 #[async_trait]
-pub trait BillingProvider: Send + Sync {
+pub trait SubscriptionProvider: Send + Sync {
     async fn create_checkout(
         &self,
         org_id: &str,
         customer: Option<&str>,
         success_url: &str,
         cancel_url: &str,
-    ) -> Result<String>;
+    ) -> ProviderResult<String>;
 
-    async fn create_portal(&self, customer: &str, return_url: &str) -> Result<String>;
+    async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String>;
+
+    async fn get_subscription(
+        &self,
+        subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation>;
+
+    async fn cancel_subscription(
+        &self,
+        subscription_id: &str,
+        idempotency_key: &str,
+        org_id: &str,
+    ) -> ProviderResult<SubscriptionObservation>;
 }
+
+/// Compatibility name for callers that still refer to the pre-provider billing trait.
+pub use SubscriptionProvider as BillingProvider;
 
 /// Billing resources shared by handlers. The provider is swappable for the browser E2E build,
 /// while webhook verification keeps its own secret regardless of which checkout adapter runs.
 #[derive(Clone)]
 pub struct BillingState {
-    provider: Arc<dyn BillingProvider>,
+    provider: Arc<dyn SubscriptionProvider>,
     webhook_secret: String,
     return_url: String,
 }
@@ -69,13 +241,25 @@ pub struct BillingState {
 impl BillingState {
     pub fn from_config(config: BillingConfig) -> Self {
         let provider = StripeBilling {
-            secret_key: config.secret_key.clone(),
+            api_key: config.api_key.clone(),
             price_id: config.price_id,
         };
         Self {
             provider: Arc::new(provider),
             webhook_secret: config.webhook_secret,
             return_url: config.return_url,
+        }
+    }
+
+    pub fn with_provider(
+        provider: Arc<dyn SubscriptionProvider>,
+        webhook_secret: String,
+        return_url: String,
+    ) -> Self {
+        Self {
+            provider,
+            webhook_secret,
+            return_url,
         }
     }
 
@@ -90,19 +274,19 @@ impl BillingState {
 }
 
 struct StripeBilling {
-    secret_key: String,
+    api_key: String,
     price_id: String,
 }
 
 #[async_trait]
-impl BillingProvider for StripeBilling {
+impl SubscriptionProvider for StripeBilling {
     async fn create_checkout(
         &self,
         org_id: &str,
         customer: Option<&str>,
         success_url: &str,
         cancel_url: &str,
-    ) -> Result<String> {
+    ) -> ProviderResult<String> {
         let mut form = vec![
             ("mode".to_string(), "subscription".to_string()),
             ("line_items[0][price]".to_string(), self.price_id.clone()),
@@ -121,23 +305,70 @@ impl BillingProvider for StripeBilling {
             form.push(("customer".to_string(), customer.to_string()));
         }
 
-        let session = stripe_post(&self.secret_key, "checkout/sessions", &form).await?;
+        let session = stripe_post(&self.api_key, "checkout/sessions", &form).await?;
         session["url"]
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| Error::Upstream("stripe checkout session had no url".into()))
+            .ok_or_else(ProviderError::malformed_response)
     }
 
-    async fn create_portal(&self, customer: &str, return_url: &str) -> Result<String> {
+    async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String> {
         let form = vec![
             ("customer".to_string(), customer.to_string()),
             ("return_url".to_string(), return_url.to_string()),
         ];
-        let session = stripe_post(&self.secret_key, "billing_portal/sessions", &form).await?;
+        let session = stripe_post(&self.api_key, "billing_portal/sessions", &form).await?;
         session["url"]
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| Error::Upstream("stripe portal session had no url".into()))
+            .ok_or_else(ProviderError::malformed_response)
+    }
+
+    async fn get_subscription(
+        &self,
+        subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        let path = format!("subscriptions/{subscription_id}");
+        match stripe_get(&self.api_key, &path).await {
+            Ok(subscription) => Ok(SubscriptionObservation::Current(subscription_snapshot(
+                &subscription,
+                subscription_id,
+            )?)),
+            Err(error) if error.kind == ProviderErrorKind::ResourceMissing => {
+                Ok(SubscriptionObservation::Missing)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn cancel_subscription(
+        &self,
+        subscription_id: &str,
+        idempotency_key: &str,
+        org_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        let current = self.get_subscription(subscription_id).await?;
+        let SubscriptionObservation::Current(snapshot) = current else {
+            return Ok(SubscriptionObservation::Missing);
+        };
+        // Terminal and missing snapshots already satisfy the purge gate; only a blocking
+        // subscription needs the destructive provider call.
+        if !matches!(snapshot.status.purge_gate(), PurgeGate::Blocking) {
+            return Ok(SubscriptionObservation::Current(snapshot));
+        }
+
+        let form = cancellation_form(org_id);
+        // Stripe may accept the cancellation while the request times out. A fresh lookup is the
+        // source of truth, so a successful terminal observation wins over the original error.
+        let cancellation = stripe_delete(
+            &self.api_key,
+            &format!("subscriptions/{subscription_id}"),
+            idempotency_key,
+            &form,
+        )
+        .await;
+        let fresh = self.get_subscription(subscription_id).await;
+        cancellation_outcome(cancellation.map(|_| ()), fresh)
     }
 }
 
@@ -148,33 +379,49 @@ struct E2eBilling {
 
 #[cfg(feature = "e2e-mock-billing")]
 #[async_trait]
-impl BillingProvider for E2eBilling {
+impl SubscriptionProvider for E2eBilling {
     async fn create_checkout(
         &self,
         _org_id: &str,
         _customer: Option<&str>,
         success_url: &str,
         cancel_url: &str,
-    ) -> Result<String> {
+    ) -> ProviderResult<String> {
         self.page_url(
             "checkout",
             &[("success_url", success_url), ("cancel_url", cancel_url)],
         )
     }
 
-    async fn create_portal(&self, _customer: &str, return_url: &str) -> Result<String> {
+    async fn create_portal(&self, _customer: &str, return_url: &str) -> ProviderResult<String> {
         self.page_url("portal", &[("return_url", return_url)])
+    }
+
+    async fn get_subscription(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Err(ProviderError::unsupported("subscription_lookup"))
+    }
+
+    async fn cancel_subscription(
+        &self,
+        _subscription_id: &str,
+        _idempotency_key: &str,
+        _org_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Err(ProviderError::unsupported("subscription_cancellation"))
     }
 }
 
 #[cfg(feature = "e2e-mock-billing")]
 impl E2eBilling {
-    fn page_url(&self, page: &str, params: &[(&str, &str)]) -> Result<String> {
+    fn page_url(&self, page: &str, params: &[(&str, &str)]) -> ProviderResult<String> {
         let base = format!(
             "{}/e2e/billing/{page}",
             self.provider_origin.trim_end_matches('/')
         );
-        let mut url = Url::parse(&base).map_err(|e| Error::Config(e.to_string()))?;
+        let mut url = Url::parse(&base).map_err(|_| ProviderError::malformed_response())?;
         url.query_pairs_mut().extend_pairs(params.iter().copied());
         Ok(url.to_string())
     }
@@ -251,7 +498,8 @@ async fn create_checkout(
     let url = billing
         .provider
         .create_checkout(&org_id, customer.as_deref(), &success_url, &cancel_url)
-        .await?;
+        .await
+        .map_err(ProviderError::into_error)?;
     tx.commit().await?;
     Ok(Json(RedirectView { url }))
 }
@@ -284,7 +532,8 @@ async fn create_portal(
     let url = billing
         .provider
         .create_portal(&customer, &app_url(&billing.return_url))
-        .await?;
+        .await
+        .map_err(ProviderError::into_error)?;
     tx.commit().await?;
     Ok(Json(RedirectView { url }))
 }
@@ -394,31 +643,131 @@ fn stripe_client() -> &'static reqwest::Client {
     })
 }
 
+fn stripe_headers(idempotency_key: Option<&str>) -> ProviderResult<reqwest::header::HeaderMap> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "Stripe-Version",
+        reqwest::header::HeaderValue::from_static(STRIPE_API_VERSION),
+    );
+    if let Some(idempotency_key) = idempotency_key {
+        let value = reqwest::header::HeaderValue::from_str(idempotency_key)
+            .map_err(|_| ProviderError::malformed_response())?;
+        headers.insert("Idempotency-Key", value);
+    }
+    Ok(headers)
+}
+
 /// One form-encoded call to the Stripe API.
 async fn stripe_post(
-    secret_key: &str,
+    api_key: &str,
     path: &str,
     form: &[(String, String)],
-) -> Result<serde_json::Value> {
+) -> ProviderResult<serde_json::Value> {
     let response = stripe_client()
         .post(format!("https://api.stripe.com/v1/{path}"))
-        .bearer_auth(secret_key)
+        .bearer_auth(api_key)
+        .headers(stripe_headers(None)?)
         .form(form)
         .send()
         .await
-        .map_err(|e| Error::Upstream(format!("stripe: {e}")))?;
-    let status = response.status();
-    let body: serde_json::Value = response
-        .json()
+        .map_err(|_| ProviderError::transport())?;
+    stripe_response(response).await
+}
+
+/// Fetch one Stripe resource with the pinned API version and structured error classification.
+async fn stripe_get(api_key: &str, path: &str) -> ProviderResult<serde_json::Value> {
+    let response = stripe_client()
+        .get(format!("https://api.stripe.com/v1/{path}"))
+        .bearer_auth(api_key)
+        .headers(stripe_headers(None)?)
+        .send()
         .await
-        .map_err(|e| Error::Upstream(format!("stripe: {e}")))?;
-    if !status.is_success() {
-        let message = body["error"]["message"]
-            .as_str()
-            .unwrap_or("request failed");
-        return Err(Error::Upstream(format!("stripe {path}: {message}")));
+        .map_err(|_| ProviderError::transport())?;
+    stripe_response(response).await
+}
+
+/// Delete one Stripe resource with an idempotency key and the explicit cancellation form.
+async fn stripe_delete(
+    api_key: &str,
+    path: &str,
+    idempotency_key: &str,
+    form: &[(String, String)],
+) -> ProviderResult<serde_json::Value> {
+    let response = stripe_client()
+        .delete(format!("https://api.stripe.com/v1/{path}"))
+        .bearer_auth(api_key)
+        .headers(stripe_headers(Some(idempotency_key))?)
+        .form(form)
+        .send()
+        .await
+        .map_err(|_| ProviderError::transport())?;
+    stripe_response(response).await
+}
+
+/// Preserve Stripe's status and machine-readable error code before the HTTP boundary sanitises it.
+async fn stripe_response(response: reqwest::Response) -> ProviderResult<serde_json::Value> {
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .await
+        .map_err(|_| ProviderError::transport())?;
+    if status >= 400 {
+        let code = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| value["error"]["code"].as_str().map(str::to_string));
+        return Err(ProviderError::http(status, code));
     }
-    Ok(body)
+    let value = if body.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&body).map_err(|_| ProviderError::malformed_response())?
+    };
+    Ok(value)
+}
+
+fn subscription_snapshot(
+    object: &serde_json::Value,
+    requested_id: &str,
+) -> ProviderResult<SubscriptionSnapshot> {
+    let status = object["status"]
+        .as_str()
+        .ok_or_else(ProviderError::malformed_response)?;
+    Ok(SubscriptionSnapshot {
+        id: object["id"].as_str().unwrap_or(requested_id).to_string(),
+        status: SubscriptionStatus::parse(status),
+    })
+}
+
+fn cancellation_form(org_id: &str) -> Vec<(String, String)> {
+    vec![
+        ("invoice_now".into(), "false".into()),
+        ("prorate".into(), "false".into()),
+        (
+            "cancellation_details[comment]".into(),
+            format!("Sotto organisation {org_id} deleted"),
+        ),
+    ]
+}
+
+fn cancellation_outcome(
+    cancellation: ProviderResult<()>,
+    fresh: ProviderResult<SubscriptionObservation>,
+) -> ProviderResult<SubscriptionObservation> {
+    match fresh {
+        Ok(observation) => {
+            if matches!(
+                observation.purge_gate(),
+                PurgeGate::Terminal | PurgeGate::Missing
+            ) {
+                Ok(observation)
+            } else {
+                // A still-blocking fresh observation must retain a failed or timed-out cancel;
+                // returning it as success would let the deletion worker advance unsafely.
+                cancellation.map(|_| observation)
+            }
+        }
+        Err(error) => Err(cancellation.err().unwrap_or(error)),
+    }
 }
 
 // --- webhook -------------------------------------------------------------------------------------
@@ -426,6 +775,9 @@ async fn stripe_post(
 /// The slice of a Stripe event we act on; everything else in the payload is ignored.
 #[derive(Deserialize)]
 struct Event {
+    id: String,
+    created: i64,
+    api_version: Option<String>,
     #[serde(rename = "type")]
     kind: String,
     data: EventData,
@@ -455,18 +807,252 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
 
     let event: Event =
         serde_json::from_str(&body).map_err(|_| Error::BadRequest("malformed event".into()))?;
+    if event.api_version.as_deref() != Some(STRIPE_API_VERSION) {
+        let mut tx = state.pool.begin().await?;
+        let inserted = record_webhook_receipt(&mut tx, &event, None).await?;
+        mark_webhook_event_processed(&mut tx, &event.id).await?;
+        tx.commit().await?;
+        if inserted {
+            eprintln!(
+                "warning: ignored Stripe webhook {} with API version {}",
+                event.id,
+                event.api_version.as_deref().unwrap_or("missing")
+            );
+        }
+        return Ok(());
+    }
+
+    let mut tx = state.pool.begin().await?;
+    prune_webhook_events(&mut tx).await?;
+    let disposition = record_webhook_event(&mut tx, &event).await?;
+    if disposition == EventDisposition::Ignore {
+        tx.commit().await?;
+        return Ok(());
+    }
+
     let object = &event.data.object;
+    let subscription_id = event_subscription_id(&event);
+    if disposition == EventDisposition::Reconcile {
+        let subscription_id = subscription_id.ok_or_else(|| {
+            Error::Config("stripe reconciliation event has no subscription id".into())
+        })?;
+        // Equal-timestamp events must not fetch snapshots concurrently: a slower, older lookup
+        // could otherwise overwrite a newer provider observation after the event tie-break.
+        // Holding this short transaction's advisory lock across the bounded provider call trades
+        // one pool connection for a cross-instance ordering guarantee.
+        let observation = billing
+            .provider
+            .get_subscription(&subscription_id)
+            .await
+            .map_err(ProviderError::into_error)?;
+        reconcile_subscription(
+            &mut tx,
+            observation,
+            &subscription_id,
+            event_org_hint(&event),
+        )
+        .await?;
+        update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+        mark_webhook_event_processed(&mut tx, &event.id).await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    match disposition {
+        EventDisposition::Apply => match event.kind.as_str() {
+            "checkout.session.completed" => checkout_completed(&mut tx, object).await?,
+            "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
+            "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
+            _ => {}
+        },
+        EventDisposition::Reconcile | EventDisposition::Ignore => {
+            return Err(Error::Config("invalid webhook disposition".into()));
+        }
+    }
+    if let Some(subscription_id) = subscription_id {
+        update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+    }
+    mark_webhook_event_processed(&mut tx, &event.id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventDisposition {
+    /// The event is newer than the stored watermark and can apply its payload normally.
+    Apply,
+    /// The event ties the watermark timestamp and must reconcile against Stripe's current state.
+    Reconcile,
+    /// The event is a duplicate or older than the stored watermark and changes nothing.
+    Ignore,
+}
+
+async fn record_webhook_event(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &Event,
+) -> Result<EventDisposition> {
+    let subscription_id = event_subscription_id(event);
+    if let Some(subscription_id) = subscription_id.as_deref() {
+        lock_subscription(tx, subscription_id).await?;
+    }
+    let inserted = record_webhook_receipt(tx, event, subscription_id.as_deref()).await?;
+    if !inserted {
+        let processed: bool = sqlx::query_scalar(
+            "SELECT processed_at IS NOT NULL FROM stripe_webhook_events WHERE event_id = $1",
+        )
+        .bind(&event.id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if processed {
+            return Ok(EventDisposition::Ignore);
+        }
+    }
+
+    let Some(subscription_id) = subscription_id else {
+        return Ok(EventDisposition::Apply);
+    };
+    let watermark: Option<(i64, String)> = sqlx::query_as(
+        "SELECT stripe_created, event_id FROM stripe_subscription_watermarks \
+         WHERE subscription_id = $1 FOR UPDATE",
+    )
+    .bind(&subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(match watermark {
+        Some((created, _)) if event.created < created => {
+            mark_webhook_event_processed(tx, &event.id).await?;
+            EventDisposition::Ignore
+        }
+        Some((created, event_id)) if event.created == created && event.id <= event_id => {
+            mark_webhook_event_processed(tx, &event.id).await?;
+            EventDisposition::Ignore
+        }
+        Some((created, _)) if event.created == created => EventDisposition::Reconcile,
+        _ => EventDisposition::Apply,
+    })
+}
+
+async fn record_webhook_receipt(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &Event,
+    subscription_id: Option<&str>,
+) -> Result<bool> {
+    let inserted = sqlx::query(
+        "INSERT INTO stripe_webhook_events \
+         (event_id, event_type, api_version, stripe_created, subscription_id) \
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING",
+    )
+    .bind(&event.id)
+    .bind(&event.kind)
+    .bind(event.api_version.as_deref().unwrap_or("missing"))
+    .bind(event.created)
+    .bind(subscription_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1;
+    Ok(inserted)
+}
+
+async fn prune_webhook_events(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query(
+        "WITH candidates AS (
+             SELECT e.event_id
+             FROM stripe_webhook_events e
+             WHERE (e.processed_at < now() - interval '30 days'
+                    OR (e.processed_at IS NULL
+                        AND e.received_at < now() - interval '1 day'))
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM stripe_subscription_watermarks w
+                   WHERE w.event_id = e.event_id
+               )
+             ORDER BY e.received_at
+             LIMIT 500
+         )
+         DELETE FROM stripe_webhook_events e
+         USING candidates
+         WHERE e.event_id = candidates.event_id",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn lock_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    subscription_id: &str,
+) -> Result<()> {
+    // Advisory locking serialises receipt decisions across server instances without locking the
+    // organisation row. The stable 64-bit text hash is sufficient here; a collision only causes
+    // unrelated subscriptions to wait briefly.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(subscription_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn mark_webhook_event_processed(
+    tx: &mut Transaction<'_, Postgres>,
+    event_id: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE stripe_webhook_events SET processed_at = now() WHERE event_id = $1")
+        .bind(event_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn update_subscription_watermark(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &Event,
+    subscription_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO stripe_subscription_watermarks (subscription_id, stripe_created, event_id) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (subscription_id) DO UPDATE SET stripe_created = EXCLUDED.stripe_created, \
+         event_id = EXCLUDED.event_id, updated_at = now() \
+         WHERE (EXCLUDED.stripe_created, EXCLUDED.event_id) > \
+               (stripe_subscription_watermarks.stripe_created, stripe_subscription_watermarks.event_id)",
+    )
+    .bind(subscription_id)
+    .bind(event.created)
+    .bind(&event.id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn event_subscription_id(event: &Event) -> Option<String> {
     match event.kind.as_str() {
-        "checkout.session.completed" => checkout_completed(&state.pool, object).await,
-        "customer.subscription.updated" => subscription_updated(&state.pool, object).await,
-        "customer.subscription.deleted" => subscription_deleted(&state.pool, object).await,
-        _ => Ok(()),
+        "checkout.session.completed" => event.data.object["subscription"]
+            .as_str()
+            .map(str::to_string),
+        "customer.subscription.updated" | "customer.subscription.deleted" => {
+            event.data.object["id"].as_str().map(str::to_string)
+        }
+        _ => None,
+    }
+}
+
+fn event_org_hint(event: &Event) -> Option<&str> {
+    match event.kind.as_str() {
+        "checkout.session.completed" => event.data.object["client_reference_id"].as_str(),
+        "customer.subscription.updated" | "customer.subscription.deleted" => {
+            event.data.object["metadata"]["org_id"].as_str()
+        }
+        _ => None,
     }
 }
 
 /// A paid checkout: record the Stripe ids and grant the Team tier. Idempotent - a redelivered
 /// event changes no rows and writes no duplicate audit entry.
-async fn checkout_completed(pool: &PgPool, object: &serde_json::Value) -> Result<()> {
+async fn checkout_completed(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<()> {
     // Sessions this server creates always carry the org id; anything else isn't ours to act on.
     let Some(org_id) = object["client_reference_id"].as_str() else {
         return Ok(());
@@ -474,23 +1060,22 @@ async fn checkout_completed(pool: &PgPool, object: &serde_json::Value) -> Result
     let customer = object["customer"].as_str();
     let subscription = object["subscription"].as_str();
 
-    let mut tx = pool.begin().await?;
     let changed = sqlx::query(
         "UPDATE organizations \
          SET tier = 'team', stripe_customer_id = $2, stripe_subscription_id = $3 \
-         WHERE id = $1 AND (tier <> 'team' \
+         WHERE id = $1 AND lifecycle_state = 'active' AND (tier <> 'team' \
             OR stripe_customer_id IS DISTINCT FROM $2 \
             OR stripe_subscription_id IS DISTINCT FROM $3)",
     )
     .bind(org_id)
     .bind(customer)
     .bind(subscription)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if changed > 0 {
         audit::record_tx(
-            &mut tx,
+            &mut *tx,
             org_id,
             "stripe",
             "billing.subscribed",
@@ -501,33 +1086,45 @@ async fn checkout_completed(pool: &PgPool, object: &serde_json::Value) -> Result
         )
         .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
 /// A subscription lifecycle change: the status decides the tier. Handles late/failed payments
 /// (`unpaid` → free) and recoveries (`active` again → team).
-async fn subscription_updated(pool: &PgPool, object: &serde_json::Value) -> Result<()> {
-    let Some(org_id) = org_for_subscription(pool, object).await? else {
+async fn subscription_updated(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<()> {
+    let Some(org_id) = org_for_subscription(tx, object).await? else {
         return Ok(());
     };
-    let status = object["status"].as_str().unwrap_or_default();
-    let tier = if ACTIVE_STATUSES.contains(&status) {
-        "team"
-    } else {
-        "free"
+    let Some(status) = object["status"].as_str() else {
+        eprintln!(
+            "warning: ignored Stripe subscription event without a status for organisation {org_id}"
+        );
+        return Ok(());
     };
+    let parsed_status = SubscriptionStatus::parse(status);
+    if matches!(&parsed_status, SubscriptionStatus::Unknown(_)) {
+        eprintln!(
+            "warning: ignored Stripe subscription event with unknown status {status} for organisation {org_id}"
+        );
+        return Ok(());
+    }
+    let tier = parsed_status.entitlement_tier();
 
-    let mut tx = pool.begin().await?;
-    let changed = sqlx::query("UPDATE organizations SET tier = $2 WHERE id = $1 AND tier <> $2")
-        .bind(&org_id)
-        .bind(tier)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+    let changed = sqlx::query(
+        "UPDATE organizations SET tier = $2 WHERE id = $1 AND lifecycle_state = 'active' \
+         AND tier <> $2",
+    )
+    .bind(&org_id)
+    .bind(tier)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
     if changed > 0 {
         audit::record_tx(
-            &mut tx,
+            &mut *tx,
             &org_id,
             "stripe",
             "billing.updated",
@@ -538,28 +1135,30 @@ async fn subscription_updated(pool: &PgPool, object: &serde_json::Value) -> Resu
         )
         .await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
 /// The subscription ended for good: back to the free tier (existing data stays readable - the
 /// entitlement gates are creation-time only).
-async fn subscription_deleted(pool: &PgPool, object: &serde_json::Value) -> Result<()> {
-    let Some(org_id) = org_for_subscription(pool, object).await? else {
+async fn subscription_deleted(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<()> {
+    let Some(org_id) = org_for_subscription(tx, object).await? else {
         return Ok(());
     };
-    let mut tx = pool.begin().await?;
     let changed = sqlx::query(
         "UPDATE organizations SET tier = 'free', stripe_subscription_id = NULL \
-         WHERE id = $1 AND (tier <> 'free' OR stripe_subscription_id IS NOT NULL)",
+         WHERE id = $1 AND lifecycle_state = 'active' \
+           AND (tier <> 'free' OR stripe_subscription_id IS NOT NULL)",
     )
     .bind(&org_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?
     .rows_affected();
     if changed > 0 {
         audit::record_tx(
-            &mut tx,
+            &mut *tx,
             &org_id,
             "stripe",
             "billing.cancelled",
@@ -570,13 +1169,68 @@ async fn subscription_deleted(pool: &PgPool, object: &serde_json::Value) -> Resu
         )
         .await?;
     }
-    tx.commit().await?;
+    Ok(())
+}
+
+/// Equal-timestamp events cannot be ordered by delivery time. Reconcile against Stripe's current
+/// object instead of letting arrival order decide the entitlement.
+async fn reconcile_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    observation: SubscriptionObservation,
+    subscription_id: &str,
+    org_hint: Option<&str>,
+) -> Result<()> {
+    let org_id = match org_hint {
+        Some(org_id) => Some(org_id.to_string()),
+        None => {
+            sqlx::query_scalar("SELECT id FROM organizations WHERE stripe_subscription_id = $1")
+                .bind(subscription_id)
+                .fetch_optional(&mut **tx)
+                .await?
+        }
+    };
+    let Some(org_id) = org_id else {
+        return Ok(());
+    };
+    let (tier, linked_subscription) = match observation {
+        SubscriptionObservation::Current(snapshot) => {
+            (snapshot.status.entitlement_tier(), Some(snapshot.id))
+        }
+        SubscriptionObservation::Missing => ("free", None),
+    };
+    let changed = sqlx::query(
+        "UPDATE organizations SET tier = $2, stripe_subscription_id = $3 \
+         WHERE id = $1 AND lifecycle_state = 'active' \
+           AND (tier <> $2 OR stripe_subscription_id IS DISTINCT FROM $3)",
+    )
+    .bind(&org_id)
+    .bind(tier)
+    .bind(linked_subscription.as_deref())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if changed > 0 {
+        audit::record_tx(
+            &mut *tx,
+            &org_id,
+            "stripe",
+            "billing.reconciled",
+            audit::Context {
+                detail: Some("equal-timestamp webhook reconciled with provider"),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
     Ok(())
 }
 
 /// Name the org for a subscription event: the metadata stamped at checkout, else the stored
 /// subscription id (covers subscriptions relinked by Stripe support), else not ours.
-async fn org_for_subscription(pool: &PgPool, object: &serde_json::Value) -> Result<Option<String>> {
+async fn org_for_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<Option<String>> {
     if let Some(org_id) = object["metadata"]["org_id"].as_str() {
         return Ok(Some(org_id.to_string()));
     }
@@ -586,7 +1240,7 @@ async fn org_for_subscription(pool: &PgPool, object: &serde_json::Value) -> Resu
     Ok(
         sqlx::query_scalar("SELECT id FROM organizations WHERE stripe_subscription_id = $1")
             .bind(subscription_id)
-            .fetch_optional(pool)
+            .fetch_optional(&mut **tx)
             .await?,
     )
 }
@@ -773,5 +1427,104 @@ mod tests {
         assert!(!verify_signature("whsec_x", "v1=abcd", "{}", 1000)); // no timestamp
         let header = format!("t=1000,v1={}", "zz".repeat(32)); // non-hex
         assert!(!verify_signature("whsec_x", &header, "{}", 1000));
+    }
+
+    #[test]
+    fn subscription_statuses_use_the_deletion_gate_not_entitlement_status() {
+        let statuses = [
+            ("active", PurgeGate::Blocking),
+            ("trialing", PurgeGate::Blocking),
+            ("past_due", PurgeGate::Blocking),
+            ("incomplete", PurgeGate::Blocking),
+            ("paused", PurgeGate::Blocking),
+            ("unpaid", PurgeGate::Blocking),
+            ("canceled", PurgeGate::Terminal),
+            ("incomplete_expired", PurgeGate::Terminal),
+            ("future_status", PurgeGate::Unknown),
+        ];
+        for (status, expected) in statuses {
+            assert_eq!(SubscriptionStatus::parse(status).purge_gate(), expected);
+        }
+        assert_eq!(
+            SubscriptionStatus::parse("unpaid").entitlement_tier(),
+            "free"
+        );
+        assert_eq!(
+            SubscriptionStatus::parse("past_due").entitlement_tier(),
+            "team"
+        );
+    }
+
+    #[test]
+    fn provider_errors_keep_status_and_code_for_retry_policy() {
+        let cases = [
+            (401, None, ProviderErrorKind::Authentication),
+            (
+                403,
+                Some("invalid_api_key"),
+                ProviderErrorKind::Authentication,
+            ),
+            (
+                404,
+                Some("resource_missing"),
+                ProviderErrorKind::ResourceMissing,
+            ),
+            (429, Some("rate_limit_error"), ProviderErrorKind::Retryable),
+            (500, Some("api_error"), ProviderErrorKind::Retryable),
+            (
+                400,
+                Some("invalid_request_error"),
+                ProviderErrorKind::Unknown,
+            ),
+        ];
+        for (status, code, kind) in cases {
+            let error = ProviderError::http(status, code.map(str::to_string));
+            assert_eq!(error.status, Some(status));
+            assert_eq!(error.kind, kind);
+        }
+        assert_eq!(
+            ProviderError::transport().kind,
+            ProviderErrorKind::Retryable
+        );
+    }
+
+    #[test]
+    fn cancellation_form_is_explicit_and_traceable() {
+        let form = cancellation_form("org-123");
+        assert!(form.contains(&("invoice_now".into(), "false".into())));
+        assert!(form.contains(&("prorate".into(), "false".into())));
+        assert!(form.iter().any(|(key, value)| {
+            key == "cancellation_details[comment]" && value.contains("org-123")
+        }));
+    }
+
+    #[test]
+    fn stripe_requests_use_the_pinned_version_and_idempotency_key() {
+        let headers = stripe_headers(Some("operation-123")).unwrap();
+        assert_eq!(headers.get("Stripe-Version").unwrap(), STRIPE_API_VERSION);
+        assert_eq!(headers.get("Idempotency-Key").unwrap(), "operation-123");
+        assert!(stripe_headers(Some("bad\nkey")).is_err());
+    }
+
+    #[test]
+    fn cancellation_reconciliation_prefers_fresh_terminal_state() {
+        let terminal = SubscriptionObservation::Current(SubscriptionSnapshot {
+            id: "sub-1".into(),
+            status: SubscriptionStatus::Canceled,
+        });
+        let result =
+            cancellation_outcome(Err(ProviderError::transport()), Ok(terminal.clone())).unwrap();
+        assert_eq!(result, terminal);
+
+        let blocking = SubscriptionObservation::Current(SubscriptionSnapshot {
+            id: "sub-1".into(),
+            status: SubscriptionStatus::Unpaid,
+        });
+        let error = cancellation_outcome(
+            Err(ProviderError::http(500, Some("api_error".into()))),
+            Ok(blocking),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Retryable);
     }
 }
