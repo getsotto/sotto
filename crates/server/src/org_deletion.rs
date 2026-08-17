@@ -1027,8 +1027,9 @@ async fn require_owner(
 #[cfg(test)]
 mod tests {
     use super::{
-        advance, billing_transition, cancel, claim_due, provider_retry_decision, request,
-        retry_delay, status, DeletionState, RetryDecision,
+        advance, billing_transition, cancel, claim_due, provider_retry_decision,
+        record_operator_observation, request, retry_delay, status, DeletionState,
+        OperatorObservation, RetryDecision,
     };
     use crate::billing::{ProviderErrorKind, PurgeGate};
     use crate::db;
@@ -1281,6 +1282,81 @@ mod tests {
         .await
         .expect("read tombstone");
         assert_eq!(tombstone, ("deleted".into(), true, true));
+        cleanup(&pool, &org_id, &owner_id).await;
+    }
+
+    #[tokio::test]
+    async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
+        let Some(pool) = pool_or_skip().await else {
+            return;
+        };
+        let (org_id, owner_id) = seed_owner(&pool).await;
+        let subscription_id = format!("sub-deletion-{}", Uuid::new_v4().simple());
+        sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
+            .bind(&org_id)
+            .bind(&subscription_id)
+            .execute(&pool)
+            .await
+            .expect("link subscription fixture");
+        let requested = request(&pool, &org_id, &owner_id, &org_id)
+            .await
+            .expect("request deletion");
+        let requested_lease = claim_due(&pool, "operator-observation-worker")
+            .await
+            .expect("claim requested")
+            .expect("requested work is due");
+        advance(&pool, &requested_lease, None)
+            .await
+            .expect("start billing cancellation")
+            .expect("billing transition");
+        let billing_lease = claim_due(&pool, "operator-observation-worker")
+            .await
+            .expect("claim billing")
+            .expect("billing work is due");
+        let failed = advance(&pool, &billing_lease, None)
+            .await
+            .expect("record unavailable provider")
+            .expect("failed transition");
+        assert_eq!(failed.state, DeletionState::Failed);
+
+        let observed = record_operator_observation(
+            &pool,
+            &org_id,
+            "operator-1",
+            OperatorObservation {
+                subscription_id: &subscription_id,
+                observed_status: "canceled",
+                observed_at: "now",
+                reason: "provider credentials are being rotated",
+                evidence: "stripe-dashboard-request-1",
+            },
+        )
+        .await
+        .expect("record operator observation");
+        assert_eq!(observed.state, DeletionState::Retention);
+        sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
+            .bind(&requested.id)
+            .execute(&pool)
+            .await
+            .expect("make retention due");
+        let retention_lease = claim_due(&pool, "operator-observation-worker")
+            .await
+            .expect("claim retention")
+            .expect("retention is due");
+        let purging = advance(&pool, &retention_lease, None)
+            .await
+            .expect("use operator observation")
+            .expect("purge transition");
+        assert_eq!(purging.state, DeletionState::Purging);
+        let purging_lease = claim_due(&pool, "operator-observation-worker")
+            .await
+            .expect("claim purge")
+            .expect("purge is due");
+        let completed = advance(&pool, &purging_lease, None)
+            .await
+            .expect("purge observed organisation")
+            .expect("completed transition");
+        assert_eq!(completed.state, DeletionState::Completed);
         cleanup(&pool, &org_id, &owner_id).await;
     }
 }
