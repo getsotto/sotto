@@ -1037,8 +1037,14 @@ mod tests {
     use sqlx::postgres::PgConnectOptions;
     use sqlx::PgPool;
     use std::str::FromStr;
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
+    use tokio::sync::Mutex;
     use uuid::Uuid;
+
+    // These fixtures share one database queue, so serialise them while preserving the production
+    // worker's global claim behaviour.
+    static DB_TEST_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
     #[test]
     fn deletion_states_round_trip_and_fail_closed() {
@@ -1127,6 +1133,14 @@ mod tests {
         Some(pool)
     }
 
+    async fn db_test_lock() -> tokio::sync::OwnedMutexGuard<()> {
+        DB_TEST_LOCK
+            .get_or_init(|| Arc::new(Mutex::new(())))
+            .clone()
+            .lock_owned()
+            .await
+    }
+
     async fn seed_owner(pool: &PgPool) -> (String, String) {
         let suffix = Uuid::new_v4().simple().to_string();
         let user_id = format!("deletion-owner-{suffix}");
@@ -1179,6 +1193,7 @@ mod tests {
         let Some(pool) = pool_or_skip().await else {
             return;
         };
+        let _test_lock = db_test_lock().await;
         let (org_id, owner_id) = seed_owner(&pool).await;
         assert!(matches!(
             request(&pool, &org_id, &owner_id, "other-org").await,
@@ -1222,6 +1237,7 @@ mod tests {
         let Some(pool) = pool_or_skip().await else {
             return;
         };
+        let _test_lock = db_test_lock().await;
         let (org_id, owner_id) = seed_owner(&pool).await;
         let requested = request(&pool, &org_id, &owner_id, &org_id)
             .await
@@ -1290,6 +1306,7 @@ mod tests {
         let Some(pool) = pool_or_skip().await else {
             return;
         };
+        let _test_lock = db_test_lock().await;
         let (org_id, owner_id) = seed_owner(&pool).await;
         let subscription_id = format!("sub-deletion-{}", Uuid::new_v4().simple());
         sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
