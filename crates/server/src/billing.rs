@@ -163,7 +163,7 @@ impl SubscriptionStatus {
         }
     }
 
-    fn entitlement_tier(&self) -> &'static str {
+    pub(crate) fn entitlement_tier(&self) -> &'static str {
         match self {
             Self::Active | Self::Trialing | Self::PastDue => "team",
             _ => "free",
@@ -729,11 +729,16 @@ fn subscription_snapshot(
     object: &serde_json::Value,
     requested_id: &str,
 ) -> ProviderResult<SubscriptionSnapshot> {
+    // A mismatched provider ID could otherwise gate deletion using another subscription's state.
+    let id = object["id"]
+        .as_str()
+        .filter(|&id| id == requested_id)
+        .ok_or_else(ProviderError::malformed_response)?;
     let status = object["status"]
         .as_str()
         .ok_or_else(ProviderError::malformed_response)?;
     Ok(SubscriptionSnapshot {
-        id: object["id"].as_str().unwrap_or(requested_id).to_string(),
+        id: id.to_string(),
         status: SubscriptionStatus::parse(status),
     })
 }
@@ -1496,6 +1501,14 @@ mod tests {
         assert!(form.iter().any(|(key, value)| {
             key == "cancellation_details[comment]" && value.contains("org-123")
         }));
+    }
+
+    #[test]
+    fn subscription_lookup_must_return_the_requested_id() {
+        let object = serde_json::json!({"id": "sub-other", "status": "canceled"});
+        let error = subscription_snapshot(&object, "sub-requested").unwrap_err();
+        assert_eq!(error.kind, ProviderErrorKind::Unknown);
+        assert_eq!(error.code.as_deref(), Some("malformed_response"));
     }
 
     #[test]
