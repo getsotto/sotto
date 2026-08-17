@@ -185,6 +185,21 @@ async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
         .expect("delete owner fixture");
 }
 
+async fn assert_audit_actions(pool: &PgPool, org_id: &str, expected: &[&str]) {
+    let actions: Vec<String> =
+        sqlx::query_scalar("SELECT action FROM audit_events WHERE org_id = $1 ORDER BY id")
+            .bind(org_id)
+            .fetch_all(pool)
+            .await
+            .expect("read deletion audit events");
+    for action in expected {
+        assert!(
+            actions.iter().any(|observed| observed == action),
+            "missing audit action {action}: {actions:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn owner_requests_are_idempotent_and_cancellable() {
     let Some(pool) = pool_or_skip().await else {
@@ -248,6 +263,16 @@ async fn owner_requests_are_idempotent_and_cancellable() {
             .await
             .expect("read lifecycle");
     assert_eq!(lifecycle, "active");
+    assert_audit_actions(
+        &pool,
+        &org_id,
+        &[
+            "org.deletion.requested",
+            "org.deletion.cancel_requested",
+            "org.deletion.recovery_completed",
+        ],
+    )
+    .await;
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
@@ -321,6 +346,16 @@ async fn worker_reconciles_free_deletion_and_purges_tombstone() {
         status(&pool, &org_id, &owner_id).await.unwrap().state,
         DeletionState::Completed
     );
+    assert_audit_actions(
+        &pool,
+        &org_id,
+        &[
+            "org.deletion.requested",
+            "org.deletion.purge_started",
+            "org.deletion.completed",
+        ],
+    )
+    .await;
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
@@ -404,6 +439,16 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
         .expect("reject stale billing observation")
         .expect("failed purge transition");
     assert_eq!(failed.state, DeletionState::Failed);
+    assert_audit_actions(
+        &pool,
+        &org_id,
+        &[
+            "org.deletion.billing_cancelled",
+            "org.deletion.purge_started",
+            "org.deletion.failed",
+        ],
+    )
+    .await;
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
@@ -501,5 +546,6 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
         .expect("purge observed organisation")
         .expect("completed transition");
     assert_eq!(completed.state, DeletionState::Completed);
+    assert_audit_actions(&pool, &org_id, &["org.deletion.billing_observed"]).await;
     cleanup(&pool, &org_id, &owner_id).await;
 }
