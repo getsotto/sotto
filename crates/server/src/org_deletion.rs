@@ -553,10 +553,9 @@ async fn operator_observation_is_fresh(pool: &PgPool, lease: &DeletionLease) -> 
     Ok(fresh.unwrap_or(false))
 }
 
-/// Record a terminal or missing provider observation made by an authenticated operator when the
-/// provider is unavailable. The exact subscription ID, actor, reason, evidence, and observation
-/// time are retained so a later operator entrypoint can audit the observation rather than bypassing
-/// the purge gate.
+/// Record a terminal or missing provider observation after the caller has authenticated the
+/// operator. The exact subscription ID, actor, reason, evidence, and observation time are retained
+/// so a later operator entrypoint can audit the observation rather than bypassing the purge gate.
 pub struct OperatorObservation<'a> {
     pub subscription_id: &'a str,
     pub observed_status: &'a str,
