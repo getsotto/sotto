@@ -761,7 +761,6 @@ async fn finish_recovery(
             .await;
         }
     };
-    let missing_subscription = matches!(observation, SubscriptionObservation::Missing);
     let mut tx = pool.begin().await?;
     let row: Option<(String, String)> = sqlx::query_as(
         "UPDATE organization_deletions SET state = 'cancelled', cancelled_at = now(), \
@@ -779,13 +778,11 @@ async fn finish_recovery(
     .await?;
     if row.is_some() {
         sqlx::query(
-            "UPDATE organizations SET lifecycle_state = 'active', tier = $1, \
-                 stripe_subscription_id = CASE WHEN $3 THEN NULL ELSE stripe_subscription_id END \
+            "UPDATE organizations SET lifecycle_state = 'active', tier = $1 \
              WHERE id = $2 AND lifecycle_state = 'deleting'",
         )
         .bind(tier)
         .bind(&lease.org_id)
-        .bind(missing_subscription)
         .execute(&mut *tx)
         .await?;
     }
