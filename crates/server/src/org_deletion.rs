@@ -197,7 +197,8 @@ pub(crate) async fn request(
             sqlx::query(
                 "UPDATE organization_deletions \
                  SET state = resume_state, resume_state = NULL, next_attempt_at = now(), \
-                     last_error_code = NULL, lease_owner = NULL, lease_expires_at = NULL, \
+                     attempt_count = 0, last_error_code = NULL, lease_owner = NULL, \
+                     lease_expires_at = NULL, \
                      state_version = state_version + 1 \
                  WHERE id = $1::uuid",
             )
@@ -1207,6 +1208,29 @@ mod tests {
             .expect("repeat deletion");
         assert_eq!(first, repeated);
         assert_eq!(status(&pool, &org_id, &owner_id).await.unwrap(), first);
+
+        sqlx::query(
+            "UPDATE organization_deletions \
+             SET state = 'failed', resume_state = 'cancelling_billing', attempt_count = 7, \
+                 last_error_code = 'billing_unavailable' \
+             WHERE id = $1::uuid",
+        )
+        .bind(&first.id)
+        .execute(&pool)
+        .await
+        .expect("exhaust retry attempts");
+        let retried = request(&pool, &org_id, &owner_id, &org_id)
+            .await
+            .expect("retry failed deletion");
+        assert_eq!(retried.state, DeletionState::CancellingBilling);
+        let attempts: i32 = sqlx::query_scalar(
+            "SELECT attempt_count FROM organization_deletions WHERE id = $1::uuid",
+        )
+        .bind(&first.id)
+        .fetch_one(&pool)
+        .await
+        .expect("read reset attempts");
+        assert_eq!(attempts, 0);
 
         let cancelled = cancel(&pool, &org_id, &owner_id)
             .await
