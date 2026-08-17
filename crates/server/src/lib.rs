@@ -27,9 +27,11 @@ pub mod entitlements;
 pub mod error;
 pub mod machine;
 pub mod org;
-// The lifecycle seam is intentionally staged before its worker loop and routes are enabled.
-#[allow(dead_code)]
-pub(crate) mod org_deletion;
+// The lifecycle seam is intentionally staged before its worker loop and routes are enabled. It is
+// doc-hidden so the database integration harness can exercise the internal worker boundary without
+// presenting it as a public application route or stable API.
+#[doc(hidden)]
+pub mod org_deletion;
 pub mod share;
 pub mod state;
 pub mod sync;

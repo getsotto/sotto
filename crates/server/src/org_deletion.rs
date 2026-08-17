@@ -18,7 +18,7 @@ use crate::org::{self, LifecycleState, Role};
 
 /// The persisted phases of one deletion attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DeletionState {
+pub enum DeletionState {
     Requested,
     CancellingBilling,
     Retention,
@@ -73,22 +73,22 @@ impl DeletionState {
 
 /// A small view shared by future handlers and worker callers.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DeletionView {
-    pub(crate) id: String,
-    pub(crate) org_id: String,
-    pub(crate) state: DeletionState,
+pub struct DeletionView {
+    pub id: String,
+    pub org_id: String,
+    pub state: DeletionState,
 }
 
 /// Work claimed by one worker.  `state_version` is the compare-and-set token for every result.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DeletionLease {
-    pub(crate) id: String,
-    pub(crate) org_id: String,
-    pub(crate) state: DeletionState,
-    pub(crate) subscription_id: Option<String>,
-    pub(crate) worker_id: String,
-    pub(crate) state_version: i64,
-    pub(crate) attempt_count: i32,
+pub struct DeletionLease {
+    pub id: String,
+    pub org_id: String,
+    pub state: DeletionState,
+    pub subscription_id: Option<String>,
+    pub worker_id: String,
+    pub state_version: i64,
+    pub attempt_count: i32,
 }
 
 /// Retry delays from the lifecycle design, in order.  `attempt_count` is the count after a lease
@@ -145,7 +145,7 @@ pub(crate) fn billing_transition(gate: PurgeGate) -> Option<DeletionState> {
 }
 
 /// Accept one confirmed owner request, or return the existing active attempt.
-pub(crate) async fn request(
+pub async fn request(
     pool: &PgPool,
     org_id: &str,
     actor: &str,
@@ -268,7 +268,7 @@ pub(crate) async fn request(
 }
 
 /// Return an owner's current active deletion attempt without changing its state.
-pub(crate) async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<DeletionView> {
+pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<DeletionView> {
     let access = org::access(pool, org_id, actor).await?;
     if access.role() != Role::Owner {
         return Err(Error::Forbidden(
@@ -294,7 +294,7 @@ pub(crate) async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<D
 }
 
 /// Begin recovery for an owner, leaving access frozen until billing has been reconciled.
-pub(crate) async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<DeletionView> {
+pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<DeletionView> {
     let mut tx = pool.begin().await?;
     let lifecycle: Option<String> =
         sqlx::query_scalar("SELECT lifecycle_state FROM organizations WHERE id = $1 FOR UPDATE")
@@ -368,7 +368,7 @@ pub(crate) async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<D
 }
 
 /// Claim one due attempt. `SKIP LOCKED` lets multiple server instances share the queue safely.
-pub(crate) async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<DeletionLease>> {
+pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<DeletionLease>> {
     if worker_id.is_empty() {
         return Err(Error::Config("deletion worker id is empty".into()));
     }
@@ -423,7 +423,7 @@ pub(crate) async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<D
 
 /// Advance one leased attempt. Provider calls happen before opening the transition transaction so
 /// a slow upstream cannot hold an organisation row lock. A stale lease returns `None` harmlessly.
-pub(crate) async fn advance(
+pub async fn advance(
     pool: &PgPool,
     lease: &DeletionLease,
     provider: Option<&dyn SubscriptionProvider>,
@@ -535,15 +535,15 @@ async fn operator_observation_is_fresh(pool: &PgPool, lease: &DeletionLease) -> 
 /// Record a terminal or missing provider observation made by an operator when the provider is
 /// unavailable. The exact subscription ID, actor, reason, evidence, and observation time are
 /// retained so this is an auditable observation mechanism rather than a purge bypass.
-pub(crate) struct OperatorObservation<'a> {
-    pub(crate) subscription_id: &'a str,
-    pub(crate) observed_status: &'a str,
-    pub(crate) observed_at: &'a str,
-    pub(crate) reason: &'a str,
-    pub(crate) evidence: &'a str,
+pub struct OperatorObservation<'a> {
+    pub subscription_id: &'a str,
+    pub observed_status: &'a str,
+    pub observed_at: &'a str,
+    pub reason: &'a str,
+    pub evidence: &'a str,
 }
 
-pub(crate) async fn record_operator_observation(
+pub async fn record_operator_observation(
     pool: &PgPool,
     org_id: &str,
     operator: &str,
@@ -1031,24 +1031,10 @@ async fn require_owner(
 #[cfg(test)]
 mod tests {
     use super::{
-        advance, billing_transition, cancel, claim_due, provider_retry_decision,
-        record_operator_observation, request, retry_delay, status, DeletionState,
-        OperatorObservation, RetryDecision,
+        billing_transition, provider_retry_decision, retry_delay, DeletionState, RetryDecision,
     };
     use crate::billing::{ProviderErrorKind, PurgeGate};
-    use crate::db;
-    use crate::error::Error;
-    use sqlx::postgres::PgConnectOptions;
-    use sqlx::PgPool;
-    use std::str::FromStr;
-    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
-    use tokio::sync::Mutex;
-    use uuid::Uuid;
-
-    // These fixtures share one database queue, so serialise them while preserving the production
-    // worker's global claim behaviour.
-    static DB_TEST_LOCK: OnceLock<Arc<Mutex<()>>> = OnceLock::new();
 
     #[test]
     fn deletion_states_round_trip_and_fail_closed() {
@@ -1117,311 +1103,5 @@ mod tests {
         );
         assert_eq!(billing_transition(PurgeGate::Blocking), None);
         assert_eq!(billing_transition(PurgeGate::Unknown), None);
-    }
-
-    async fn pool_or_skip() -> Option<PgPool> {
-        let Ok(database_url) = std::env::var("DATABASE_URL") else {
-            return None;
-        };
-        if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
-            return None;
-        }
-        let options = PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
-        assert!(
-            matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
-            "refusing destructive deletion tests against non-local host: {}",
-            options.get_host()
-        );
-        let pool = db::connect(&database_url).await.expect("connect");
-        db::migrate(&pool).await.expect("migrate");
-        Some(pool)
-    }
-
-    async fn db_test_lock() -> tokio::sync::OwnedMutexGuard<()> {
-        DB_TEST_LOCK
-            .get_or_init(|| Arc::new(Mutex::new(())))
-            .clone()
-            .lock_owned()
-            .await
-    }
-
-    async fn seed_owner(pool: &PgPool) -> (String, String) {
-        let suffix = Uuid::new_v4().simple().to_string();
-        let user_id = format!("deletion-owner-{suffix}");
-        let org_id = format!("deletion-org-{suffix}");
-        sqlx::query(
-            "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'test', $1)",
-        )
-        .bind(&user_id)
-        .execute(pool)
-        .await
-        .expect("insert owner");
-        sqlx::query("INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, $2, $3)")
-            .bind(&org_id)
-            .bind(b"opaque".as_slice())
-            .bind(&user_id)
-            .execute(pool)
-            .await
-            .expect("insert organisation");
-        sqlx::query(
-            "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, 'owner')",
-        )
-        .bind(&org_id)
-        .bind(&user_id)
-        .execute(pool)
-        .await
-        .expect("insert owner membership");
-        (org_id, user_id)
-    }
-
-    async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
-        sqlx::query("DELETE FROM organization_deletions WHERE org_id = $1")
-            .bind(org_id)
-            .execute(pool)
-            .await
-            .expect("delete operation history");
-        sqlx::query("DELETE FROM organizations WHERE id = $1")
-            .bind(org_id)
-            .execute(pool)
-            .await
-            .expect("delete organisation fixture");
-        sqlx::query("DELETE FROM users WHERE id = $1")
-            .bind(user_id)
-            .execute(pool)
-            .await
-            .expect("delete owner fixture");
-    }
-
-    #[tokio::test]
-    async fn owner_requests_are_idempotent_and_cancellable() {
-        let Some(pool) = pool_or_skip().await else {
-            return;
-        };
-        let _test_lock = db_test_lock().await;
-        let (org_id, owner_id) = seed_owner(&pool).await;
-        assert!(matches!(
-            request(&pool, &org_id, &owner_id, "other-org").await,
-            Err(Error::BadRequest(_))
-        ));
-        let first = request(&pool, &org_id, &owner_id, &org_id)
-            .await
-            .expect("request deletion");
-        let repeated = request(&pool, &org_id, &owner_id, &org_id)
-            .await
-            .expect("repeat deletion");
-        assert_eq!(first, repeated);
-        assert_eq!(status(&pool, &org_id, &owner_id).await.unwrap(), first);
-
-        sqlx::query(
-            "UPDATE organization_deletions \
-             SET state = 'failed', resume_state = 'cancelling_billing', attempt_count = 7, \
-                 last_error_code = 'billing_unavailable' \
-             WHERE id = $1::uuid",
-        )
-        .bind(&first.id)
-        .execute(&pool)
-        .await
-        .expect("exhaust retry attempts");
-        let retried = request(&pool, &org_id, &owner_id, &org_id)
-            .await
-            .expect("retry failed deletion");
-        assert_eq!(retried.state, DeletionState::CancellingBilling);
-        let attempts: i32 = sqlx::query_scalar(
-            "SELECT attempt_count FROM organization_deletions WHERE id = $1::uuid",
-        )
-        .bind(&first.id)
-        .fetch_one(&pool)
-        .await
-        .expect("read reset attempts");
-        assert_eq!(attempts, 0);
-
-        let cancelled = cancel(&pool, &org_id, &owner_id)
-            .await
-            .expect("request recovery");
-        assert_eq!(cancelled.state, DeletionState::Recovering);
-        let lease = claim_due(&pool, "deletion-test-worker")
-            .await
-            .expect("claim recovery")
-            .expect("recovery is due");
-        assert_eq!(lease.state, DeletionState::Recovering);
-        let recovered = advance(&pool, &lease, None)
-            .await
-            .expect("reconcile recovery")
-            .expect("recovery transition");
-        assert_eq!(recovered.state, DeletionState::Cancelled);
-        let lifecycle: String =
-            sqlx::query_scalar("SELECT lifecycle_state FROM organizations WHERE id = $1")
-                .bind(&org_id)
-                .fetch_one(&pool)
-                .await
-                .expect("read lifecycle");
-        assert_eq!(lifecycle, "active");
-        cleanup(&pool, &org_id, &owner_id).await;
-    }
-
-    #[tokio::test]
-    async fn worker_reconciles_free_deletion_and_purges_tombstone() {
-        let Some(pool) = pool_or_skip().await else {
-            return;
-        };
-        let _test_lock = db_test_lock().await;
-        let (org_id, owner_id) = seed_owner(&pool).await;
-        let requested = request(&pool, &org_id, &owner_id, &org_id)
-            .await
-            .expect("request deletion");
-        let requested_lease = claim_due(&pool, "deletion-purge-worker")
-            .await
-            .expect("claim requested")
-            .expect("requested work is due");
-        assert_eq!(requested_lease.state, DeletionState::Requested);
-        assert_eq!(requested_lease.attempt_count, 0);
-        let billing = advance(&pool, &requested_lease, None)
-            .await
-            .expect("start billing cancellation")
-            .expect("billing transition");
-        assert_eq!(billing.state, DeletionState::CancellingBilling);
-
-        let cancelling_lease = claim_due(&pool, "deletion-purge-worker")
-            .await
-            .expect("claim billing")
-            .expect("billing work is due");
-        assert_eq!(cancelling_lease.attempt_count, 1);
-        let retention = advance(&pool, &cancelling_lease, None)
-            .await
-            .expect("reconcile missing subscription")
-            .expect("retention transition");
-        assert_eq!(retention.state, DeletionState::Retention);
-
-        sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
-            .bind(&requested.id)
-            .execute(&pool)
-            .await
-            .expect("make retention due");
-        let retention_lease = claim_due(&pool, "deletion-purge-worker")
-            .await
-            .expect("claim retention")
-            .expect("retention is due");
-        let purging = advance(&pool, &retention_lease, None)
-            .await
-            .expect("start purge")
-            .expect("purge transition");
-        assert_eq!(purging.state, DeletionState::Purging);
-
-        let purging_lease = claim_due(&pool, "deletion-purge-worker")
-            .await
-            .expect("claim purge")
-            .expect("purge is due");
-        let completed = advance(&pool, &purging_lease, None)
-            .await
-            .expect("purge organisation")
-            .expect("completed transition");
-        assert_eq!(completed.state, DeletionState::Completed);
-        let tombstone: (String, bool, bool) = sqlx::query_as(
-            "SELECT lifecycle_state, enc_name IS NULL, stripe_subscription_id IS NULL \
-             FROM organizations WHERE id = $1",
-        )
-        .bind(&org_id)
-        .fetch_one(&pool)
-        .await
-        .expect("read tombstone");
-        assert_eq!(tombstone, ("deleted".into(), true, true));
-        cleanup(&pool, &org_id, &owner_id).await;
-    }
-
-    #[tokio::test]
-    async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
-        let Some(pool) = pool_or_skip().await else {
-            return;
-        };
-        let _test_lock = db_test_lock().await;
-        let (org_id, owner_id) = seed_owner(&pool).await;
-        let subscription_id = format!("sub-deletion-{}", Uuid::new_v4().simple());
-        sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
-            .bind(&org_id)
-            .bind(&subscription_id)
-            .execute(&pool)
-            .await
-            .expect("link subscription fixture");
-        let requested = request(&pool, &org_id, &owner_id, &org_id)
-            .await
-            .expect("request deletion");
-        let requested_lease = claim_due(&pool, "operator-observation-worker")
-            .await
-            .expect("claim requested")
-            .expect("requested work is due");
-        advance(&pool, &requested_lease, None)
-            .await
-            .expect("start billing cancellation")
-            .expect("billing transition");
-        let billing_lease = claim_due(&pool, "operator-observation-worker")
-            .await
-            .expect("claim billing")
-            .expect("billing work is due");
-        let failed = advance(&pool, &billing_lease, None)
-            .await
-            .expect("record unavailable provider")
-            .expect("failed transition");
-        assert_eq!(failed.state, DeletionState::Failed);
-
-        for (operator, observed_status, observed_at) in [
-            ("", "canceled", "now"),
-            ("operator-1", "", "now"),
-            ("operator-1", "canceled", ""),
-        ] {
-            let result = record_operator_observation(
-                &pool,
-                &org_id,
-                operator,
-                OperatorObservation {
-                    subscription_id: &subscription_id,
-                    observed_status,
-                    observed_at,
-                    reason: "provider credentials are being rotated",
-                    evidence: "stripe-dashboard-request-1",
-                },
-            )
-            .await;
-            assert!(matches!(result, Err(Error::BadRequest(_))));
-        }
-
-        let observed = record_operator_observation(
-            &pool,
-            &org_id,
-            "operator-1",
-            OperatorObservation {
-                subscription_id: &subscription_id,
-                observed_status: "canceled",
-                observed_at: "now",
-                reason: "provider credentials are being rotated",
-                evidence: "stripe-dashboard-request-1",
-            },
-        )
-        .await
-        .expect("record operator observation");
-        assert_eq!(observed.state, DeletionState::Retention);
-        sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
-            .bind(&requested.id)
-            .execute(&pool)
-            .await
-            .expect("make retention due");
-        let retention_lease = claim_due(&pool, "operator-observation-worker")
-            .await
-            .expect("claim retention")
-            .expect("retention is due");
-        let purging = advance(&pool, &retention_lease, None)
-            .await
-            .expect("use operator observation")
-            .expect("purge transition");
-        assert_eq!(purging.state, DeletionState::Purging);
-        let purging_lease = claim_due(&pool, "operator-observation-worker")
-            .await
-            .expect("claim purge")
-            .expect("purge is due");
-        let completed = advance(&pool, &purging_lease, None)
-            .await
-            .expect("purge observed organisation")
-            .expect("completed transition");
-        assert_eq!(completed.state, DeletionState::Completed);
-        cleanup(&pool, &org_id, &owner_id).await;
     }
 }
