@@ -214,11 +214,26 @@ async fn owner_requests_are_idempotent_and_cancellable() {
     let first = request(&pool, &org_id, &owner_id, &org_id)
         .await
         .expect("request deletion");
+    let first_times: (String, String) = sqlx::query_as(
+        "SELECT requested_at::text, purge_after::text FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&first.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read initial retention window");
     let repeated = request(&pool, &org_id, &owner_id, &org_id)
         .await
         .expect("repeat deletion");
     assert_eq!(first, repeated);
     assert_eq!(status(&pool, &org_id, &owner_id).await.unwrap(), first);
+    let repeated_times: (String, String) = sqlx::query_as(
+        "SELECT requested_at::text, purge_after::text FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&first.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read repeated retention window");
+    assert_eq!(repeated_times, first_times);
 
     sqlx::query(
         "UPDATE organization_deletions \
@@ -323,6 +338,10 @@ async fn worker_reconciles_free_deletion_and_purges_tombstone() {
         .expect("start purge")
         .expect("purge transition");
     assert_eq!(purging.state, DeletionState::Purging);
+    assert!(matches!(
+        cancel(&pool, &org_id, &owner_id).await,
+        Err(Error::Conflict(_))
+    ));
 
     let purging_lease = claim_due(&pool, "deletion-purge-worker")
         .await
