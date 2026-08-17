@@ -359,6 +359,13 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
         .expect("retention transition");
     assert_eq!(retention.state, DeletionState::Retention);
     assert_eq!(provider.cancellation_calls(), 1);
+    let attempts: i32 =
+        sqlx::query_scalar("SELECT attempt_count FROM organization_deletions WHERE id = $1::uuid")
+            .bind(&requested.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read reset attempts");
+    assert_eq!(attempts, 0);
 
     sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
         .bind(&requested.id)
@@ -380,11 +387,19 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
         .await
         .expect("claim purge")
         .expect("purge is due");
-    let completed = advance(&pool, &purging_lease, None)
+    sqlx::query(
+        "UPDATE organization_deletions \
+         SET billing_checked_at = now() - interval '16 minutes' WHERE id = $1::uuid",
+    )
+    .bind(&requested.id)
+    .execute(&pool)
+    .await
+    .expect("age billing observation");
+    let failed = advance(&pool, &purging_lease, None)
         .await
-        .expect("purge organisation")
-        .expect("completed transition");
-    assert_eq!(completed.state, DeletionState::Completed);
+        .expect("reject stale billing observation")
+        .expect("failed purge transition");
+    assert_eq!(failed.state, DeletionState::Failed);
     cleanup(&pool, &org_id, &owner_id).await;
 }
 

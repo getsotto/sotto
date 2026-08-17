@@ -342,7 +342,7 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
     }
     sqlx::query(
         "UPDATE organization_deletions SET state = 'recovering', resume_state = NULL, \
-         next_attempt_at = now(), \
+         attempt_count = 0, next_attempt_at = now(), \
          lease_owner = NULL, lease_expires_at = NULL, state_version = state_version + 1 \
          WHERE id = $1::uuid",
     )
@@ -600,7 +600,7 @@ pub async fn record_operator_observation(
     }
     let row: Option<(String, String)> = sqlx::query_as(
         "UPDATE organization_deletions SET state = 'retention', resume_state = NULL, \
-         last_billing_state = $1, billing_checked_at = $2::timestamptz, \
+         attempt_count = 0, last_billing_state = $1, billing_checked_at = $2::timestamptz, \
          billing_observation_source = 'operator', billing_observed_by = $3, \
          billing_observation_reason = $4, billing_observation_evidence = $5, \
          next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL, \
@@ -659,7 +659,7 @@ async fn finish_retention_reconciliation(
     let mut tx = pool.begin().await?;
     let row: Option<(String, String)> = sqlx::query_as(
         "UPDATE organization_deletions SET state = $1, last_billing_state = $2, \
-         billing_checked_at = now(), billing_observation_source = 'provider', \
+         attempt_count = 0, billing_checked_at = now(), billing_observation_source = 'provider', \
          next_attempt_at = CASE WHEN $3 THEN now() ELSE NULL END, \
          lease_owner = NULL, lease_expires_at = NULL, state_version = state_version + 1 \
          WHERE id = $4::uuid AND state_version = $5 AND lease_owner = $6 \
@@ -681,7 +681,7 @@ async fn finish_retention_reconciliation(
 async fn enter_purging(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionView>> {
     let mut tx = pool.begin().await?;
     let row: Option<(String, String)> = sqlx::query_as(
-        "UPDATE organization_deletions SET state = 'purging', next_attempt_at = NULL, \
+        "UPDATE organization_deletions SET state = 'purging', attempt_count = 0, next_attempt_at = NULL, \
          lease_owner = NULL, lease_expires_at = NULL, state_version = state_version + 1 \
          WHERE id = $1::uuid AND state = 'retention' AND purge_after <= now() \
            AND state_version = $2 AND lease_owner = $3 \
@@ -708,7 +708,7 @@ async fn finish_billing(
         let mut tx = pool.begin().await?;
         let row: Option<(String, String)> = sqlx::query_as(
             "UPDATE organization_deletions SET state = $1, last_billing_state = $2, \
-             billing_checked_at = now(), billing_observation_source = 'provider', \
+             attempt_count = 0, billing_checked_at = now(), billing_observation_source = 'provider', \
              next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL, \
              state_version = state_version + 1 \
              WHERE id = $3::uuid AND state_version = $4 AND lease_owner = $5 \
@@ -765,7 +765,7 @@ async fn finish_recovery(
     let mut tx = pool.begin().await?;
     let row: Option<(String, String)> = sqlx::query_as(
         "UPDATE organization_deletions SET state = 'cancelled', cancelled_at = now(), \
-             last_billing_state = $1, billing_checked_at = now(), \
+             attempt_count = 0, last_billing_state = $1, billing_checked_at = now(), \
              billing_observation_source = 'provider', next_attempt_at = NULL, \
              lease_owner = NULL, lease_expires_at = NULL, state_version = state_version + 1 \
              WHERE id = $2::uuid AND state_version = $3 AND lease_owner = $4 \
@@ -904,9 +904,8 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
     let row: Option<PurgeRow> = sqlx::query_as(
         "SELECT d.org_id, d.state, d.subscription_id, d.last_billing_state, \
                 d.billing_observation_source, d.billing_checked_at IS NOT NULL, \
-                (d.billing_observation_source = 'provider' \
-                 OR (d.billing_observation_source = 'operator' \
-                     AND d.billing_checked_at >= now() - interval '15 minutes')), \
+                (d.billing_checked_at >= now() - interval '15 minutes' \
+                 AND d.billing_observation_source IN ('provider', 'operator')), \
                 d.purge_after <= now(), \
                 o.lifecycle_state, o.stripe_subscription_id \
          FROM organization_deletions d JOIN organizations o ON o.id = d.org_id \
