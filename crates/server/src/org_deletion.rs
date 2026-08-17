@@ -711,8 +711,12 @@ async fn finish_retention_reconciliation(
 
 async fn enter_purging(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionView>> {
     let mut tx = pool.begin().await?;
+    // A deletion without a subscription was reconciled as missing before retention. Refresh that
+    // observation when the retention window ends so the final purge gate measures this transition,
+    // rather than the thirty-day-old billing check that made the operation eligible for purge.
     let row: Option<(String, String)> = sqlx::query_as(
-        "UPDATE organization_deletions SET state = 'purging', attempt_count = 0, next_attempt_at = NULL, \
+        "UPDATE organization_deletions SET state = 'purging', attempt_count = 0, \
+         billing_checked_at = now(), next_attempt_at = NULL, \
          lease_owner = NULL, lease_expires_at = NULL, state_version = state_version + 1 \
          WHERE id = $1::uuid AND state = 'retention' AND purge_after <= now() \
            AND state_version = $2 AND lease_owner = $3 \

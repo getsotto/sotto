@@ -324,11 +324,15 @@ async fn worker_reconciles_free_deletion_and_purges_tombstone() {
         .expect("retention transition");
     assert_eq!(retention.state, DeletionState::Retention);
 
-    sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
-        .bind(&requested.id)
-        .execute(&pool)
-        .await
-        .expect("make retention due");
+    sqlx::query(
+        "UPDATE organization_deletions SET requested_at = now() - interval '31 days', \
+         purge_after = now() - interval '1 day', billing_checked_at = now() - interval '30 days' \
+         WHERE id = $1::uuid",
+    )
+    .bind(&requested.id)
+    .execute(&pool)
+    .await
+    .expect("age retention operation");
     let retention_lease = claim_due(&pool, "deletion-purge-worker")
         .await
         .expect("claim retention")
