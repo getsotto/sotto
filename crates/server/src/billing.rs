@@ -729,6 +729,7 @@ fn subscription_snapshot(
     object: &serde_json::Value,
     requested_id: &str,
 ) -> ProviderResult<SubscriptionSnapshot> {
+    // A mismatched provider ID could otherwise gate deletion using another subscription's state.
     let id = object["id"]
         .as_str()
         .filter(|&id| id == requested_id)

@@ -59,14 +59,14 @@ impl DeletionState {
         }
     }
 
-    fn can_cancel(self) -> bool {
+    pub fn can_cancel(self) -> bool {
         matches!(
             self,
             Self::Requested | Self::CancellingBilling | Self::Retention | Self::Failed
         )
     }
 
-    fn is_terminal(self) -> bool {
+    pub fn is_terminal(self) -> bool {
         matches!(self, Self::Cancelled | Self::Completed)
     }
 }
@@ -114,6 +114,7 @@ pub(crate) fn retry_delay(attempt_count: i32) -> Option<Duration> {
 /// while deterministic tests can still assert the base ladder.
 fn retry_delay_with_jitter(operation_id: &str, attempt_count: i32) -> Option<Duration> {
     let base = retry_delay(attempt_count)?;
+    // FNV-1a's fixed prime gives stable per-operation jitter without storing another random value.
     let hash = operation_id.bytes().fold(0_u64, |hash, byte| {
         hash.wrapping_mul(1_099_511_628_211)
             .wrapping_add(byte as u64)
@@ -320,24 +321,24 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
         return Err(Error::NotFound("deletion not found".into()));
     };
     let state = DeletionState::from_db(&state)?;
-    if state == DeletionState::Purging {
-        return Err(Error::Conflict(
-            "organisation deletion cannot be cancelled after purge has started".into(),
-        ));
-    }
-    if state == DeletionState::Recovering || state.is_terminal() {
-        tx.commit().await?;
-        return Ok(DeletionView {
-            id,
-            org_id: org_id.into(),
-            state,
-        });
-    }
-    if !state.can_cancel() {
-        return Err(Error::Config(format!(
-            "organisation deletion cannot be cancelled from {}",
-            state.as_str()
-        )));
+    match state {
+        DeletionState::Purging => {
+            return Err(Error::Conflict(
+                "organisation deletion cannot be cancelled after purge has started".into(),
+            ));
+        }
+        DeletionState::Recovering | DeletionState::Cancelled | DeletionState::Completed => {
+            tx.commit().await?;
+            return Ok(DeletionView {
+                id,
+                org_id: org_id.into(),
+                state,
+            });
+        }
+        DeletionState::Requested
+        | DeletionState::CancellingBilling
+        | DeletionState::Retention
+        | DeletionState::Failed => {}
     }
     sqlx::query(
         "UPDATE organization_deletions SET state = 'recovering', resume_state = NULL, \
@@ -373,6 +374,7 @@ pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<Deletion
         return Err(Error::Config("deletion worker id is empty".into()));
     }
     let mut tx = pool.begin().await?;
+    // Five-minute leases give another worker a bounded recovery window after a crash.
     let candidate: Option<String> = sqlx::query_scalar(
         "SELECT id::text FROM organization_deletions \
          WHERE (lease_expires_at IS NULL OR lease_expires_at <= now()) \
@@ -396,7 +398,7 @@ pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<Deletion
     };
     let row: (String, String, Option<String>, i64, i32) = sqlx::query_as(
         "UPDATE organization_deletions \
-         SET lease_owner = $1, lease_expires_at = now() + interval '5 minutes', \
+             SET lease_owner = $1, lease_expires_at = now() + interval '5 minutes', \
              state_version = state_version + 1, \
              attempt_count = attempt_count + CASE \
                  WHEN state IN ('cancelling_billing', 'recovering') \
@@ -517,6 +519,7 @@ async fn advance_retention(
 }
 
 async fn operator_observation_is_fresh(pool: &PgPool, lease: &DeletionLease) -> Result<bool> {
+    // Fifteen minutes is the documented maximum age for an operator observation at purge time.
     let fresh: Option<bool> = sqlx::query_scalar(
         "SELECT billing_observation_source = 'operator' \
                 AND last_billing_state IN ('terminal', 'missing') \
@@ -532,9 +535,10 @@ async fn operator_observation_is_fresh(pool: &PgPool, lease: &DeletionLease) -> 
     Ok(fresh.unwrap_or(false))
 }
 
-/// Record a terminal or missing provider observation made by an operator when the provider is
-/// unavailable. The exact subscription ID, actor, reason, evidence, and observation time are
-/// retained so this is an auditable observation mechanism rather than a purge bypass.
+/// Record a terminal or missing provider observation made by an authenticated operator when the
+/// provider is unavailable. The exact subscription ID, actor, reason, evidence, and observation
+/// time are retained so a later operator entrypoint can audit the observation rather than bypassing
+/// the purge gate.
 pub struct OperatorObservation<'a> {
     pub subscription_id: &'a str,
     pub observed_status: &'a str,
@@ -879,7 +883,6 @@ fn view_from_row(id: &str, (org_id, state): (String, String)) -> Result<Deletion
     })
 }
 
-/// Apply the final purge only after rechecking every safety gate in the same transaction.
 type PurgeRow = (
     String,
     String,
@@ -893,8 +896,11 @@ type PurgeRow = (
     Option<String>,
 );
 
+/// Apply the final purge only after rechecking every safety gate in the same transaction.
 async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionView>> {
     let mut tx = pool.begin().await?;
+    // Provider and operator observations share the fifteen-minute freshness bound after a lost
+    // lease, so a stale result cannot satisfy the destructive purge gate.
     let row: Option<PurgeRow> = sqlx::query_as(
         "SELECT d.org_id, d.state, d.subscription_id, d.last_billing_state, \
                 d.billing_observation_source, d.billing_checked_at IS NOT NULL, \
