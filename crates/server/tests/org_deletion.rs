@@ -449,9 +449,11 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
         .await
         .expect("claim purge")
         .expect("purge is due");
+    // Keep the stale observation after the request so the migration's timestamp ordering remains
+    // valid while the purge freshness check still rejects it.
     sqlx::query(
-        "UPDATE organization_deletions \
-         SET billing_checked_at = now() - interval '16 minutes' WHERE id = $1::uuid",
+        "UPDATE organization_deletions SET requested_at = now() - interval '1 hour', \
+         billing_checked_at = now() - interval '16 minutes' WHERE id = $1::uuid",
     )
     .bind(&requested.id)
     .execute(&pool)
