@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
 
 use sotto_server::billing::{
@@ -61,6 +61,55 @@ impl TestProvider {
 
     fn status_calls(&self) -> usize {
         self.status_calls.load(Ordering::Relaxed)
+    }
+}
+
+struct BlockingCancellationProvider {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl BlockingCancellationProvider {
+    fn new() -> Self {
+        Self {
+            started: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl SubscriptionProvider for BlockingCancellationProvider {
+    async fn create_checkout(
+        &self,
+        _org_id: &str,
+        _customer: Option<&str>,
+        _success_url: &str,
+        _cancel_url: &str,
+    ) -> ProviderResult<String> {
+        Err(TestProvider::unsupported("checkout"))
+    }
+
+    async fn create_portal(&self, _customer: &str, _return_url: &str) -> ProviderResult<String> {
+        Err(TestProvider::unsupported("portal"))
+    }
+
+    async fn get_subscription(
+        &self,
+        subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Ok(cancelled(subscription_id))
+    }
+
+    async fn cancel_subscription(
+        &self,
+        subscription_id: &str,
+        _idempotency_key: &str,
+        _org_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        self.started.notify_one();
+        self.release.notified().await;
+        Ok(cancelled(subscription_id))
     }
 }
 
@@ -296,6 +345,12 @@ async fn owner_requests_are_idempotent_and_cancellable() {
             .await
             .expect("read lifecycle");
     assert_eq!(lifecycle, "active");
+    let tier: String = sqlx::query_scalar("SELECT tier FROM organizations WHERE id = $1")
+        .bind(&org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read recovered tier");
+    assert_eq!(tier, "free");
     assert_audit_actions(
         &pool,
         &org_id,
@@ -749,6 +804,205 @@ async fn authentication_failure_fails_without_a_retry_schedule() {
     .expect("read authentication error code");
     assert_eq!(error_code, "billing_unavailable");
     assert_audit_actions(&pool, &org_id, &["org.deletion.failed"]).await;
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn owner_can_recover_before_purge_from_every_worker_phase() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = db_test_lock().await;
+
+    let (requested_org, requested_owner) = seed_owner(&pool).await;
+    request(&pool, &requested_org, &requested_owner, &requested_org)
+        .await
+        .expect("request deletion");
+    let requested_view = cancel(&pool, &requested_org, &requested_owner)
+        .await
+        .expect("cancel requested deletion");
+    assert_eq!(requested_view.state, DeletionState::Recovering);
+    let requested_lease = claim_due(&pool, "phase-recovery-worker")
+        .await
+        .expect("claim requested recovery")
+        .expect("requested recovery is due");
+    let requested_cancelled = advance(&pool, &requested_lease, None)
+        .await
+        .expect("complete requested recovery")
+        .expect("requested recovery transition");
+    assert_eq!(requested_cancelled.state, DeletionState::Cancelled);
+    cleanup(&pool, &requested_org, &requested_owner).await;
+
+    let (billing_org, billing_owner) = seed_owner(&pool).await;
+    request(&pool, &billing_org, &billing_owner, &billing_org)
+        .await
+        .expect("request deletion");
+    let billing_requested_lease = claim_due(&pool, "phase-recovery-worker")
+        .await
+        .expect("claim billing request")
+        .expect("billing request is due");
+    let billing_state = advance(&pool, &billing_requested_lease, None)
+        .await
+        .expect("enter billing cancellation")
+        .expect("billing cancellation transition");
+    assert_eq!(billing_state.state, DeletionState::CancellingBilling);
+    let billing_cancelled = cancel(&pool, &billing_org, &billing_owner)
+        .await
+        .expect("cancel billing deletion");
+    assert_eq!(billing_cancelled.state, DeletionState::Recovering);
+    let billing_lease = claim_due(&pool, "phase-recovery-worker")
+        .await
+        .expect("claim billing recovery")
+        .expect("billing recovery is due");
+    let billing_recovered = advance(&pool, &billing_lease, None)
+        .await
+        .expect("complete billing recovery")
+        .expect("billing recovery transition");
+    assert_eq!(billing_recovered.state, DeletionState::Cancelled);
+    cleanup(&pool, &billing_org, &billing_owner).await;
+
+    let (retention_org, retention_owner) = seed_owner(&pool).await;
+    request(&pool, &retention_org, &retention_owner, &retention_org)
+        .await
+        .expect("request deletion");
+    let retention_requested_lease = claim_due(&pool, "phase-recovery-worker")
+        .await
+        .expect("claim retention request")
+        .expect("retention request is due");
+    advance(&pool, &retention_requested_lease, None)
+        .await
+        .expect("enter retention billing")
+        .expect("retention billing transition");
+    let retention_billing_lease = claim_due(&pool, "phase-recovery-worker")
+        .await
+        .expect("claim retention billing")
+        .expect("retention billing is due");
+    let retention_state = advance(&pool, &retention_billing_lease, None)
+        .await
+        .expect("enter retention")
+        .expect("retention transition");
+    assert_eq!(retention_state.state, DeletionState::Retention);
+    let retention_cancelled = cancel(&pool, &retention_org, &retention_owner)
+        .await
+        .expect("cancel retention deletion");
+    assert_eq!(retention_cancelled.state, DeletionState::Recovering);
+    let retention_lease = claim_due(&pool, "phase-recovery-worker")
+        .await
+        .expect("claim retention recovery")
+        .expect("retention recovery is due");
+    let retention_recovered = advance(&pool, &retention_lease, None)
+        .await
+        .expect("complete retention recovery")
+        .expect("retention recovery transition");
+    assert_eq!(retention_recovered.state, DeletionState::Cancelled);
+    cleanup(&pool, &retention_org, &retention_owner).await;
+}
+
+#[tokio::test]
+async fn owner_recovery_wins_an_in_flight_provider_cancellation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = db_test_lock().await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let _subscription_id = link_subscription(&pool, &org_id).await;
+    let _requested = request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(&pool, "racing-recovery-worker")
+        .await
+        .expect("claim requested")
+        .expect("requested work is due");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start billing cancellation")
+        .expect("billing transition");
+    let billing_lease = claim_due(&pool, "racing-recovery-worker")
+        .await
+        .expect("claim billing")
+        .expect("billing work is due");
+    let provider = Arc::new(BlockingCancellationProvider::new());
+    let started = provider.started.clone();
+    let release = provider.release.clone();
+    let advance_task = tokio::spawn({
+        let pool = pool.clone();
+        let lease = billing_lease.clone();
+        let provider = provider.clone();
+        async move { advance(&pool, &lease, Some(provider.as_ref())).await }
+    });
+    started.notified().await;
+
+    let recovering = cancel(&pool, &org_id, &owner_id)
+        .await
+        .expect("request recovery while cancellation is in flight");
+    assert_eq!(recovering.state, DeletionState::Recovering);
+    release.notify_one();
+    let stale_worker_result = advance_task
+        .await
+        .expect("join cancellation worker")
+        .expect("complete cancellation worker");
+    assert!(stale_worker_result.is_none());
+
+    let recovery_lease = claim_due(&pool, "racing-recovery-worker")
+        .await
+        .expect("claim recovery")
+        .expect("recovery is due");
+    let recovered = advance(&pool, &recovery_lease, Some(provider.as_ref()))
+        .await
+        .expect("complete recovery")
+        .expect("recovery transition");
+    assert_eq!(recovered.state, DeletionState::Cancelled);
+    assert_eq!(status(&pool, &org_id, &owner_id).await.unwrap(), recovered);
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn recovery_restores_team_from_a_provider_observation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = db_test_lock().await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let subscription_id = link_subscription(&pool, &org_id).await;
+    let provider = TestProvider::new(
+        [],
+        [Ok(current(&subscription_id, SubscriptionStatus::Active))],
+    );
+    let _requested = request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(&pool, "team-recovery-worker")
+        .await
+        .expect("claim requested")
+        .expect("requested work is due");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start billing cancellation")
+        .expect("billing transition");
+    let _billing_lease = claim_due(&pool, "team-recovery-worker")
+        .await
+        .expect("claim billing")
+        .expect("billing work is due");
+    let recovering = cancel(&pool, &org_id, &owner_id)
+        .await
+        .expect("request recovery");
+    assert_eq!(recovering.state, DeletionState::Recovering);
+    let recovery_lease = claim_due(&pool, "team-recovery-worker")
+        .await
+        .expect("claim recovery")
+        .expect("recovery is due");
+    assert_eq!(recovery_lease.state, DeletionState::Recovering);
+    let recovered = advance(&pool, &recovery_lease, Some(&provider))
+        .await
+        .expect("reconcile active subscription")
+        .expect("recovery transition");
+    assert_eq!(recovered.state, DeletionState::Cancelled);
+    let tier: String = sqlx::query_scalar("SELECT tier FROM organizations WHERE id = $1")
+        .bind(&org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read recovered tier");
+    assert_eq!(tier, "team");
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
