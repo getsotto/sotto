@@ -16,6 +16,10 @@ pub enum Error {
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
+    /// An internal invariant failed without an upstream or database error.
+    #[error("internal error: {0}")]
+    Internal(String),
+
     /// A schema migration failed.
     #[error("migration error: {0}")]
     Migrate(String),
@@ -77,7 +81,11 @@ impl IntoResponse for Error {
                 "upstream authentication error".to_string(),
             ),
             // Internal faults: never leak details to the client; log them server-side.
-            Error::Db(_) | Error::Config(_) | Error::Migrate(_) | Error::Io(_) => (
+            Error::Db(_)
+            | Error::Internal(_)
+            | Error::Config(_)
+            | Error::Migrate(_)
+            | Error::Io(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal error".to_string(),
             ),

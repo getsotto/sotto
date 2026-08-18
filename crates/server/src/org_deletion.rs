@@ -19,7 +19,7 @@ use crate::org::{self, LifecycleState, Role};
 /// Keep corrupted lifecycle data on the internal-error path rather than treating it as client
 /// configuration or input.
 fn lifecycle_error(message: impl Into<String>) -> Error {
-    Error::Db(sqlx::Error::Protocol(message.into()))
+    Error::Internal(message.into())
 }
 
 /// The persisted phases of one deletion attempt.
@@ -1167,7 +1167,7 @@ mod tests {
         }
         assert!(matches!(
             DeletionState::from_db("archived"),
-            Err(Error::Db(sqlx::Error::Protocol(_)))
+            Err(Error::Internal(_))
         ));
     }
 
