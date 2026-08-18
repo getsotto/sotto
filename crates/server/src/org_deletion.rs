@@ -65,14 +65,14 @@ impl DeletionState {
         }
     }
 
-    pub fn can_cancel(self) -> bool {
+    pub(crate) fn can_cancel(self) -> bool {
         matches!(
             self,
             Self::Requested | Self::CancellingBilling | Self::Retention | Self::Failed
         )
     }
 
-    pub fn is_terminal(self) -> bool {
+    pub(crate) fn is_terminal(self) -> bool {
         matches!(self, Self::Cancelled | Self::Completed)
     }
 }
