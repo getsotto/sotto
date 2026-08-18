@@ -16,6 +16,12 @@ use crate::billing::{
 use crate::error::{Error, Result};
 use crate::org::{self, LifecycleState, Role};
 
+/// Keep corrupted lifecycle data on the internal-error path rather than treating it as client
+/// configuration or input.
+fn lifecycle_error(message: impl Into<String>) -> Error {
+    Error::Db(sqlx::Error::Protocol(message.into()))
+}
+
 /// The persisted phases of one deletion attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeletionState {
@@ -53,7 +59,7 @@ impl DeletionState {
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
             "completed" => Ok(Self::Completed),
-            other => Err(Error::Config(format!(
+            other => Err(lifecycle_error(format!(
                 "unknown organisation deletion state in db: {other}"
             ))),
         }
@@ -185,15 +191,14 @@ pub async fn request(
         .fetch_optional(&mut *tx)
         .await?;
         let Some((id, state, resume_state)) = existing else {
-            return Err(Error::Config(
-                "deleting organisation has no active deletion operation".into(),
+            return Err(lifecycle_error(
+                "deleting organisation has no active deletion operation",
             ));
         };
         let state = DeletionState::from_db(&state)?;
         if state == DeletionState::Failed {
-            let resume_state = resume_state.ok_or_else(|| {
-                Error::Config("failed deletion has no recorded resume state".into())
-            })?;
+            let resume_state = resume_state
+                .ok_or_else(|| lifecycle_error("failed deletion has no recorded resume state"))?;
             DeletionState::from_db(&resume_state)?;
             sqlx::query(
                 "UPDATE organization_deletions \
@@ -389,7 +394,7 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
 /// Claim one due attempt. `SKIP LOCKED` lets multiple server instances share the queue safely.
 pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<DeletionLease>> {
     if worker_id.is_empty() {
-        return Err(Error::Config("deletion worker id is empty".into()));
+        return Err(Error::BadRequest("deletion worker id is empty".into()));
     }
     let mut tx = pool.begin().await?;
     // Five-minute leases give another worker a bounded recovery window after a crash.
@@ -875,7 +880,7 @@ async fn handle_provider_error(
     match provider_retry_decision(kind, lease.attempt_count) {
         RetryDecision::Retry(_) => {
             let delay = retry_delay_with_jitter(&lease.id, lease.attempt_count)
-                .ok_or_else(|| Error::Config("retry delay unexpectedly exhausted".into()))?;
+                .ok_or_else(|| lifecycle_error("retry delay unexpectedly exhausted"))?;
             schedule_retry(pool, lease, code, delay).await
         }
         RetryDecision::Failed => {
