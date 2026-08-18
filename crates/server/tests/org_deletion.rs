@@ -114,6 +114,13 @@ fn cancelled(subscription_id: &str) -> SubscriptionObservation {
     })
 }
 
+fn current(subscription_id: &str, status: SubscriptionStatus) -> SubscriptionObservation {
+    SubscriptionObservation::Current(SubscriptionSnapshot {
+        id: subscription_id.into(),
+        status,
+    })
+}
+
 async fn pool_or_skip() -> Option<PgPool> {
     let Ok(database_url) = std::env::var("DATABASE_URL") else {
         return None;
@@ -474,6 +481,155 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
         ],
     )
     .await;
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn provider_missing_satisfies_the_retention_purge_gate() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = db_test_lock().await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let subscription_id = format!("sub-deletion-{}", Uuid::new_v4().simple());
+    sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
+        .bind(&org_id)
+        .bind(&subscription_id)
+        .execute(&pool)
+        .await
+        .expect("link subscription fixture");
+    let provider = TestProvider::new(
+        [Ok(cancelled(&subscription_id))],
+        [Ok(SubscriptionObservation::Missing)],
+    );
+    let requested = request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(&pool, "missing-subscription-worker")
+        .await
+        .expect("claim requested")
+        .expect("requested work is due");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start billing cancellation")
+        .expect("billing transition");
+    let billing_lease = claim_due(&pool, "missing-subscription-worker")
+        .await
+        .expect("claim billing")
+        .expect("billing work is due");
+    let retention = advance(&pool, &billing_lease, Some(&provider))
+        .await
+        .expect("cancel subscription")
+        .expect("retention transition");
+    assert_eq!(retention.state, DeletionState::Retention);
+
+    sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+        .await
+        .expect("make retention due");
+    let retention_lease = claim_due(&pool, "missing-subscription-worker")
+        .await
+        .expect("claim retention")
+        .expect("retention is due");
+    let purging = advance(&pool, &retention_lease, Some(&provider))
+        .await
+        .expect("reconcile missing subscription")
+        .expect("purge transition");
+    assert_eq!(purging.state, DeletionState::Purging);
+    let billing_result: (String, String) = sqlx::query_as(
+        "SELECT last_billing_state, billing_observation_source \
+         FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&requested.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read missing billing result");
+    assert_eq!(billing_result, ("missing".into(), "provider".into()));
+
+    let purging_lease = claim_due(&pool, "missing-subscription-worker")
+        .await
+        .expect("claim purge")
+        .expect("purge is due");
+    let completed = advance(&pool, &purging_lease, None)
+        .await
+        .expect("purge missing subscription")
+        .expect("completed transition");
+    assert_eq!(completed.state, DeletionState::Completed);
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn unknown_provider_status_blocks_purge_and_schedules_retry() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = db_test_lock().await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let subscription_id = format!("sub-deletion-{}", Uuid::new_v4().simple());
+    sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
+        .bind(&org_id)
+        .bind(&subscription_id)
+        .execute(&pool)
+        .await
+        .expect("link subscription fixture");
+    let provider = TestProvider::new(
+        [Ok(cancelled(&subscription_id))],
+        [Ok(current(
+            &subscription_id,
+            SubscriptionStatus::Unknown("future_status".into()),
+        ))],
+    );
+    let requested = request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(&pool, "unknown-status-worker")
+        .await
+        .expect("claim requested")
+        .expect("requested work is due");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start billing cancellation")
+        .expect("billing transition");
+    let billing_lease = claim_due(&pool, "unknown-status-worker")
+        .await
+        .expect("claim billing")
+        .expect("billing work is due");
+    advance(&pool, &billing_lease, Some(&provider))
+        .await
+        .expect("cancel subscription")
+        .expect("retention transition");
+
+    sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+        .await
+        .expect("make retention due");
+    let retention_lease = claim_due(&pool, "unknown-status-worker")
+        .await
+        .expect("claim retention")
+        .expect("retention is due");
+    let retry = advance(&pool, &retention_lease, Some(&provider))
+        .await
+        .expect("reject unknown status")
+        .expect("retry transition");
+    assert_eq!(retry.state, DeletionState::Retention);
+    let retry_state: (String, bool, Option<String>) = sqlx::query_as(
+        "SELECT state, next_attempt_at IS NOT NULL, last_error_code \
+         FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&requested.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read unknown status retry");
+    assert_eq!(
+        retry_state,
+        (
+            "retention".into(),
+            true,
+            Some("billing_status_unknown".into())
+        )
+    );
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
