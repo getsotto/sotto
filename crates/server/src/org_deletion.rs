@@ -110,7 +110,8 @@ const RETRY_DELAYS: [Duration; 6] = [
     Duration::from_secs(24 * 60 * 60),
 ];
 
-/// Maximum age for a billing observation to satisfy a destructive purge gate.
+/// A shared fifteen-minute window keeps both checks from authorising a destructive purge on stale
+/// billing state.
 const BILLING_OBSERVATION_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 
 pub(crate) fn retry_delay(attempt_count: i32) -> Option<Duration> {
