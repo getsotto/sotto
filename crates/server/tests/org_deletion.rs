@@ -174,6 +174,17 @@ async fn seed_owner(pool: &PgPool) -> (String, String) {
     (org_id, user_id)
 }
 
+async fn link_subscription(pool: &PgPool, org_id: &str) -> String {
+    let subscription_id = format!("sub-deletion-{}", Uuid::new_v4().simple());
+    sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
+        .bind(org_id)
+        .bind(&subscription_id)
+        .execute(pool)
+        .await
+        .expect("link subscription fixture");
+    subscription_id
+}
+
 async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
     sqlx::query("DELETE FROM organization_deletions WHERE org_id = $1")
         .bind(org_id)
@@ -630,6 +641,114 @@ async fn unknown_provider_status_blocks_purge_and_schedules_retry() {
             Some("billing_status_unknown".into())
         )
     );
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn retryable_provider_failure_schedules_the_next_attempt() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = db_test_lock().await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let _subscription_id = link_subscription(&pool, &org_id).await;
+    let provider = TestProvider::new(
+        [Err(ProviderError {
+            status: Some(429),
+            code: Some("rate_limit_error".into()),
+            kind: ProviderErrorKind::Retryable,
+        })],
+        [],
+    );
+    let requested = request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(&pool, "retryable-provider-worker")
+        .await
+        .expect("claim requested")
+        .expect("requested work is due");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start billing cancellation")
+        .expect("billing transition");
+    let billing_lease = claim_due(&pool, "retryable-provider-worker")
+        .await
+        .expect("claim billing")
+        .expect("billing work is due");
+    let retry = advance(&pool, &billing_lease, Some(&provider))
+        .await
+        .expect("handle retryable provider failure")
+        .expect("retry transition");
+    assert_eq!(retry.state, DeletionState::CancellingBilling);
+    let retry_state: (i32, bool, Option<String>) = sqlx::query_as(
+        "SELECT attempt_count, next_attempt_at IS NOT NULL, last_error_code \
+         FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&requested.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read retry state");
+    assert_eq!(retry_state, (1, true, Some("rate_limit_error".into())));
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn authentication_failure_fails_without_a_retry_schedule() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = db_test_lock().await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let _subscription_id = link_subscription(&pool, &org_id).await;
+    let provider = TestProvider::new(
+        [Err(ProviderError {
+            status: Some(401),
+            code: Some("authentication_error".into()),
+            kind: ProviderErrorKind::Authentication,
+        })],
+        [],
+    );
+    let requested = request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(&pool, "authentication-provider-worker")
+        .await
+        .expect("claim requested")
+        .expect("requested work is due");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start billing cancellation")
+        .expect("billing transition");
+    let billing_lease = claim_due(&pool, "authentication-provider-worker")
+        .await
+        .expect("claim billing")
+        .expect("billing work is due");
+    let failed = advance(&pool, &billing_lease, Some(&provider))
+        .await
+        .expect("handle authentication failure")
+        .expect("failed transition");
+    assert_eq!(failed.state, DeletionState::Failed);
+    let failure_state: (String, Option<String>, bool) = sqlx::query_as(
+        "SELECT state, resume_state, next_attempt_at IS NOT NULL \
+         FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&requested.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read authentication failure");
+    assert_eq!(
+        failure_state,
+        ("failed".into(), Some("cancelling_billing".into()), false)
+    );
+    let error_code: String = sqlx::query_scalar(
+        "SELECT last_error_code FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&requested.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read authentication error code");
+    assert_eq!(error_code, "billing_unavailable");
+    assert_audit_actions(&pool, &org_id, &["org.deletion.failed"]).await;
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
