@@ -1007,6 +1007,51 @@ async fn recovery_restores_team_from_a_provider_observation() {
 }
 
 #[tokio::test]
+async fn recovery_restores_free_from_a_missing_provider_observation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = db_test_lock().await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let _subscription_id = link_subscription(&pool, &org_id).await;
+    let provider = TestProvider::new([], [Ok(SubscriptionObservation::Missing)]);
+    request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(&pool, "free-recovery-worker")
+        .await
+        .expect("claim requested")
+        .expect("requested work is due");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start billing cancellation")
+        .expect("billing transition");
+    let _billing_lease = claim_due(&pool, "free-recovery-worker")
+        .await
+        .expect("claim billing")
+        .expect("billing work is due");
+    cancel(&pool, &org_id, &owner_id)
+        .await
+        .expect("request recovery");
+    let recovery_lease = claim_due(&pool, "free-recovery-worker")
+        .await
+        .expect("claim recovery")
+        .expect("recovery is due");
+    let recovered = advance(&pool, &recovery_lease, Some(&provider))
+        .await
+        .expect("reconcile missing subscription")
+        .expect("recovery transition");
+    assert_eq!(recovered.state, DeletionState::Cancelled);
+    let tier: String = sqlx::query_scalar("SELECT tier FROM organizations WHERE id = $1")
+        .bind(&org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read recovered tier");
+    assert_eq!(tier, "free");
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
 async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
     let Some(pool) = pool_or_skip().await else {
         return;
