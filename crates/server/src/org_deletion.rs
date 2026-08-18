@@ -66,14 +66,14 @@ impl DeletionState {
         }
     }
 
-    pub(crate) fn can_cancel(self) -> bool {
+    fn can_cancel(self) -> bool {
         matches!(
             self,
             Self::Requested | Self::CancellingBilling | Self::Retention | Self::Failed
         )
     }
 
-    pub(crate) fn is_terminal(self) -> bool {
+    fn is_terminal(self) -> bool {
         matches!(self, Self::Cancelled | Self::Completed)
     }
 }
@@ -348,24 +348,18 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
         return Err(Error::NotFound("deletion not found".into()));
     };
     let state = DeletionState::from_db(&state)?;
-    match state {
-        DeletionState::Purging => {
+    if !state.can_cancel() {
+        if state == DeletionState::Purging {
             return Err(Error::Conflict(
                 "organisation deletion cannot be cancelled after purge has started".into(),
             ));
         }
-        DeletionState::Recovering | DeletionState::Cancelled | DeletionState::Completed => {
-            tx.commit().await?;
-            return Ok(DeletionView {
-                id,
-                org_id: org_id.into(),
-                state,
-            });
-        }
-        DeletionState::Requested
-        | DeletionState::CancellingBilling
-        | DeletionState::Retention
-        | DeletionState::Failed => {}
+        tx.commit().await?;
+        return Ok(DeletionView {
+            id,
+            org_id: org_id.into(),
+            state,
+        });
     }
     sqlx::query(
         "UPDATE organization_deletions SET state = 'recovering', resume_state = NULL, \
@@ -458,6 +452,9 @@ pub async fn advance(
     lease: &DeletionLease,
     provider: Option<&dyn SubscriptionProvider>,
 ) -> Result<Option<DeletionView>> {
+    if lease.state.is_terminal() {
+        return Ok(None);
+    }
     match lease.state {
         DeletionState::Requested => {
             transition_state(pool, lease, DeletionState::CancellingBilling).await
@@ -1150,6 +1147,8 @@ mod tests {
         billing_transition, provider_retry_decision, retry_delay, DeletionState, RetryDecision,
     };
     use crate::billing::{ProviderErrorKind, PurgeGate};
+    use crate::error::Error;
+    use sqlx::postgres::PgPoolOptions;
     use std::time::Duration;
 
     #[test]
@@ -1166,7 +1165,22 @@ mod tests {
         ] {
             assert_eq!(DeletionState::from_db(state.as_str()).unwrap(), state);
         }
-        assert!(DeletionState::from_db("archived").is_err());
+        assert!(matches!(
+            DeletionState::from_db("archived"),
+            Err(Error::Db(sqlx::Error::Protocol(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_worker_id_is_a_bad_request() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/sotto")
+            .expect("valid lazy database URL");
+
+        assert!(matches!(
+            super::claim_due(&pool, "").await,
+            Err(Error::BadRequest(message)) if message == "deletion worker id is empty"
+        ));
     }
 
     #[test]
