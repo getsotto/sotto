@@ -1064,6 +1064,9 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
         .expect("failed transition");
     assert_eq!(failed.state, DeletionState::Failed);
 
+    // PostgreSQL resolves the special "now" timestamp literal when it casts the bound value,
+    // keeping these observations fresh without adding a time-formatting dependency to the test.
+    // Empty fields intentionally exercise the required-field validation one at a time.
     for (operator, observed_status, observed_at) in [
         ("", "canceled", "now"),
         ("operator-1", "", "now"),
