@@ -1122,10 +1122,12 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
     // PostgreSQL resolves the special "now" timestamp literal when it casts the bound value,
     // keeping these observations fresh without adding a time-formatting dependency to the test.
     // Empty fields intentionally exercise the required-field validation one at a time.
-    for (operator, observed_status, observed_at) in [
-        ("", "canceled", "now"),
-        ("operator-1", "", "now"),
-        ("operator-1", "canceled", ""),
+    for (operator, observed_status, observed_at, reason, evidence) in [
+        ("", "canceled", "now", "reason", "evidence"),
+        ("operator-1", "", "now", "reason", "evidence"),
+        ("operator-1", "canceled", "", "reason", "evidence"),
+        ("operator-1", "canceled", "now", "", "evidence"),
+        ("operator-1", "canceled", "now", "reason", ""),
     ] {
         let result = record_operator_observation(
             &pool,
@@ -1135,8 +1137,8 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
                 subscription_id: &subscription_id,
                 observed_status,
                 observed_at,
-                reason: "provider credentials are being rotated",
-                evidence: "stripe-dashboard-request-1",
+                reason,
+                evidence,
             },
         )
         .await;
