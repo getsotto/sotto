@@ -28,7 +28,9 @@ use sotto_server::org_deletion::{
 
 static DB_TEST_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
 
-// Keep one provider fake for ordinary outcomes and the in-flight cancellation race.
+// Keep one provider fake for ordinary outcomes and the in-flight cancellation race. The optional
+// gate holds the provider call open until recovery commits, forcing the worker's stale
+// compare-and-set result to race the newer recovery state.
 #[derive(Clone)]
 struct CancellationGate {
     started: Arc<Notify>,
