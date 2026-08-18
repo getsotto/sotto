@@ -268,6 +268,25 @@ updated. `pause_collection` does not need a separate rule: Stripe leaves the sub
 unchanged when collection is paused, so the exhaustive status mapping still gives the right gate.
 This mapping must not reuse the entitlement-only `ACTIVE_STATUSES` constant.
 
+### Billing observation timestamps
+
+`last_billing_state`, `billing_observation_source`, and `billing_checked_at` form one stored billing
+result. The state records the purge-relevant outcome, the source records how that outcome was
+established, and the timestamp records when the result became authoritative for the deletion gate.
+The final purge check accepts only `Terminal` or `Missing` with a provider or operator source and a
+timestamp no more than 15 minutes old.
+
+- A provider observation records the time the provider result was received and stores
+  `billing_observation_source = 'provider'`.
+- A subscription-less free organisation records `last_billing_state = 'missing'` in the same
+  provider-result shape, but does not make a provider call. When its retention window ends, the
+  worker refreshes only `billing_checked_at` in the database transition to `purging`. That is a
+  database-side confirmation that no subscription has appeared, not a new provider observation;
+  the source and missing state remain unchanged.
+- An operator observation stores `billing_observation_source = 'operator'` and the timestamp
+  supplied as `observed_at`. The worker does not replace that time with the transaction time, so
+  the freshness check reflects when the operator actually inspected billing.
+
 The Stripe HTTP helper must preserve the response status and `error.code` instead of collapsing all
 non-success responses into an opaque upstream error. The adapter classifies lookup results as
 follows:
@@ -501,6 +520,8 @@ command may skip the billing observation mechanism or directly delete an `organi
 - Recovery after provider cancellation restores the free tier.
 - A fresh, audited operator observation can satisfy the same terminal-state gate; stale,
   mismatched, non-terminal, and unaudited observations cannot.
+- Billing timestamp coverage distinguishes provider result time, the database-side refresh for a
+  subscription-less organisation, and the operator's supplied observation time.
 
 ### Database and API tests
 
