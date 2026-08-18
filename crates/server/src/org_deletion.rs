@@ -73,6 +73,7 @@ impl DeletionState {
         )
     }
 
+    #[cfg(test)]
     fn is_terminal(self) -> bool {
         matches!(self, Self::Cancelled | Self::Completed)
     }
@@ -452,9 +453,6 @@ pub async fn advance(
     lease: &DeletionLease,
     provider: Option<&dyn SubscriptionProvider>,
 ) -> Result<Option<DeletionView>> {
-    if lease.state.is_terminal() {
-        return Ok(None);
-    }
     match lease.state {
         DeletionState::Requested => {
             transition_state(pool, lease, DeletionState::CancellingBilling).await
