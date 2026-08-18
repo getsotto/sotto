@@ -622,13 +622,7 @@ async fn unknown_provider_status_blocks_purge_and_schedules_retry() {
     };
     let _test_lock = db_test_lock().await;
     let (org_id, owner_id) = seed_owner(&pool).await;
-    let subscription_id = format!("sub-deletion-{}", Uuid::new_v4().simple());
-    sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
-        .bind(&org_id)
-        .bind(&subscription_id)
-        .execute(&pool)
-        .await
-        .expect("link subscription fixture");
+    let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
         [Ok(cancelled(&subscription_id))],
         [Ok(current(
@@ -1048,13 +1042,7 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
     };
     let _test_lock = db_test_lock().await;
     let (org_id, owner_id) = seed_owner(&pool).await;
-    let subscription_id = format!("sub-deletion-{}", Uuid::new_v4().simple());
-    sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
-        .bind(&org_id)
-        .bind(&subscription_id)
-        .execute(&pool)
-        .await
-        .expect("link subscription fixture");
+    let subscription_id = link_subscription(&pool, &org_id).await;
     let requested = request(&pool, &org_id, &owner_id, &org_id)
         .await
         .expect("request deletion");
