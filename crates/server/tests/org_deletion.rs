@@ -64,6 +64,8 @@ impl TestProvider {
     }
 }
 
+// Keep the provider call open until the owner recovery commits, forcing the worker's stale
+// compare-and-set result to race the newer recovery state.
 struct BlockingCancellationProvider {
     started: Arc<Notify>,
     release: Arc<Notify>,
