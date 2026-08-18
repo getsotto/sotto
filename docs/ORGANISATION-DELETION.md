@@ -109,6 +109,7 @@ flowchart LR
     billing --> failed[failed]
     purge --> failed
     failed --> billing
+    failed -->|operator observation| retention
     failed --> purge
     request --> recovering[recovering]
     billing --> recovering
@@ -125,7 +126,7 @@ flowchart LR
 | `retention` | The billing gate is confirmed `Terminal` or `Missing` and the recovery deadline has not passed. | `purging`, `recovering` |
 | `purging` | A worker owns the final database purge. Recovery is no longer possible. | `completed`, `failed` |
 | `recovering` | An owner cancelled deletion; billing is being reconciled before writes return. | `cancelled`, `failed` |
-| `failed` | Automatic attempts stopped after a sanitised, recorded failure. Data remains intact and write-frozen. | The recorded resume state, or `recovering` |
+| `failed` | Automatic attempts stopped after a sanitised, recorded failure. Data remains intact and write-frozen. | The recorded resume state, an authoritative operator observation to `retention`, or `recovering` |
 | `cancelled` | Billing was reconciled and the organisation was recovered. | Terminal for this attempt. A later request creates a new attempt. |
 | `completed` | Primary organisation data was purged and only the tombstone, deletion record, and retained audit metadata remain. | Terminal |
 
