@@ -1046,14 +1046,14 @@ async fn recovery_restores_team_from_a_provider_observation() {
 }
 
 #[tokio::test]
-async fn recovery_restores_free_from_a_missing_provider_observation() {
+async fn recovery_restores_free_from_a_cancelled_provider_observation() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
     let _test_lock = db_test_lock().await;
     let (org_id, owner_id) = seed_owner(&pool).await;
-    let _subscription_id = link_subscription(&pool, &org_id).await;
-    let provider = TestProvider::new([], [Ok(SubscriptionObservation::Missing)]);
+    let subscription_id = link_subscription(&pool, &org_id).await;
+    let provider = TestProvider::new([], [Ok(cancelled(&subscription_id))]);
     request(&pool, &org_id, &owner_id, &org_id)
         .await
         .expect("request deletion");
