@@ -464,13 +464,7 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
     };
     let _test_lock = db_test_lock().await;
     let (org_id, owner_id) = seed_owner(&pool).await;
-    let subscription_id = format!("sub-deletion-{}", Uuid::new_v4().simple());
-    sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
-        .bind(&org_id)
-        .bind(&subscription_id)
-        .execute(&pool)
-        .await
-        .expect("link subscription fixture");
+    let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
         [Ok(cancelled(&subscription_id))],
         [Ok(cancelled(&subscription_id))],
@@ -559,13 +553,7 @@ async fn provider_missing_satisfies_the_retention_purge_gate() {
     };
     let _test_lock = db_test_lock().await;
     let (org_id, owner_id) = seed_owner(&pool).await;
-    let subscription_id = format!("sub-deletion-{}", Uuid::new_v4().simple());
-    sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
-        .bind(&org_id)
-        .bind(&subscription_id)
-        .execute(&pool)
-        .await
-        .expect("link subscription fixture");
+    let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
         [Ok(cancelled(&subscription_id))],
         [Ok(SubscriptionObservation::Missing)],
