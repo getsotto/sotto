@@ -619,6 +619,7 @@ async fn provider_missing_satisfies_the_retention_purge_gate() {
         .expect("cancel subscription")
         .expect("retention transition");
     assert_eq!(retention.state, DeletionState::Retention);
+    assert_eq!(provider.cancellation_calls(), 1);
 
     // Move the retention deadline into the past so the worker path can run without waiting thirty
     // days in a database-backed test.
@@ -636,6 +637,7 @@ async fn provider_missing_satisfies_the_retention_purge_gate() {
         .expect("reconcile missing subscription")
         .expect("purge transition");
     assert_eq!(purging.state, DeletionState::Purging);
+    assert_eq!(provider.status_calls(), 1);
     let billing_result: (String, String) = sqlx::query_as(
         "SELECT last_billing_state, billing_observation_source \
          FROM organization_deletions WHERE id = $1::uuid",
