@@ -1062,6 +1062,35 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
         assert!(matches!(result, Err(Error::BadRequest(_))));
     }
 
+    let mismatched = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: "sub-other",
+            observed_status: "canceled",
+            observed_at: "now",
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+        },
+    )
+    .await;
+    assert!(matches!(mismatched, Err(Error::Conflict(_))));
+    let non_terminal = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "active",
+            observed_at: "now",
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+        },
+    )
+    .await;
+    assert!(matches!(non_terminal, Err(Error::BadRequest(_))));
+
     let observed = record_operator_observation(
         &pool,
         &org_id,
