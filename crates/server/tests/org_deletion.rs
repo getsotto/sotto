@@ -1189,20 +1189,47 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
     .await
     .expect("record operator observation");
     assert_eq!(observed.state, DeletionState::Retention);
-    // Move the retention deadline into the past so the worker path can run without waiting thirty
-    // days in a database-backed test.
-    sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
-        .bind(&requested.id)
-        .execute(&pool)
+    // Age the operator observation beyond the fifteen-minute freshness bound while making the
+    // retention work due, proving that an old manual result cannot unlock the purge.
+    sqlx::query(
+        "UPDATE organization_deletions SET purge_after = now(), \
+         billing_checked_at = now() - interval '16 minutes' WHERE id = $1::uuid",
+    )
+    .bind(&requested.id)
+    .execute(&pool)
+    .await
+    .expect("age operator observation");
+    let stale_retention_lease = claim_due(&pool, "operator-observation-worker")
         .await
-        .expect("make retention due");
+        .expect("claim stale retention")
+        .expect("stale retention is due");
+    let stale = advance(&pool, &stale_retention_lease, None)
+        .await
+        .expect("reject stale operator observation")
+        .expect("failed stale retention transition");
+    assert_eq!(stale.state, DeletionState::Failed);
+    let observed = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "canceled",
+            observed_at: "now",
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+        },
+    )
+    .await
+    .expect("refresh operator observation");
+    assert_eq!(observed.state, DeletionState::Retention);
     let retention_lease = claim_due(&pool, "operator-observation-worker")
         .await
-        .expect("claim retention")
-        .expect("retention is due");
+        .expect("claim fresh retention")
+        .expect("fresh retention is due");
     let purging = advance(&pool, &retention_lease, None)
         .await
-        .expect("use operator observation")
+        .expect("use fresh operator observation")
         .expect("purge transition");
     assert_eq!(purging.state, DeletionState::Purging);
     let purging_lease = claim_due(&pool, "operator-observation-worker")
