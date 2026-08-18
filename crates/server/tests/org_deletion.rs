@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use uuid::Uuid;
 
@@ -898,6 +899,11 @@ async fn owner_recovery_wins_an_in_flight_provider_cancellation() {
     let _test_lock = db_test_lock().await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let _subscription_id = link_subscription(&pool, &org_id).await;
+    sqlx::query("UPDATE organizations SET tier = 'team' WHERE id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("seed team tier");
     let _requested = request(&pool, &org_id, &owner_id, &org_id)
         .await
         .expect("request deletion");
@@ -922,7 +928,9 @@ async fn owner_recovery_wins_an_in_flight_provider_cancellation() {
         let provider = provider.clone();
         async move { advance(&pool, &lease, Some(provider.as_ref())).await }
     });
-    started.notified().await;
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("provider cancellation started");
 
     let recovering = cancel(&pool, &org_id, &owner_id)
         .await
@@ -933,6 +941,7 @@ async fn owner_recovery_wins_an_in_flight_provider_cancellation() {
         .await
         .expect("join cancellation worker")
         .expect("complete cancellation worker");
+    // None means the worker compare-and-set lost to the newer recovery state.
     assert!(stale_worker_result.is_none());
 
     let recovery_lease = claim_due(&pool, "racing-recovery-worker")
@@ -945,6 +954,12 @@ async fn owner_recovery_wins_an_in_flight_provider_cancellation() {
         .expect("recovery transition");
     assert_eq!(recovered.state, DeletionState::Cancelled);
     assert_eq!(status(&pool, &org_id, &owner_id).await.unwrap(), recovered);
+    let tier: String = sqlx::query_scalar("SELECT tier FROM organizations WHERE id = $1")
+        .bind(&org_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read recovered tier");
+    assert_eq!(tier, "free");
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
