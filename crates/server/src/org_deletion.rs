@@ -402,7 +402,6 @@ pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<Deletion
                  AND (next_attempt_at IS NULL OR next_attempt_at <= now())) \
              OR (state IN ('requested', 'cancelling_billing', 'recovering') \
                  AND (next_attempt_at IS NULL OR next_attempt_at <= now())) \
-             OR (state = 'failed' AND next_attempt_at IS NOT NULL AND next_attempt_at <= now())\
            ) \
          ORDER BY CASE WHEN state = 'retention' THEN purge_after \
                        ELSE COALESCE(next_attempt_at, requested_at) END, id \
