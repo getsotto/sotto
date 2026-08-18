@@ -59,6 +59,7 @@ impl DeletionState {
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
             "completed" => Ok(Self::Completed),
+            // Never let an unknown persisted value become claimable work.
             other => Err(lifecycle_error(format!(
                 "unknown organisation deletion state in db: {other}"
             ))),
