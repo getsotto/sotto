@@ -1173,6 +1173,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_worker_id_is_a_bad_request() {
+        // Validation happens before the transaction starts, so this pool never connects.
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://localhost/sotto")
             .expect("valid lazy database URL");
