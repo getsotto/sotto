@@ -392,7 +392,7 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
 /// Claim one due attempt. `SKIP LOCKED` lets multiple server instances share the queue safely.
 pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<DeletionLease>> {
     if worker_id.is_empty() {
-        return Err(Error::BadRequest("deletion worker id is empty".into()));
+        return Err(Error::Internal("deletion worker id is empty".into()));
     }
     let mut tx = pool.begin().await?;
     // Five-minute leases give another worker a bounded recovery window after a crash.
@@ -1172,7 +1172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_worker_id_is_a_bad_request() {
+    async fn empty_worker_id_is_an_internal_error() {
         // Validation happens before the transaction starts, so this pool never connects.
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://localhost/sotto")
@@ -1180,7 +1180,7 @@ mod tests {
 
         assert!(matches!(
             super::claim_due(&pool, "").await,
-            Err(Error::BadRequest(message)) if message == "deletion worker id is empty"
+            Err(Error::Internal(message)) if message == "deletion worker id is empty"
         ));
     }
 
