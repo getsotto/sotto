@@ -498,6 +498,8 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
             .expect("read reset attempts");
     assert_eq!(attempts, 0);
 
+    // Move the retention deadline into the past so the worker path can run without waiting thirty
+    // days in a database-backed test.
     sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
         .bind(&requested.id)
         .execute(&pool)
@@ -579,6 +581,8 @@ async fn provider_missing_satisfies_the_retention_purge_gate() {
         .expect("retention transition");
     assert_eq!(retention.state, DeletionState::Retention);
 
+    // Move the retention deadline into the past so the worker path can run without waiting thirty
+    // days in a database-backed test.
     sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
         .bind(&requested.id)
         .execute(&pool)
@@ -650,6 +654,8 @@ async fn unknown_provider_status_blocks_purge_and_schedules_retry() {
         .expect("cancel subscription")
         .expect("retention transition");
 
+    // Move the retention deadline into the past so the worker path can run without waiting thirty
+    // days in a database-backed test.
     sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
         .bind(&requested.id)
         .execute(&pool)
@@ -1132,6 +1138,8 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
     .await
     .expect("record operator observation");
     assert_eq!(observed.state, DeletionState::Retention);
+    // Move the retention deadline into the past so the worker path can run without waiting thirty
+    // days in a database-backed test.
     sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
         .bind(&requested.id)
         .execute(&pool)
