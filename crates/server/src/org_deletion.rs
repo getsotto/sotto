@@ -108,6 +108,9 @@ const RETRY_DELAYS: [Duration; 6] = [
     Duration::from_secs(24 * 60 * 60),
 ];
 
+/// Maximum age for a billing observation to satisfy a destructive purge gate.
+const BILLING_OBSERVATION_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+
 pub(crate) fn retry_delay(attempt_count: i32) -> Option<Duration> {
     if attempt_count <= 0 {
         return Some(RETRY_DELAYS[0]);
@@ -547,10 +550,11 @@ async fn operator_observation_is_fresh(pool: &PgPool, lease: &DeletionLease) -> 
     let fresh: Option<bool> = sqlx::query_scalar(
         "SELECT billing_observation_source = 'operator' \
                 AND last_billing_state IN ('terminal', 'missing') \
-                AND billing_checked_at >= now() - interval '15 minutes' \
+                AND billing_checked_at >= now() - ($1 * interval '1 second') \
          FROM organization_deletions \
-         WHERE id = $1::uuid AND state_version = $2 AND lease_owner = $3",
+         WHERE id = $2::uuid AND state_version = $3 AND lease_owner = $4",
     )
+    .bind(BILLING_OBSERVATION_MAX_AGE.as_secs() as i64)
     .bind(&lease.id)
     .bind(lease.state_version)
     .bind(&lease.worker_id)
@@ -995,14 +999,15 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
     let row: Option<PurgeRow> = sqlx::query_as(
         "SELECT d.org_id, d.state, d.subscription_id, d.last_billing_state, \
                 d.billing_observation_source, d.billing_checked_at IS NOT NULL, \
-                (d.billing_checked_at >= now() - interval '15 minutes' \
+                (d.billing_checked_at >= now() - ($1 * interval '1 second') \
                  AND d.billing_observation_source IN ('provider', 'operator')), \
                 d.purge_after <= now(), \
                 o.lifecycle_state, o.stripe_subscription_id \
          FROM organization_deletions d JOIN organizations o ON o.id = d.org_id \
-         WHERE d.id = $1::uuid AND d.state_version = $2 AND d.lease_owner = $3 \
+         WHERE d.id = $2::uuid AND d.state_version = $3 AND d.lease_owner = $4 \
          FOR UPDATE OF d, o",
     )
+    .bind(BILLING_OBSERVATION_MAX_AGE.as_secs() as i64)
     .bind(&lease.id)
     .bind(lease.state_version)
     .bind(&lease.worker_id)
