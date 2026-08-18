@@ -308,13 +308,18 @@ async fn owner_requests_are_idempotent_and_cancellable() {
     sqlx::query(
         "UPDATE organization_deletions \
          SET state = 'failed', resume_state = 'cancelling_billing', attempt_count = 7, \
-             last_error_code = 'billing_unavailable' \
+             last_error_code = 'billing_unavailable', next_attempt_at = now() \
          WHERE id = $1::uuid",
     )
     .bind(&first.id)
     .execute(&pool)
     .await
     .expect("exhaust retry attempts");
+    // Failed operations resume through an owner action, not the worker queue.
+    assert!(claim_due(&pool, "deletion-test-worker")
+        .await
+        .expect("check failed operation queue")
+        .is_none());
     let retried = request(&pool, &org_id, &owner_id, &org_id)
         .await
         .expect("retry failed deletion");

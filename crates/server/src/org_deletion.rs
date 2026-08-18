@@ -393,6 +393,8 @@ pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<Deletion
     }
     let mut tx = pool.begin().await?;
     // Five-minute leases give another worker a bounded recovery window after a crash.
+    // Failed rows stay out of this queue because an owner action or the deferred operator retry
+    // command, not an automatic retry, must restore their recorded resume state.
     let candidate: Option<String> = sqlx::query_scalar(
         "SELECT id::text FROM organization_deletions \
          WHERE (lease_expires_at IS NULL OR lease_expires_at <= now()) \
@@ -402,7 +404,6 @@ pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<Deletion
                  AND (next_attempt_at IS NULL OR next_attempt_at <= now())) \
              OR (state IN ('requested', 'cancelling_billing', 'recovering') \
                  AND (next_attempt_at IS NULL OR next_attempt_at <= now())) \
-             OR (state = 'failed' AND next_attempt_at IS NOT NULL AND next_attempt_at <= now())\
            ) \
          ORDER BY CASE WHEN state = 'retention' THEN purge_after \
                        ELSE COALESCE(next_attempt_at, requested_at) END, id \
