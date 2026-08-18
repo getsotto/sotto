@@ -467,8 +467,14 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
-        [Ok(cancelled(&subscription_id))],
-        [Ok(cancelled(&subscription_id))],
+        [
+            Ok(cancelled(&subscription_id)),
+            Ok(cancelled(&subscription_id)),
+        ],
+        [
+            Ok(current(&subscription_id, SubscriptionStatus::Active)),
+            Ok(cancelled(&subscription_id)),
+        ],
     );
     let requested = request(&pool, &org_id, &owner_id, &org_id)
         .await
@@ -510,12 +516,38 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
         .await
         .expect("claim retention")
         .expect("retention is due");
-    let purging = advance(&pool, &retention_lease, Some(&provider))
+    let cancelling = advance(&pool, &retention_lease, Some(&provider))
+        .await
+        .expect("reconcile blocking subscription")
+        .expect("cancellation transition");
+    assert_eq!(cancelling.state, DeletionState::CancellingBilling);
+    let cancellation_lease = claim_due(&pool, "paid-deletion-worker")
+        .await
+        .expect("claim retention cancellation")
+        .expect("retention cancellation is due");
+    let retention = advance(&pool, &cancellation_lease, Some(&provider))
+        .await
+        .expect("cancel blocking subscription")
+        .expect("retention transition");
+    assert_eq!(retention.state, DeletionState::Retention);
+    assert_eq!(provider.cancellation_calls(), 2);
+
+    // Reconcile the cancellation before entering the purge state.
+    sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+        .await
+        .expect("make reconciled retention due");
+    let reconciled_retention_lease = claim_due(&pool, "paid-deletion-worker")
+        .await
+        .expect("claim reconciled retention")
+        .expect("reconciled retention is due");
+    let purging = advance(&pool, &reconciled_retention_lease, Some(&provider))
         .await
         .expect("reconcile terminal subscription")
         .expect("purge transition");
     assert_eq!(purging.state, DeletionState::Purging);
-    assert_eq!(provider.status_calls(), 1);
+    assert_eq!(provider.status_calls(), 2);
 
     let purging_lease = claim_due(&pool, "paid-deletion-worker")
         .await
