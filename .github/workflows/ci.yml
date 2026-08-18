@@ -233,7 +233,16 @@ jobs:
 
       - name: Install Playwright's chromium browser
         working-directory: web
-        run: npx playwright install --with-deps chromium
+        # ubuntu-latest already includes Chromium and its system libraries. Avoid --with-deps here
+        # because its apt transaction has previously hung before this required gate could start.
+        run: |
+          timeout --kill-after=30s 5m npx playwright install chromium || {
+            status=$?
+            if [ "$status" -eq 124 ]; then
+              echo "::error::Playwright Chromium install exceeded five minutes"
+            fi
+            exit "$status"
+          }
 
       - name: Funnel regression suite
         working-directory: web
