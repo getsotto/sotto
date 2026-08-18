@@ -16,6 +16,12 @@ use crate::billing::{
 use crate::error::{Error, Result};
 use crate::org::{self, LifecycleState, Role};
 
+/// Keep corrupted lifecycle data on the internal-error path rather than treating it as client
+/// configuration or input.
+fn lifecycle_error(message: impl Into<String>) -> Error {
+    Error::Internal(message.into())
+}
+
 /// The persisted phases of one deletion attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeletionState {
@@ -53,20 +59,22 @@ impl DeletionState {
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
             "completed" => Ok(Self::Completed),
-            other => Err(Error::Config(format!(
+            // Never let an unknown persisted value become claimable work.
+            other => Err(lifecycle_error(format!(
                 "unknown organisation deletion state in db: {other}"
             ))),
         }
     }
 
-    pub fn can_cancel(self) -> bool {
+    fn can_cancel(self) -> bool {
         matches!(
             self,
             Self::Requested | Self::CancellingBilling | Self::Retention | Self::Failed
         )
     }
 
-    pub fn is_terminal(self) -> bool {
+    #[cfg(test)]
+    fn is_terminal(self) -> bool {
         matches!(self, Self::Cancelled | Self::Completed)
     }
 }
@@ -101,6 +109,10 @@ const RETRY_DELAYS: [Duration; 6] = [
     Duration::from_secs(6 * 60 * 60),
     Duration::from_secs(24 * 60 * 60),
 ];
+
+/// A shared fifteen-minute window keeps both checks from authorising a destructive purge on stale
+/// billing state.
+const BILLING_OBSERVATION_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 
 pub(crate) fn retry_delay(attempt_count: i32) -> Option<Duration> {
     if attempt_count <= 0 {
@@ -185,15 +197,14 @@ pub async fn request(
         .fetch_optional(&mut *tx)
         .await?;
         let Some((id, state, resume_state)) = existing else {
-            return Err(Error::Config(
-                "deleting organisation has no active deletion operation".into(),
+            return Err(lifecycle_error(
+                "deleting organisation has no active deletion operation",
             ));
         };
         let state = DeletionState::from_db(&state)?;
         if state == DeletionState::Failed {
-            let resume_state = resume_state.ok_or_else(|| {
-                Error::Config("failed deletion has no recorded resume state".into())
-            })?;
+            let resume_state = resume_state
+                .ok_or_else(|| lifecycle_error("failed deletion has no recorded resume state"))?;
             DeletionState::from_db(&resume_state)?;
             sqlx::query(
                 "UPDATE organization_deletions \
@@ -339,24 +350,18 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
         return Err(Error::NotFound("deletion not found".into()));
     };
     let state = DeletionState::from_db(&state)?;
-    match state {
-        DeletionState::Purging => {
+    if !state.can_cancel() {
+        if state == DeletionState::Purging {
             return Err(Error::Conflict(
                 "organisation deletion cannot be cancelled after purge has started".into(),
             ));
         }
-        DeletionState::Recovering | DeletionState::Cancelled | DeletionState::Completed => {
-            tx.commit().await?;
-            return Ok(DeletionView {
-                id,
-                org_id: org_id.into(),
-                state,
-            });
-        }
-        DeletionState::Requested
-        | DeletionState::CancellingBilling
-        | DeletionState::Retention
-        | DeletionState::Failed => {}
+        tx.commit().await?;
+        return Ok(DeletionView {
+            id,
+            org_id: org_id.into(),
+            state,
+        });
     }
     sqlx::query(
         "UPDATE organization_deletions SET state = 'recovering', resume_state = NULL, \
@@ -389,7 +394,7 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
 /// Claim one due attempt. `SKIP LOCKED` lets multiple server instances share the queue safely.
 pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<DeletionLease>> {
     if worker_id.is_empty() {
-        return Err(Error::Config("deletion worker id is empty".into()));
+        return Err(Error::Internal("deletion worker id is empty".into()));
     }
     let mut tx = pool.begin().await?;
     // Five-minute leases give another worker a bounded recovery window after a crash.
@@ -542,10 +547,11 @@ async fn operator_observation_is_fresh(pool: &PgPool, lease: &DeletionLease) -> 
     let fresh: Option<bool> = sqlx::query_scalar(
         "SELECT billing_observation_source = 'operator' \
                 AND last_billing_state IN ('terminal', 'missing') \
-                AND billing_checked_at >= now() - interval '15 minutes' \
+                AND billing_checked_at >= now() - ($1 * interval '1 second') \
          FROM organization_deletions \
-         WHERE id = $1::uuid AND state_version = $2 AND lease_owner = $3",
+         WHERE id = $2::uuid AND state_version = $3 AND lease_owner = $4",
     )
+    .bind(BILLING_OBSERVATION_MAX_AGE.as_secs() as i64)
     .bind(&lease.id)
     .bind(lease.state_version)
     .bind(&lease.worker_id)
@@ -875,7 +881,7 @@ async fn handle_provider_error(
     match provider_retry_decision(kind, lease.attempt_count) {
         RetryDecision::Retry(_) => {
             let delay = retry_delay_with_jitter(&lease.id, lease.attempt_count)
-                .ok_or_else(|| Error::Config("retry delay unexpectedly exhausted".into()))?;
+                .ok_or_else(|| lifecycle_error("retry delay unexpectedly exhausted"))?;
             schedule_retry(pool, lease, code, delay).await
         }
         RetryDecision::Failed => {
@@ -990,14 +996,15 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
     let row: Option<PurgeRow> = sqlx::query_as(
         "SELECT d.org_id, d.state, d.subscription_id, d.last_billing_state, \
                 d.billing_observation_source, d.billing_checked_at IS NOT NULL, \
-                (d.billing_checked_at >= now() - interval '15 minutes' \
+                (d.billing_checked_at >= now() - ($1 * interval '1 second') \
                  AND d.billing_observation_source IN ('provider', 'operator')), \
                 d.purge_after <= now(), \
                 o.lifecycle_state, o.stripe_subscription_id \
          FROM organization_deletions d JOIN organizations o ON o.id = d.org_id \
-         WHERE d.id = $1::uuid AND d.state_version = $2 AND d.lease_owner = $3 \
+         WHERE d.id = $2::uuid AND d.state_version = $3 AND d.lease_owner = $4 \
          FOR UPDATE OF d, o",
     )
+    .bind(BILLING_OBSERVATION_MAX_AGE.as_secs() as i64)
     .bind(&lease.id)
     .bind(lease.state_version)
     .bind(&lease.worker_id)
@@ -1139,6 +1146,8 @@ mod tests {
         billing_transition, provider_retry_decision, retry_delay, DeletionState, RetryDecision,
     };
     use crate::billing::{ProviderErrorKind, PurgeGate};
+    use crate::error::Error;
+    use sqlx::postgres::PgPoolOptions;
     use std::time::Duration;
 
     #[test]
@@ -1155,7 +1164,24 @@ mod tests {
         ] {
             assert_eq!(DeletionState::from_db(state.as_str()).unwrap(), state);
         }
-        assert!(DeletionState::from_db("archived").is_err());
+        assert!(matches!(
+            DeletionState::from_db("archived"),
+            Err(Error::Internal(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_worker_id_is_an_internal_error() {
+        // Validation happens before the transaction starts, so this pool never connects. The
+        // closed local port also prevents an accidental future connection from touching dev data.
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1:1/sotto")
+            .expect("valid lazy database URL");
+
+        assert!(matches!(
+            super::claim_due(&pool, "").await,
+            Err(Error::Internal(message)) if message == "deletion worker id is empty"
+        ));
     }
 
     #[test]
