@@ -554,7 +554,8 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
         .expect("claim purge")
         .expect("purge is due");
     // Keep the stale observation after the request so the migration's timestamp ordering remains
-    // valid while the purge freshness check still rejects it.
+    // valid while the purge freshness check still rejects it. Sixteen minutes is deliberately just
+    // beyond the documented fifteen-minute freshness bound.
     sqlx::query(
         "UPDATE organization_deletions SET requested_at = now() - interval '1 hour', \
          billing_checked_at = now() - interval '16 minutes' WHERE id = $1::uuid",
