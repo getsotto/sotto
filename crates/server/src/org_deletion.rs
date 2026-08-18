@@ -1171,9 +1171,10 @@ mod tests {
 
     #[tokio::test]
     async fn empty_worker_id_is_an_internal_error() {
-        // Validation happens before the transaction starts, so this pool never connects.
+        // Validation happens before the transaction starts, so this pool never connects. The
+        // closed local port also prevents an accidental future connection from touching dev data.
         let pool = PgPoolOptions::new()
-            .connect_lazy("postgres://localhost/sotto")
+            .connect_lazy("postgres://127.0.0.1:1/sotto")
             .expect("valid lazy database URL");
 
         assert!(matches!(
