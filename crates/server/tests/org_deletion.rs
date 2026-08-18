@@ -726,13 +726,15 @@ async fn retryable_provider_failure_schedules_the_next_attempt() {
         .expect("retry transition");
     assert_eq!(retry.state, DeletionState::CancellingBilling);
     let retry_state: (i32, bool, Option<String>) = sqlx::query_as(
-        "SELECT attempt_count, next_attempt_at IS NOT NULL, last_error_code \
+        "SELECT attempt_count, next_attempt_at > now() + interval '30 seconds', last_error_code \
          FROM organization_deletions WHERE id = $1::uuid",
     )
     .bind(&requested.id)
     .fetch_one(&pool)
     .await
     .expect("read retry state");
+    // The timestamp must be newly scheduled after the failure, not merely left over from the
+    // requested-to-cancelling transition.
     assert_eq!(retry_state, (1, true, Some("rate_limit_error".into())));
     cleanup(&pool, &org_id, &owner_id).await;
 }
