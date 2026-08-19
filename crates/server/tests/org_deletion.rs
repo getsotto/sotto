@@ -815,94 +815,110 @@ async fn authentication_failure_fails_without_a_retry_schedule() {
 }
 
 #[tokio::test]
-async fn owner_can_recover_before_purge_from_every_worker_phase() {
+async fn owner_can_recover_from_requested_phase() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
     let _test_lock = db_test_lock().await;
 
-    let (requested_org, requested_owner) = seed_owner(&pool).await;
-    request(&pool, &requested_org, &requested_owner, &requested_org)
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    request(&pool, &org_id, &owner_id, &org_id)
         .await
         .expect("request deletion");
-    let requested_view = cancel(&pool, &requested_org, &requested_owner)
+    let recovering = cancel(&pool, &org_id, &owner_id)
         .await
         .expect("cancel requested deletion");
-    assert_eq!(requested_view.state, DeletionState::Recovering);
-    let requested_lease = claim_due(&pool, "phase-recovery-worker")
+    assert_eq!(recovering.state, DeletionState::Recovering);
+    let recovery_lease = claim_due(&pool, "requested-recovery-worker")
         .await
         .expect("claim requested recovery")
         .expect("requested recovery is due");
-    let requested_cancelled = advance(&pool, &requested_lease, None)
+    let recovered = advance(&pool, &recovery_lease, None)
         .await
         .expect("complete requested recovery")
         .expect("requested recovery transition");
-    assert_eq!(requested_cancelled.state, DeletionState::Cancelled);
-    cleanup(&pool, &requested_org, &requested_owner).await;
+    assert_eq!(recovered.state, DeletionState::Cancelled);
+    cleanup(&pool, &org_id, &owner_id).await;
+}
 
-    let (billing_org, billing_owner) = seed_owner(&pool).await;
-    request(&pool, &billing_org, &billing_owner, &billing_org)
+#[tokio::test]
+async fn owner_can_recover_from_cancelling_billing_phase() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = db_test_lock().await;
+
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    request(&pool, &org_id, &owner_id, &org_id)
         .await
         .expect("request deletion");
-    let billing_requested_lease = claim_due(&pool, "phase-recovery-worker")
+    let requested_lease = claim_due(&pool, "billing-recovery-worker")
         .await
-        .expect("claim billing request")
-        .expect("billing request is due");
-    let billing_state = advance(&pool, &billing_requested_lease, None)
+        .expect("claim requested billing transition")
+        .expect("requested billing transition is due");
+    let billing_state = advance(&pool, &requested_lease, None)
         .await
         .expect("enter billing cancellation")
         .expect("billing cancellation transition");
     assert_eq!(billing_state.state, DeletionState::CancellingBilling);
-    let billing_cancelled = cancel(&pool, &billing_org, &billing_owner)
+    let recovering = cancel(&pool, &org_id, &owner_id)
         .await
         .expect("cancel billing deletion");
-    assert_eq!(billing_cancelled.state, DeletionState::Recovering);
-    let billing_lease = claim_due(&pool, "phase-recovery-worker")
+    assert_eq!(recovering.state, DeletionState::Recovering);
+    let recovery_lease = claim_due(&pool, "billing-recovery-worker")
         .await
         .expect("claim billing recovery")
         .expect("billing recovery is due");
-    let billing_recovered = advance(&pool, &billing_lease, None)
+    let recovered = advance(&pool, &recovery_lease, None)
         .await
         .expect("complete billing recovery")
         .expect("billing recovery transition");
-    assert_eq!(billing_recovered.state, DeletionState::Cancelled);
-    cleanup(&pool, &billing_org, &billing_owner).await;
+    assert_eq!(recovered.state, DeletionState::Cancelled);
+    cleanup(&pool, &org_id, &owner_id).await;
+}
 
-    let (retention_org, retention_owner) = seed_owner(&pool).await;
-    request(&pool, &retention_org, &retention_owner, &retention_org)
+#[tokio::test]
+async fn owner_can_recover_from_retention_phase() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = db_test_lock().await;
+
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    request(&pool, &org_id, &owner_id, &org_id)
         .await
         .expect("request deletion");
-    let retention_requested_lease = claim_due(&pool, "phase-recovery-worker")
+    let requested_lease = claim_due(&pool, "retention-recovery-worker")
         .await
-        .expect("claim retention request")
-        .expect("retention request is due");
-    advance(&pool, &retention_requested_lease, None)
+        .expect("claim requested retention transition")
+        .expect("requested retention transition is due");
+    advance(&pool, &requested_lease, None)
         .await
         .expect("enter retention billing")
         .expect("retention billing transition");
-    let retention_billing_lease = claim_due(&pool, "phase-recovery-worker")
+    let billing_lease = claim_due(&pool, "retention-recovery-worker")
         .await
         .expect("claim retention billing")
         .expect("retention billing is due");
-    let retention_state = advance(&pool, &retention_billing_lease, None)
+    let retention = advance(&pool, &billing_lease, None)
         .await
         .expect("enter retention")
         .expect("retention transition");
-    assert_eq!(retention_state.state, DeletionState::Retention);
-    let retention_cancelled = cancel(&pool, &retention_org, &retention_owner)
+    assert_eq!(retention.state, DeletionState::Retention);
+    let recovering = cancel(&pool, &org_id, &owner_id)
         .await
         .expect("cancel retention deletion");
-    assert_eq!(retention_cancelled.state, DeletionState::Recovering);
-    let retention_lease = claim_due(&pool, "phase-recovery-worker")
+    assert_eq!(recovering.state, DeletionState::Recovering);
+    let recovery_lease = claim_due(&pool, "retention-recovery-worker")
         .await
         .expect("claim retention recovery")
         .expect("retention recovery is due");
-    let retention_recovered = advance(&pool, &retention_lease, None)
+    let recovered = advance(&pool, &recovery_lease, None)
         .await
         .expect("complete retention recovery")
         .expect("retention recovery transition");
-    assert_eq!(retention_recovered.state, DeletionState::Cancelled);
-    cleanup(&pool, &retention_org, &retention_owner).await;
+    assert_eq!(recovered.state, DeletionState::Cancelled);
+    cleanup(&pool, &org_id, &owner_id).await;
 }
 
 #[tokio::test]
