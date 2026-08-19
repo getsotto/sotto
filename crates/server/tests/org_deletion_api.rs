@@ -233,3 +233,53 @@ async fn owner_can_cancel_deletion_idempotently() {
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
+
+#[tokio::test]
+async fn deletion_request_requires_both_explicit_confirmations() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    let uri = format!("/orgs/{org_id}/deletion");
+    let cases = [
+        (
+            json!({"acknowledge_subscription_cancellation": true}),
+            "deletion confirmation is required",
+        ),
+        (
+            json!({"confirm_org_id": org_id}),
+            "subscription cancellation acknowledgement is required",
+        ),
+        (
+            json!({
+                "confirm_org_id": org_id,
+                "acknowledge_subscription_cancellation": false
+            }),
+            "subscription cancellation acknowledgement is required",
+        ),
+        (
+            json!({
+                "confirm_org_id": "another-organisation",
+                "acknowledge_subscription_cancellation": true
+            }),
+            "deletion confirmation does not match the organisation",
+        ),
+    ];
+
+    for (body, expected) in cases {
+        let (status, response) = send(
+            deletion_app(pool.clone()),
+            "POST",
+            &uri,
+            Some(&token),
+            Some(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response, expected);
+    }
+    let (status, _) = send(deletion_app(pool.clone()), "GET", &uri, Some(&token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    cleanup(&pool, &org_id, &[&owner_id]).await;
+}
