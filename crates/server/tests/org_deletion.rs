@@ -163,7 +163,7 @@ async fn pool_or_skip() -> Option<PgPool> {
     Some(pool)
 }
 
-async fn db_test_lock(pool: &PgPool) -> Transaction<'static, Postgres> {
+async fn prepare_deletion_test(pool: &PgPool) -> Transaction<'static, Postgres> {
     let mut tx = pool.begin().await.expect("begin deletion test lock");
     // The worker queue is global, so a database lock also serialises separate integration-test
     // binaries that cannot share an in-process mutex.
@@ -171,25 +171,31 @@ async fn db_test_lock(pool: &PgPool) -> Transaction<'static, Postgres> {
         .execute(&mut *tx)
         .await
         .expect("lock deletion tests");
-    clean_abandoned_api_fixtures(pool).await;
+    clean_abandoned_fixtures(pool).await;
     tx
 }
 
-async fn clean_abandoned_api_fixtures(pool: &PgPool) {
-    // A failed handler assertion can leave due work behind. Clear only the API suite's reserved
-    // identifiers before a lifecycle worker can claim that abandoned operation on the next run.
-    sqlx::query("DELETE FROM organization_deletions WHERE org_id LIKE 'deletion-api-org-%'")
+async fn clean_abandoned_fixtures(pool: &PgPool) {
+    // A failed assertion can leave due work behind. Clear only the two deletion suites' reserved
+    // identifiers before a lifecycle worker can claim an abandoned operation on the next run.
+    sqlx::query(
+        "DELETE FROM organization_deletions \
+         WHERE org_id LIKE 'deletion-org-%' OR org_id LIKE 'deletion-api-org-%'",
+    )
+    .execute(pool)
+    .await
+    .expect("delete abandoned deletion operations");
+    sqlx::query(
+        "DELETE FROM organizations \
+         WHERE id LIKE 'deletion-org-%' OR id LIKE 'deletion-api-org-%'",
+    )
+    .execute(pool)
+    .await
+    .expect("delete abandoned deletion organisations");
+    sqlx::query("DELETE FROM users WHERE id LIKE 'deletion-owner-%' OR id LIKE 'deletion-api-%'")
         .execute(pool)
         .await
-        .expect("delete abandoned API operations");
-    sqlx::query("DELETE FROM organizations WHERE id LIKE 'deletion-api-org-%'")
-        .execute(pool)
-        .await
-        .expect("delete abandoned API organisations");
-    sqlx::query("DELETE FROM users WHERE id LIKE 'deletion-api-%'")
-        .execute(pool)
-        .await
-        .expect("delete abandoned API users");
+        .expect("delete abandoned deletion users");
 }
 
 async fn seed_owner(pool: &PgPool) -> (String, String) {
@@ -268,7 +274,7 @@ async fn owner_requests_are_idempotent_and_cancellable() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     assert!(matches!(
         request(&pool, &org_id, &owner_id, "other-org").await,
@@ -372,7 +378,7 @@ async fn worker_reconciles_free_deletion_and_purges_tombstone() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let requested = request(&pool, &org_id, &owner_id, &org_id)
         .await
@@ -463,7 +469,7 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
@@ -587,7 +593,7 @@ async fn provider_missing_satisfies_the_retention_purge_gate() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
@@ -660,7 +666,7 @@ async fn unknown_provider_status_blocks_purge_and_schedules_retry() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
@@ -730,7 +736,7 @@ async fn retryable_provider_failure_schedules_the_next_attempt() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let _subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
@@ -780,7 +786,7 @@ async fn authentication_failure_fails_without_a_retry_schedule() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let _subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
@@ -840,7 +846,7 @@ async fn owner_can_recover_from_requested_phase() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
 
     let (org_id, owner_id) = seed_owner(&pool).await;
     request(&pool, &org_id, &owner_id, &org_id)
@@ -867,7 +873,7 @@ async fn owner_can_recover_from_cancelling_billing_phase() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
 
     let (org_id, owner_id) = seed_owner(&pool).await;
     request(&pool, &org_id, &owner_id, &org_id)
@@ -903,7 +909,7 @@ async fn owner_can_recover_from_retention_phase() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
 
     let (org_id, owner_id) = seed_owner(&pool).await;
     request(&pool, &org_id, &owner_id, &org_id)
@@ -947,7 +953,7 @@ async fn owner_recovery_wins_an_in_flight_provider_cancellation() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     sqlx::query("UPDATE organizations SET tier = 'team' WHERE id = $1")
@@ -1024,7 +1030,7 @@ async fn recovery_restores_team_from_a_provider_observation() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
@@ -1074,7 +1080,7 @@ async fn recovery_restores_free_from_a_cancelled_provider_observation() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new([], [Ok(cancelled(&subscription_id))]);
@@ -1119,7 +1125,7 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock(&pool).await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let requested = request(&pool, &org_id, &owner_id, &org_id)
