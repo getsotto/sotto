@@ -421,3 +421,69 @@ async fn production_router_does_not_expose_deletion() {
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
+
+#[tokio::test]
+async fn deletion_status_exposes_only_sanitised_failure_codes() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
+        .bind(&org_id)
+        .bind("sub-deletion-api-unconfigured")
+        .execute(&pool)
+        .await
+        .expect("link subscription fixture");
+    let uri = format!("/orgs/{org_id}/deletion");
+    send(
+        deletion_app(pool.clone()),
+        "POST",
+        &uri,
+        Some(&token),
+        Some(json!({
+            "confirm_org_id": org_id,
+            "acknowledge_subscription_cancellation": true
+        })),
+    )
+    .await;
+    // Arrange the worker-owned failure directly so this HTTP test cannot claim another test's
+    // globally due operation while the suite runs in parallel.
+    sqlx::query(
+        "UPDATE organization_deletions SET state = 'failed', \
+         resume_state = 'cancelling_billing', last_error_code = 'billing_unavailable' \
+         WHERE org_id = $1",
+    )
+    .bind(&org_id)
+    .execute(&pool)
+    .await
+    .expect("arrange failed deletion");
+
+    let cases = [
+        ("billing_unavailable", "billing_unavailable"),
+        ("billing_status_unknown", "billing_unknown"),
+        ("purge_precondition_failed", "purge_failed"),
+        (
+            "provider_detail_that_must_not_escape",
+            "billing_unavailable",
+        ),
+    ];
+    for (stored_error, public_error) in cases {
+        sqlx::query("UPDATE organization_deletions SET last_error_code = $2 WHERE org_id = $1")
+            .bind(&org_id)
+            .bind(stored_error)
+            .execute(&pool)
+            .await
+            .expect("set failure code");
+        let (status, body) =
+            send(deletion_app(pool.clone()), "GET", &uri, Some(&token), None).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let response: Value = serde_json::from_str(&body).expect("failed status JSON");
+        assert_eq!(response["state"], "failed");
+        assert_eq!(response["error"], public_error);
+        assert!(!body.contains("provider_detail_that_must_not_escape"));
+        assert!(!body.contains("sub-deletion-api-unconfigured"));
+    }
+
+    cleanup(&pool, &org_id, &[&owner_id]).await;
+}
