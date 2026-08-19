@@ -487,3 +487,84 @@ async fn deletion_status_exposes_only_sanitised_failure_codes() {
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
+
+#[tokio::test]
+async fn requester_can_read_a_completed_deletion_without_reusing_the_id() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (org_id, owner_id, owner_token) = seed_owner(&pool).await;
+    let (outsider_id, outsider_token) = seed_user(&pool, "terminal-outsider").await;
+    let uri = format!("/orgs/{org_id}/deletion");
+    send(
+        deletion_app(pool.clone()),
+        "POST",
+        &uri,
+        Some(&owner_token),
+        Some(json!({
+            "confirm_org_id": org_id,
+            "acknowledge_subscription_cancellation": true
+        })),
+    )
+    .await;
+    let mut tx = pool.begin().await.expect("begin tombstone fixture");
+    sqlx::query(
+        "UPDATE organization_deletions SET state = 'completed', completed_at = now() \
+         WHERE org_id = $1",
+    )
+    .bind(&org_id)
+    .execute(&mut *tx)
+    .await
+    .expect("complete operation fixture");
+    sqlx::query("DELETE FROM organization_memberships WHERE org_id = $1")
+        .bind(&org_id)
+        .execute(&mut *tx)
+        .await
+        .expect("purge memberships fixture");
+    sqlx::query(
+        "UPDATE organizations SET lifecycle_state = 'deleted', deleted_at = now(), \
+         enc_name = NULL, created_by = NULL, tier = 'free', trial_ends_at = NULL, \
+         stripe_customer_id = NULL, stripe_subscription_id = NULL WHERE id = $1",
+    )
+    .bind(&org_id)
+    .execute(&mut *tx)
+    .await
+    .expect("create tombstone fixture");
+    tx.commit().await.expect("commit tombstone fixture");
+
+    let (requester_status, requester_body) = send(
+        deletion_app(pool.clone()),
+        "GET",
+        &uri,
+        Some(&owner_token),
+        None,
+    )
+    .await;
+    let (outsider_status, _) = send(
+        deletion_app(pool.clone()),
+        "GET",
+        &uri,
+        Some(&outsider_token),
+        None,
+    )
+    .await;
+    let (repeated_status, _) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &uri,
+        Some(&owner_token),
+        Some(json!({
+            "confirm_org_id": org_id,
+            "acknowledge_subscription_cancellation": true
+        })),
+    )
+    .await;
+
+    assert_eq!(requester_status, StatusCode::OK);
+    let response: Value = serde_json::from_str(&requester_body).expect("completed status JSON");
+    assert_eq!(response["state"], "completed");
+    assert_eq!(outsider_status, StatusCode::NOT_FOUND);
+    assert_eq!(repeated_status, StatusCode::CONFLICT);
+
+    cleanup(&pool, &org_id, &[&owner_id, &outsider_id]).await;
+}

@@ -213,7 +213,24 @@ pub async fn request(
     };
     let lifecycle = LifecycleState::from_db(&lifecycle)?;
     if lifecycle == LifecycleState::Deleted {
-        return Err(Error::NotFound("organisation not found".into()));
+        // The requesting owner may already inspect this terminal operation after memberships are
+        // purged, so tell only that actor that the id is permanently unavailable. Everyone else
+        // receives the same not-found response as an unknown organisation.
+        let requested_by_actor: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM organization_deletions \
+             WHERE org_id = $1 AND requested_by = $2 AND state = 'completed' LIMIT 1",
+        )
+        .bind(org_id)
+        .bind(actor)
+        .fetch_optional(&mut *tx)
+        .await?;
+        return if requested_by_actor.is_some() {
+            Err(Error::Conflict(
+                "organisation has already been deleted".into(),
+            ))
+        } else {
+            Err(Error::NotFound("organisation not found".into()))
+        };
     }
     require_owner(&mut tx, org_id, actor).await?;
 
