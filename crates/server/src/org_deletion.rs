@@ -1,8 +1,8 @@
 //! Internal organisation-deletion lifecycle and worker operations.
 //!
-//! The public route is deliberately absent from this module's callers for now.  This seam owns
-//! the durable state machine, leases, compare-and-set transitions, provider reconciliation, and
-//! final purge so a later HTTP layer cannot duplicate safety rules.
+//! The production route is deliberately absent for now. This seam owns the durable state machine,
+//! leases, compare-and-set transitions, provider reconciliation, and final purge so the staged
+//! HTTP adapter cannot duplicate safety rules.
 
 use std::time::Duration;
 
@@ -85,6 +85,36 @@ pub struct DeletionView {
     pub id: String,
     pub org_id: String,
     pub state: DeletionState,
+}
+
+/// The owner-visible status of one deletion operation. Provider details remain private to this
+/// module; [`DeletionStatus::public_error`] exposes only the documented error vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletionStatus {
+    pub id: String,
+    pub org_id: String,
+    pub state: DeletionState,
+    pub requested_at: String,
+    pub recoverable_until: String,
+    pub managed_backup_expiry_by: Option<String>,
+    pub next_retry_at: Option<String>,
+    last_error_code: Option<String>,
+}
+
+impl DeletionStatus {
+    pub(crate) fn public_error(&self) -> Option<&'static str> {
+        let code = self.last_error_code.as_deref()?;
+        // A completed phase must not keep displaying a transient provider failure recorded by an
+        // earlier retry. Failed operations and scheduled retries remain visible to their owner.
+        if self.state != DeletionState::Failed && self.next_retry_at.is_none() {
+            return None;
+        }
+        match code {
+            "purge_precondition_failed" => Some("purge_failed"),
+            "billing_status_unknown" => Some("billing_unknown"),
+            _ => Some("billing_unavailable"),
+        }
+    }
 }
 
 /// Work claimed by one worker.  `state_version` is the compare-and-set token for every result.
@@ -279,8 +309,18 @@ pub async fn request(
     })
 }
 
-/// Return an owner's current active deletion attempt without changing its state.
-pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<DeletionView> {
+type DeletionStatusRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// Return an owner's current deletion status without changing its state.
+pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<DeletionStatus> {
     match org::access(pool, org_id, actor).await {
         Ok(access) if access.role() == Role::Owner => {}
         Ok(_) => {
@@ -291,8 +331,16 @@ pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
         Err(Error::NotFound(_)) => {}
         Err(error) => return Err(error),
     }
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT id::text, state FROM organization_deletions \
+    let row: Option<DeletionStatusRow> = sqlx::query_as(
+        // Normalising in PostgreSQL keeps the wire timestamps truthful without adding a second
+        // time library solely for formatting database values.
+        "SELECT id::text, state, \
+                to_char(requested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                to_char(purge_after AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                to_char(managed_backup_expiry_by AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                last_error_code \
+         FROM organization_deletions \
          WHERE org_id = $1 AND state NOT IN ('cancelled', 'completed') \
          ORDER BY requested_at DESC LIMIT 1",
     )
@@ -303,9 +351,15 @@ pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
         Some(row) => Some(row),
         None => {
             sqlx::query_as(
-                "SELECT id::text, state FROM organization_deletions \
-             WHERE org_id = $1 AND requested_by = $2 AND state IN ('cancelled', 'completed') \
-             ORDER BY requested_at DESC LIMIT 1",
+                "SELECT id::text, state, \
+                        to_char(requested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                        to_char(purge_after AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                        to_char(managed_backup_expiry_by AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                        to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                        last_error_code \
+                 FROM organization_deletions \
+                 WHERE org_id = $1 AND requested_by = $2 AND state IN ('cancelled', 'completed') \
+                 ORDER BY requested_at DESC LIMIT 1",
             )
             .bind(org_id)
             .bind(actor)
@@ -313,13 +367,27 @@ pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
             .await?
         }
     };
-    let Some((id, state)) = row else {
+    let Some((
+        id,
+        state,
+        requested_at,
+        recoverable_until,
+        managed_backup_expiry_by,
+        next_retry_at,
+        last_error_code,
+    )) = row
+    else {
         return Err(Error::NotFound("deletion not found".into()));
     };
-    Ok(DeletionView {
+    Ok(DeletionStatus {
         id,
         org_id: org_id.into(),
         state: DeletionState::from_db(&state)?,
+        requested_at,
+        recoverable_until,
+        managed_backup_expiry_by,
+        next_retry_at,
+        last_error_code,
     })
 }
 

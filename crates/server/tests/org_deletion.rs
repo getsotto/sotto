@@ -269,7 +269,9 @@ async fn owner_requests_are_idempotent_and_cancellable() {
         .await
         .expect("repeat deletion");
     assert_eq!(first, repeated);
-    assert_eq!(status(&pool, &org_id, &owner_id).await.unwrap(), first);
+    let current = status(&pool, &org_id, &owner_id).await.unwrap();
+    assert_eq!(current.id, first.id);
+    assert_eq!(current.state, first.state);
     let repeated_times: (String, String) = sqlx::query_as(
         "SELECT requested_at::text, purge_after::text FROM organization_deletions WHERE id = $1::uuid",
     )
@@ -986,7 +988,9 @@ async fn owner_recovery_wins_an_in_flight_provider_cancellation() {
         .expect("complete recovery")
         .expect("recovery transition");
     assert_eq!(recovered.state, DeletionState::Cancelled);
-    assert_eq!(status(&pool, &org_id, &owner_id).await.unwrap(), recovered);
+    let current = status(&pool, &org_id, &owner_id).await.unwrap();
+    assert_eq!(current.id, recovered.id);
+    assert_eq!(current.state, recovered.state);
     let tier: String = sqlx::query_scalar("SELECT tier FROM organizations WHERE id = $1")
         .bind(&org_id)
         .fetch_one(&pool)
