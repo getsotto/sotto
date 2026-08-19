@@ -8,7 +8,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use serde_json::{json, Value};
 use sqlx::postgres::PgConnectOptions;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::str::FromStr;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -33,6 +33,35 @@ async fn pool_or_skip() -> Option<PgPool> {
     let pool = db::connect(&database_url).await.expect("connect");
     db::migrate(&pool).await.expect("migrate");
     Some(pool)
+}
+
+async fn db_test_lock(pool: &PgPool) -> Transaction<'static, Postgres> {
+    let mut tx = pool.begin().await.expect("begin deletion API test lock");
+    // The lifecycle worker consumes one global queue, so the handler and worker test binaries
+    // share a database lock rather than relying on Cargo to run them in a particular order.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('sotto organisation deletion tests'))")
+        .execute(&mut *tx)
+        .await
+        .expect("lock deletion API tests");
+    clean_abandoned_fixtures(pool).await;
+    tx
+}
+
+async fn clean_abandoned_fixtures(pool: &PgPool) {
+    // A prior failed assertion may have skipped the normal cleanup. These prefixes belong only to
+    // this suite, so removing them makes reruns safe without touching another test's fixtures.
+    sqlx::query("DELETE FROM organization_deletions WHERE org_id LIKE 'deletion-api-org-%'")
+        .execute(pool)
+        .await
+        .expect("delete abandoned operations");
+    sqlx::query("DELETE FROM organizations WHERE id LIKE 'deletion-api-org-%'")
+        .execute(pool)
+        .await
+        .expect("delete abandoned organisations");
+    sqlx::query("DELETE FROM users WHERE id LIKE 'deletion-api-%'")
+        .execute(pool)
+        .await
+        .expect("delete abandoned users");
 }
 
 fn state(pool: PgPool) -> AppState {
@@ -141,6 +170,7 @@ async fn owner_can_request_deletion_with_the_documented_status_shape() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
+    let _test_lock = db_test_lock(&pool).await;
     let (org_id, owner_id, token) = seed_owner(&pool).await;
 
     let (status, body) = send(
@@ -175,6 +205,7 @@ async fn owner_can_read_the_current_deletion_status() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
+    let _test_lock = db_test_lock(&pool).await;
     let (org_id, owner_id, token) = seed_owner(&pool).await;
     let uri = format!("/orgs/{org_id}/deletion");
     let (_, requested_body) = send(
@@ -203,6 +234,7 @@ async fn repeated_deletion_request_returns_the_same_operation() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
+    let _test_lock = db_test_lock(&pool).await;
     let (org_id, owner_id, token) = seed_owner(&pool).await;
     let uri = format!("/orgs/{org_id}/deletion");
     let body = json!({
@@ -239,6 +271,7 @@ async fn owner_can_cancel_deletion_idempotently() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
+    let _test_lock = db_test_lock(&pool).await;
     let (org_id, owner_id, token) = seed_owner(&pool).await;
     let deletion_uri = format!("/orgs/{org_id}/deletion");
     send(
@@ -286,6 +319,7 @@ async fn deletion_request_requires_both_explicit_confirmations() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
+    let _test_lock = db_test_lock(&pool).await;
     let (org_id, owner_id, token) = seed_owner(&pool).await;
     let uri = format!("/orgs/{org_id}/deletion");
     let cases = [
@@ -336,6 +370,7 @@ async fn deletion_routes_preserve_the_owner_access_policy() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
+    let _test_lock = db_test_lock(&pool).await;
     let (org_id, owner_id, owner_token) = seed_owner(&pool).await;
     let (member_id, member_token) = seed_user(&pool, "member").await;
     let (outsider_id, outsider_token) = seed_user(&pool, "outsider").await;
@@ -440,6 +475,7 @@ async fn production_router_does_not_expose_deletion() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
+    let _test_lock = db_test_lock(&pool).await;
     let (org_id, owner_id, token) = seed_owner(&pool).await;
     let (status, _) = send(
         sotto_server::app(state(pool.clone())),
@@ -463,6 +499,7 @@ async fn deletion_status_exposes_only_sanitised_failure_codes() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
+    let _test_lock = db_test_lock(&pool).await;
     let (org_id, owner_id, token) = seed_owner(&pool).await;
     sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
         .bind(&org_id)
@@ -529,6 +566,7 @@ async fn requester_can_read_a_completed_deletion_without_reusing_the_id() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
+    let _test_lock = db_test_lock(&pool).await;
     let (org_id, owner_id, owner_token) = seed_owner(&pool).await;
     let (outsider_id, outsider_token) = seed_user(&pool, "terminal-outsider").await;
     let uri = format!("/orgs/{org_id}/deletion");
@@ -610,6 +648,7 @@ async fn cancellation_is_rejected_after_purge_starts() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
+    let _test_lock = db_test_lock(&pool).await;
     let (org_id, owner_id, token) = seed_owner(&pool).await;
     let deletion_uri = format!("/orgs/{org_id}/deletion");
     send(
@@ -653,6 +692,7 @@ async fn completed_recovery_keeps_cancellation_idempotent() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
+    let _test_lock = db_test_lock(&pool).await;
     let (org_id, owner_id, token) = seed_owner(&pool).await;
     let deletion_uri = format!("/orgs/{org_id}/deletion");
     send(
