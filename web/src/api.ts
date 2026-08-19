@@ -179,9 +179,16 @@ function parseOrganisationDeletionStatus(body: {
   };
 }
 
-async function deletionResponseError(resp: Response, fallback: string): Promise<Error> {
-  const detail = (await resp.text()).trim();
-  return new Error(detail === "" ? fallback : detail);
+function deletionResponseError(resp: Response, fallback: string): Error {
+  const messages: Record<number, string> = {
+    400: "Check the deletion confirmation and try again.",
+    401: "Your session has expired. Sign in again.",
+    403: "Only an organisation owner can manage deletion.",
+    404: "The organisation deletion operation was not found.",
+    409: "The organisation deletion cannot be changed in its current state.",
+    503: "Deletion billing is not available yet. Try again later.",
+  };
+  return new Error(messages[resp.status] ?? fallback);
 }
 
 /// Read the current deletion operation. A missing operation is normal before the owner confirms.
@@ -193,7 +200,7 @@ export async function fetchOrganisationDeletionStatus(
     return null;
   }
   if (!resp.ok) {
-    throw await deletionResponseError(resp, `server error (${resp.status})`);
+    throw deletionResponseError(resp, "The deletion status could not be loaded. Try again.");
   }
   return parseOrganisationDeletionStatus(await resp.json());
 }
@@ -212,7 +219,7 @@ export async function requestOrganisationDeletion(
     ...CREDS,
   });
   if (!resp.ok) {
-    throw await deletionResponseError(resp, `server error (${resp.status})`);
+    throw deletionResponseError(resp, "The deletion request could not be completed. Try again.");
   }
   return parseOrganisationDeletionStatus(await resp.json());
 }
@@ -226,7 +233,7 @@ export async function cancelOrganisationDeletion(
     ...CREDS,
   });
   if (!resp.ok) {
-    throw await deletionResponseError(resp, `server error (${resp.status})`);
+    throw deletionResponseError(resp, "The deletion could not be cancelled. Try again.");
   }
   return parseOrganisationDeletionStatus(await resp.json());
 }
