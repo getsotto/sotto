@@ -52,13 +52,16 @@ validate a typed plaintext name. Both fields are required. A valid first request
   "state": "requested",
   "requested_at": "2026-08-07T12:00:00Z",
   "recoverable_until": "2026-09-06T12:00:00Z",
-  "managed_backup_expiry_by": "2026-10-06T12:00:00Z",
+  "managed_backup_expiry_by": null,
   "next_retry_at": null,
   "error": null
 }
 ```
 
 The worker may advance `requested` to `cancelling_billing` before a later status read.
+`managed_backup_expiry_by` remains `null` in the staged API until the operations slice configures
+managed-backup retention. Production enablement must populate and report it when managed backups
+can outlive the recovery deadline.
 
 ### Read status
 
