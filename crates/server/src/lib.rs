@@ -27,11 +27,13 @@ pub mod entitlements;
 pub mod error;
 pub mod machine;
 pub mod org;
-// The lifecycle seam is intentionally staged before its worker loop and routes are enabled. It is
-// doc-hidden so the database integration harness can exercise the internal worker boundary without
-// presenting it as a public application route or stable API.
+// The lifecycle seam and HTTP adapter are staged before their worker loop and production routes
+// are enabled. They remain doc-hidden so tests can exercise the complete boundary without
+// presenting deletion as a stable public API.
 #[doc(hidden)]
 pub mod org_deletion;
+#[doc(hidden)]
+pub mod org_deletion_api;
 pub mod share;
 pub mod state;
 pub mod sync;

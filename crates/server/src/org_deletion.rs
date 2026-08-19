@@ -1,8 +1,8 @@
 //! Internal organisation-deletion lifecycle and worker operations.
 //!
-//! The public route is deliberately absent from this module's callers for now.  This seam owns
-//! the durable state machine, leases, compare-and-set transitions, provider reconciliation, and
-//! final purge so a later HTTP layer cannot duplicate safety rules.
+//! The production route is deliberately absent for now. This seam owns the durable state machine,
+//! leases, compare-and-set transitions, provider reconciliation, and final purge so the staged
+//! HTTP adapter cannot duplicate safety rules.
 
 use std::time::Duration;
 
@@ -85,6 +85,38 @@ pub struct DeletionView {
     pub id: String,
     pub org_id: String,
     pub state: DeletionState,
+}
+
+/// The owner-visible status of one deletion operation. Provider details remain private to this
+/// module; [`DeletionStatus::public_error`] exposes only the documented error vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletionStatus {
+    pub id: String,
+    pub org_id: String,
+    pub state: DeletionState,
+    pub requested_at: String,
+    pub recoverable_until: String,
+    pub managed_backup_expiry_by: Option<String>,
+    pub next_retry_at: Option<String>,
+    last_error_code: Option<String>,
+}
+
+impl DeletionStatus {
+    pub(crate) fn public_error(&self) -> Option<&'static str> {
+        let code = self.last_error_code.as_deref()?;
+        // A completed phase must not keep displaying a transient provider failure recorded by an
+        // earlier retry. Failed operations and scheduled retries remain visible to their owner.
+        if self.state != DeletionState::Failed && self.next_retry_at.is_none() {
+            return None;
+        }
+        match code {
+            "purge_precondition_failed" => Some("purge_failed"),
+            "billing_status_unknown" => Some("billing_unknown"),
+            // Unknown internal/provider codes collapse to the least specific public billing error
+            // so adding a new diagnostic can never expose it through the owner-facing contract.
+            _ => Some("billing_unavailable"),
+        }
+    }
 }
 
 /// Work claimed by one worker.  `state_version` is the compare-and-set token for every result.
@@ -183,7 +215,24 @@ pub async fn request(
     };
     let lifecycle = LifecycleState::from_db(&lifecycle)?;
     if lifecycle == LifecycleState::Deleted {
-        return Err(Error::NotFound("organisation not found".into()));
+        // The requesting owner may already inspect this terminal operation after memberships are
+        // purged, so tell only that actor that the id is permanently unavailable. Everyone else
+        // receives the same not-found response as an unknown organisation.
+        let requested_by_actor: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM organization_deletions \
+             WHERE org_id = $1 AND requested_by = $2 AND state = 'completed' LIMIT 1",
+        )
+        .bind(org_id)
+        .bind(actor)
+        .fetch_optional(&mut *tx)
+        .await?;
+        return if requested_by_actor.is_some() {
+            Err(Error::Conflict(
+                "organisation has already been deleted".into(),
+            ))
+        } else {
+            Err(Error::NotFound("organisation not found".into()))
+        };
     }
     require_owner(&mut tx, org_id, actor).await?;
 
@@ -279,48 +328,103 @@ pub async fn request(
     })
 }
 
-/// Return an owner's current active deletion attempt without changing its state.
-pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<DeletionView> {
-    match org::access(pool, org_id, actor).await {
-        Ok(access) if access.role() == Role::Owner => {}
+#[derive(sqlx::FromRow)]
+struct DeletionStatusRow {
+    id: String,
+    state: String,
+    requested_at: String,
+    recoverable_until: String,
+    managed_backup_expiry_by: Option<String>,
+    next_retry_at: Option<String>,
+    last_error_code: Option<String>,
+}
+
+async fn status_for_operation(
+    pool: &PgPool,
+    org_id: &str,
+    operation_id: &str,
+) -> Result<DeletionStatus> {
+    // Normalising in PostgreSQL keeps the wire timestamps truthful without adding a second time
+    // library solely for formatting database values.
+    let row: Option<DeletionStatusRow> = sqlx::query_as(
+        "SELECT id::text, state, \
+                to_char(requested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+                    AS requested_at, \
+                to_char(purge_after AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+                    AS recoverable_until, \
+                to_char(managed_backup_expiry_by AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS managed_backup_expiry_by, \
+                to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+                    AS next_retry_at, \
+                last_error_code \
+         FROM organization_deletions WHERE id = $1::uuid AND org_id = $2",
+    )
+    .bind(operation_id)
+    .bind(org_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Err(Error::NotFound("deletion not found".into()));
+    };
+    Ok(DeletionStatus {
+        id: row.id,
+        org_id: org_id.into(),
+        state: DeletionState::from_db(&row.state)?,
+        requested_at: row.requested_at,
+        recoverable_until: row.recoverable_until,
+        managed_backup_expiry_by: row.managed_backup_expiry_by,
+        next_retry_at: row.next_retry_at,
+        last_error_code: row.last_error_code,
+    })
+}
+
+/// Refetch the exact operation returned by an authorised mutation. Keeping this separate from
+/// [`status`] prevents a worker completing the operation between commit and response from changing
+/// which caller may receive that already-authorised response.
+pub(crate) async fn status_after_mutation(
+    pool: &PgPool,
+    operation: &DeletionView,
+) -> Result<DeletionStatus> {
+    status_for_operation(pool, &operation.org_id, &operation.id).await
+}
+
+/// Return an owner's current deletion status without changing its state.
+pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<DeletionStatus> {
+    let can_read_active = match org::access(pool, org_id, actor).await {
+        Ok(access) if access.role() == Role::Owner => true,
         Ok(_) => {
             return Err(Error::Forbidden(
                 "only an organisation owner may inspect deletion".into(),
             ));
         }
-        Err(Error::NotFound(_)) => {}
+        // Memberships are gone after purge, so the requesting owner needs a separate terminal
+        // lookup. Never let this fallback expose an active operation to a non-member.
+        Err(Error::NotFound(_)) => false,
         Err(error) => return Err(error),
-    }
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT id::text, state FROM organization_deletions \
-         WHERE org_id = $1 AND state NOT IN ('cancelled', 'completed') \
-         ORDER BY requested_at DESC LIMIT 1",
-    )
-    .bind(org_id)
-    .fetch_optional(pool)
-    .await?;
-    let row = match row {
-        Some(row) => Some(row),
-        None => {
-            sqlx::query_as(
-                "SELECT id::text, state FROM organization_deletions \
-             WHERE org_id = $1 AND requested_by = $2 AND state IN ('cancelled', 'completed') \
-             ORDER BY requested_at DESC LIMIT 1",
-            )
-            .bind(org_id)
-            .bind(actor)
-            .fetch_optional(pool)
-            .await?
-        }
     };
-    let Some((id, state)) = row else {
+    let operation_id: Option<String> = if can_read_active {
+        sqlx::query_scalar(
+            "SELECT id::text FROM organization_deletions \
+             WHERE org_id = $1 AND state <> 'completed' ORDER BY requested_at DESC LIMIT 1",
+        )
+        .bind(org_id)
+        .fetch_optional(pool)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            "SELECT id::text FROM organization_deletions \
+             WHERE org_id = $1 AND requested_by = $2 AND state = 'completed' \
+             ORDER BY requested_at DESC LIMIT 1",
+        )
+        .bind(org_id)
+        .bind(actor)
+        .fetch_optional(pool)
+        .await?
+    };
+    let Some(operation_id) = operation_id else {
         return Err(Error::NotFound("deletion not found".into()));
     };
-    Ok(DeletionView {
-        id,
-        org_id: org_id.into(),
-        state: DeletionState::from_db(&state)?,
-    })
+    status_for_operation(pool, org_id, &operation_id).await
 }
 
 /// Begin recovery for an owner, leaving access frozen until billing has been reconciled.
@@ -335,6 +439,21 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
         return Err(Error::NotFound("organisation not found".into()));
     };
     if LifecycleState::from_db(&lifecycle)? == LifecycleState::Deleted {
+        // Memberships no longer exist on a tombstone. Preserve the post-purge conflict only for
+        // the original requester, using the same terminal visibility boundary as status reads.
+        let requested_completed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM organization_deletions \
+             WHERE org_id = $1 AND requested_by = $2 AND state = 'completed')",
+        )
+        .bind(org_id)
+        .bind(actor)
+        .fetch_one(&mut *tx)
+        .await?;
+        if requested_completed {
+            return Err(Error::Conflict(
+                "organisation deletion cannot be cancelled after purge has started".into(),
+            ));
+        }
         return Err(Error::NotFound("organisation not found".into()));
     }
     require_owner(&mut tx, org_id, actor).await?;
@@ -346,6 +465,21 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
     .bind(org_id)
     .fetch_optional(&mut *tx)
     .await?;
+    let row = match row {
+        Some(row) => Some(row),
+        None => {
+            // Recovery may finish between repeated client calls. The organisation is active here,
+            // so every current owner may repeat cancellation and inspect its reconciled result.
+            sqlx::query_as(
+                "SELECT id::text, state FROM organization_deletions \
+                 WHERE org_id = $1 AND state = 'cancelled' \
+                 ORDER BY requested_at DESC LIMIT 1",
+            )
+            .bind(org_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        }
+    };
     let Some((id, state)) = row else {
         return Err(Error::NotFound("deletion not found".into()));
     };
@@ -365,7 +499,7 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
     }
     sqlx::query(
         "UPDATE organization_deletions SET state = 'recovering', resume_state = NULL, \
-         attempt_count = 0, next_attempt_at = now(), \
+         attempt_count = 0, next_attempt_at = now(), last_error_code = NULL, \
          lease_owner = NULL, lease_expires_at = NULL, state_version = state_version + 1 \
          WHERE id = $1::uuid",
     )

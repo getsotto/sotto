@@ -6,13 +6,13 @@
 
 use async_trait::async_trait;
 use sqlx::postgres::PgConnectOptions;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use sotto_server::billing::{
@@ -25,8 +25,6 @@ use sotto_server::org_deletion::{
     advance, cancel, claim_due, record_operator_observation, request, status, DeletionState,
     OperatorObservation,
 };
-
-static DB_TEST_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
 
 // Keep one provider fake for ordinary outcomes and the in-flight cancellation race. The optional
 // gate holds the provider call open until recovery commits, forcing the worker's stale
@@ -165,12 +163,39 @@ async fn pool_or_skip() -> Option<PgPool> {
     Some(pool)
 }
 
-async fn db_test_lock() -> tokio::sync::OwnedMutexGuard<()> {
-    DB_TEST_LOCK
-        .get_or_init(|| Arc::new(AsyncMutex::new(())))
-        .clone()
-        .lock_owned()
+async fn prepare_deletion_test(pool: &PgPool) -> Transaction<'static, Postgres> {
+    let mut tx = pool.begin().await.expect("begin deletion test lock");
+    // The worker queue is global, so a database lock also serialises separate integration-test
+    // binaries that cannot share an in-process mutex.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('sotto organisation deletion tests'))")
+        .execute(&mut *tx)
         .await
+        .expect("lock deletion tests");
+    clean_abandoned_fixtures(pool).await;
+    tx
+}
+
+async fn clean_abandoned_fixtures(pool: &PgPool) {
+    // A failed assertion can leave due work behind. Clear only the two deletion suites' reserved
+    // identifiers before a lifecycle worker can claim an abandoned operation on the next run.
+    sqlx::query(
+        "DELETE FROM organization_deletions \
+         WHERE org_id LIKE 'deletion-org-%' OR org_id LIKE 'deletion-api-org-%'",
+    )
+    .execute(pool)
+    .await
+    .expect("delete abandoned deletion operations");
+    sqlx::query(
+        "DELETE FROM organizations \
+         WHERE id LIKE 'deletion-org-%' OR id LIKE 'deletion-api-org-%'",
+    )
+    .execute(pool)
+    .await
+    .expect("delete abandoned deletion organisations");
+    sqlx::query("DELETE FROM users WHERE id LIKE 'deletion-owner-%' OR id LIKE 'deletion-api-%'")
+        .execute(pool)
+        .await
+        .expect("delete abandoned deletion users");
 }
 
 async fn seed_owner(pool: &PgPool) -> (String, String) {
@@ -249,7 +274,7 @@ async fn owner_requests_are_idempotent_and_cancellable() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     assert!(matches!(
         request(&pool, &org_id, &owner_id, "other-org").await,
@@ -269,7 +294,9 @@ async fn owner_requests_are_idempotent_and_cancellable() {
         .await
         .expect("repeat deletion");
     assert_eq!(first, repeated);
-    assert_eq!(status(&pool, &org_id, &owner_id).await.unwrap(), first);
+    let current = status(&pool, &org_id, &owner_id).await.unwrap();
+    assert_eq!(current.id, first.id);
+    assert_eq!(current.state, first.state);
     let repeated_times: (String, String) = sqlx::query_as(
         "SELECT requested_at::text, purge_after::text FROM organization_deletions WHERE id = $1::uuid",
     )
@@ -351,7 +378,7 @@ async fn worker_reconciles_free_deletion_and_purges_tombstone() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let requested = request(&pool, &org_id, &owner_id, &org_id)
         .await
@@ -442,7 +469,7 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
@@ -566,7 +593,7 @@ async fn provider_missing_satisfies_the_retention_purge_gate() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
@@ -639,7 +666,7 @@ async fn unknown_provider_status_blocks_purge_and_schedules_retry() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
@@ -709,7 +736,7 @@ async fn retryable_provider_failure_schedules_the_next_attempt() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let _subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
@@ -759,7 +786,7 @@ async fn authentication_failure_fails_without_a_retry_schedule() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let _subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
@@ -819,7 +846,7 @@ async fn owner_can_recover_from_requested_phase() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
 
     let (org_id, owner_id) = seed_owner(&pool).await;
     request(&pool, &org_id, &owner_id, &org_id)
@@ -846,7 +873,7 @@ async fn owner_can_recover_from_cancelling_billing_phase() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
 
     let (org_id, owner_id) = seed_owner(&pool).await;
     request(&pool, &org_id, &owner_id, &org_id)
@@ -882,7 +909,7 @@ async fn owner_can_recover_from_retention_phase() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
 
     let (org_id, owner_id) = seed_owner(&pool).await;
     request(&pool, &org_id, &owner_id, &org_id)
@@ -926,7 +953,7 @@ async fn owner_recovery_wins_an_in_flight_provider_cancellation() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     sqlx::query("UPDATE organizations SET tier = 'team' WHERE id = $1")
@@ -986,7 +1013,9 @@ async fn owner_recovery_wins_an_in_flight_provider_cancellation() {
         .expect("complete recovery")
         .expect("recovery transition");
     assert_eq!(recovered.state, DeletionState::Cancelled);
-    assert_eq!(status(&pool, &org_id, &owner_id).await.unwrap(), recovered);
+    let current = status(&pool, &org_id, &owner_id).await.unwrap();
+    assert_eq!(current.id, recovered.id);
+    assert_eq!(current.state, recovered.state);
     let tier: String = sqlx::query_scalar("SELECT tier FROM organizations WHERE id = $1")
         .bind(&org_id)
         .fetch_one(&pool)
@@ -1001,7 +1030,7 @@ async fn recovery_restores_team_from_a_provider_observation() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
@@ -1051,7 +1080,7 @@ async fn recovery_restores_free_from_a_cancelled_provider_observation() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new([], [Ok(cancelled(&subscription_id))]);
@@ -1096,7 +1125,7 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let _test_lock = db_test_lock().await;
+    let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let subscription_id = link_subscription(&pool, &org_id).await;
     let requested = request(&pool, &org_id, &owner_id, &org_id)
