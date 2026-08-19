@@ -199,6 +199,42 @@ async fn owner_can_read_the_current_deletion_status() {
 }
 
 #[tokio::test]
+async fn repeated_deletion_request_returns_the_same_operation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    let uri = format!("/orgs/{org_id}/deletion");
+    let body = json!({
+        "confirm_org_id": org_id,
+        "acknowledge_subscription_cancellation": true
+    });
+
+    let (first_status, first_body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &uri,
+        Some(&token),
+        Some(body.clone()),
+    )
+    .await;
+    let (repeated_status, repeated_body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &uri,
+        Some(&token),
+        Some(body),
+    )
+    .await;
+
+    assert_eq!(first_status, StatusCode::ACCEPTED);
+    assert_eq!(repeated_status, StatusCode::ACCEPTED);
+    assert_eq!(first_body, repeated_body);
+
+    cleanup(&pool, &org_id, &[&owner_id]).await;
+}
+
+#[tokio::test]
 async fn owner_can_cancel_deletion_idempotently() {
     let Some(pool) = pool_or_skip().await else {
         return;
