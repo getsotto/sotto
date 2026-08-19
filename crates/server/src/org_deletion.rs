@@ -112,6 +112,8 @@ impl DeletionStatus {
         match code {
             "purge_precondition_failed" => Some("purge_failed"),
             "billing_status_unknown" => Some("billing_unknown"),
+            // Unknown internal/provider codes collapse to the least specific public billing error
+            // so adding a new diagnostic can never expose it through the owner-facing contract.
             _ => Some("billing_unavailable"),
         }
     }

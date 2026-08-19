@@ -34,11 +34,17 @@ struct RequestDeletion {
 
 #[derive(Serialize)]
 struct DeletionResponse {
+    /// Current lifecycle phase from the closed [`org_deletion::DeletionState`] vocabulary.
     state: &'static str,
+    /// Time the first accepted request fixed the operation's recovery window.
     requested_at: String,
+    /// Final recovery deadline, backed by the operation's immutable `purge_after` value.
     recoverable_until: String,
+    /// Latest managed-backup expiry when the operations policy has supplied one.
     managed_backup_expiry_by: Option<String>,
+    /// Next scheduled worker attempt, or `None` when no retry or transition is queued.
     next_retry_at: Option<String>,
+    /// Sanitised owner-visible failure code; provider messages and identifiers never appear here.
     error: Option<&'static str>,
 }
 
@@ -56,14 +62,17 @@ impl From<DeletionStatus> for DeletionResponse {
     }
 }
 
+/// `POST /orgs/{org_id}/deletion` - accept an owner's exact, explicit confirmation. The first and
+/// repeated valid requests return `202`; malformed confirmations return `400` without mutation.
 async fn request_deletion(
     State(state): State<AppState>,
     user: AuthUser,
     Path(org_id): Path<String>,
     body: std::result::Result<Json<RequestDeletion>, JsonRejection>,
 ) -> Result<(StatusCode, Json<DeletionResponse>)> {
-    // Axum distinguishes syntax and data errors with different default statuses. This endpoint
-    // presents one stable 400 contract for every malformed deletion confirmation instead.
+    // Axum distinguishes syntax and data errors with different default statuses. Discard the
+    // parser detail rather than logging or exposing client input, and present one stable 400
+    // contract for every malformed deletion confirmation instead.
     let Json(body) = body.map_err(|_| Error::BadRequest("invalid deletion request".into()))?;
     let confirmation = body
         .confirm_org_id
@@ -81,6 +90,7 @@ async fn request_deletion(
     Ok((StatusCode::ACCEPTED, Json(status.into())))
 }
 
+/// `GET /orgs/{org_id}/deletion` - return an owner-visible active or permitted terminal status.
 async fn get_deletion(
     State(state): State<AppState>,
     user: AuthUser,
@@ -90,6 +100,8 @@ async fn get_deletion(
     Ok(Json(status.into()))
 }
 
+/// `POST /orgs/{org_id}/deletion/cancel` - begin idempotent owner recovery with `202`, or return
+/// `409` once purge has started and recovery is no longer safe.
 async fn cancel_deletion(
     State(state): State<AppState>,
     user: AuthUser,
