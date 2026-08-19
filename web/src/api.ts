@@ -137,6 +137,107 @@ export async function fetchOrgs(): Promise<Org[]> {
   }));
 }
 
+export type OrganisationDeletionState =
+  | "requested"
+  | "cancelling_billing"
+  | "retention"
+  | "purging"
+  | "recovering"
+  | "failed"
+  | "cancelled"
+  | "completed";
+
+export interface OrganisationDeletionStatus {
+  state: OrganisationDeletionState;
+  requestedAt: string;
+  recoverableUntil: string;
+  managedBackupExpiryBy: string | null;
+  nextRetryAt: string | null;
+  error: "billing_unavailable" | "billing_unknown" | "purge_failed" | null;
+}
+
+/// The staged client gate stays off until the server routes, worker and operations runbook are
+/// enabled together. Vite leaves this false when the deployment does not opt in explicitly.
+export const organisationDeletionEnabled =
+  import.meta.env.VITE_ORGANISATION_DELETION_ENABLED === "true";
+
+function parseOrganisationDeletionStatus(body: {
+  state: OrganisationDeletionState;
+  requested_at: string;
+  recoverable_until: string;
+  managed_backup_expiry_by: string | null;
+  next_retry_at: string | null;
+  error: OrganisationDeletionStatus["error"];
+}): OrganisationDeletionStatus {
+  return {
+    state: body.state,
+    requestedAt: body.requested_at,
+    recoverableUntil: body.recoverable_until,
+    managedBackupExpiryBy: body.managed_backup_expiry_by,
+    nextRetryAt: body.next_retry_at,
+    error: body.error,
+  };
+}
+
+function deletionResponseError(resp: Response, fallback: string): Error {
+  const messages: Record<number, string> = {
+    400: "Check the deletion confirmation and try again.",
+    401: "Your session has expired. Sign in again.",
+    403: "Only an organisation owner can manage deletion.",
+    404: "The organisation deletion operation was not found.",
+    409: "The organisation deletion cannot be changed in its current state.",
+    503: "Deletion billing is not available yet. Try again later.",
+  };
+  return new Error(messages[resp.status] ?? fallback);
+}
+
+/// Read the current deletion operation. A missing operation is normal before the owner confirms.
+export async function fetchOrganisationDeletionStatus(
+  orgId: string,
+): Promise<OrganisationDeletionStatus | null> {
+  const resp = await fetch(`/orgs/${encodeURIComponent(orgId)}/deletion`, CREDS);
+  if (resp.status === 404) {
+    return null;
+  }
+  if (!resp.ok) {
+    throw deletionResponseError(resp, "The deletion status could not be loaded. Try again.");
+  }
+  return parseOrganisationDeletionStatus(await resp.json());
+}
+
+/// Submit the exact-id and subscription-cancellation confirmation for an organisation.
+export async function requestOrganisationDeletion(
+  orgId: string,
+): Promise<OrganisationDeletionStatus> {
+  const resp = await fetch(`/orgs/${encodeURIComponent(orgId)}/deletion`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      confirm_org_id: orgId,
+      acknowledge_subscription_cancellation: true,
+    }),
+    ...CREDS,
+  });
+  if (!resp.ok) {
+    throw deletionResponseError(resp, "The deletion request could not be completed. Try again.");
+  }
+  return parseOrganisationDeletionStatus(await resp.json());
+}
+
+/// Ask an owner to recover an active deletion before purge begins.
+export async function cancelOrganisationDeletion(
+  orgId: string,
+): Promise<OrganisationDeletionStatus> {
+  const resp = await fetch(`/orgs/${encodeURIComponent(orgId)}/deletion/cancel`, {
+    method: "POST",
+    ...CREDS,
+  });
+  if (!resp.ok) {
+    throw deletionResponseError(resp, "The deletion could not be cancelled. Try again.");
+  }
+  return parseOrganisationDeletionStatus(await resp.json());
+}
+
 export interface Entitlements {
   tier: string;
   effectiveTier: string;

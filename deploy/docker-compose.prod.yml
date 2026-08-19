@@ -62,6 +62,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.web
+      args:
+        # The client flag is compiled into the SPA; keep it off until the final enablement PR.
+        VITE_ORGANISATION_DELETION_ENABLED: ${VITE_ORGANISATION_DELETION_ENABLED:-false}
     restart: unless-stopped
     environment:
       SOTTO_DOMAIN: ${SOTTO_DOMAIN}

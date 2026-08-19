@@ -16,6 +16,8 @@ RUN curl -fsSL https://rustwasm.github.io/wasm-pack/installer/init.sh | sh
 
 WORKDIR /app
 COPY . .
+ARG VITE_ORGANISATION_DELETION_ENABLED=false
+ENV VITE_ORGANISATION_DELETION_ENABLED=${VITE_ORGANISATION_DELETION_ENABLED}
 RUN cd web && npm ci && npm run build
 
 # Build a Caddy binary bundling the caddy-ratelimit plugin, which powers the `rate_limit` directive

@@ -68,3 +68,16 @@ test("checkout cancelled return is handled", async ({ page }) => {
   // The consumed `billing` param is stripped so a reload doesn't repeat the banner.
   await expect(page).not.toHaveURL(/billing=cancelled/);
 });
+
+// The deletion server routes and worker remain staged, so the client must keep destructive
+// controls unavailable until the final enablement change turns the feature on deliberately.
+test("organisation deletion stays disabled before enablement", async ({ page }) => {
+  await loginAndUnlock(page);
+  await selectOwnerOrganisation(page);
+
+  await expect(page.getByRole("heading", { name: "Delete organisation" })).toBeVisible();
+  await expect(
+    page.getByText("Deletion controls are not enabled on this server yet.", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Request deletion" })).toHaveCount(0);
+});
