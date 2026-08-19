@@ -158,3 +158,31 @@ async fn owner_can_request_deletion_with_the_documented_status_shape() {
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
+
+#[tokio::test]
+async fn owner_can_read_the_current_deletion_status() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    let uri = format!("/orgs/{org_id}/deletion");
+    let (_, requested_body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &uri,
+        Some(&token),
+        Some(json!({
+            "confirm_org_id": org_id,
+            "acknowledge_subscription_cancellation": true
+        })),
+    )
+    .await;
+
+    let (status, status_body) =
+        send(deletion_app(pool.clone()), "GET", &uri, Some(&token), None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status_body, requested_body);
+
+    cleanup(&pool, &org_id, &[&owner_id]).await;
+}
