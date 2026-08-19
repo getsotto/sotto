@@ -568,3 +568,46 @@ async fn requester_can_read_a_completed_deletion_without_reusing_the_id() {
 
     cleanup(&pool, &org_id, &[&owner_id, &outsider_id]).await;
 }
+
+#[tokio::test]
+async fn cancellation_is_rejected_after_purge_starts() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    let deletion_uri = format!("/orgs/{org_id}/deletion");
+    send(
+        deletion_app(pool.clone()),
+        "POST",
+        &deletion_uri,
+        Some(&token),
+        Some(json!({
+            "confirm_org_id": org_id,
+            "acknowledge_subscription_cancellation": true
+        })),
+    )
+    .await;
+    // Purging is worker-owned, so arrange the phase without claiming the suite's global queue.
+    sqlx::query("UPDATE organization_deletions SET state = 'purging' WHERE org_id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("arrange purging deletion");
+
+    let (status, body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &format!("{deletion_uri}/cancel"),
+        Some(&token),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body,
+        "organisation deletion cannot be cancelled after purge has started"
+    );
+
+    cleanup(&pool, &org_id, &[&owner_id]).await;
+}
