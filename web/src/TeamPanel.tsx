@@ -15,6 +15,7 @@ import {
   type Org,
 } from "./api";
 import { decryptOrgName, openOrgKey, sealGrantTo } from "./vault";
+import { OrganisationDeletionPanel } from "./OrganisationDeletionPanel";
 
 interface NamedOrg {
   org: Org;
@@ -82,6 +83,7 @@ export function TeamPanel({
   const [error, setError] = useState<string | null>(null);
   const [billingBusy, setBillingBusy] = useState(false);
   const [billingOutcome] = useState(parseBillingOutcome);
+  const [deletionActive, setDeletionActive] = useState(false);
 
   useEffect(() => {
     if (billingOutcome !== null) {
@@ -107,6 +109,7 @@ export function TeamPanel({
     setMembers(null);
     setAudit(null);
     setPlan(null);
+    setDeletionActive(false);
     try {
       setMembers(await fetchMembers(no.org.id));
       const entitlements = await fetchEntitlements(no.org.id);
@@ -168,7 +171,8 @@ export function TeamPanel({
     return null;
   }
   // Admin/owner: the server's bar for both membership management and billing.
-  const canManage = openOrg !== null && ["owner", "admin"].includes(openOrg.org.role);
+  const canManage =
+    openOrg !== null && ["owner", "admin"].includes(openOrg.org.role) && !deletionActive;
 
   return (
     <section>
@@ -233,6 +237,13 @@ export function TeamPanel({
                 </button>
               )}
             </p>
+          )}
+          {openOrg.org.role === "owner" && (
+            <OrganisationDeletionPanel
+              orgId={openOrg.org.id}
+              orgName={openOrg.name}
+              onActiveChange={setDeletionActive}
+            />
           )}
           <h3>Members of {openOrg.name}</h3>
           {members === null ? (
