@@ -737,18 +737,27 @@ async fn cancellation_is_rejected_after_purge_starts() {
 }
 
 #[tokio::test]
-async fn completed_recovery_keeps_cancellation_idempotent() {
+async fn every_owner_can_read_and_repeat_completed_recovery() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
     let _test_lock = db_test_lock(&pool).await;
-    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    let (org_id, owner_id, requester_token) = seed_owner(&pool).await;
+    let (other_owner_id, other_owner_token) = seed_user(&pool, "other-owner").await;
+    sqlx::query(
+        "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, 'owner')",
+    )
+    .bind(&org_id)
+    .bind(&other_owner_id)
+    .execute(&pool)
+    .await
+    .expect("insert second owner");
     let deletion_uri = format!("/orgs/{org_id}/deletion");
     send(
         deletion_app(pool.clone()),
         "POST",
         &deletion_uri,
-        Some(&token),
+        Some(&requester_token),
         Some(json!({
             "confirm_org_id": org_id,
             "acknowledge_subscription_cancellation": true
@@ -760,7 +769,7 @@ async fn completed_recovery_keeps_cancellation_idempotent() {
         deletion_app(pool.clone()),
         "POST",
         &cancel_uri,
-        Some(&token),
+        Some(&other_owner_token),
         None,
     )
     .await;
@@ -782,18 +791,28 @@ async fn completed_recovery_keeps_cancellation_idempotent() {
         .expect("restore organisation fixture");
     tx.commit().await.expect("commit recovery fixture");
 
-    let (status, body) = send(
+    let (read_status, read_body) = send(
+        deletion_app(pool.clone()),
+        "GET",
+        &deletion_uri,
+        Some(&other_owner_token),
+        None,
+    )
+    .await;
+    let (cancel_status, cancel_body) = send(
         deletion_app(pool.clone()),
         "POST",
         &cancel_uri,
-        Some(&token),
+        Some(&other_owner_token),
         None,
     )
     .await;
 
-    assert_eq!(status, StatusCode::ACCEPTED);
-    let response: Value = serde_json::from_str(&body).expect("cancelled status JSON");
+    assert_eq!(read_status, StatusCode::OK);
+    assert_eq!(cancel_status, StatusCode::ACCEPTED);
+    assert_eq!(read_body, cancel_body);
+    let response: Value = serde_json::from_str(&cancel_body).expect("cancelled status JSON");
     assert_eq!(response["state"], "cancelled");
 
-    cleanup(&pool, &org_id, &[&owner_id]).await;
+    cleanup(&pool, &org_id, &[&owner_id, &other_owner_id]).await;
 }

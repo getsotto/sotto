@@ -383,11 +383,13 @@ pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
                         to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
                         last_error_code \
                  FROM organization_deletions \
-                 WHERE org_id = $1 AND requested_by = $2 AND state IN ('cancelled', 'completed') \
+                 WHERE org_id = $1 AND state IN ('cancelled', 'completed') \
+                   AND ($3 OR requested_by = $2) \
                  ORDER BY requested_at DESC LIMIT 1",
             )
             .bind(org_id)
             .bind(actor)
+            .bind(can_read_active)
             .fetch_optional(pool)
             .await?
         }
@@ -457,15 +459,14 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
     let row = match row {
         Some(row) => Some(row),
         None => {
-            // Recovery may finish between repeated client calls. Return only the requesting
-            // owner's latest cancelled operation so idempotency does not widen terminal access.
+            // Recovery may finish between repeated client calls. The organisation is active here,
+            // so every current owner may repeat cancellation and inspect its reconciled result.
             sqlx::query_as(
                 "SELECT id::text, state FROM organization_deletions \
-                 WHERE org_id = $1 AND requested_by = $2 AND state = 'cancelled' \
+                 WHERE org_id = $1 AND state = 'cancelled' \
                  ORDER BY requested_at DESC LIMIT 1",
             )
             .bind(org_id)
-            .bind(actor)
             .fetch_optional(&mut *tx)
             .await?
         }
