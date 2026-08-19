@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   cancelOrganisationDeletion,
@@ -73,17 +73,21 @@ export function OrganisationDeletionPanel({
   const [confirmation, setConfirmation] = useState("");
   const [acknowledged, setAcknowledged] = useState(false);
   const [busy, setBusy] = useState(false);
+  const lastKnownStatus = useRef<OrganisationDeletionStatus | null>(null);
 
   useEffect(() => {
     if (!organisationDeletionEnabled) {
       return;
     }
     let current = true;
+    lastKnownStatus.current = null;
+    setStatus(null);
     setStatusLoading(true);
     onActiveChange(true);
     void fetchOrganisationDeletionStatus(orgId)
       .then((next) => {
         if (current) {
+          lastKnownStatus.current = next;
           setStatus(next);
           setStatusError(null);
           onActiveChange(isActiveStatus(next));
@@ -92,7 +96,7 @@ export function OrganisationDeletionPanel({
       .catch((error: unknown) => {
         if (current) {
           setStatusError(message(error));
-          onActiveChange(true);
+          onActiveChange(isActiveStatus(lastKnownStatus.current));
         }
       })
       .finally(() => {
@@ -113,14 +117,15 @@ export function OrganisationDeletionPanel({
     setStatusError(null);
     try {
       const next = await requestOrganisationDeletion(orgId);
+      lastKnownStatus.current = next;
       setStatus(next);
-      onActiveChange(true);
+      onActiveChange(isActiveStatus(next));
       setConfirming(false);
       setConfirmation("");
       setAcknowledged(false);
     } catch (error) {
       setStatusError(message(error));
-      onActiveChange(true);
+      onActiveChange(isActiveStatus(lastKnownStatus.current));
     } finally {
       setBusy(false);
     }
@@ -131,11 +136,12 @@ export function OrganisationDeletionPanel({
     setStatusError(null);
     try {
       const next = await cancelOrganisationDeletion(orgId);
+      lastKnownStatus.current = next;
       setStatus(next);
-      onActiveChange(true);
+      onActiveChange(isActiveStatus(next));
     } catch (error) {
       setStatusError(message(error));
-      onActiveChange(true);
+      onActiveChange(isActiveStatus(lastKnownStatus.current));
     } finally {
       setBusy(false);
     }
@@ -146,11 +152,12 @@ export function OrganisationDeletionPanel({
     setStatusError(null);
     try {
       const next = await fetchOrganisationDeletionStatus(orgId);
+      lastKnownStatus.current = next;
       setStatus(next);
       onActiveChange(isActiveStatus(next));
     } catch (error) {
       setStatusError(message(error));
-      onActiveChange(true);
+      onActiveChange(isActiveStatus(lastKnownStatus.current));
     } finally {
       setStatusLoading(false);
     }
@@ -164,7 +171,12 @@ export function OrganisationDeletionPanel({
       ) : statusLoading ? (
         <p className="muted">Checking deletion status…</p>
       ) : statusError !== null && status === null ? (
-        <p role="alert">{statusError}</p>
+        <div role="alert">
+          <p>{statusError}</p>
+          <button type="button" className="ghost" onClick={() => void refreshStatus()}>
+            Retry status
+          </button>
+        </div>
       ) : status === null ? (
         <>
           <p>
