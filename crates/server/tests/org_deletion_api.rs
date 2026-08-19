@@ -398,3 +398,26 @@ async fn deletion_routes_preserve_the_owner_access_policy() {
 
     cleanup(&pool, &org_id, &[&owner_id, &member_id, &outsider_id]).await;
 }
+
+#[tokio::test]
+async fn production_router_does_not_expose_deletion() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    let (status, _) = send(
+        sotto_server::app(state(pool.clone())),
+        "POST",
+        &format!("/orgs/{org_id}/deletion"),
+        Some(&token),
+        Some(json!({
+            "confirm_org_id": org_id,
+            "acknowledge_subscription_cancellation": true
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    cleanup(&pool, &org_id, &[&owner_id]).await;
+}
