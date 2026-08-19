@@ -28,11 +28,21 @@ use sotto_server::org_deletion::{
 
 static DB_TEST_LOCK: OnceLock<Arc<AsyncMutex<()>>> = OnceLock::new();
 
+// Keep one provider fake for ordinary outcomes and the in-flight cancellation race. The optional
+// gate holds the provider call open until recovery commits, forcing the worker's stale
+// compare-and-set result to race the newer recovery state.
+#[derive(Clone)]
+struct CancellationGate {
+    started: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
 struct TestProvider {
     cancellation: Mutex<VecDeque<ProviderResult<SubscriptionObservation>>>,
     status: Mutex<VecDeque<ProviderResult<SubscriptionObservation>>>,
     cancellation_calls: AtomicUsize,
     status_calls: AtomicUsize,
+    cancellation_gate: Option<CancellationGate>,
 }
 
 impl TestProvider {
@@ -45,7 +55,18 @@ impl TestProvider {
             status: Mutex::new(status.into_iter().collect()),
             cancellation_calls: AtomicUsize::new(0),
             status_calls: AtomicUsize::new(0),
+            cancellation_gate: None,
         }
+    }
+
+    fn with_blocking_cancellation(mut self) -> (Self, Arc<Notify>, Arc<Notify>) {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        self.cancellation_gate = Some(CancellationGate {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        (self, started, release)
     }
 
     fn unsupported(operation: &str) -> ProviderError {
@@ -62,57 +83,6 @@ impl TestProvider {
 
     fn status_calls(&self) -> usize {
         self.status_calls.load(Ordering::Relaxed)
-    }
-}
-
-// Keep the provider call open until the owner recovery commits, forcing the worker's stale
-// compare-and-set result to race the newer recovery state.
-struct BlockingCancellationProvider {
-    started: Arc<Notify>,
-    release: Arc<Notify>,
-}
-
-impl BlockingCancellationProvider {
-    fn new() -> Self {
-        Self {
-            started: Arc::new(Notify::new()),
-            release: Arc::new(Notify::new()),
-        }
-    }
-}
-
-#[async_trait]
-impl SubscriptionProvider for BlockingCancellationProvider {
-    async fn create_checkout(
-        &self,
-        _org_id: &str,
-        _customer: Option<&str>,
-        _success_url: &str,
-        _cancel_url: &str,
-    ) -> ProviderResult<String> {
-        Err(TestProvider::unsupported("checkout"))
-    }
-
-    async fn create_portal(&self, _customer: &str, _return_url: &str) -> ProviderResult<String> {
-        Err(TestProvider::unsupported("portal"))
-    }
-
-    async fn get_subscription(
-        &self,
-        subscription_id: &str,
-    ) -> ProviderResult<SubscriptionObservation> {
-        Ok(cancelled(subscription_id))
-    }
-
-    async fn cancel_subscription(
-        &self,
-        subscription_id: &str,
-        _idempotency_key: &str,
-        _org_id: &str,
-    ) -> ProviderResult<SubscriptionObservation> {
-        self.started.notify_one();
-        self.release.notified().await;
-        Ok(cancelled(subscription_id))
     }
 }
 
@@ -151,6 +121,10 @@ impl SubscriptionProvider for TestProvider {
         _org_id: &str,
     ) -> ProviderResult<SubscriptionObservation> {
         self.cancellation_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(gate) = &self.cancellation_gate {
+            gate.started.notify_one();
+            gate.release.notified().await;
+        }
         self.cancellation
             .lock()
             .expect("cancellation queue lock")
@@ -938,7 +912,7 @@ async fn owner_recovery_wins_an_in_flight_provider_cancellation() {
     };
     let _test_lock = db_test_lock().await;
     let (org_id, owner_id) = seed_owner(&pool).await;
-    let _subscription_id = link_subscription(&pool, &org_id).await;
+    let subscription_id = link_subscription(&pool, &org_id).await;
     sqlx::query("UPDATE organizations SET tier = 'team' WHERE id = $1")
         .bind(&org_id)
         .execute(&pool)
@@ -959,9 +933,12 @@ async fn owner_recovery_wins_an_in_flight_provider_cancellation() {
         .await
         .expect("claim billing")
         .expect("billing work is due");
-    let provider = Arc::new(BlockingCancellationProvider::new());
-    let started = provider.started.clone();
-    let release = provider.release.clone();
+    let (provider, started, release) = TestProvider::new(
+        [Ok(cancelled(&subscription_id))],
+        [Ok(cancelled(&subscription_id))],
+    )
+    .with_blocking_cancellation();
+    let provider = Arc::new(provider);
     let advance_task = tokio::spawn({
         let pool = pool.clone();
         let lease = billing_lease.clone();
