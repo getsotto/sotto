@@ -426,6 +426,21 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
         return Err(Error::NotFound("organisation not found".into()));
     };
     if LifecycleState::from_db(&lifecycle)? == LifecycleState::Deleted {
+        // Memberships no longer exist on a tombstone. Preserve the post-purge conflict only for
+        // the original requester, using the same terminal visibility boundary as status reads.
+        let requested_completed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM organization_deletions \
+             WHERE org_id = $1 AND requested_by = $2 AND state = 'completed')",
+        )
+        .bind(org_id)
+        .bind(actor)
+        .fetch_one(&mut *tx)
+        .await?;
+        if requested_completed {
+            return Err(Error::Conflict(
+                "organisation deletion cannot be cancelled after purge has started".into(),
+            ));
+        }
         return Err(Error::NotFound("organisation not found".into()));
     }
     require_owner(&mut tx, org_id, actor).await?;

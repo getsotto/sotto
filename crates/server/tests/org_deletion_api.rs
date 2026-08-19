@@ -640,12 +640,31 @@ async fn requester_can_read_a_completed_deletion_without_reusing_the_id() {
         })),
     )
     .await;
+    let cancel_uri = format!("{uri}/cancel");
+    let (requester_cancel_status, _) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &cancel_uri,
+        Some(&owner_token),
+        None,
+    )
+    .await;
+    let (outsider_cancel_status, _) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &cancel_uri,
+        Some(&outsider_token),
+        None,
+    )
+    .await;
 
     assert_eq!(requester_status, StatusCode::OK);
     let response: Value = serde_json::from_str(&requester_body).expect("completed status JSON");
     assert_eq!(response["state"], "completed");
     assert_eq!(outsider_status, StatusCode::NOT_FOUND);
     assert_eq!(repeated_status, StatusCode::CONFLICT);
+    assert_eq!(requester_cancel_status, StatusCode::CONFLICT);
+    assert_eq!(outsider_cancel_status, StatusCode::NOT_FOUND);
 
     cleanup(&pool, &org_id, &[&owner_id, &outsider_id]).await;
 }
