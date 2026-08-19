@@ -894,7 +894,7 @@ async fn owner_can_recover_from_retention_phase() {
         .expect("requested retention transition is due");
     advance(&pool, &requested_lease, None)
         .await
-        .expect("enter retention billing")
+        .expect("enter billing cancellation")
         .expect("retention billing transition");
     let billing_lease = claim_due(&pool, "retention-recovery-worker")
         .await
