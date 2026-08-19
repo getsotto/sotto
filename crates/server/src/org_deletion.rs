@@ -328,15 +328,65 @@ pub async fn request(
     })
 }
 
-type DeletionStatusRow = (
-    String,
-    String,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
+#[derive(sqlx::FromRow)]
+struct DeletionStatusRow {
+    id: String,
+    state: String,
+    requested_at: String,
+    recoverable_until: String,
+    managed_backup_expiry_by: Option<String>,
+    next_retry_at: Option<String>,
+    last_error_code: Option<String>,
+}
+
+async fn status_for_operation(
+    pool: &PgPool,
+    org_id: &str,
+    operation_id: &str,
+) -> Result<DeletionStatus> {
+    // Normalising in PostgreSQL keeps the wire timestamps truthful without adding a second time
+    // library solely for formatting database values.
+    let row: Option<DeletionStatusRow> = sqlx::query_as(
+        "SELECT id::text, state, \
+                to_char(requested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+                    AS requested_at, \
+                to_char(purge_after AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+                    AS recoverable_until, \
+                to_char(managed_backup_expiry_by AT TIME ZONE 'UTC', \
+                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS managed_backup_expiry_by, \
+                to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+                    AS next_retry_at, \
+                last_error_code \
+         FROM organization_deletions WHERE id = $1::uuid AND org_id = $2",
+    )
+    .bind(operation_id)
+    .bind(org_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Err(Error::NotFound("deletion not found".into()));
+    };
+    Ok(DeletionStatus {
+        id: row.id,
+        org_id: org_id.into(),
+        state: DeletionState::from_db(&row.state)?,
+        requested_at: row.requested_at,
+        recoverable_until: row.recoverable_until,
+        managed_backup_expiry_by: row.managed_backup_expiry_by,
+        next_retry_at: row.next_retry_at,
+        last_error_code: row.last_error_code,
+    })
+}
+
+/// Refetch the exact operation returned by an authorised mutation. Keeping this separate from
+/// [`status`] prevents a worker completing the operation between commit and response from changing
+/// which caller may receive that already-authorised response.
+pub(crate) async fn status_after_mutation(
+    pool: &PgPool,
+    operation: &DeletionView,
+) -> Result<DeletionStatus> {
+    status_for_operation(pool, &operation.org_id, &operation.id).await
+}
 
 /// Return an owner's current deletion status without changing its state.
 pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<DeletionStatus> {
@@ -352,70 +402,29 @@ pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
         Err(Error::NotFound(_)) => false,
         Err(error) => return Err(error),
     };
-    let row: Option<DeletionStatusRow> = if can_read_active {
-        sqlx::query_as(
-            // Normalising in PostgreSQL keeps the wire timestamps truthful without adding a second
-            // time library solely for formatting database values.
-            "SELECT id::text, state, \
-                    to_char(requested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-                    to_char(purge_after AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-                    to_char(managed_backup_expiry_by AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-                    to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-                    last_error_code \
-             FROM organization_deletions \
-             WHERE org_id = $1 AND state NOT IN ('cancelled', 'completed') \
-             ORDER BY requested_at DESC LIMIT 1",
+    let operation_id: Option<String> = if can_read_active {
+        sqlx::query_scalar(
+            "SELECT id::text FROM organization_deletions \
+             WHERE org_id = $1 AND state <> 'completed' ORDER BY requested_at DESC LIMIT 1",
         )
         .bind(org_id)
         .fetch_optional(pool)
         .await?
     } else {
-        None
+        sqlx::query_scalar(
+            "SELECT id::text FROM organization_deletions \
+             WHERE org_id = $1 AND requested_by = $2 AND state = 'completed' \
+             ORDER BY requested_at DESC LIMIT 1",
+        )
+        .bind(org_id)
+        .bind(actor)
+        .fetch_optional(pool)
+        .await?
     };
-    let row = match row {
-        Some(row) => Some(row),
-        None => {
-            sqlx::query_as(
-                "SELECT id::text, state, \
-                        to_char(requested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-                        to_char(purge_after AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-                        to_char(managed_backup_expiry_by AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-                        to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-                        last_error_code \
-                 FROM organization_deletions \
-                 WHERE org_id = $1 AND state IN ('cancelled', 'completed') \
-                   AND ($3 OR requested_by = $2) \
-                 ORDER BY requested_at DESC LIMIT 1",
-            )
-            .bind(org_id)
-            .bind(actor)
-            .bind(can_read_active)
-            .fetch_optional(pool)
-            .await?
-        }
-    };
-    let Some((
-        id,
-        state,
-        requested_at,
-        recoverable_until,
-        managed_backup_expiry_by,
-        next_retry_at,
-        last_error_code,
-    )) = row
-    else {
+    let Some(operation_id) = operation_id else {
         return Err(Error::NotFound("deletion not found".into()));
     };
-    Ok(DeletionStatus {
-        id,
-        org_id: org_id.into(),
-        state: DeletionState::from_db(&state)?,
-        requested_at,
-        recoverable_until,
-        managed_backup_expiry_by,
-        next_retry_at,
-        last_error_code,
-    })
+    status_for_operation(pool, org_id, &operation_id).await
 }
 
 /// Begin recovery for an owner, leaving access frozen until billing has been reconciled.

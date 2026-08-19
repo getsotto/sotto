@@ -83,10 +83,11 @@ async fn request_deletion(
             "subscription cancellation acknowledgement is required".into(),
         ));
     }
-    org_deletion::request(&state.pool, &org_id, &user.user_id, confirmation).await?;
-    // Refetch the operation so both first and repeated requests use the same response projection;
-    // a concurrent worker transition is safe to report as the newer status.
-    let status = org_deletion::status(&state.pool, &org_id, &user.user_id).await?;
+    let operation =
+        org_deletion::request(&state.pool, &org_id, &user.user_id, confirmation).await?;
+    // Refetch the authorised operation by id so first and repeated requests share one projection;
+    // a concurrent transition may update its state without changing terminal visibility here.
+    let status = org_deletion::status_after_mutation(&state.pool, &operation).await?;
     Ok((StatusCode::ACCEPTED, Json(status.into())))
 }
 
@@ -107,9 +108,9 @@ async fn cancel_deletion(
     user: AuthUser,
     Path(org_id): Path<String>,
 ) -> Result<(StatusCode, Json<DeletionResponse>)> {
-    org_deletion::cancel(&state.pool, &org_id, &user.user_id).await?;
-    // Cancellation and its response stay separate so an idempotent repeat reports whichever
-    // recovery state is current after the transition commits.
-    let status = org_deletion::status(&state.pool, &org_id, &user.user_id).await?;
+    let operation = org_deletion::cancel(&state.pool, &org_id, &user.user_id).await?;
+    // Recovery may complete after cancellation commits. Refetching the authorised operation by id
+    // reports that newer state without turning a successful second-owner request into a 404.
+    let status = org_deletion::status_after_mutation(&state.pool, &operation).await?;
     Ok((StatusCode::ACCEPTED, Json(status.into())))
 }
