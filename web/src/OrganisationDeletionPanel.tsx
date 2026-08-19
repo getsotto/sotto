@@ -33,14 +33,24 @@ function readableDate(value: string): string {
 
 function stateLabel(state: OrganisationDeletionState): string {
   switch (state) {
+    case "requested":
+      return "deletion requested";
     case "cancelling_billing":
-      return "cancelling billing";
+      return "billing cancellation in progress";
+    case "retention":
+      return "recovery window";
     case "purging":
       return "purging organisation data";
+    case "recovering":
+      return "restoring access";
+    case "failed":
+      return "needs attention";
     case "cancelled":
       return "recovered";
+    case "completed":
+      return "completed";
     default:
-      return state;
+      return "unknown deletion state";
   }
 }
 
@@ -53,12 +63,19 @@ function errorLabel(error: OrganisationDeletionStatus["error"]): string | null {
     case "purge_failed":
       return "The final purge could not complete. Your organisation remains protected while the operation is reviewed.";
     default:
-      return null;
+      return error === null
+        ? null
+        : "Deletion could not be confirmed safely. Your organisation remains protected while it is reviewed.";
   }
 }
 
 function isActiveStatus(status: OrganisationDeletionStatus | null): boolean {
   return status !== null && status.state !== "cancelled" && status.state !== "completed";
+}
+
+function activeAfterStatusFailure(status: OrganisationDeletionStatus | null): boolean {
+  // An unknown first response must keep writes frozen until the owner can retry the check.
+  return status === null ? true : isActiveStatus(status);
 }
 
 export function OrganisationDeletionPanel({
@@ -74,6 +91,14 @@ export function OrganisationDeletionPanel({
   const [acknowledged, setAcknowledged] = useState(false);
   const [busy, setBusy] = useState(false);
   const lastKnownStatus = useRef<OrganisationDeletionStatus | null>(null);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!organisationDeletionEnabled) {
@@ -96,7 +121,7 @@ export function OrganisationDeletionPanel({
       .catch((error: unknown) => {
         if (current) {
           setStatusError(message(error));
-          onActiveChange(isActiveStatus(lastKnownStatus.current));
+          onActiveChange(activeAfterStatusFailure(lastKnownStatus.current));
         }
       })
       .finally(() => {
@@ -117,6 +142,9 @@ export function OrganisationDeletionPanel({
     setStatusError(null);
     try {
       const next = await requestOrganisationDeletion(orgId);
+      if (!mounted.current) {
+        return;
+      }
       lastKnownStatus.current = next;
       setStatus(next);
       onActiveChange(isActiveStatus(next));
@@ -124,10 +152,15 @@ export function OrganisationDeletionPanel({
       setConfirmation("");
       setAcknowledged(false);
     } catch (error) {
+      if (!mounted.current) {
+        return;
+      }
       setStatusError(message(error));
-      onActiveChange(isActiveStatus(lastKnownStatus.current));
+      onActiveChange(activeAfterStatusFailure(lastKnownStatus.current));
     } finally {
-      setBusy(false);
+      if (mounted.current) {
+        setBusy(false);
+      }
     }
   }
 
@@ -136,14 +169,22 @@ export function OrganisationDeletionPanel({
     setStatusError(null);
     try {
       const next = await cancelOrganisationDeletion(orgId);
+      if (!mounted.current) {
+        return;
+      }
       lastKnownStatus.current = next;
       setStatus(next);
       onActiveChange(isActiveStatus(next));
     } catch (error) {
+      if (!mounted.current) {
+        return;
+      }
       setStatusError(message(error));
-      onActiveChange(isActiveStatus(lastKnownStatus.current));
+      onActiveChange(activeAfterStatusFailure(lastKnownStatus.current));
     } finally {
-      setBusy(false);
+      if (mounted.current) {
+        setBusy(false);
+      }
     }
   }
 
@@ -152,19 +193,27 @@ export function OrganisationDeletionPanel({
     setStatusError(null);
     try {
       const next = await fetchOrganisationDeletionStatus(orgId);
+      if (!mounted.current) {
+        return;
+      }
       lastKnownStatus.current = next;
       setStatus(next);
       onActiveChange(isActiveStatus(next));
     } catch (error) {
+      if (!mounted.current) {
+        return;
+      }
       setStatusError(message(error));
-      onActiveChange(isActiveStatus(lastKnownStatus.current));
+      onActiveChange(activeAfterStatusFailure(lastKnownStatus.current));
     } finally {
-      setStatusLoading(false);
+      if (mounted.current) {
+        setStatusLoading(false);
+      }
     }
   }
 
   return (
-    <section className="deletion-panel" aria-labelledby={`delete-${orgId}`}>
+    <section aria-labelledby={`delete-${orgId}`}>
       <h3 id={`delete-${orgId}`}>Delete organisation</h3>
       {!organisationDeletionEnabled ? (
         <p className="muted">Deletion controls are not enabled on this server yet.</p>
@@ -180,8 +229,8 @@ export function OrganisationDeletionPanel({
       ) : status === null ? (
         <>
           <p>
-            Deleting <strong>{orgName}</strong> freezes organisation writes during a 30-day
-            recovery window. Reads and exports remain available until purge begins.
+            Deleting <strong>{orgName}</strong> freezes organisation writes during the recovery
+            window. Reads and exports remain available until purge begins.
           </p>
           {!confirming ? (
             <button className="danger" onClick={() => setConfirming(true)}>
@@ -203,7 +252,9 @@ export function OrganisationDeletionPanel({
               <p>
                 Sotto purges its local organisation data, but Stripe retains billing records. This
                 is not personal-data erasure. Downloaded data and keys, and existing unattributed
-                share links, remain outside this deletion boundary.
+                share links, remain outside this deletion boundary. Managed backups may retain
+                ciphertext beyond the purge deadline; their expiry is reported when operations has
+                configured it.
               </p>
               <label>
                 Type this organisation ID exactly to confirm: <code>{orgId}</code>
@@ -271,7 +322,13 @@ function DeletionStatusView({
       </p>
       <dl>
         <div>
-          <dt>Recovery available until</dt>
+          <dt>Requested</dt>
+          <dd>
+            <time dateTime={status.requestedAt}>{readableDate(status.requestedAt)}</time>
+          </dd>
+        </div>
+        <div>
+          <dt>{status.state === "completed" ? "Recovery window ended" : "Recovery deadline"}</dt>
           <dd>
             <time dateTime={status.recoverableUntil}>{readableDate(status.recoverableUntil)}</time>
           </dd>
@@ -280,7 +337,7 @@ function DeletionStatusView({
           <dt>Managed backup expiry</dt>
           <dd>
             {status.managedBackupExpiryBy === null
-              ? "Not configured yet"
+              ? "Not reported; backups may outlive purge"
               : (
                   <time dateTime={status.managedBackupExpiryBy}>
                     {readableDate(status.managedBackupExpiryBy)}
