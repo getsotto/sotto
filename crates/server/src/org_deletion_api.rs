@@ -75,6 +75,8 @@ async fn request_deletion(
         ));
     }
     org_deletion::request(&state.pool, &org_id, &user.user_id, confirmation).await?;
+    // Refetch the operation so both first and repeated requests use the same response projection;
+    // a concurrent worker transition is safe to report as the newer status.
     let status = org_deletion::status(&state.pool, &org_id, &user.user_id).await?;
     Ok((StatusCode::ACCEPTED, Json(status.into())))
 }
@@ -94,6 +96,8 @@ async fn cancel_deletion(
     Path(org_id): Path<String>,
 ) -> Result<(StatusCode, Json<DeletionResponse>)> {
     org_deletion::cancel(&state.pool, &org_id, &user.user_id).await?;
+    // Cancellation and its response stay separate so an idempotent repeat reports whichever
+    // recovery state is current after the transition commits.
     let status = org_deletion::status(&state.pool, &org_id, &user.user_id).await?;
     Ok((StatusCode::ACCEPTED, Json(status.into())))
 }
