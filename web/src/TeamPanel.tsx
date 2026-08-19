@@ -238,6 +238,8 @@ export function TeamPanel({
               )}
             </p>
           )}
+          // Deletion status is owner-only; admins keep this read surface, while the server rejects
+          // their organisation writes with 409 during an active deletion.
           {openOrg.org.role === "owner" && (
             <OrganisationDeletionPanel
               orgId={openOrg.org.id}
