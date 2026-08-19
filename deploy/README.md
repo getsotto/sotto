@@ -45,6 +45,11 @@ Database migrations run automatically on server boot. Pin a released version wit
 for unreleased changes, or if you'd rather not trust prebuilt images - use
 `up -d --build`; that needs ~4 GB of RAM and takes several minutes the first time.
 
+The web image compiles the staged organisation-deletion control into the SPA. Keep
+`VITE_ORGANISATION_DELETION_ENABLED=false` until the deletion routes, worker, monitoring, and
+recovery runbook have been enabled together. The default prebuilt images and source builds both
+keep the control unavailable; setting it to `true` is reserved for that final enablement.
+
 On a 1 GB host, give the kernel some headroom before the first start:
 
 ```sh
