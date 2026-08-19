@@ -186,3 +186,50 @@ async fn owner_can_read_the_current_deletion_status() {
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
+
+#[tokio::test]
+async fn owner_can_cancel_deletion_idempotently() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    let deletion_uri = format!("/orgs/{org_id}/deletion");
+    send(
+        deletion_app(pool.clone()),
+        "POST",
+        &deletion_uri,
+        Some(&token),
+        Some(json!({
+            "confirm_org_id": org_id,
+            "acknowledge_subscription_cancellation": true
+        })),
+    )
+    .await;
+    let cancel_uri = format!("{deletion_uri}/cancel");
+
+    let (first_status, first_body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &cancel_uri,
+        Some(&token),
+        None,
+    )
+    .await;
+    let (repeated_status, repeated_body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &cancel_uri,
+        Some(&token),
+        None,
+    )
+    .await;
+
+    assert_eq!(first_status, StatusCode::ACCEPTED);
+    assert_eq!(repeated_status, StatusCode::ACCEPTED);
+    assert_eq!(first_body, repeated_body);
+    let response: Value = serde_json::from_str(&first_body).expect("cancellation status JSON");
+    assert_eq!(response["state"], "recovering");
+    assert!(response["next_retry_at"].as_str().unwrap().ends_with('Z'));
+
+    cleanup(&pool, &org_id, &[&owner_id]).await;
+}

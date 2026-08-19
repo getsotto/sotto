@@ -5,7 +5,7 @@
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -17,10 +17,12 @@ use crate::state::AppState;
 /// Build the deletion routes for the test-only router. Production enablement must explicitly merge
 /// this router into [`crate::app`] after the remaining client, operations, and safety gates exist.
 pub fn router() -> Router<AppState> {
-    Router::new().route(
-        "/orgs/{org_id}/deletion",
-        get(get_deletion).post(request_deletion),
-    )
+    Router::new()
+        .route(
+            "/orgs/{org_id}/deletion",
+            get(get_deletion).post(request_deletion),
+        )
+        .route("/orgs/{org_id}/deletion/cancel", post(cancel_deletion))
 }
 
 #[derive(Deserialize)]
@@ -80,4 +82,14 @@ async fn get_deletion(
 ) -> Result<Json<DeletionResponse>> {
     let status = org_deletion::status(&state.pool, &org_id, &user.user_id).await?;
     Ok(Json(status.into()))
+}
+
+async fn cancel_deletion(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(org_id): Path<String>,
+) -> Result<(StatusCode, Json<DeletionResponse>)> {
+    org_deletion::cancel(&state.pool, &org_id, &user.user_id).await?;
+    let status = org_deletion::status(&state.pool, &org_id, &user.user_id).await?;
+    Ok((StatusCode::ACCEPTED, Json(status.into())))
 }
