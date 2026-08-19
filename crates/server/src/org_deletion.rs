@@ -321,32 +321,38 @@ type DeletionStatusRow = (
 
 /// Return an owner's current deletion status without changing its state.
 pub async fn status(pool: &PgPool, org_id: &str, actor: &str) -> Result<DeletionStatus> {
-    match org::access(pool, org_id, actor).await {
-        Ok(access) if access.role() == Role::Owner => {}
+    let can_read_active = match org::access(pool, org_id, actor).await {
+        Ok(access) if access.role() == Role::Owner => true,
         Ok(_) => {
             return Err(Error::Forbidden(
                 "only an organisation owner may inspect deletion".into(),
             ));
         }
-        Err(Error::NotFound(_)) => {}
+        // Memberships are gone after purge, so the requesting owner needs a separate terminal
+        // lookup. Never let this fallback expose an active operation to a non-member.
+        Err(Error::NotFound(_)) => false,
         Err(error) => return Err(error),
-    }
-    let row: Option<DeletionStatusRow> = sqlx::query_as(
-        // Normalising in PostgreSQL keeps the wire timestamps truthful without adding a second
-        // time library solely for formatting database values.
-        "SELECT id::text, state, \
-                to_char(requested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-                to_char(purge_after AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-                to_char(managed_backup_expiry_by AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-                to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
-                last_error_code \
-         FROM organization_deletions \
-         WHERE org_id = $1 AND state NOT IN ('cancelled', 'completed') \
-         ORDER BY requested_at DESC LIMIT 1",
-    )
-    .bind(org_id)
-    .fetch_optional(pool)
-    .await?;
+    };
+    let row: Option<DeletionStatusRow> = if can_read_active {
+        sqlx::query_as(
+            // Normalising in PostgreSQL keeps the wire timestamps truthful without adding a second
+            // time library solely for formatting database values.
+            "SELECT id::text, state, \
+                    to_char(requested_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                    to_char(purge_after AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                    to_char(managed_backup_expiry_by AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                    to_char(next_attempt_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+                    last_error_code \
+             FROM organization_deletions \
+             WHERE org_id = $1 AND state NOT IN ('cancelled', 'completed') \
+             ORDER BY requested_at DESC LIMIT 1",
+        )
+        .bind(org_id)
+        .fetch_optional(pool)
+        .await?
+    } else {
+        None
+    };
     let row = match row {
         Some(row) => Some(row),
         None => {

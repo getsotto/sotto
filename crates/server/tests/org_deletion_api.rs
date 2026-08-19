@@ -79,6 +79,17 @@ async fn seed_owner(pool: &PgPool) -> (String, String, String) {
     (org_id, user_id, token)
 }
 
+async fn seed_user(pool: &PgPool, label: &str) -> (String, String) {
+    let user_id = format!("deletion-api-{label}-{}", Uuid::new_v4().simple());
+    sqlx::query("INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'test', $1)")
+        .bind(&user_id)
+        .execute(pool)
+        .await
+        .expect("insert user");
+    let token = session::issue(pool, &user_id).await.expect("issue session");
+    (user_id, token)
+}
+
 async fn cleanup(pool: &PgPool, org_id: &str, user_ids: &[&str]) {
     sqlx::query("DELETE FROM organization_deletions WHERE org_id = $1")
         .bind(org_id)
@@ -282,4 +293,108 @@ async fn deletion_request_requires_both_explicit_confirmations() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
+}
+
+#[tokio::test]
+async fn deletion_routes_preserve_the_owner_access_policy() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (org_id, owner_id, owner_token) = seed_owner(&pool).await;
+    let (member_id, member_token) = seed_user(&pool, "member").await;
+    let (outsider_id, outsider_token) = seed_user(&pool, "outsider").await;
+    sqlx::query(
+        "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, 'member')",
+    )
+    .bind(&org_id)
+    .bind(&member_id)
+    .execute(&pool)
+    .await
+    .expect("insert member");
+    let uri = format!("/orgs/{org_id}/deletion");
+    send(
+        deletion_app(pool.clone()),
+        "POST",
+        &uri,
+        Some(&owner_token),
+        Some(json!({
+            "confirm_org_id": org_id,
+            "acknowledge_subscription_cancellation": true
+        })),
+    )
+    .await;
+
+    let (unauthenticated, _) = send(deletion_app(pool.clone()), "GET", &uri, None, None).await;
+    let (member, _) = send(
+        deletion_app(pool.clone()),
+        "GET",
+        &uri,
+        Some(&member_token),
+        None,
+    )
+    .await;
+    let (outsider, _) = send(
+        deletion_app(pool.clone()),
+        "GET",
+        &uri,
+        Some(&outsider_token),
+        None,
+    )
+    .await;
+    let (missing, _) = send(
+        deletion_app(pool.clone()),
+        "GET",
+        "/orgs/missing-organisation/deletion",
+        Some(&owner_token),
+        None,
+    )
+    .await;
+    let repeated_request = json!({
+        "confirm_org_id": org_id,
+        "acknowledge_subscription_cancellation": true
+    });
+    let (member_request, _) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &uri,
+        Some(&member_token),
+        Some(repeated_request.clone()),
+    )
+    .await;
+    let (outsider_request, _) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &uri,
+        Some(&outsider_token),
+        Some(repeated_request),
+    )
+    .await;
+    let cancel_uri = format!("{uri}/cancel");
+    let (member_cancel, _) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &cancel_uri,
+        Some(&member_token),
+        None,
+    )
+    .await;
+    let (outsider_cancel, _) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &cancel_uri,
+        Some(&outsider_token),
+        None,
+    )
+    .await;
+
+    assert_eq!(unauthenticated, StatusCode::UNAUTHORIZED);
+    assert_eq!(member, StatusCode::FORBIDDEN);
+    assert_eq!(outsider, StatusCode::NOT_FOUND);
+    assert_eq!(missing, StatusCode::NOT_FOUND);
+    assert_eq!(member_request, StatusCode::FORBIDDEN);
+    assert_eq!(outsider_request, StatusCode::NOT_FOUND);
+    assert_eq!(member_cancel, StatusCode::FORBIDDEN);
+    assert_eq!(outsider_cancel, StatusCode::NOT_FOUND);
+
+    cleanup(&pool, &org_id, &[&owner_id, &member_id, &outsider_id]).await;
 }
