@@ -345,6 +345,13 @@ async fn deletion_request_requires_both_explicit_confirmations() {
             }),
             "deletion confirmation does not match the organisation",
         ),
+        (
+            json!({
+                "confirm_org_id": 42,
+                "acknowledge_subscription_cancellation": true
+            }),
+            "invalid deletion request",
+        ),
     ];
 
     for (body, expected) in cases {

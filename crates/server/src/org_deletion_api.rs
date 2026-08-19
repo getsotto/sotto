@@ -3,6 +3,7 @@
 //! [`router`] is intentionally absent from [`crate::app`]. Tests exercise the complete wire
 //! contract now, while the production route remains unavailable until the later enablement PR.
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -59,8 +60,11 @@ async fn request_deletion(
     State(state): State<AppState>,
     user: AuthUser,
     Path(org_id): Path<String>,
-    Json(body): Json<RequestDeletion>,
+    body: std::result::Result<Json<RequestDeletion>, JsonRejection>,
 ) -> Result<(StatusCode, Json<DeletionResponse>)> {
+    // Axum distinguishes syntax and data errors with different default statuses. This endpoint
+    // presents one stable 400 contract for every malformed deletion confirmation instead.
+    let Json(body) = body.map_err(|_| Error::BadRequest("invalid deletion request".into()))?;
     let confirmation = body
         .confirm_org_id
         .as_deref()
