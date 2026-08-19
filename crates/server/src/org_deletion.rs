@@ -437,6 +437,22 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
     .bind(org_id)
     .fetch_optional(&mut *tx)
     .await?;
+    let row = match row {
+        Some(row) => Some(row),
+        None => {
+            // Recovery may finish between repeated client calls. Return only the requesting
+            // owner's latest cancelled operation so idempotency does not widen terminal access.
+            sqlx::query_as(
+                "SELECT id::text, state FROM organization_deletions \
+                 WHERE org_id = $1 AND requested_by = $2 AND state = 'cancelled' \
+                 ORDER BY requested_at DESC LIMIT 1",
+            )
+            .bind(org_id)
+            .bind(actor)
+            .fetch_optional(&mut *tx)
+            .await?
+        }
+    };
     let Some((id, state)) = row else {
         return Err(Error::NotFound("deletion not found".into()));
     };

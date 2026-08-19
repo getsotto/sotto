@@ -647,3 +647,64 @@ async fn cancellation_is_rejected_after_purge_starts() {
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
+
+#[tokio::test]
+async fn completed_recovery_keeps_cancellation_idempotent() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    let deletion_uri = format!("/orgs/{org_id}/deletion");
+    send(
+        deletion_app(pool.clone()),
+        "POST",
+        &deletion_uri,
+        Some(&token),
+        Some(json!({
+            "confirm_org_id": org_id,
+            "acknowledge_subscription_cancellation": true
+        })),
+    )
+    .await;
+    let cancel_uri = format!("{deletion_uri}/cancel");
+    send(
+        deletion_app(pool.clone()),
+        "POST",
+        &cancel_uri,
+        Some(&token),
+        None,
+    )
+    .await;
+    let mut tx = pool.begin().await.expect("begin recovery fixture");
+    // Recovery completion is worker-owned; arranging it directly keeps this contract test away
+    // from the shared due-work queue used by the lifecycle suite.
+    sqlx::query(
+        "UPDATE organization_deletions SET state = 'cancelled', cancelled_at = now(), \
+         next_attempt_at = NULL WHERE org_id = $1",
+    )
+    .bind(&org_id)
+    .execute(&mut *tx)
+    .await
+    .expect("complete recovery fixture");
+    sqlx::query("UPDATE organizations SET lifecycle_state = 'active' WHERE id = $1")
+        .bind(&org_id)
+        .execute(&mut *tx)
+        .await
+        .expect("restore organisation fixture");
+    tx.commit().await.expect("commit recovery fixture");
+
+    let (status, body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &cancel_uri,
+        Some(&token),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let response: Value = serde_json::from_str(&body).expect("cancelled status JSON");
+    assert_eq!(response["state"], "cancelled");
+
+    cleanup(&pool, &org_id, &[&owner_id]).await;
+}
