@@ -575,6 +575,19 @@ async fn deletion_status_exposes_only_sanitised_failure_codes() {
         assert!(!body.contains("sub-deletion-api-unconfigured"));
     }
 
+    let (cancel_status, cancel_body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &format!("{uri}/cancel"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(cancel_status, StatusCode::ACCEPTED);
+    let cancelled: Value = serde_json::from_str(&cancel_body).expect("recovery status JSON");
+    assert_eq!(cancelled["state"], "recovering");
+    assert_eq!(cancelled["error"], Value::Null);
+
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
 

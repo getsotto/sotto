@@ -489,7 +489,7 @@ pub async fn cancel(pool: &PgPool, org_id: &str, actor: &str) -> Result<Deletion
     }
     sqlx::query(
         "UPDATE organization_deletions SET state = 'recovering', resume_state = NULL, \
-         attempt_count = 0, next_attempt_at = now(), \
+         attempt_count = 0, next_attempt_at = now(), last_error_code = NULL, \
          lease_owner = NULL, lease_expires_at = NULL, state_version = state_version + 1 \
          WHERE id = $1::uuid",
     )
