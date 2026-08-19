@@ -69,6 +69,8 @@ test("checkout cancelled return is handled", async ({ page }) => {
   await expect(page).not.toHaveURL(/billing=cancelled/);
 });
 
+// The deletion server routes and worker remain staged, so the client must keep destructive
+// controls unavailable until the final enablement change turns the feature on deliberately.
 test("organisation deletion stays disabled before enablement", async ({ page }) => {
   await loginAndUnlock(page);
   await selectOwnerOrganisation(page);
