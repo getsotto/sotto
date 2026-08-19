@@ -49,7 +49,7 @@ validate a typed plaintext name. Both fields are required. A valid first request
 
 ```json
 {
-  "state": "cancelling_billing",
+  "state": "requested",
   "requested_at": "2026-08-07T12:00:00Z",
   "recoverable_until": "2026-09-06T12:00:00Z",
   "managed_backup_expiry_by": "2026-10-06T12:00:00Z",
@@ -57,6 +57,8 @@ validate a typed plaintext name. Both fields are required. A valid first request
   "error": null
 }
 ```
+
+The worker may advance `requested` to `cancelling_billing` before a later status read.
 
 ### Read status
 
