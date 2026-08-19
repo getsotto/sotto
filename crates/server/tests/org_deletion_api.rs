@@ -484,19 +484,29 @@ async fn production_router_does_not_expose_deletion() {
     };
     let _test_lock = db_test_lock(&pool).await;
     let (org_id, owner_id, token) = seed_owner(&pool).await;
-    let (status, _) = send(
-        sotto_server::app(state(pool.clone())),
-        "POST",
-        &format!("/orgs/{org_id}/deletion"),
-        Some(&token),
-        Some(json!({
-            "confirm_org_id": org_id,
-            "acknowledge_subscription_cancellation": true
-        })),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    let deletion_uri = format!("/orgs/{org_id}/deletion");
+    for (method, uri, body) in [
+        (
+            "POST",
+            deletion_uri.clone(),
+            Some(json!({
+                "confirm_org_id": org_id,
+                "acknowledge_subscription_cancellation": true
+            })),
+        ),
+        ("GET", deletion_uri.clone(), None),
+        ("POST", format!("{deletion_uri}/cancel"), None),
+    ] {
+        let (status, _) = send(
+            sotto_server::app(state(pool.clone())),
+            method,
+            &uri,
+            Some(&token),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
