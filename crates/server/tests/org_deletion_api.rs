@@ -273,6 +273,7 @@ async fn owner_deletion_flow_is_idempotent_and_recoverable_over_http() {
         .await
         .expect("claim recovery")
         .expect("recovery is due");
+    assert_eq!(lease.org_id, org_id);
     let recovered = advance(&pool, &lease, None)
         .await
         .expect("complete recovery")
@@ -875,8 +876,8 @@ async fn every_owner_can_read_and_repeat_completed_recovery() {
     )
     .await;
     let mut tx = pool.begin().await.expect("begin recovery fixture");
-    // Recovery completion is worker-owned; arranging it directly keeps this contract test away
-    // from the shared due-work queue used by the lifecycle suite.
+    // Arrange completion directly so this ownership contract focuses on a second owner's access
+    // to a completed recovery rather than worker scheduling.
     sqlx::query(
         "UPDATE organization_deletions SET state = 'cancelled', cancelled_at = now(), \
          next_attempt_at = NULL WHERE org_id = $1",
