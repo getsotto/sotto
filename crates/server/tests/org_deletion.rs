@@ -1308,6 +1308,40 @@ async fn authentication_failure_fails_without_a_retry_schedule() {
             .await
             .expect("count retained environment");
     assert_eq!(environment_count, 1);
+    let secret_count: i64 = sqlx::query_scalar("SELECT count(*) FROM secrets WHERE id = $1")
+        .bind(&tree.secret)
+        .fetch_one(&pool)
+        .await
+        .expect("count retained secret");
+    assert_eq!(secret_count, 1);
+    let version_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM secret_versions WHERE id = $1")
+            .bind(&tree.version)
+            .fetch_one(&pool)
+            .await
+            .expect("count retained secret version");
+    assert_eq!(version_count, 1);
+    let grant_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM environment_grants WHERE env_id = $1")
+            .bind(&tree.environment)
+            .fetch_one(&pool)
+            .await
+            .expect("count retained environment grant");
+    assert_eq!(grant_count, 1);
+    let machine_token_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM machine_tokens WHERE id = $1")
+            .bind(&tree.machine_token)
+            .fetch_one(&pool)
+            .await
+            .expect("count retained machine token");
+    assert_eq!(machine_token_count, 1);
+    let membership_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM organization_memberships WHERE org_id = $1")
+            .bind(&org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count retained membership");
+    assert_eq!(membership_count, 1);
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
