@@ -317,7 +317,9 @@ async fn owner_can_read_the_current_deletion_status() {
         send(deletion_app(pool.clone()), "GET", &uri, Some(&token), None).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(status_body, requested_body);
+    let requested: Value = serde_json::from_str(&requested_body).expect("requested status JSON");
+    let status_response: Value = serde_json::from_str(&status_body).expect("status JSON");
+    assert_eq!(status_response, requested);
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
@@ -354,7 +356,10 @@ async fn repeated_deletion_request_returns_the_same_operation() {
 
     assert_eq!(first_status, StatusCode::ACCEPTED);
     assert_eq!(repeated_status, StatusCode::ACCEPTED);
-    assert_eq!(first_body, repeated_body);
+    let first_response: Value = serde_json::from_str(&first_body).expect("first status JSON");
+    let repeated_response: Value =
+        serde_json::from_str(&repeated_body).expect("repeated status JSON");
+    assert_eq!(first_response, repeated_response);
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
@@ -399,7 +404,10 @@ async fn owner_can_cancel_deletion_idempotently() {
 
     assert_eq!(first_status, StatusCode::ACCEPTED);
     assert_eq!(repeated_status, StatusCode::ACCEPTED);
-    assert_eq!(first_body, repeated_body);
+    let first_response: Value = serde_json::from_str(&first_body).expect("first cancellation JSON");
+    let repeated_response: Value =
+        serde_json::from_str(&repeated_body).expect("repeated cancellation JSON");
+    assert_eq!(first_response, repeated_response);
     let response: Value = serde_json::from_str(&first_body).expect("cancellation status JSON");
     assert_eq!(response["state"], "recovering");
     assert!(response["next_retry_at"].as_str().unwrap().ends_with('Z'));
@@ -903,7 +911,9 @@ async fn every_owner_can_read_and_repeat_completed_recovery() {
 
     assert_eq!(read_status, StatusCode::OK);
     assert_eq!(cancel_status, StatusCode::ACCEPTED);
-    assert_eq!(read_body, cancel_body);
+    let read_response: Value = serde_json::from_str(&read_body).expect("owner status JSON");
+    let cancel_response: Value = serde_json::from_str(&cancel_body).expect("cancel status JSON");
+    assert_eq!(read_response, cancel_response);
     let response: Value = serde_json::from_str(&cancel_body).expect("cancelled status JSON");
     assert_eq!(response["state"], "cancelled");
 
