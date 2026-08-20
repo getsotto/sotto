@@ -263,17 +263,13 @@ async fn seed_project_tree(pool: &PgPool, org_id: &str, owner_id: &str) -> Proje
         .execute(pool)
         .await
         .expect("insert project fixture");
-    sqlx::query(
-        "INSERT INTO environments (id, project_id, enc_name, enc_vault_key) \
-         VALUES ($1, $2, $3, $4)",
-    )
-    .bind(&environment_id)
-    .bind(&project_id)
-    .bind(b"environment".as_slice())
-    .bind(b"vault-key".as_slice())
-    .execute(pool)
-    .await
-    .expect("insert environment fixture");
+    sqlx::query("INSERT INTO environments (id, project_id, enc_name) VALUES ($1, $2, $3)")
+        .bind(&environment_id)
+        .bind(&project_id)
+        .bind(b"environment".as_slice())
+        .execute(pool)
+        .await
+        .expect("insert environment fixture");
     sqlx::query(
         "INSERT INTO secrets (id, env_id, enc_name, enc_value, enc_data_key, version) \
          VALUES ($1, $2, $3, $4, $5, 1)",
@@ -531,8 +527,7 @@ async fn concurrent_workers_claim_one_due_operation() {
     // Expire the lease directly so the test covers replacement after a worker crash without
     // waiting five minutes; the old compare-and-set result must then be discarded.
     sqlx::query(
-        "UPDATE organization_deletions SET lease_expires_at = now() - interval '1 second' \
-         WHERE id = $1::uuid",
+        "UPDATE organization_deletions SET lease_expires_at = requested_at WHERE id = $1::uuid",
     )
     .bind(&claimed.id)
     .execute(&pool)
