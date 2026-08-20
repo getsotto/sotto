@@ -550,6 +550,24 @@ async fn webhooks_cannot_change_deleting_or_deleted_organisations() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
+    // These fixed receipts and watermarks must be cleared before the test so a rerun cannot be
+    // acknowledged by deduplication without executing the lifecycle guards again.
+    sqlx::query(
+        "DELETE FROM stripe_subscription_watermarks \
+         WHERE subscription_id IN ('sub_lifecycle_new', 'sub_test_lifecycle', \
+                                   'sub_late', 'sub_late_updated', 'sub_late_deleted')",
+    )
+    .execute(&pool)
+    .await
+    .expect("clean lifecycle webhook watermarks");
+    sqlx::query(
+        "DELETE FROM stripe_webhook_events WHERE event_id IN (\
+         'evt_lifecycle_checkout', 'evt_lifecycle_updated', 'evt_lifecycle_deleted', \
+         'evt_lifecycle_late', 'evt_lifecycle_late_updated', 'evt_lifecycle_late_deleted')",
+    )
+    .execute(&pool)
+    .await
+    .expect("clean lifecycle webhook receipts");
     seed_user(&pool, "billing-user-lifecycle").await;
     seed_org(
         &pool,
@@ -606,11 +624,11 @@ async fn webhooks_cannot_change_deleting_or_deleted_organisations() {
             post_webhook(&app, payload, Some(&stripe_signature(payload))).await,
             StatusCode::OK
         );
+        assert_eq!(
+            org_billing_state(&pool, "billing-org-lifecycle").await,
+            ("free".into(), None, Some("sub_test_lifecycle".into()))
+        );
     }
-    assert_eq!(
-        org_billing_state(&pool, "billing-org-lifecycle").await,
-        ("free".into(), None, Some("sub_test_lifecycle".into()))
-    );
 
     sqlx::query(
         "UPDATE organizations SET lifecycle_state = 'deleted', deleted_at = now(), \
@@ -661,11 +679,11 @@ async fn webhooks_cannot_change_deleting_or_deleted_organisations() {
             post_webhook(&app, payload, Some(&stripe_signature(payload))).await,
             StatusCode::OK
         );
+        assert_eq!(
+            org_billing_state(&pool, "billing-org-lifecycle").await,
+            ("free".into(), None, None)
+        );
     }
-    assert_eq!(
-        org_billing_state(&pool, "billing-org-lifecycle").await,
-        ("free".into(), None, None)
-    );
 }
 
 #[tokio::test]
