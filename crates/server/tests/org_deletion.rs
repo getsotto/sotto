@@ -348,6 +348,20 @@ async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
         .expect("delete owner fixture");
 }
 
+async fn age_free_deletion(pool: &PgPool, operation_id: &str) {
+    // Age the fixture past retention while keeping the billing observation old enough to require
+    // the final freshness check, without making the test wait for the production window.
+    sqlx::query(
+        "UPDATE organization_deletions SET requested_at = now() - interval '31 days', \
+         purge_after = now() - interval '1 day', billing_checked_at = now() - interval '30 days' \
+         WHERE id = $1::uuid",
+    )
+    .bind(operation_id)
+    .execute(pool)
+    .await
+    .expect("age free deletion");
+}
+
 async fn ready_free_purge(
     pool: &PgPool,
     worker_id: &str,
@@ -373,15 +387,7 @@ async fn ready_free_purge(
         .await
         .expect("confirm missing subscription")
         .expect("retention transition");
-    sqlx::query(
-        "UPDATE organization_deletions SET requested_at = now() - interval '31 days', \
-         purge_after = now() - interval '1 day', billing_checked_at = now() - interval '30 days' \
-         WHERE org_id = $1",
-    )
-    .bind(&org_id)
-    .execute(pool)
-    .await
-    .expect("age free deletion");
+    age_free_deletion(pool, &requested.id).await;
     let retention_lease = claim_due(pool, worker_id)
         .await
         .expect("claim retention work")
@@ -815,15 +821,7 @@ async fn worker_reconciles_free_deletion_and_purges_tombstone() {
         .expect("retention transition");
     assert_eq!(retention.state, DeletionState::Retention);
 
-    sqlx::query(
-        "UPDATE organization_deletions SET requested_at = now() - interval '31 days', \
-         purge_after = now() - interval '1 day', billing_checked_at = now() - interval '30 days' \
-         WHERE id = $1::uuid",
-    )
-    .bind(&requested.id)
-    .execute(&pool)
-    .await
-    .expect("age retention operation");
+    age_free_deletion(&pool, &requested.id).await;
     let retention_lease = claim_due(&pool, "deletion-purge-worker")
         .await
         .expect("claim retention")
