@@ -559,7 +559,7 @@ async fn concurrent_workers_claim_one_due_operation() {
 }
 
 #[tokio::test]
-async fn concurrent_workers_do_not_duplicate_paid_cancellation_or_purge() {
+async fn paid_deletion_phases_have_exclusive_worker_claims() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
