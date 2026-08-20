@@ -207,6 +207,70 @@ async fn owner_can_request_deletion_with_the_documented_status_shape() {
 }
 
 #[tokio::test]
+async fn owner_deletion_flow_is_idempotent_and_recoverable_over_http() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    let deletion_uri = format!("/orgs/{org_id}/deletion");
+    let confirmation = json!({
+        "confirm_org_id": org_id,
+        "acknowledge_subscription_cancellation": true
+    });
+
+    let (request_status, request_body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &deletion_uri,
+        Some(&token),
+        Some(confirmation.clone()),
+    )
+    .await;
+    assert_eq!(request_status, StatusCode::ACCEPTED);
+    let requested: Value = serde_json::from_str(&request_body).expect("request status JSON");
+    assert_eq!(requested["state"], "requested");
+
+    let (status_code, status_body) = send(
+        deletion_app(pool.clone()),
+        "GET",
+        &deletion_uri,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+    assert_eq!(status_body, request_body);
+
+    let cancel_uri = format!("{deletion_uri}/cancel");
+    let (cancel_status, cancel_body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &cancel_uri,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(cancel_status, StatusCode::ACCEPTED);
+    let recovering: Value = serde_json::from_str(&cancel_body).expect("recovery status JSON");
+    assert_eq!(recovering["state"], "recovering");
+    assert_eq!(recovering["error"], Value::Null);
+
+    let (repeat_status, repeat_body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &deletion_uri,
+        Some(&token),
+        Some(confirmation),
+    )
+    .await;
+    assert_eq!(repeat_status, StatusCode::ACCEPTED);
+    assert_eq!(repeat_body, cancel_body);
+
+    cleanup(&pool, &org_id, &[&owner_id]).await;
+}
+
+#[tokio::test]
 async fn owner_can_read_the_current_deletion_status() {
     let Some(pool) = pool_or_skip().await else {
         return;
