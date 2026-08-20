@@ -528,6 +528,34 @@ async fn concurrent_workers_claim_one_due_operation() {
     assert_eq!(lease.0, claimed.worker_id);
     assert!(lease.1.is_some());
 
+    // Expire the lease directly so the test covers replacement after a worker crash without
+    // waiting five minutes; the old compare-and-set result must then be discarded.
+    sqlx::query(
+        "UPDATE organization_deletions SET lease_expires_at = now() - interval '1 second' \
+         WHERE id = $1::uuid",
+    )
+    .bind(&claimed.id)
+    .execute(&pool)
+    .await
+    .expect("expire worker lease");
+    let reclaimed = claim_due(&pool, "deletion-worker-c")
+        .await
+        .expect("reclaim expired lease")
+        .expect("expired work is reclaimable");
+    assert_eq!(reclaimed.worker_id, "deletion-worker-c");
+    assert!(advance(&pool, &claimed, None)
+        .await
+        .expect("discard stale worker result")
+        .is_none());
+    assert_eq!(
+        advance(&pool, &reclaimed, None)
+            .await
+            .expect("advance reclaimed work")
+            .expect("reclaimed transition")
+            .state,
+        DeletionState::CancellingBilling
+    );
+
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
@@ -677,11 +705,16 @@ async fn worker_reconciles_free_deletion_and_purges_tombstone() {
         .await
         .expect("claim purge")
         .expect("purge is due");
+    let stale_purge_lease = purging_lease.clone();
     let completed = advance(&pool, &purging_lease, None)
         .await
         .expect("purge organisation")
         .expect("completed transition");
     assert_eq!(completed.state, DeletionState::Completed);
+    assert!(advance(&pool, &stale_purge_lease, None)
+        .await
+        .expect("ignore repeated purge result")
+        .is_none());
     let tombstone: (
         String,
         bool,
