@@ -575,6 +575,8 @@ async fn concurrent_workers_do_not_duplicate_paid_cancellation_or_purge() {
     assert_eq!(retention.state, DeletionState::Retention);
     assert_eq!(provider.cancellation_calls(), 1);
 
+    // Move the retention deadline into the past so this database test exercises the worker path
+    // without waiting thirty days; production deadlines remain immutable after the request.
     sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
         .bind(&requested.id)
         .execute(&pool)
