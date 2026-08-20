@@ -633,10 +633,35 @@ async fn webhooks_cannot_change_deleting_or_deleted_organisations() {
         }}
     })
     .to_string();
-    assert_eq!(
-        post_webhook(&app, &late, Some(&stripe_signature(&late))).await,
-        StatusCode::OK
-    );
+    let late_updated = serde_json::json!({
+        "id": "evt_lifecycle_late_updated",
+        "created": 104,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.updated",
+        "data": { "object": {
+            "id": "sub_late_updated",
+            "status": "active",
+            "metadata": { "org_id": "billing-org-lifecycle" }
+        }}
+    })
+    .to_string();
+    let late_deleted = serde_json::json!({
+        "id": "evt_lifecycle_late_deleted",
+        "created": 105,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.deleted",
+        "data": { "object": {
+            "id": "sub_late_deleted",
+            "metadata": { "org_id": "billing-org-lifecycle" }
+        }}
+    })
+    .to_string();
+    for payload in [&late, &late_updated, &late_deleted] {
+        assert_eq!(
+            post_webhook(&app, payload, Some(&stripe_signature(payload))).await,
+            StatusCode::OK
+        );
+    }
     assert_eq!(
         org_billing_state(&pool, "billing-org-lifecycle").await,
         ("free".into(), None, None)
