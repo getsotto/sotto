@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use sotto_server::auth::session;
 use sotto_server::db;
+use sotto_server::org_deletion::{advance, claim_due, DeletionState};
 use sotto_server::state::AppState;
 
 async fn pool_or_skip() -> Option<PgPool> {
@@ -266,6 +267,27 @@ async fn owner_deletion_flow_is_idempotent_and_recoverable_over_http() {
     .await;
     assert_eq!(repeat_status, StatusCode::ACCEPTED);
     assert_eq!(repeat_body, cancel_body);
+
+    let lease = claim_due(&pool, "deletion-api-worker")
+        .await
+        .expect("claim recovery")
+        .expect("recovery is due");
+    let recovered = advance(&pool, &lease, None)
+        .await
+        .expect("complete recovery")
+        .expect("recovery transition");
+    assert_eq!(recovered.state, DeletionState::Cancelled);
+    let (final_status, final_body) = send(
+        deletion_app(pool.clone()),
+        "GET",
+        &deletion_uri,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(final_status, StatusCode::OK);
+    let cancelled: Value = serde_json::from_str(&final_body).expect("cancelled status JSON");
+    assert_eq!(cancelled["state"], "cancelled");
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
