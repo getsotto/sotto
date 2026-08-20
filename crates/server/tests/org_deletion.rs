@@ -1238,6 +1238,64 @@ async fn retryable_provider_failure_schedules_the_next_attempt() {
 }
 
 #[tokio::test]
+async fn retryable_provider_failure_exhausts_the_ladder() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let _subscription_id = link_subscription(&pool, &org_id).await;
+    let provider = TestProvider::new(
+        [Err(ProviderError {
+            status: Some(500),
+            code: Some("api_error".into()),
+            kind: ProviderErrorKind::Retryable,
+        })],
+        [],
+    );
+    let requested = request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(&pool, "exhausted-provider-worker")
+        .await
+        .expect("claim requested")
+        .expect("requested work is due");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start billing cancellation")
+        .expect("billing transition");
+    let billing_lease = claim_due(&pool, "exhausted-provider-worker")
+        .await
+        .expect("claim billing")
+        .expect("billing work is due");
+    sqlx::query("UPDATE organization_deletions SET attempt_count = 6 WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+        .await
+        .expect("exhaust retry ladder");
+    let exhausted_lease = DeletionLease {
+        attempt_count: 6,
+        ..billing_lease
+    };
+    let failed = advance(&pool, &exhausted_lease, Some(&provider))
+        .await
+        .expect("handle exhausted provider failure")
+        .expect("failed transition");
+    assert_eq!(failed.state, DeletionState::Failed);
+    let failure_state: (Option<String>, Option<String>, bool) = sqlx::query_as(
+        "SELECT next_attempt_at::text, last_error_code, resume_state IS NOT NULL \
+         FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&requested.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read exhausted retry state");
+    assert_eq!(failure_state, (None, Some("api_error".into()), true));
+    assert_audit_actions(&pool, &org_id, &["org.deletion.failed"]).await;
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
 async fn authentication_failure_fails_without_a_retry_schedule() {
     let Some(pool) = pool_or_skip().await else {
         return;
