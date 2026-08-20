@@ -1133,6 +1133,7 @@ async fn authentication_failure_fails_without_a_retry_schedule() {
     };
     let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
+    let tree = seed_project_tree(&pool, &org_id, &owner_id).await;
     let _subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
         [Err(ProviderError {
@@ -1183,6 +1184,28 @@ async fn authentication_failure_fails_without_a_retry_schedule() {
     .expect("read authentication error code");
     assert_eq!(error_code, "billing_unavailable");
     assert_audit_actions(&pool, &org_id, &["org.deletion.failed"]).await;
+
+    let retained: (String, bool) = sqlx::query_as(
+        "SELECT lifecycle_state, enc_name IS NOT NULL FROM organizations WHERE id = $1",
+    )
+    .bind(&org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read retained organisation");
+    assert_eq!(retained, ("deleting".into(), true));
+    let project_count: i64 = sqlx::query_scalar("SELECT count(*) FROM projects WHERE id = $1")
+        .bind(&tree.project)
+        .fetch_one(&pool)
+        .await
+        .expect("count retained project");
+    assert_eq!(project_count, 1);
+    let environment_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM environments WHERE id = $1")
+            .bind(&tree.environment)
+            .fetch_one(&pool)
+            .await
+            .expect("count retained environment");
+    assert_eq!(environment_count, 1);
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
