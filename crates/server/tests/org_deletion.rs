@@ -245,8 +245,9 @@ struct ProjectTreeIds {
 }
 
 // Use opaque byte fixtures for every encrypted column: the purge only deletes ciphertext and must
-// never need to decrypt or interpret these values. Return the identifiers needed to assert project
-// and environment removal directly, plus the environment-linked secret and token rows.
+// never need to decrypt or interpret these values. Return identifiers for the project tree so
+// assertions can verify its project, environment, secret, secret version and machine-token rows,
+// plus the environment-linked grants, after purging.
 async fn seed_project_tree(pool: &PgPool, org_id: &str, owner_id: &str) -> ProjectTreeIds {
     let suffix = Uuid::new_v4().simple().to_string();
     let project_id = format!("deletion-project-{suffix}");
