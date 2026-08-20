@@ -710,7 +710,7 @@ async fn purge_rejects_changed_safety_preconditions() {
     let cases = [
         (
             "organisation lifecycle",
-            "UPDATE organizations SET lifecycle_state = 'active' WHERE id = $1::uuid",
+            "UPDATE organizations SET lifecycle_state = 'active' WHERE id = $1",
         ),
         (
             "retention deadline",
@@ -718,7 +718,7 @@ async fn purge_rejects_changed_safety_preconditions() {
         ),
         (
             "new subscription",
-            "UPDATE organizations SET stripe_subscription_id = 'sub-appeared' WHERE id = $1::uuid",
+            "UPDATE organizations SET stripe_subscription_id = 'sub-appeared' WHERE id = $1",
         ),
     ];
     for (label, mutation) in cases {
