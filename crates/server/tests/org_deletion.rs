@@ -513,6 +513,15 @@ async fn owner_requests_are_idempotent_and_cancellable() {
         ],
     )
     .await;
+    let reuse = sqlx::query("INSERT INTO organizations (id, enc_name) VALUES ($1, $2)")
+        .bind(&org_id)
+        .bind(b"replacement".as_slice())
+        .execute(&pool)
+        .await;
+    assert!(
+        reuse.is_err(),
+        "a completed tombstone must reserve its identifier"
+    );
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
