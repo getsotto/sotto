@@ -517,7 +517,7 @@ async fn owner_requests_are_idempotent_and_cancellable() {
 }
 
 #[tokio::test]
-async fn concurrent_owner_requests_converge_on_one_operation() {
+async fn owner_requests_converge_on_one_operation() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -546,7 +546,7 @@ async fn concurrent_owner_requests_converge_on_one_operation() {
 }
 
 #[tokio::test]
-async fn concurrent_workers_claim_one_due_operation() {
+async fn worker_claims_are_exclusive_for_due_work() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
