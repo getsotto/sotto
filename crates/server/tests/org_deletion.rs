@@ -22,8 +22,8 @@ use sotto_server::billing::{
 use sotto_server::db;
 use sotto_server::error::Error;
 use sotto_server::org_deletion::{
-    advance, cancel, claim_due, record_operator_observation, request, status, DeletionState,
-    OperatorObservation,
+    advance, cancel, claim_due, record_operator_observation, request, status, DeletionLease,
+    DeletionState, OperatorObservation,
 };
 
 // Keep one provider fake for ordinary outcomes and the in-flight cancellation race. The optional
@@ -348,6 +348,55 @@ async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
         .expect("delete owner fixture");
 }
 
+async fn ready_free_purge(
+    pool: &PgPool,
+    worker_id: &str,
+) -> (String, String, String, ProjectTreeIds, DeletionLease) {
+    let (org_id, owner_id) = seed_owner(pool).await;
+    let tree = seed_project_tree(pool, &org_id, &owner_id).await;
+    let requested = request(pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(pool, worker_id)
+        .await
+        .expect("claim requested work")
+        .expect("requested work is due");
+    advance(pool, &requested_lease, None)
+        .await
+        .expect("enter billing cancellation")
+        .expect("billing transition");
+    let billing_lease = claim_due(pool, worker_id)
+        .await
+        .expect("claim billing work")
+        .expect("billing work is due");
+    advance(pool, &billing_lease, None)
+        .await
+        .expect("confirm missing subscription")
+        .expect("retention transition");
+    sqlx::query(
+        "UPDATE organization_deletions SET requested_at = now() - interval '31 days', \
+         purge_after = now() - interval '1 day', billing_checked_at = now() - interval '30 days' \
+         WHERE org_id = $1",
+    )
+    .bind(&org_id)
+    .execute(pool)
+    .await
+    .expect("age free deletion");
+    let retention_lease = claim_due(pool, worker_id)
+        .await
+        .expect("claim retention work")
+        .expect("retention work is due");
+    advance(pool, &retention_lease, None)
+        .await
+        .expect("enter purge")
+        .expect("purge transition");
+    let purge_lease = claim_due(pool, worker_id)
+        .await
+        .expect("claim purge work")
+        .expect("purge work is due");
+    (org_id, owner_id, requested.id, tree, purge_lease)
+}
+
 async fn assert_audit_actions(pool: &PgPool, org_id: &str, expected: &[&str]) {
     let actions: Vec<String> =
         sqlx::query_scalar("SELECT action FROM audit_events WHERE org_id = $1 ORDER BY id")
@@ -641,6 +690,58 @@ async fn paid_deletion_phases_have_exclusive_worker_claims() {
     assert_eq!(provider.status_calls(), 1);
 
     cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn purge_rejects_changed_safety_preconditions() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let cases = [
+        (
+            "organisation lifecycle",
+            "UPDATE organizations SET lifecycle_state = 'active' WHERE id = $1",
+        ),
+        (
+            "retention deadline",
+            "UPDATE organization_deletions SET purge_after = now() + interval '1 day' WHERE id = $1",
+        ),
+        (
+            "new subscription",
+            "UPDATE organizations SET stripe_subscription_id = 'sub-appeared' WHERE id = $1",
+        ),
+    ];
+    for (label, mutation) in cases {
+        let (org_id, owner_id, operation_id, tree, purge_lease) =
+            ready_free_purge(&pool, &format!("purge-precondition-{label}")).await;
+        sqlx::query(mutation)
+            .bind(&org_id)
+            .execute(&pool)
+            .await
+            .expect("mutate purge precondition");
+        let failed = advance(&pool, &purge_lease, None)
+            .await
+            .expect("handle changed purge precondition")
+            .expect("failed purge transition");
+        assert_eq!(failed.state, DeletionState::Failed, "{label}");
+        let error_code: String = sqlx::query_scalar(
+            "SELECT last_error_code FROM organization_deletions WHERE id = $1::uuid",
+        )
+        .bind(&operation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read purge precondition failure");
+        assert_eq!(error_code, "purge_precondition_failed", "{label}");
+        let project_count: i64 = sqlx::query_scalar("SELECT count(*) FROM projects WHERE id = $1")
+            .bind(&tree.project)
+            .fetch_one(&pool)
+            .await
+            .expect("count retained project");
+        assert_eq!(project_count, 1, "{label}");
+        assert_audit_actions(&pool, &org_id, &["org.deletion.failed"]).await;
+        cleanup(&pool, &org_id, &owner_id).await;
+    }
 }
 
 #[tokio::test]
