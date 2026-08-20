@@ -362,10 +362,15 @@ async fn age_free_deletion(pool: &PgPool, operation_id: &str) {
     .expect("age free deletion");
 }
 
-async fn ready_free_purge(
-    pool: &PgPool,
-    worker_id: &str,
-) -> (String, String, String, ProjectTreeIds, DeletionLease) {
+struct ReadyFreePurge {
+    org_id: String,
+    owner_id: String,
+    operation_id: String,
+    tree: ProjectTreeIds,
+    purge_lease: DeletionLease,
+}
+
+async fn ready_free_purge(pool: &PgPool, worker_id: &str) -> ReadyFreePurge {
     let (org_id, owner_id) = seed_owner(pool).await;
     let tree = seed_project_tree(pool, &org_id, &owner_id).await;
     let requested = request(pool, &org_id, &owner_id, &org_id)
@@ -400,7 +405,13 @@ async fn ready_free_purge(
         .await
         .expect("claim purge work")
         .expect("purge work is due");
-    (org_id, owner_id, requested.id, tree, purge_lease)
+    ReadyFreePurge {
+        org_id,
+        owner_id,
+        operation_id: requested.id,
+        tree,
+        purge_lease,
+    }
 }
 
 async fn assert_audit_actions(pool: &PgPool, org_id: &str, expected: &[&str]) {
@@ -721,8 +732,13 @@ async fn purge_rejects_changed_safety_preconditions() {
         ),
     ];
     for (label, mutation) in cases {
-        let (org_id, owner_id, operation_id, tree, purge_lease) =
-            ready_free_purge(&pool, &format!("purge-precondition-{label}")).await;
+        let ReadyFreePurge {
+            org_id,
+            owner_id,
+            operation_id,
+            tree,
+            purge_lease,
+        } = ready_free_purge(&pool, &format!("purge-precondition-{label}")).await;
         sqlx::query(mutation)
             .bind(&org_id)
             .execute(&pool)
@@ -758,8 +774,13 @@ async fn purge_rejects_subscription_different_from_snapshot() {
         return;
     };
     let _test_lock = prepare_deletion_test(&pool).await;
-    let (org_id, owner_id, operation_id, tree, purge_lease) =
-        ready_free_purge(&pool, "purge-precondition-snapshot").await;
+    let ReadyFreePurge {
+        org_id,
+        owner_id,
+        operation_id,
+        tree,
+        purge_lease,
+    } = ready_free_purge(&pool, "purge-precondition-snapshot").await;
     sqlx::query(
         "UPDATE organization_deletions SET subscription_id = 'sub-snapshot' WHERE id = $1::uuid",
     )
