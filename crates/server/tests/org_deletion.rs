@@ -754,6 +754,41 @@ async fn purge_rejects_changed_safety_preconditions() {
 }
 
 #[tokio::test]
+async fn purge_rejects_subscription_different_from_snapshot() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id, operation_id, tree, purge_lease) =
+        ready_free_purge(&pool, "purge-precondition-snapshot").await;
+    sqlx::query(
+        "UPDATE organization_deletions SET subscription_id = 'sub-snapshot' WHERE id = $1::uuid",
+    )
+    .bind(&operation_id)
+    .execute(&pool)
+    .await
+    .expect("set subscription snapshot");
+    sqlx::query("UPDATE organizations SET stripe_subscription_id = 'sub-different' WHERE id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("set current subscription");
+    let failed = advance(&pool, &purge_lease, None)
+        .await
+        .expect("handle changed subscription")
+        .expect("failed purge transition");
+    assert_eq!(failed.state, DeletionState::Failed);
+    let project_count: i64 = sqlx::query_scalar("SELECT count(*) FROM projects WHERE id = $1")
+        .bind(&tree.project)
+        .fetch_one(&pool)
+        .await
+        .expect("count retained project");
+    assert_eq!(project_count, 1);
+    assert_audit_actions(&pool, &org_id, &["org.deletion.failed"]).await;
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
 async fn worker_reconciles_free_deletion_and_purges_tombstone() {
     let Some(pool) = pool_or_skip().await else {
         return;
