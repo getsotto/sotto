@@ -1310,7 +1310,7 @@ async fn retryable_provider_failure_exhausts_the_ladder() {
         .await
         .expect("exhaust retry ladder");
     let exhausted_lease = DeletionLease {
-        attempt_count: 6,
+        attempt_count: 7,
         ..billing_lease
     };
     let failed = advance(&pool, &exhausted_lease, Some(&provider))
