@@ -254,6 +254,7 @@ async fn seed_project_tree(pool: &PgPool, org_id: &str, owner_id: &str) -> Proje
     let secret_id = format!("deletion-secret-{suffix}");
     let version_id = format!("deletion-secret-version-{suffix}");
     let machine_token_id = format!("deletion-machine-token-{suffix}");
+    let token_hash = format!("token-hash-{suffix}");
 
     sqlx::query("INSERT INTO projects (id, owner_id, enc_name, org_id) VALUES ($1, $2, $3, $4)")
         .bind(&project_id)
@@ -311,7 +312,7 @@ async fn seed_project_tree(pool: &PgPool, org_id: &str, owner_id: &str) -> Proje
     )
     .bind(&machine_token_id)
     .bind(&environment_id)
-    .bind(b"token-hash".as_slice())
+    .bind(token_hash.as_bytes())
     .bind(b"public-key".as_slice())
     .bind(b"sealed-token-vault-key".as_slice())
     .bind(owner_id)
