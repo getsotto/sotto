@@ -714,7 +714,7 @@ async fn purge_rejects_changed_safety_preconditions() {
         ),
         (
             "retention deadline",
-            "UPDATE organization_deletions SET purge_after = now() + interval '1 day' WHERE id = $1::uuid",
+            "UPDATE organization_deletions SET purge_after = now() + interval '1 day' WHERE org_id = $1",
         ),
         (
             "new subscription",
