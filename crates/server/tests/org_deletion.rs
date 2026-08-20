@@ -707,6 +707,8 @@ async fn purge_rejects_changed_safety_preconditions() {
         return;
     };
     let _test_lock = prepare_deletion_test(&pool).await;
+    // Bind the text organisation id in every case: organizations.id and the deletion's org_id
+    // are text columns, while the operation's primary key is a UUID.
     let cases = [
         (
             "organisation lifecycle",
