@@ -236,6 +236,83 @@ async fn link_subscription(pool: &PgPool, org_id: &str) -> String {
     subscription_id
 }
 
+async fn seed_project_tree(pool: &PgPool, org_id: &str, owner_id: &str) {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let project_id = format!("deletion-project-{suffix}");
+    let environment_id = format!("deletion-environment-{suffix}");
+    let secret_id = format!("deletion-secret-{suffix}");
+    let version_id = format!("deletion-secret-version-{suffix}");
+    let machine_token_id = format!("deletion-machine-token-{suffix}");
+
+    sqlx::query("INSERT INTO projects (id, owner_id, enc_name, org_id) VALUES ($1, $2, $3, $4)")
+        .bind(&project_id)
+        .bind(owner_id)
+        .bind(b"project".as_slice())
+        .bind(org_id)
+        .execute(pool)
+        .await
+        .expect("insert project fixture");
+    sqlx::query(
+        "INSERT INTO environments (id, project_id, enc_name, enc_vault_key) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(&environment_id)
+    .bind(&project_id)
+    .bind(b"environment".as_slice())
+    .bind(b"vault-key".as_slice())
+    .execute(pool)
+    .await
+    .expect("insert environment fixture");
+    sqlx::query(
+        "INSERT INTO secrets (id, env_id, enc_name, enc_value, enc_data_key, version) \
+         VALUES ($1, $2, $3, $4, $5, 1)",
+    )
+    .bind(&secret_id)
+    .bind(&environment_id)
+    .bind(b"secret".as_slice())
+    .bind(b"secret-value".as_slice())
+    .bind(b"data-key".as_slice())
+    .execute(pool)
+    .await
+    .expect("insert secret fixture");
+    sqlx::query(
+        "INSERT INTO secret_versions (id, secret_id, version, enc_name, enc_value, enc_data_key) \
+         VALUES ($1, $2, 1, $3, $4, $5)",
+    )
+    .bind(&version_id)
+    .bind(&secret_id)
+    .bind(b"secret".as_slice())
+    .bind(b"secret-value".as_slice())
+    .bind(b"data-key".as_slice())
+    .execute(pool)
+    .await
+    .expect("insert secret version fixture");
+    sqlx::query(
+        "INSERT INTO environment_grants (env_id, user_id, enc_vault_key, granted_by) \
+         VALUES ($1, $2, $3, $2)",
+    )
+    .bind(&environment_id)
+    .bind(owner_id)
+    .bind(b"sealed-vault-key".as_slice())
+    .execute(pool)
+    .await
+    .expect("insert environment grant fixture");
+    sqlx::query(
+        "INSERT INTO machine_tokens \
+         (id, env_id, name, token_hash, public_key, enc_vault_key, created_by) \
+         VALUES ($1, $2, 'deletion-test', $3, $4, $5, $6)",
+    )
+    .bind(&machine_token_id)
+    .bind(&environment_id)
+    .bind(b"token-hash".as_slice())
+    .bind(b"public-key".as_slice())
+    .bind(b"sealed-token-vault-key".as_slice())
+    .bind(owner_id)
+    .execute(pool)
+    .await
+    .expect("insert machine token fixture");
+}
+
 async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
     sqlx::query("DELETE FROM organization_deletions WHERE org_id = $1")
         .bind(org_id)
@@ -374,12 +451,75 @@ async fn owner_requests_are_idempotent_and_cancellable() {
 }
 
 #[tokio::test]
+async fn concurrent_owner_requests_converge_on_one_operation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+
+    let (first, second) = tokio::join!(
+        request(&pool, &org_id, &owner_id, &org_id),
+        request(&pool, &org_id, &owner_id, &org_id),
+    );
+    let first = first.expect("first concurrent request");
+    let second = second.expect("second concurrent request");
+    assert_eq!(first, second);
+
+    let active_operations: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM organization_deletions \
+         WHERE org_id = $1 AND state NOT IN ('cancelled', 'completed')",
+    )
+    .bind(&org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count active deletion operations");
+    assert_eq!(active_operations, 1);
+
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn concurrent_workers_claim_one_due_operation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+
+    let (first, second) = tokio::join!(
+        claim_due(&pool, "deletion-worker-a"),
+        claim_due(&pool, "deletion-worker-b"),
+    );
+    let first = first.expect("first worker claim");
+    let second = second.expect("second worker claim");
+    assert!(first.is_some() ^ second.is_some());
+
+    let claimed = first.or(second).expect("one worker owns the lease");
+    let lease: (String, Option<String>) = sqlx::query_as(
+        "SELECT lease_owner, lease_expires_at::text FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&claimed.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read worker lease");
+    assert_eq!(lease.0, claimed.worker_id);
+    assert!(lease.1.is_some());
+
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
 async fn worker_reconciles_free_deletion_and_purges_tombstone() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
     let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
+    seed_project_tree(&pool, &org_id, &owner_id).await;
     let requested = request(&pool, &org_id, &owner_id, &org_id)
         .await
         .expect("request deletion");
@@ -438,15 +578,50 @@ async fn worker_reconciles_free_deletion_and_purges_tombstone() {
         .expect("purge organisation")
         .expect("completed transition");
     assert_eq!(completed.state, DeletionState::Completed);
-    let tombstone: (String, bool, bool) = sqlx::query_as(
-        "SELECT lifecycle_state, enc_name IS NULL, stripe_subscription_id IS NULL \
-         FROM organizations WHERE id = $1",
+    let tombstone: (
+        String,
+        bool,
+        bool,
+        bool,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT lifecycle_state, enc_name IS NULL, created_by IS NULL, \
+                    stripe_subscription_id IS NULL, tier, trial_ends_at::text, stripe_customer_id \
+             FROM organizations WHERE id = $1",
     )
     .bind(&org_id)
     .fetch_one(&pool)
     .await
     .expect("read tombstone");
-    assert_eq!(tombstone, ("deleted".into(), true, true));
+    assert_eq!(
+        tombstone,
+        (
+            "deleted".into(),
+            true,
+            true,
+            true,
+            "free".into(),
+            None,
+            None,
+        )
+    );
+    let counts: (i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM projects WHERE org_id = $1),
+            (SELECT count(*) FROM environments e JOIN projects p ON p.id = e.project_id WHERE p.org_id = $1),
+            (SELECT count(*) FROM secrets s JOIN environments e ON e.id = s.env_id JOIN projects p ON p.id = e.project_id WHERE p.org_id = $1),
+            (SELECT count(*) FROM secret_versions v JOIN secrets s ON s.id = v.secret_id JOIN environments e ON e.id = s.env_id JOIN projects p ON p.id = e.project_id WHERE p.org_id = $1),
+            (SELECT count(*) FROM environment_grants g JOIN environments e ON e.id = g.env_id JOIN projects p ON p.id = e.project_id WHERE p.org_id = $1),
+            (SELECT count(*) FROM machine_tokens m JOIN environments e ON e.id = m.env_id JOIN projects p ON p.id = e.project_id WHERE p.org_id = $1),
+            (SELECT count(*) FROM organization_memberships WHERE org_id = $1)",
+    )
+    .bind(&org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count purged rows");
+    assert_eq!(counts, (0, 0, 0, 0, 0, 0, 0));
     assert_eq!(
         status(&pool, &org_id, &owner_id).await.unwrap().state,
         DeletionState::Completed
