@@ -245,8 +245,8 @@ struct ProjectTreeIds {
 }
 
 // Use opaque byte fixtures for every encrypted column: the purge only deletes ciphertext and must
-// never need to decrypt or interpret these values. Returning each id lets the assertions verify
-// every child table directly after its parent project has been removed.
+// never need to decrypt or interpret these values. Return the identifiers needed to assert project
+// and environment removal directly, plus the environment-linked secret and token rows.
 async fn seed_project_tree(pool: &PgPool, org_id: &str, owner_id: &str) -> ProjectTreeIds {
     let suffix = Uuid::new_v4().simple().to_string();
     let project_id = format!("deletion-project-{suffix}");
@@ -515,18 +515,20 @@ async fn concurrent_workers_claim_one_due_operation() {
     assert!(first.is_some() ^ second.is_some());
 
     let claimed = first.or(second).expect("one worker owns the lease");
-    let lease: (String, Option<String>) = sqlx::query_as(
-        "SELECT lease_owner, lease_expires_at::text FROM organization_deletions WHERE id = $1::uuid",
+    let lease: (String, bool) = sqlx::query_as(
+        "SELECT lease_owner, lease_expires_at > now() + interval '4 minutes' \
+         FROM organization_deletions WHERE id = $1::uuid",
     )
     .bind(&claimed.id)
     .fetch_one(&pool)
     .await
     .expect("read worker lease");
     assert_eq!(lease.0, claimed.worker_id);
-    assert!(lease.1.is_some());
+    assert!(lease.1);
 
-    // Expire the lease directly so the test covers replacement after a worker crash without
-    // waiting five minutes; the old compare-and-set result must then be discarded.
+    // The lease constraint requires lease_expires_at >= requested_at, so requested_at is the
+    // earliest valid value that is already expired. This covers replacement after a worker crash
+    // without waiting five minutes; the old compare-and-set result must then be discarded.
     sqlx::query(
         "UPDATE organization_deletions SET lease_expires_at = requested_at WHERE id = $1::uuid",
     )
