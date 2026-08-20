@@ -1303,7 +1303,8 @@ async fn retryable_provider_failure_exhausts_the_ladder() {
         .await
         .expect("claim billing")
         .expect("billing work is due");
-    sqlx::query("UPDATE organization_deletions SET attempt_count = 6 WHERE id = $1::uuid")
+    // The seventh claimed attempt is beyond the six-delay retry ladder.
+    sqlx::query("UPDATE organization_deletions SET attempt_count = 7 WHERE id = $1::uuid")
         .bind(&requested.id)
         .execute(&pool)
         .await
