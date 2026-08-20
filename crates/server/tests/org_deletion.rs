@@ -1271,6 +1271,18 @@ async fn retryable_provider_failure_schedules_the_next_attempt() {
     // The timestamp must be newly scheduled after the failure, not merely left over from the
     // requested-to-cancelling transition.
     assert_eq!(retry_state, (1, true, Some("rate_limit_error".into())));
+    // Make the scheduled retry due immediately so the next claim proves the counter advances.
+    sqlx::query("UPDATE organization_deletions SET next_attempt_at = now() WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+        .await
+        .expect("make scheduled retry due");
+    let retried_lease = claim_due(&pool, "retryable-provider-worker")
+        .await
+        .expect("claim scheduled retry")
+        .expect("scheduled retry is due");
+    assert_eq!(retried_lease.org_id, org_id);
+    assert_eq!(retried_lease.attempt_count, 2);
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
