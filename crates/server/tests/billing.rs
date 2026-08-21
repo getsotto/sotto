@@ -560,10 +560,13 @@ async fn webhooks_cannot_change_deleting_or_deleted_organisations() {
     .execute(&pool)
     .await
     .expect("clean lifecycle webhook watermarks");
-    sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id LIKE 'evt_lifecycle_%'")
-        .execute(&pool)
-        .await
-        .expect("clean lifecycle webhook receipts");
+    sqlx::query(
+        "DELETE FROM stripe_webhook_events \
+         WHERE event_id LIKE 'evt\\_lifecycle\\_%' ESCAPE '\\'",
+    )
+    .execute(&pool)
+    .await
+    .expect("clean lifecycle webhook receipts");
     seed_user(&pool, "billing-user-lifecycle").await;
     seed_org(
         &pool,
