@@ -22,8 +22,8 @@ use sotto_server::billing::{
 use sotto_server::db;
 use sotto_server::error::Error;
 use sotto_server::org_deletion::{
-    advance, cancel, claim_due, record_operator_observation, request, status, DeletionState,
-    OperatorObservation,
+    advance, cancel, claim_due, record_operator_observation, request, status, DeletionLease,
+    DeletionState, OperatorObservation,
 };
 
 // Keep one provider fake for ordinary outcomes and the in-flight cancellation race. The optional
@@ -236,6 +236,100 @@ async fn link_subscription(pool: &PgPool, org_id: &str) -> String {
     subscription_id
 }
 
+struct ProjectTreeIds {
+    project: String,
+    environment: String,
+    secret: String,
+    version: String,
+    machine_token: String,
+}
+
+// Use opaque byte fixtures for every encrypted column: the purge only deletes ciphertext and must
+// never need to decrypt or interpret these values. Return identifiers for the project tree so
+// assertions can verify its project, environment, secret, secret version and machine-token rows,
+// plus the environment-linked grants, after purging.
+async fn seed_project_tree(pool: &PgPool, org_id: &str, owner_id: &str) -> ProjectTreeIds {
+    let suffix = Uuid::new_v4().simple().to_string();
+    let project_id = format!("deletion-project-{suffix}");
+    let environment_id = format!("deletion-environment-{suffix}");
+    let secret_id = format!("deletion-secret-{suffix}");
+    let version_id = format!("deletion-secret-version-{suffix}");
+    let machine_token_id = format!("deletion-machine-token-{suffix}");
+    let token_hash = format!("token-hash-{suffix}");
+
+    sqlx::query("INSERT INTO projects (id, owner_id, enc_name, org_id) VALUES ($1, $2, $3, $4)")
+        .bind(&project_id)
+        .bind(owner_id)
+        .bind(b"project".as_slice())
+        .bind(org_id)
+        .execute(pool)
+        .await
+        .expect("insert project fixture");
+    sqlx::query("INSERT INTO environments (id, project_id, enc_name) VALUES ($1, $2, $3)")
+        .bind(&environment_id)
+        .bind(&project_id)
+        .bind(b"environment".as_slice())
+        .execute(pool)
+        .await
+        .expect("insert environment fixture");
+    sqlx::query(
+        "INSERT INTO secrets (id, env_id, enc_name, enc_value, enc_data_key, version) \
+         VALUES ($1, $2, $3, $4, $5, 1)",
+    )
+    .bind(&secret_id)
+    .bind(&environment_id)
+    .bind(b"secret".as_slice())
+    .bind(b"secret-value".as_slice())
+    .bind(b"data-key".as_slice())
+    .execute(pool)
+    .await
+    .expect("insert secret fixture");
+    sqlx::query(
+        "INSERT INTO secret_versions (id, secret_id, version, enc_name, enc_value, enc_data_key) \
+         VALUES ($1, $2, 1, $3, $4, $5)",
+    )
+    .bind(&version_id)
+    .bind(&secret_id)
+    .bind(b"secret".as_slice())
+    .bind(b"secret-value".as_slice())
+    .bind(b"data-key".as_slice())
+    .execute(pool)
+    .await
+    .expect("insert secret version fixture");
+    sqlx::query(
+        "INSERT INTO environment_grants (env_id, user_id, enc_vault_key, granted_by) \
+         VALUES ($1, $2, $3, $2)",
+    )
+    .bind(&environment_id)
+    .bind(owner_id)
+    .bind(b"sealed-vault-key".as_slice())
+    .execute(pool)
+    .await
+    .expect("insert environment grant fixture");
+    sqlx::query(
+        "INSERT INTO machine_tokens \
+         (id, env_id, name, token_hash, public_key, enc_vault_key, created_by) \
+         VALUES ($1, $2, 'deletion-test', $3, $4, $5, $6)",
+    )
+    .bind(&machine_token_id)
+    .bind(&environment_id)
+    .bind(token_hash.as_bytes())
+    .bind(b"public-key".as_slice())
+    .bind(b"sealed-token-vault-key".as_slice())
+    .bind(owner_id)
+    .execute(pool)
+    .await
+    .expect("insert machine token fixture");
+
+    ProjectTreeIds {
+        project: project_id,
+        environment: environment_id,
+        secret: secret_id,
+        version: version_id,
+        machine_token: machine_token_id,
+    }
+}
+
 async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
     sqlx::query("DELETE FROM organization_deletions WHERE org_id = $1")
         .bind(org_id)
@@ -252,6 +346,72 @@ async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
         .execute(pool)
         .await
         .expect("delete owner fixture");
+}
+
+async fn age_free_deletion(pool: &PgPool, operation_id: &str) {
+    // Age the fixture past retention while keeping the billing observation old enough to require
+    // the final freshness check, without making the test wait for the production window.
+    sqlx::query(
+        "UPDATE organization_deletions SET requested_at = now() - interval '31 days', \
+         purge_after = now() - interval '1 day', billing_checked_at = now() - interval '30 days' \
+         WHERE id = $1::uuid",
+    )
+    .bind(operation_id)
+    .execute(pool)
+    .await
+    .expect("age free deletion");
+}
+
+struct ReadyFreePurge {
+    org_id: String,
+    owner_id: String,
+    operation_id: String,
+    tree: ProjectTreeIds,
+    purge_lease: DeletionLease,
+}
+
+async fn ready_free_purge(pool: &PgPool, worker_id: &str) -> ReadyFreePurge {
+    let (org_id, owner_id) = seed_owner(pool).await;
+    let tree = seed_project_tree(pool, &org_id, &owner_id).await;
+    let requested = request(pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(pool, worker_id)
+        .await
+        .expect("claim requested work")
+        .expect("requested work is due");
+    advance(pool, &requested_lease, None)
+        .await
+        .expect("enter billing cancellation")
+        .expect("billing transition");
+    let billing_lease = claim_due(pool, worker_id)
+        .await
+        .expect("claim billing work")
+        .expect("billing work is due");
+    advance(pool, &billing_lease, None)
+        .await
+        .expect("confirm missing subscription")
+        .expect("retention transition");
+    age_free_deletion(pool, &requested.id).await;
+    let retention_lease = claim_due(pool, worker_id)
+        .await
+        .expect("claim retention work")
+        .expect("retention work is due");
+    advance(pool, &retention_lease, None)
+        .await
+        .expect("enter purge")
+        .expect("purge transition");
+    let purge_lease = claim_due(pool, worker_id)
+        .await
+        .expect("claim purge work")
+        .expect("purge work is due");
+    ReadyFreePurge {
+        org_id,
+        owner_id,
+        operation_id: requested.id,
+        tree,
+        purge_lease,
+    }
 }
 
 async fn assert_audit_actions(pool: &PgPool, org_id: &str, expected: &[&str]) {
@@ -374,12 +534,288 @@ async fn owner_requests_are_idempotent_and_cancellable() {
 }
 
 #[tokio::test]
+async fn owner_requests_converge_on_one_operation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+
+    let (first, second) = tokio::join!(
+        request(&pool, &org_id, &owner_id, &org_id),
+        request(&pool, &org_id, &owner_id, &org_id),
+    );
+    let first = first.expect("first concurrent request");
+    let second = second.expect("second concurrent request");
+    assert_eq!(first, second);
+
+    let active_operations: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM organization_deletions \
+         WHERE org_id = $1 AND state NOT IN ('cancelled', 'completed')",
+    )
+    .bind(&org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count active deletion operations");
+    assert_eq!(active_operations, 1);
+
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn worker_claims_are_exclusive_for_due_work() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+
+    let (first, second) = tokio::join!(
+        claim_due(&pool, "deletion-worker-a"),
+        claim_due(&pool, "deletion-worker-b"),
+    );
+    let first = first.expect("first worker claim");
+    let second = second.expect("second worker claim");
+    assert!(first.is_some() ^ second.is_some());
+
+    let claimed = first.or(second).expect("one worker owns the lease");
+    let lease: (String, bool) = sqlx::query_as(
+        "SELECT lease_owner, lease_expires_at > now() + interval '4 minutes' \
+         FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&claimed.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read worker lease");
+    assert_eq!(lease.0, claimed.worker_id);
+    assert!(lease.1);
+
+    // The lease constraint requires lease_expires_at >= requested_at, so requested_at is the
+    // earliest valid value that is already expired. This covers replacement after a worker crash
+    // without waiting five minutes; the old compare-and-set result must then be discarded.
+    sqlx::query(
+        "UPDATE organization_deletions SET lease_expires_at = requested_at WHERE id = $1::uuid",
+    )
+    .bind(&claimed.id)
+    .execute(&pool)
+    .await
+    .expect("expire worker lease");
+    let reclaimed = claim_due(&pool, "deletion-worker-c")
+        .await
+        .expect("reclaim expired lease")
+        .expect("expired work is reclaimable");
+    assert_eq!(reclaimed.worker_id, "deletion-worker-c");
+    assert!(advance(&pool, &claimed, None)
+        .await
+        .expect("discard stale worker result")
+        .is_none());
+    assert_eq!(
+        advance(&pool, &reclaimed, None)
+            .await
+            .expect("advance reclaimed work")
+            .expect("reclaimed transition")
+            .state,
+        DeletionState::CancellingBilling
+    );
+
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn paid_deletion_phases_have_exclusive_worker_claims() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let subscription_id = link_subscription(&pool, &org_id).await;
+    let provider = TestProvider::new(
+        [Ok(cancelled(&subscription_id))],
+        [Ok(cancelled(&subscription_id))],
+    );
+    let requested = request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+
+    let (first, second) = tokio::join!(
+        claim_due(&pool, "deletion-paid-worker-a"),
+        claim_due(&pool, "deletion-paid-worker-b"),
+    );
+    let first = first.expect("first requested claim");
+    let second = second.expect("second requested claim");
+    assert!(first.is_some() ^ second.is_some());
+    let requested_lease = first.or(second).expect("one worker owns requested work");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start billing cancellation")
+        .expect("billing transition");
+
+    let (first, second) = tokio::join!(
+        claim_due(&pool, "deletion-paid-worker-a"),
+        claim_due(&pool, "deletion-paid-worker-b"),
+    );
+    let first = first.expect("first billing claim");
+    let second = second.expect("second billing claim");
+    assert!(first.is_some() ^ second.is_some());
+    let billing_lease = first.or(second).expect("one worker owns billing work");
+    let retention = advance(&pool, &billing_lease, Some(&provider))
+        .await
+        .expect("cancel subscription")
+        .expect("retention transition");
+    assert_eq!(retention.state, DeletionState::Retention);
+    assert_eq!(provider.cancellation_calls(), 1);
+
+    // Move the retention deadline into the past so this database test exercises the worker path
+    // without waiting thirty days; production deadlines remain immutable after the request.
+    sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+        .await
+        .expect("make retention due");
+    let (first, second) = tokio::join!(
+        claim_due(&pool, "deletion-paid-worker-a"),
+        claim_due(&pool, "deletion-paid-worker-b"),
+    );
+    let first = first.expect("first retention claim");
+    let second = second.expect("second retention claim");
+    assert!(first.is_some() ^ second.is_some());
+    let retention_lease = first.or(second).expect("one worker owns retention work");
+    let purging = advance(&pool, &retention_lease, Some(&provider))
+        .await
+        .expect("reconcile terminal subscription")
+        .expect("purge transition");
+    assert_eq!(purging.state, DeletionState::Purging);
+    assert_eq!(provider.status_calls(), 1);
+
+    let (first, second) = tokio::join!(
+        claim_due(&pool, "deletion-paid-worker-a"),
+        claim_due(&pool, "deletion-paid-worker-b"),
+    );
+    let first = first.expect("first purge claim");
+    let second = second.expect("second purge claim");
+    assert!(first.is_some() ^ second.is_some());
+    let purge_lease = first.or(second).expect("one worker owns purge work");
+    let completed = advance(&pool, &purge_lease, None)
+        .await
+        .expect("purge organisation")
+        .expect("completed transition");
+    assert_eq!(completed.state, DeletionState::Completed);
+    assert_eq!(provider.cancellation_calls(), 1);
+    assert_eq!(provider.status_calls(), 1);
+
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn purge_rejects_changed_safety_preconditions() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    // Bind the text organisation id in every case: organizations.id and the deletion's org_id
+    // are text columns, while the operation's primary key is a UUID.
+    let cases = [
+        (
+            "organisation lifecycle",
+            "UPDATE organizations SET lifecycle_state = 'active' WHERE id = $1",
+        ),
+        (
+            "retention deadline",
+            "UPDATE organization_deletions SET purge_after = now() + interval '1 day' WHERE org_id = $1",
+        ),
+        (
+            "new subscription",
+            "UPDATE organizations SET stripe_subscription_id = 'sub-appeared' WHERE id = $1",
+        ),
+    ];
+    for (label, mutation) in cases {
+        let ReadyFreePurge {
+            org_id,
+            owner_id,
+            operation_id,
+            tree,
+            purge_lease,
+        } = ready_free_purge(&pool, &format!("purge-precondition-{label}")).await;
+        sqlx::query(mutation)
+            .bind(&org_id)
+            .execute(&pool)
+            .await
+            .expect("mutate purge precondition");
+        let failed = advance(&pool, &purge_lease, None)
+            .await
+            .expect("handle changed purge precondition")
+            .expect("failed purge transition");
+        assert_eq!(failed.state, DeletionState::Failed, "{label}");
+        let error_code: String = sqlx::query_scalar(
+            "SELECT last_error_code FROM organization_deletions WHERE id = $1::uuid",
+        )
+        .bind(&operation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read purge precondition failure");
+        assert_eq!(error_code, "purge_precondition_failed", "{label}");
+        let project_count: i64 = sqlx::query_scalar("SELECT count(*) FROM projects WHERE id = $1")
+            .bind(&tree.project)
+            .fetch_one(&pool)
+            .await
+            .expect("count retained project");
+        assert_eq!(project_count, 1, "{label}");
+        assert_audit_actions(&pool, &org_id, &["org.deletion.failed"]).await;
+        cleanup(&pool, &org_id, &owner_id).await;
+    }
+}
+
+#[tokio::test]
+async fn purge_rejects_subscription_different_from_snapshot() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let ReadyFreePurge {
+        org_id,
+        owner_id,
+        operation_id,
+        tree,
+        purge_lease,
+    } = ready_free_purge(&pool, "purge-precondition-snapshot").await;
+    sqlx::query(
+        "UPDATE organization_deletions SET subscription_id = 'sub-snapshot' WHERE id = $1::uuid",
+    )
+    .bind(&operation_id)
+    .execute(&pool)
+    .await
+    .expect("set subscription snapshot");
+    sqlx::query("UPDATE organizations SET stripe_subscription_id = 'sub-different' WHERE id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("set current subscription");
+    let failed = advance(&pool, &purge_lease, None)
+        .await
+        .expect("handle changed subscription")
+        .expect("failed purge transition");
+    assert_eq!(failed.state, DeletionState::Failed);
+    let project_count: i64 = sqlx::query_scalar("SELECT count(*) FROM projects WHERE id = $1")
+        .bind(&tree.project)
+        .fetch_one(&pool)
+        .await
+        .expect("count retained project");
+    assert_eq!(project_count, 1);
+    assert_audit_actions(&pool, &org_id, &["org.deletion.failed"]).await;
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
 async fn worker_reconciles_free_deletion_and_purges_tombstone() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
     let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
+    let tree = seed_project_tree(&pool, &org_id, &owner_id).await;
     let requested = request(&pool, &org_id, &owner_id, &org_id)
         .await
         .expect("request deletion");
@@ -406,15 +842,7 @@ async fn worker_reconciles_free_deletion_and_purges_tombstone() {
         .expect("retention transition");
     assert_eq!(retention.state, DeletionState::Retention);
 
-    sqlx::query(
-        "UPDATE organization_deletions SET requested_at = now() - interval '31 days', \
-         purge_after = now() - interval '1 day', billing_checked_at = now() - interval '30 days' \
-         WHERE id = $1::uuid",
-    )
-    .bind(&requested.id)
-    .execute(&pool)
-    .await
-    .expect("age retention operation");
+    age_free_deletion(&pool, &requested.id).await;
     let retention_lease = claim_due(&pool, "deletion-purge-worker")
         .await
         .expect("claim retention")
@@ -433,20 +861,104 @@ async fn worker_reconciles_free_deletion_and_purges_tombstone() {
         .await
         .expect("claim purge")
         .expect("purge is due");
+    let stale_purge_lease = purging_lease.clone();
     let completed = advance(&pool, &purging_lease, None)
         .await
         .expect("purge organisation")
         .expect("completed transition");
     assert_eq!(completed.state, DeletionState::Completed);
-    let tombstone: (String, bool, bool) = sqlx::query_as(
-        "SELECT lifecycle_state, enc_name IS NULL, stripe_subscription_id IS NULL \
-         FROM organizations WHERE id = $1",
+    assert!(advance(&pool, &stale_purge_lease, None)
+        .await
+        .expect("ignore repeated purge result")
+        .is_none());
+    let reuse = sqlx::query("INSERT INTO organizations (id, enc_name) VALUES ($1, $2)")
+        .bind(&org_id)
+        .bind(b"replacement".as_slice())
+        .execute(&pool)
+        .await;
+    assert!(
+        reuse.is_err(),
+        "a completed tombstone must reserve its identifier"
+    );
+    let tombstone: (
+        String,
+        bool,
+        bool,
+        bool,
+        String,
+        Option<String>,
+        Option<String>,
+        bool,
+    ) = sqlx::query_as(
+        "SELECT lifecycle_state, enc_name IS NULL, created_by IS NULL, \
+                    stripe_subscription_id IS NULL, tier, trial_ends_at::text, stripe_customer_id, \
+                    deleted_at IS NOT NULL \
+             FROM organizations WHERE id = $1",
     )
     .bind(&org_id)
     .fetch_one(&pool)
     .await
     .expect("read tombstone");
-    assert_eq!(tombstone, ("deleted".into(), true, true));
+    assert_eq!(
+        tombstone,
+        (
+            "deleted".into(),
+            true,
+            true,
+            true,
+            "free".into(),
+            None,
+            None,
+            true,
+        )
+    );
+    let project_count: i64 = sqlx::query_scalar("SELECT count(*) FROM projects WHERE id = $1")
+        .bind(&tree.project)
+        .fetch_one(&pool)
+        .await
+        .expect("count purged project");
+    assert_eq!(project_count, 0, "project should be purged");
+    let environment_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM environments WHERE id = $1")
+            .bind(&tree.environment)
+            .fetch_one(&pool)
+            .await
+            .expect("count purged environment");
+    assert_eq!(environment_count, 0, "environment should be purged");
+    let secret_count: i64 = sqlx::query_scalar("SELECT count(*) FROM secrets WHERE id = $1")
+        .bind(&tree.secret)
+        .fetch_one(&pool)
+        .await
+        .expect("count purged secret");
+    assert_eq!(secret_count, 0, "secret should be purged");
+    let version_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM secret_versions WHERE id = $1")
+            .bind(&tree.version)
+            .fetch_one(&pool)
+            .await
+            .expect("count purged secret version");
+    assert_eq!(version_count, 0, "secret version should be purged");
+    let grant_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM environment_grants WHERE env_id = $1")
+            .bind(&tree.environment)
+            .fetch_one(&pool)
+            .await
+            .expect("count purged environment grant");
+    assert_eq!(grant_count, 0, "environment grant should be purged");
+    let machine_token_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM machine_tokens WHERE id = $1")
+            .bind(&tree.machine_token)
+            .fetch_one(&pool)
+            .await
+            .expect("count purged machine token");
+    assert_eq!(machine_token_count, 0, "machine token should be purged");
+    let membership_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM organization_memberships WHERE org_id = $1")
+            .bind(&org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count purged membership");
+    assert_eq!(membership_count, 0, "membership should be purged");
     assert_eq!(
         status(&pool, &org_id, &owner_id).await.unwrap().state,
         DeletionState::Completed
@@ -778,6 +1290,77 @@ async fn retryable_provider_failure_schedules_the_next_attempt() {
     // The timestamp must be newly scheduled after the failure, not merely left over from the
     // requested-to-cancelling transition.
     assert_eq!(retry_state, (1, true, Some("rate_limit_error".into())));
+    // Make the scheduled retry due immediately so the next claim proves the counter advances.
+    sqlx::query("UPDATE organization_deletions SET next_attempt_at = now() WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+        .await
+        .expect("make scheduled retry due");
+    let retried_lease = claim_due(&pool, "retryable-provider-worker")
+        .await
+        .expect("claim scheduled retry")
+        .expect("scheduled retry is due");
+    assert_eq!(retried_lease.org_id, org_id);
+    assert_eq!(retried_lease.attempt_count, 2);
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn retryable_provider_failure_exhausts_the_ladder() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let _subscription_id = link_subscription(&pool, &org_id).await;
+    let provider = TestProvider::new(
+        [Err(ProviderError {
+            status: Some(500),
+            code: Some("api_error".into()),
+            kind: ProviderErrorKind::Retryable,
+        })],
+        [],
+    );
+    let requested = request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(&pool, "exhausted-provider-worker")
+        .await
+        .expect("claim requested")
+        .expect("requested work is due");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start billing cancellation")
+        .expect("billing transition");
+    let billing_lease = claim_due(&pool, "exhausted-provider-worker")
+        .await
+        .expect("claim billing")
+        .expect("billing work is due");
+    sqlx::query("UPDATE organization_deletions SET attempt_count = 7 WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+        .await
+        .expect("exhaust retry ladder");
+    // The seventh claimed attempt is beyond the six-delay retry ladder.
+    let exhausted_lease = DeletionLease {
+        attempt_count: 7,
+        ..billing_lease
+    };
+    let failed = advance(&pool, &exhausted_lease, Some(&provider))
+        .await
+        .expect("handle exhausted provider failure")
+        .expect("failed transition");
+    assert_eq!(failed.state, DeletionState::Failed);
+    let failure_state: (Option<String>, Option<String>, bool) = sqlx::query_as(
+        "SELECT next_attempt_at::text, last_error_code, resume_state IS NOT NULL \
+         FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&requested.id)
+    .fetch_one(&pool)
+    .await
+    .expect("read exhausted retry state");
+    assert_eq!(failure_state, (None, Some("api_error".into()), true));
+    assert_audit_actions(&pool, &org_id, &["org.deletion.failed"]).await;
     cleanup(&pool, &org_id, &owner_id).await;
 }
 
@@ -788,6 +1371,7 @@ async fn authentication_failure_fails_without_a_retry_schedule() {
     };
     let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
+    let tree = seed_project_tree(&pool, &org_id, &owner_id).await;
     let _subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
         [Err(ProviderError {
@@ -838,6 +1422,62 @@ async fn authentication_failure_fails_without_a_retry_schedule() {
     .expect("read authentication error code");
     assert_eq!(error_code, "billing_unavailable");
     assert_audit_actions(&pool, &org_id, &["org.deletion.failed"]).await;
+
+    let retained: (String, bool) = sqlx::query_as(
+        "SELECT lifecycle_state, enc_name IS NOT NULL FROM organizations WHERE id = $1",
+    )
+    .bind(&org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read retained organisation");
+    assert_eq!(retained, ("deleting".into(), true));
+    let project_count: i64 = sqlx::query_scalar("SELECT count(*) FROM projects WHERE id = $1")
+        .bind(&tree.project)
+        .fetch_one(&pool)
+        .await
+        .expect("count retained project");
+    assert_eq!(project_count, 1);
+    let environment_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM environments WHERE id = $1")
+            .bind(&tree.environment)
+            .fetch_one(&pool)
+            .await
+            .expect("count retained environment");
+    assert_eq!(environment_count, 1);
+    let secret_count: i64 = sqlx::query_scalar("SELECT count(*) FROM secrets WHERE id = $1")
+        .bind(&tree.secret)
+        .fetch_one(&pool)
+        .await
+        .expect("count retained secret");
+    assert_eq!(secret_count, 1);
+    let version_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM secret_versions WHERE id = $1")
+            .bind(&tree.version)
+            .fetch_one(&pool)
+            .await
+            .expect("count retained secret version");
+    assert_eq!(version_count, 1);
+    let grant_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM environment_grants WHERE env_id = $1")
+            .bind(&tree.environment)
+            .fetch_one(&pool)
+            .await
+            .expect("count retained environment grant");
+    assert_eq!(grant_count, 1);
+    let machine_token_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM machine_tokens WHERE id = $1")
+            .bind(&tree.machine_token)
+            .fetch_one(&pool)
+            .await
+            .expect("count retained machine token");
+    assert_eq!(machine_token_count, 1);
+    let membership_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM organization_memberships WHERE org_id = $1")
+            .bind(&org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count retained membership");
+    assert_eq!(membership_count, 1);
     cleanup(&pool, &org_id, &owner_id).await;
 }
 

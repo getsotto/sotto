@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use sotto_server::auth::session;
 use sotto_server::db;
+use sotto_server::org_deletion::{advance, claim_due, DeletionState};
 use sotto_server::state::AppState;
 
 async fn pool_or_skip() -> Option<PgPool> {
@@ -207,6 +208,93 @@ async fn owner_can_request_deletion_with_the_documented_status_shape() {
 }
 
 #[tokio::test]
+async fn owner_deletion_flow_is_idempotent_and_recoverable_over_http() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    let deletion_uri = format!("/orgs/{org_id}/deletion");
+    let confirmation = json!({
+        "confirm_org_id": org_id,
+        "acknowledge_subscription_cancellation": true
+    });
+
+    let (request_status, request_body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &deletion_uri,
+        Some(&token),
+        Some(confirmation.clone()),
+    )
+    .await;
+    assert_eq!(request_status, StatusCode::ACCEPTED);
+    let requested: Value = serde_json::from_str(&request_body).expect("request status JSON");
+    assert_eq!(requested["state"], "requested");
+
+    let (status_code, status_body) = send(
+        deletion_app(pool.clone()),
+        "GET",
+        &deletion_uri,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status_code, StatusCode::OK);
+    let status_response: Value = serde_json::from_str(&status_body).expect("status JSON");
+    assert_eq!(status_response, requested);
+
+    let cancel_uri = format!("{deletion_uri}/cancel");
+    let (cancel_status, cancel_body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &cancel_uri,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(cancel_status, StatusCode::ACCEPTED);
+    let recovering: Value = serde_json::from_str(&cancel_body).expect("recovery status JSON");
+    assert_eq!(recovering["state"], "recovering");
+
+    let (repeat_status, repeat_body) = send(
+        deletion_app(pool.clone()),
+        "POST",
+        &deletion_uri,
+        Some(&token),
+        Some(confirmation),
+    )
+    .await;
+    assert_eq!(repeat_status, StatusCode::ACCEPTED);
+    let repeated: Value = serde_json::from_str(&repeat_body).expect("repeat status JSON");
+    assert_eq!(repeated, recovering);
+
+    let lease = claim_due(&pool, "deletion-api-worker")
+        .await
+        .expect("claim recovery")
+        .expect("recovery is due");
+    assert_eq!(lease.org_id, org_id);
+    let recovered = advance(&pool, &lease, None)
+        .await
+        .expect("complete recovery")
+        .expect("recovery transition");
+    assert_eq!(recovered.state, DeletionState::Cancelled);
+    let (final_status, final_body) = send(
+        deletion_app(pool.clone()),
+        "GET",
+        &deletion_uri,
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(final_status, StatusCode::OK);
+    let cancelled: Value = serde_json::from_str(&final_body).expect("cancelled status JSON");
+    assert_eq!(cancelled["state"], "cancelled");
+
+    cleanup(&pool, &org_id, &[&owner_id]).await;
+}
+
+#[tokio::test]
 async fn owner_can_read_the_current_deletion_status() {
     let Some(pool) = pool_or_skip().await else {
         return;
@@ -230,7 +318,9 @@ async fn owner_can_read_the_current_deletion_status() {
         send(deletion_app(pool.clone()), "GET", &uri, Some(&token), None).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(status_body, requested_body);
+    let requested: Value = serde_json::from_str(&requested_body).expect("requested status JSON");
+    let status_response: Value = serde_json::from_str(&status_body).expect("status JSON");
+    assert_eq!(status_response, requested);
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
@@ -267,7 +357,10 @@ async fn repeated_deletion_request_returns_the_same_operation() {
 
     assert_eq!(first_status, StatusCode::ACCEPTED);
     assert_eq!(repeated_status, StatusCode::ACCEPTED);
-    assert_eq!(first_body, repeated_body);
+    let first_response: Value = serde_json::from_str(&first_body).expect("first status JSON");
+    let repeated_response: Value =
+        serde_json::from_str(&repeated_body).expect("repeated status JSON");
+    assert_eq!(first_response, repeated_response);
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
@@ -312,7 +405,10 @@ async fn owner_can_cancel_deletion_idempotently() {
 
     assert_eq!(first_status, StatusCode::ACCEPTED);
     assert_eq!(repeated_status, StatusCode::ACCEPTED);
-    assert_eq!(first_body, repeated_body);
+    let first_response: Value = serde_json::from_str(&first_body).expect("first cancellation JSON");
+    let repeated_response: Value =
+        serde_json::from_str(&repeated_body).expect("repeated cancellation JSON");
+    assert_eq!(first_response, repeated_response);
     let response: Value = serde_json::from_str(&first_body).expect("cancellation status JSON");
     assert_eq!(response["state"], "recovering");
     assert!(response["next_retry_at"].as_str().unwrap().ends_with('Z'));
@@ -780,8 +876,8 @@ async fn every_owner_can_read_and_repeat_completed_recovery() {
     )
     .await;
     let mut tx = pool.begin().await.expect("begin recovery fixture");
-    // Recovery completion is worker-owned; arranging it directly keeps this contract test away
-    // from the shared due-work queue used by the lifecycle suite.
+    // Arrange completion directly so this ownership contract focuses on a second owner's access
+    // to a completed recovery rather than worker scheduling.
     sqlx::query(
         "UPDATE organization_deletions SET state = 'cancelled', cancelled_at = now(), \
          next_attempt_at = NULL WHERE org_id = $1",
@@ -816,7 +912,9 @@ async fn every_owner_can_read_and_repeat_completed_recovery() {
 
     assert_eq!(read_status, StatusCode::OK);
     assert_eq!(cancel_status, StatusCode::ACCEPTED);
-    assert_eq!(read_body, cancel_body);
+    let read_response: Value = serde_json::from_str(&read_body).expect("owner status JSON");
+    let cancel_response: Value = serde_json::from_str(&cancel_body).expect("cancel status JSON");
+    assert_eq!(read_response, cancel_response);
     let response: Value = serde_json::from_str(&cancel_body).expect("cancelled status JSON");
     assert_eq!(response["state"], "cancelled");
 
