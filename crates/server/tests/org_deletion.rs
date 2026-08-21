@@ -349,8 +349,9 @@ async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
 }
 
 async fn age_deletion_for_purge(pool: &PgPool, operation_id: &str) {
-    // Age the fixture past retention while keeping the billing observation old enough to require
-    // the final freshness check, without making the test wait for the production window.
+    // Preserve production's immutable purge deadline while ageing the fixture past retention and
+    // keeping the billing observation old enough to require the final freshness check, without
+    // making the test wait for the production window.
     sqlx::query(
         "UPDATE organization_deletions SET requested_at = now() - interval '31 days', \
          purge_after = now() - interval '1 day', billing_checked_at = now() - interval '30 days' \
@@ -1055,8 +1056,8 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
         .await
         .expect("claim purge")
         .expect("purge is due");
-    // Keep the stale observation after the request so the migration's timestamp ordering remains
-    // valid while the purge freshness check still rejects it. Sixteen minutes is deliberately just
+    // Keep the provider observation just beyond the freshness bound while preserving the helper's
+    // production-ordered request and retention timestamps. Sixteen minutes is deliberately just
     // beyond the documented fifteen-minute freshness bound.
     sqlx::query(
         "UPDATE organization_deletions SET billing_checked_at = now() - interval '16 minutes' \
