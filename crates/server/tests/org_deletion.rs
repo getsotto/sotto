@@ -1313,6 +1313,10 @@ async fn retryable_provider_failure_exhausts_the_ladder() {
     let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let _subscription_id = link_subscription(&pool, &org_id).await;
+    // retry_delay_with_jitter adds hash % 30 seconds; keep the upper bound tied to that range
+    // and allow one second for the database read after scheduling.
+    const RETRY_JITTER_RANGE_SECONDS: i64 = 30;
+    const RETRY_QUERY_SLACK_SECONDS: i64 = 1;
     let provider = TestProvider::new(
         (1..=7).map(|attempt| {
             Err(ProviderError {
@@ -1339,7 +1343,8 @@ async fn retryable_provider_failure_exhausts_the_ladder() {
         .expect("claim billing")
         .expect("billing work is due");
 
-    // Advance the retry clock directly; production waits for each scheduled delay.
+    // Keep this table aligned with RETRY_DELAYS in src/org_deletion.rs. Advance the retry clock
+    // directly; production waits for each scheduled delay.
     for (attempt, base_delay_seconds) in [
         (1_i32, 60_i64),
         (2, 5 * 60),
@@ -1356,13 +1361,14 @@ async fn retryable_provider_failure_exhausts_the_ladder() {
         assert_eq!(retry.state, DeletionState::CancellingBilling);
         let retry_state: (i32, bool, bool, Option<String>) = sqlx::query_as(
             "SELECT attempt_count, \
-                    next_attempt_at > now() + (($2 - 30) * interval '1 second'), \
-                    next_attempt_at < now() + (($2 + 31) * interval '1 second'), \
+                    next_attempt_at > now() + ($2 * interval '1 second'), \
+                    next_attempt_at < now() + ($3 * interval '1 second'), \
                     last_error_code \
              FROM organization_deletions WHERE id = $1::uuid",
         )
         .bind(&requested.id)
-        .bind(base_delay_seconds)
+        .bind(base_delay_seconds - RETRY_QUERY_SLACK_SECONDS)
+        .bind(base_delay_seconds + RETRY_JITTER_RANGE_SECONDS + RETRY_QUERY_SLACK_SECONDS)
         .fetch_one(&pool)
         .await
         .expect("read retry ladder state");
