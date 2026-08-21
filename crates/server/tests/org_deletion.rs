@@ -1885,12 +1885,12 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
     .await
     .expect("record operator observation");
     assert_eq!(observed.state, DeletionState::Retention);
-    // Age the operator observation beyond the fifteen-minute freshness bound while making the
-    // retention work due, proving that an old manual result cannot unlock the purge.
+    age_deletion_for_purge(&pool, &requested.id).await;
+    // Override only the operator observation timestamp so the retention work is due while the
+    // helper keeps the request and purge deadline in production order.
     sqlx::query(
-        "UPDATE organization_deletions SET requested_at = now() - interval '1 hour', \
-         purge_after = now(), \
-         billing_checked_at = now() - interval '16 minutes' WHERE id = $1::uuid",
+        "UPDATE organization_deletions SET billing_checked_at = now() - interval '16 minutes' \
+         WHERE id = $1::uuid",
     )
     .bind(&requested.id)
     .execute(&pool)
