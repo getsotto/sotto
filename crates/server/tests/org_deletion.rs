@@ -348,9 +348,10 @@ async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
         .expect("delete owner fixture");
 }
 
-async fn age_free_deletion(pool: &PgPool, operation_id: &str) {
-    // Age the fixture past retention while keeping the billing observation old enough to require
-    // the final freshness check, without making the test wait for the production window.
+async fn age_deletion_for_purge(pool: &PgPool, operation_id: &str) {
+    // Preserve production's immutable purge deadline while ageing the fixture past retention and
+    // keeping the billing observation old enough to require the final freshness check, without
+    // making the test wait for the production window.
     sqlx::query(
         "UPDATE organization_deletions SET requested_at = now() - interval '31 days', \
          purge_after = now() - interval '1 day', billing_checked_at = now() - interval '30 days' \
@@ -359,7 +360,7 @@ async fn age_free_deletion(pool: &PgPool, operation_id: &str) {
     .bind(operation_id)
     .execute(pool)
     .await
-    .expect("age free deletion");
+    .expect("age deletion fixture");
 }
 
 struct ReadyFreePurge {
@@ -392,7 +393,7 @@ async fn ready_free_purge(pool: &PgPool, worker_id: &str) -> ReadyFreePurge {
         .await
         .expect("confirm missing subscription")
         .expect("retention transition");
-    age_free_deletion(pool, &requested.id).await;
+    age_deletion_for_purge(pool, &requested.id).await;
     let retention_lease = claim_due(pool, worker_id)
         .await
         .expect("claim retention work")
@@ -668,13 +669,7 @@ async fn paid_deletion_phases_have_exclusive_worker_claims() {
     assert_eq!(retention.state, DeletionState::Retention);
     assert_eq!(provider.cancellation_calls(), 1);
 
-    // Move the retention deadline into the past so this database test exercises the worker path
-    // without waiting thirty days; production deadlines remain immutable after the request.
-    sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
-        .bind(&requested.id)
-        .execute(&pool)
-        .await
-        .expect("make retention due");
+    age_deletion_for_purge(&pool, &requested.id).await;
     let (first, second) = tokio::join!(
         claim_due(&pool, "deletion-paid-worker-a"),
         claim_due(&pool, "deletion-paid-worker-b"),
@@ -842,7 +837,7 @@ async fn worker_reconciles_free_deletion_and_purges_tombstone() {
         .expect("retention transition");
     assert_eq!(retention.state, DeletionState::Retention);
 
-    age_free_deletion(&pool, &requested.id).await;
+    age_deletion_for_purge(&pool, &requested.id).await;
     let retention_lease = claim_due(&pool, "deletion-purge-worker")
         .await
         .expect("claim retention")
@@ -1023,13 +1018,7 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
             .expect("read reset attempts");
     assert_eq!(attempts, 0);
 
-    // Move the retention deadline into the past so the worker path can run without waiting thirty
-    // days in a database-backed test.
-    sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
-        .bind(&requested.id)
-        .execute(&pool)
-        .await
-        .expect("make retention due");
+    age_deletion_for_purge(&pool, &requested.id).await;
     let retention_lease = claim_due(&pool, "paid-deletion-worker")
         .await
         .expect("claim retention")
@@ -1051,11 +1040,7 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
     assert_eq!(provider.cancellation_calls(), 2);
 
     // Reconcile the cancellation before entering the purge state.
-    sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
-        .bind(&requested.id)
-        .execute(&pool)
-        .await
-        .expect("make reconciled retention due");
+    age_deletion_for_purge(&pool, &requested.id).await;
     let reconciled_retention_lease = claim_due(&pool, "paid-deletion-worker")
         .await
         .expect("claim reconciled retention")
@@ -1071,12 +1056,12 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
         .await
         .expect("claim purge")
         .expect("purge is due");
-    // Keep the stale observation after the request so the migration's timestamp ordering remains
-    // valid while the purge freshness check still rejects it. Sixteen minutes is deliberately just
+    // Keep the provider observation just beyond the freshness bound while preserving the helper's
+    // production-ordered request and retention timestamps. Sixteen minutes is deliberately just
     // beyond the documented fifteen-minute freshness bound.
     sqlx::query(
-        "UPDATE organization_deletions SET requested_at = now() - interval '1 hour', \
-         billing_checked_at = now() - interval '16 minutes' WHERE id = $1::uuid",
+        "UPDATE organization_deletions SET billing_checked_at = now() - interval '16 minutes' \
+         WHERE id = $1::uuid",
     )
     .bind(&requested.id)
     .execute(&pool)
@@ -1134,13 +1119,7 @@ async fn provider_missing_satisfies_the_retention_purge_gate() {
     assert_eq!(retention.state, DeletionState::Retention);
     assert_eq!(provider.cancellation_calls(), 1);
 
-    // Move the retention deadline into the past so the worker path can run without waiting thirty
-    // days in a database-backed test.
-    sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
-        .bind(&requested.id)
-        .execute(&pool)
-        .await
-        .expect("make retention due");
+    age_deletion_for_purge(&pool, &requested.id).await;
     let retention_lease = claim_due(&pool, "missing-subscription-worker")
         .await
         .expect("claim retention")
@@ -1208,13 +1187,7 @@ async fn unknown_provider_status_blocks_purge_and_schedules_retry() {
         .expect("cancel subscription")
         .expect("retention transition");
 
-    // Move the retention deadline into the past so the worker path can run without waiting thirty
-    // days in a database-backed test.
-    sqlx::query("UPDATE organization_deletions SET purge_after = now() WHERE id = $1::uuid")
-        .bind(&requested.id)
-        .execute(&pool)
-        .await
-        .expect("make retention due");
+    age_deletion_for_purge(&pool, &requested.id).await;
     let retention_lease = claim_due(&pool, "unknown-status-worker")
         .await
         .expect("claim retention")
@@ -1912,12 +1885,12 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
     .await
     .expect("record operator observation");
     assert_eq!(observed.state, DeletionState::Retention);
-    // Age the operator observation beyond the fifteen-minute freshness bound while making the
-    // retention work due, proving that an old manual result cannot unlock the purge.
+    age_deletion_for_purge(&pool, &requested.id).await;
+    // Override only the operator observation timestamp so the retention work is due while the
+    // helper keeps the request and purge deadline in production order.
     sqlx::query(
-        "UPDATE organization_deletions SET requested_at = now() - interval '1 hour', \
-         purge_after = now(), \
-         billing_checked_at = now() - interval '16 minutes' WHERE id = $1::uuid",
+        "UPDATE organization_deletions SET billing_checked_at = now() - interval '16 minutes' \
+         WHERE id = $1::uuid",
     )
     .bind(&requested.id)
     .execute(&pool)
