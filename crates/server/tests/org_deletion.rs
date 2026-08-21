@@ -1314,11 +1314,13 @@ async fn retryable_provider_failure_exhausts_the_ladder() {
     let (org_id, owner_id) = seed_owner(&pool).await;
     let _subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
-        [Err(ProviderError {
-            status: Some(500),
-            code: Some("api_error".into()),
-            kind: ProviderErrorKind::Retryable,
-        })],
+        (1..=7).map(|attempt| {
+            Err(ProviderError {
+                status: Some(500),
+                code: Some(format!("retry_attempt_{attempt}")),
+                kind: ProviderErrorKind::Retryable,
+            })
+        }),
         [],
     );
     let requested = request(&pool, &org_id, &owner_id, &org_id)
@@ -1332,21 +1334,66 @@ async fn retryable_provider_failure_exhausts_the_ladder() {
         .await
         .expect("start billing cancellation")
         .expect("billing transition");
-    let billing_lease = claim_due(&pool, "exhausted-provider-worker")
+    let mut lease = claim_due(&pool, "exhausted-provider-worker")
         .await
         .expect("claim billing")
         .expect("billing work is due");
-    sqlx::query("UPDATE organization_deletions SET attempt_count = 7 WHERE id = $1::uuid")
+
+    // Advance the retry clock directly; production waits for each scheduled delay.
+    for (attempt, base_delay_seconds) in [
+        (1_i32, 60_i64),
+        (2, 5 * 60),
+        (3, 30 * 60),
+        (4, 2 * 60 * 60),
+        (5, 6 * 60 * 60),
+        (6, 24 * 60 * 60),
+    ] {
+        assert_eq!(lease.attempt_count, attempt);
+        let retry = advance(&pool, &lease, Some(&provider))
+            .await
+            .expect("handle retryable provider failure")
+            .expect("retry transition");
+        assert_eq!(retry.state, DeletionState::CancellingBilling);
+        let retry_state: (i32, bool, bool, Option<String>) = sqlx::query_as(
+            "SELECT attempt_count, \
+                    next_attempt_at > now() + (($2 - 30) * interval '1 second'), \
+                    next_attempt_at < now() + (($2 + 31) * interval '1 second'), \
+                    last_error_code \
+             FROM organization_deletions WHERE id = $1::uuid",
+        )
+        .bind(&requested.id)
+        .bind(base_delay_seconds)
+        .fetch_one(&pool)
+        .await
+        .expect("read retry ladder state");
+        assert_eq!(retry_state.0, attempt);
+        assert!(retry_state.1, "retry {attempt} is too early");
+        assert!(retry_state.2, "retry {attempt} is too late");
+        assert_eq!(retry_state.3, Some(format!("retry_attempt_{attempt}")));
+
+        assert!(
+            claim_due(&pool, "exhausted-provider-worker")
+                .await
+                .expect("check retry due time")
+                .is_none(),
+            "retry {attempt} was claimable before its delay elapsed"
+        );
+        sqlx::query(
+            "UPDATE organization_deletions SET next_attempt_at = now() WHERE id = $1::uuid",
+        )
         .bind(&requested.id)
         .execute(&pool)
         .await
-        .expect("exhaust retry ladder");
+        .expect("make retry due");
+        lease = claim_due(&pool, "exhausted-provider-worker")
+            .await
+            .expect("claim next retry")
+            .expect("next retry is due");
+        assert_eq!(lease.attempt_count, attempt + 1);
+    }
+
     // The seventh claimed attempt is beyond the six-delay retry ladder.
-    let exhausted_lease = DeletionLease {
-        attempt_count: 7,
-        ..billing_lease
-    };
-    let failed = advance(&pool, &exhausted_lease, Some(&provider))
+    let failed = advance(&pool, &lease, Some(&provider))
         .await
         .expect("handle exhausted provider failure")
         .expect("failed transition");
@@ -1359,7 +1406,7 @@ async fn retryable_provider_failure_exhausts_the_ladder() {
     .fetch_one(&pool)
     .await
     .expect("read exhausted retry state");
-    assert_eq!(failure_state, (None, Some("api_error".into()), true));
+    assert_eq!(failure_state, (None, Some("retry_attempt_7".into()), true));
     assert_audit_actions(&pool, &org_id, &["org.deletion.failed"]).await;
     cleanup(&pool, &org_id, &owner_id).await;
 }
