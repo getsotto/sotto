@@ -171,16 +171,19 @@ fn parse_organisation_deletion_retention_days(value: Option<&str>) -> Result<i64
 /// Unlike optional URL settings, an empty recovery window must fail boot rather than hide a
 /// deployment policy error behind the 30-day default.
 fn organisation_deletion_retention_from_env() -> Result<i64> {
-    match std::env::var(ORGANISATION_DELETION_RETENTION_ENV) {
-        Ok(value) => organisation_deletion_retention_from_value(Some(value)),
-        Err(std::env::VarError::NotPresent) => organisation_deletion_retention_from_value(None),
-        Err(std::env::VarError::NotUnicode(_)) => Err(invalid_organisation_deletion_retention()),
-    }
+    organisation_deletion_retention_from_env_result(std::env::var(
+        ORGANISATION_DELETION_RETENTION_ENV,
+    ))
 }
 
-fn organisation_deletion_retention_from_value(value: Option<String>) -> Result<i64> {
-    let value = value.map(|value| value.trim().to_string());
-    parse_organisation_deletion_retention_days(value.as_deref())
+fn organisation_deletion_retention_from_env_result(
+    value: std::result::Result<String, std::env::VarError>,
+) -> Result<i64> {
+    match value {
+        Ok(value) => parse_organisation_deletion_retention_days(Some(value.trim())),
+        Err(std::env::VarError::NotPresent) => parse_organisation_deletion_retention_days(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(invalid_organisation_deletion_retention()),
+    }
 }
 
 fn invalid_organisation_deletion_retention() -> Error {
@@ -226,7 +229,7 @@ fn env_nonempty(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        billing_return_url, organisation_deletion_retention_from_value,
+        billing_return_url, organisation_deletion_retention_from_env_result,
         parse_organisation_deletion_retention_days, telemetry_ping_enabled,
         DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
     };
@@ -275,9 +278,26 @@ mod tests {
             assert!(parse_organisation_deletion_retention_days(Some(value)).is_err());
         }
         assert_eq!(
-            organisation_deletion_retention_from_value(None).unwrap(),
+            organisation_deletion_retention_from_env_result(Err(std::env::VarError::NotPresent,))
+                .unwrap(),
             DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS
         );
-        assert!(organisation_deletion_retention_from_value(Some("".into())).is_err());
+        assert_eq!(
+            organisation_deletion_retention_from_env_result(Ok(" 45 ".into())).unwrap(),
+            45
+        );
+        for value in ["", "  "] {
+            assert!(organisation_deletion_retention_from_env_result(Ok(value.into())).is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+
+            assert!(organisation_deletion_retention_from_env_result(Err(
+                std::env::VarError::NotUnicode(OsString::from_vec(vec![0xff])),
+            ))
+            .is_err());
+        }
     }
 }
