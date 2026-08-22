@@ -245,7 +245,7 @@ async fn configured_retention_applies_to_new_requests() {
     .fetch_one(&pool)
     .await
     .expect("read configured retention");
-    assert!((7 * 86_400..8 * 86_400).contains(&seconds));
+    assert_eq!(seconds, 7 * 86_400);
 
     let (repeated_status, _) = send(
         deletion_app_with_retention(pool.clone(), 14),
