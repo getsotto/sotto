@@ -30,6 +30,7 @@ fn app(pool: PgPool) -> Router {
         oauth: None,
         oauth_config: None,
         billing: None,
+        organisation_deletion_retention_days: 30,
     };
     Router::new()
         .merge(sotto_server::account::router())

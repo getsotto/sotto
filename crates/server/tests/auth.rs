@@ -50,6 +50,7 @@ fn app(pool: PgPool, identity: Identity) -> Router {
             web_origin: Some("https://app.sotto.test".into()),
         }),
         billing: None,
+        organisation_deletion_retention_days: 30,
     };
     Router::new().merge(auth::router()).with_state(state)
 }

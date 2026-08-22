@@ -19,11 +19,12 @@ use sotto_server::billing::{
     ProviderError, ProviderErrorKind, ProviderResult, SubscriptionObservation,
     SubscriptionProvider, SubscriptionSnapshot, SubscriptionStatus,
 };
+use sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS;
 use sotto_server::db;
-use sotto_server::error::Error;
+use sotto_server::error::{Error, Result};
 use sotto_server::org_deletion::{
-    advance, cancel, claim_due, record_operator_observation, request, status, DeletionLease,
-    DeletionState, OperatorObservation,
+    advance, cancel, claim_due, record_operator_observation, request_with_retention, status,
+    DeletionLease, DeletionState, OperatorObservation,
 };
 
 // Keep one provider fake for ordinary outcomes and the in-flight cancellation race. The optional
@@ -223,6 +224,22 @@ async fn seed_owner(pool: &PgPool) -> (String, String) {
     .await
     .expect("insert owner membership");
     (org_id, user_id)
+}
+
+async fn request(
+    pool: &PgPool,
+    org_id: &str,
+    actor: &str,
+    confirmation_org_id: &str,
+) -> Result<sotto_server::org_deletion::DeletionView> {
+    request_with_retention(
+        pool,
+        org_id,
+        actor,
+        confirmation_org_id,
+        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+    )
+    .await
 }
 
 async fn link_subscription(pool: &PgPool, org_id: &str) -> String {

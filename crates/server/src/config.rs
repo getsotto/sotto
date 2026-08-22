@@ -8,6 +8,9 @@ const DEFAULT_BIND: &str = "127.0.0.1:8080";
 const DEFAULT_PUBLIC_URL: &str = "http://localhost:8080";
 /// Default endpoint the anonymous version ping reports to (the hosted instance).
 const DEFAULT_TELEMETRY_URL: &str = "https://getsotto.co.uk/telemetry/v1/ping";
+/// Default recovery window for a new organisation-deletion request.
+pub const DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS: i64 = 30;
+const ORGANISATION_DELETION_RETENTION_ENV: &str = "SOTTO_ORGANISATION_DELETION_RETENTION_DAYS";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -21,6 +24,8 @@ pub struct Config {
     pub billing: Option<BillingConfig>,
     /// Anonymous version-ping telemetry (see [`crate::telemetry`] and the README).
     pub telemetry: TelemetryConfig,
+    /// Recovery window applied to new organisation-deletion requests.
+    pub organisation_deletion_retention_days: i64,
 }
 
 /// Anonymous version-ping telemetry settings (see [`crate::telemetry`]).
@@ -136,6 +141,7 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_TELEMETRY_URL.to_string()),
             ingest_enabled: env_nonempty("SOTTO_TELEMETRY_INGEST").as_deref() == Some("1"),
         };
+        let organisation_deletion_retention_days = organisation_deletion_retention_from_env()?;
 
         Ok(Self {
             database_url,
@@ -143,8 +149,44 @@ impl Config {
             oauth,
             billing,
             telemetry,
+            organisation_deletion_retention_days,
         })
     }
+}
+
+/// Parse the configurable recovery window while keeping a safe default for existing deployments.
+fn parse_organisation_deletion_retention_days(value: Option<&str>) -> Result<i64> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS);
+    };
+    let days = value
+        .parse::<i64>()
+        .ok()
+        .filter(|days| *days > 0)
+        .ok_or_else(invalid_organisation_deletion_retention)?;
+    Ok(days)
+}
+
+/// Read the retention setting without treating an explicitly empty value as an unset default.
+/// Unlike optional URL settings, an empty recovery window must fail boot rather than hide a
+/// deployment policy error behind the 30-day default.
+fn organisation_deletion_retention_from_env() -> Result<i64> {
+    match std::env::var(ORGANISATION_DELETION_RETENTION_ENV) {
+        Ok(value) => organisation_deletion_retention_from_value(Some(value)),
+        Err(std::env::VarError::NotPresent) => organisation_deletion_retention_from_value(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(invalid_organisation_deletion_retention()),
+    }
+}
+
+fn organisation_deletion_retention_from_value(value: Option<String>) -> Result<i64> {
+    let value = value.map(|value| value.trim().to_string());
+    parse_organisation_deletion_retention_days(value.as_deref())
+}
+
+fn invalid_organisation_deletion_retention() -> Error {
+    Error::Config(format!(
+        "{ORGANISATION_DELETION_RETENTION_ENV} must be a positive integer"
+    ))
 }
 
 /// Return users to the browser application's origin when it is deployed separately from the API.
@@ -183,7 +225,11 @@ fn env_nonempty(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{billing_return_url, telemetry_ping_enabled};
+    use super::{
+        billing_return_url, organisation_deletion_retention_from_value,
+        parse_organisation_deletion_retention_days, telemetry_ping_enabled,
+        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+    };
 
     #[test]
     fn billing_returns_to_the_web_origin_when_configured() {
@@ -213,5 +259,25 @@ mod tests {
         assert!(!telemetry_ping_enabled(None, Some("true")));
         // Opt-out beats an explicit opt-in - when signals disagree, privacy wins.
         assert!(!telemetry_ping_enabled(Some("on"), Some("1")));
+    }
+
+    #[test]
+    fn organisation_deletion_retention_defaults_and_rejects_invalid_values() {
+        assert_eq!(
+            parse_organisation_deletion_retention_days(None).unwrap(),
+            DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS
+        );
+        assert_eq!(
+            parse_organisation_deletion_retention_days(Some("45")).unwrap(),
+            45
+        );
+        for value in ["", "0", "-1", "thirty"] {
+            assert!(parse_organisation_deletion_retention_days(Some(value)).is_err());
+        }
+        assert_eq!(
+            organisation_deletion_retention_from_value(None).unwrap(),
+            DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS
+        );
+        assert!(organisation_deletion_retention_from_value(Some("".into())).is_err());
     }
 }

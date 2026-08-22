@@ -80,6 +80,7 @@ async fn run() -> Result<()> {
         oauth_config: config.oauth.clone(),
         billing,
         telemetry_ingest: config.telemetry.ingest_enabled,
+        organisation_deletion_retention_days: config.organisation_deletion_retention_days,
     };
 
     // Default-on telemetry must never be a surprise: say so at boot, with the off switch.
