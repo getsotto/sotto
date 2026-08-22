@@ -155,11 +155,13 @@ impl Config {
 }
 
 /// Parse the configurable recovery window while keeping a safe default for existing deployments.
+/// Whitespace around a present value is ignored before validating its positive integer form.
 fn parse_organisation_deletion_retention_days(value: Option<&str>) -> Result<i64> {
     let Some(value) = value else {
         return Ok(DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS);
     };
     let days = value
+        .trim()
         .parse::<i64>()
         .ok()
         .filter(|days| *days > 0)
@@ -167,20 +169,21 @@ fn parse_organisation_deletion_retention_days(value: Option<&str>) -> Result<i64
     Ok(days)
 }
 
-/// Read the retention setting without treating an explicitly empty value as an unset default.
-/// Unlike optional URL settings, an empty recovery window must fail boot rather than hide a
-/// deployment policy error behind the 30-day default.
+/// Read the retention setting from the process environment.
 fn organisation_deletion_retention_from_env() -> Result<i64> {
     organisation_deletion_retention_from_env_result(std::env::var(
         ORGANISATION_DELETION_RETENTION_ENV,
     ))
 }
 
+/// Preserve the distinction between an unset setting and an explicitly invalid value. Unlike
+/// optional URL settings, an empty recovery window must fail boot rather than hide a deployment
+/// policy error behind the 30-day default.
 fn organisation_deletion_retention_from_env_result(
     value: std::result::Result<String, std::env::VarError>,
 ) -> Result<i64> {
     match value {
-        Ok(value) => parse_organisation_deletion_retention_days(Some(value.trim())),
+        Ok(value) => parse_organisation_deletion_retention_days(Some(&value)),
         Err(std::env::VarError::NotPresent) => parse_organisation_deletion_retention_days(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(invalid_organisation_deletion_retention()),
     }
@@ -265,13 +268,13 @@ mod tests {
     }
 
     #[test]
-    fn organisation_deletion_retention_defaults_and_rejects_invalid_values() {
+    fn organisation_deletion_retention_config_covers_environment_and_parser() {
         assert_eq!(
             parse_organisation_deletion_retention_days(None).unwrap(),
             DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS
         );
         assert_eq!(
-            parse_organisation_deletion_retention_days(Some("45")).unwrap(),
+            parse_organisation_deletion_retention_days(Some(" 45 ")).unwrap(),
             45
         );
         for value in ["", "0", "-1", "thirty"] {
@@ -291,6 +294,7 @@ mod tests {
         }
         #[cfg(unix)]
         {
+            // Invalid bytes are constructible here; keep the NotUnicode branch covered locally.
             use std::ffi::OsString;
             use std::os::unix::ffi::OsStringExt;
 
