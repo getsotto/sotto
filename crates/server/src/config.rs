@@ -221,8 +221,8 @@ fn env_nonempty(name: &str) -> Option<String> {
 mod tests {
     use super::{
         billing_return_url, organisation_deletion_retention_from_value,
-        parse_organisation_deletion_retention_days,
-        telemetry_ping_enabled, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+        parse_organisation_deletion_retention_days, telemetry_ping_enabled,
+        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
     #[test]
