@@ -141,9 +141,7 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_TELEMETRY_URL.to_string()),
             ingest_enabled: env_nonempty("SOTTO_TELEMETRY_INGEST").as_deref() == Some("1"),
         };
-        let organisation_deletion_retention_days = parse_organisation_deletion_retention_days(
-            env_nonempty(ORGANISATION_DELETION_RETENTION_ENV).as_deref(),
-        )?;
+        let organisation_deletion_retention_days = organisation_deletion_retention_from_env()?;
 
         Ok(Self {
             database_url,
@@ -171,6 +169,18 @@ fn parse_organisation_deletion_retention_days(value: Option<&str>) -> Result<i64
             ))
         })?;
     Ok(days)
+}
+
+/// Read the retention setting without treating an explicitly empty value as an unset default.
+fn organisation_deletion_retention_from_env() -> Result<i64> {
+    organisation_deletion_retention_from_value(
+        std::env::var(ORGANISATION_DELETION_RETENTION_ENV).ok(),
+    )
+}
+
+fn organisation_deletion_retention_from_value(value: Option<String>) -> Result<i64> {
+    let value = value.map(|value| value.trim().to_string());
+    parse_organisation_deletion_retention_days(value.as_deref())
 }
 
 /// Return users to the browser application's origin when it is deployed separately from the API.
@@ -210,8 +220,9 @@ fn env_nonempty(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        billing_return_url, parse_organisation_deletion_retention_days, telemetry_ping_enabled,
-        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+        billing_return_url, organisation_deletion_retention_from_value,
+        parse_organisation_deletion_retention_days,
+        telemetry_ping_enabled, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
     #[test]
@@ -257,5 +268,10 @@ mod tests {
         for value in ["", "0", "-1", "thirty"] {
             assert!(parse_organisation_deletion_retention_days(Some(value)).is_err());
         }
+        assert_eq!(
+            organisation_deletion_retention_from_value(None).unwrap(),
+            DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS
+        );
+        assert!(organisation_deletion_retention_from_value(Some("".into())).is_err());
     }
 }
