@@ -50,7 +50,7 @@ The web image compiles the staged organisation-deletion control into the SPA. Ke
 recovery runbook have been enabled together. The default prebuilt images and source builds both
 keep the control unavailable; setting it to `true` is reserved for that final enablement.
 
-The staged deletion worker uses a 30-day recovery window by default. Set
+New staged deletion requests use a 30-day recovery window by default. Set
 `SOTTO_ORGANISATION_DELETION_RETENTION_DAYS` to a positive integer (number of days) in `deploy/.env` to
 change the window for new requests. Changing it never shortens an existing operation's stored
 `purge_after` deadline.

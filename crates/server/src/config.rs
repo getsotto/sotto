@@ -163,24 +163,28 @@ fn parse_organisation_deletion_retention_days(value: Option<&str>) -> Result<i64
         .parse::<i64>()
         .ok()
         .filter(|days| *days > 0)
-        .ok_or_else(|| {
-            Error::Config(format!(
-                "{ORGANISATION_DELETION_RETENTION_ENV} must be a positive integer"
-            ))
-        })?;
+        .ok_or_else(invalid_organisation_deletion_retention)?;
     Ok(days)
 }
 
 /// Read the retention setting without treating an explicitly empty value as an unset default.
 fn organisation_deletion_retention_from_env() -> Result<i64> {
-    organisation_deletion_retention_from_value(
-        std::env::var(ORGANISATION_DELETION_RETENTION_ENV).ok(),
-    )
+    match std::env::var(ORGANISATION_DELETION_RETENTION_ENV) {
+        Ok(value) => organisation_deletion_retention_from_value(Some(value)),
+        Err(std::env::VarError::NotPresent) => organisation_deletion_retention_from_value(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(invalid_organisation_deletion_retention()),
+    }
 }
 
 fn organisation_deletion_retention_from_value(value: Option<String>) -> Result<i64> {
     let value = value.map(|value| value.trim().to_string());
     parse_organisation_deletion_retention_days(value.as_deref())
+}
+
+fn invalid_organisation_deletion_retention() -> Error {
+    Error::Config(format!(
+        "{ORGANISATION_DELETION_RETENTION_ENV} must be a positive integer"
+    ))
 }
 
 /// Return users to the browser application's origin when it is deployed separately from the API.
