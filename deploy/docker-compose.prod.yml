@@ -53,7 +53,8 @@ services:
       # Anonymous daily version ping (random instance uuid + version + os/arch, nothing else -
       # README §Telemetry). On by default; set SOTTO_TELEMETRY=off in deploy/.env to opt out.
       SOTTO_TELEMETRY: ${SOTTO_TELEMETRY:-}
-      # Recovery window for new deletion requests; existing operations keep their stored deadline.
+      # Recovery window for new requests; match it to backup/export retention. Existing operations
+      # keep their stored deadline.
       # Use '-' rather than ':-' so an explicitly empty value reaches server validation.
       SOTTO_ORGANISATION_DELETION_RETENTION_DAYS: ${SOTTO_ORGANISATION_DELETION_RETENTION_DAYS-30}
     depends_on:

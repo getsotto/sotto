@@ -54,6 +54,8 @@ New staged deletion requests use a 30-day recovery window by default. Set
 `SOTTO_ORGANISATION_DELETION_RETENTION_DAYS` to a positive integer (number of days) in `deploy/.env` to
 change the window for new requests. Changing it never shortens an existing operation's stored
 `purge_after` deadline.
+Choose a value that covers the managed-backup and export lifecycle: backups taken before purge can
+retain ciphertext after the recovery window, and self-hosted operators must remove unmanaged copies.
 
 On a 1 GB host, give the kernel some headroom before the first start:
 
