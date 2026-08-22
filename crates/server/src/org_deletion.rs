@@ -13,7 +13,6 @@ use crate::audit;
 use crate::billing::{
     ProviderErrorKind, PurgeGate, SubscriptionObservation, SubscriptionProvider, SubscriptionStatus,
 };
-use crate::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS;
 use crate::error::{Error, Result};
 use crate::org::{self, LifecycleState, Role};
 
@@ -188,23 +187,6 @@ pub(crate) fn billing_transition(gate: PurgeGate) -> Option<DeletionState> {
         PurgeGate::Terminal | PurgeGate::Missing => Some(DeletionState::Retention),
         PurgeGate::Blocking | PurgeGate::Unknown => None,
     }
-}
-
-/// Accept one confirmed owner request, or return the existing active attempt.
-pub async fn request(
-    pool: &PgPool,
-    org_id: &str,
-    actor: &str,
-    confirmation_org_id: &str,
-) -> Result<DeletionView> {
-    request_with_retention(
-        pool,
-        org_id,
-        actor,
-        confirmation_org_id,
-        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
-    )
-    .await
 }
 
 /// Accept one confirmed owner request using the configured recovery window.
