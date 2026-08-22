@@ -17,7 +17,7 @@ use sotto_server::billing::{
     BillingState, ProviderResult, SubscriptionObservation, SubscriptionProvider,
     SubscriptionSnapshot, SubscriptionStatus, STRIPE_API_VERSION,
 };
-use sotto_server::config::BillingConfig;
+use sotto_server::config::{BillingConfig, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS};
 use sotto_server::db;
 use sotto_server::state::AppState;
 
@@ -44,7 +44,7 @@ fn app(pool: PgPool, configured: bool) -> Router {
                 return_url: "https://app.sotto.test".into(),
             })
         }),
-        organisation_deletion_retention_days: 30,
+        organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
     };
     Router::new()
         .merge(sotto_server::billing::router())
@@ -99,7 +99,7 @@ fn app_with_provider(pool: PgPool, provider: Arc<dyn SubscriptionProvider>) -> R
             WEBHOOK_SECRET.into(),
             "https://app.sotto.test".into(),
         )),
-        organisation_deletion_retention_days: 30,
+        organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
     };
     Router::new()
         .merge(sotto_server::billing::router())

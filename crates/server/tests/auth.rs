@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tower::ServiceExt;
 
 use sotto_server::auth::{self, session, Identity, OAuthProvider};
-use sotto_server::config::OAuthConfig;
+use sotto_server::config::{OAuthConfig, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS};
 use sotto_server::db;
 use sotto_server::error::Result;
 use sotto_server::state::AppState;
@@ -50,7 +50,7 @@ fn app(pool: PgPool, identity: Identity) -> Router {
             web_origin: Some("https://app.sotto.test".into()),
         }),
         billing: None,
-        organisation_deletion_retention_days: 30,
+        organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
     };
     Router::new().merge(auth::router()).with_state(state)
 }

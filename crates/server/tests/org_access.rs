@@ -13,6 +13,7 @@ use sqlx::PgPool;
 use tower::ServiceExt;
 
 use sotto_server::auth::session;
+use sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS;
 use sotto_server::db;
 use sotto_server::state::AppState;
 
@@ -37,7 +38,7 @@ fn app(pool: PgPool) -> Router {
                 return_url: "https://app.sotto.test".into(),
             },
         )),
-        organisation_deletion_retention_days: 30,
+        organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
     };
     sotto_server::app(state)
 }

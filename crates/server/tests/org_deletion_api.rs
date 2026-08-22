@@ -14,6 +14,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use sotto_server::auth::session;
+use sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS;
 use sotto_server::db;
 use sotto_server::org_deletion::{advance, claim_due, DeletionState};
 use sotto_server::state::AppState;
@@ -83,7 +84,7 @@ fn state_with_retention(pool: PgPool, retention_days: i64) -> AppState {
 }
 
 fn state(pool: PgPool) -> AppState {
-    state_with_retention(pool, 30)
+    state_with_retention(pool, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS)
 }
 
 fn deletion_app(pool: PgPool) -> Router {
