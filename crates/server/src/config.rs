@@ -168,6 +168,8 @@ fn parse_organisation_deletion_retention_days(value: Option<&str>) -> Result<i64
 }
 
 /// Read the retention setting without treating an explicitly empty value as an unset default.
+/// Unlike optional URL settings, an empty recovery window must fail boot rather than hide a
+/// deployment policy error behind the 30-day default.
 fn organisation_deletion_retention_from_env() -> Result<i64> {
     match std::env::var(ORGANISATION_DELETION_RETENTION_ENV) {
         Ok(value) => organisation_deletion_retention_from_value(Some(value)),
