@@ -550,7 +550,7 @@ async fn webhooks_cannot_change_deleting_or_deleted_organisations() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    // These fixed receipts and watermarks must be cleared before the test so a rerun cannot be
+    // These lifecycle receipts and watermarks must be cleared before the test so a rerun cannot be
     // acknowledged by deduplication without executing the lifecycle guards again.
     sqlx::query(
         "DELETE FROM stripe_subscription_watermarks \
@@ -561,9 +561,8 @@ async fn webhooks_cannot_change_deleting_or_deleted_organisations() {
     .await
     .expect("clean lifecycle webhook watermarks");
     sqlx::query(
-        "DELETE FROM stripe_webhook_events WHERE event_id IN (\
-         'evt_lifecycle_checkout', 'evt_lifecycle_updated', 'evt_lifecycle_deleted', \
-         'evt_lifecycle_late', 'evt_lifecycle_late_updated', 'evt_lifecycle_late_deleted')",
+        "DELETE FROM stripe_webhook_events \
+         WHERE event_id LIKE 'evt\\_lifecycle\\_%' ESCAPE '\\'",
     )
     .execute(&pool)
     .await
