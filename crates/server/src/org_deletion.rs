@@ -304,7 +304,7 @@ pub async fn request_with_retention(
         "INSERT INTO organization_deletions \
          (id, org_id, state, requested_by, requested_at, purge_after, subscription_id) \
          VALUES ($1::uuid, $2, 'requested', $3, now(), \
-                 now() + ($4::double precision * interval '1 day'), $5)",
+                 now() + ($4::bigint * interval '1 day'), $5)",
     )
     .bind(&id)
     .bind(org_id)
