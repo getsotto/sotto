@@ -37,6 +37,7 @@ fn app(pool: PgPool) -> Router {
                 return_url: "https://app.sotto.test".into(),
             },
         )),
+        organisation_deletion_retention_days: 30,
     };
     sotto_server::app(state)
 }

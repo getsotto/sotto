@@ -83,8 +83,14 @@ async fn request_deletion(
             "subscription cancellation acknowledgement is required".into(),
         ));
     }
-    let operation =
-        org_deletion::request(&state.pool, &org_id, &user.user_id, confirmation).await?;
+    let operation = org_deletion::request_with_retention(
+        &state.pool,
+        &org_id,
+        &user.user_id,
+        confirmation,
+        state.organisation_deletion_retention_days,
+    )
+    .await?;
     // Refetch the authorised operation by id so first and repeated requests share one projection;
     // a concurrent transition may update its state without changing terminal visibility here.
     let status = org_deletion::status_after_mutation(&state.pool, &operation).await?;

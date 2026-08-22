@@ -44,6 +44,7 @@ fn app(pool: PgPool, configured: bool) -> Router {
                 return_url: "https://app.sotto.test".into(),
             })
         }),
+        organisation_deletion_retention_days: 30,
     };
     Router::new()
         .merge(sotto_server::billing::router())
@@ -98,6 +99,7 @@ fn app_with_provider(pool: PgPool, provider: Arc<dyn SubscriptionProvider>) -> R
             WEBHOOK_SECRET.into(),
             "https://app.sotto.test".into(),
         )),
+        organisation_deletion_retention_days: 30,
     };
     Router::new()
         .merge(sotto_server::billing::router())

@@ -71,20 +71,31 @@ async fn clean_abandoned_fixtures(pool: &PgPool) {
         .expect("delete abandoned deletion users");
 }
 
-fn state(pool: PgPool) -> AppState {
+fn state_with_retention(pool: PgPool, retention_days: i64) -> AppState {
     AppState {
         telemetry_ingest: false,
         pool,
         oauth: None,
         oauth_config: None,
         billing: None,
+        organisation_deletion_retention_days: retention_days,
     }
+}
+
+fn state(pool: PgPool) -> AppState {
+    state_with_retention(pool, 30)
 }
 
 fn deletion_app(pool: PgPool) -> Router {
     Router::new()
         .merge(sotto_server::org_deletion_api::router())
         .with_state(state(pool))
+}
+
+fn deletion_app_with_retention(pool: PgPool, retention_days: i64) -> Router {
+    Router::new()
+        .merge(sotto_server::org_deletion_api::router())
+        .with_state(state_with_retention(pool, retention_days))
 }
 
 async fn seed_owner(pool: &PgPool) -> (String, String, String) {
@@ -204,6 +215,59 @@ async fn owner_can_request_deletion_with_the_documented_status_shape() {
     assert_eq!(response["next_retry_at"], Value::Null);
     assert_eq!(response["error"], Value::Null);
 
+    cleanup(&pool, &org_id, &[&owner_id]).await;
+}
+
+#[tokio::test]
+async fn configured_retention_applies_to_new_requests() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    let (status, _) = send(
+        deletion_app_with_retention(pool.clone(), 7),
+        "POST",
+        &format!("/orgs/{org_id}/deletion"),
+        Some(&token),
+        Some(json!({
+            "confirm_org_id": org_id,
+            "acknowledge_subscription_cancellation": true
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let seconds: i64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM purge_after - requested_at)::bigint \
+         FROM organization_deletions WHERE org_id = $1",
+    )
+    .bind(&org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read configured retention");
+    assert!((7 * 86_400..8 * 86_400).contains(&seconds));
+
+    let (repeated_status, _) = send(
+        deletion_app_with_retention(pool.clone(), 14),
+        "POST",
+        &format!("/orgs/{org_id}/deletion"),
+        Some(&token),
+        Some(json!({
+            "confirm_org_id": org_id,
+            "acknowledge_subscription_cancellation": true
+        })),
+    )
+    .await;
+    assert_eq!(repeated_status, StatusCode::ACCEPTED);
+    let repeated_seconds: i64 = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM purge_after - requested_at)::bigint \
+         FROM organization_deletions WHERE org_id = $1",
+    )
+    .bind(&org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read repeated configured retention");
+    assert_eq!(repeated_seconds, seconds);
     cleanup(&pool, &org_id, &[&owner_id]).await;
 }
 

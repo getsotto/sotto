@@ -13,6 +13,7 @@ use crate::audit;
 use crate::billing::{
     ProviderErrorKind, PurgeGate, SubscriptionObservation, SubscriptionProvider, SubscriptionStatus,
 };
+use crate::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS;
 use crate::error::{Error, Result};
 use crate::org::{self, LifecycleState, Role};
 
@@ -196,6 +197,29 @@ pub async fn request(
     actor: &str,
     confirmation_org_id: &str,
 ) -> Result<DeletionView> {
+    request_with_retention(
+        pool,
+        org_id,
+        actor,
+        confirmation_org_id,
+        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+    )
+    .await
+}
+
+/// Accept one confirmed owner request using the configured recovery window.
+pub async fn request_with_retention(
+    pool: &PgPool,
+    org_id: &str,
+    actor: &str,
+    confirmation_org_id: &str,
+    retention_days: i64,
+) -> Result<DeletionView> {
+    if retention_days <= 0 {
+        return Err(lifecycle_error(
+            "organisation deletion retention must be positive",
+        ));
+    }
     if confirmation_org_id != org_id {
         return Err(Error::BadRequest(
             "deletion confirmation does not match the organisation".into(),
@@ -297,11 +321,13 @@ pub async fn request(
     sqlx::query(
         "INSERT INTO organization_deletions \
          (id, org_id, state, requested_by, requested_at, purge_after, subscription_id) \
-         VALUES ($1::uuid, $2, 'requested', $3, now(), now() + interval '30 days', $4)",
+         VALUES ($1::uuid, $2, 'requested', $3, now(), \
+                 now() + ($4::double precision * interval '1 day'), $5)",
     )
     .bind(&id)
     .bind(org_id)
     .bind(actor)
+    .bind(retention_days)
     .bind(subscription_id)
     .execute(&mut *tx)
     .await?;
