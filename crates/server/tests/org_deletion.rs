@@ -612,8 +612,10 @@ async fn metrics_snapshot_reports_state_and_worker_outcomes() {
         .expect("claim request")
         .expect("request due");
     advance(&pool, &first, None).await.expect("advance request");
+    // Age both timestamps so the state-entry check remains valid while the alert window is tested.
     sqlx::query(
-        "UPDATE organization_deletions SET state_entered_at = now() - interval '2 days' \
+        "UPDATE organization_deletions SET requested_at = now() - interval '3 days', \
+         state_entered_at = now() - interval '2 days' \
          WHERE id = $1::uuid",
     )
     .bind(&first.id)
