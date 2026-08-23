@@ -34,6 +34,8 @@ pub mod org;
 pub mod org_deletion;
 #[doc(hidden)]
 pub mod org_deletion_api;
+// Metrics are staged until an authenticated exporter exists, so this internal snapshot is not a
+// stable public API yet.
 #[doc(hidden)]
 pub mod org_deletion_metrics;
 pub mod share;
