@@ -26,6 +26,7 @@ use sotto_server::org_deletion::{
     advance, cancel, claim_due, record_operator_observation, request_with_retention, status,
     DeletionLease, DeletionState, OperatorObservation,
 };
+use sotto_server::org_deletion_metrics::{self, snapshot};
 
 // Keep one provider fake for ordinary outcomes and the in-flight cancellation race. The optional
 // gate holds the provider call open until recovery commits, forcing the worker's stale
@@ -548,6 +549,68 @@ async fn owner_requests_are_idempotent_and_cancellable() {
         ],
     )
     .await;
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn metrics_snapshot_reports_state_and_worker_outcomes() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let before = snapshot(&pool).await.expect("read metrics before worker");
+    let before_missing = before
+        .counters
+        .iter()
+        .find(|counter| {
+            counter.metric == org_deletion_metrics::PROVIDER_CANCELLATION_ATTEMPTS
+                && counter.outcome == "missing"
+        })
+        .map_or(0, |counter| counter.value);
+
+    request_with_retention(
+        &pool,
+        &org_id,
+        &owner_id,
+        &org_id,
+        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+    )
+    .await
+    .expect("request deletion");
+    let state_metric = snapshot(&pool)
+        .await
+        .expect("read requested state metrics")
+        .states
+        .into_iter()
+        .find(|state| state.state == "requested")
+        .expect("requested metric");
+    assert!(state_metric.count >= 1);
+    assert!(state_metric.oldest_age_seconds >= 0);
+
+    let first = claim_due(&pool, "metrics-worker")
+        .await
+        .expect("claim request")
+        .expect("request due");
+    advance(&pool, &first, None).await.expect("advance request");
+    let second = claim_due(&pool, "metrics-worker")
+        .await
+        .expect("claim billing")
+        .expect("billing due");
+    advance(&pool, &second, None)
+        .await
+        .expect("record missing billing outcome");
+
+    let after = snapshot(&pool).await.expect("read metrics after worker");
+    let after_missing = after
+        .counters
+        .iter()
+        .find(|counter| {
+            counter.metric == org_deletion_metrics::PROVIDER_CANCELLATION_ATTEMPTS
+                && counter.outcome == "missing"
+        })
+        .map_or(0, |counter| counter.value);
+    assert_eq!(after_missing, before_missing + 1);
     cleanup(&pool, &org_id, &owner_id).await;
 }
 

@@ -15,6 +15,7 @@ use crate::billing::{
 };
 use crate::error::{Error, Result};
 use crate::org::{self, LifecycleState, Role};
+use crate::org_deletion_metrics as metrics;
 
 /// Keep corrupted lifecycle data on the internal-error path rather than treating it as client
 /// configuration or input.
@@ -542,8 +543,9 @@ pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<Deletion
     // Five-minute leases give another worker a bounded recovery window after a crash.
     // Failed rows stay out of this queue because an owner action or the deferred operator retry
     // command, not an automatic retry, must restore their recorded resume state.
-    let candidate: Option<String> = sqlx::query_scalar(
-        "SELECT id::text FROM organization_deletions \
+    let candidate: Option<(String, bool)> = sqlx::query_as(
+        "SELECT id::text, lease_expires_at IS NOT NULL AS was_expired \
+         FROM organization_deletions \
          WHERE (lease_expires_at IS NULL OR lease_expires_at <= now()) \
            AND (\
              (state = 'purging' AND purge_after <= now()) \
@@ -558,7 +560,7 @@ pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<Deletion
     )
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(id) = candidate else {
+    let Some((id, was_expired)) = candidate else {
         tx.commit().await?;
         return Ok(None);
     };
@@ -577,6 +579,9 @@ pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<Deletion
     .bind(&id)
     .fetch_one(&mut *tx)
     .await?;
+    if was_expired {
+        metrics::increment_tx(&mut tx, metrics::LEASE_EXPIRIES, "reclaimed").await?;
+    }
     tx.commit().await?;
     Ok(Some(DeletionLease {
         id,
@@ -626,6 +631,9 @@ async fn transition_state(
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
+    if row.is_none() {
+        metrics::increment_tx(&mut tx, metrics::STALE_COMPARE_AND_SET, "rejected").await?;
+    }
     tx.commit().await?;
     row.map(|row| view_from_row(&lease.id, row)).transpose()
 }
@@ -644,7 +652,7 @@ async fn advance_billing(
         };
     };
     let Some(provider) = provider else {
-        return fail_attempt(pool, lease, "billing_unavailable").await;
+        return fail_attempt(pool, lease, "billing_unavailable", None, None).await;
     };
     let observation = if recovering {
         provider.get_subscription(subscription_id).await
@@ -676,7 +684,7 @@ async fn advance_retention(
         if operator_observation_is_fresh(pool, lease).await? {
             return enter_purging(pool, lease).await;
         }
-        return fail_attempt(pool, lease, "billing_unavailable").await;
+        return fail_attempt(pool, lease, "billing_unavailable", None, None).await;
     };
     match provider.get_subscription(subscription_id).await {
         Ok(observation) => finish_retention_reconciliation(pool, lease, observation).await,
@@ -826,6 +834,8 @@ async fn finish_retention_reconciliation(
     let row: Option<(String, String)> = sqlx::query_as(
         "UPDATE organization_deletions SET state = $1, last_billing_state = $2, \
          attempt_count = 0, billing_checked_at = now(), billing_observation_source = 'provider', \
+         purge_started_at = CASE WHEN $1 = 'purging' THEN COALESCE(purge_started_at, now()) \
+                                 ELSE purge_started_at END, \
          next_attempt_at = CASE WHEN $3 THEN now() ELSE NULL END, \
          lease_owner = NULL, lease_expires_at = NULL, state_version = state_version + 1 \
          WHERE id = $4::uuid AND state_version = $5 AND lease_owner = $6 \
@@ -840,6 +850,16 @@ async fn finish_retention_reconciliation(
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
+    if row.is_some() {
+        metrics::increment_tx(
+            &mut tx,
+            metrics::PROVIDER_RECONCILIATION_ATTEMPTS,
+            billing_state_name(gate),
+        )
+        .await?;
+    } else {
+        metrics::increment_tx(&mut tx, metrics::STALE_COMPARE_AND_SET, "rejected").await?;
+    }
     if row.is_some() && state == DeletionState::Purging {
         audit::record_tx(
             &mut tx,
@@ -864,6 +884,7 @@ async fn enter_purging(pool: &PgPool, lease: &DeletionLease) -> Result<Option<De
     // rather than the thirty-day-old billing check that made the operation eligible for purge.
     let row: Option<(String, String)> = sqlx::query_as(
         "UPDATE organization_deletions SET state = 'purging', attempt_count = 0, \
+         purge_started_at = COALESCE(purge_started_at, now()), \
          billing_checked_at = CASE WHEN subscription_id IS NULL THEN now() ELSE billing_checked_at END, \
          next_attempt_at = NULL, \
          lease_owner = NULL, lease_expires_at = NULL, state_version = state_version + 1 \
@@ -888,6 +909,8 @@ async fn enter_purging(pool: &PgPool, lease: &DeletionLease) -> Result<Option<De
             },
         )
         .await?;
+    } else {
+        metrics::increment_tx(&mut tx, metrics::STALE_COMPARE_AND_SET, "rejected").await?;
     }
     tx.commit().await?;
     row.map(|row| view_from_row(&lease.id, row)).transpose()
@@ -919,6 +942,12 @@ async fn finish_billing(
         .fetch_optional(&mut *tx)
         .await?;
         if row.is_some() {
+            metrics::increment_tx(
+                &mut tx,
+                metrics::PROVIDER_CANCELLATION_ATTEMPTS,
+                billing_state,
+            )
+            .await?;
             audit::record_tx(
                 &mut tx,
                 &lease.org_id,
@@ -931,6 +960,8 @@ async fn finish_billing(
                 },
             )
             .await?;
+        } else {
+            metrics::increment_tx(&mut tx, metrics::STALE_COMPARE_AND_SET, "rejected").await?;
         }
         tx.commit().await?;
         return row.map(|row| view_from_row(&lease.id, row)).transpose();
@@ -988,6 +1019,12 @@ async fn finish_recovery(
     .fetch_optional(&mut *tx)
     .await?;
     if row.is_some() {
+        metrics::increment_tx(
+            &mut tx,
+            metrics::PROVIDER_RECONCILIATION_ATTEMPTS,
+            billing_state_name(gate),
+        )
+        .await?;
         sqlx::query(
             "UPDATE organizations SET lifecycle_state = 'active', tier = $1 \
              WHERE id = $2 AND lifecycle_state = 'deleting'",
@@ -1008,6 +1045,8 @@ async fn finish_recovery(
             },
         )
         .await?;
+    } else {
+        metrics::increment_tx(&mut tx, metrics::STALE_COMPARE_AND_SET, "rejected").await?;
     }
     tx.commit().await?;
     row.map(|row| view_from_row(&lease.id, row)).transpose()
@@ -1020,11 +1059,13 @@ async fn handle_provider_error(
     code: Option<String>,
 ) -> Result<Option<DeletionView>> {
     let authentication = matches!(&kind, ProviderErrorKind::Authentication);
+    let metric = provider_metric_for_state(lease.state);
+    let outcome = provider_error_outcome(&kind);
     match provider_retry_decision(kind, lease.attempt_count) {
         RetryDecision::Retry(_) => {
             let delay = retry_delay_with_jitter(&lease.id, lease.attempt_count)
                 .ok_or_else(|| lifecycle_error("retry delay unexpectedly exhausted"))?;
-            schedule_retry(pool, lease, code, delay).await
+            schedule_retry(pool, lease, code, delay, metric, Some(outcome)).await
         }
         RetryDecision::Failed => {
             let code = if authentication {
@@ -1032,8 +1073,31 @@ async fn handle_provider_error(
             } else {
                 code.as_deref().unwrap_or("provider_error")
             };
-            fail_attempt(pool, lease, code).await
+            fail_attempt(pool, lease, code, metric, Some(outcome)).await
         }
+    }
+}
+
+fn provider_metric_for_state(state: DeletionState) -> Option<&'static str> {
+    match state {
+        DeletionState::CancellingBilling => Some(metrics::PROVIDER_CANCELLATION_ATTEMPTS),
+        DeletionState::Retention | DeletionState::Recovering => {
+            Some(metrics::PROVIDER_RECONCILIATION_ATTEMPTS)
+        }
+        DeletionState::Requested
+        | DeletionState::Purging
+        | DeletionState::Failed
+        | DeletionState::Cancelled
+        | DeletionState::Completed => None,
+    }
+}
+
+fn provider_error_outcome(kind: &ProviderErrorKind) -> &'static str {
+    match kind {
+        ProviderErrorKind::Authentication => "authentication",
+        ProviderErrorKind::ResourceMissing => "resource_missing",
+        ProviderErrorKind::Retryable => "retryable",
+        ProviderErrorKind::Unknown => "unknown",
     }
 }
 
@@ -1042,6 +1106,8 @@ async fn schedule_retry(
     lease: &DeletionLease,
     code: Option<String>,
     delay: Duration,
+    metric: Option<&str>,
+    outcome: Option<&str>,
 ) -> Result<Option<DeletionView>> {
     let mut tx = pool.begin().await?;
     let row: Option<(String, String)> = sqlx::query_as(
@@ -1058,6 +1124,13 @@ async fn schedule_retry(
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
+    if row.is_some() {
+        if let (Some(metric), Some(outcome)) = (metric, outcome) {
+            metrics::increment_tx(&mut tx, metric, outcome).await?;
+        }
+    } else {
+        metrics::increment_tx(&mut tx, metrics::STALE_COMPARE_AND_SET, "rejected").await?;
+    }
     tx.commit().await?;
     row.map(|row| view_from_row(&lease.id, row)).transpose()
 }
@@ -1066,6 +1139,8 @@ async fn fail_attempt(
     pool: &PgPool,
     lease: &DeletionLease,
     code: &str,
+    metric: Option<&str>,
+    outcome: Option<&str>,
 ) -> Result<Option<DeletionView>> {
     let mut tx = pool.begin().await?;
     let row: Option<(String, String)> = sqlx::query_as(
@@ -1083,6 +1158,9 @@ async fn fail_attempt(
     .fetch_optional(&mut *tx)
     .await?;
     if row.is_some() {
+        if let (Some(metric), Some(outcome)) = (metric, outcome) {
+            metrics::increment_tx(&mut tx, metric, outcome).await?;
+        }
         audit::record_tx(
             &mut tx,
             &lease.org_id,
@@ -1095,6 +1173,8 @@ async fn fail_attempt(
             },
         )
         .await?;
+    } else {
+        metrics::increment_tx(&mut tx, metrics::STALE_COMPARE_AND_SET, "rejected").await?;
     }
     tx.commit().await?;
     row.map(|row| view_from_row(&lease.id, row)).transpose()
@@ -1165,6 +1245,7 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
         current_subscription,
     )) = row
     else {
+        metrics::increment_tx(&mut tx, metrics::STALE_COMPARE_AND_SET, "rejected").await?;
         tx.commit().await?;
         return Ok(None);
     };
@@ -1192,6 +1273,7 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(failed_org_id) = failed.as_deref() {
+            metrics::increment_tx(&mut tx, metrics::PURGE_ATTEMPTS, "failed").await?;
             audit::record_tx(
                 &mut tx,
                 failed_org_id,
@@ -1253,6 +1335,9 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
+    if completed.is_some() {
+        metrics::increment_tx(&mut tx, metrics::PURGE_ATTEMPTS, "completed").await?;
+    }
     tx.commit().await?;
     Ok(completed.map(|org_id| DeletionView {
         id: lease.id.clone(),
