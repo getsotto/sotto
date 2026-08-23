@@ -139,8 +139,8 @@ flowchart LR
 integer from 1 to 365 days and may be changed only through
 `SOTTO_ORGANISATION_DELETION_RETENTION_DAYS`. The organisation remains frozen for the whole
 configured window, and the value must match the managed-backup and export lifecycle. It must never
-shorten an operation already in progress. The setting applies only to new requests. Billing
-confirmation can delay purge beyond that date but can never bring it forward.
+be shortened for an operation already in progress. The setting applies only to new requests.
+Billing confirmation can delay purge beyond that date but can never bring it forward.
 
 Automatic provider retries use bounded exponential backoff with jitter: one minute, five minutes,
 30 minutes, two hours, six hours, and 24 hours. Exhaustion moves the operation to `failed` and
