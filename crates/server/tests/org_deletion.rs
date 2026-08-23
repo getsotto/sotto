@@ -560,14 +560,19 @@ async fn metrics_snapshot_reports_state_and_worker_outcomes() {
     let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
     let before = snapshot(&pool).await.expect("read metrics before worker");
-    let before_missing = before
+    let before_terminal = before
         .counters
         .iter()
         .find(|counter| {
             counter.metric == org_deletion_metrics::PROVIDER_CANCELLATION_ATTEMPTS
-                && counter.outcome == "missing"
+                && counter.outcome == "terminal"
         })
         .map_or(0, |counter| counter.value);
+    sqlx::query("UPDATE organizations SET stripe_subscription_id = 'sub-metrics' WHERE id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("link metrics subscription");
 
     request_with_retention(
         &pool,
@@ -597,20 +602,21 @@ async fn metrics_snapshot_reports_state_and_worker_outcomes() {
         .await
         .expect("claim billing")
         .expect("billing due");
-    advance(&pool, &second, None)
+    let provider = TestProvider::new([Ok(cancelled("sub-metrics"))], []);
+    advance(&pool, &second, Some(&provider))
         .await
-        .expect("record missing billing outcome");
+        .expect("record terminal billing outcome");
 
     let after = snapshot(&pool).await.expect("read metrics after worker");
-    let after_missing = after
+    let after_terminal = after
         .counters
         .iter()
         .find(|counter| {
             counter.metric == org_deletion_metrics::PROVIDER_CANCELLATION_ATTEMPTS
-                && counter.outcome == "missing"
+                && counter.outcome == "terminal"
         })
         .map_or(0, |counter| counter.value);
-    assert_eq!(after_missing, before_missing + 1);
+    assert_eq!(after_terminal, before_terminal + 1);
     cleanup(&pool, &org_id, &owner_id).await;
 }
 

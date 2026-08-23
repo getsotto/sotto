@@ -9,7 +9,7 @@ secret value is stored in a metric row.
 
 `organization_deletions` is the source for the current operation gauges:
 
-- `state` and `count(*)` show deletion attempts by lifecycle state;
+- `state` and `count(*)` show deletion attempts by every lifecycle state;
 - `requested_at` gives the age of the oldest operation in each non-terminal state;
 - `purge_started_at` and `completed_at` give completed purge duration.
 

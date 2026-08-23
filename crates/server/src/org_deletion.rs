@@ -850,14 +850,13 @@ async fn finish_retention_reconciliation(
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if row.is_some() {
-        metrics::increment_tx(
-            &mut tx,
-            metrics::PROVIDER_RECONCILIATION_ATTEMPTS,
-            billing_state_name(gate),
-        )
-        .await?;
-    } else {
+    metrics::increment_tx(
+        &mut tx,
+        metrics::PROVIDER_RECONCILIATION_ATTEMPTS,
+        billing_state_name(gate),
+    )
+    .await?;
+    if row.is_none() {
         metrics::increment_tx(&mut tx, metrics::STALE_COMPARE_AND_SET, "rejected").await?;
     }
     if row.is_some() && state == DeletionState::Purging {
@@ -941,13 +940,15 @@ async fn finish_billing(
         .bind(&lease.worker_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if row.is_some() {
+        if lease.subscription_id.is_some() {
             metrics::increment_tx(
                 &mut tx,
                 metrics::PROVIDER_CANCELLATION_ATTEMPTS,
                 billing_state,
             )
             .await?;
+        }
+        if row.is_some() {
             audit::record_tx(
                 &mut tx,
                 &lease.org_id,
@@ -1018,13 +1019,15 @@ async fn finish_recovery(
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if row.is_some() {
+    if lease.subscription_id.is_some() {
         metrics::increment_tx(
             &mut tx,
             metrics::PROVIDER_RECONCILIATION_ATTEMPTS,
             billing_state_name(gate),
         )
         .await?;
+    }
+    if row.is_some() {
         sqlx::query(
             "UPDATE organizations SET lifecycle_state = 'active', tier = $1 \
              WHERE id = $2 AND lifecycle_state = 'deleting'",
@@ -1124,11 +1127,10 @@ async fn schedule_retry(
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
-    if row.is_some() {
-        if let (Some(metric), Some(outcome)) = (metric, outcome) {
-            metrics::increment_tx(&mut tx, metric, outcome).await?;
-        }
-    } else {
+    if let (Some(metric), Some(outcome)) = (metric, outcome) {
+        metrics::increment_tx(&mut tx, metric, outcome).await?;
+    }
+    if row.is_none() {
         metrics::increment_tx(&mut tx, metrics::STALE_COMPARE_AND_SET, "rejected").await?;
     }
     tx.commit().await?;
@@ -1157,10 +1159,10 @@ async fn fail_attempt(
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
+    if let (Some(metric), Some(outcome)) = (metric, outcome) {
+        metrics::increment_tx(&mut tx, metric, outcome).await?;
+    }
     if row.is_some() {
-        if let (Some(metric), Some(outcome)) = (metric, outcome) {
-            metrics::increment_tx(&mut tx, metric, outcome).await?;
-        }
         audit::record_tx(
             &mut tx,
             &lease.org_id,

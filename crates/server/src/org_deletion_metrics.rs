@@ -9,37 +9,54 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::error::Result;
 
+/// Provider calls made while cancelling a linked subscription.
 pub const PROVIDER_CANCELLATION_ATTEMPTS: &str = "provider_cancellation_attempts";
+/// Provider status calls made while reconciling retention or recovery.
 pub const PROVIDER_RECONCILIATION_ATTEMPTS: &str = "provider_reconciliation_attempts";
+/// Due work reclaimed after another worker's lease expired.
 pub const LEASE_EXPIRIES: &str = "lease_expiries";
+/// Worker results rejected by a state-version or lease compare-and-set.
 pub const STALE_COMPARE_AND_SET: &str = "stale_compare_and_set";
+/// Final purge outcomes.
 pub const PURGE_ATTEMPTS: &str = "purge_attempts";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StateMetric {
+    /// The persisted lifecycle state.
     pub state: String,
+    /// Number of operations currently in this state.
     pub count: i64,
+    /// Age of the oldest non-terminal operation in seconds, or zero for terminal states.
     pub oldest_age_seconds: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CounterMetric {
+    /// The fixed operational metric name.
     pub metric: String,
+    /// The fixed, sanitised outcome label.
     pub outcome: String,
+    /// Monotonic counter value.
     pub value: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PurgeDurationMetric {
+    /// Number of completed purges with both timestamps present.
     pub count: i64,
+    /// Average completed purge duration in seconds.
     pub average_seconds: i64,
+    /// Longest completed purge duration in seconds.
     pub maximum_seconds: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeletionMetricsSnapshot {
+    /// Current counts and oldest ages by lifecycle state.
     pub states: Vec<StateMetric>,
+    /// Durable worker counters by metric and outcome.
     pub counters: Vec<CounterMetric>,
+    /// Aggregate duration of completed purges.
     pub purge_duration: PurgeDurationMetric,
 }
 
@@ -67,9 +84,10 @@ pub async fn increment_tx(
 pub async fn snapshot(pool: &PgPool) -> Result<DeletionMetricsSnapshot> {
     let states = sqlx::query_as::<_, (String, i64, i64)>(
         "SELECT state, count(*)::bigint, \
-                EXTRACT(EPOCH FROM (now() - min(requested_at)))::bigint \
+                CASE WHEN state NOT IN ('cancelled', 'completed') \
+                     THEN EXTRACT(EPOCH FROM (now() - min(requested_at)))::bigint \
+                     ELSE 0 END \
          FROM organization_deletions \
-         WHERE state NOT IN ('cancelled', 'completed') \
          GROUP BY state ORDER BY state",
     )
     .fetch_all(pool)
