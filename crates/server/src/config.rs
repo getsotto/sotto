@@ -10,6 +10,8 @@ const DEFAULT_PUBLIC_URL: &str = "http://localhost:8080";
 const DEFAULT_TELEMETRY_URL: &str = "https://getsotto.co.uk/telemetry/v1/ping";
 /// Default recovery window for a new organisation-deletion request.
 pub const DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS: i64 = 30;
+/// Maximum recovery window for a new organisation-deletion request.
+pub const MAX_ORGANISATION_DELETION_RETENTION_DAYS: i64 = 365;
 const ORGANISATION_DELETION_RETENTION_ENV: &str = "SOTTO_ORGANISATION_DELETION_RETENTION_DAYS";
 
 #[derive(Debug, Clone)]
@@ -164,7 +166,7 @@ fn parse_organisation_deletion_retention_days(value: Option<&str>) -> Result<i64
         .trim()
         .parse::<i64>()
         .ok()
-        .filter(|days| *days > 0)
+        .filter(|days| (1..=MAX_ORGANISATION_DELETION_RETENTION_DAYS).contains(days))
         .ok_or_else(invalid_organisation_deletion_retention)?;
     Ok(days)
 }
@@ -191,7 +193,7 @@ fn organisation_deletion_retention_from_env_result(
 
 fn invalid_organisation_deletion_retention() -> Error {
     Error::Config(format!(
-        "{ORGANISATION_DELETION_RETENTION_ENV} must be a positive integer"
+        "{ORGANISATION_DELETION_RETENTION_ENV} must be an integer between 1 and {MAX_ORGANISATION_DELETION_RETENTION_DAYS}"
     ))
 }
 
@@ -234,7 +236,7 @@ mod tests {
     use super::{
         billing_return_url, organisation_deletion_retention_from_env_result,
         parse_organisation_deletion_retention_days, telemetry_ping_enabled,
-        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
     #[test]
@@ -277,7 +279,11 @@ mod tests {
             parse_organisation_deletion_retention_days(Some(" 45 ")).unwrap(),
             45
         );
-        for value in ["", "0", "-1", "thirty"] {
+        assert_eq!(
+            parse_organisation_deletion_retention_days(Some("365")).unwrap(),
+            MAX_ORGANISATION_DELETION_RETENTION_DAYS
+        );
+        for value in ["", "0", "-1", "366", "thirty"] {
             assert!(parse_organisation_deletion_retention_days(Some(value)).is_err());
         }
         assert_eq!(
