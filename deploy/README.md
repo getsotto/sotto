@@ -169,6 +169,13 @@ docker compose -f docker-compose.prod.yml exec caddy \
 `https://<SOTTO_DOMAIN>/health` (e.g. a free UptimeRobot monitor, 5-minute interval, keyword
 `ok`). Alerting from *outside* the box is the point: a dead VM cannot report itself.
 
+## Organisation-deletion metrics
+
+The staged deletion worker stores aggregate lifecycle counters in Postgres. Their fixed vocabulary,
+alert conditions, and the boundary before a protected exporter is enabled are documented in
+[DELETION-METRICS.md](DELETION-METRICS.md). The deletion routes remain disabled until the complete
+enablement checklist has passed.
+
 ## Database security
 
 The default `docker-compose.prod.yml` keeps Postgres on the **internal compose network only** - it
