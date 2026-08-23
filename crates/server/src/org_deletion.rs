@@ -543,6 +543,8 @@ pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<Deletion
     // Five-minute leases give another worker a bounded recovery window after a crash.
     // Failed rows stay out of this queue because an owner action or the deferred operator retry
     // command, not an automatic retry, must restore their recorded resume state.
+    // The queue admits only unleased or already-expired leases, so a non-null lease here is
+    // necessarily expired and can be counted as reclaimed.
     let candidate: Option<(String, bool)> = sqlx::query_as(
         "SELECT id::text, lease_expires_at IS NOT NULL AS was_expired \
          FROM organization_deletions \
