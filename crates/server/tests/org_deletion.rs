@@ -568,6 +568,8 @@ async fn metrics_snapshot_reports_state_and_worker_outcomes() {
                 && counter.outcome == "terminal"
         })
         .map_or(0, |counter| counter.value);
+    // Force the paid cancellation path so this test proves a provider outcome counter, not just
+    // the free-organisation path that completes without an upstream call.
     sqlx::query("UPDATE organizations SET stripe_subscription_id = 'sub-metrics' WHERE id = $1")
         .bind(&org_id)
         .execute(&pool)

@@ -831,6 +831,8 @@ async fn finish_retention_reconciliation(
         }
     };
     let mut tx = pool.begin().await?;
+    // Keep the first purge transition so the metrics snapshot can measure duration across worker
+    // retries without allowing a later claim to reset the start time.
     let row: Option<(String, String)> = sqlx::query_as(
         "UPDATE organization_deletions SET state = $1, last_billing_state = $2, \
          attempt_count = 0, billing_checked_at = now(), billing_observation_source = 'provider', \
@@ -880,7 +882,8 @@ async fn enter_purging(pool: &PgPool, lease: &DeletionLease) -> Result<Option<De
     let mut tx = pool.begin().await?;
     // A deletion without a subscription was reconciled as missing before retention. Refresh that
     // observation when the retention window ends so the final purge gate measures this transition,
-    // rather than the thirty-day-old billing check that made the operation eligible for purge.
+    // rather than the thirty-day-old billing check that made the operation eligible for purge. The
+    // first purge timestamp is retained for duration metrics if a worker is replaced.
     let row: Option<(String, String)> = sqlx::query_as(
         "UPDATE organization_deletions SET state = 'purging', attempt_count = 0, \
          purge_started_at = COALESCE(purge_started_at, now()), \
