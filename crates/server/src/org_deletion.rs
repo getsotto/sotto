@@ -854,6 +854,8 @@ async fn finish_retention_reconciliation(
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
+    // Only provider-backed retention calls enter this function; count the observation even when
+    // the following state compare-and-set loses a race.
     metrics::increment_tx(
         &mut tx,
         metrics::PROVIDER_RECONCILIATION_ATTEMPTS,
@@ -945,6 +947,7 @@ async fn finish_billing(
         .bind(&lease.worker_id)
         .fetch_optional(&mut *tx)
         .await?;
+        // Free deletions bypass provider cancellation, so only linked subscriptions count here.
         if lease.subscription_id.is_some() {
             metrics::increment_tx(
                 &mut tx,
@@ -1024,6 +1027,7 @@ async fn finish_recovery(
     .bind(&lease.worker_id)
     .fetch_optional(&mut *tx)
     .await?;
+    // Recovery without a subscription uses a local missing observation, not a provider call.
     if lease.subscription_id.is_some() {
         metrics::increment_tx(
             &mut tx,
