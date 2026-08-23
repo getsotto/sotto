@@ -30,19 +30,15 @@ CREATE TABLE organization_deletion_metric_counters (
     ),
     CONSTRAINT organization_deletion_metric_outcome_check
         CHECK (
-            -- Blocking cancellation observations are retried as provider errors, not stored as a
-            -- blocking cancellation outcome.
             (metric = 'provider_cancellation_attempts'
                 AND outcome IN (
                     'terminal', 'missing', 'authentication', 'resource_missing', 'retryable', 'unknown'
                 ))
-            -- Retention and recovery reconcile blocking subscriptions before another cancellation.
             OR (metric = 'provider_reconciliation_attempts'
                 AND outcome IN (
                     'terminal', 'missing', 'blocking', 'authentication', 'resource_missing',
                     'retryable', 'unknown'
                 ))
-            -- These worker counters each have one deliberately bounded outcome label.
             OR (metric = 'lease_expiries' AND outcome = 'reclaimed')
             OR (metric = 'stale_compare_and_set' AND outcome = 'rejected')
             OR (metric = 'purge_attempts' AND outcome IN ('completed', 'failed'))
