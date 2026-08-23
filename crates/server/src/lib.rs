@@ -34,6 +34,8 @@ pub mod org;
 pub mod org_deletion;
 #[doc(hidden)]
 pub mod org_deletion_api;
+#[doc(hidden)]
+pub mod org_deletion_metrics;
 pub mod share;
 pub mod state;
 pub mod sync;
