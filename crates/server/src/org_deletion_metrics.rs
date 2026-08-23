@@ -26,7 +26,7 @@ pub struct StateMetric {
     pub state: String,
     /// Number of operations currently in this state.
     pub count: i64,
-    /// Age of the oldest non-terminal operation in seconds, or zero for terminal states.
+    /// Age of the oldest operation in its current non-terminal state, or zero for terminal states.
     pub oldest_age_seconds: i64,
 }
 
@@ -85,7 +85,7 @@ pub async fn snapshot(pool: &PgPool) -> Result<DeletionMetricsSnapshot> {
     let states = sqlx::query_as::<_, (String, i64, i64)>(
         "SELECT state, count(*)::bigint, \
                 CASE WHEN state NOT IN ('cancelled', 'completed') \
-                     THEN EXTRACT(EPOCH FROM (now() - min(requested_at)))::bigint \
+                     THEN EXTRACT(EPOCH FROM (now() - min(state_entered_at)))::bigint \
                      ELSE 0 END \
          FROM organization_deletions \
          GROUP BY state ORDER BY state",

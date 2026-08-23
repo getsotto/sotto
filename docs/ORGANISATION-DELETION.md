@@ -499,7 +499,8 @@ provider errors out of responses and persistent metadata.
 Required metrics:
 
 - deletion attempts by state;
-- age of the oldest operation in each non-terminal state;
+- age of the oldest operation in its current non-terminal state, measured from `state_entered_at`
+  and reset whenever the operation changes phase;
 - provider cancellation and reconciliation attempts by outcome;
 - lease expiry and stale compare-and-set counts;
 - purge duration and failures.

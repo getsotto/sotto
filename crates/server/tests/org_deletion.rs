@@ -612,6 +612,22 @@ async fn metrics_snapshot_reports_state_and_worker_outcomes() {
         .expect("claim request")
         .expect("request due");
     advance(&pool, &first, None).await.expect("advance request");
+    sqlx::query(
+        "UPDATE organization_deletions SET state_entered_at = now() - interval '2 days' \
+         WHERE id = $1::uuid",
+    )
+    .bind(&first.id)
+    .execute(&pool)
+    .await
+    .expect("age cancelling state");
+    let cancelling_age = snapshot(&pool)
+        .await
+        .expect("read cancelling state age")
+        .states
+        .into_iter()
+        .find(|state| state.state == "cancelling_billing")
+        .expect("cancelling metric");
+    assert!(cancelling_age.oldest_age_seconds >= 2 * 24 * 60 * 60 - 1);
     let second = claim_due(&pool, "metrics-worker")
         .await
         .expect("claim billing")
@@ -620,6 +636,14 @@ async fn metrics_snapshot_reports_state_and_worker_outcomes() {
     advance(&pool, &second, Some(&provider))
         .await
         .expect("record terminal billing outcome");
+    let retention_age = snapshot(&pool)
+        .await
+        .expect("read retention state age")
+        .states
+        .into_iter()
+        .find(|state| state.state == "retention")
+        .expect("retention metric");
+    assert!(retention_age.oldest_age_seconds < 60);
 
     let after = snapshot(&pool).await.expect("read metrics after worker");
     let after_terminal = after

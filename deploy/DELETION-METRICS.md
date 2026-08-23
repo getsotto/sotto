@@ -10,8 +10,11 @@ secret value is stored in a metric row.
 `organization_deletions` is the source for the current operation gauges:
 
 - `state` and `count(*)` show deletion attempts by every lifecycle state;
-- `requested_at` gives the age of the oldest operation in each non-terminal state;
+- `state_entered_at` gives the age of the oldest operation in each non-terminal state;
 - `purge_started_at` and `completed_at` give completed purge duration.
+
+`state_entered_at` is reset by the database whenever an operation changes phase, so a retry or
+provider reconciliation is measured from its current state rather than from the original request.
 
 `organization_deletion_metric_counters` stores these monotonic counters:
 
