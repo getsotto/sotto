@@ -366,6 +366,18 @@ async fn cleanup(pool: &PgPool, org_id: &str, user_id: &str) {
         .expect("delete owner fixture");
 }
 
+fn metric_value(
+    metrics: &org_deletion_metrics::DeletionMetricsSnapshot,
+    metric: &str,
+    outcome: &str,
+) -> i64 {
+    metrics
+        .counters
+        .iter()
+        .find(|counter| counter.metric == metric && counter.outcome == outcome)
+        .map_or(0, |counter| counter.value)
+}
+
 async fn age_deletion_for_purge(pool: &PgPool, operation_id: &str) {
     // Preserve production's immutable purge deadline while ageing the fixture past retention and
     // keeping the billing observation old enough to require the final freshness check, without
@@ -658,6 +670,7 @@ async fn worker_claims_are_exclusive_for_due_work() {
     };
     let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
+    let before = snapshot(&pool).await.expect("read metrics before claims");
     request(&pool, &org_id, &owner_id, &org_id)
         .await
         .expect("request deletion");
@@ -709,6 +722,23 @@ async fn worker_claims_are_exclusive_for_due_work() {
             .state,
         DeletionState::CancellingBilling
     );
+    let after = snapshot(&pool).await.expect("read metrics after claims");
+    assert_eq!(
+        metric_value(&after, org_deletion_metrics::LEASE_EXPIRIES, "reclaimed"),
+        metric_value(&before, org_deletion_metrics::LEASE_EXPIRIES, "reclaimed") + 1
+    );
+    assert_eq!(
+        metric_value(
+            &after,
+            org_deletion_metrics::STALE_COMPARE_AND_SET,
+            "rejected"
+        ),
+        metric_value(
+            &before,
+            org_deletion_metrics::STALE_COMPARE_AND_SET,
+            "rejected"
+        ) + 1
+    );
 
     cleanup(&pool, &org_id, &owner_id).await;
 }
@@ -720,6 +750,9 @@ async fn paid_deletion_phases_have_exclusive_worker_claims() {
     };
     let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id) = seed_owner(&pool).await;
+    let before = snapshot(&pool)
+        .await
+        .expect("read metrics before paid purge");
     let subscription_id = link_subscription(&pool, &org_id).await;
     let provider = TestProvider::new(
         [Ok(cancelled(&subscription_id))],
@@ -756,6 +789,21 @@ async fn paid_deletion_phases_have_exclusive_worker_claims() {
         .expect("retention transition");
     assert_eq!(retention.state, DeletionState::Retention);
     assert_eq!(provider.cancellation_calls(), 1);
+    let after_cancellation = snapshot(&pool)
+        .await
+        .expect("read metrics after cancellation");
+    assert_eq!(
+        metric_value(
+            &after_cancellation,
+            org_deletion_metrics::PROVIDER_CANCELLATION_ATTEMPTS,
+            "terminal"
+        ),
+        metric_value(
+            &before,
+            org_deletion_metrics::PROVIDER_CANCELLATION_ATTEMPTS,
+            "terminal"
+        ) + 1
+    );
 
     age_deletion_for_purge(&pool, &requested.id).await;
     let (first, second) = tokio::join!(
@@ -772,6 +820,21 @@ async fn paid_deletion_phases_have_exclusive_worker_claims() {
         .expect("purge transition");
     assert_eq!(purging.state, DeletionState::Purging);
     assert_eq!(provider.status_calls(), 1);
+    let after_reconciliation = snapshot(&pool)
+        .await
+        .expect("read metrics after reconciliation");
+    assert_eq!(
+        metric_value(
+            &after_reconciliation,
+            org_deletion_metrics::PROVIDER_RECONCILIATION_ATTEMPTS,
+            "terminal"
+        ),
+        metric_value(
+            &before,
+            org_deletion_metrics::PROVIDER_RECONCILIATION_ATTEMPTS,
+            "terminal"
+        ) + 1
+    );
 
     let (first, second) = tokio::join!(
         claim_due(&pool, "deletion-paid-worker-a"),
@@ -788,6 +851,93 @@ async fn paid_deletion_phases_have_exclusive_worker_claims() {
     assert_eq!(completed.state, DeletionState::Completed);
     assert_eq!(provider.cancellation_calls(), 1);
     assert_eq!(provider.status_calls(), 1);
+    let after = snapshot(&pool)
+        .await
+        .expect("read metrics after paid purge");
+    assert_eq!(
+        metric_value(&after, org_deletion_metrics::PURGE_ATTEMPTS, "completed"),
+        metric_value(&before, org_deletion_metrics::PURGE_ATTEMPTS, "completed") + 1
+    );
+    assert_eq!(after.purge_duration.count, before.purge_duration.count + 1);
+
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn purge_retry_preserves_started_at_and_records_outcomes() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let before = snapshot(&pool)
+        .await
+        .expect("read metrics before purge retry");
+    let ReadyFreePurge {
+        org_id,
+        owner_id,
+        operation_id,
+        purge_lease,
+        ..
+    } = ready_free_purge(&pool, "purge-retry-metrics").await;
+    let started_at: String = sqlx::query_scalar(
+        "SELECT purge_started_at::text FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read purge start time");
+
+    sqlx::query("UPDATE organizations SET lifecycle_state = 'active' WHERE id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("break purge precondition");
+    let failed = advance(&pool, &purge_lease, None)
+        .await
+        .expect("handle failed purge")
+        .expect("failed purge transition");
+    assert_eq!(failed.state, DeletionState::Failed);
+
+    sqlx::query("UPDATE organizations SET lifecycle_state = 'deleting' WHERE id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("restore deletion lifecycle");
+    request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request purge retry");
+    let retry_lease = claim_due(&pool, "purge-retry-metrics")
+        .await
+        .expect("claim purge retry")
+        .expect("purge retry is due");
+    let completed = advance(&pool, &retry_lease, None)
+        .await
+        .expect("complete retried purge")
+        .expect("completed purge transition");
+    assert_eq!(completed.state, DeletionState::Completed);
+
+    let (completed_started_at, completed_at): (String, String) = sqlx::query_as(
+        "SELECT purge_started_at::text, completed_at::text \
+         FROM organization_deletions WHERE id = $1::uuid",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read completed purge timestamps");
+    assert_eq!(completed_started_at, started_at);
+    assert!(!completed_at.is_empty());
+    let after = snapshot(&pool)
+        .await
+        .expect("read metrics after purge retry");
+    assert_eq!(
+        metric_value(&after, org_deletion_metrics::PURGE_ATTEMPTS, "failed"),
+        metric_value(&before, org_deletion_metrics::PURGE_ATTEMPTS, "failed") + 1
+    );
+    assert_eq!(
+        metric_value(&after, org_deletion_metrics::PURGE_ATTEMPTS, "completed"),
+        metric_value(&before, org_deletion_metrics::PURGE_ATTEMPTS, "completed") + 1
+    );
+    assert_eq!(after.purge_duration.count, before.purge_duration.count + 1);
 
     cleanup(&pool, &org_id, &owner_id).await;
 }
