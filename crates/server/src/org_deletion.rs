@@ -1329,8 +1329,9 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
         },
     )
     .await?;
+    // Use the wall clock after the purge deletes so duration metrics include this transaction's work.
     let completed: Option<String> = sqlx::query_scalar(
-        "UPDATE organization_deletions SET state = 'completed', completed_at = now(), \
+        "UPDATE organization_deletions SET state = 'completed', completed_at = clock_timestamp(), \
          lease_owner = NULL, lease_expires_at = NULL, state_version = state_version + 1 \
          WHERE id = $1::uuid AND state_version = $2 AND lease_owner = $3 \
          RETURNING org_id",
