@@ -504,6 +504,12 @@ Required metrics:
 - lease expiry and stale compare-and-set counts;
 - purge duration and failures.
 
+The staged implementation stores these metrics in PostgreSQL and keeps them separate from the
+organisation audit stream. See [deploy/DELETION-METRICS.md](../deploy/DELETION-METRICS.md) for the
+fixed counter vocabulary and alert conditions. The internal snapshot is not a public endpoint; the
+enablement change must put it behind an authenticated exporter before operators rely on a live
+dashboard.
+
 Alert when an operation reaches `failed`, remains in `cancelling_billing` beyond 24 hours, is due for
 purge but has not advanced, or loses repeated worker leases.
 
