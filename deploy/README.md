@@ -51,9 +51,9 @@ recovery runbook have been enabled together. The default prebuilt images and sou
 keep the control unavailable; setting it to `true` is reserved for that final enablement.
 
 New staged deletion requests use a 30-day recovery window by default. Set
-`SOTTO_ORGANISATION_DELETION_RETENTION_DAYS` to a positive integer (number of days) in `deploy/.env` to
-change the window for new requests. Changing it never shortens an existing operation's stored
-`purge_after` deadline.
+`SOTTO_ORGANISATION_DELETION_RETENTION_DAYS` to an integer from 1 to 365 in `deploy/.env` to change
+the window for new requests. The organisation stays frozen for the whole configured window.
+Changing it never shortens an existing operation's stored `purge_after` deadline.
 Choose a value that covers the managed-backup and export lifecycle: backups taken before purge can
 retain ciphertext after the recovery window, and self-hosted operators must remove unmanaged copies.
 

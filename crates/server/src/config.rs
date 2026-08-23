@@ -10,6 +10,9 @@ const DEFAULT_PUBLIC_URL: &str = "http://localhost:8080";
 const DEFAULT_TELEMETRY_URL: &str = "https://getsotto.co.uk/telemetry/v1/ping";
 /// Default recovery window for a new organisation-deletion request.
 pub const DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS: i64 = 30;
+/// Maximum recovery window for a new organisation-deletion request, preventing fat-fingered
+/// values from freezing an organisation for years while leaving room for long backup lifecycles.
+pub const MAX_ORGANISATION_DELETION_RETENTION_DAYS: i64 = 365;
 const ORGANISATION_DELETION_RETENTION_ENV: &str = "SOTTO_ORGANISATION_DELETION_RETENTION_DAYS";
 
 #[derive(Debug, Clone)]
@@ -155,7 +158,7 @@ impl Config {
 }
 
 /// Parse the configurable recovery window while keeping a safe default for existing deployments.
-/// Whitespace around a present value is ignored before validating its positive integer form.
+/// Whitespace around a present value is ignored before validating it against the accepted range.
 fn parse_organisation_deletion_retention_days(value: Option<&str>) -> Result<i64> {
     let Some(value) = value else {
         return Ok(DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS);
@@ -164,7 +167,7 @@ fn parse_organisation_deletion_retention_days(value: Option<&str>) -> Result<i64
         .trim()
         .parse::<i64>()
         .ok()
-        .filter(|days| *days > 0)
+        .filter(|days| (1..=MAX_ORGANISATION_DELETION_RETENTION_DAYS).contains(days))
         .ok_or_else(invalid_organisation_deletion_retention)?;
     Ok(days)
 }
@@ -191,7 +194,7 @@ fn organisation_deletion_retention_from_env_result(
 
 fn invalid_organisation_deletion_retention() -> Error {
     Error::Config(format!(
-        "{ORGANISATION_DELETION_RETENTION_ENV} must be a positive integer"
+        "{ORGANISATION_DELETION_RETENTION_ENV} must be an integer between 1 and {MAX_ORGANISATION_DELETION_RETENTION_DAYS}"
     ))
 }
 
@@ -234,7 +237,7 @@ mod tests {
     use super::{
         billing_return_url, organisation_deletion_retention_from_env_result,
         parse_organisation_deletion_retention_days, telemetry_ping_enabled,
-        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
     #[test]
@@ -277,9 +280,19 @@ mod tests {
             parse_organisation_deletion_retention_days(Some(" 45 ")).unwrap(),
             45
         );
-        for value in ["", "0", "-1", "thirty"] {
+        assert_eq!(
+            parse_organisation_deletion_retention_days(Some("365")).unwrap(),
+            MAX_ORGANISATION_DELETION_RETENTION_DAYS
+        );
+        assert_eq!(
+            parse_organisation_deletion_retention_days(Some("1")).unwrap(),
+            1
+        );
+        for value in ["", "0", "-1", "366", "thirty"] {
             assert!(parse_organisation_deletion_retention_days(Some(value)).is_err());
         }
+        let huge = i64::MAX.to_string();
+        assert!(parse_organisation_deletion_retention_days(Some(&huge)).is_err());
         assert_eq!(
             organisation_deletion_retention_from_env_result(Err(std::env::VarError::NotPresent,))
                 .unwrap(),
