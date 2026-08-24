@@ -24,7 +24,7 @@ pub fn spawn(pool: PgPool, provider: Option<Arc<dyn SubscriptionProvider>>) {
 }
 
 /// Claim and advance at most one due operation. This small seam keeps the loop testable and makes
-/// a database or provider error leave the lease for normal expiry rather than guessing a state.
+/// a database or internal error leaves the lease for normal expiry rather than guessing a state.
 pub async fn run_once(
     pool: &PgPool,
     worker_id: &str,
@@ -48,6 +48,8 @@ async fn run(pool: PgPool, worker_id: String, provider: Option<Arc<dyn Subscript
             }
             Ok(false) => tokio::time::sleep(POLL_INTERVAL).await,
             Err(error) => {
+                // Provider failures become lifecycle retries in advance; this arm covers database
+                // and internal errors that must leave the lease for expiry.
                 eprintln!("organisation deletion worker: {error}");
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
