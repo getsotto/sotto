@@ -42,6 +42,7 @@ base64 = "0.22"
 # (it has HMAC-SHA512-256). Both crates are already in the tree transitively via sqlx.
 hmac = "0.12"
 sha2 = "0.10"
+# Constant-time comparison for the protected metrics bearer token.
 subtle = "2"
 # Parse Stripe webhook events; also used by integration tests for response bodies.
 serde_json = "1"
