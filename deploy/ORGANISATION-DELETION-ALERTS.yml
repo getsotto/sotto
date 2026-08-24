@@ -1,5 +1,6 @@
 # Starter Prometheus rules for the protected organisation-deletion exporter.
 # Load these rules only when the scrape target is configured; tune notification routing per fleet.
+# Prometheus is the default format; adapt the expressions to another monitoring system as needed.
 
 groups:
   - name: sotto-organisation-deletion

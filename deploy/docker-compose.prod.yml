@@ -60,7 +60,7 @@ services:
       # Keep the worker off until the final enablement checklist is complete; only "1" starts it.
       # Use ':-' rather than '-' so an explicitly empty value stays disabled.
       SOTTO_ORGANISATION_DELETION_WORKER_ENABLED: ${SOTTO_ORGANISATION_DELETION_WORKER_ENABLED:-0}
-      # Keep the exporter dark until Prometheus is configured; never put this bearer token in logs.
+      # Keep the exporter dark until a metrics scraper is configured; never put this bearer token in logs.
       SOTTO_ORGANISATION_DELETION_METRICS_TOKEN: ${SOTTO_ORGANISATION_DELETION_METRICS_TOKEN:-}
     depends_on:
       postgres:
