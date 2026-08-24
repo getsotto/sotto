@@ -807,7 +807,12 @@ pub async fn record_operator_observation(
         ));
     }
     if state == DeletionState::Recovering.as_str()
-        || resume_state.as_deref() == Some(DeletionState::Recovering.as_str())
+        || matches!(
+            resume_state.as_deref(),
+            Some(value)
+                if value == DeletionState::Recovering.as_str()
+                    || value == DeletionState::Purging.as_str()
+        )
     {
         return Err(Error::Conflict(
             "organisation recovery is in progress".into(),

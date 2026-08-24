@@ -2220,8 +2220,35 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
     sqlx::query("UPDATE organization_deletions SET state = 'failed', resume_state = 'cancelling_billing' WHERE id = $1::uuid")
         .bind(&requested.id)
         .execute(&pool)
+    .await
+    .expect("restore failed state");
+    sqlx::query("UPDATE organization_deletions SET resume_state = 'purging' WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
         .await
-        .expect("restore failed state");
+        .expect("mark purge retry");
+    let purging_retry = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "canceled",
+            observed_at: observed_at.as_str(),
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
+        },
+    )
+    .await;
+    assert!(matches!(purging_retry, Err(Error::Conflict(_))));
+    sqlx::query(
+        "UPDATE organization_deletions SET resume_state = 'cancelling_billing' WHERE id = $1::uuid",
+    )
+    .bind(&requested.id)
+    .execute(&pool)
+    .await
+    .expect("restore billing retry");
 
     let malformed_time = record_operator_observation(
         &pool,
