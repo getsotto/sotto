@@ -73,6 +73,28 @@ pub struct DeletionMetricsSnapshot {
 
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 
+// Export every allowed pair, including zero-valued rows, so Prometheus range alerts see a series
+// before the first event for that pair.
+const FIXED_COUNTERS: &[(&str, &str)] = &[
+    (PROVIDER_CANCELLATION_ATTEMPTS, "terminal"),
+    (PROVIDER_CANCELLATION_ATTEMPTS, "missing"),
+    (PROVIDER_CANCELLATION_ATTEMPTS, "authentication"),
+    (PROVIDER_CANCELLATION_ATTEMPTS, "resource_missing"),
+    (PROVIDER_CANCELLATION_ATTEMPTS, "retryable"),
+    (PROVIDER_CANCELLATION_ATTEMPTS, "unknown"),
+    (PROVIDER_RECONCILIATION_ATTEMPTS, "terminal"),
+    (PROVIDER_RECONCILIATION_ATTEMPTS, "missing"),
+    (PROVIDER_RECONCILIATION_ATTEMPTS, "blocking"),
+    (PROVIDER_RECONCILIATION_ATTEMPTS, "authentication"),
+    (PROVIDER_RECONCILIATION_ATTEMPTS, "resource_missing"),
+    (PROVIDER_RECONCILIATION_ATTEMPTS, "retryable"),
+    (PROVIDER_RECONCILIATION_ATTEMPTS, "unknown"),
+    (LEASE_EXPIRIES, "reclaimed"),
+    (STALE_COMPARE_AND_SET, "rejected"),
+    (PURGE_ATTEMPTS, "completed"),
+    (PURGE_ATTEMPTS, "failed"),
+];
+
 /// Build the protected Prometheus scrape endpoint. It stays unavailable until an operator sets a
 /// dedicated bearer token, so adding the route cannot accidentally publish lifecycle data.
 pub fn router() -> Router<AppState> {
@@ -249,20 +271,14 @@ pub async fn snapshot(pool: &PgPool) -> Result<DeletionMetricsSnapshot> {
     })
     .collect();
 
-    let counters = sqlx::query_as::<_, (String, String, i64)>(
+    let counter_rows = sqlx::query_as::<_, (String, String, i64)>(
         "SELECT metric, outcome, value \
          FROM organization_deletion_metric_counters \
          ORDER BY metric, outcome",
     )
     .fetch_all(pool)
-    .await?
-    .into_iter()
-    .map(|(metric, outcome, value)| CounterMetric {
-        metric,
-        outcome,
-        value,
-    })
-    .collect();
+    .await?;
+    let counters = complete_counters(counter_rows);
 
     let (count, average_seconds, maximum_seconds): (i64, i64, i64) = sqlx::query_as(
         "SELECT count(*)::bigint, \
@@ -291,6 +307,20 @@ pub async fn snapshot(pool: &PgPool) -> Result<DeletionMetricsSnapshot> {
         },
         purge_due_count,
     })
+}
+
+fn complete_counters(rows: Vec<(String, String, i64)>) -> Vec<CounterMetric> {
+    FIXED_COUNTERS
+        .iter()
+        .map(|(metric, outcome)| CounterMetric {
+            metric: (*metric).into(),
+            outcome: (*outcome).into(),
+            value: rows
+                .iter()
+                .find(|(row_metric, row_outcome, _)| row_metric == metric && row_outcome == outcome)
+                .map_or(0, |(_, _, value)| *value),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -332,5 +362,12 @@ mod tests {
         assert!(token_matches("metrics-secret", "metrics-secret"));
         assert!(!token_matches("metrics-secret", "metrics-secret-extra"));
         assert!(!token_matches("metrics-secret", " metrics-secret"));
+    }
+
+    #[test]
+    fn missing_counter_rows_are_exported_as_zero() {
+        let counters = complete_counters(Vec::new());
+        assert_eq!(counters.len(), FIXED_COUNTERS.len());
+        assert!(counters.iter().all(|counter| counter.value == 0));
     }
 }
