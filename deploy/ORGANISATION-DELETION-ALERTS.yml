@@ -1,0 +1,54 @@
+# Starter Prometheus rules for the protected organisation-deletion exporter.
+# Load these rules only when the scrape target is configured; tune notification routing per fleet.
+# Prometheus is the default format; adapt the expressions to another monitoring system as needed.
+
+groups:
+  - name: sotto-organisation-deletion
+    rules:
+      - alert: SottoOrganisationDeletionFailed
+        expr: sotto_organisation_deletion_operations{state="failed"} > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Organisation deletion has failed
+          description: A deletion operation is waiting for an owner or operator action.
+
+      - alert: SottoOrganisationDeletionBillingStuck
+        expr: sotto_organisation_deletion_oldest_age_seconds{state="cancelling_billing"} > 86400
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Organisation deletion billing cancellation is stuck
+          description: Billing cancellation has remained in progress for more than 24 hours.
+
+      - alert: SottoOrganisationDeletionPurgeDue
+        expr: sotto_organisation_deletion_purge_due_count > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Organisation deletion is due for purge but has not advanced
+          description: A retention operation has passed its deadline without entering purging.
+
+      - alert: SottoOrganisationDeletionWorkerRaces
+        expr: >-
+          sum(increase(sotto_organisation_deletion_attempts_total{metric="lease_expiries", outcome="reclaimed"}[1h]))
+          + sum(increase(sotto_organisation_deletion_attempts_total{metric="stale_compare_and_set", outcome="rejected"}[1h])) > 3
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Organisation deletion workers are losing repeated races
+          description: Lease recovery or stale compare-and-set rejections are rising.
+
+      - alert: SottoOrganisationDeletionPurgeFailed
+        expr: >-
+          increase(sotto_organisation_deletion_attempts_total{metric="purge_attempts", outcome="failed"}[1h]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: Organisation deletion purge failed
+          description: A purge failed closed and requires the recovery runbook.

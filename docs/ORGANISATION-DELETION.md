@@ -505,19 +505,24 @@ Required metrics:
 - lease expiry and stale compare-and-set counts;
 - purge duration and failures.
 
-The staged implementation stores these metrics in PostgreSQL and keeps them separate from the
-organisation audit stream. See [deploy/DELETION-METRICS.md](../deploy/DELETION-METRICS.md) for the
-fixed counter vocabulary and alert conditions. The internal snapshot is not a public endpoint; the
-enablement change must put it behind an authenticated exporter before operators rely on a live
-dashboard.
+The staged implementation stores these metrics in Postgres and keeps them separate from the
+organisation audit stream. The protected Prometheus endpoint is
+`GET /ops/organisation-deletion/metrics`, authenticated by the dedicated
+`SOTTO_ORGANISATION_DELETION_METRICS_TOKEN`. See
+[deploy/DELETION-METRICS.md](../deploy/DELETION-METRICS.md) and
+[deploy/ORGANISATION-DELETION-ALERTS.yml](../deploy/ORGANISATION-DELETION-ALERTS.yml) for the
+scrape format, fixed counter vocabulary, and alert conditions. The endpoint does not enable the
+deletion routes or client control.
 
 Alert when an operation reaches `failed`, remains in `cancelling_billing` beyond 24 hours, is due for
 purge but has not advanced, or loses repeated worker leases.
 
-The runbook must cover inspecting a sanitised operation, retrying its recorded resume state,
-recording a fresh operator billing observation when provider credentials are unavailable,
-cancelling before purge, handling a failed purge, and the isolated restore procedure. No runbook
-command may skip the billing observation mechanism or directly delete an `organizations` row.
+The runbook in [deploy/ORGANISATION-DELETION-RUNBOOK.md](../deploy/ORGANISATION-DELETION-RUNBOOK.md)
+must cover inspecting a sanitised operation, retrying its recorded resume state, recording a fresh
+operator billing observation when provider credentials are unavailable, cancelling before purge,
+handling a failed purge, and the isolated restore procedure. No runbook command may skip the
+billing observation mechanism or directly delete an `organizations` row. The operator observation
+entrypoint and completed rehearsal record are prerequisites for final enablement.
 
 ## 11. Verification
 
@@ -611,8 +616,8 @@ Each item is an independently reviewable PR. The route remains absent through it
    control unavailable against production until enablement.
 7. **Tests:** add the cross-module concurrency, billing-race, complete-purge, recovery, and
    end-to-end suites after the underlying seams exist.
-8. **Operations:** add metrics, alerts, retention configuration, the backup/restore runbook, and a
-   rehearsed recovery record.
+8. **Operations:** add metrics, alerts, retention configuration, the protected exporter, the
+   backup/restore runbook, and a rehearsed recovery record.
 9. **Enablement:** register the routes, enable the client control, run the complete database,
    Playwright, and credentialed Stripe suites, then update public documentation.
 

@@ -51,6 +51,7 @@ fn app(pool: PgPool, identity: Identity) -> Router {
         }),
         billing: None,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+        organisation_deletion_metrics_token: None,
     };
     Router::new().merge(auth::router()).with_state(state)
 }

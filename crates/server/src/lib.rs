@@ -36,8 +36,7 @@ pub mod org_deletion;
 pub mod org_deletion_api;
 #[doc(hidden)]
 pub mod org_deletion_worker;
-// Metrics are staged until an authenticated exporter exists, so this internal snapshot is not a
-// stable public API yet.
+// Metrics stay behind their dedicated bearer token and remain separate from the user-facing API.
 #[doc(hidden)]
 pub mod org_deletion_metrics;
 pub mod share;
@@ -65,6 +64,7 @@ pub fn app(state: AppState) -> Router {
         .merge(sync::router())
         .merge(share::router())
         .merge(telemetry::router())
+        .merge(org_deletion_metrics::router())
         .with_state(state)
 }
 

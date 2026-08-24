@@ -244,6 +244,29 @@ async fn request(
     .await
 }
 
+async fn enter_retention(pool: &PgPool, org_id: &str, owner_id: &str, worker_id: &str) -> String {
+    let requested = request(pool, org_id, owner_id, org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(pool, worker_id)
+        .await
+        .expect("claim requested work")
+        .expect("requested work is due");
+    advance(pool, &requested_lease, None)
+        .await
+        .expect("advance requested work")
+        .expect("billing cancellation transition");
+    let billing_lease = claim_due(pool, worker_id)
+        .await
+        .expect("claim billing work")
+        .expect("billing work is due");
+    advance(pool, &billing_lease, None)
+        .await
+        .expect("advance billing work")
+        .expect("retention transition");
+    requested.id
+}
+
 async fn link_subscription(pool: &PgPool, org_id: &str) -> String {
     let subscription_id = format!("sub-deletion-{}", Uuid::new_v4().simple());
     sqlx::query("UPDATE organizations SET stripe_subscription_id = $2 WHERE id = $1")
@@ -659,6 +682,56 @@ async fn metrics_snapshot_reports_state_and_worker_outcomes() {
         .map_or(0, |counter| counter.value);
     assert_eq!(after_terminal, before_terminal + 1);
     cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn metrics_snapshot_counts_only_due_retention_operations() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let before = snapshot(&pool).await.expect("read metrics before fixtures");
+
+    let (due_org, due_owner) = seed_owner(&pool).await;
+    let due_operation = enter_retention(&pool, &due_org, &due_owner, "metrics-due-worker").await;
+    let (future_org, future_owner) = seed_owner(&pool).await;
+    let _future_operation =
+        enter_retention(&pool, &future_org, &future_owner, "metrics-future-worker").await;
+    let (purging_org, purging_owner) = seed_owner(&pool).await;
+    let purging_operation = enter_retention(
+        &pool,
+        &purging_org,
+        &purging_owner,
+        "metrics-purging-worker",
+    )
+    .await;
+
+    sqlx::query(
+        "UPDATE organization_deletions SET requested_at = now() - interval '2 days', \
+         purge_after = now() - interval '1 hour' \
+         WHERE id = $1::uuid",
+    )
+    .bind(&due_operation)
+    .execute(&pool)
+    .await
+    .expect("age due retention fixture");
+    // A purging operation may have an old deadline, but it is no longer waiting in retention.
+    sqlx::query(
+        "UPDATE organization_deletions SET state = 'purging', \
+         requested_at = now() - interval '2 days', purge_after = now() - interval '1 hour' \
+         WHERE id = $1::uuid",
+    )
+    .bind(&purging_operation)
+    .execute(&pool)
+    .await
+    .expect("move purging fixture");
+
+    let after = snapshot(&pool).await.expect("read metrics after fixtures");
+    assert_eq!(after.purge_due_count, before.purge_due_count + 1);
+
+    cleanup(&pool, &due_org, &due_owner).await;
+    cleanup(&pool, &future_org, &future_owner).await;
+    cleanup(&pool, &purging_org, &purging_owner).await;
 }
 
 #[tokio::test]
