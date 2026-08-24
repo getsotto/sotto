@@ -27,6 +27,7 @@ use sotto_server::org_deletion::{
     DeletionLease, DeletionState, OperatorObservation,
 };
 use sotto_server::org_deletion_metrics::{self, snapshot};
+use sotto_server::org_deletion_worker::run_once;
 
 // Keep one provider fake for ordinary outcomes and the in-flight cancellation race. The optional
 // gate holds the provider call open until recovery commits, forcing the worker's stale
@@ -657,6 +658,44 @@ async fn metrics_snapshot_reports_state_and_worker_outcomes() {
         })
         .map_or(0, |counter| counter.value);
     assert_eq!(after_terminal, before_terminal + 1);
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn worker_run_once_claims_and_advances_one_operation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+
+    assert!(run_once(&pool, "worker-run-once", None)
+        .await
+        .expect("advance requested operation"));
+    assert_eq!(
+        status(&pool, &org_id, &owner_id)
+            .await
+            .expect("read cancelling state")
+            .state,
+        DeletionState::CancellingBilling
+    );
+    assert!(run_once(&pool, "worker-run-once", None)
+        .await
+        .expect("advance free operation"));
+    assert_eq!(
+        status(&pool, &org_id, &owner_id)
+            .await
+            .expect("read retention state")
+            .state,
+        DeletionState::Retention
+    );
+    assert!(!run_once(&pool, "worker-run-once", None)
+        .await
+        .expect("leave retention work until its deadline"));
+
     cleanup(&pool, &org_id, &owner_id).await;
 }
 

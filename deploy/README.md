@@ -45,10 +45,11 @@ Database migrations run automatically on server boot. Pin a released version wit
 for unreleased changes, or if you'd rather not trust prebuilt images - use
 `up -d --build`; that needs ~4 GB of RAM and takes several minutes the first time.
 
-The web image compiles the staged organisation-deletion control into the SPA. Keep
-`VITE_ORGANISATION_DELETION_ENABLED=false` until the deletion routes, worker, monitoring, and
-recovery runbook have been enabled together. The default prebuilt images and source builds both
-keep the control unavailable; setting it to `true` is reserved for that final enablement.
+The server includes the staged organisation-deletion worker, but it is idle unless
+`SOTTO_ORGANISATION_DELETION_WORKER_ENABLED=1`. Keep that value at `0`, and keep
+`VITE_ORGANISATION_DELETION_ENABLED=false`, until the deletion routes, monitoring, and recovery
+runbook have been enabled together. The default prebuilt images and source builds keep both sides
+unavailable; changing either value is reserved for the final enablement.
 
 New staged deletion requests use a 30-day recovery window by default. Set
 `SOTTO_ORGANISATION_DELETION_RETENTION_DAYS` to an integer from 1 to 365 in `deploy/.env` to change

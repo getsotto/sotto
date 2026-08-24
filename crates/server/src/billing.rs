@@ -239,6 +239,11 @@ pub struct BillingState {
 }
 
 impl BillingState {
+    /// Share the provider with the deletion worker without exposing billing credentials.
+    pub fn provider(&self) -> Arc<dyn SubscriptionProvider> {
+        Arc::clone(&self.provider)
+    }
+
     pub fn from_config(config: BillingConfig) -> Self {
         let provider = StripeBilling {
             api_key: config.api_key.clone(),

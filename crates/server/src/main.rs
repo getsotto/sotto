@@ -73,6 +73,8 @@ async fn run() -> Result<()> {
             BillingState::from_config(billing)
         }
     });
+    // AppState owns billing; keep only the provider handle for the optional worker.
+    let worker_provider = billing.as_ref().map(BillingState::provider);
 
     let state = AppState {
         pool: pool.clone(),
@@ -89,6 +91,9 @@ async fn run() -> Result<()> {
             "telemetry: daily anonymous version ping is on (random instance uuid + version + \
              os/arch, nothing else) - set SOTTO_TELEMETRY=off to disable; see README §Telemetry"
         );
+    }
+    if config.organisation_deletion_worker_enabled {
+        sotto_server::org_deletion_worker::spawn(pool.clone(), worker_provider);
     }
     sotto_server::telemetry::spawn(pool, config.telemetry.clone());
 

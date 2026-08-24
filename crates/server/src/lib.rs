@@ -27,13 +27,15 @@ pub mod entitlements;
 pub mod error;
 pub mod machine;
 pub mod org;
-// The lifecycle seam and HTTP adapter are staged before their worker loop and production routes
-// are enabled. They remain doc-hidden so tests can exercise the complete boundary without
-// presenting deletion as a stable public API.
+// The lifecycle seam, HTTP adapter, and worker are staged before production enablement. They
+// remain doc-hidden so tests can exercise the complete boundary without presenting deletion as a
+// stable public API.
 #[doc(hidden)]
 pub mod org_deletion;
 #[doc(hidden)]
 pub mod org_deletion_api;
+#[doc(hidden)]
+pub mod org_deletion_worker;
 // Metrics are staged until an authenticated exporter exists, so this internal snapshot is not a
 // stable public API yet.
 #[doc(hidden)]

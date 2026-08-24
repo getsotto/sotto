@@ -57,6 +57,9 @@ services:
       # operations keep their stored deadline. The organisation stays frozen for the whole window.
       # Use '-' rather than ':-' so an explicitly empty value reaches server validation.
       SOTTO_ORGANISATION_DELETION_RETENTION_DAYS: ${SOTTO_ORGANISATION_DELETION_RETENTION_DAYS-30}
+      # Keep the worker off until the final enablement checklist is complete; only "1" starts it.
+      # Use ':-' rather than '-' so an explicitly empty value stays disabled.
+      SOTTO_ORGANISATION_DELETION_WORKER_ENABLED: ${SOTTO_ORGANISATION_DELETION_WORKER_ENABLED:-0}
     depends_on:
       postgres:
         condition: service_healthy
