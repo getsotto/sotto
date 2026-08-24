@@ -90,6 +90,9 @@ async fn run() -> Result<()> {
              os/arch, nothing else) - set SOTTO_TELEMETRY=off to disable; see README §Telemetry"
         );
     }
+    if config.organisation_deletion_worker_enabled {
+        sotto_server::org_deletion_worker::spawn(pool.clone(), billing.clone());
+    }
     sotto_server::telemetry::spawn(pool, config.telemetry.clone());
 
     let listener = tokio::net::TcpListener::bind(&config.bind_addr)
