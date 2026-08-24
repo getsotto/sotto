@@ -721,6 +721,8 @@ pub struct OperatorObservation<'a> {
     pub observed_at: &'a str,
     pub reason: &'a str,
     pub evidence: &'a str,
+    /// Optional latest expiry reported by the managed backup lifecycle.
+    pub managed_backup_expiry_by: Option<&'a str>,
 }
 
 pub async fn record_operator_observation(
@@ -752,8 +754,8 @@ pub async fn record_operator_observation(
     }
 
     let mut tx = pool.begin().await?;
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT d.id::text, d.state, d.subscription_id \
+    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT d.id::text, d.state, d.subscription_id, d.resume_state \
          FROM organization_deletions d JOIN organizations o ON o.id = d.org_id \
          WHERE d.org_id = $1 AND o.lifecycle_state = 'deleting' \
            AND d.state NOT IN ('cancelled', 'completed') FOR UPDATE OF d, o",
@@ -761,12 +763,44 @@ pub async fn record_operator_observation(
     .bind(org_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((id, state, operation_subscription)) = row else {
+    let Some((id, state, operation_subscription, resume_state)) = row else {
         return Err(Error::NotFound("deletion not found".into()));
     };
+    sqlx::query_scalar::<_, String>("SELECT $1::timestamptz::text")
+        .bind(observation.observed_at)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| observation_input_error(error, "observed_at must be a timestamp"))?;
+    if let Some(expiry) = observation.managed_backup_expiry_by {
+        let outlives_purge: bool = sqlx::query_scalar(
+            "SELECT $1::timestamptz >= purge_after FROM organization_deletions WHERE id = $2::uuid",
+        )
+        .bind(expiry)
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| {
+            observation_input_error(
+                error,
+                "managed_backup_expiry_by must be a timestamp after the purge deadline",
+            )
+        })?;
+        if !outlives_purge {
+            return Err(Error::BadRequest(
+                "managed_backup_expiry_by must be after the purge deadline".into(),
+            ));
+        }
+    }
     if state == DeletionState::Purging.as_str() {
         return Err(Error::Conflict(
             "organisation deletion cannot be observed after purge has started".into(),
+        ));
+    }
+    if state == DeletionState::Recovering.as_str()
+        || resume_state.as_deref() == Some(DeletionState::Recovering.as_str())
+    {
+        return Err(Error::Conflict(
+            "organisation recovery is in progress".into(),
         ));
     }
     if operation_subscription.as_deref() != Some(observation.subscription_id) {
@@ -779,9 +813,10 @@ pub async fn record_operator_observation(
          attempt_count = 0, last_billing_state = $1, billing_checked_at = $2::timestamptz, \
          billing_observation_source = 'operator', billing_observed_by = $3, \
          billing_observation_reason = $4, billing_observation_evidence = $5, \
+         managed_backup_expiry_by = COALESCE($6::timestamptz, managed_backup_expiry_by), \
          next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL, \
          state_version = state_version + 1 \
-         WHERE id = $6::uuid AND $2::timestamptz <= now() \
+         WHERE id = $7::uuid AND $2::timestamptz <= now() \
          RETURNING org_id, state",
     )
     .bind(billing_state_name(gate))
@@ -789,6 +824,7 @@ pub async fn record_operator_observation(
     .bind(operator)
     .bind(observation.reason)
     .bind(observation.evidence)
+    .bind(observation.managed_backup_expiry_by)
     .bind(&id)
     .fetch_optional(&mut *tx)
     .await?;
@@ -811,6 +847,13 @@ pub async fn record_operator_observation(
     .await?;
     tx.commit().await?;
     view_from_row(&id, row)
+}
+
+fn observation_input_error(error: sqlx::Error, message: &str) -> Error {
+    match error {
+        sqlx::Error::Database(_) => Error::BadRequest(message.into()),
+        error => Error::Db(error),
+    }
 }
 
 async fn finish_retention_reconciliation(

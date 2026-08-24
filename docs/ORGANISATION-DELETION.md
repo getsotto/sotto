@@ -59,9 +59,10 @@ validate a typed plaintext name. Both fields are required. A valid first request
 ```
 
 The worker may advance `requested` to `cancelling_billing` before a later status read.
-`managed_backup_expiry_by` remains `null` in the staged API until the operations slice configures
-managed-backup retention. Production enablement must populate and report it when managed backups
-can outlive the recovery deadline.
+`managed_backup_expiry_by` is `null` until the deployment has configured and verified a managed
+backup lifecycle. The operator-observation endpoint can report the optional latest expiry; status
+then returns that stored value. Production enablement must populate it when managed backups can
+outlive the recovery deadline.
 
 ### Read status
 
@@ -308,7 +309,9 @@ follows:
 
 An operator may record an authoritative manual billing observation when the configured provider is
 unavailable, so a self-hoster is not permanently blocked by a historical subscription ID. This is
-an operator-only operational endpoint, not a user-facing endpoint or bypass flag. It requires the
+an operator-only operational endpoint, not a user-facing endpoint or bypass flag. The `operator`
+value is an audit label supplied by the bearer-authenticated operator, so token access must be
+managed as the authority. It requires the
 exact organisation and subscription IDs, the observed Stripe status, observation time, actor, reason,
 and an evidence reference such as a Stripe Dashboard request or subscription URL. It writes the same
 billing-result fields used by the provider adapter plus an audit event with `source = 'operator'`.

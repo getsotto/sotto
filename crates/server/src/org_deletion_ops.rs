@@ -26,12 +26,14 @@ pub fn router() -> Router<AppState> {
 
 #[derive(Deserialize)]
 struct OperatorObservationRequest {
+    /// Audit label supplied by the authenticated operator; the bearer token grants authority.
     operator: String,
     subscription_id: String,
     observed_status: String,
     observed_at: String,
     reason: String,
     evidence: String,
+    managed_backup_expiry_by: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -88,6 +90,7 @@ async fn record_observation(
             observed_at: &body.observed_at,
             reason: &body.reason,
             evidence: &body.evidence,
+            managed_backup_expiry_by: body.managed_backup_expiry_by.as_deref(),
         },
     )
     .await?;

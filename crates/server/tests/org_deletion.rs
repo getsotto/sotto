@@ -2191,6 +2191,64 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
         .expect("failed transition");
     assert_eq!(failed.state, DeletionState::Failed);
 
+    sqlx::query("UPDATE organization_deletions SET state = 'recovering', resume_state = NULL WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+        .await
+        .expect("enter recovery");
+    let recovering = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "canceled",
+            observed_at: "now",
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
+        },
+    )
+    .await;
+    assert!(matches!(recovering, Err(Error::Conflict(_))));
+    sqlx::query("UPDATE organization_deletions SET state = 'failed', resume_state = 'cancelling_billing' WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+        .await
+        .expect("restore failed state");
+
+    let malformed_time = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "canceled",
+            observed_at: "not-a-timestamp",
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
+        },
+    )
+    .await;
+    assert!(matches!(malformed_time, Err(Error::BadRequest(_))));
+
+    let before_purge = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "canceled",
+            observed_at: "now",
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: Some("2000-01-01T00:00:00Z"),
+        },
+    )
+    .await;
+    assert!(matches!(before_purge, Err(Error::BadRequest(_))));
+
     // PostgreSQL resolves the special "now" timestamp literal when it casts the bound value,
     // keeping these observations fresh without adding a time-formatting dependency to the test.
     // Empty fields intentionally exercise the required-field validation one at a time.
@@ -2211,6 +2269,7 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
                 observed_at,
                 reason,
                 evidence,
+                managed_backup_expiry_by: None,
             },
         )
         .await;
@@ -2227,6 +2286,7 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
             observed_at: "now",
             reason: "provider credentials are being rotated",
             evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
         },
     )
     .await;
@@ -2241,6 +2301,7 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
             observed_at: "now",
             reason: "provider credentials are being rotated",
             evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
         },
     )
     .await;
@@ -2256,6 +2317,7 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
             observed_at: "now",
             reason: "provider credentials are being rotated",
             evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
         },
     )
     .await
@@ -2291,6 +2353,7 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
             observed_at: "now",
             reason: "provider credentials are being rotated",
             evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
         },
     )
     .await

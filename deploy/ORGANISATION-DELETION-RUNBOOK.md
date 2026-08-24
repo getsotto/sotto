@@ -72,11 +72,13 @@ curl --fail --silent --show-error -X POST \
   -H "Authorization: Bearer <operator-token>" \
   -H "Content-Type: application/json" \
   "https://<SOTTO_DOMAIN>/ops/organisation-deletion/<org-id>/billing-observation" \
-  -d '{"operator":"<operator-id>","subscription_id":"<subscription-id>","observed_status":"canceled","observed_at":"<RFC3339-time>","reason":"<why-provider-was-unavailable>","evidence":"<provider-request-or-subscription-url>"}'
+  -d '{"operator":"<operator-id>","subscription_id":"<subscription-id>","observed_status":"canceled","observed_at":"<RFC3339-time>","reason":"<why-provider-was-unavailable>","evidence":"<provider-request-or-subscription-url>","managed_backup_expiry_by":"<RFC3339-backup-expiry>"}'
 ```
 
 The endpoint remains unavailable with `503` until its dedicated token is configured. Never write the
-billing fields directly or reuse the metrics token for this write-capable control.
+billing fields directly or reuse the metrics token for this write-capable control. Omit
+`managed_backup_expiry_by` when no managed lifecycle has been configured; a supplied expiry must be
+after the operation's recovery deadline.
 
 ## Cancel before purge
 

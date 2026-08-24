@@ -120,6 +120,20 @@ async fn prepare_test(pool: &PgPool) -> Transaction<'static, Postgres> {
         .execute(&mut *tx)
         .await
         .expect("lock deletion tests");
+    // The lifecycle suites share one queue, so clean only this test's prefixes while the advisory
+    // lock prevents another deletion test from claiming an abandoned fixture at the same time.
+    sqlx::query("DELETE FROM organization_deletions WHERE org_id LIKE 'deletion-ops-org-%'")
+        .execute(pool)
+        .await
+        .expect("delete abandoned operations");
+    sqlx::query("DELETE FROM organizations WHERE id LIKE 'deletion-ops-org-%'")
+        .execute(pool)
+        .await
+        .expect("delete abandoned organisations");
+    sqlx::query("DELETE FROM users WHERE id LIKE 'deletion-ops-owner-%'")
+        .execute(pool)
+        .await
+        .expect("delete abandoned owners");
     tx
 }
 
@@ -166,7 +180,7 @@ async fn operator_endpoint_records_audited_observation() {
     .await
     .expect("request deletion");
 
-    let body = r#"{"operator":"on-call","subscription_id":"sub-operator","observed_status":"canceled","observed_at":"now","reason":"provider unavailable","evidence":"ticket-123"}"#;
+    let body = r#"{"operator":"on-call","subscription_id":"sub-operator","observed_status":"canceled","observed_at":"now","reason":"provider unavailable","evidence":"ticket-123","managed_backup_expiry_by":"2099-01-01T00:00:00Z"}"#;
     let (status, body) = post_observation(
         &app(pool.clone(), Some("operator-secret")),
         Some("operator-secret"),
@@ -177,6 +191,7 @@ async fn operator_endpoint_records_audited_observation() {
     let response: Value = serde_json::from_str(&body).expect("status JSON");
     assert_eq!(response["state"], "retention");
     assert_eq!(response["error"], Value::Null);
+    assert!(response["managed_backup_expiry_by"].as_str().is_some());
     let action: String = sqlx::query_scalar(
         "SELECT action FROM audit_events WHERE org_id = $1 ORDER BY id DESC LIMIT 1",
     )
