@@ -32,10 +32,17 @@ fn app(pool: PgPool, token: Option<&str>) -> Router {
         .with_state(state)
 }
 
-async fn post_observation(app: &Router, token: Option<&str>, body: &str) -> (StatusCode, String) {
+async fn post_observation(
+    app: &Router,
+    token: Option<&str>,
+    org_id: &str,
+    body: &str,
+) -> (StatusCode, String) {
     let mut request = Request::builder()
         .method("POST")
-        .uri("/ops/organisation-deletion/example/billing-observation")
+        .uri(format!(
+            "/ops/organisation-deletion/{org_id}/billing-observation"
+        ))
         .header("content-type", "application/json");
     if let Some(token) = token {
         request = request.header("authorization", format!("Bearer {token}"));
@@ -59,6 +66,7 @@ async fn operator_endpoint_is_dark_without_a_token() {
         post_observation(
             &app(pool, None),
             None,
+            "example",
             r#"{"operator":"ops","subscription_id":"sub","observed_status":"canceled","observed_at":"now","reason":"rotation","evidence":"ticket-1"}"#,
         )
         .await
@@ -74,11 +82,13 @@ async fn operator_endpoint_rejects_missing_and_wrong_tokens() {
     let body = r#"{"operator":"ops","subscription_id":"sub","observed_status":"canceled","observed_at":"now","reason":"rotation","evidence":"ticket-1"}"#;
 
     assert_eq!(
-        post_observation(&app, None, body).await.0,
+        post_observation(&app, None, "example", body).await.0,
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(
-        post_observation(&app, Some("wrong-secret"), body).await.0,
+        post_observation(&app, Some("wrong-secret"), "example", body)
+            .await
+            .0,
         StatusCode::UNAUTHORIZED
     );
 }
@@ -90,6 +100,7 @@ async fn operator_endpoint_rejects_malformed_json_after_authentication() {
         post_observation(
             &app(pool, Some("operator-secret")),
             Some("operator-secret"),
+            "example",
             "not-json"
         )
         .await
@@ -188,6 +199,7 @@ async fn operator_endpoint_records_audited_observation() {
     let (status, body) = post_observation(
         &app(pool.clone(), Some("operator-secret")),
         Some("operator-secret"),
+        &org_id,
         &body,
     )
     .await;
