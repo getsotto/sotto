@@ -68,11 +68,14 @@ rehearsed. Record the exact values from the provider dashboard or request log wi
 bearer token in shell history:
 
 ```sh
+read -r -s OPERATOR_TOKEN
+printf '\n'
 curl --fail --silent --show-error -X POST \
-  -H "Authorization: Bearer <operator-token>" \
+  -H "Authorization: Bearer ${OPERATOR_TOKEN}" \
   -H "Content-Type: application/json" \
   "https://<SOTTO_DOMAIN>/ops/organisation-deletion/<org-id>/billing-observation" \
   -d '{"operator":"<operator-id>","subscription_id":"<subscription-id>","observed_status":"canceled","observed_at":"<RFC3339-time>","reason":"<why-provider-was-unavailable>","evidence":"<provider-request-or-subscription-url>","managed_backup_expiry_by":"<RFC3339-backup-expiry>"}'
+unset OPERATOR_TOKEN
 ```
 
 The endpoint remains unavailable with `503` until its dedicated token is configured. Never write the
