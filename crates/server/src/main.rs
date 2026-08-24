@@ -73,6 +73,7 @@ async fn run() -> Result<()> {
             BillingState::from_config(billing)
         }
     });
+    // AppState owns billing; keep only the provider handle for the optional worker.
     let worker_provider = billing.as_ref().map(BillingState::provider);
 
     let state = AppState {
