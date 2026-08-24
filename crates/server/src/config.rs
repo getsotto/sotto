@@ -14,6 +14,7 @@ pub const DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS: i64 = 30;
 /// values from freezing an organisation for years while leaving room for long backup lifecycles.
 pub const MAX_ORGANISATION_DELETION_RETENTION_DAYS: i64 = 365;
 const ORGANISATION_DELETION_RETENTION_ENV: &str = "SOTTO_ORGANISATION_DELETION_RETENTION_DAYS";
+const ORGANISATION_DELETION_WORKER_ENV: &str = "SOTTO_ORGANISATION_DELETION_WORKER_ENABLED";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -29,6 +30,8 @@ pub struct Config {
     pub telemetry: TelemetryConfig,
     /// Recovery window applied to new organisation-deletion requests.
     pub organisation_deletion_retention_days: i64,
+    /// Whether this instance runs the staged organisation-deletion worker.
+    pub organisation_deletion_worker_enabled: bool,
 }
 
 /// Anonymous version-ping telemetry settings (see [`crate::telemetry`]).
@@ -145,6 +148,9 @@ impl Config {
             ingest_enabled: env_nonempty("SOTTO_TELEMETRY_INGEST").as_deref() == Some("1"),
         };
         let organisation_deletion_retention_days = organisation_deletion_retention_from_env()?;
+        let organisation_deletion_worker_enabled = organisation_deletion_worker_is_enabled(
+            env_nonempty(ORGANISATION_DELETION_WORKER_ENV).as_deref(),
+        );
 
         Ok(Self {
             database_url,
@@ -153,8 +159,15 @@ impl Config {
             billing,
             telemetry,
             organisation_deletion_retention_days,
+            organisation_deletion_worker_enabled,
         })
     }
+}
+
+/// Enable the destructive worker only for the exact opt-in value, so empty or unexpected values
+/// keep the staged lifecycle disabled until an operator has completed the enablement checklist.
+fn organisation_deletion_worker_is_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
 }
 
 /// Parse the configurable recovery window while keeping a safe default for existing deployments.
@@ -236,8 +249,9 @@ fn env_nonempty(name: &str) -> Option<String> {
 mod tests {
     use super::{
         billing_return_url, organisation_deletion_retention_from_env_result,
-        parse_organisation_deletion_retention_days, telemetry_ping_enabled,
-        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
+        organisation_deletion_worker_is_enabled, parse_organisation_deletion_retention_days,
+        telemetry_ping_enabled, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+        MAX_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
     #[test]
@@ -316,5 +330,13 @@ mod tests {
             ))
             .is_err());
         }
+    }
+
+    #[test]
+    fn organisation_deletion_worker_requires_exact_opt_in() {
+        assert!(!organisation_deletion_worker_is_enabled(None));
+        assert!(!organisation_deletion_worker_is_enabled(Some("")));
+        assert!(!organisation_deletion_worker_is_enabled(Some("true")));
+        assert!(organisation_deletion_worker_is_enabled(Some("1")));
     }
 }
