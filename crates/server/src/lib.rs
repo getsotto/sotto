@@ -36,9 +36,12 @@ pub mod org_deletion;
 pub mod org_deletion_api;
 #[doc(hidden)]
 pub mod org_deletion_worker;
-// Metrics stay behind their dedicated bearer token and remain separate from the user-facing API.
+// Operational deletion controls stay behind their dedicated bearer token and remain separate from
+// the user-facing API. Metrics and operator observations use different secrets by design.
 #[doc(hidden)]
 pub mod org_deletion_metrics;
+#[doc(hidden)]
+pub mod org_deletion_ops;
 pub mod share;
 pub mod state;
 pub mod sync;
@@ -65,6 +68,7 @@ pub fn app(state: AppState) -> Router {
         .merge(share::router())
         .merge(telemetry::router())
         .merge(org_deletion_metrics::router())
+        .merge(org_deletion_ops::router())
         .with_state(state)
 }
 

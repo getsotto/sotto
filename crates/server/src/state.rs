@@ -24,4 +24,6 @@ pub struct AppState {
     pub organisation_deletion_retention_days: i64,
     /// Bearer token for the protected organisation-deletion metrics exporter.
     pub organisation_deletion_metrics_token: Option<String>,
+    /// Bearer token for the protected operator-observation endpoint.
+    pub organisation_deletion_operator_token: Option<String>,
 }

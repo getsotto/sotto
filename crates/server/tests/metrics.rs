@@ -23,6 +23,7 @@ fn app(pool: PgPool, token: Option<&str>) -> Router {
         telemetry_ingest: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: token.map(str::to_owned),
+        organisation_deletion_operator_token: None,
     };
     Router::new()
         .merge(sotto_server::org_deletion_metrics::router())
