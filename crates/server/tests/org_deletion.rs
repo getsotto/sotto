@@ -2253,6 +2253,21 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
     )
     .await;
     assert!(matches!(implicit_timezone, Err(Error::BadRequest(_))));
+    let before_request = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "canceled",
+            observed_at: "2000-01-01T00:00:00Z",
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
+        },
+    )
+    .await;
+    assert!(matches!(before_request, Err(Error::BadRequest(_))));
 
     let before_purge = record_operator_observation(
         &pool,

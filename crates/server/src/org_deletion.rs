@@ -826,7 +826,8 @@ pub async fn record_operator_observation(
          managed_backup_expiry_by = COALESCE($6::timestamptz, managed_backup_expiry_by), \
          next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL, \
          state_version = state_version + 1 \
-         WHERE id = $7::uuid AND $2::timestamptz <= now() \
+         WHERE id = $7::uuid AND requested_at <= $2::timestamptz \
+           AND $2::timestamptz <= now() \
          RETURNING org_id, state",
     )
     .bind(billing_state_name(gate))
@@ -840,7 +841,7 @@ pub async fn record_operator_observation(
     .await?;
     let Some(row) = row else {
         return Err(Error::BadRequest(
-            "manual observation time cannot be in the future".into(),
+            "manual observation time must be between the deletion request and now".into(),
         ));
     };
     audit::record_tx(
