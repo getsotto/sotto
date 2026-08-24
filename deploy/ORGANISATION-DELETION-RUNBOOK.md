@@ -14,8 +14,8 @@ record.
   system and test one notification without using a real deletion.
 - Run the backup script and restore the dump into an isolated scratch database. Complete the
   rehearsal record at the end of this document before enabling the client control.
-- Confirm that the Stripe API version, restricted key, and webhook endpoint match the billing
-  section of [`ORGANISATION-DELETION.md`](../docs/ORGANISATION-DELETION.md).
+- Confirm that the configured billing provider's API version, restricted key, and webhook endpoint
+  match the [billing deployment settings](README.md#billing-optional).
 
 ## Inspect a failed or delayed operation
 
@@ -37,7 +37,7 @@ SELECT id::text, org_id, state, requested_at, purge_after, next_attempt_at,
  WHERE id = '<operation-uuid>';
 ```
 
-`last_error_code` is a sanitised code. Raw Stripe response text is never stored in this table and
+`last_error_code` is a sanitised code. Raw provider response text is never stored in this table and
 must not be copied into an incident or an owner-facing response. Check server logs for the request
 correlation and the provider dashboard separately.
 
@@ -74,7 +74,7 @@ curl --fail --silent --show-error -X POST \
   "https://<SOTTO_DOMAIN>/orgs/<org-id>/deletion/cancel"
 ```
 
-The worker reconciles Stripe after the cancellation request. Do not assume a local `recovering`
+The worker reconciles the billing provider after the cancellation request. Do not assume a local `recovering`
 state means Team access has already been restored, and do not resume collection for a purged
 organisation.
 
