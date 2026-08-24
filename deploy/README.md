@@ -173,9 +173,10 @@ docker compose -f docker-compose.prod.yml exec caddy \
 ## Organisation-deletion metrics
 
 The staged deletion worker stores aggregate lifecycle counters in Postgres. Their fixed vocabulary,
-alert conditions, and the boundary before a protected exporter is enabled are documented in
-[DELETION-METRICS.md](DELETION-METRICS.md). The deletion routes remain disabled until the complete
-enablement checklist has passed.
+alert conditions, and the protected Prometheus scrape are documented in
+[DELETION-METRICS.md](DELETION-METRICS.md). Set `SOTTO_ORGANISATION_DELETION_METRICS_TOKEN` only
+when the monitoring system is ready to send the bearer token securely. The deletion routes remain
+disabled until the complete enablement checklist has passed.
 
 ## Database security
 
@@ -252,3 +253,6 @@ docker compose -f docker-compose.prod.yml ps               # health at a glance
 - To try it without a public domain, set `SOTTO_DOMAIN=localhost`: Caddy serves a self-signed
   certificate (`curl -k https://localhost/health`). GitHub login still requires a callback URL
   reachable by your browser.
+- Organisation-deletion incidents follow the
+  [`ORGANISATION-DELETION-RUNBOOK.md`](ORGANISATION-DELETION-RUNBOOK.md). It forbids direct SQL
+  lifecycle changes and requires an isolated restore rehearsal before enablement.
