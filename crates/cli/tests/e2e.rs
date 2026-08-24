@@ -72,6 +72,7 @@ impl TestServer {
                     billing: None,
                     organisation_deletion_retention_days:
                         sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+                    organisation_deletion_metrics_token: None,
                 };
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                     .await

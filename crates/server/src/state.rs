@@ -22,4 +22,6 @@ pub struct AppState {
     pub telemetry_ingest: bool,
     /// Recovery window applied to new organisation-deletion requests.
     pub organisation_deletion_retention_days: i64,
+    /// Bearer token for the protected organisation-deletion metrics exporter.
+    pub organisation_deletion_metrics_token: Option<String>,
 }

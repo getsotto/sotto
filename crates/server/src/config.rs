@@ -15,6 +15,7 @@ pub const DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS: i64 = 30;
 pub const MAX_ORGANISATION_DELETION_RETENTION_DAYS: i64 = 365;
 const ORGANISATION_DELETION_RETENTION_ENV: &str = "SOTTO_ORGANISATION_DELETION_RETENTION_DAYS";
 const ORGANISATION_DELETION_WORKER_ENV: &str = "SOTTO_ORGANISATION_DELETION_WORKER_ENABLED";
+const ORGANISATION_DELETION_METRICS_TOKEN_ENV: &str = "SOTTO_ORGANISATION_DELETION_METRICS_TOKEN";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -32,6 +33,8 @@ pub struct Config {
     pub organisation_deletion_retention_days: i64,
     /// Whether this instance runs the staged organisation-deletion worker.
     pub organisation_deletion_worker_enabled: bool,
+    /// Bearer token for the protected organisation-deletion metrics exporter.
+    pub organisation_deletion_metrics_token: Option<String>,
 }
 
 /// Anonymous version-ping telemetry settings (see [`crate::telemetry`]).
@@ -151,6 +154,8 @@ impl Config {
         let worker_enabled_value = std::env::var(ORGANISATION_DELETION_WORKER_ENV).ok();
         let organisation_deletion_worker_enabled =
             organisation_deletion_worker_is_enabled(worker_enabled_value.as_deref());
+        let organisation_deletion_metrics_token =
+            env_nonempty(ORGANISATION_DELETION_METRICS_TOKEN_ENV);
 
         Ok(Self {
             database_url,
@@ -160,6 +165,7 @@ impl Config {
             telemetry,
             organisation_deletion_retention_days,
             organisation_deletion_worker_enabled,
+            organisation_deletion_metrics_token,
         })
     }
 }

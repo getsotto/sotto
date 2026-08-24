@@ -45,6 +45,7 @@ fn app(pool: PgPool, configured: bool) -> Router {
             })
         }),
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+        organisation_deletion_metrics_token: None,
     };
     Router::new()
         .merge(sotto_server::billing::router())
@@ -100,6 +101,7 @@ fn app_with_provider(pool: PgPool, provider: Arc<dyn SubscriptionProvider>) -> R
             "https://app.sotto.test".into(),
         )),
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
+        organisation_deletion_metrics_token: None,
     };
     Router::new()
         .merge(sotto_server::billing::router())
