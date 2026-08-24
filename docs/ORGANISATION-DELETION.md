@@ -308,10 +308,10 @@ follows:
 
 An operator may record an authoritative manual billing observation when the configured provider is
 unavailable, so a self-hoster is not permanently blocked by a historical subscription ID. This is
-an operator-only command, not a public endpoint or bypass flag. It requires the exact organisation
-and subscription IDs, the observed Stripe status, observation time, actor, reason, and an evidence
-reference such as a Stripe Dashboard request or subscription URL. It writes the same billing-result
-fields used by the provider adapter plus an audit event with `source = 'operator'`.
+an operator-only operational endpoint, not a user-facing endpoint or bypass flag. It requires the
+exact organisation and subscription IDs, the observed Stripe status, observation time, actor, reason,
+and an evidence reference such as a Stripe Dashboard request or subscription URL. It writes the same
+billing-result fields used by the provider adapter plus an audit event with `source = 'operator'`.
 
 A manual observation follows the same exhaustive status mapping and must be no more than 15 minutes
 old when purge begins. A stale, mismatched, non-terminal, or unaudited observation does not satisfy
@@ -512,7 +512,10 @@ organisation audit stream. The protected Prometheus endpoint is
 [deploy/DELETION-METRICS.md](../deploy/DELETION-METRICS.md) and
 [deploy/ORGANISATION-DELETION-ALERTS.yml](../deploy/ORGANISATION-DELETION-ALERTS.yml) for the
 scrape format, fixed counter vocabulary, and alert conditions. The endpoint does not enable the
-deletion routes or client control.
+deletion routes or client control. The authenticated operator-observation endpoint is a separate
+operational control at `POST /ops/organisation-deletion/{org_id}/billing-observation`, protected by
+`SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN`; it records the evidence-backed billing result used by
+the same purge gate and does not expose provider text to callers.
 
 Alert when an operation reaches `failed`, remains in `cancelling_billing` beyond 24 hours, is due for
 purge but has not advanced, or loses repeated worker leases.
