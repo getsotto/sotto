@@ -32,11 +32,7 @@ fn app(pool: PgPool, token: Option<&str>) -> Router {
         .with_state(state)
 }
 
-async fn post_observation(
-    app: &Router,
-    token: Option<&str>,
-    body: &'static str,
-) -> (StatusCode, String) {
+async fn post_observation(app: &Router, token: Option<&str>, body: &str) -> (StatusCode, String) {
     let mut request = Request::builder()
         .method("POST")
         .uri("/ops/organisation-deletion/example/billing-observation")
@@ -46,7 +42,7 @@ async fn post_observation(
     }
     let response = app
         .clone()
-        .oneshot(request.body(Body::from(body)).expect("request"))
+        .oneshot(request.body(Body::from(body.to_owned())).expect("request"))
         .await
         .expect("response");
     let status = response.status();
@@ -180,11 +176,19 @@ async fn operator_endpoint_records_audited_observation() {
     .await
     .expect("request deletion");
 
-    let body = r#"{"operator":"on-call","subscription_id":"sub-operator","observed_status":"canceled","observed_at":"now","reason":"provider unavailable","evidence":"ticket-123","managed_backup_expiry_by":"2099-01-01T00:00:00Z"}"#;
+    let observed_at: String = sqlx::query_scalar(
+        "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("format observation timestamp");
+    let body = format!(
+        r#"{{"operator":"on-call","subscription_id":"sub-operator","observed_status":"canceled","observed_at":"{observed_at}","reason":"provider unavailable","evidence":"ticket-123","managed_backup_expiry_by":"2099-01-01T00:00:00Z"}}"#
+    );
     let (status, body) = post_observation(
         &app(pool.clone(), Some("operator-secret")),
         Some("operator-secret"),
-        body,
+        &body,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
