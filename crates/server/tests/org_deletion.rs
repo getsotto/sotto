@@ -707,7 +707,8 @@ async fn metrics_snapshot_counts_only_due_retention_operations() {
     .await;
 
     sqlx::query(
-        "UPDATE organization_deletions SET purge_after = now() - interval '1 hour' \
+        "UPDATE organization_deletions SET requested_at = now() - interval '2 days', \
+         purge_after = now() - interval '1 hour' \
          WHERE id = $1::uuid",
     )
     .bind(&due_operation)
@@ -716,7 +717,8 @@ async fn metrics_snapshot_counts_only_due_retention_operations() {
     .expect("age due retention fixture");
     // A purging operation may have an old deadline, but it is no longer waiting in retention.
     sqlx::query(
-        "UPDATE organization_deletions SET state = 'purging', purge_after = now() - interval '1 hour' \
+        "UPDATE organization_deletions SET state = 'purging', \
+         requested_at = now() - interval '2 days', purge_after = now() - interval '1 hour' \
          WHERE id = $1::uuid",
     )
     .bind(&purging_operation)
