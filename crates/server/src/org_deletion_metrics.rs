@@ -72,6 +72,7 @@ pub struct DeletionMetricsSnapshot {
     pub purge_due_count: i64,
 }
 
+// Prometheus scrapers use the versioned text exposition format negotiated by this media type.
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 
 // Export every allowed pair, including zero-valued rows, so Prometheus range alerts see a series
@@ -105,6 +106,8 @@ pub fn router() -> Router<AppState> {
 /// `GET /ops/organisation-deletion/metrics` - return aggregate deletion metrics to an operator
 /// bearer token, never organisation identifiers or provider text.
 async fn export(State(state): State<AppState>, headers: HeaderMap) -> Result<Response> {
+    // Report an unconfigured exporter before checking credentials so a dark deployment is
+    // distinguishable from a caller with an invalid token.
     let expected = state
         .organisation_deletion_metrics_token
         .as_deref()
@@ -122,6 +125,7 @@ async fn export(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
         CONTENT_TYPE,
         HeaderValue::from_static(PROMETHEUS_CONTENT_TYPE),
     );
+    // Operational snapshots must not remain in an intermediary cache after a scrape.
     response
         .headers_mut()
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
