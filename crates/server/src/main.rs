@@ -84,6 +84,7 @@ async fn run() -> Result<()> {
         telemetry_ingest: config.telemetry.ingest_enabled,
         organisation_deletion_retention_days: config.organisation_deletion_retention_days,
         organisation_deletion_metrics_token: config.organisation_deletion_metrics_token,
+        organisation_deletion_operator_token: config.organisation_deletion_operator_token,
     };
 
     // Default-on telemetry must never be a surprise: say so at boot, with the off switch.

@@ -2190,16 +2190,141 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
         .expect("record unavailable provider")
         .expect("failed transition");
     assert_eq!(failed.state, DeletionState::Failed);
+    let observed_at: String = sqlx::query_scalar(
+        "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("format observation timestamp");
 
-    // PostgreSQL resolves the special "now" timestamp literal when it casts the bound value,
-    // keeping these observations fresh without adding a time-formatting dependency to the test.
+    sqlx::query("UPDATE organization_deletions SET state = 'recovering', resume_state = NULL WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+        .await
+        .expect("enter recovery");
+    let recovering = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "canceled",
+            observed_at: observed_at.as_str(),
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
+        },
+    )
+    .await;
+    assert!(matches!(recovering, Err(Error::Conflict(_))));
+    sqlx::query("UPDATE organization_deletions SET state = 'failed', resume_state = 'cancelling_billing' WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+    .await
+    .expect("restore failed state");
+    sqlx::query("UPDATE organization_deletions SET resume_state = 'purging' WHERE id = $1::uuid")
+        .bind(&requested.id)
+        .execute(&pool)
+        .await
+        .expect("mark purge retry");
+    let purging_retry = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "canceled",
+            observed_at: observed_at.as_str(),
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
+        },
+    )
+    .await;
+    assert!(matches!(purging_retry, Err(Error::Conflict(_))));
+    sqlx::query(
+        "UPDATE organization_deletions SET resume_state = 'cancelling_billing' WHERE id = $1::uuid",
+    )
+    .bind(&requested.id)
+    .execute(&pool)
+    .await
+    .expect("restore billing retry");
+
+    let malformed_time = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "canceled",
+            observed_at: "not-a-timestamp",
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
+        },
+    )
+    .await;
+    assert!(matches!(malformed_time, Err(Error::BadRequest(_))));
+    let implicit_timezone = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "canceled",
+            observed_at: "now",
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
+        },
+    )
+    .await;
+    assert!(matches!(implicit_timezone, Err(Error::BadRequest(_))));
+    let before_request = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "canceled",
+            observed_at: "2000-01-01T00:00:00Z",
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
+        },
+    )
+    .await;
+    assert!(matches!(before_request, Err(Error::BadRequest(_))));
+
+    let before_purge = record_operator_observation(
+        &pool,
+        &org_id,
+        "operator-1",
+        OperatorObservation {
+            subscription_id: &subscription_id,
+            observed_status: "canceled",
+            observed_at: observed_at.as_str(),
+            reason: "provider credentials are being rotated",
+            evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: Some("2000-01-01T00:00:00Z"),
+        },
+    )
+    .await;
+    assert!(matches!(before_purge, Err(Error::BadRequest(_))));
+
     // Empty fields intentionally exercise the required-field validation one at a time.
     for (operator, observed_status, observed_at, reason, evidence) in [
-        ("", "canceled", "now", "reason", "evidence"),
-        ("operator-1", "", "now", "reason", "evidence"),
+        ("", "canceled", observed_at.as_str(), "reason", "evidence"),
+        ("operator-1", "", observed_at.as_str(), "reason", "evidence"),
         ("operator-1", "canceled", "", "reason", "evidence"),
-        ("operator-1", "canceled", "now", "", "evidence"),
-        ("operator-1", "canceled", "now", "reason", ""),
+        (
+            "operator-1",
+            "canceled",
+            observed_at.as_str(),
+            "",
+            "evidence",
+        ),
+        ("operator-1", "canceled", observed_at.as_str(), "reason", ""),
     ] {
         let result = record_operator_observation(
             &pool,
@@ -2211,6 +2336,7 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
                 observed_at,
                 reason,
                 evidence,
+                managed_backup_expiry_by: None,
             },
         )
         .await;
@@ -2224,9 +2350,10 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
         OperatorObservation {
             subscription_id: "sub-other",
             observed_status: "canceled",
-            observed_at: "now",
+            observed_at: observed_at.as_str(),
             reason: "provider credentials are being rotated",
             evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
         },
     )
     .await;
@@ -2238,9 +2365,10 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
         OperatorObservation {
             subscription_id: &subscription_id,
             observed_status: "active",
-            observed_at: "now",
+            observed_at: observed_at.as_str(),
             reason: "provider credentials are being rotated",
             evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
         },
     )
     .await;
@@ -2253,9 +2381,10 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
         OperatorObservation {
             subscription_id: &subscription_id,
             observed_status: "canceled",
-            observed_at: "now",
+            observed_at: observed_at.as_str(),
             reason: "provider credentials are being rotated",
             evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
         },
     )
     .await
@@ -2288,9 +2417,10 @@ async fn fresh_operator_observation_unblocks_an_unconfigured_provider() {
         OperatorObservation {
             subscription_id: &subscription_id,
             observed_status: "canceled",
-            observed_at: "now",
+            observed_at: observed_at.as_str(),
             reason: "provider credentials are being rotated",
             evidence: "stripe-dashboard-request-1",
+            managed_backup_expiry_by: None,
         },
     )
     .await

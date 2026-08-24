@@ -132,7 +132,7 @@ async fn export(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
     Ok(response)
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -141,8 +141,9 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-// Compare fixed-size digests so a token-length or prefix match is not observable.
-fn token_matches(expected: &str, provided: &str) -> bool {
+// Compare fixed-size digests so authentication checks token contents without prefix matching; the
+// digest lengths are fixed before the constant-time comparison.
+pub(crate) fn token_matches(expected: &str, provided: &str) -> bool {
     let expected_digest: [u8; 32] = Sha256::digest(expected.as_bytes()).into();
     let provided_digest: [u8; 32] = Sha256::digest(provided.as_bytes()).into();
     expected_digest.ct_eq(&provided_digest).into()

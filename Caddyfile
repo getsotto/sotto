@@ -70,7 +70,7 @@
 
 	# The rest of the server's API (bearer-authenticated). Together with @ratelimited above this must
 	# cover every path the routers in `crates/server/src/lib.rs` serve - keep the two in sync.
-	@api path /health /auth/me /auth/logout /account /account/* /projects /projects/* /environments/* /orgs /orgs/* /machine/* /billing/* /ops/organisation-deletion/metrics
+	@api path /health /auth/me /auth/logout /account /account/* /projects /projects/* /environments/* /orgs /orgs/* /machine/* /billing/* /ops/organisation-deletion/metrics /ops/organisation-deletion/*
 	handle @api {
 		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
 	}

@@ -10,6 +10,8 @@ record.
 - Configure a managed backup or export lifecycle that covers the configured recovery window.
 - Set `SOTTO_ORGANISATION_DELETION_METRICS_TOKEN` in the deployment secret store. Do not put it in
   a scrape URL or an access-loggable command history entry.
+- Keep `SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN` unset until the authenticated observation
+  procedure below has been reviewed and rehearsed; it is a separate write-capable secret.
 - Load [`ORGANISATION-DELETION-ALERTS.yml`](ORGANISATION-DELETION-ALERTS.yml) into the monitoring
   system and test one notification without using a real deletion.
 - Run the backup script and restore the dump into an isolated scratch database. Complete the
@@ -60,9 +62,26 @@ operator observation. The internal lifecycle seam requires the exact subscriptio
 missing status, an observation time no more than 15 minutes old at purge, an actor, a reason, and an
 evidence reference such as a provider request or subscription URL.
 
-There is intentionally no public HTTP endpoint for this action in the staged release. Do not create
-one ad hoc and do not write the billing fields directly. The enablement change must provide and
-review the authenticated operator command before a deployment relies on this recovery path.
+The staged release provides an operational endpoint, not a public user route. Set
+`SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN` only after this procedure has been reviewed and
+rehearsed. Record the exact values from the provider dashboard or request log without putting the
+bearer token in shell history:
+
+```sh
+read -r -s OPERATOR_TOKEN
+printf '\n'
+curl --fail --silent --show-error -X POST \
+  -H "Authorization: Bearer ${OPERATOR_TOKEN}" \
+  -H "Content-Type: application/json" \
+  "https://<SOTTO_DOMAIN>/ops/organisation-deletion/<org-id>/billing-observation" \
+  -d '{"operator":"<operator-id>","subscription_id":"<subscription-id>","observed_status":"canceled","observed_at":"<RFC3339-time>","reason":"<why-provider-was-unavailable>","evidence":"<provider-request-or-subscription-url>","managed_backup_expiry_by":"<RFC3339-backup-expiry>"}'
+unset OPERATOR_TOKEN
+```
+
+The endpoint remains unavailable with `503` until its dedicated token is configured. Never write the
+billing fields directly or reuse the metrics token for this write-capable control. Omit
+`managed_backup_expiry_by` when no managed lifecycle has been configured; a supplied expiry must be
+after the operation's recovery deadline.
 
 ## Cancel before purge
 

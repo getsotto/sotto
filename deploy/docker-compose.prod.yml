@@ -62,6 +62,8 @@ services:
       SOTTO_ORGANISATION_DELETION_WORKER_ENABLED: ${SOTTO_ORGANISATION_DELETION_WORKER_ENABLED:-0}
       # Keep the exporter dark until a metrics scraper is configured; never put this bearer token in logs.
       SOTTO_ORGANISATION_DELETION_METRICS_TOKEN: ${SOTTO_ORGANISATION_DELETION_METRICS_TOKEN:-}
+      # Keep operator observations behind a separate bearer token; leave blank until the runbook is ready.
+      SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN: ${SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy

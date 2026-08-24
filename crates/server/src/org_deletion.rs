@@ -721,6 +721,8 @@ pub struct OperatorObservation<'a> {
     pub observed_at: &'a str,
     pub reason: &'a str,
     pub evidence: &'a str,
+    /// Optional latest expiry reported by the managed backup lifecycle.
+    pub managed_backup_expiry_by: Option<&'a str>,
 }
 
 pub async fn record_operator_observation(
@@ -752,8 +754,8 @@ pub async fn record_operator_observation(
     }
 
     let mut tx = pool.begin().await?;
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT d.id::text, d.state, d.subscription_id \
+    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT d.id::text, d.state, d.subscription_id, d.resume_state \
          FROM organization_deletions d JOIN organizations o ON o.id = d.org_id \
          WHERE d.org_id = $1 AND o.lifecycle_state = 'deleting' \
            AND d.state NOT IN ('cancelled', 'completed') FOR UPDATE OF d, o",
@@ -761,12 +763,59 @@ pub async fn record_operator_observation(
     .bind(org_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((id, state, operation_subscription)) = row else {
+    let Some((id, state, operation_subscription, resume_state)) = row else {
         return Err(Error::NotFound("deletion not found".into()));
+    };
+    let observed_at = normalise_rfc3339_timestamp(
+        &mut tx,
+        observation.observed_at,
+        "observed_at must be an RFC3339 timestamp with an explicit timezone",
+    )
+    .await?;
+    let managed_backup_expiry_by = if let Some(expiry) = observation.managed_backup_expiry_by {
+        let expiry = normalise_rfc3339_timestamp(
+            &mut tx,
+            expiry,
+            "managed_backup_expiry_by must be an RFC3339 timestamp with an explicit timezone",
+        )
+        .await?;
+        let outlives_purge: bool = sqlx::query_scalar(
+            "SELECT $1::timestamptz > purge_after FROM organization_deletions WHERE id = $2::uuid",
+        )
+        .bind(&expiry)
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| {
+            observation_input_error(
+                error,
+                "managed_backup_expiry_by must be after the purge deadline",
+            )
+        })?;
+        if !outlives_purge {
+            return Err(Error::BadRequest(
+                "managed_backup_expiry_by must be after the purge deadline".into(),
+            ));
+        }
+        Some(expiry)
+    } else {
+        None
     };
     if state == DeletionState::Purging.as_str() {
         return Err(Error::Conflict(
             "organisation deletion cannot be observed after purge has started".into(),
+        ));
+    }
+    if state == DeletionState::Recovering.as_str()
+        || matches!(
+            resume_state.as_deref(),
+            Some(value)
+                if value == DeletionState::Recovering.as_str()
+                    || value == DeletionState::Purging.as_str()
+        )
+    {
+        return Err(Error::Conflict(
+            "organisation recovery is in progress".into(),
         ));
     }
     if operation_subscription.as_deref() != Some(observation.subscription_id) {
@@ -779,22 +828,25 @@ pub async fn record_operator_observation(
          attempt_count = 0, last_billing_state = $1, billing_checked_at = $2::timestamptz, \
          billing_observation_source = 'operator', billing_observed_by = $3, \
          billing_observation_reason = $4, billing_observation_evidence = $5, \
+         managed_backup_expiry_by = COALESCE($6::timestamptz, managed_backup_expiry_by), \
          next_attempt_at = NULL, lease_owner = NULL, lease_expires_at = NULL, \
          state_version = state_version + 1 \
-         WHERE id = $6::uuid AND $2::timestamptz <= now() \
+         WHERE id = $7::uuid AND requested_at <= $2::timestamptz \
+           AND $2::timestamptz <= now() \
          RETURNING org_id, state",
     )
     .bind(billing_state_name(gate))
-    .bind(observation.observed_at)
+    .bind(&observed_at)
     .bind(operator)
     .bind(observation.reason)
     .bind(observation.evidence)
+    .bind(managed_backup_expiry_by)
     .bind(&id)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
         return Err(Error::BadRequest(
-            "manual observation time cannot be in the future".into(),
+            "manual observation time must be between the deletion request and now".into(),
         ));
     };
     audit::record_tx(
@@ -811,6 +863,82 @@ pub async fn record_operator_observation(
     .await?;
     tx.commit().await?;
     view_from_row(&id, row)
+}
+
+fn observation_input_error(error: sqlx::Error, message: &str) -> Error {
+    match error {
+        sqlx::Error::Database(_) => Error::BadRequest(message.into()),
+        error => Error::Db(error),
+    }
+}
+
+async fn normalise_rfc3339_timestamp(
+    tx: &mut Transaction<'_, Postgres>,
+    value: &str,
+    message: &str,
+) -> Result<String> {
+    if !looks_like_rfc3339(value) {
+        return Err(Error::BadRequest(message.into()));
+    }
+    sqlx::query_scalar(
+        "SELECT to_char($1::timestamptz AT TIME ZONE 'UTC', \
+                'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
+    )
+    .bind(value)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| observation_input_error(error, message))
+}
+
+fn looks_like_rfc3339(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return false;
+    }
+    let timezone_start = if bytes.last() == Some(&b'Z') {
+        bytes.len() - 1
+    } else {
+        if bytes.len() < 25 {
+            return false;
+        }
+        bytes.len() - 6
+    };
+    if !bytes[0..4].iter().all(u8::is_ascii_digit)
+        || !bytes[5..7].iter().all(u8::is_ascii_digit)
+        || !bytes[8..10].iter().all(u8::is_ascii_digit)
+        || !bytes[11..13].iter().all(u8::is_ascii_digit)
+        || !bytes[14..16].iter().all(u8::is_ascii_digit)
+        || !bytes[17..19].iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+    if timezone_start > 19 {
+        if bytes[19] != b'.' || timezone_start == 20 {
+            return false;
+        }
+        if !bytes[20..timezone_start].iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+    }
+    if bytes.last() == Some(&b'Z') {
+        true
+    } else {
+        bytes.len() >= timezone_start + 6
+            && matches!(bytes[timezone_start], b'+' | b'-')
+            && bytes[timezone_start + 3] == b':'
+            && bytes[timezone_start + 1..timezone_start + 3]
+                .iter()
+                .all(u8::is_ascii_digit)
+            && bytes[timezone_start + 4..timezone_start + 6]
+                .iter()
+                .all(u8::is_ascii_digit)
+    }
 }
 
 async fn finish_retention_reconciliation(

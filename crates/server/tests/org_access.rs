@@ -40,6 +40,7 @@ fn app(pool: PgPool) -> Router {
         )),
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
+        organisation_deletion_operator_token: None,
     };
     sotto_server::app(state)
 }

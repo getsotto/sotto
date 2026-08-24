@@ -178,6 +178,11 @@ alert conditions, and the protected Prometheus scrape are documented in
 when the monitoring system is ready to send the bearer token securely. The deletion routes remain
 disabled until the complete enablement checklist has passed.
 
+The operator observation endpoint is separately protected by
+`SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN`. Leave it blank until the deletion runbook has been
+rehearsed and the authenticated observation procedure is ready. Never reuse the metrics token for
+this write-capable operational control.
+
 ## Database security
 
 The default `docker-compose.prod.yml` keeps Postgres on the **internal compose network only** - it
