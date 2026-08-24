@@ -240,7 +240,7 @@ pub struct BillingState {
 
 impl BillingState {
     /// Share the provider with the deletion worker without exposing billing credentials.
-    pub(crate) fn provider(&self) -> Arc<dyn SubscriptionProvider> {
+    pub fn provider(&self) -> Arc<dyn SubscriptionProvider> {
         Arc::clone(&self.provider)
     }
 

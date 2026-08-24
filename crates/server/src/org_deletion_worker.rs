@@ -10,7 +10,7 @@ use std::time::Duration;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::billing::{BillingState, SubscriptionProvider};
+use crate::billing::SubscriptionProvider;
 use crate::error::Result;
 use crate::org_deletion::{advance, claim_due};
 
@@ -18,9 +18,8 @@ use crate::org_deletion::{advance, claim_due};
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Start one queue runner with a process-unique lease owner.
-pub fn spawn(pool: PgPool, billing: Option<BillingState>) {
+pub fn spawn(pool: PgPool, provider: Option<Arc<dyn SubscriptionProvider>>) {
     let worker_id = format!("sotto-deletion-worker-{}", Uuid::new_v4());
-    let provider = billing.map(|billing| billing.provider());
     tokio::spawn(run(pool, worker_id, provider));
 }
 
