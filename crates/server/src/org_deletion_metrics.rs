@@ -5,6 +5,7 @@
 //! are running, without exposing deletion details through the user-facing API.
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use subtle::ConstantTimeEq;
 
@@ -136,9 +137,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-// Compare the operator secret without making a token-length or prefix match observable.
+// Compare fixed-size digests so a token-length or prefix match is not observable.
 fn token_matches(expected: &str, provided: &str) -> bool {
-    expected.as_bytes().ct_eq(provided.as_bytes()).into()
+    let expected_digest: [u8; 32] = Sha256::digest(expected.as_bytes()).into();
+    let provided_digest: [u8; 32] = Sha256::digest(provided.as_bytes()).into();
+    expected_digest.ct_eq(&provided_digest).into()
 }
 
 fn render_prometheus(snapshot: &DeletionMetricsSnapshot) -> String {
