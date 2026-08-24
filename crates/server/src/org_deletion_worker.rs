@@ -14,7 +14,7 @@ use crate::billing::SubscriptionProvider;
 use crate::error::Result;
 use crate::org_deletion::{advance, claim_due};
 
-/// Keep idle queue polling bounded without turning a quiet server into a busy loop.
+/// Keep queue polling bounded without turning a quiet or repeatedly-ready server into a busy loop.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Start one queue runner with a process-unique lease owner.
@@ -41,7 +41,11 @@ async fn run(pool: PgPool, worker_id: String, provider: Option<Arc<dyn Subscript
     loop {
         let provider_ref = provider.as_deref();
         match run_once(&pool, &worker_id, provider_ref).await {
-            Ok(true) => continue,
+            Ok(true) => {
+                // Pace successive claims so an inconsistent provider cannot create a tight loop.
+                tokio::time::sleep(POLL_INTERVAL).await;
+                continue;
+            }
             Ok(false) => tokio::time::sleep(POLL_INTERVAL).await,
             Err(error) => {
                 eprintln!("organisation deletion worker: {error}");
