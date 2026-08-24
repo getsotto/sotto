@@ -148,9 +148,9 @@ impl Config {
             ingest_enabled: env_nonempty("SOTTO_TELEMETRY_INGEST").as_deref() == Some("1"),
         };
         let organisation_deletion_retention_days = organisation_deletion_retention_from_env()?;
-        let organisation_deletion_worker_enabled = organisation_deletion_worker_is_enabled(
-            env_nonempty(ORGANISATION_DELETION_WORKER_ENV).as_deref(),
-        );
+        let worker_enabled_value = std::env::var(ORGANISATION_DELETION_WORKER_ENV).ok();
+        let organisation_deletion_worker_enabled =
+            organisation_deletion_worker_is_enabled(worker_enabled_value.as_deref());
 
         Ok(Self {
             database_url,
@@ -337,6 +337,7 @@ mod tests {
         assert!(!organisation_deletion_worker_is_enabled(None));
         assert!(!organisation_deletion_worker_is_enabled(Some("")));
         assert!(!organisation_deletion_worker_is_enabled(Some("true")));
+        assert!(!organisation_deletion_worker_is_enabled(Some(" 1 ")));
         assert!(organisation_deletion_worker_is_enabled(Some("1")));
     }
 }
