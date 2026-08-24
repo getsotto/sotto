@@ -73,6 +73,7 @@ async fn run() -> Result<()> {
             BillingState::from_config(billing)
         }
     });
+    let worker_billing = billing.clone();
 
     let state = AppState {
         pool: pool.clone(),
@@ -91,7 +92,7 @@ async fn run() -> Result<()> {
         );
     }
     if config.organisation_deletion_worker_enabled {
-        sotto_server::org_deletion_worker::spawn(pool.clone(), billing.clone());
+        sotto_server::org_deletion_worker::spawn(pool.clone(), worker_billing);
     }
     sotto_server::telemetry::spawn(pool, config.telemetry.clone());
 
