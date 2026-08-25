@@ -82,6 +82,9 @@ async fn run() -> Result<()> {
         oauth_config: config.oauth.clone(),
         billing,
         telemetry_ingest: config.telemetry.ingest_enabled,
+        // One opt-in drives both halves: the routes that accept work and the worker that performs
+        // it. Splitting them would let a deployment freeze organisations it can never purge.
+        organisation_deletion_enabled: config.organisation_deletion_worker_enabled,
         organisation_deletion_retention_days: config.organisation_deletion_retention_days,
         organisation_deletion_metrics_token: config.organisation_deletion_metrics_token,
         organisation_deletion_operator_token: config.organisation_deletion_operator_token,

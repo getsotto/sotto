@@ -45,13 +45,14 @@ Database migrations run automatically on server boot. Pin a released version wit
 for unreleased changes, or if you'd rather not trust prebuilt images - use
 `up -d --build`; that needs ~4 GB of RAM and takes several minutes the first time.
 
-The server includes the staged organisation-deletion worker, but it is idle unless
-`SOTTO_ORGANISATION_DELETION_WORKER_ENABLED=1`. Keep that value at `0`, and keep
-`VITE_ORGANISATION_DELETION_ENABLED=false`, until the deletion routes, monitoring, and recovery
-runbook have been enabled together. The default prebuilt images and source builds keep both sides
-unavailable; changing either value is reserved for the final enablement.
+Organisation deletion ships disabled. `SOTTO_ORGANISATION_DELETION_WORKER_ENABLED=1` turns on both
+halves of the server side at once - the lifecycle worker and the owner-facing deletion routes - and
+`VITE_ORGANISATION_DELETION_ENABLED=true` turns on the client control. The default prebuilt images
+and source builds keep every side unavailable. Enabling it is a deliberate procedure with
+prerequisites, not a single switch: follow
+[Enabling organisation deletion](#enabling-organisation-deletion) below.
 
-New staged deletion requests use a 30-day recovery window by default. Set
+New deletion requests use a 30-day recovery window by default. Set
 `SOTTO_ORGANISATION_DELETION_RETENTION_DAYS` to an integer from 1 to 365 in `deploy/.env` to change
 the window for new requests. The organisation stays frozen for the whole configured window.
 Changing it never shortens an existing operation's stored `purge_after` deadline.
@@ -172,16 +173,68 @@ docker compose -f docker-compose.prod.yml exec caddy \
 
 ## Organisation-deletion metrics
 
-The staged deletion worker stores aggregate lifecycle counters in Postgres. Their fixed vocabulary,
-alert conditions, and the protected Prometheus scrape are documented in
+The deletion worker stores aggregate lifecycle counters in Postgres. Their fixed vocabulary, alert
+conditions, and the protected Prometheus scrape are documented in
 [DELETION-METRICS.md](DELETION-METRICS.md). Set `SOTTO_ORGANISATION_DELETION_METRICS_TOKEN` only
-when the monitoring system is ready to send the bearer token securely. The deletion routes remain
-disabled until the complete enablement checklist has passed.
+when the monitoring system is ready to send the bearer token securely.
 
 The operator observation endpoint is separately protected by
 `SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN`. Leave it blank until the deletion runbook has been
 rehearsed and the authenticated observation procedure is ready. Never reuse the metrics token for
 this write-capable operational control.
+
+Both endpoints are independent of the deletion flags: configuring either token does not enable
+deletion, and neither is enabled by turning deletion on.
+
+## Enabling organisation deletion
+
+Deletion is irreversible once purge begins, so treat enablement as a release of its own. Work
+through it on a staging deployment first, then repeat it on production with the same pinned image
+tag. The full operator procedure, including the rehearsal record you must complete, is in
+[ORGANISATION-DELETION-RUNBOOK.md](ORGANISATION-DELETION-RUNBOOK.md).
+
+**Prerequisites** - all of these before either flag changes:
+
+1. A managed backup or export lifecycle covering the configured recovery window, with a restore
+   into an isolated scratch database rehearsed and recorded.
+2. `SOTTO_ORGANISATION_DELETION_METRICS_TOKEN` set from the deployment secret store, the
+   [alert rules](ORGANISATION-DELETION-ALERTS.yml) loaded, and one notification tested.
+3. `SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN` set from the deployment secret store, with the
+   authenticated observation procedure reviewed and rehearsed.
+4. Billing configured and verified end to end: the provider's API version, restricted key, and
+   webhook endpoint matching [Billing](#billing-optional).
+5. `SOTTO_IMAGE_TAG` pinned to a released version, so the server and web images cannot skew.
+
+**Enablement**, on staging first:
+
+```sh
+# in deploy/.env
+SOTTO_ORGANISATION_DELETION_WORKER_ENABLED=1
+VITE_ORGANISATION_DELETION_ENABLED=true
+```
+
+```sh
+docker compose -f docker-compose.prod.yml up -d
+```
+
+The web flag is compiled in, so a source build (`up -d --build`) is what applies it; with prebuilt
+images, use the image built with the flag set.
+
+**Verify**, before repeating any of this on production:
+
+- `https://<SOTTO_DOMAIN>/health` returns `ok`;
+- the protected metrics endpoint answers with its token and `503` without one;
+- the operator observation endpoint answers with its token, `503` without one, and `401` for a
+  wrong one;
+- an owner on a disposable test organisation can complete the confirmation flow, see the recovery
+  window, and cancel it again;
+- the audit trail and server logs show the request, cancellation, and operator observation, with
+  no bearer token or provider text in them.
+
+**Turning it back off** stops new requests and idles the worker, but does not restore an
+organisation whose purge has already begun. Existing operations keep their stored `purge_after`
+deadline; the routes return `404` again and the worker stops advancing the queue, leaving frozen
+organisations frozen until deletion is re-enabled or an operator recovers them through the runbook.
 
 ## Database security
 

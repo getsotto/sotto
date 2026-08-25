@@ -70,6 +70,7 @@ impl TestServer {
                     oauth: None,
                     oauth_config: None,
                     billing: None,
+                    organisation_deletion_enabled: false,
                     organisation_deletion_retention_days:
                         sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
                     organisation_deletion_metrics_token: None,

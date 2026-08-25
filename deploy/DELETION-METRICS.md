@@ -1,6 +1,6 @@
 # Organisation-deletion metrics
 
-The staged deletion worker records aggregate operational metrics in Postgres. The counters are
+The deletion worker records aggregate operational metrics in Postgres. The counters are
 separate from the organisation audit stream: retries and compare-and-set races are useful to an
 operator, but are not user-visible organisation events. No organisation id, provider message, or
 secret value is stored in a metric row.
@@ -43,8 +43,8 @@ values come from the fixed database vocabularies; they are not arbitrary provide
 
 The internal `org_deletion_metrics::snapshot` function reads these gauges and counters in one
 consistent interface for the protected exporter. The metrics route is operational-only and does
-not expose organisation identifiers or provider text. The deletion routes and client control
-remain staged, so this endpoint does not enable deletion by itself.
+not expose organisation identifiers or provider text. It is independent of the deletion flags:
+configuring its token does not enable deletion, and enabling deletion does not configure it.
 
 ## Alert conditions
 

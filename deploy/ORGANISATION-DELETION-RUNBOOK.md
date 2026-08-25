@@ -19,6 +19,22 @@ record.
 - Confirm that the configured billing provider's API version, restricted key, and webhook endpoint
   match the [billing deployment settings](README.md#billing-optional).
 
+## Enabling deletion
+
+`SOTTO_ORGANISATION_DELETION_WORKER_ENABLED=1` enables the lifecycle worker and the owner-facing
+deletion routes together; `VITE_ORGANISATION_DELETION_ENABLED=true` enables the client control.
+The single server flag is deliberate: an instance can never accept a deletion request that no
+worker will advance, which would freeze an organisation with nothing watching it.
+
+Enable on a staging deployment first, verify it there, then repeat on production with the same
+pinned image tag. The deployment steps and the verification list are in
+[README.md](README.md#enabling-organisation-deletion). Do not enable production on the strength of a
+staging result alone if the two deployments differ in billing configuration or image tag.
+
+Until both flags are set, the deletion routes return `404` and the worker leaves the queue
+untouched. Turning the flags back off restores that state for new requests, but it does not
+un-purge an organisation and does not thaw one already inside its recovery window.
+
 ## Inspect a failed or delayed operation
 
 First check the protected metrics endpoint without exposing the bearer token in shell output:
@@ -62,7 +78,8 @@ operator observation. The internal lifecycle seam requires the exact subscriptio
 missing status, an observation time no more than 15 minutes old at purge, an actor, a reason, and an
 evidence reference such as a provider request or subscription URL.
 
-The staged release provides an operational endpoint, not a public user route. Set
+This is an operational endpoint, not a public user route, and it stays separate from the
+owner-facing deletion API whether or not deletion is enabled. Set
 `SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN` only after this procedure has been reviewed and
 rehearsed. Record the exact values from the provider dashboard or request log without putting the
 bearer token in shell history:
@@ -115,7 +132,9 @@ database, never the live database. Verify that:
 
 - migrations apply cleanly;
 - deletion rows, tombstones, audit events, and metric counters are present;
-- the restored server remains healthy with both deletion flags disabled; and
+- the restored server remains healthy with both deletion flags disabled;
+- the deletion routes return `404` on that restored server, confirming the gate holds after a
+  restore; and
 - the metrics endpoint remains `503` when its token is absent.
 
 Record the rehearsal before enablement:

@@ -79,6 +79,9 @@ fn state_with_retention(pool: PgPool, retention_days: i64) -> AppState {
         oauth: None,
         oauth_config: None,
         billing: None,
+        // The contract suites merge the deletion router themselves, so they cover the handlers
+        // regardless of the deployment gate. Only the two routing tests below vary this flag.
+        organisation_deletion_enabled: false,
         organisation_deletion_retention_days: retention_days,
         organisation_deletion_metrics_token: None,
         organisation_deletion_operator_token: None,
@@ -87,6 +90,14 @@ fn state_with_retention(pool: PgPool, retention_days: i64) -> AppState {
 
 fn state(pool: PgPool) -> AppState {
     state_with_retention(pool, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS)
+}
+
+/// The state of a deployment that has completed the enablement checklist and opted in.
+fn enabled_state(pool: PgPool) -> AppState {
+    AppState {
+        organisation_deletion_enabled: true,
+        ..state(pool)
+    }
 }
 
 fn deletion_app(pool: PgPool) -> Router {
@@ -646,26 +657,17 @@ async fn deletion_routes_preserve_the_owner_access_policy() {
     cleanup(&pool, &org_id, &[&owner_id, &member_id, &outsider_id]).await;
 }
 
+/// A deployment that has not opted in must not route deletion at all: an authenticated owner
+/// sending a complete, valid request gets `404`, so an unfinished rollout cannot freeze an
+/// organisation. This is the property the enablement gate exists to hold.
 #[tokio::test]
-async fn production_router_does_not_expose_deletion() {
+async fn application_router_hides_deletion_until_the_deployment_opts_in() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
     let _test_lock = prepare_deletion_test(&pool).await;
     let (org_id, owner_id, token) = seed_owner(&pool).await;
-    let deletion_uri = format!("/orgs/{org_id}/deletion");
-    for (method, uri, body) in [
-        (
-            "POST",
-            deletion_uri.clone(),
-            Some(json!({
-                "confirm_org_id": org_id,
-                "acknowledge_subscription_cancellation": true
-            })),
-        ),
-        ("GET", deletion_uri.clone(), None),
-        ("POST", format!("{deletion_uri}/cancel"), None),
-    ] {
+    for (method, uri, body) in deletion_requests(&org_id) {
         let (status, _) = send(
             sotto_server::app(state(pool.clone())),
             method,
@@ -676,8 +678,70 @@ async fn production_router_does_not_expose_deletion() {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
+    // Nothing may have been recorded: a 404 that still wrote an operation would be worse than a
+    // reachable route, because no client or worker would then be watching it.
+    let operations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM organization_deletions WHERE org_id = $1")
+            .bind(&org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count operations");
+    assert_eq!(operations, 0);
 
     cleanup(&pool, &org_id, &[&owner_id]).await;
+}
+
+/// The mirror image: once the deployment opts in, the same requests reach the same handlers
+/// through `app` that the contract suites drive through the router directly.
+#[tokio::test]
+async fn application_router_serves_deletion_once_the_deployment_opts_in() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id, token) = seed_owner(&pool).await;
+    let expected = [StatusCode::ACCEPTED, StatusCode::OK, StatusCode::ACCEPTED];
+    for ((method, uri, body), expected) in deletion_requests(&org_id).into_iter().zip(expected) {
+        let (status, _) = send(
+            sotto_server::app(enabled_state(pool.clone())),
+            method,
+            &uri,
+            Some(&token),
+            body,
+        )
+        .await;
+        assert_eq!(status, expected, "{method} {uri}");
+    }
+    // The gate controls routing only. Authorisation still belongs to the handlers, so an
+    // unauthenticated caller must not benefit from the deployment having opted in.
+    let (unauthenticated, _) = send(
+        sotto_server::app(enabled_state(pool.clone())),
+        "GET",
+        &format!("/orgs/{org_id}/deletion"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(unauthenticated, StatusCode::UNAUTHORIZED);
+
+    cleanup(&pool, &org_id, &[&owner_id]).await;
+}
+
+/// The full owner-facing request set, in lifecycle order: request, read, cancel.
+fn deletion_requests(org_id: &str) -> Vec<(&'static str, String, Option<Value>)> {
+    let deletion_uri = format!("/orgs/{org_id}/deletion");
+    vec![
+        (
+            "POST",
+            deletion_uri.clone(),
+            Some(json!({
+                "confirm_org_id": org_id,
+                "acknowledge_subscription_cancellation": true
+            })),
+        ),
+        ("GET", deletion_uri.clone(), None),
+        ("POST", format!("{deletion_uri}/cancel"), None),
+    ]
 }
 
 #[tokio::test]
