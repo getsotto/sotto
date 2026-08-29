@@ -89,19 +89,24 @@ a compatibility break before upgrading past a minor version.
 **Renamed settings are the one thing `git pull` cannot fix for you.** Your `.env` is deliberately
 untracked, so a variable renamed upstream leaves the old name sitting in your file where nothing
 reads it, and the new name unset. Compose substitutes an empty value, the server treats the setting
-as absent, and the feature ships dark rather than failing loudly. Diff your `.env` against
-`.env.example` before every upgrade:
+as absent, and the feature ships dark rather than failing loudly.
+
+Running containers keep their environment until `up -d` recreates them, so the moment to check is
+after `git pull` has refreshed `.env.example` and before `up -d`. In that window, compare the
+setting names in your `.env` against the fresh template (only names reach the temporary files,
+never values):
 
 ```sh
-diff <(sed -n 's/^\([A-Z_][A-Z_0-9]*\)=.*/\1/p' .env | sort) \
-     <(sed -n 's/^\([A-Z_][A-Z_0-9]*\)=.*/\1/p' .env.example | sort)
+sed -n 's/^\([A-Z_][A-Z_0-9]*\)=.*/\1/p' .env | sort > /tmp/env.mine
+sed -n 's/^\([A-Z_][A-Z_0-9]*\)=.*/\1/p' .env.example | sort > /tmp/env.upstream
+diff /tmp/env.mine /tmp/env.upstream; rm -f /tmp/env.mine /tmp/env.upstream
 ```
 
-Lines marked `<` are settings nothing reads any more; lines marked `>` are ones you have not set,
-most of which are optional. The known rename:
-`STRIPE_SECRET_KEY` became `STRIPE_API_KEY`. Upgrading across that rename with the old name in place
-leaves billing unconfigured, so `POST /billing/webhook` answers `503` instead of `401` and providers
-eventually disable an endpoint that keeps failing. Rename it **before** pulling, not after.
+Lines marked `<` are settings nothing reads any more, which usually means a rename to apply to your
+`.env`; lines marked `>` are ones you have not set, most of which are optional. The known rename:
+`STRIPE_SECRET_KEY` became `STRIPE_API_KEY`. Upgrading across it with the old name in place leaves
+billing unconfigured, so `POST /billing/webhook` answers `503` instead of `401` and providers
+eventually disable an endpoint that keeps failing. Apply the rename before `up -d`, not after.
 
 ## Backups
 
