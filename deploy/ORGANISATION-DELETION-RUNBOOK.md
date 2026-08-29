@@ -137,7 +137,12 @@ database, never the live database. Verify that:
   restore; and
 - the metrics endpoint remains `503` when its token is absent.
 
-Record the rehearsal before enablement:
+Record the rehearsal before enablement, using the template below.
+
+Keep the completed record **outside version control**. A finished rehearsal names your backup
+bucket, dates and object checksums, and usually the operational weaknesses the rehearsal itself
+uncovered. That is exactly the material not to publish about a live deployment. `deploy/rehearsals/`
+is gitignored for this purpose; a private operations wiki or ticket does just as well.
 
 | Field | Value |
 | --- | --- |
