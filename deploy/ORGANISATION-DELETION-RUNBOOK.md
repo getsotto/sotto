@@ -31,9 +31,12 @@ pinned image tag. The deployment steps and the verification list are in
 [README.md](README.md#enabling-organisation-deletion). Do not enable production on the strength of a
 staging result alone if the two deployments differ in billing configuration or image tag.
 
-Until both flags are set, the deletion routes return `404` and the worker leaves the queue
-untouched. Turning the flags back off restores that state for new requests, but it does not
-un-purge an organisation and does not thaw one already inside its recovery window.
+Until the server flag is set, the deletion routes return `404` and the worker leaves the queue
+untouched. The client flag controls only whether the web app offers the deletion control; it has no
+part in routing or queue processing, so setting the server flag alone makes the API reachable and
+starts the worker even while the control stays hidden. Turning the server flag back off restores
+the `404` for new requests, but it does not un-purge an organisation and does not thaw one already
+inside its recovery window.
 
 ## Inspect a failed or delayed operation
 
@@ -135,7 +138,8 @@ database, never the live database. Verify that:
 - the restored server remains healthy with both deletion flags disabled;
 - the deletion routes return `404` on that restored server, confirming the gate holds after a
   restore; and
-- the metrics endpoint remains `503` when its token is absent.
+- the metrics endpoint remains `503` while no metrics token is configured on that server; once one
+  is configured, a request without it gets `401` instead.
 
 Record the rehearsal before enablement, using the template below.
 

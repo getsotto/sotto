@@ -210,22 +210,36 @@ tag. The full operator procedure, including the rehearsal record you must comple
 ```sh
 # in deploy/.env
 SOTTO_ORGANISATION_DELETION_WORKER_ENABLED=1
-VITE_ORGANISATION_DELETION_ENABLED=true
 ```
 
 ```sh
 docker compose -f docker-compose.prod.yml up -d
 ```
 
-The web flag is compiled in, so a source build (`up -d --build`) is what applies it; with prebuilt
-images, use the image built with the flag set.
+That enables the whole server side, the deletion routes and the lifecycle worker together, and it
+works with prebuilt images. Everything in the verification list below goes through the API, so the
+server side can be enabled and verified on its own.
+
+The client control is a separate step with a trap in it. `VITE_ORGANISATION_DELETION_ENABLED` is
+compiled into the web bundle when the image is built, and the published images are built with it
+`false`, so setting it in `deploy/.env` changes nothing while you pull prebuilt images. To show the
+control in the web app, set it in `deploy/.env` and rebuild the web image from source, which routes
+the value through the compose build argument:
+
+```sh
+docker compose -f docker-compose.prod.yml up -d --build caddy
+```
+
+or publish your own web image with that build argument set and pin the deployment to it. A source
+build needs the RAM headroom noted under [First deployment](#first-deployment).
 
 **Verify**, before repeating any of this on production:
 
 - `https://<SOTTO_DOMAIN>/health` returns `ok`;
-- the protected metrics endpoint answers with its token and `503` without one;
-- the operator observation endpoint answers with its token, `503` without one, and `401` for a
-  wrong one;
+- the protected metrics endpoint answers `200` with its token and `401` with a missing or wrong
+  one; a `503` instead means its token is not configured, so prerequisite 2 is unmet;
+- the operator observation endpoint answers `401` for a missing token, for a wrong one, and for
+  the metrics token, which it must never accept; a `503` instead means prerequisite 3 is unmet;
 - an owner on a disposable test organisation can complete the confirmation flow, see the recovery
   window, and cancel it again;
 - the audit trail and server logs show the request, cancellation, and operator observation, with
