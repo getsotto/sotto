@@ -11,6 +11,11 @@
 !.env.example
 # NOTE: `.secrets.yaml` written by `sotto init` is meant to be COMMITTED (no secrets in it).
 
+# Completed restore-rehearsal records. The template in deploy/ORGANISATION-DELETION-RUNBOOK.md is
+# public documentation; a filled-in record describes one live deployment (bucket names, object
+# checksums, and whatever weaknesses the rehearsal found) and must stay out of a public repository.
+deploy/rehearsals/
+
 # WASM build artefacts
 /crates/wasm/pkg
 
