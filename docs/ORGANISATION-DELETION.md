@@ -2,8 +2,9 @@
 
 This document specifies the implementation accepted by
 [ADR 0002](./adr/0002-safe-organisation-deletion.md) for issue #77. It is an implementation plan,
-not a claim about current behaviour. `DELETE /orgs/{org_id}` remains unregistered until the final
-enablement step.
+not a claim about current behaviour. There is no `DELETE /orgs/{org_id}`; the owner-facing routes
+are the lifecycle ones under `/orgs/{org_id}/deletion`, and they are registered only on a
+deployment that has set `SOTTO_ORGANISATION_DELETION_WORKER_ENABLED=1` (step 9 below).
 
 ## 1. Safety properties
 
@@ -624,8 +625,19 @@ Each item is an independently reviewable PR. The route remains absent through it
    end-to-end suites after the underlying seams exist.
 8. **Operations:** add metrics, alerts, retention configuration, the protected exporter, the
    backup/restore runbook, and a rehearsed recovery record.
-9. **Enablement:** register the routes, enable the client control, run the complete database,
-   Playwright, and credentialed Stripe suites, then update public documentation.
+9. **Enablement:** register the routes behind a server-side deployment gate, enable the client
+   control, run the complete database, Playwright, and credentialed Stripe suites, then update
+   public documentation.
+
+   The gate reuses `SOTTO_ORGANISATION_DELETION_WORKER_ENABLED` rather than adding a variable of
+   its own, and it gates *registration* in `app` rather than checking inside each handler. Both
+   choices are deliberate. One flag means the routes that accept work and the worker that performs
+   it cannot diverge, so no deployment can freeze an organisation it will never purge. Gating
+   registration means the routes are absent, not merely erroring, on an instance that has not
+   opted in, and a route added to `org_deletion_api` later cannot become reachable by forgetting a
+   check. The cost is that a disabled instance answers `404`, indistinguishable from an unknown
+   organisation, which is why the client keeps its own separate `VITE_ORGANISATION_DELETION_ENABLED`
+   signal to explain the state instead of reporting an error.
 
 The enablement PR must include a checklist linking the evidence for every safety property in
 section 1. A destructive cascade or a synchronous `DELETE /orgs/{org_id}` is not an acceptable

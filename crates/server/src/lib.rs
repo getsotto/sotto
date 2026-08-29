@@ -27,9 +27,9 @@ pub mod entitlements;
 pub mod error;
 pub mod machine;
 pub mod org;
-// The lifecycle seam, HTTP adapter, and worker are staged before production enablement. They
-// remain doc-hidden so tests can exercise the complete boundary without presenting deletion as a
-// stable public API.
+// The lifecycle seam, HTTP adapter, and worker remain doc-hidden: deletion is enabled per
+// deployment rather than presented as a stable public API surface, and the internal seam is not
+// something an embedder should call directly.
 #[doc(hidden)]
 pub mod org_deletion;
 #[doc(hidden)]
@@ -54,7 +54,19 @@ use crate::state::AppState;
 
 /// Build the full application router (health + auth + account + org + sync + share) over the shared
 /// state. Shared by the binary and the end-to-end tests so they exercise the same wiring.
+///
+/// The destructive organisation-deletion routes are the one conditional part of this wiring. They
+/// are registered only when [`AppState::organisation_deletion_enabled`] is set, which follows the
+/// worker opt-in; a deployment that has not opted in serves `404` for them, exactly as it did
+/// before the routes existed. Gating registration rather than checking inside each handler means a
+/// route added to [`org_deletion_api`] later cannot become reachable by forgetting the check.
 pub fn app(state: AppState) -> Router {
+    // Built before `with_state` so the branch is on the flag, not on a per-request extraction.
+    let organisation_deletion = if state.organisation_deletion_enabled {
+        org_deletion_api::router()
+    } else {
+        Router::new()
+    };
     Router::new()
         .route("/health", get(health))
         .merge(auth::router())
@@ -69,6 +81,7 @@ pub fn app(state: AppState) -> Router {
         .merge(telemetry::router())
         .merge(org_deletion_metrics::router())
         .merge(org_deletion_ops::router())
+        .merge(organisation_deletion)
         .with_state(state)
 }
 

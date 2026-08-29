@@ -38,6 +38,7 @@ fn app(pool: PgPool) -> Router {
                 return_url: "https://app.sotto.test".into(),
             },
         )),
+        organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
         organisation_deletion_operator_token: None,

@@ -156,8 +156,10 @@ export interface OrganisationDeletionStatus {
   error: "billing_unavailable" | "billing_unknown" | "purge_failed" | null;
 }
 
-/// The staged client gate stays off until the server routes, worker and operations runbook are
-/// enabled together. Vite leaves this false when the deployment does not opt in explicitly.
+/// The client gate. It is deliberately separate from the server's own gate rather than derived
+/// from it: the server answers 404 when deletion is off, which is indistinguishable from an
+/// unknown organisation, so the client needs its own signal to explain the state rather than
+/// report an error. Vite leaves this false when the deployment does not opt in explicitly.
 export const organisationDeletionEnabled =
   import.meta.env.VITE_ORGANISATION_DELETION_ENABLED === "true";
 

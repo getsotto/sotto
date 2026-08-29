@@ -20,6 +20,12 @@ pub struct AppState {
     pub billing: Option<BillingState>,
     /// Whether this instance accepts telemetry pings (`SOTTO_TELEMETRY_INGEST=1`, hosted only).
     pub telemetry_ingest: bool,
+    /// Whether the organisation-deletion API is registered on this instance.
+    ///
+    /// Sourced from the same `SOTTO_ORGANISATION_DELETION_WORKER_ENABLED` opt-in that starts the
+    /// lifecycle worker, so a deployment can never accept deletion requests that no worker will
+    /// ever advance. [`crate::app`] leaves the routes unregistered when this is false.
+    pub organisation_deletion_enabled: bool,
     /// Recovery window applied to new organisation-deletion requests.
     pub organisation_deletion_retention_days: i64,
     /// Bearer token for the protected organisation-deletion metrics exporter.

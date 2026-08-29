@@ -19,6 +19,25 @@ record.
 - Confirm that the configured billing provider's API version, restricted key, and webhook endpoint
   match the [billing deployment settings](README.md#billing-optional).
 
+## Enabling deletion
+
+`SOTTO_ORGANISATION_DELETION_WORKER_ENABLED=1` enables the lifecycle worker and the owner-facing
+deletion routes together; `VITE_ORGANISATION_DELETION_ENABLED=true` enables the client control.
+The single server flag is deliberate: an instance can never accept a deletion request that no
+worker will advance, which would freeze an organisation with nothing watching it.
+
+Enable on a staging deployment first, verify it there, then repeat on production with the same
+pinned image tag. The deployment steps and the verification list are in
+[README.md](README.md#enabling-organisation-deletion). Do not enable production on the strength of a
+staging result alone if the two deployments differ in billing configuration or image tag.
+
+Until the server flag is set, the deletion routes return `404` and the worker leaves the queue
+untouched. The client flag controls only whether the web app offers the deletion control; it has no
+part in routing or queue processing, so setting the server flag alone makes the API reachable and
+starts the worker even while the control stays hidden. Turning the server flag back off restores
+the `404` for new requests, but it does not un-purge an organisation and does not thaw one already
+inside its recovery window.
+
 ## Inspect a failed or delayed operation
 
 First check the protected metrics endpoint without exposing the bearer token in shell output:
@@ -62,7 +81,8 @@ operator observation. The internal lifecycle seam requires the exact subscriptio
 missing status, an observation time no more than 15 minutes old at purge, an actor, a reason, and an
 evidence reference such as a provider request or subscription URL.
 
-The staged release provides an operational endpoint, not a public user route. Set
+This is an operational endpoint, not a public user route, and it stays separate from the
+owner-facing deletion API whether or not deletion is enabled. Set
 `SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN` only after this procedure has been reviewed and
 rehearsed. Record the exact values from the provider dashboard or request log without putting the
 bearer token in shell history:
@@ -115,10 +135,18 @@ database, never the live database. Verify that:
 
 - migrations apply cleanly;
 - deletion rows, tombstones, audit events, and metric counters are present;
-- the restored server remains healthy with both deletion flags disabled; and
-- the metrics endpoint remains `503` when its token is absent.
+- the restored server remains healthy with both deletion flags disabled;
+- the deletion routes return `404` on that restored server, confirming the gate holds after a
+  restore; and
+- the metrics endpoint remains `503` while no metrics token is configured on that server; once one
+  is configured, a request without it gets `401` instead.
 
-Record the rehearsal before enablement:
+Record the rehearsal before enablement, using the template below.
+
+Keep the completed record **outside version control**. A finished rehearsal names your backup
+bucket, dates and object checksums, and usually the operational weaknesses the rehearsal itself
+uncovered. That is exactly the material not to publish about a live deployment. `deploy/rehearsals/`
+is gitignored for this purpose; a private operations wiki or ticket does just as well.
 
 | Field | Value |
 | --- | --- |

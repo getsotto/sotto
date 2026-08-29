@@ -1,7 +1,9 @@
-//! Staged HTTP adapter for organisation deletion.
+//! HTTP adapter for organisation deletion.
 //!
-//! [`router`] is intentionally absent from [`crate::app`]. Tests exercise the complete wire
-//! contract now, while the production route remains unavailable until the later enablement PR.
+//! [`crate::app`] merges [`router`] only when the deployment has opted in (see
+//! [`crate::state::AppState::organisation_deletion_enabled`]), so these destructive routes stay
+//! unreachable - `404`, not a handler returning an error - on an instance that has not enabled
+//! them. Tests drive the router directly to exercise the wire contract either way.
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -15,8 +17,8 @@ use crate::error::{Error, Result};
 use crate::org_deletion::{self, DeletionStatus};
 use crate::state::AppState;
 
-/// Build the deletion routes for the test-only router. Production enablement must explicitly merge
-/// this router into [`crate::app`] after the remaining client, operations, and safety gates exist.
+/// Build the deletion routes. [`crate::app`] merges this only behind the deployment opt-in; tests
+/// merge it directly to cover the contract on both sides of that gate.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
