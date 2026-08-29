@@ -31,7 +31,12 @@ test("login, unlock, invite, and checkout", async ({ page }) => {
     .getByRole("heading", { name: /^Members of/ })
     .locator("xpath=following-sibling::p[normalize-space()='Loading…']");
   await expect(memberLoading).toHaveCount(0);
-  const invitedRow = page.getByRole("listitem").filter({ hasText: fixture.invitee_user_id });
+  const membersList = page
+    .getByRole("heading", { name: /^Members of/ })
+    .locator("xpath=following-sibling::ul[1]");
+  const invitedRow = membersList
+    .getByRole("listitem")
+    .filter({ hasText: fixture.invitee_user_id });
   if (!(await invitedRow.isVisible().catch(() => false))) {
     await page.getByLabel("Invite by email").fill(fixture.invitee_email);
     await page.getByRole("button", { name: "Invite" }).click();
