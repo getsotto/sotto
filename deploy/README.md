@@ -178,7 +178,18 @@ One-time setup, any provider:
    ```
 
 **Restore** (into a running instance; drops and recreates objects from the dump). Fetch the
-dump with your provider's tool (`gsutil cp` / `aws s3 cp` / `rclone copyto`), then:
+dump on your own machine, never the host - the append-only posture means the host cannot read
+what it wrote. One consequence of uniform bucket-level access is easy to miss: it disables the
+object ACLs that basic project roles relied on, so until you grant yourself read explicitly,
+nobody at all can fetch a backup - project owner included. Grant it once:
+
+```sh
+# Google Cloud:
+gcloud storage buckets add-iam-policy-binding gs://<bucket> \
+  --member="user:<your-account>" --role="roles/storage.objectViewer"
+```
+
+Then fetch with your provider's tool (`gsutil cp` / `aws s3 cp` / `rclone copyto`) and restore:
 
 ```sh
 docker compose -f docker-compose.prod.yml exec -T postgres \
