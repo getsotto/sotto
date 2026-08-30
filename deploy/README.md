@@ -160,14 +160,8 @@ One-time setup, any provider:
      --member="serviceAccount:<vm-service-account>" --role="roles/storage.legacyBucketReader"
    ```
 
-   The host can then list backup names but read none of them. Verify all three properties from
-   the host once, after setup:
-
-   ```sh
-   ./backup.sh                                      # upload succeeds
-   gsutil cat gs://<bucket>/sotto-<stamp>.dump      # AccessDenied: needs storage.objects.get
-   gsutil rm gs://<bucket>/sotto-<stamp>.dump       # AccessDenied: needs storage.objects.delete
-   ```
+   The host can then list backup names but read none of them; the posture check at the end of
+   this section proves it once everything is configured.
 
    On AWS, an IAM policy allowing only `s3:PutObject` on the bucket serves the same purpose.
    Restore rehearsals fetch the dump with your own credentials on another machine, never on the
@@ -192,8 +186,18 @@ docker compose -f docker-compose.prod.yml exec -T postgres \
 docker compose -f docker-compose.prod.yml restart server
 ```
 
-Run one backup by hand now (`./backup.sh`) and rehearse the restore once against a scratch
-database - a backup that has never been restored is a hope, not a backup.
+Run one backup by hand now and verify all three properties of the append-only posture from the
+host - the upload must succeed and both refusals must appear, because an unverified posture and a
+working one look identical from the outside:
+
+```sh
+./backup.sh                                      # upload succeeds
+gsutil cat gs://<bucket>/sotto-<stamp>.dump      # AccessDenied: needs storage.objects.get
+gsutil rm gs://<bucket>/sotto-<stamp>.dump       # AccessDenied: needs storage.objects.delete
+```
+
+Then rehearse the restore once against a scratch database - a backup that has never been restored
+is a hope, not a backup.
 
 ## Access logs
 
