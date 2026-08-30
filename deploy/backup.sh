@@ -8,7 +8,8 @@
 #
 # One-time setup (full walkthrough in deploy/README.md § Backups):
 #   1. Create a bucket with a ~30-day deletion lifecycle at your provider.
-#   2. Give this host WRITE-ONLY access to it.
+#   2. Give this host APPEND-ONLY access to it (create + list, never read or delete - the
+#      exact roles per provider are in the README; create alone cannot upload with gsutil).
 #   3. Set SOTTO_BACKUP_BUCKET in deploy/.env (unquoted, like every .env value).
 #   4. Install the cron entry.
 #
