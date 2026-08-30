@@ -138,16 +138,34 @@ One-time setup, any provider:
      '{"Rules":[{"ID":"expire","Status":"Enabled","Filter":{},"Expiration":{"Days":30}}]}'
    ```
 
-2. **Write-only credentials for the host.** The box should be able to add backups but never
-   read or delete them - a compromised host then can't destroy your history. On GCS that is
-   `roles/storage.objectCreator` for the VM's service account; on AWS, an IAM policy allowing
-   only `s3:PutObject` on the bucket.
+2. **Append-only credentials for the host.** The box should be able to add backups but never
+   read or delete them - a compromised host then can't destroy or exfiltrate your history. Two
+   subtleties make this stricter than it looks on GCS:
+
+   - `roles/storage.objectCreator` alone cannot even upload: `gsutil cp` checks whether the
+     destination is a "directory" first, and that check is a list operation. Pair it with
+     `roles/storage.legacyBucketReader`, which adds exactly `storage.objects.list` and
+     `storage.buckets.get` - object names and bucket metadata, nothing that reads contents. (`gcloud storage cp` does not help here - it stats the destination
+     object before writing, which needs `storage.objects.get`, the very permission to withhold.)
+   - On a bucket with fine-grained ACLs, the uploader is granted owner on every object it
+     creates and can read its own uploads back regardless of IAM. Enable uniform bucket-level
+     access so IAM alone decides.
 
    ```sh
    # Google Cloud:
+   gcloud storage buckets update gs://<bucket> --uniform-bucket-level-access
    gcloud storage buckets add-iam-policy-binding gs://<bucket> \
      --member="serviceAccount:<vm-service-account>" --role="roles/storage.objectCreator"
+   gcloud storage buckets add-iam-policy-binding gs://<bucket> \
+     --member="serviceAccount:<vm-service-account>" --role="roles/storage.legacyBucketReader"
    ```
+
+   The host can then list backup names but read none of them; the posture check at the end of
+   this section proves it once everything is configured.
+
+   On AWS, an IAM policy allowing only `s3:PutObject` on the bucket serves the same purpose.
+   Restore rehearsals fetch the dump with your own credentials on another machine, never on the
+   host - by design, the host can no longer read what it wrote.
 
 3. **Point the script at it** (`deploy/.env`): `SOTTO_BACKUP_BUCKET=gs://<bucket>` (or the
    `s3://` / rclone form).
@@ -168,8 +186,18 @@ docker compose -f docker-compose.prod.yml exec -T postgres \
 docker compose -f docker-compose.prod.yml restart server
 ```
 
-Run one backup by hand now (`./backup.sh`) and rehearse the restore once against a scratch
-database - a backup that has never been restored is a hope, not a backup.
+Run one backup by hand now and verify all three properties of the append-only posture from the
+host - the upload must succeed and both refusals must appear, because an unverified posture and a
+working one look identical from the outside:
+
+```sh
+./backup.sh                                      # upload succeeds
+gsutil cat gs://<bucket>/sotto-<stamp>.dump      # AccessDenied: needs storage.objects.get
+gsutil rm gs://<bucket>/sotto-<stamp>.dump       # AccessDenied: needs storage.objects.delete
+```
+
+Then rehearse the restore once against a scratch database - a backup that has never been restored
+is a hope, not a backup.
 
 ## Access logs
 
