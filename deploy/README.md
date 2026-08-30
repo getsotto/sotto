@@ -144,8 +144,8 @@ One-time setup, any provider:
 
    - `roles/storage.objectCreator` alone cannot even upload: `gsutil cp` checks whether the
      destination is a "directory" first, and that check is a list operation. Pair it with
-     `roles/storage.legacyBucketReader`, which adds exactly `storage.objects.list` and nothing
-     that reads contents. (`gcloud storage cp` does not help here - it stats the destination
+     `roles/storage.legacyBucketReader`, which adds exactly `storage.objects.list` and
+     `storage.buckets.get` - object names and bucket metadata, nothing that reads contents. (`gcloud storage cp` does not help here - it stats the destination
      object before writing, which needs `storage.objects.get`, the very permission to withhold.)
    - On a bucket with fine-grained ACLs, the uploader is granted owner on every object it
      creates and can read its own uploads back regardless of IAM. Enable uniform bucket-level
