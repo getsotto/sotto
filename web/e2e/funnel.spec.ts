@@ -83,6 +83,7 @@ test("landing page offers a star and a contributor path", async ({ page }) => {
         stars: 12,
         forks: 3,
         repo_url: "https://github.com/getsotto/sotto",
+        contributor_count: 2,
         contributors: [
           { login: "alice", html_url: "https://github.com/alice", contributions: 8 },
           { login: "bob", html_url: "https://github.com/bob", contributions: 2 },

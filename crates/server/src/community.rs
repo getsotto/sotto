@@ -40,7 +40,10 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
 const REPO_API: &str = "https://api.github.com/repos/getsotto/sotto";
 const CONTRIBUTORS_API: &str =
     "https://api.github.com/repos/getsotto/sotto/contributors?per_page=20";
-/// Cap what we serialise even if GitHub returns more.
+/// `per_page=1` so the Link `rel="last"` page number is the total contributor count.
+const CONTRIBUTORS_COUNT_API: &str =
+    "https://api.github.com/repos/getsotto/sotto/contributors?per_page=1";
+/// Cap the displayed name list; [`Snapshot::contributor_count`] is the unpaginated total.
 const MAX_CONTRIBUTORS: usize = 20;
 
 /// The complete `/community` payload. Adding a field here must update the pinning test.
@@ -49,6 +52,8 @@ pub struct Snapshot {
     pub stars: u32,
     pub forks: u32,
     pub repo_url: String,
+    /// GitHub's total, including pages we do not serialise in [`Self::contributors`].
+    pub contributor_count: u32,
     pub contributors: Vec<Contributor>,
 }
 
@@ -241,12 +246,63 @@ impl Source {
 async fn fetch_github(client: &reqwest::Client) -> Result<Snapshot, String> {
     // Both calls share the client timeout; running them together keeps the whole refresh inside
     // that bound instead of stacking two sequential 10s waits.
-    let (repo, raw) = tokio::try_join!(
+    let (repo, page) = tokio::try_join!(
         get_github::<GithubRepo>(client, REPO_API),
-        get_github::<Vec<GithubContributor>>(client, CONTRIBUTORS_API),
+        get_github_page::<Vec<GithubContributor>>(client, CONTRIBUTORS_API),
     )?;
-    let contributors = raw
-        .into_iter()
+    let contributor_count = match contributor_total(page.body.len() as u32, page.link.as_deref()) {
+        Some(n) => n,
+        None => {
+            let count_page =
+                get_github_page::<Vec<GithubContributor>>(client, CONTRIBUTORS_COUNT_API).await?;
+            last_page_from_link(count_page.link.as_deref().unwrap_or(""))
+                .unwrap_or(count_page.body.len() as u32)
+        }
+    };
+    Ok(Snapshot {
+        stars: repo.stargazers_count,
+        forks: repo.forks_count,
+        repo_url: repo.html_url,
+        contributor_count,
+        contributors: display_contributors(page.body),
+    })
+}
+
+struct GithubPage<T> {
+    body: T,
+    link: Option<String>,
+}
+
+async fn get_github<T: for<'de> Deserialize<'de>>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<T, String> {
+    Ok(get_github_page(client, url).await?.body)
+}
+
+async fn get_github_page<T: for<'de> Deserialize<'de>>(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<GithubPage<T>, String> {
+    let resp = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    let link = resp
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(GithubPage { body, link })
+}
+
+fn display_contributors(raw: Vec<GithubContributor>) -> Vec<Contributor> {
+    raw.into_iter()
         .filter(|c| c.usable())
         .take(MAX_CONTRIBUTORS)
         .map(|c| Contributor {
@@ -254,30 +310,34 @@ async fn fetch_github(client: &reqwest::Client) -> Result<Snapshot, String> {
             html_url: c.html_url,
             contributions: c.contributions,
         })
-        .collect();
-    Ok(Snapshot {
-        stars: repo.stargazers_count,
-        forks: repo.forks_count,
-        repo_url: repo.html_url,
-        contributors,
-    })
+        .collect()
 }
 
-async fn get_github<T: for<'de> Deserialize<'de>>(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<T, String> {
-    client
-        .get(url)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json()
-        .await
-        .map_err(|e| e.to_string())
+/// Exact total when GitHub sent a complete first page; `None` if more pages exist.
+fn contributor_total(page_len: u32, link: Option<&str>) -> Option<u32> {
+    match link.and_then(last_page_from_link) {
+        None => Some(page_len),
+        Some(_) => None,
+    }
+}
+
+fn last_page_from_link(link: &str) -> Option<u32> {
+    for part in link.split(',') {
+        let part = part.trim();
+        if !part.contains("rel=\"last\"") && !part.contains("rel=last") {
+            continue;
+        }
+        let start = part.find('<')?;
+        let end = part[start..].find('>')? + start;
+        let href = &part[start + 1..end];
+        let parsed = url::Url::parse(href).ok()?;
+        for (key, value) in parsed.query_pairs() {
+            if key == "page" {
+                return value.parse().ok();
+            }
+        }
+    }
+    None
 }
 
 #[derive(Deserialize)]
@@ -360,6 +420,7 @@ mod pin {
             stars: 12,
             forks: 3,
             repo_url: "https://github.com/getsotto/sotto".into(),
+            contributor_count: 1,
             contributors: vec![Contributor {
                 login: "alice".into(),
                 html_url: "https://github.com/alice".into(),
@@ -379,7 +440,13 @@ mod pin {
             .collect();
         assert_eq!(
             keys,
-            BTreeSet::from(["contributors", "forks", "repo_url", "stars"])
+            BTreeSet::from([
+                "contributor_count",
+                "contributors",
+                "forks",
+                "repo_url",
+                "stars"
+            ])
         );
         let contrib = &json["contributors"][0];
         let contrib_keys: BTreeSet<&str> = contrib
@@ -417,5 +484,32 @@ mod pin {
             r#type: "User".into(),
         }
         .usable());
+    }
+
+    #[test]
+    fn github_contributor_json_drops_bots() {
+        let raw: Vec<GithubContributor> = serde_json::from_str(
+            r#"[{"login":"dependabot[bot]","html_url":"https://github.com/apps/dependabot","contributions":4,"type":"Bot"},{"login":"alice","html_url":"https://github.com/alice","contributions":8,"type":"User"}]"#,
+        )
+        .unwrap();
+        let people = display_contributors(raw);
+        assert_eq!(people.len(), 1);
+        assert_eq!(people[0].login, "alice");
+    }
+
+    #[test]
+    fn complete_first_page_is_the_total() {
+        assert_eq!(contributor_total(3, None), Some(3));
+        assert_eq!(contributor_total(3, Some("")), Some(3));
+    }
+
+    #[test]
+    fn link_header_last_page_is_the_total_at_per_page_one() {
+        let link = concat!(
+            r#"<https://api.github.com/repositories/1/contributors?per_page=1&page=2>; rel="next", "#,
+            r#"<https://api.github.com/repositories/1/contributors?per_page=1&page=47>; rel="last""#
+        );
+        assert_eq!(last_page_from_link(link), Some(47));
+        assert_eq!(contributor_total(20, Some(link)), None);
     }
 }

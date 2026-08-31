@@ -16,6 +16,7 @@ fn sample() -> Snapshot {
         stars: 12,
         forks: 3,
         repo_url: "https://github.com/getsotto/sotto".into(),
+        contributor_count: 1,
         contributors: vec![Contributor {
             login: "alice".into(),
             html_url: "https://github.com/alice".into(),
@@ -55,6 +56,7 @@ async fn returns_the_pinned_payload() {
     assert_eq!(body["stars"], 12);
     assert_eq!(body["forks"], 3);
     assert_eq!(body["repo_url"], "https://github.com/getsotto/sotto");
+    assert_eq!(body["contributor_count"], 1);
     assert_eq!(body["contributors"][0]["login"], "alice");
     assert_eq!(body["contributors"][0]["contributions"], 8);
     assert!(body["contributors"][0].get("avatar_url").is_none());

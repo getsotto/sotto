@@ -614,6 +614,7 @@ export interface Community {
   stars: number;
   forks: number;
   repoUrl: string;
+  contributorCount: number;
   contributors: CommunityContributor[];
 }
 
@@ -629,12 +630,14 @@ export async function fetchCommunity(): Promise<Community | null> {
       stars: number;
       forks: number;
       repo_url: string;
+      contributor_count: number;
       contributors: { login: string; html_url: string; contributions: number }[];
     };
     return {
       stars: body.stars,
       forks: body.forks,
       repoUrl: body.repo_url,
+      contributorCount: body.contributor_count,
       contributors: body.contributors.map((c) => ({
         login: c.login,
         htmlUrl: c.html_url,

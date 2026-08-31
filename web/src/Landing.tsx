@@ -225,8 +225,8 @@ function communitySummary(stats: Community | null): string | null {
   if (stats.forks > 0) {
     parts.push(`${stats.forks} ${stats.forks === 1 ? "fork" : "forks"}`);
   }
-  if (stats.contributors.length > 1) {
-    parts.push(`${stats.contributors.length} contributors`);
+  if (stats.contributorCount > 1) {
+    parts.push(`${stats.contributorCount} contributors`);
   }
   return parts.length > 0 ? parts.join(" · ") : null;
 }
