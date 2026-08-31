@@ -149,8 +149,12 @@ impl Source {
 }
 
 async fn fetch_github(client: &reqwest::Client) -> Result<Snapshot, String> {
-    let repo: GithubRepo = get_github(client, REPO_API).await?;
-    let raw: Vec<GithubContributor> = get_github(client, CONTRIBUTORS_API).await?;
+    // Both calls share the client timeout; running them together keeps the whole refresh inside
+    // that bound instead of stacking two sequential 10s waits.
+    let (repo, raw) = tokio::try_join!(
+        get_github::<GithubRepo>(client, REPO_API),
+        get_github::<Vec<GithubContributor>>(client, CONTRIBUTORS_API),
+    )?;
     let contributors = raw
         .into_iter()
         .filter(|c| c.usable())
