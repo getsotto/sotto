@@ -74,9 +74,6 @@ test("checkout cancelled return is handled", async ({ page }) => {
   await expect(page).not.toHaveURL(/billing=cancelled/);
 });
 
-// Deletion is opt-in per deployment and the repository defaults keep it off, so a build made
-// without `VITE_ORGANISATION_DELETION_ENABLED=true` must never show a destructive control. This
-// suite builds with those defaults, which is what makes it the regression test for them.
 test("landing page offers a star and a contributor path", async ({ page }) => {
   await page.route("**/community", async (route) => {
     await route.fulfill({
@@ -112,6 +109,9 @@ test("landing page offers a star and a contributor path", async ({ page }) => {
   );
 });
 
+// Deletion is opt-in per deployment and the repository defaults keep it off, so a build made
+// without `VITE_ORGANISATION_DELETION_ENABLED=true` must never show a destructive control. This
+// suite builds with those defaults, which is what makes it the regression test for them.
 test("organisation deletion stays disabled in a default build", async ({ page }) => {
   await loginAndUnlock(page);
   await selectOwnerOrganisation(page);
