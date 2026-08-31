@@ -2,10 +2,10 @@
 
 Thank you for your interest in contributing to Sotto.
 
-Sotto is a zero knowledge secret sync tool: one Rust crypto core, a native CLI, an Axum
+Sotto is a zero-knowledge secret sync tool: one Rust crypto core, a native CLI, an Axum
 server that stores ciphertext only, and a browser client that runs the same core through
 WebAssembly. The end-to-end flow works (encrypt locally, sync, decrypt on another device,
-share a one time link, team grants and rotation). It is pre-1.0 and has not had a
+share a one-time link, team grants and rotation). It is pre-1.0 and has not had a
 third-party cryptographic audit - see [SECURITY.md](SECURITY.md).
 
 The fastest way in is a labelled
