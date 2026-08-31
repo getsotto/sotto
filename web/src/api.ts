@@ -603,3 +603,45 @@ export async function fetchShare(token: string): Promise<Share> {
     passphraseSalt: body.passphrase_salt ? standardB64ToBytes(body.passphrase_salt) : null,
   };
 }
+
+export interface CommunityContributor {
+  login: string;
+  htmlUrl: string;
+  contributions: number;
+}
+
+export interface Community {
+  stars: number;
+  forks: number;
+  repoUrl: string;
+  contributors: CommunityContributor[];
+}
+
+/// Public GitHub snapshot for the landing page. Same-origin (`/community`); returns `null` when
+/// the server cannot reach GitHub and has nothing cached - the page then hides the counts.
+export async function fetchCommunity(): Promise<Community | null> {
+  try {
+    const resp = await fetch("/community");
+    if (!resp.ok) {
+      return null;
+    }
+    const body = (await resp.json()) as {
+      stars: number;
+      forks: number;
+      repo_url: string;
+      contributors: { login: string; html_url: string; contributions: number }[];
+    };
+    return {
+      stars: body.stars,
+      forks: body.forks,
+      repoUrl: body.repo_url,
+      contributors: body.contributors.map((c) => ({
+        login: c.login,
+        htmlUrl: c.html_url,
+        contributions: c.contributions,
+      })),
+    };
+  } catch {
+    return null;
+  }
+}

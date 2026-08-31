@@ -77,6 +77,17 @@ test("checkout cancelled return is handled", async ({ page }) => {
 // Deletion is opt-in per deployment and the repository defaults keep it off, so a build made
 // without `VITE_ORGANISATION_DELETION_ENABLED=true` must never show a destructive control. This
 // suite builds with those defaults, which is what makes it the regression test for them.
+test("landing page offers a star and a contributor path", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Open source" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Star on GitHub" })).toHaveAttribute(
+    "href",
+    "https://github.com/getsotto/sotto",
+  );
+  await expect(page.getByRole("link", { name: "Good first issues" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Contributing" })).toBeVisible();
+});
+
 test("organisation deletion stays disabled in a default build", async ({ page }) => {
   await loginAndUnlock(page);
   await selectOwnerOrganisation(page);

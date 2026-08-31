@@ -240,6 +240,15 @@ exposure, how the (re-fetched, weaker) web surface is hardened, and how to verif
 The full adversary model, guarantees, and explicit non-goals are published in
 [THREAT-MODEL.md](THREAT-MODEL.md). Report vulnerabilities privately per SECURITY.md.
 
+## Contributing
+
+Sotto is Apache-2.0 and welcomes contributions. Start at [CONTRIBUTING.md](CONTRIBUTING.md);
+[good first issues](https://github.com/getsotto/sotto/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+are labelled, and questions that are not bugs belong in
+[Discussions](https://github.com/getsotto/sotto/discussions).
+
+Please report vulnerabilities privately per [SECURITY.md](SECURITY.md).
+
 ## Licence
 
 Licensed under the [Apache License, Version 2.0](LICENSE) - all crates and the web client.

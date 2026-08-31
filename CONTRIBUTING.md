@@ -2,7 +2,33 @@
 
 Thank you for your interest in contributing to Sotto.
 
-Sotto is an early-stage, multi-crate Rust workspace for a zero-knowledge secret sync tool. The project is currently under active development and most behaviour is still scaffolding, so contribution guidance is focused on code quality, tests, and safe collaboration.
+Sotto is a zero knowledge secret sync tool: one Rust crypto core, a native CLI, an Axum
+server that stores ciphertext only, and a browser client that runs the same core through
+WebAssembly. The end-to-end flow works (encrypt locally, sync, decrypt on another device,
+share a one time link, team grants and rotation). It is pre-1.0 and has not had a
+third-party cryptographic audit - see [SECURITY.md](SECURITY.md).
+
+The fastest way in is a labelled
+[good first issue](https://github.com/getsotto/sotto/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22).
+Questions that are not bugs belong in
+[Discussions](https://github.com/getsotto/sotto/discussions).
+
+## Ways in
+
+You do not need to touch cryptography to help.
+
+- **Docs and copy.** README, CLI `--help` text, and the landing page. Prose uses British
+  English (organisation, initialise, behaviour) and plain hyphens, never em dashes.
+- **CLI affordances.** Completions already exist (`sotto completions bash`); wiring them
+  into `install.sh`, adding examples to `--help`, and Windows PATH notes are typical
+  first issues.
+- **Tests and fixtures.** Anything that makes a failure mode obvious without expanding
+  the crypto surface.
+- **Crypto and the server** are welcome too, but start a discussion or issue first.
+  Unaudited cryptography is a first-class review concern.
+
+Search existing issues before opening a new one. Security reports go privately per
+[SECURITY.md](SECURITY.md), never as a public issue.
 
 ## Getting started
 
@@ -36,10 +62,9 @@ cargo test --workspace
 
 ## Issues
 
-- Search existing issues before opening a new one.
-- Use clear, specific titles and reproduction steps where possible.
-- For bug reports, include the command you ran, the expected behaviour, and the observed behaviour.
-- For design or feature discussions, describe the problem and a proposed approach.
+Use the issue templates. Search existing issues first. Bug reports need the command, the
+expected behaviour, and the observed behaviour. Feature ideas start with the problem, not
+the patch.
 
 ## Coding standards
 
@@ -115,5 +140,6 @@ Pull requests with unsigned commits cannot be merged.
 
 ## Notes
 
-- This project is not production-ready.
-- The current implementation is early scaffolding and should not be used to protect real secrets.
+- Sotto is pre-1.0 and has not had a third-party cryptographic audit. Honest guidance:
+  useful for team development and staging secrets today; keep production crown jewels
+  elsewhere until the audit. See [SECURITY.md](SECURITY.md) and [THREAT-MODEL.md](THREAT-MODEL.md).
