@@ -53,6 +53,8 @@ services:
       # Anonymous daily version ping (random instance uuid + version + os/arch, nothing else -
       # README §Telemetry). On by default; set SOTTO_TELEMETRY=off in deploy/.env to opt out.
       SOTTO_TELEMETRY: ${SOTTO_TELEMETRY:-}
+      # Landing-page GitHub stats. Dark (503, no outbound GitHub) unless set to 1.
+      SOTTO_COMMUNITY: ${SOTTO_COMMUNITY:-}
       # Recovery window for new requests, 1-365 days; match it to backup/export retention. Existing
       # operations keep their stored deadline. The organisation stays frozen for the whole window.
       # Use '-' rather than ':-' so an explicitly empty value reaches server validation.

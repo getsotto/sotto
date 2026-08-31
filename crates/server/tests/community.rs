@@ -89,6 +89,12 @@ async fn serves_stale_when_github_fails_after_a_hit() {
 }
 
 #[tokio::test]
+async fn disabled_source_is_service_unavailable() {
+    let (status, _) = get_community(&app(Handle::disabled())).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn empty_cache_and_failed_fetch_is_bad_gateway() {
     let app = app(Handle::sequence(vec![Err("github down".into())]));
     let (status, _) = get_community(&app).await;

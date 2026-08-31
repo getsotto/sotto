@@ -1,8 +1,14 @@
 //! Public GitHub community snapshot for the marketing page.
 //!
-//! `GET /community` is unauthenticated (Caddy rate-limits it with the other public routes). The
-//! browser never talks to `api.github.com`: a strict `connect-src 'self'` CSP forbids it, so this
-//! process fetches and caches the numbers and the landing page reads them same-origin.
+//! `GET /community` is unauthenticated. The bundled Caddyfile puts it in the same per-IP
+//! rate-limit zone as the other public routes; the handler itself does not rate-limit, so a
+//! deployment that is not using that Caddyfile is unlimited. The browser never talks to
+//! `api.github.com`: a strict `connect-src 'self'` CSP forbids it, so this process fetches and
+//! caches the numbers and the landing page reads them same-origin.
+//!
+//! Talking to GitHub ships dark: `SOTTO_COMMUNITY=1` enables the live source (the hosted
+//! marketing instance). Everywhere else the route returns 503 and the landing page hides the
+//! counts, so a self-hosted server never calls `api.github.com`.
 //!
 //! The entire JSON body is [`Snapshot`] - stars, forks, contributor logins, and the repo URL.
 //! Adding a field is a contract change: the unit test in this file pins the keys. Avatars are
@@ -84,6 +90,7 @@ struct Cached {
 enum Source {
     Live { client: reqwest::Client },
     Sequence(Arc<Mutex<VecDeque<Result<Snapshot, String>>>>),
+    Disabled,
 }
 
 impl Handle {
@@ -96,6 +103,15 @@ impl Handle {
             .build()
             .expect("reqwest client with static config builds");
         Self::new(Source::Live { client }, TTL, NEGATIVE_TTL, Duration::ZERO)
+    }
+
+    /// No GitHub calls. Production uses this unless `SOTTO_COMMUNITY=1`.
+    pub fn disabled() -> Self {
+        Self::new(Source::Disabled, TTL, NEGATIVE_TTL, Duration::ZERO)
+    }
+
+    fn enabled(&self) -> bool {
+        !matches!(self.source, Source::Disabled)
     }
 
     /// Scripted source for tests. Each call to GitHub is a pop from the front of `responses`.
@@ -141,6 +157,9 @@ impl Handle {
     }
 
     async fn snapshot(&self) -> Option<Snapshot> {
+        if !self.enabled() {
+            return None;
+        }
         if let Some(hit) = self.fresh() {
             return Some(hit);
         }
@@ -209,6 +228,7 @@ impl Source {
     async fn fetch(&self) -> Result<Snapshot, String> {
         match self {
             Self::Live { client } => fetch_github(client).await,
+            Self::Disabled => Err("community github is not enabled".into()),
             Self::Sequence(queue) => queue
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -287,9 +307,20 @@ impl GithubContributor {
     }
 }
 
-/// Production router: live GitHub, merged into [`crate::app`].
+/// Production router: live GitHub when `SOTTO_COMMUNITY=1`, otherwise dark.
 pub fn router() -> Router<AppState> {
-    router_with(Handle::live())
+    if community_github_enabled() {
+        router_with(Handle::live())
+    } else {
+        router_with(Handle::disabled())
+    }
+}
+
+fn community_github_enabled() -> bool {
+    std::env::var("SOTTO_COMMUNITY")
+        .ok()
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
 }
 
 /// Test seam: the same route with an injected handle, still typed as `Router<AppState>` so it
@@ -309,6 +340,9 @@ pub fn router_standalone(handle: Handle) -> axum::Router {
 
 /// `GET /community` - cached GitHub stars, forks, and contributor logins.
 async fn community(Extension(handle): Extension<Handle>) -> Result<Json<Snapshot>, StatusCode> {
+    if !handle.enabled() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     handle
         .snapshot()
         .await
