@@ -76,9 +76,10 @@ impl Handle {
     pub fn live() -> Self {
         let client = reqwest::Client::builder()
             .timeout(UPSTREAM_TIMEOUT)
+            .connect_timeout(Duration::from_secs(5))
             .user_agent("sotto-server")
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("reqwest client with static config builds");
         Self {
             source: Source::Live { client },
             cache: Arc::new(Mutex::new(None)),
