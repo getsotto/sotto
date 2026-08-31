@@ -94,3 +94,36 @@ async fn empty_cache_and_failed_fetch_is_bad_gateway() {
     let (status, _) = get_community(&app).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 }
+
+#[tokio::test]
+async fn coalesces_concurrent_misses_into_one_fetch() {
+    let app = app(Handle::sequence_with_ttl_and_backoff(
+        vec![Ok(sample()), Err("second fetch must not happen".into())],
+        Duration::from_secs(60 * 60),
+        Duration::from_secs(60 * 60),
+        Duration::from_millis(50),
+    ));
+    let (a, b) = tokio::join!(get_community(&app), get_community(&app));
+    assert_eq!(a.0, StatusCode::OK);
+    assert_eq!(b.0, StatusCode::OK);
+    assert_eq!(a.1, b.1);
+    assert_eq!(a.1["stars"], 12);
+}
+
+#[tokio::test]
+async fn failed_fetch_is_not_retried_until_backoff_elapses() {
+    let app = app(Handle::sequence_with_ttl_and_backoff(
+        vec![Err("github down".into()), Ok(sample())],
+        Duration::from_secs(60 * 60),
+        Duration::from_millis(40),
+        Duration::ZERO,
+    ));
+    let (first, _) = get_community(&app).await;
+    assert_eq!(first, StatusCode::BAD_GATEWAY);
+    let (second, _) = get_community(&app).await;
+    assert_eq!(second, StatusCode::BAD_GATEWAY);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (third, body) = get_community(&app).await;
+    assert_eq!(third, StatusCode::OK);
+    assert_eq!(body["stars"], 12);
+}

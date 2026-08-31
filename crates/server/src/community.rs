@@ -8,8 +8,10 @@
 //! Adding a field is a contract change: the unit test in this file pins the keys. Avatars are
 //! omitted on purpose (`img-src 'self'`, and Sordino does not put imagery on the landing page).
 //!
-//! The cache is in-memory and per-process. A GitHub outage with a warm cache serves the stale
-//! snapshot; a cold cache and a failed fetch is 502, and the landing page hides the counts.
+//! The cache is in-memory and per-process. Concurrent misses share one in-flight refresh so a
+//! burst of landing-page traffic cannot stampede GitHub. A GitHub outage with a warm cache serves
+//! the stale snapshot and backs off before retrying; a cold cache and a failed fetch is 502, and
+//! the landing page hides the counts.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -25,6 +27,8 @@ use crate::state::AppState;
 
 /// How long a successful GitHub fetch is reused before the next request goes upstream.
 const TTL: Duration = Duration::from_secs(60 * 60);
+/// How long a failed fetch suppresses retries (stale data is still served).
+const NEGATIVE_TTL: Duration = Duration::from_secs(5 * 60);
 /// Bound the GitHub round-trip so a hung upstream cannot stall the landing page.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
 const REPO_API: &str = "https://api.github.com/repos/getsotto/sotto";
@@ -55,8 +59,19 @@ pub struct Contributor {
 #[derive(Clone)]
 pub struct Handle {
     source: Source,
-    cache: Arc<Mutex<Option<Cached>>>,
+    state: Arc<Mutex<CacheState>>,
+    /// Serialises refreshes so concurrent misses share one upstream round-trip.
+    fetch_lock: Arc<tokio::sync::Mutex<()>>,
     ttl: Duration,
+    negative_ttl: Duration,
+    /// Test-only pause before talking to [`Source`], so two requests can overlap a miss.
+    fetch_delay: Duration,
+}
+
+struct CacheState {
+    entry: Option<Cached>,
+    /// Do not fetch again until this instant (set after a failure).
+    retry_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -80,11 +95,7 @@ impl Handle {
             .user_agent("sotto-server")
             .build()
             .expect("reqwest client with static config builds");
-        Self {
-            source: Source::Live { client },
-            cache: Arc::new(Mutex::new(None)),
-            ttl: TTL,
-        }
+        Self::new(Source::Live { client }, TTL, NEGATIVE_TTL, Duration::ZERO)
     }
 
     /// Scripted source for tests. Each call to GitHub is a pop from the front of `responses`.
@@ -93,16 +104,58 @@ impl Handle {
     }
 
     pub fn sequence_with_ttl(responses: Vec<Result<Snapshot, String>>, ttl: Duration) -> Self {
-        Self {
-            source: Source::Sequence(Arc::new(Mutex::new(VecDeque::from(responses)))),
-            cache: Arc::new(Mutex::new(None)),
+        Self::new(
+            Source::Sequence(Arc::new(Mutex::new(VecDeque::from(responses)))),
             ttl,
+            NEGATIVE_TTL,
+            Duration::ZERO,
+        )
+    }
+
+    pub fn sequence_with_ttl_and_backoff(
+        responses: Vec<Result<Snapshot, String>>,
+        ttl: Duration,
+        negative_ttl: Duration,
+        fetch_delay: Duration,
+    ) -> Self {
+        Self::new(
+            Source::Sequence(Arc::new(Mutex::new(VecDeque::from(responses)))),
+            ttl,
+            negative_ttl,
+            fetch_delay,
+        )
+    }
+
+    fn new(source: Source, ttl: Duration, negative_ttl: Duration, fetch_delay: Duration) -> Self {
+        Self {
+            source,
+            state: Arc::new(Mutex::new(CacheState {
+                entry: None,
+                retry_at: None,
+            })),
+            fetch_lock: Arc::new(tokio::sync::Mutex::new(())),
+            ttl,
+            negative_ttl,
+            fetch_delay,
         }
     }
 
     async fn snapshot(&self) -> Option<Snapshot> {
         if let Some(hit) = self.fresh() {
             return Some(hit);
+        }
+        if self.in_backoff() {
+            return self.stale();
+        }
+        let _refresh = self.fetch_lock.lock().await;
+        if let Some(hit) = self.fresh() {
+            return Some(hit);
+        }
+        if self.in_backoff() {
+            return self.stale();
+        }
+        if !self.fetch_delay.is_zero() {
+            tokio::time::sleep(self.fetch_delay).await;
         }
         match self.source.fetch().await {
             Ok(snapshot) => {
@@ -111,30 +164,44 @@ impl Handle {
             }
             Err(e) => {
                 eprintln!("community: github fetch failed: {e}");
+                self.note_failure();
                 self.stale()
             }
         }
     }
 
     fn fresh(&self) -> Option<Snapshot> {
-        let guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let cached = guard.as_ref()?;
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let cached = guard.entry.as_ref()?;
         (cached.at.elapsed() < self.ttl).then(|| cached.snapshot.clone())
     }
 
+    fn in_backoff(&self) -> bool {
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.retry_at.is_some_and(|at| Instant::now() < at)
+    }
+
     fn stale(&self) -> Option<Snapshot> {
-        self.cache
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .entry
             .as_ref()
             .map(|c| c.snapshot.clone())
     }
 
     fn store(&self, snapshot: Snapshot) {
-        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(Cached {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.entry = Some(Cached {
             at: Instant::now(),
             snapshot,
         });
+        guard.retry_at = None;
+    }
+
+    fn note_failure(&self) {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        guard.retry_at = Some(Instant::now() + self.negative_ttl);
     }
 }
 
