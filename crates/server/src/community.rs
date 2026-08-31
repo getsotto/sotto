@@ -109,7 +109,10 @@ impl Handle {
                 self.store(snapshot.clone());
                 Some(snapshot)
             }
-            Err(_) => self.stale(),
+            Err(e) => {
+                eprintln!("community: github fetch failed: {e}");
+                self.stale()
+            }
         }
     }
 
