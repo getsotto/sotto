@@ -79,7 +79,7 @@ export function Landing() {
         <h2>Should you trust this?</h2>
         <p>
           Not blindly. Sotto is pre-1.0 and has <strong>not had a third-party cryptographic
-          audit</strong> yet. You should know that before putting anything important in it. Here
+            audit</strong> yet. You should know that before putting anything important in it. Here
           is what you can verify yourself, today:
         </p>
         <ul>
@@ -135,7 +135,7 @@ export function Landing() {
         </div>
         <p className="muted">
           Or run it yourself: the <a href={`${REPO}/blob/main/deploy/README.md`}>server is
-          self-hostable</a> and Apache-2.0. Self-hosting has no tiers.
+            self-hostable</a> and Apache-2.0. Self-hosting has no tiers.
         </p>
       </section>
 
@@ -146,6 +146,7 @@ export function Landing() {
         <pre className="quickstart">
           <code>{`sotto init                   # create your identity; SAVE the Emergency Kit
 sotto set DATABASE_URL       # hidden prompt; encrypted before it touches disk
+sotto import .env            # optional: pull in an existing file, still encrypted locally
 sotto run -- npm start       # inject secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via getsotto.co.uk
 sotto share DATABASE_URL     # one-time link for a single secret`}</code>

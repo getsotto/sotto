@@ -88,5 +88,30 @@ case ":$PATH:" in
 *":$INSTALL_DIR:"*) ;;
 *) say "note: $INSTALL_DIR is not on your PATH - add: export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
 esac
-say "shell completions: sotto completions bash|zsh|fish (also bundled in the release tarball)"
+
+# --- install shell completions -------------------------------------------------------------------
+comp_src="$tmp/sotto-$version-$target/completions"
+installed_comps=""
+
+if [ -d "$HOME/.local/share/bash-completion/completions" ] && [ -f "$comp_src/sotto.bash" ]; then
+    cp "$comp_src/sotto.bash" "$HOME/.local/share/bash-completion/completions/sotto"
+    installed_comps="$installed_comps bash"
+fi
+
+if [ -d "$HOME/.zfunc" ] && [ -f "$comp_src/sotto.zsh" ]; then
+    cp "$comp_src/sotto.zsh" "$HOME/.zfunc/_sotto"
+    installed_comps="$installed_comps zsh"
+fi
+
+if [ -d "$HOME/.config/fish/completions" ] && [ -f "$comp_src/sotto.fish" ]; then
+    cp "$comp_src/sotto.fish" "$HOME/.config/fish/completions/sotto.fish"
+    installed_comps="$installed_comps fish"
+fi
+
+if [ -n "$installed_comps" ]; then
+    say "installed shell completions for:$installed_comps"
+else
+    say "shell completions: sotto completions bash|zsh|fish (also bundled in the release tarball)"
+fi
+
 say "get started: sotto init"
