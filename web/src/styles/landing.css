@@ -165,6 +165,18 @@
   }
 }
 
+/* ---- Open source: counts when they exist, links either way ---------------- */
+
+.landing .community-stats {
+  font-size: var(--text-sm);
+}
+
+.landing .community-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+}
+
 /* ---- The quick start: a quiet sunk block ---------------------------------- */
 
 .landing pre.quickstart {

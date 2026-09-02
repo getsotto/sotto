@@ -87,6 +87,7 @@ const apiProxy = {
   "/environments": api,
   "/orgs": api,
   "/shares": api,
+  "/community": api,
 };
 
 export default defineConfig({

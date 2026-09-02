@@ -1,0 +1,29 @@
+name: Enhancement
+description: A change or addition that is not a bug.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What is awkward, missing, or surprising today? A past event beats a hypothetical.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: A sketch is enough. If this touches cryptography, say so - those changes need an issue before a PR.
+    validations:
+      required: true
+  - type: checkboxes
+    id: surface
+    attributes:
+      label: Where this lives
+      options:
+        - label: CLI
+        - label: Server
+        - label: Web client
+        - label: Docs / copy
+        - label: Installer / packaging
+        - label: Crypto core (needs discussion first)

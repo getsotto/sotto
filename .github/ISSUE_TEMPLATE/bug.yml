@@ -1,0 +1,36 @@
+name: Bug report
+description: Something does not work the way the docs or the command say it should.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security issues go through [SECURITY.md](https://github.com/getsotto/sotto/blob/main/SECURITY.md), not this form.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran, what you expected, and what you observed.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Sotto version
+      description: Output of `sotto --version`, or the release tag.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and install method
+      description: e.g. macOS 15 / install.sh, Windows 11 / install.ps1, built from source.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The shortest steps that produce the failure. Redact secret values.
+    validations:
+      required: true

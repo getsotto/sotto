@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 
+import { fetchCommunity, type Community } from "./api";
 import "./styles/landing.css";
 
 const REPO = "https://github.com/getsotto/sotto";
@@ -18,6 +19,7 @@ export function Landing() {
           <a href="#how">How it works</a>
           <a href="#trust">Trust</a>
           <a href="#pricing">Pricing</a>
+          <a href="#open-source">Contribute</a>
           <a href={REPO}>GitHub</a>
           <a className="login" href="/app">
             Log in
@@ -137,6 +139,8 @@ export function Landing() {
         </p>
       </section>
 
+      <CommunitySection />
+
       <section id="start">
         <h2>Get started</h2>
         <pre className="quickstart">
@@ -157,6 +161,7 @@ sotto share DATABASE_URL     # one-time link for a single secret`}</code>
       <footer>
         <nav aria-label="Footer">
           <a href={REPO}>GitHub</a>
+          <a href="#open-source">Contribute</a>
           <a href={`${REPO}/releases`}>Releases</a>
           <a href={`${REPO}/blob/main/THREAT-MODEL.md`}>Threat model</a>
           <a href={`${REPO}/blob/main/SECURITY.md`}>Security policy</a>
@@ -169,6 +174,62 @@ sotto share DATABASE_URL     # one-time link for a single secret`}</code>
       </footer>
     </main>
   );
+}
+
+const GOOD_FIRST =
+  `${REPO}/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22`;
+
+function CommunitySection() {
+  const [stats, setStats] = useState<Community | null>(null);
+
+  useEffect(() => {
+    void fetchCommunity().then(setStats);
+  }, []);
+
+  const summary = communitySummary(stats);
+
+  return (
+    <section id="open-source">
+      <h2>Open source</h2>
+      <p>
+        Apache-2.0. One repo, one crypto core. Star it if Sotto saved you from pasting a{" "}
+        <code>.env</code> into Slack; pick a good first issue if you want to help.
+      </p>
+      {summary !== null ? <p className="muted community-stats">{summary}</p> : null}
+      {stats !== null && stats.contributors.length > 1 ? (
+        <p className="muted">
+          {stats.contributors.map((c, i) => (
+            <span key={c.login}>
+              {i > 0 ? ", " : null}
+              <a href={c.htmlUrl}>{c.login}</a>
+            </span>
+          ))}
+        </p>
+      ) : null}
+      <p className="community-actions">
+        <a href={REPO}>Star on GitHub</a>
+        <a href={GOOD_FIRST}>Good first issues</a>
+        <a href={`${REPO}/blob/main/CONTRIBUTING.md`}>Contributing</a>
+      </p>
+    </section>
+  );
+}
+
+function communitySummary(stats: Community | null): string | null {
+  if (stats === null) {
+    return null;
+  }
+  const parts: string[] = [];
+  if (stats.stars > 0) {
+    parts.push(`${stats.stars} ${stats.stars === 1 ? "star" : "stars"}`);
+  }
+  if (stats.forks > 0) {
+    parts.push(`${stats.forks} ${stats.forks === 1 ? "fork" : "forks"}`);
+  }
+  if (stats.contributorCount > 1) {
+    parts.push(`${stats.contributorCount} contributors`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : null;
 }
 
 function CopyButton({ text }: { text: string }) {

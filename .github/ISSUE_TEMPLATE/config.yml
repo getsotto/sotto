@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security report
+    url: https://github.com/getsotto/sotto/security/advisories/new
+    about: Report a vulnerability privately. Do not file a public issue.
+  - name: Discussions
+    url: https://github.com/getsotto/sotto/discussions
+    about: Questions, ideas, and "is this a bug?" that are not ready to be issues.
