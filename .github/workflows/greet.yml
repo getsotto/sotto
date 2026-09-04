@@ -17,8 +17,8 @@ jobs:
     steps:
       - uses: actions/first-interaction@v3
         with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-          issue-message: |
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          issue_message: |
             Thanks for opening your first issue in Sotto, and welcome.
 
             A quick note on where things belong:
@@ -28,7 +28,7 @@ jobs:
             - Something security sensitive? Please report it privately per [SECURITY.md](https://github.com/getsotto/sotto/blob/main/SECURITY.md), never as a public issue.
 
             The full contributor guide is in [CONTRIBUTING.md](https://github.com/getsotto/sotto/blob/main/CONTRIBUTING.md).
-          pr-message: |
+          pr_message: |
             Thanks for your first pull request to Sotto, and welcome.
 
             Two things that trip up newcomers:
