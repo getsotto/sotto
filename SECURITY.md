@@ -15,7 +15,7 @@ your secret names or values.
   sealed to each member's - or machine token's - public key) → the vault key wraps a per-secret
   **data key** → encrypts the name and value. Sharing seals the vault key to a teammate's public
   key; removing a member rotates the vault key and rewraps the data keys.
-- **One audited implementation:** the crypto lives in `sotto-core` (Rust) and runs identically in
+- **One implementation:** the crypto lives in `sotto-core` (Rust) and runs identically in
   the CLI (native) and the browser (WASM). A cross-implementation gate pins byte-for-byte test
   vectors so the two builds can't silently diverge.
 - **Associated data (AAD)** binds every ciphertext to its location (environment, secret, version,

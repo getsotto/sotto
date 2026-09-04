@@ -1,4 +1,4 @@
-//! The environment key hierarchy and secret encryption - one audited implementation shared by the
+//! The environment key hierarchy and secret encryption - one implementation shared by the
 //! CLI (native) and the web client (WASM).
 //!
 //! A per-environment **vault key** is shared to each member as a **grant**: it is sealed (X25519
