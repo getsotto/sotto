@@ -76,6 +76,53 @@ function sriPlugin(): Plugin {
 // Two deliberate exceptions: the copy button is disabled (no clipboard without JS) and the
 // community stats paragraph is omitted (it only appears after a live fetch, which crawlers
 // never perform). (No inline scripts or styles in the snapshot: the build-time CSP bans both.)
+// Machine-readable metadata (canonical address, social tags, structured data, crawler rules,
+// sitemap) carries the deployment's own origin from SOTTO_PUBLIC_URL at build time.
+// Illustrative copy keeps the hosted addresses verbatim, exactly as <Landing> renders them -
+// the transcript and quickstart are prose, not identity claims.
+function publicOrigin(): string {
+  const raw = (process.env.SOTTO_PUBLIC_URL ?? "https://getsotto.co.uk").trim().replace(/\/+$/, "");
+  if (!/^https?:\/\/[^/]+$/i.test(raw)) {
+    throw new Error(
+      `sotto-seo: SOTTO_PUBLIC_URL must be a bare origin like https://example.co.uk, got ${JSON.stringify(process.env.SOTTO_PUBLIC_URL)}`,
+    );
+  }
+  return raw;
+}
+
+function robotsTxt(origin: string): string {
+  return `User-agent: *
+Allow: /
+Disallow: /app
+Disallow: /s/
+Disallow: /auth
+Disallow: /account
+Disallow: /projects
+Disallow: /environments
+Disallow: /orgs
+Disallow: /machine
+Disallow: /billing
+Disallow: /shares
+Disallow: /community
+Disallow: /telemetry
+Disallow: /health
+Disallow: /ops
+
+Sitemap: ${origin}/sitemap.xml
+`;
+}
+
+function sitemapXml(origin: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>${origin}/</loc>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+  </url>
+</urlset>
+`;
+}
 const SEO_SNAPSHOT = `<main class="landing">
 <header><span class="wordmark">Sotto</span><nav aria-label="Site"><a href="#how">How it works</a><a href="#trust">Trust</a><a href="#pricing">Pricing</a><a href="#open-source">Contribute</a><a href="https://github.com/getsotto/sotto">GitHub</a><a class="login" href="/app">Log in</a></nav></header>
 <section class="hero"><h1>Stop Slacking your <code>.env</code> files.</h1><p class="lead">Sotto syncs secrets across your team with end-to-end encryption. Values are encrypted on your machine before they leave it and decrypted only on your teammates’ machines. The server stores ciphertext it cannot read.</p><div class="install"><code>curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh</code><button class="sm" type="button" disabled>Copy</button></div><p class="muted">Signed binaries for macOS and Linux. The installer verifies the checksum, and the Sigstore signature when <code>cosign</code> is installed. Prefer to <a href="https://github.com/getsotto/sotto/blob/main/install.sh">read it first</a>? Or grab a tarball from <a href="https://github.com/getsotto/sotto/releases">releases</a>.</p></section>
@@ -122,7 +169,16 @@ function seoPrerenderPlugin(): Plugin {
       if (!ROOT_PATTERN.test(html)) {
         throw new Error("sotto-seo-prerender: <div id=\"root\"></div> not found in index.html");
       }
-      return html.replace(ROOT_PATTERN, `<div id="root">${SEO_SNAPSHOT}</div>`);
+      const origin = publicOrigin();
+      return html
+        .replace(ROOT_PATTERN, `<div id="root">${SEO_SNAPSHOT}</div>`)
+        .split("__SOTTO_PUBLIC_URL__")
+        .join(origin);
+    },
+    generateBundle() {
+      const origin = publicOrigin();
+      this.emitFile({ type: "asset", fileName: "robots.txt", source: robotsTxt(origin) });
+      this.emitFile({ type: "asset", fileName: "sitemap.xml", source: sitemapXml(origin) });
     },
   };
 }
