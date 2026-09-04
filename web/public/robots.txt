@@ -1,0 +1,13 @@
+User-agent: *
+Allow: /
+Disallow: /app
+Disallow: /s/
+Disallow: /auth/
+Disallow: /account
+Disallow: /projects/
+Disallow: /environments/
+Disallow: /orgs/
+Disallow: /machine/
+Disallow: /billing/
+
+Sitemap: https://getsotto.co.uk/sitemap.xml
