@@ -1,0 +1,39 @@
+name: Greet first-time contributors
+
+on:
+  issues:
+    types: [opened]
+  pull_request:
+    types: [opened]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  greet:
+    name: Greet first-time contributors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/first-interaction@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          issue-message: |
+            Thanks for opening your first issue in Sotto, and welcome.
+
+            A quick note on where things belong:
+
+            - A bug report or a feature idea? You are in the right place - the issue templates will guide you on what to include.
+            - A question that is not a bug? Please ask in [Discussions](https://github.com/getsotto/sotto/discussions) instead.
+            - Something security sensitive? Please report it privately per [SECURITY.md](https://github.com/getsotto/sotto/blob/main/SECURITY.md), never as a public issue.
+
+            The full contributor guide is in [CONTRIBUTING.md](https://github.com/getsotto/sotto/blob/main/CONTRIBUTING.md).
+          pr-message: |
+            Thanks for your first pull request to Sotto, and welcome.
+
+            Two things that trip up newcomers:
+
+            - Every commit needs a `Signed-off-by` line under the Developer Certificate of Origin - PRs with unsigned commits cannot be merged. Sign off with `git commit -s`; if your branch already has unsigned commits, run `git rebase --signoff main` and push again.
+            - Please run `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` before pushing, and add tests for new behaviour (`cargo test --workspace` runs the suite).
+
+            The full guide is in [CONTRIBUTING.md](https://github.com/getsotto/sotto/blob/main/CONTRIBUTING.md) - a maintainer will review shortly.
