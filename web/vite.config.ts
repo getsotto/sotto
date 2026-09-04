@@ -73,10 +73,12 @@ function sriPlugin(): Plugin {
 // React replaces it on load (`createRoot`), so interactive users see no difference. The
 // snapshot MUST stay text-identical to what <Landing> renders for the same content -
 // showing crawlers different copy than users is cloaking. Source of truth: src/Landing.tsx.
-// (No inline scripts or styles in the snapshot: the build-time CSP bans both.)
+// Two deliberate exceptions: the copy button is disabled (no clipboard without JS) and the
+// community stats paragraph is omitted (it only appears after a live fetch, which crawlers
+// never perform). (No inline scripts or styles in the snapshot: the build-time CSP bans both.)
 const SEO_SNAPSHOT = `<main class="landing">
 <header><span class="wordmark">Sotto</span><nav aria-label="Site"><a href="#how">How it works</a><a href="#trust">Trust</a><a href="#pricing">Pricing</a><a href="#open-source">Contribute</a><a href="https://github.com/getsotto/sotto">GitHub</a><a class="login" href="/app">Log in</a></nav></header>
-<section class="hero"><h1>Stop Slacking your <code>.env</code> files.</h1><p class="lead">Sotto syncs secrets across your team with end-to-end encryption. Values are encrypted on your machine before they leave it and decrypted only on your teammates’ machines. The server stores ciphertext it cannot read.</p><div class="install"><code>curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh</code></div><p class="muted">Signed binaries for macOS and Linux. The installer verifies the checksum, and the Sigstore signature when <code>cosign</code> is installed. Prefer to <a href="https://github.com/getsotto/sotto/blob/main/install.sh">read it first</a>? Or grab a tarball from <a href="https://github.com/getsotto/sotto/releases">releases</a>.</p></section>
+<section class="hero"><h1>Stop Slacking your <code>.env</code> files.</h1><p class="lead">Sotto syncs secrets across your team with end-to-end encryption. Values are encrypted on your machine before they leave it and decrypted only on your teammates’ machines. The server stores ciphertext it cannot read.</p><div class="install"><code>curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh</code><button class="sm" type="button" disabled>Copy</button></div><p class="muted">Signed binaries for macOS and Linux. The installer verifies the checksum, and the Sigstore signature when <code>cosign</code> is installed. Prefer to <a href="https://github.com/getsotto/sotto/blob/main/install.sh">read it first</a>? Or grab a tarball from <a href="https://github.com/getsotto/sotto/releases">releases</a>.</p></section>
 <pre class="term"><code>$ sotto init
   Save your Emergency Kit - these cannot be recovered:
     Secret Key:   SK1-9FKQ-XXXX-XXXX-XXXX
@@ -108,15 +110,19 @@ sotto share DATABASE_URL     # one-time link for a single secret</code></pre><p>
 <footer><nav aria-label="Footer"><a href="https://github.com/getsotto/sotto">GitHub</a><a href="#open-source">Contribute</a><a href="https://github.com/getsotto/sotto/releases">Releases</a><a href="https://github.com/getsotto/sotto/blob/main/THREAT-MODEL.md">Threat model</a><a href="https://github.com/getsotto/sotto/blob/main/SECURITY.md">Security policy</a><a href="https://github.com/getsotto/sotto/blob/main/deploy/README.md">Run your own</a><a href="/app">Log in</a></nav><p class="muted">Sotto takes its name from <em>sotto voce</em>: in a low voice, in confidence. Apache-2.0.</p></footer>
 </main>`;
 
+// Tolerates reformatting of the root div (whitespace, extra attributes) but still fails
+// the build when the mount point itself goes missing.
+const ROOT_PATTERN = /<div\s+id="root"[^>]*>\s*<\/div>/;
+
 function seoPrerenderPlugin(): Plugin {
   return {
     name: "sotto-seo-prerender",
     apply: "build",
     transformIndexHtml(html) {
-      if (!html.includes('<div id="root"></div>')) {
+      if (!ROOT_PATTERN.test(html)) {
         throw new Error("sotto-seo-prerender: <div id=\"root\"></div> not found in index.html");
       }
-      return html.replace('<div id="root"></div>', `<div id="root">${SEO_SNAPSHOT}</div>`);
+      return html.replace(ROOT_PATTERN, `<div id="root">${SEO_SNAPSHOT}</div>`);
     },
   };
 }

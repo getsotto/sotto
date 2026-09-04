@@ -2,12 +2,17 @@ User-agent: *
 Allow: /
 Disallow: /app
 Disallow: /s/
-Disallow: /auth/
+Disallow: /auth
 Disallow: /account
-Disallow: /projects/
-Disallow: /environments/
-Disallow: /orgs/
-Disallow: /machine/
-Disallow: /billing/
+Disallow: /projects
+Disallow: /environments
+Disallow: /orgs
+Disallow: /machine
+Disallow: /billing
+Disallow: /shares
+Disallow: /community
+Disallow: /telemetry
+Disallow: /health
+Disallow: /ops
 
 Sitemap: https://getsotto.co.uk/sitemap.xml
