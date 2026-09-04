@@ -22,11 +22,11 @@
 	order rate_limit before reverse_proxy
 }
 
-# Canonical host: fold www onto the apex so every link and share lands on the single origin
-# that web/index.html declares as <link rel="canonical">. Inert for deployments whose DNS
-# never sends www.getsotto.co.uk here - adjust or delete if this instance serves another name.
-www.getsotto.co.uk {
-	redir https://getsotto.co.uk{uri} permanent
+# Canonical host: fold the www subdomain onto the apex so every link and share lands on
+# the single origin the landing page declares as canonical. Derived from SOTTO_DOMAIN, so
+# each deployment redirects its own www subdomain with no file edits.
+www.{$SOTTO_DOMAIN} {
+	redir https://{$SOTTO_DOMAIN}{uri} permanent
 }
 
 {$SOTTO_DOMAIN:localhost} {
