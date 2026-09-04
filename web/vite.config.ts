@@ -92,8 +92,13 @@ function publicOrigin(): string {
   return raw;
 }
 
+// The disallowed paths mirror the Caddyfile @ratelimited/@api matchers and the client-side
+// routes (/app, /s/, /auth/callback). Keep all three in sync with the routers in
+// crates/server/src/lib.rs - a new route needs a line here the same day.
 function robotsTxt(origin: string): string {
-  return `User-agent: *
+  return `# Generated at build time by web/vite.config.ts - edit the template, not the built copy.
+# The paths below mirror the Caddyfile matchers; keep them in sync with crates/server/src.
+User-agent: *
 Allow: /
 Disallow: /app
 Disallow: /s/
