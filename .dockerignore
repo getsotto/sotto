@@ -4,6 +4,10 @@ target
 docs
 **/*.db
 *.log
+# Never send local environment files into a Docker build context. Keep the checked-in example.
+.env
+.env.*
+!deploy/.env.example
 # Web: dependencies and generated artefacts are (re)built inside the image.
 web/node_modules
 web/dist
