@@ -200,6 +200,24 @@ Supply-chain policy is defined in `deny.toml` and checked in CI with
 cargo deny check
 ```
 
+The full lockfile audit also runs in the `supply-chain` CI job (Python 3.11+ required):
+
+```sh
+cargo install cargo-audit --version 0.22.2 --locked
+python3 -B -m unittest discover -s scripts/tests -v
+scripts/check-cargo-audit
+```
+
+The [audit policy](.ci/cargo-audit-policy.toml) records exact exceptions for dormant `rsa` and
+`spin` lock entries. Each must match its package, version, registry and finding, and have no
+normal, build or test dependency path across all targets, with default and all workspace features.
+New findings, changed identities, reachable packages, failed scans and stale exceptions fail CI.
+Remove an exception in the same PR that removes its finding; an empty exception list requires a
+clean audit. Raw `cargo audit` still reports these findings: this policy documents and verifies
+their dormancy, and does not claim the vulnerable/yanked releases have been fixed.
+Project [audit defaults](.cargo/audit.toml) keep advisory fetching and yanked checks enabled and
+override a developer's global audit configuration. Do not add advisory ignores or scan filters.
+
 The cross-implementation gate proves the native and WASM builds agree - native-produced ciphertext
 decrypts byte-for-byte in WASM from shared golden vectors:
 

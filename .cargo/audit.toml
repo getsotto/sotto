@@ -1,0 +1,11 @@
+# Explicit project defaults override a developer's global audit.toml. Exceptions
+# belong in .ci/cargo-audit-policy.toml, where reachability is checked every run.
+[database]
+fetch = true
+stale = false
+
+[advisories]
+ignore = []
+
+[yanked]
+enabled = true

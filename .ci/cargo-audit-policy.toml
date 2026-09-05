@@ -1,0 +1,20 @@
+# Exact exceptions for lockfile-only findings. Every entry must still have its finding
+# and remain absent from normal, build and dev graphs across all targets, with both
+# default and all workspace features. A stale entry fails: remove it when resolved.
+version = 1
+
+[[allowed_dormant]]
+package = "rsa"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+kind = "vulnerability"
+finding = "RUSTSEC-2023-0071"
+reason = "Optional sqlx-mysql dependency; Sotto enables PostgreSQL, not MySQL. This is an exception based on dependency reachability, not a fix for the Marvin vulnerability."
+
+[[allowed_dormant]]
+package = "spin"
+version = "0.9.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+kind = "yanked"
+finding = "yanked"
+reason = "Dormant lockfile paths through flume and lazy_static retain this yanked version; neither enables spin in Sotto's resolved graph. Re-evaluate if features or dependency paths change."

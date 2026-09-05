@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Accept exact audit findings only while Cargo proves their packages dormant.
+
+Requires Python 3.11+ and cargo-audit 0.22.2. Run from any directory.
+"""
+
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tomllib
+
+
+class PolicyError(Exception):
+    """The scan failed or the dependency policy was not satisfied."""
+
+
+def finding_key(kind, package, finding):
+    return kind, package["name"], package["version"], package["source"], finding
+
+
+def load_policy(root):
+    policy = tomllib.loads((root / ".ci/cargo-audit-policy.toml").read_text())
+    if (set(policy) != {"version", "allowed_dormant"} or type(policy["version"]) is not int
+            or policy["version"] != 1 or not isinstance(policy["allowed_dormant"], list)):
+        raise PolicyError("invalid policy: expected version = 1 and allowed_dormant list")
+    allowed = {}
+    for entry in policy["allowed_dormant"]:
+        fields = {"package", "version", "source", "kind", "finding", "reason"}
+        if (not isinstance(entry, dict) or set(entry) != fields
+                or any(not isinstance(v, str) or not v.strip() for v in entry.values())):
+            raise PolicyError("invalid policy entry: exact fields and nonempty strings required")
+        if (not re.fullmatch(r"[A-Za-z0-9_-]+", entry["package"])
+                or not re.fullmatch(r"\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?", entry["version"])
+                or entry["source"] != "registry+https://github.com/rust-lang/crates.io-index"
+                or entry["kind"] not in {"vulnerability", "yanked"}
+                or (entry["kind"] == "yanked" and entry["finding"] != "yanked")
+                or (entry["kind"] == "vulnerability"
+                    and not re.fullmatch(r"RUSTSEC-\d{4}-\d{4}", entry["finding"]))):
+            raise PolicyError(f"invalid policy identity: {entry}")
+        key = finding_key(entry["kind"], {"name": entry["package"], **entry}, entry["finding"])
+        if key in allowed:
+            raise PolicyError(f"duplicate policy entry: {key}")
+        allowed[key] = entry
+
+    lock = tomllib.loads((root / "Cargo.lock").read_text())
+    for entry in allowed.values():
+        identities = {(p["version"], p.get("source")) for p in lock["package"]
+                      if p["name"] == entry["package"]}
+        if identities != {(entry["version"], entry["source"])}:
+            raise PolicyError(f'lockfile changed for {entry["package"]}; remove or review its policy entry')
+    return allowed
+
+
+def parse_report(audit):
+    try:
+        report = json.loads(audit.stdout)
+        if "error" in report or not report["database"]["last-commit"]:
+            raise ValueError("missing advisory database revision")
+        if report["database"]["advisory-count"] <= 0 or report["lockfile"]["dependency-count"] <= 0:
+            raise ValueError("empty advisory database or lockfile")
+        settings = report["settings"]
+        if (settings["ignore"] != [] or settings["target_arch"] != []
+                or settings["target_os"] != [] or settings["severity"] is not None
+                or set(settings["informational_warnings"]) != {"unmaintained", "unsound", "notice"}):
+            raise PolicyError("filtered audit report; remove ignored advisories or scan filters")
+        vulnerabilities = report["vulnerabilities"]
+        if (not isinstance(vulnerabilities["list"], list)
+                or vulnerabilities["count"] != len(vulnerabilities["list"])
+                or vulnerabilities["found"] is not bool(vulnerabilities["list"])):
+            raise ValueError("inconsistent vulnerability summary")
+        findings = {
+            finding_key("vulnerability", f["package"], f["advisory"]["id"])
+            for f in vulnerabilities["list"]
+        }
+        for kind, warnings in report["warnings"].items():
+            if not isinstance(warnings, list):
+                raise ValueError("warnings must be lists")
+            for warning in warnings:
+                if warning["kind"] != kind:
+                    raise ValueError("inconsistent warning kind")
+                advisory = warning["advisory"]
+                findings.add(finding_key(kind, warning["package"], advisory["id"] if advisory else kind))
+        if bool(findings) != (audit.returncode == 1):
+            raise ValueError("exit status disagrees with findings")
+        return findings
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        raise PolicyError(f"invalid cargo audit report: {error}") from error
+
+
+def check_dormant(root, package):
+    for features in ([], ["--all-features"]):
+        tree = subprocess.run(
+            ["cargo", "tree", "--locked", "--workspace", "--target", "all",
+             "--edges", "normal,build,dev", "--color", "never", "--prefix", "none",
+             "--format", "{p}", *features],
+            cwd=root, capture_output=True, text=True, timeout=300,
+        )
+        if tree.returncode != 0:
+            raise PolicyError(f"cargo tree failed for {package}: {tree.stderr.strip()}")
+        # Inspect the forward graph: inverse lookup can error for an optional package
+        # absent under default features before we have checked all workspace features.
+        # Cargo separates multiple workspace roots with blank lines.
+        lines = [line for line in tree.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise PolicyError("cargo tree returned an empty graph")
+        for line in lines:
+            match = re.fullmatch(r"([A-Za-z0-9_-]+) v(\S+)(?: .*)?", line)
+            if not match:
+                raise PolicyError(f"unrecognised cargo tree output: {line!r}")
+            if f"{match[1]}@{match[2]}" == package:
+                mode = "all features" if features else "default features"
+                raise PolicyError(
+                    f"{package} is reachable ({mode}):\n{line}\n"
+                    f"Inspect paths with cargo tree --workspace --all-features --target all "
+                    f"--edges normal,build,dev --invert {package}"
+                )
+
+
+def check(root):
+    allowed = load_policy(root)
+    audit = subprocess.run(
+        ["cargo", "audit", "--json", "--deny", "warnings", "--file", str(root / "Cargo.lock")],
+        cwd=root, capture_output=True, text=True, timeout=300,
+    )
+    # Exit 1 means findings, not a broken scan. Operational errors use exit 2.
+    if audit.returncode not in (0, 1):
+        raise PolicyError(f"cargo audit failed ({audit.returncode}): {audit.stderr.strip()}")
+    findings = parse_report(audit)
+    unexpected = findings - allowed.keys()
+    if unexpected:
+        raise PolicyError(f"unapproved audit findings: {sorted(unexpected)}")
+    stale = allowed.keys() - findings
+    if stale:
+        raise PolicyError(f"stale exceptions; remove or re-evaluate: {sorted(stale)}")
+
+    for entry in allowed.values():
+        package = f'{entry["package"]}@{entry["version"]}'
+        check_dormant(root, package)
+        print(f'allowed dormant: {package} / {entry["finding"]}\n  {entry["reason"]}')
+    print(f"cargo audit policy passed: {len(allowed)} verified dormant exceptions")
+
+
+if __name__ == "__main__":
+    try:
+        check(Path(__file__).resolve().parents[1])
+    except (PolicyError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        print(f"cargo audit policy failed: {error}", file=sys.stderr)
+        sys.exit(1)

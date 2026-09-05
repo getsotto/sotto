@@ -270,5 +270,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        # Keep the JSON report parser/tests in sync when upgrading this version.
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Test cargo audit policy
+        run: python3 -B -m unittest discover -s scripts/tests -v
+      - name: Audit lockfile and verify dormant exceptions
+        run: scripts/check-cargo-audit
       - name: cargo-deny (advisories, bans, licences, sources)
         uses: EmbarkStudios/cargo-deny-action@v2

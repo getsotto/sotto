@@ -110,6 +110,10 @@ This repository includes `deny.toml` for dependency and licence checks. Validate
 cargo deny check
 ```
 
+Run `scripts/check-cargo-audit` too (Python 3.11+ and `cargo-audit` 0.22.2 required).
+See [Development checks](README.md#development-checks) for installation, policy tests and
+the rules for reviewing or removing dormant lockfile exceptions.
+
 ## Security
 
 - Sotto is a cryptographic project, and security is a first-class concern.
