@@ -78,6 +78,9 @@ services:
       args:
         # The client flag is compiled into the SPA; keep it off until the final enablement PR.
         VITE_ORGANISATION_DELETION_ENABLED: ${VITE_ORGANISATION_DELETION_ENABLED:-false}
+        # Baked into the SPA's crawler-facing metadata at build time, so the box
+        # declares its own canonical address rather than the hosted site's.
+        SOTTO_PUBLIC_URL: https://${SOTTO_DOMAIN:?set SOTTO_DOMAIN in deploy/.env}
     restart: unless-stopped
     environment:
       SOTTO_DOMAIN: ${SOTTO_DOMAIN}

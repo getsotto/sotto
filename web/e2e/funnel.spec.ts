@@ -123,3 +123,31 @@ test("organisation deletion stays disabled in a default build", async ({ page })
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Request deletion" })).toHaveCount(0);
 });
+
+// The snapshot gate: web/vite.config.ts inlines a static copy of the landing page into the
+// built index.html for crawlers and visitors without scripting. With scripting off React
+// never runs, so every assertion below reads the snapshot alone - a regression that empties
+// or drifts it fails here, not in production.
+test.describe("landing page prerender (no scripting)", () => {
+  test.use({ javaScriptEnabled: false });
+
+  test("crawlers and no-scripting visitors get the landing copy", async ({ page }) => {
+    await page.goto("/");
+    await expect(
+      page.getByRole("heading", { name: "Stop Slacking your .env files." }),
+    ).toBeVisible();
+    await expect(page.getByText("curl -fsSL", { exact: false })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "How it works" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Should you trust this?" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Pricing" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Open source" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Get started" })).toBeVisible();
+    // Terminal transcript and quickstart, one unique line each.
+    await expect(
+      page.getByText("share link (acme-api/dev) - burns after 1 view(s):", { exact: false }),
+    ).toBeVisible();
+    await expect(page.getByText("sotto login && sotto push", { exact: false })).toBeVisible();
+    // Discovery metadata ships in the static head.
+    await expect(page.locator('link[rel="canonical"]')).toHaveAttribute("href", /.+\/$/);
+  });
+});
