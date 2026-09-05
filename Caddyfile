@@ -22,6 +22,13 @@
 	order rate_limit before reverse_proxy
 }
 
+# Canonical host: fold the www subdomain onto the apex so every link and share lands on
+# the single origin the landing page declares as canonical. Derived from SOTTO_DOMAIN, so
+# each deployment redirects its own www subdomain with no file edits.
+www.{$SOTTO_DOMAIN} {
+	redir https://{$SOTTO_DOMAIN}{uri} permanent
+}
+
 {$SOTTO_DOMAIN:localhost} {
 	encode gzip
 

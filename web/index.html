@@ -13,6 +13,17 @@
       content="Stop Slacking your .env files. Secrets are encrypted before they leave your machine; the server only ever stores ciphertext."
     />
     <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Sotto" />
+    <meta property="og:url" content="__SOTTO_PUBLIC_URL__/" />
+    <meta property="og:image" content="__SOTTO_PUBLIC_URL__/icon-512.png" />
+    <meta property="og:image:alt" content="Sotto logo" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="Sotto: end-to-end encrypted secret sync" />
+    <meta
+      name="twitter:description"
+      content="Stop Slacking your .env files. Secrets are encrypted before they leave your machine; the server only ever stores ciphertext."
+    />
+    <link rel="canonical" href="__SOTTO_PUBLIC_URL__/" />
     <meta name="theme-color" content="#fbfaf8" />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
@@ -20,6 +31,36 @@
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <link rel="manifest" href="/site.webmanifest" />
     <title>Sotto: end-to-end encrypted secret sync</title>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "Organization",
+            "@id": "__SOTTO_PUBLIC_URL__/#org",
+            "name": "Sotto",
+            "url": "__SOTTO_PUBLIC_URL__/",
+            "logo": "__SOTTO_PUBLIC_URL__/icon-512.png",
+            "sameAs": ["https://github.com/getsotto/sotto"]
+          },
+          {
+            "@type": "SoftwareApplication",
+            "name": "Sotto",
+            "url": "__SOTTO_PUBLIC_URL__/",
+            "applicationCategory": "DeveloperApplication",
+            "operatingSystem": ["macOS", "Linux"],
+            "offers": {
+              "@type": "AggregateOffer",
+              "lowPrice": "0",
+              "highPrice": "15",
+              "priceCurrency": "GBP",
+              "offerCount": "2"
+            },
+            "publisher": { "@id": "__SOTTO_PUBLIC_URL__/#org" }
+          }
+        ]
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>
