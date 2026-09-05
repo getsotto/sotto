@@ -232,6 +232,15 @@ Opt out with `SOTTO_TELEMETRY=off` (or the cross-tool
 no request is ever made. `SOTTO_TELEMETRY_URL` redirects the ping (e.g. to aggregate a private
 fleet), and records idle for 12 months are purged from the hosted census.
 
+### Environments
+
+```sh
+sotto env ls                 # environments in this project; the active one is marked
+sotto env use staging        # switch the active environment
+sotto env copy dev staging --confirm   # promote keys (adds and updates; never deletes)
+```
+Without `--confirm`, `copy` is a dry run showing what would change.
+
 ## Security
 
 Sotto's model is zero-knowledge: plaintext secrets and usable decryption keys stay on client
