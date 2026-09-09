@@ -176,6 +176,9 @@ enum Command {
         version: i64,
     },
     /// Run a command with the environment's secrets injected as environment variables.
+    #[command(
+        after_help = "Examples:\n  sotto run -- npm start\n  sotto run --env staging -- npm test\n  sotto run -- python -c \"print('hello')\"\n\nSotto options go before --; the command and its arguments go after it."
+    )]
     Run {
         /// The command and its arguments (after `--`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -1398,7 +1401,56 @@ fn machine_export(token: &str, format: ExportFormat, reveal: bool) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::display_secret;
+    use clap::{CommandFactory, Parser};
+
+    use super::{display_secret, Cli, Command};
+
+    #[test]
+    fn run_help_explains_command_forwarding() {
+        let mut command = Cli::command();
+        let run = command
+            .find_subcommand_mut("run")
+            .expect("run subcommand should exist");
+        let help = run.render_long_help().to_string();
+
+        assert!(help.contains("sotto run -- npm start"));
+        assert!(help.contains("sotto run --env staging -- npm test"));
+        assert!(help.contains("sotto run -- python -c \"print('hello')\""));
+        assert!(help.contains("Sotto options go before --"));
+    }
+
+    #[test]
+    fn run_parser_preserves_forwarded_arguments() {
+        let cli = Cli::try_parse_from(["sotto", "run", "--", "npm", "start"])
+            .expect("npm example should parse");
+        assert!(cli.env.is_none());
+        let Command::Run { args } = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args, vec!["npm".to_owned(), "start".to_owned()]);
+
+        let cli = Cli::try_parse_from(["sotto", "run", "--env", "staging", "--", "npm", "test"])
+            .expect("environment example should parse");
+        assert_eq!(cli.env.as_deref(), Some("staging"));
+        let Command::Run { args } = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(args, vec!["npm".to_owned(), "test".to_owned()]);
+
+        let cli = Cli::try_parse_from(["sotto", "run", "--", "python", "-c", "print('hello')"])
+            .expect("python example should parse");
+        let Command::Run { args } = cli.command else {
+            panic!("expected run command");
+        };
+        assert_eq!(
+            args,
+            vec![
+                "python".to_owned(),
+                "-c".to_owned(),
+                "print('hello')".to_owned(),
+            ]
+        );
+    }
 
     #[test]
     fn display_secret_keeps_plain_text() {
