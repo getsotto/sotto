@@ -100,6 +100,9 @@ enum Command {
     /// Log out of the sync server (clear the stored session token).
     Logout,
     /// Create a one-time / expiring share link for a secret and print it.
+    #[command(
+        after_help = "Examples:\n  sotto share DATABASE_URL\n  sotto share DATABASE_URL --views 3\n  sotto share DATABASE_URL --expire 3600"
+    )]
     Share {
         /// The secret name to share.
         name: String,
