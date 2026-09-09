@@ -233,25 +233,40 @@ function communitySummary(stats: Community | null): string | null {
 }
 
 function CopyButton({ text }: { text: string }) {
-  const [copied, setCopied] = useState(false);
+  const [status, setStatus] = useState<"idle" | "copied" | "failed">("idle");
 
   useEffect(() => {
-    if (!copied) {
+    if (status === "idle") {
       return;
     }
-    const timer = setTimeout(() => setCopied(false), 2000);
+    const timer = setTimeout(() => setStatus("idle"), 2000);
     return () => clearTimeout(timer);
-  }, [copied]);
+  }, [status]);
+
+  const handleClick = async () => {
+    if (!navigator.clipboard) {
+      setStatus("failed");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setStatus("copied");
+    } catch {
+      setStatus("failed");
+    }
+  };
 
   return (
     <button
       className="sm"
       aria-live="polite"
-      onClick={() => {
-        void navigator.clipboard.writeText(text).then(() => setCopied(true));
-      }}
+      onClick={() => void handleClick()}
     >
-      {copied ? "Copied" : "Copy"}
+      {status === "copied"
+        ? "Copied"
+        : status === "failed"
+          ? "Copy failed"
+          : "Copy"}
     </button>
   );
 }
