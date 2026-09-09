@@ -110,6 +110,35 @@ mod tests {
     }
 
     #[test]
+    fn dotenv_round_trips_through_parser() {
+        let scenarios = [
+            vec![],
+            vec![
+                ("EMPTY".into(), "".into()),
+                ("LEADING_SPACE".into(), " leading".into()),
+                ("TRAILING_SPACE".into(), "trailing ".into()),
+                ("SINGLE_QUOTE".into(), "it's literal".into()),
+                ("DOUBLE_QUOTE".into(), "say \"hello\"".into()),
+                ("BACKSLASH".into(), r"C:\path\file".into()),
+                ("DOLLAR".into(), "$HOME".into()),
+                ("HASH".into(), "value#not-a-comment".into()),
+                ("EQUALS".into(), "left=right==".into()),
+                ("NEWLINE".into(), "line1\nline2".into()),
+                ("CARRIAGE_RETURN".into(), "left\rright".into()),
+                ("TAB".into(), "left\tright".into()),
+                ("LITERAL_BACKSLASH_N".into(), r"line1\nline2".into()),
+                ("UNICODE".into(), "café 東京".into()),
+            ],
+        ];
+
+        for entries in scenarios {
+            let rendered = render(ExportFormat::Dotenv, &entries);
+            let parsed = crate::dotenv::parse(&rendered).expect("rendered dotenv should parse");
+            assert_eq!(parsed, entries);
+        }
+    }
+
+    #[test]
     fn shell_uses_posix_single_quoting() {
         let out = render(ExportFormat::Shell, &[("Q".into(), "a'b".into())]);
         // a'b  ->  'a'\''b'
