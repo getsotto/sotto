@@ -843,7 +843,7 @@ async fn webhooks_cannot_change_deleting_or_deleted_organisations() {
 }
 
 #[tokio::test]
-async fn webhook_api_version_mismatch_is_recorded_and_ignored() {
+async fn webhook_api_version_mismatch_is_recorded_and_refused() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -869,14 +869,20 @@ async fn webhook_api_version_mismatch_is_recorded_and_ignored() {
         }}
     })
     .to_string();
+    // Refused rather than accepted. This assertion was the opposite until a version mismatch
+    // dropped twelve days of live webhooks in silence: reporting success to Stripe means the
+    // event is never retried, so a mismatch that could have been fixed in an hour was instead
+    // unrecoverable the moment it arrived.
     assert_eq!(
         post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
-        StatusCode::OK
+        StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(
         org_billing_state(&pool, "billing-org-version").await,
         ("free".into(), None, None)
     );
+    // Recorded, so the receipt shows what arrived, but deliberately not marked processed: the
+    // redelivery has to be allowed to do the work once the version is understood.
     let processed: bool = sqlx::query_scalar(
         "SELECT processed_at IS NOT NULL FROM stripe_webhook_events \
          WHERE event_id = 'evt_version_mismatch'",
@@ -884,11 +890,14 @@ async fn webhook_api_version_mismatch_is_recorded_and_ignored() {
     .fetch_one(&pool)
     .await
     .expect("read mismatched webhook receipt");
-    assert!(processed);
+    assert!(
+        !processed,
+        "a refused event must stay eligible for redelivery"
+    );
 }
 
 #[tokio::test]
-async fn webhook_missing_api_version_is_recorded_and_ignored() {
+async fn webhook_missing_api_version_is_recorded_and_refused() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -915,7 +924,7 @@ async fn webhook_missing_api_version_is_recorded_and_ignored() {
     .to_string();
     assert_eq!(
         post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
-        StatusCode::OK
+        StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(
         org_billing_state(&pool, "billing-org-missing-version").await,
@@ -928,7 +937,11 @@ async fn webhook_missing_api_version_is_recorded_and_ignored() {
     .fetch_one(&pool)
     .await
     .expect("read missing-version receipt");
-    assert_eq!(receipt, ("missing".into(), true));
+    assert_eq!(
+        receipt,
+        ("missing".into(), false),
+        "recorded as missing, and left unprocessed so a redelivery can still be acted on"
+    );
 }
 
 #[tokio::test]
