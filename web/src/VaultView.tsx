@@ -419,8 +419,9 @@ export function VaultView({
 
       {revealed !== null && (
         <section>
-          <h2>{revealed.name}</h2>
+          <h2 id="vault-secret-heading">{revealed.name}</h2>
           <textarea
+            aria-labelledby="vault-secret-heading"
             className="secret-value"
             readOnly
             value={revealed.value}
@@ -433,8 +434,11 @@ export function VaultView({
             </button>
           ) : (
             <>
-              <p className="muted">Share link (burns after one view):</p>
+              <p id="vault-share-link-label" className="muted">
+                Share link (burns after one view):
+              </p>
               <textarea
+                aria-labelledby="vault-share-link-label"
                 className="share-link"
                 readOnly
                 value={revealed.link}

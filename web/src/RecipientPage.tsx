@@ -56,11 +56,12 @@ export function RecipientPage({ token }: { token: string }) {
   if (state.kind === "revealed") {
     return (
       <Shell>
-        <h1>Shared secret</h1>
+        <h1 id="recipient-secret-heading">Shared secret</h1>
         <p className="muted">
           This secret has now been viewed - copy it, it may not be available again.
         </p>
         <textarea
+          aria-labelledby="recipient-secret-heading"
           className="secret-value"
           readOnly
           value={state.secret}
