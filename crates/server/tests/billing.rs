@@ -291,6 +291,24 @@ async fn webhook_rejects_missing_and_invalid_signatures() {
     );
 }
 
+#[test]
+fn the_versions_this_deployment_actually_receives_stay_accepted() {
+    // Pinned literally rather than derived, because a test that iterates the constant only ever
+    // proves the constant agrees with itself: delete the live endpoint's version from the list
+    // and every other test here still passes while production silently stops applying payments.
+    //
+    // `2026-06-24.dahlia` is what the live webhook endpoint renders, fixed when the endpoint was
+    // created and not editable afterwards. `2026-08-26.dahlia` is the account default, which is
+    // what a recreated endpoint would inherit. Changing either is a deliberate act; changing this
+    // list without one is the bug.
+    for required in ["2026-06-24.dahlia", "2026-08-26.dahlia"] {
+        assert!(
+            sotto_server::billing::ACCEPTED_WEBHOOK_API_VERSIONS.contains(&required),
+            "{required} is a version this deployment receives; removing it stops billing"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_webhook_at_any_accepted_version_is_acted_on() {
     // Every version in the list has to work, not just the one the fixtures happen to use.

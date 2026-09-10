@@ -860,6 +860,12 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         // version to the list above, ship, and have the backlog delivered rather than recovered
         // by hand from a dashboard.
         let mut tx = state.pool.begin().await?;
+        // Pruned here as well as on the accepted path, because this is the one path that can run
+        // for days on its own. Refusing leaves each receipt pending on purpose so a redelivery
+        // can still do the work, and the retention policy already covers that case: pending rows
+        // older than a day go. Without this call a version mismatch would be the only state in
+        // which nothing ever prunes, which is precisely the state it has to survive.
+        prune_webhook_events(&mut tx).await?;
         let inserted = record_webhook_receipt(&mut tx, &event, None).await?;
         tx.commit().await?;
         if inserted {
