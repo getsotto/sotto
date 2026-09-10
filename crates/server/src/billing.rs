@@ -1064,7 +1064,14 @@ async fn checkout_completed(
     object: &serde_json::Value,
 ) -> Result<()> {
     // Sessions this server creates always carry the org id; anything else isn't ours to act on.
+    // Said out loud, because ignoring an event and acting on one are indistinguishable from
+    // outside: both answer 200, and Stripe records both as delivered. A payment that completes
+    // while the tier stays put leaves nothing behind to look at otherwise.
     let Some(org_id) = object["client_reference_id"].as_str() else {
+        eprintln!(
+            "warning: ignored checkout.session.completed with no client_reference_id; \
+             it was not created by this server"
+        );
         return Ok(());
     };
     let customer = object["customer"].as_str();
@@ -1083,6 +1090,16 @@ async fn checkout_completed(
     .execute(&mut **tx)
     .await?
     .rows_affected();
+    if changed == 0 {
+        // The other silent ending, and the more misleading one: the event was ours, the handler
+        // ran, and the `WHERE` matched nothing. An organisation that is already on the tier is a
+        // legitimate repeat delivery; one that is missing or not active is a real problem, and
+        // the two should not look the same in a log.
+        eprintln!(
+            "warning: checkout.session.completed for organisation {org_id} changed no rows; \
+             it is already on the team tier, or it is absent or not active"
+        );
+    }
     if changed > 0 {
         audit::record_tx(
             &mut *tx,

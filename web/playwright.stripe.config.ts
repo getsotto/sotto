@@ -34,6 +34,12 @@ export default defineConfig({
       // to authenticate against real GitHub. `cargo run` re-links when the feature set differs.
       // Do not include e2e-mock-billing here. The smoke must exercise StripeBilling and its real
       // Checkout redirect, with the webhook listener supplying STRIPE_WEBHOOK_SECRET.
+      // Piped so the server's own warnings reach the run log. Playwright swallows this output
+      // by default, which is why a webhook that arrived, was accepted and did nothing left no
+      // trace anywhere: Stripe recorded a delivery, the test saw a tier that had not moved, and
+      // the one process that knew why said it into a void.
+      stdout: "pipe",
+      stderr: "pipe",
       command: "cargo run -p sotto-server --features e2e-mock-oauth",
       url: `http://127.0.0.1:${SERVER_PORT}/health`,
       reuseExistingServer: false,
