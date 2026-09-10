@@ -40,9 +40,39 @@ use crate::{audit, org};
 
 /// Reject webhook timestamps further than this from now (replay protection).
 const SIGNATURE_TOLERANCE_SECS: i64 = 300;
-/// Every Stripe request and webhook fixture uses the same version so response shapes cannot drift
+/// The version this server *sends* on every outbound request, so response shapes cannot drift
 /// underneath billing or deletion decisions.
 pub const STRIPE_API_VERSION: &str = "2026-07-29.dahlia";
+
+/// The versions this server will *accept* an inbound webhook at.
+///
+/// Deliberately a set rather than the constant above, because the two directions are not the same
+/// problem. Outbound, we choose the version and pin it. Inbound, Stripe chooses: a webhook
+/// endpoint's `api_version` is fixed when the endpoint is created and cannot be edited afterwards,
+/// and an account's default only moves forwards. So an endpoint created before this code existed
+/// renders events at a version this code can never be configured to ask for.
+///
+/// That is not hypothetical. In September 2026 the live endpoint was rendering
+/// `2026-06-24.dahlia`, the account default had moved on to `2026-08-26.dahlia`, and this server
+/// accepted only `2026-07-29.dahlia`: a version reachable from neither. Every live
+/// `checkout.session.completed` was dropped for twelve days, and only an unrelated test failure
+/// surfaced it.
+///
+/// Widening this is safe because of how little of a payload is actually read. The handlers touch
+/// `client_reference_id`, `customer`, `subscription`, `status`, `metadata.org_id` and `id`, and
+/// [`Event`] says as much: everything else is ignored. Those fields are not what changes between
+/// API versions. Add a version here when Stripe moves and the fields above still mean what they
+/// meant; remove one when it stops being served.
+pub const ACCEPTED_WEBHOOK_API_VERSIONS: &[&str] = &[
+    "2026-06-24.dahlia",
+    "2026-07-29.dahlia",
+    "2026-08-26.dahlia",
+];
+
+/// Whether an inbound webhook's API version is one this server understands.
+pub fn webhook_version_accepted(version: Option<&str>) -> bool {
+    version.is_some_and(|v| ACCEPTED_WEBHOOK_API_VERSIONS.contains(&v))
+}
 
 /// Provider failures retain the machine-readable classification needed by retry and deletion
 /// policy. Human-readable provider text never crosses the HTTP or persistence boundary.
@@ -817,19 +847,33 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
 
     let event: Event =
         serde_json::from_str(&body).map_err(|_| Error::BadRequest("malformed event".into()))?;
-    if event.api_version.as_deref() != Some(STRIPE_API_VERSION) {
+    if !webhook_version_accepted(event.api_version.as_deref()) {
+        // Recorded, but deliberately NOT marked processed, and answered with a failure.
+        //
+        // The previous version of this did the opposite of both, and the combination was the
+        // trap: a 200 tells Stripe the event was handled, so it is never retried, and marking it
+        // processed means a manual resend is skipped as a duplicate. An event arriving one
+        // version too new was therefore lost the instant it arrived, silently, having reported
+        // success. A paid subscription that never applies is not a thing to be quiet about.
+        //
+        // Failing instead buys Stripe's retry schedule, which is hours: long enough to add the
+        // version to the list above, ship, and have the backlog delivered rather than recovered
+        // by hand from a dashboard.
         let mut tx = state.pool.begin().await?;
         let inserted = record_webhook_receipt(&mut tx, &event, None).await?;
-        mark_webhook_event_processed(&mut tx, &event.id).await?;
         tx.commit().await?;
         if inserted {
             eprintln!(
-                "warning: ignored Stripe webhook {} with API version {}",
+                "error: refusing Stripe webhook {} sent at unsupported API version {}; \
+                 add it to ACCEPTED_WEBHOOK_API_VERSIONS if the payload is compatible",
                 event.id,
                 event.api_version.as_deref().unwrap_or("missing")
             );
         }
-        return Ok(());
+        return Err(Error::Internal(format!(
+            "unsupported Stripe API version {}",
+            event.api_version.as_deref().unwrap_or("missing")
+        )));
     }
 
     let mut tx = state.pool.begin().await?;

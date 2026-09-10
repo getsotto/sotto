@@ -111,8 +111,12 @@ jobs:
         run: |
           set -euo pipefail
           listener_log="$RUNNER_TEMP/stripe-listen.log"
-          # The Stripe test account default API version is pinned to 2026-07-29.dahlia in
-          # Dashboard configuration; the restricted key must not read webhook endpoint settings.
+          # `stripe listen` renders events at the account's default API version and offers no
+          # way to choose one, so what arrives here is whatever the Dashboard is set to. This
+          # comment used to claim the account was pinned to match the server, which stopped
+          # being true without anything noticing; the server now accepts a set of versions
+          # instead of depending on that. The restricted key must not read webhook endpoint
+          # settings.
           stripe listen \
             --api-key "$STRIPE_API_KEY" \
             --events checkout.session.completed,customer.subscription.updated,customer.subscription.deleted \
