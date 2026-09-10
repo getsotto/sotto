@@ -32,3 +32,9 @@ docs/
 # for the times a bare python3 invocation makes some anyway.
 __pycache__/
 *.pyc
+
+# Promo and demo media. Large binaries that belong wherever the rest of the video work lives,
+# not in a repository people clone for the source. Present here as working files, and ignored so
+# a `git add -A` cannot sweep twenty megabytes of mp4 into a commit about something else, which
+# is exactly how they arrived in #188.
+demo/
