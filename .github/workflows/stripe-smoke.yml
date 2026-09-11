@@ -1,6 +1,16 @@
 name: Stripe smoke
 
 on:
+  # Weekly, because dispatch-only meant it last ran on 4 August and five weeks of drift arrived
+  # at once: by the time anyone looked, Stripe had changed the account API version, Link had
+  # learned the test email, and a live billing defect had been sitting unnoticed for twelve days.
+  # None of those was caused by a change in this repository, which is exactly why a check that
+  # only runs when someone remembers is not a check.
+  #
+  # Tuesday rather than Monday, and an odd minute, for the same reason every other schedule here
+  # avoids round times: GitHub queues scheduled workflows and the popular slots are the slowest.
+  schedule:
+    - cron: "41 4 * * 2"
   workflow_dispatch:
 
 permissions:
@@ -19,8 +29,17 @@ jobs:
     # fork and pull-request workflow runs from reaching the Stripe test account.
     if: github.repository == 'getsotto/sotto' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    # The environment approval is the second gate: its secrets are unavailable until a maintainer
-    # approves this manually dispatched job.
+    # The environment scopes the Stripe credentials to this job rather than exposing them
+    # repository-wide. It used to carry a required-reviewers rule as a second gate, which was
+    # removed when this workflow went on a schedule: the two cannot coexist. A scheduled run does
+    # not bypass an approval, it queues behind one, and an unapproved run is cancelled rather than
+    # failed, so it would never have reached the alert below. A weekly check that reports nothing
+    # when it does not run is worse than no check, because it looks like one.
+    #
+    # What still gates the credentials is the condition above. A run must be on main of the
+    # canonical repository to reach this job at all, so anyone who could have got past the
+    # reviewer rule already had write access to the default branch, and could have removed the
+    # rule as easily as satisfied it. The key is test-mode.
     environment:
       name: stripe-smoke
     services:
@@ -294,3 +313,4 @@ jobs:
             web/playwright-report/
             web/test-results/
           retention-days: 7
+
