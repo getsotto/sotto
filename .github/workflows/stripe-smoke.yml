@@ -343,7 +343,7 @@ jobs:
 
           existing="$(gh issue list --state open --label "$LABEL" \
             --json number --jq '.[0].number // empty')"
-          body="$(printf 'The weekly Stripe smoke test failed in [this run](%s).\n\nThis covers the real checkout flow against the Stripe test account: a failure here means either a regression in billing or drift in the Stripe account that this repository did not cause. The Playwright report and the webhook listener log are attached to the run as artefacts.' "$RUN_URL")"
+          body="$(printf 'The weekly Stripe smoke test failed in [this run](%s).\n\nThis covers the real checkout flow against the Stripe test account: a failure here means either a regression in billing or drift in the Stripe account that this repository did not cause. The Playwright report is uploaded as an artefact when the run got far enough to produce one. The webhook listener log is not: it is printed into the job log instead, because the redaction of its signing secret happens on the way to stderr and the file itself still contains the secret.' "$RUN_URL")"
 
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "$body"
