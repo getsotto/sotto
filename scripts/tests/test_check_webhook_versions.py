@@ -132,17 +132,31 @@ class Fetch(unittest.TestCase):
     def test_the_key_travels_in_a_header_and_never_in_the_url(self):
         seen = {}
 
-        def opener(request):
+        def opener(request, timeout=None):
             seen["url"] = request.full_url
             seen["auth"] = request.get_header("Authorization")
+            seen["timeout"] = timeout
             return io.StringIO(json.dumps({"data": [endpoint()], "has_more": False}))
 
         check.fetch_endpoints("rk_live_secret", opener=opener)
         self.assertNotIn("rk_live_secret", seen["url"])
         self.assertEqual(seen["auth"], "Bearer rk_live_secret")
 
+    def test_the_request_is_bounded_by_a_timeout(self):
+        # Unbounded, a stall holds the job until Actions kills it, and a killed job never reaches
+        # the step that would say so. The hang and the pass look identical from outside.
+        seen = {}
+
+        def opener(request, timeout=None):
+            seen["timeout"] = timeout
+            return io.StringIO(json.dumps({"data": [], "has_more": False}))
+
+        check.fetch_endpoints("rk_live_secret", opener=opener)
+        self.assertEqual(seen["timeout"], check.TIMEOUT_SECONDS)
+        self.assertTrue(0 < check.TIMEOUT_SECONDS <= 60)
+
     def test_a_truncated_listing_raises_rather_than_checking_a_subset(self):
-        def opener(request):
+        def opener(request, timeout=None):
             return io.StringIO(json.dumps({"data": [endpoint()], "has_more": True}))
 
         with self.assertRaises(ValueError):

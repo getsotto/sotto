@@ -39,6 +39,12 @@ HANDLED_EVENTS = frozenset(
 
 CONSTANT = "ACCEPTED_WEBHOOK_API_VERSIONS"
 
+# Matching scripts/status-probe. Without one, urlopen waits for ever: a stalled connection would
+# hold this job until the Actions timeout kills the whole thing, and a killed job never reaches
+# the step that raises the alert. A monitor that hangs is indistinguishable from a monitor that
+# passed, which is the failure this workflow exists to stop happening elsewhere.
+TIMEOUT_SECONDS = 15
+
 
 def accepted_versions(source):
     """Pull the accepted version list out of billing.rs.
@@ -122,7 +128,7 @@ def fetch_endpoints(key, opener=urllib.request.urlopen):
         "https://api.stripe.com/v1/webhook_endpoints?limit=100",
         headers={"Authorization": f"Bearer {key}"},
     )
-    with opener(request) as response:
+    with opener(request, timeout=TIMEOUT_SECONDS) as response:
         payload = json.load(response)
     if payload.get("has_more"):
         # Refusing beats checking a subset and reporting it as the whole. Paging is not worth
