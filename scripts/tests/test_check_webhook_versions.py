@@ -6,13 +6,17 @@ total drift in the other; and no test may let a webhook path reach the output, b
 in a public repository where the log and the issue it raises are both world-readable.
 """
 
+import contextlib
 import importlib.machinery
 import importlib.util
 import io
 import json
 import pathlib
 import sys
+import tempfile
 import unittest
+import unittest.mock
+import urllib.error
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 LOADER = importlib.machinery.SourceFileLoader(
@@ -161,6 +165,69 @@ class Fetch(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             check.fetch_endpoints("rk_live_secret", opener=opener)
+
+
+class ExitCodes(unittest.TestCase):
+    """0 agrees, 1 has drifted, 2 could not tell. The workflow branches on the last two, and
+    reporting an unreadable file or a dropped connection as drift is how an alert loses its
+    meaning: the reader is sent to billing.rs over a problem that is not in it."""
+
+    GOOD_SOURCE = 'pub const ACCEPTED_WEBHOOK_API_VERSIONS: &[&str] = &["2026-06-24.dahlia"];'
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = pathlib.Path(self.dir.name) / "billing.rs"
+        self.path.write_text(self.GOOD_SOURCE, encoding="utf-8")
+        self.args = ["--billing-source", f"live={self.path}"]
+        patched = unittest.mock.patch.dict(
+            "os.environ", {"STRIPE_LIVE_READ_KEY": "rk_live_fake"}
+        )
+        patched.start()
+        self.addCleanup(patched.stop)
+
+    def run_with(self, endpoints=None, raises=None):
+        def fetch(key, opener=None):
+            if raises is not None:
+                raise raises
+            return endpoints
+
+        with unittest.mock.patch.object(check, "fetch_endpoints", fetch):
+            return check.main(self.args)
+
+    def test_agreement_is_zero(self):
+        self.assertEqual(self.run_with([endpoint()]), 0)
+
+    def test_drift_is_one(self):
+        self.assertEqual(self.run_with([endpoint(api_version="2027-01-01.elder")]), 1)
+
+    def test_a_missing_key_is_two(self):
+        with unittest.mock.patch.dict("os.environ", {"STRIPE_LIVE_READ_KEY": ""}):
+            self.assertEqual(self.run_with([endpoint()]), 2)
+
+    def test_an_unreadable_source_is_two_not_drift(self):
+        args = ["--billing-source", f"live={self.path.parent / 'absent.rs'}"]
+        with unittest.mock.patch.object(check, "fetch_endpoints", lambda *a, **k: []):
+            self.assertEqual(check.main(args), 2)
+
+    def test_a_source_the_parser_cannot_read_is_two_not_drift(self):
+        # The one that would bite in practice: someone renames or reshapes the constant, and a
+        # check that answered 1 would send them hunting for a Stripe change that never happened.
+        self.path.write_text("pub const SOMETHING_ELSE: &[&str] = &[];", encoding="utf-8")
+        self.assertEqual(self.run_with([endpoint()]), 2)
+
+    def test_a_truncated_listing_is_two_not_drift(self):
+        self.assertEqual(self.run_with(raises=ValueError("too many endpoints")), 2)
+
+    def test_a_dropped_connection_is_two_not_drift(self):
+        self.assertEqual(self.run_with(raises=urllib.error.URLError("no route")), 2)
+
+    def test_malformed_json_is_two_and_does_not_quote_the_body(self):
+        broken = json.JSONDecodeError("Expecting value", "sk_live_leaked_in_a_body", 0)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(self.run_with(raises=broken), 2)
+        self.assertNotIn("sk_live_leaked_in_a_body", stderr.getvalue())
 
 
 if __name__ == "__main__":

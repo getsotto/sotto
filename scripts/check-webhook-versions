@@ -12,6 +12,11 @@ When they disagree, every billing webhook is refused. Since v0.8.0 a refusal ans
 retried by Stripe for three days rather than being silently dropped, so this check exists to use
 that window rather than discover the problem after it closes.
 
+Exits 0 when everything agrees, 1 when a live endpoint has drifted, and 2 when the check could
+not run at all. The workflow branches on that difference, and conflating the last two would report
+an unset secret or a stalled network as a billing outage, sending somebody to read billing.rs over
+a problem that is not there.
+
 The live secret is read from STRIPE_LIVE_READ_KEY and never printed. Neither are the webhook
 paths: this runs in a public repository, where both the action log and the issue it raises are
 world-readable, and an endpoint's full URL is the one part of its record worth not publishing.
@@ -148,13 +153,21 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
+    # Every operational failure below returns 2 rather than raising. An uncaught exception would
+    # exit 1, which the workflow reads as drift: a missing file, a parser that no longer matches,
+    # a truncated listing or a dropped connection would each be announced as "your live webhook
+    # endpoint has drifted", which is both false and the sort of alarm that stops being read.
     accepted_by_label = {}
-    for pair in args.billing_source:
-        label, _, path = pair.partition("=")
-        if not label or not path:
-            parser.error(f"--billing-source wants LABEL=PATH, got {pair!r}")
-        with open(path, encoding="utf-8") as handle:
-            accepted_by_label[label] = accepted_versions(handle.read())
+    try:
+        for pair in args.billing_source:
+            label, _, path = pair.partition("=")
+            if not label or not path:
+                parser.error(f"--billing-source wants LABEL=PATH, got {pair!r}")
+            with open(path, encoding="utf-8") as handle:
+                accepted_by_label[label] = accepted_versions(handle.read())
+    except (OSError, ValueError) as error:
+        print(f"cannot read the accepted versions: {error}", file=sys.stderr)
+        return 2
 
     key = os.environ.get("STRIPE_LIVE_READ_KEY", "")
     if not key:
@@ -167,6 +180,17 @@ def main(argv=None):
         # Deliberately not printing the body. Stripe echoes enough of the request back that a
         # misconfigured key can end up quoted into a public log.
         print(f"Stripe refused the request: HTTP {error.code}", file=sys.stderr)
+        return 2
+    except ValueError as error:
+        # Either this script objecting to Stripe's answer, which is worth quoting, or the JSON
+        # decoder objecting, whose message carries a slice of the response body. The body is not
+        # printed for the same reason it is not printed above.
+        detail = "malformed JSON" if isinstance(error, json.JSONDecodeError) else error
+        print(f"could not read the webhook endpoints: {detail}", file=sys.stderr)
+        return 2
+    except OSError as error:
+        # urllib.error.URLError and socket.timeout both land here.
+        print(f"could not reach Stripe: {type(error).__name__}", file=sys.stderr)
         return 2
 
     for label, accepted in accepted_by_label.items():
