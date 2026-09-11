@@ -65,12 +65,17 @@ jobs:
           # commands in the step that holds the live Stripe key. A newline would be worse still,
           # since it would forge a second workflow output, and that is the one metacharacter git
           # does forbid, because ref names may not contain ASCII control characters.
-          if tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null)"; then
-            git show "${tag}:crates/server/src/billing.rs" > "$RUNNER_TEMP/sources/release.rs"
-            echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          else
-            echo "no v* tag found; comparing against main only" >&2
+          if ! tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null)"; then
+            # Refusing rather than quietly checking half of what this claims to check. Falling
+            # back to main alone would still print a reassuring line and exit 0, while the one
+            # direction that actually hurts, main accepting a version the deployed release does
+            # not, went unexamined. A tick that means less than it looks like is the failure this
+            # whole workflow was written to stop.
+            echo "no v* tag found, so the list the deployed release carries cannot be read" >&2
+            exit 1
           fi
+          git show "${tag}:crates/server/src/billing.rs" > "$RUNNER_TEMP/sources/release.rs"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Compare the live endpoints against them
         id: check
@@ -81,10 +86,10 @@ jobs:
           RELEASE_TAG: ${{ steps.sources.outputs.tag }}
         run: |
           set -uo pipefail
-          args=(--billing-source "main=$RUNNER_TEMP/sources/main.rs")
-          if [ -n "${RELEASE_TAG:-}" ]; then
-            args+=(--billing-source "$RELEASE_TAG=$RUNNER_TEMP/sources/release.rs")
-          fi
+          # Both sources, always. The step above refuses to continue without a release tag, so
+          # there is no half-configured case left for this to guard against.
+          args=(--billing-source "main=$RUNNER_TEMP/sources/main.rs"
+                --billing-source "$RELEASE_TAG=$RUNNER_TEMP/sources/release.rs")
 
           # Output is captured rather than only streamed, so the alert can quote what actually
           # went wrong instead of telling a reader to go and find the log. The script redacts
