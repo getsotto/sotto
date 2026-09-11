@@ -148,7 +148,8 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
+          # One call rather than a comment and then a close: two of those are two notifications
+          # for one piece of good news.
           for number in $(gh issue list --state open --label "$LABEL" --json number --jq '.[].number'); do
-            gh issue comment "$number" --body "Agreeing again as of [this run]($RUN_URL)."
-            gh issue close "$number"
+            gh issue close "$number" --comment "Agreeing again as of [this run]($RUN_URL)."
           done
