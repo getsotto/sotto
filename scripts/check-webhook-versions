@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Check that the live Stripe webhook endpoints send a version this deployment accepts.
+
+Usage: scripts/check-webhook-versions --billing-source LABEL=PATH [--billing-source ...]
+
+Stripe fixes a webhook endpoint's API version when the endpoint is created and will not let it be
+edited afterwards, so the version production receives is decided once and then never moves on its
+own. The server's ACCEPTED_WEBHOOK_API_VERSIONS is the other half of that pair, and it does move,
+which is why the two are checked against each other rather than either being trusted alone.
+
+When they disagree, every billing webhook is refused. Since v0.8.0 a refusal answers 500 and is
+retried by Stripe for three days rather than being silently dropped, so this check exists to use
+that window rather than discover the problem after it closes.
+
+The live secret is read from STRIPE_LIVE_READ_KEY and never printed. Neither are the webhook
+paths: this runs in a public repository, where both the action log and the issue it raises are
+world-readable, and an endpoint's full URL is the one part of its record worth not publishing.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# The events the server actually acts on. An endpoint subscribed to none of them can hold any
+# version it likes without affecting billing, and flagging it would be noise that trains you to
+# ignore the ones that matter.
+HANDLED_EVENTS = frozenset(
+    {
+        "checkout.session.completed",
+        "customer.subscription.deleted",
+        "customer.subscription.updated",
+    }
+)
+
+CONSTANT = "ACCEPTED_WEBHOOK_API_VERSIONS"
+
+
+def accepted_versions(source):
+    """Pull the accepted version list out of billing.rs.
+
+    Raises rather than returning an empty list on anything unexpected. An empty list would make
+    every endpoint look unaccepted, which is merely noisy, but a parser that quietly degrades is
+    one refactor away from the opposite: matching a different constant, finding nothing, and
+    reporting that nothing is wrong. A check that cannot read its own input has not passed, so it
+    says so.
+    """
+    match = re.search(
+        rf"{re.escape(CONSTANT)}\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\]", source, re.DOTALL
+    )
+    if match is None:
+        raise ValueError(f"{CONSTANT} not found; the constant moved or changed shape")
+    versions = re.findall(r'"([^"]+)"', match.group(1))
+    if not versions:
+        raise ValueError(f"{CONSTANT} parsed as empty, which cannot be what was meant")
+    return versions
+
+
+def relevant(endpoint):
+    """Whether this endpoint carries billing events for us.
+
+    `*` is Stripe's wildcard for every event type, which includes the three below.
+    """
+    events = set(endpoint.get("enabled_events") or [])
+    return "*" in events or bool(events & HANDLED_EVENTS)
+
+
+def redact(url):
+    """Host only. The path is the part worth not publishing to a public issue tracker."""
+    if not url:
+        return "(no url)"
+    parts = urllib.parse.urlsplit(url)
+    if not parts.netloc:
+        return "(unparseable url)"
+    return f"{parts.scheme}://{parts.netloc}/…"
+
+
+def findings(endpoints, accepted_by_label):
+    """Every disagreement between the live endpoints and the accepted lists, worst first.
+
+    Returns a list of human-readable lines. Empty means the live configuration and every source
+    checked agree.
+    """
+    live = [e for e in endpoints if e.get("status") == "enabled" and relevant(e)]
+
+    if not live:
+        return [
+            "No enabled live webhook endpoint subscribes to any of "
+            f"{', '.join(sorted(HANDLED_EVENTS))}. Billing webhooks reach nothing, so a "
+            "completed checkout will never be applied."
+        ]
+
+    out = []
+    for endpoint in live:
+        where = f"{endpoint.get('id', '(no id)')} at {redact(endpoint.get('url'))}"
+        version = endpoint.get("api_version")
+        if not version:
+            out.append(
+                f"{where} has no pinned API version, so Stripe renders its events at whatever "
+                "the account default happens to be at delivery time. That will drift without "
+                "any change here and without warning."
+            )
+            continue
+        missing = [
+            label for label, accepted in accepted_by_label.items() if version not in accepted
+        ]
+        if missing:
+            out.append(
+                f"{where} sends {version}, which {CONSTANT} does not accept at "
+                f"{', '.join(missing)}. Webhooks from it are refused and retried for three days."
+            )
+    return out
+
+
+def fetch_endpoints(key, opener=urllib.request.urlopen):
+    """List the live webhook endpoints. The key goes in a header and never into a URL or a log."""
+    request = urllib.request.Request(
+        "https://api.stripe.com/v1/webhook_endpoints?limit=100",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    with opener(request) as response:
+        payload = json.load(response)
+    if payload.get("has_more"):
+        # Refusing beats checking a subset and reporting it as the whole. Paging is not worth
+        # writing against an account that would need a hundred webhook endpoints to reach it.
+        raise ValueError("more than 100 webhook endpoints; this check would only see some")
+    return payload.get("data", [])
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--billing-source",
+        action="append",
+        required=True,
+        metavar="LABEL=PATH",
+        help="a billing.rs to read the accepted versions from, labelled for the report",
+    )
+    args = parser.parse_args(argv)
+
+    accepted_by_label = {}
+    for pair in args.billing_source:
+        label, _, path = pair.partition("=")
+        if not label or not path:
+            parser.error(f"--billing-source wants LABEL=PATH, got {pair!r}")
+        with open(path, encoding="utf-8") as handle:
+            accepted_by_label[label] = accepted_versions(handle.read())
+
+    key = os.environ.get("STRIPE_LIVE_READ_KEY", "")
+    if not key:
+        print("STRIPE_LIVE_READ_KEY is unset; nothing to check against", file=sys.stderr)
+        return 2
+
+    try:
+        endpoints = fetch_endpoints(key)
+    except urllib.error.HTTPError as error:
+        # Deliberately not printing the body. Stripe echoes enough of the request back that a
+        # misconfigured key can end up quoted into a public log.
+        print(f"Stripe refused the request: HTTP {error.code}", file=sys.stderr)
+        return 2
+
+    for label, accepted in accepted_by_label.items():
+        print(f"{label} accepts: {', '.join(accepted)}")
+
+    problems = findings(endpoints, accepted_by_label)
+    if not problems:
+        print(f"checked {len(endpoints)} live endpoint(s); every relevant one agrees")
+        return 0
+    for problem in problems:
+        print(f"DRIFT: {problem}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
