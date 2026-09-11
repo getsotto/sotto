@@ -366,7 +366,15 @@ jobs:
           set -euo pipefail
           # Every open alert, not just the newest: taking only the first would leave any earlier
           # duplicate open for ever, claiming an outage that ended.
+          # One call, not a comment followed by a close. Two calls mean two timeline entries and
+          # two notifications for a single piece of good news, and this PR's whole argument is
+          # that an alert people learn to skim is an alert that has stopped working.
+          #
+          # No guard against the label not existing, deliberately, though the sibling carries one.
+          # `gh issue list --label` returns an empty list and exits 0 for a label that was never
+          # created, and bash does not apply errexit to a failed substitution in a `for` word
+          # list, so both halves of the feared failure are absent. A genuine API error still
+          # leaves the loop empty and the alert open, which is the safe direction.
           for number in $(gh issue list --state open --label "$LABEL" --json number --jq '.[].number'); do
-            gh issue comment "$number" --body "Passing again as of [this run]($RUN_URL)."
-            gh issue close "$number"
+            gh issue close "$number" --comment "Passing again as of [this run]($RUN_URL)."
           done
