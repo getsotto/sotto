@@ -1,6 +1,16 @@
 name: Stripe smoke
 
 on:
+  # Weekly, because dispatch-only meant it last ran on 4 August and five weeks of drift arrived
+  # at once: by the time anyone looked, Stripe had changed the account API version, Link had
+  # learned the test email, and a live billing defect had been sitting unnoticed for twelve days.
+  # None of those was caused by a change in this repository, which is exactly why a check that
+  # only runs when someone remembers is not a check.
+  #
+  # Tuesday rather than Monday, and an odd minute, for the same reason every other schedule here
+  # avoids round times: GitHub queues scheduled workflows and the popular slots are the slowest.
+  schedule:
+    - cron: "41 4 * * 2"
   workflow_dispatch:
 
 permissions:
@@ -15,12 +25,27 @@ concurrency:
 jobs:
   stripe-smoke:
     name: stripe test-mode smoke
+    permissions:
+      contents: read
+      # Raise an alert that outlives the run. Dispatched by hand, a failure was seen by whoever
+      # pressed the button; on a schedule there is nobody watching, and a red tick in a list is
+      # not a notification.
+      issues: write
     # Only the canonical repository main branch may use the credentialed environment. This keeps
     # fork and pull-request workflow runs from reaching the Stripe test account.
     if: github.repository == 'getsotto/sotto' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    # The environment approval is the second gate: its secrets are unavailable until a maintainer
-    # approves this manually dispatched job.
+    # The environment scopes the Stripe credentials to this job rather than exposing them
+    # repository-wide. It used to carry a required-reviewers rule as a second gate, which was
+    # removed when this workflow went on a schedule: the two cannot coexist. A scheduled run does
+    # not bypass an approval, it queues behind one, and an unapproved run is cancelled rather than
+    # failed, so it would never have reached the alert below. A weekly check that reports nothing
+    # when it does not run is worse than no check, because it looks like one.
+    #
+    # What still gates the credentials is the condition above. A run must be on main of the
+    # canonical repository to reach this job at all, so anyone who could have got past the
+    # reviewer rule already had write access to the default branch, and could have removed the
+    # rule as easily as satisfied it. The key is test-mode.
     environment:
       name: stripe-smoke
     services:
@@ -107,6 +132,7 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Run real Stripe Checkout smoke
+        id: checkout_flow
         working-directory: web
         run: |
           set -euo pipefail
@@ -173,6 +199,7 @@ jobs:
           npm run e2e -- --config=playwright.stripe.config.ts
 
       - name: Confirm the webhook was actually delivered
+        id: webhook_delivered
         if: always()
         env:
           LISTENER_LOG: ${{ runner.temp }}/stripe-listen.log
@@ -196,6 +223,7 @@ jobs:
           fi
 
       - name: Reject skipped Stripe smoke tests
+        id: not_skipped
         working-directory: web
         run: |
           set -euo pipefail
@@ -294,3 +322,73 @@ jobs:
             web/playwright-report/
             web/test-results/
           retention-days: 7
+
+      # Only on a schedule. A dispatched run has somebody watching it by definition, and during
+      # the five rounds of debugging that produced this workflow's current shape every failed
+      # attempt would have commented here. Alert fatigue is how an alert stops working.
+      - name: Open or update the alert
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job does check out, so gh could resolve the repository from the remote. Set
+          # explicitly anyway: a later change that drops the checkout would otherwise take this
+          # step with it under set -e and disable the alert without failing anything.
+          GH_REPO: ${{ github.repository }}
+          TITLE: "Stripe billing smoke is failing"
+          LABEL: billing-alert
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # `failure()` fires for anything in the job, and most of the job is not billing: eleven
+          # setup and build steps run before the first Stripe call, and the cleanup afterwards can
+          # fail on its own. Telling somebody a wasm-pack download was a billing regression is the
+          # alert fatigue this workflow is meant to avoid, so the three steps that actually
+          # exercise checkout are identified and the body says which kind of failure this was.
+          BILLING_FAILED: ${{ steps.checkout_flow.outcome == 'failure' || steps.webhook_delivered.outcome == 'failure' || steps.not_skipped.outcome == 'failure' }}
+        run: |
+          set -euo pipefail
+          # Identified by label rather than title, for the same reason as the backup alert: title
+          # search is token-based and would adopt a human issue that happens to mention Stripe.
+          gh label create "$LABEL" --force \
+            --color B60205 --description "Raised automatically when the Stripe smoke test fails"
+
+          existing="$(gh issue list --state open --label "$LABEL" \
+            --json number --jq '.[0].number // empty')"
+          if [ "${BILLING_FAILED:-}" = "true" ]; then
+            what='A step that exercises real checkout failed, so this is either a regression in billing or drift in the Stripe account that this repository did not cause.'
+          else
+            what='The checkout steps themselves did not fail. Something around them did, which is setup, a build, or the cleanup afterwards, so read the log before concluding anything about billing.'
+          fi
+          body="$(printf 'The weekly Stripe smoke test failed in [this run](%s).\n\n%s\n\nThe Playwright report is uploaded as an artefact when the run got far enough to produce one. The webhook listener log is not: it is printed into the job log instead, because the redaction of its signing secret happens on the way to stderr and the file itself still contains the secret.' "$RUN_URL" "$what")"
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$TITLE" --label "$LABEL" --body "$body"
+          fi
+
+      # Closed on any success, including a dispatched one, which is the asymmetry with the step
+      # above and is deliberate: fixing a failure and dispatching a run to confirm it is exactly
+      # the moment the alert should clear, and waiting until Tuesday to clear it would leave an
+      # issue standing that describes a problem already solved.
+      - name: Close a resolved alert
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LABEL: billing-alert
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Every open alert, not just the newest: taking only the first would leave any earlier
+          # duplicate open for ever, claiming an outage that ended.
+          # One call, not a comment followed by a close. Two calls mean two timeline entries and
+          # two notifications for a single piece of good news, and this PR's whole argument is
+          # that an alert people learn to skim is an alert that has stopped working.
+          #
+          # No guard against the label not existing, deliberately, though the sibling carries one.
+          # `gh issue list --label` returns an empty list and exits 0 for a label that was never
+          # created, and bash does not apply errexit to a failed substitution in a `for` word
+          # list, so both halves of the feared failure are absent. A genuine API error still
+          # leaves the loop empty and the alert open, which is the safe direction.
+          for number in $(gh issue list --state open --label "$LABEL" --json number --jq '.[].number'); do
+            gh issue close "$number" --comment "Passing again as of [this run]($RUN_URL)."
+          done
