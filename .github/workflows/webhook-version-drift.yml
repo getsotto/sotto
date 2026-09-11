@@ -2,8 +2,10 @@ name: Webhook version drift
 
 # Stripe fixes a webhook endpoint's API version when the endpoint is created and will not let it
 # be edited. The server's ACCEPTED_WEBHOOK_API_VERSIONS is the other half of that pair and does
-# move. When they disagree every billing webhook is refused, which between 29 August and 7
-# September 2026 is exactly what production did, unnoticed, for twelve days.
+# move. When they disagree every billing webhook is refused, which is exactly what production did
+# between the v0.5.0 release on 29 August 2026, which first shipped the narrowed version check,
+# and the fix in v0.8.0 on 10 September. Twelve days, unnoticed, surfaced by an unrelated test
+# failure rather than by anything watching billing.
 #
 # The repository side of that pair is already guarded: crates/server/tests/billing.rs pins both
 # versions literally, so CI fails if someone edits the constant and drops one. What nothing
