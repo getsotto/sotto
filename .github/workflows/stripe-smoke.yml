@@ -25,6 +25,12 @@ concurrency:
 jobs:
   stripe-smoke:
     name: stripe test-mode smoke
+    permissions:
+      contents: read
+      # Raise an alert that outlives the run. Dispatched by hand, a failure was seen by whoever
+      # pressed the button; on a schedule there is nobody watching, and a red tick in a list is
+      # not a notification.
+      issues: write
     # Only the canonical repository main branch may use the credentialed environment. This keeps
     # fork and pull-request workflow runs from reaching the Stripe test account.
     if: github.repository == 'getsotto/sotto' && github.ref == 'refs/heads/main'
@@ -314,3 +320,53 @@ jobs:
             web/test-results/
           retention-days: 7
 
+      # Only on a schedule. A dispatched run has somebody watching it by definition, and during
+      # the five rounds of debugging that produced this workflow's current shape every failed
+      # attempt would have commented here. Alert fatigue is how an alert stops working.
+      - name: Open or update the alert
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This job does check out, so gh could resolve the repository from the remote. Set
+          # explicitly anyway: a later change that drops the checkout would otherwise take this
+          # step with it under set -e and disable the alert without failing anything.
+          GH_REPO: ${{ github.repository }}
+          TITLE: "Stripe billing smoke is failing"
+          LABEL: billing-alert
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Identified by label rather than title, for the same reason as the backup alert: title
+          # search is token-based and would adopt a human issue that happens to mention Stripe.
+          gh label create "$LABEL" --force \
+            --color B60205 --description "Raised automatically when the Stripe smoke test fails"
+
+          existing="$(gh issue list --state open --label "$LABEL" \
+            --json number --jq '.[0].number // empty')"
+          body="$(printf 'The weekly Stripe smoke test failed in [this run](%s).\n\nThis covers the real checkout flow against the Stripe test account: a failure here means either a regression in billing or drift in the Stripe account that this repository did not cause. The Playwright report and the webhook listener log are attached to the run as artefacts.' "$RUN_URL")"
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$TITLE" --label "$LABEL" --body "$body"
+          fi
+
+      # Closed on any success, including a dispatched one, which is the asymmetry with the step
+      # above and is deliberate: fixing a failure and dispatching a run to confirm it is exactly
+      # the moment the alert should clear, and waiting until Tuesday to clear it would leave an
+      # issue standing that describes a problem already solved.
+      - name: Close a resolved alert
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LABEL: billing-alert
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Every open alert, not just the newest: taking only the first would leave any earlier
+          # duplicate open for ever, claiming an outage that ended.
+          for number in $(gh issue list --state open --label "$LABEL" --json number --jq '.[].number'); do
+            gh issue comment "$number" --body "Passing again as of [this run]($RUN_URL)."
+            gh issue close "$number"
+          done
