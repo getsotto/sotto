@@ -90,6 +90,15 @@ sotto login && sotto push    # optional: sync ciphertext via the hosted instance
 sotto share DATABASE_URL     # one-time, burn-after-reading link for a single secret
 ```
 
+Utilisez `--env` pour sélectionner un environnement pour une seule commande sans modifier celui par défaut du projet :
+
+```sh
+sotto run --env staging -- npm test
+sotto ls --env staging
+```
+
+`--env` ne s'applique qu'à cette commande ; `sotto env use` modifie l'environnement par défaut.
+
 `sotto login` utilise l'instance hébergée sur [getsotto.co.uk](https://getsotto.co.uk) sauf si vous le faites pointer
 ailleurs avec `--server <url>` (voir [Déploiement](deploy/README.md) pour héberger le vôtre). Dans tous les cas,
 le serveur ne stocke que du texte chiffré : le coffre web à la même adresse déchiffre dans votre
