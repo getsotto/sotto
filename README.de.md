@@ -90,6 +90,15 @@ sotto login && sotto push    # optional: sync ciphertext via the hosted instance
 sotto share DATABASE_URL     # one-time, burn-after-reading link for a single secret
 ```
 
+Mit `--env` wählst du eine Umgebung für einen einzelnen Befehl aus, ohne die Standardumgebung des Projekts zu ändern:
+
+```sh
+sotto run --env staging -- npm test
+sotto ls --env staging
+```
+
+`--env` gilt nur für diesen Befehl; `sotto env use` ändert die Standardumgebung.
+
 `sotto login` verwendet die gehostete Instanz unter [getsotto.co.uk](https://getsotto.co.uk), sofern du die CLI nicht mit
 `--server <url>` auf einen anderen Server richtest (siehe [Bereitstellung](deploy/README.md) für den eigenen Betrieb). In jedem Fall
 speichert der Server nur Chiffrat: Der Web-Tresor unter derselben Adresse entschlüsselt in deinem
@@ -104,6 +113,16 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user
 sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
+
+### Ein weiteres Gerät
+
+```sh
+sotto login                  # same account as the first machine
+sotto setup                  # unpack the Emergency Kit onto this device
+sotto pull                   # download the ciphertext you already pushed
+```
+
+Du brauchst das von `sotto init` ausgegebene Emergency Kit. Ohne es kann ein neues Gerät den Tresor nicht entschlüsseln.
 
 ## Architektur
 
