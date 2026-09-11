@@ -132,6 +132,35 @@ class Findings(unittest.TestCase):
         self.assertNotIn("deployed", out[0])
 
 
+class UnrecognisedShape(unittest.TestCase):
+    """What happens when a real endpoint record does not look like the fixtures.
+
+    This is the acknowledged weak point: the code reads `status` and `enabled_events`, and if
+    Stripe ever renames or omits either, every endpoint is filtered out. The question that matters
+    is which way that fails. Filtering everything out reaches the "no relevant endpoint" branch and
+    alarms, rather than reaching the end with nothing to complain about and reporting agreement.
+    A false alarm costs somebody a look at the dashboard; a false pass costs twelve days.
+    """
+
+    def test_an_endpoint_with_no_status_field_alarms_rather_than_passing(self):
+        stripped = endpoint()
+        del stripped["status"]
+        self.assertNotEqual(check.findings([stripped], ACCEPTED), [])
+
+    def test_an_endpoint_with_no_events_field_alarms_rather_than_passing(self):
+        stripped = endpoint()
+        del stripped["enabled_events"]
+        self.assertNotEqual(check.findings([stripped], ACCEPTED), [])
+
+    def test_a_record_this_script_understands_nothing_about_alarms(self):
+        self.assertNotEqual(check.findings([{"id": "we_odd"}], ACCEPTED), [])
+
+    def test_an_empty_listing_alarms(self):
+        # Not the same as "no endpoints drifted". Stripe returning nothing means billing webhooks
+        # reach nothing at all, which is the outage rather than the absence of one.
+        self.assertNotEqual(check.findings([], ACCEPTED), [])
+
+
 class Fetch(unittest.TestCase):
     def test_the_key_travels_in_a_header_and_never_in_the_url(self):
         seen = {}
