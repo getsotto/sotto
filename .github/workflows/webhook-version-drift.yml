@@ -52,33 +52,46 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/sources"
           cp crates/server/src/billing.rs "$RUNNER_TEMP/sources/main.rs"
-          args="--billing-source main=$RUNNER_TEMP/sources/main.rs"
 
           # The most recent release tag stands in for what production runs. It is a proxy, not a
           # fact: a deployment can lag its latest tag, and this workflow has no way to ask the
           # host what image it is on. Checking both ends means a version that main accepts but the
           # last release does not still gets reported, which is the direction that would otherwise
           # pass while production was refusing every webhook.
+          #
+          # Only the tag name crosses to the next step, never an assembled command line. A tag is
+          # a ref, and git permits $, (, ), backticks and semicolons in ref names: an assembled
+          # string interpolated into a `run:` block would let anyone who can push a tag run
+          # commands in the step that holds the live Stripe key. A newline would be worse still,
+          # since it would forge a second workflow output, and that is the one metacharacter git
+          # does forbid, because ref names may not contain ASCII control characters.
           if tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null)"; then
             git show "${tag}:crates/server/src/billing.rs" > "$RUNNER_TEMP/sources/release.rs"
-            args="$args --billing-source $tag=$RUNNER_TEMP/sources/release.rs"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
           else
             echo "no v* tag found; comparing against main only" >&2
           fi
-          echo "args=$args" >> "$GITHUB_OUTPUT"
 
       - name: Compare the live endpoints against them
         id: check
         env:
           STRIPE_LIVE_READ_KEY: ${{ secrets.STRIPE_LIVE_READ_KEY }}
+          # Through the environment, which GitHub sets as data, rather than through `${{ }}` in
+          # the script body, which it splices in as source before bash sees it.
+          RELEASE_TAG: ${{ steps.sources.outputs.tag }}
         run: |
           set -uo pipefail
+          args=(--billing-source "main=$RUNNER_TEMP/sources/main.rs")
+          if [ -n "${RELEASE_TAG:-}" ]; then
+            args+=(--billing-source "$RELEASE_TAG=$RUNNER_TEMP/sources/release.rs")
+          fi
+
           # Output is captured rather than only streamed, so the alert can quote what actually
           # went wrong instead of telling a reader to go and find the log. The script redacts
           # webhook paths and never prints the key, which is what makes quoting it into a public
           # issue safe.
           set +e
-          python3 scripts/check-webhook-versions ${{ steps.sources.outputs.args }} \
+          python3 scripts/check-webhook-versions "${args[@]}" \
             > "$RUNNER_TEMP/drift.txt" 2>&1
           status=$?
           set -e
