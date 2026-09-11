@@ -132,6 +132,7 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Run real Stripe Checkout smoke
+        id: checkout_flow
         working-directory: web
         run: |
           set -euo pipefail
@@ -198,6 +199,7 @@ jobs:
           npm run e2e -- --config=playwright.stripe.config.ts
 
       - name: Confirm the webhook was actually delivered
+        id: webhook_delivered
         if: always()
         env:
           LISTENER_LOG: ${{ runner.temp }}/stripe-listen.log
@@ -221,6 +223,7 @@ jobs:
           fi
 
       - name: Reject skipped Stripe smoke tests
+        id: not_skipped
         working-directory: web
         run: |
           set -euo pipefail
@@ -334,6 +337,12 @@ jobs:
           TITLE: "Stripe billing smoke is failing"
           LABEL: billing-alert
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # `failure()` fires for anything in the job, and most of the job is not billing: eleven
+          # setup and build steps run before the first Stripe call, and the cleanup afterwards can
+          # fail on its own. Telling somebody a wasm-pack download was a billing regression is the
+          # alert fatigue this workflow is meant to avoid, so the three steps that actually
+          # exercise checkout are identified and the body says which kind of failure this was.
+          BILLING_FAILED: ${{ steps.checkout_flow.outcome == 'failure' || steps.webhook_delivered.outcome == 'failure' || steps.not_skipped.outcome == 'failure' }}
         run: |
           set -euo pipefail
           # Identified by label rather than title, for the same reason as the backup alert: title
@@ -343,7 +352,12 @@ jobs:
 
           existing="$(gh issue list --state open --label "$LABEL" \
             --json number --jq '.[0].number // empty')"
-          body="$(printf 'The weekly Stripe smoke test failed in [this run](%s).\n\nThis covers the real checkout flow against the Stripe test account: a failure here means either a regression in billing or drift in the Stripe account that this repository did not cause. The Playwright report is uploaded as an artefact when the run got far enough to produce one. The webhook listener log is not: it is printed into the job log instead, because the redaction of its signing secret happens on the way to stderr and the file itself still contains the secret.' "$RUN_URL")"
+          if [ "${BILLING_FAILED:-}" = "true" ]; then
+            what='A step that exercises real checkout failed, so this is either a regression in billing or drift in the Stripe account that this repository did not cause.'
+          else
+            what='The checkout steps themselves did not fail. Something around them did, which is setup, a build, or the cleanup afterwards, so read the log before concluding anything about billing.'
+          fi
+          body="$(printf 'The weekly Stripe smoke test failed in [this run](%s).\n\n%s\n\nThe Playwright report is uploaded as an artefact when the run got far enough to produce one. The webhook listener log is not: it is printed into the job log instead, because the redaction of its signing secret happens on the way to stderr and the file itself still contains the secret.' "$RUN_URL" "$what")"
 
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "$body"
