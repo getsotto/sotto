@@ -184,7 +184,12 @@ enum Command {
     )]
     Run {
         /// The command and its arguments (after `--`).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(
+            num_args = 1..,
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
         args: Vec<String>,
     },
     /// Print the environment's secrets in a chosen format (plaintext).
@@ -1453,6 +1458,26 @@ mod tests {
                 "print('hello')".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn run_parser_rejects_missing_command() {
+        for args in [
+            vec!["sotto", "run"],
+            vec!["sotto", "run", "--"],
+            vec!["sotto", "run", "--env", "staging", "--"],
+        ] {
+            let error = match Cli::try_parse_from(&args) {
+                Ok(_) => panic!("{args:?} should require a forwarded command"),
+                Err(error) => error,
+            };
+
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+            assert!(error.to_string().contains("Usage:"));
+        }
     }
 
     #[test]
