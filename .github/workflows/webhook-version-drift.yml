@@ -105,7 +105,11 @@ jobs:
           exit $status
 
       - name: Open or update the alert
-        if: failure() && steps.check.outcome == 'failure' && github.event_name == 'schedule'
+        # Any scheduled failure, not only one the check itself reported. Gating on
+        # `steps.check.outcome` meant a failure in checkout or in materialising the sources left
+        # that step skipped rather than failed, so the job went red and nothing opened an issue:
+        # invisible, on the one kind of run where nobody is watching.
+        if: failure() && github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -117,20 +121,26 @@ jobs:
           gh label create "$LABEL" --force --color B60205 \
             --description "Raised when a live Stripe webhook endpoint drifts from the accepted API versions"
 
-          # Exit 1 is drift, exit 2 is the check being unable to run at all. Both are failures and
-          # neither is the other: reporting a missing credential as a billing outage would send
-          # somebody to read billing.rs over an unset secret.
-          if [ "${STATUS:-1}" = "2" ]; then
-            headline="The webhook version check could not run."
-          else
-            headline="A live Stripe webhook endpoint no longer sends a version this server accepts."
-          fi
+          # Exit 1 is drift, exit 2 is the check running and being unable to tell, and an empty
+          # status is the check never having run at all. None of the three is the other: reporting
+          # a missing credential as a billing outage would send somebody to read billing.rs over
+          # an unset secret, and reporting a checkout failure as either would be worse.
+          case "${STATUS:-}" in
+            1) headline="A live Stripe webhook endpoint no longer sends a version this server accepts." ;;
+            2) headline="The webhook version check ran but could not reach a verdict." ;;
+            *) headline="This job failed before the webhook version check reached a verdict." ;;
+          esac
 
           {
-            printf '%s\n\n' "$headline"
-            printf 'From [this run](%s):\n\n```\n' "$RUN_URL"
-            cat "$RUNNER_TEMP/drift.txt"
-            printf '```\n\nWebhook paths are redacted by the check itself, because this issue is public.\n'
+            printf '%s\n\nFrom [this run](%s):\n\n' "$headline" "$RUN_URL"
+            if [ -s "$RUNNER_TEMP/drift.txt" ]; then
+              printf '```\n'
+              cat "$RUNNER_TEMP/drift.txt"
+              printf '```\n'
+            else
+              printf 'The check produced no output, so the failure is earlier in the job.\n'
+            fi
+            printf '\nWebhook paths are redacted by the check itself, because this issue is public.\n'
           } > "$RUNNER_TEMP/body.md"
 
           existing="$(gh issue list --state open --label "$LABEL" \
