@@ -115,7 +115,25 @@
             Write-Host "note: $InstallDir is not on your PATH - add it, e.g.:"
             Write-Host "  [Environment]::SetEnvironmentVariable('PATH', `"`$env:PATH;$InstallDir`", 'User')"
         }
-        Write-Host "shell completions: sotto completions powershell (also bundled in the release zip)"
+        $CompletionSource = Join-Path $Tmp "sotto-$Version-$Target\completions\sotto.ps1"
+        $CompletionDir = $null
+        foreach ($Candidate in @(
+            (Join-Path $HOME "Documents\PowerShell\Completions"),
+            (Join-Path $HOME "Documents\WindowsPowerShell\Completions")
+        )) {
+            if (Test-Path -Path $Candidate -PathType Container) {
+                $CompletionDir = $Candidate
+                break
+            }
+        }
+        if ($CompletionDir -and (Test-Path -Path $CompletionSource -PathType Leaf)) {
+            $CompletionPath = Join-Path $CompletionDir "sotto.ps1"
+            Copy-Item -Path $CompletionSource -Destination $CompletionPath -Force
+            Write-Host "installed PowerShell completions to $CompletionPath"
+            Write-Host "register it with: sotto completions powershell | Out-String | Invoke-Expression"
+        } else {
+            Write-Host "shell completions: sotto completions powershell (also bundled in the release zip)"
+        }
         Write-Host "get started: sotto init"
     } finally {
         Remove-Item -Recurse -Force $Tmp -ErrorAction SilentlyContinue
