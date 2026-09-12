@@ -454,7 +454,7 @@ PROBES: list[Probe] = [
     ),
 ]
 
-# Declared but not probed. Nothing is, now that the canary has a throwaway organisation and a
+# Declared but not probed. Nothing is, now that the canary has a throwaway project and a
 # machine token behind it, but the mechanism stays: it is how a component says plainly that it
 # is not being watched, rather than implying by omission that everything is. A future component
 # with no probe yet belongs here rather than being left off the page.
