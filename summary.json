@@ -1,7 +1,7 @@
 {
   "components": [
     {
-      "checked_at": "2026-09-12T22:32:45Z",
+      "checked_at": "2026-09-12T23:03:45Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -25,8 +25,8 @@
         },
         {
           "date": "2026-09-12",
-          "ok": 8,
-          "total": 8
+          "ok": 9,
+          "total": 9
         }
       ],
       "description": "Serving requests and reaching its database",
@@ -36,7 +36,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-09-12T22:32:45Z",
+      "checked_at": "2026-09-12T23:03:45Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -60,8 +60,8 @@
         },
         {
           "date": "2026-09-12",
-          "ok": 8,
-          "total": 8
+          "ok": 9,
+          "total": 9
         }
       ],
       "description": "The application shell loads",
@@ -71,7 +71,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-09-12T22:32:45Z",
+      "checked_at": "2026-09-12T23:03:45Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -95,8 +95,8 @@
         },
         {
           "date": "2026-09-12",
-          "ok": 8,
-          "total": 8
+          "ok": 9,
+          "total": 9
         }
       ],
       "description": "The GitHub sign-in flow starts",
@@ -106,7 +106,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-09-12T22:32:45Z",
+      "checked_at": "2026-09-12T23:03:45Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -130,8 +130,8 @@
         },
         {
           "date": "2026-09-12",
-          "ok": 8,
-          "total": 8
+          "ok": 9,
+          "total": 9
         }
       ],
       "description": "Subscription webhooks are accepted and authenticated",
@@ -141,14 +141,21 @@
       "state": "ok"
     },
     {
-      "days": [],
-      "description": "A canary secret can be fetched and decrypted",
-      "detail": "no canary organisation is configured",
+      "checked_at": "2026-09-12T23:03:45Z",
+      "days": [
+        {
+          "date": "2026-09-12",
+          "ok": 1,
+          "total": 1
+        }
+      ],
+      "description": "A canary machine token can retrieve its grant and its secrets",
+      "detail": null,
       "id": "sync",
       "name": "Secret sync",
-      "state": "unconfigured"
+      "state": "ok"
     }
   ],
-  "generated_at": "2026-09-12T22:32:45Z",
+  "generated_at": "2026-09-12T23:03:45Z",
   "schema": 1
 }
