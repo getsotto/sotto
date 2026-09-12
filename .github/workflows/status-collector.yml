@@ -84,9 +84,11 @@ jobs:
           # component reports itself unconfigured and the rest of the sampling is unaffected,
           # which is what a fork or a self-hoster without a canary organisation should see.
           #
-          # Only the bearer half of this ever leaves the runner: the probe splits the token and
-          # discards the private key before building a request, so this job can prove a machine
-          # is able to fetch what it needs to decrypt without being able to decrypt it.
+          # Store ONLY the bearer half here, the `smt_…` part before the dot. The probe refuses
+          # to run with a whole `SOTTO_TOKEN` rather than trimming one, because trimming leaves
+          # the private key in this process's environment where anything reading `os.environ`
+          # could pair it with the ciphertext just fetched. Refusing is what makes "this job
+          # cannot decrypt the canary" true rather than merely intended.
           SOTTO_CANARY_TOKEN: ${{ secrets.SOTTO_CANARY_TOKEN }}
         run: |
           set -euo pipefail

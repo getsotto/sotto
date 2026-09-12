@@ -14,9 +14,10 @@ component answers, not that it is healthy for a signed-in user, which is the que
 status page asks.
 
 The exception is the canary, which presents a machine token belonging to a throwaway
-organisation. It sends only the bearer half of that token and never the private key half, so
-this job can prove that a machine can retrieve what it needs to decrypt an environment while
-remaining unable to decrypt anything itself. A compromise here yields ciphertext.
+organisation. It refuses to run with a token that still carries its private key half, so this
+job can prove that a machine can retrieve what it needs to decrypt an environment while holding
+nothing that could decrypt it. A compromise here yields ciphertext and no way to read it, and
+that is a property of what the process is given rather than of what it chooses to send.
 """
 
 from __future__ import annotations
@@ -186,17 +187,33 @@ MACHINE_TOKEN_PREFIX = "smt_"
 SEALED_VAULT_KEY_LEN = 80
 
 
-def api_half(raw: str) -> str | None:
-    """The bearer half of a `SOTTO_TOKEN`, or None if it does not look like one.
+def bearer_problem(raw: str) -> str | None:
+    """Why a configured machine token must not be sent, or None when it can be.
 
-    Splitting here rather than asking for a pre-split secret means the same value works whether
-    it was stored whole or already trimmed, and the private key half is discarded before any
-    request is built rather than being carried around and merely not used. The prefix check is
-    what turns a wrong value into an honest "not configured" instead of a bearer token made of
-    somebody's passphrase being sent to the server.
+    A `SOTTO_TOKEN` is `<smt_api-token>.<MT1-…>`: the server-issued bearer joined with the
+    machine's X25519 private key. An earlier version of this split the string and sent only the
+    left half, which was not enough and was worse than not enough, because it read as though the
+    private key were handled when it was merely unused. The whole string was still in this
+    process's environment, and anything able to read `os.environ` could pair that key with the
+    ciphertext this job had just fetched and decrypt the canary environment.
+
+    So the key half is refused rather than dropped. "This job cannot decrypt" is only true if the
+    private key is not here at all, and the only way to make that true is to decline to run with
+    it. A secret holding the whole token reports unconfigured, with a detail saying what to do.
     """
-    bearer = raw.split(".", 1)[0].strip()
-    return bearer if bearer.startswith(MACHINE_TOKEN_PREFIX) else None
+    value = raw.strip()
+    if not value:
+        return "is not set"
+    if not value.startswith(MACHINE_TOKEN_PREFIX):
+        return f"does not look like a machine token; it should begin {MACHINE_TOKEN_PREFIX}"
+    if "." in value:
+        # Never the token itself, which would put the thing being complained about into a public
+        # record ninety days deep.
+        return (
+            "still carries its private key half; store only the part before the dot, so this job "
+            "cannot decrypt what it fetches"
+        )
+    return None
 
 
 def judge_canary(response: Response) -> Outcome:
@@ -463,15 +480,14 @@ def observe(base_url: str, probes: list[Probe]) -> dict[str, Outcome]:
     for probe in probes:
         token = None
         if probe.token_env is not None:
-            token = api_half(os.environ.get(probe.token_env, ""))
-            if token is None:
+            raw = os.environ.get(probe.token_env, "")
+            if (problem := bearer_problem(raw)) is not None:
                 # Before any request. An instance with no canary must not have one attempted
                 # against it with an empty bearer, which the server would answer 401 and this
                 # would then publish as somebody's outage.
-                outcomes[probe.id] = Outcome(
-                    UNCONFIGURED, f"no machine token in {probe.token_env}"
-                )
+                outcomes[probe.id] = Outcome(UNCONFIGURED, f"{probe.token_env} {problem}")
                 continue
+            token = raw.strip()
         try:
             response = fetch(base_url, probe, token=token)
         except TRANSPORT_FAILURES as e:

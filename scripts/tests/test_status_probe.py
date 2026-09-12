@@ -278,22 +278,36 @@ class BillingVerdict(unittest.TestCase):
 
 
 class MachineToken(unittest.TestCase):
-    """Splitting `SOTTO_TOKEN` into the half that may leave this machine and the half that
-    must not. The private key opens the vault-key grant, so a probe that carried it could
-    decrypt the canary environment, and so could anyone who got at this job's environment."""
+    """Which configured values this job is willing to run with at all.
 
-    def test_the_key_half_is_dropped_not_merely_unused(self):
-        self.assertEqual(probe.api_half("smt_bearer.MT1-privatekeymaterial"), "smt_bearer")
+    The private key half opens the vault-key grant. Sending only the bearer was not enough while
+    the whole string sat in `os.environ`: anything able to read the environment could pair that
+    key with the ciphertext just fetched. So a token carrying its key half is refused rather than
+    trimmed, which is the difference between this job being unable to decrypt and merely not
+    bothering to.
+    """
 
-    def test_a_token_stored_already_trimmed_still_works(self):
-        self.assertEqual(probe.api_half("smt_bearer"), "smt_bearer")
+    def test_a_bearer_on_its_own_is_accepted(self):
+        self.assertIsNone(probe.bearer_problem("smt_bearer"))
+        self.assertIsNone(probe.bearer_problem("  smt_bearer  "))
+
+    def test_a_whole_token_is_refused_rather_than_trimmed(self):
+        problem = probe.bearer_problem("smt_bearer.MT1-privatekeymaterial")
+        self.assertIsNotNone(problem)
+        self.assertIn("before the dot", problem)
+
+    def test_the_refusal_never_repeats_the_token(self):
+        # Details are published and kept for ninety days.
+        problem = probe.bearer_problem("smt_SECRETBEARER.MT1-SECRETKEY")
+        self.assertNotIn("SECRETBEARER", problem)
+        self.assertNotIn("SECRETKEY", problem)
 
     def test_something_that_is_not_a_machine_token_is_refused(self):
         # Without the prefix check a passphrase, an API key or an empty variable would be sent
         # to the server as a bearer token and come back 401, which this would then publish as
         # the deployment having an outage.
         for wrong in ("", "   ", "hunter2", "st_session_token", "MT1-onlythekey"):
-            self.assertIsNone(probe.api_half(wrong), wrong)
+            self.assertIsNotNone(probe.bearer_problem(wrong), wrong)
 
 
 def grant_body(sealed_bytes=probe.SEALED_VAULT_KEY_LEN, env_id="env_abc"):
@@ -376,6 +390,21 @@ class CanarySecretsVerdict(unittest.TestCase):
 class CanaryObservation(unittest.TestCase):
     def canary(self):
         return next(p for p in probe.PROBES if p.id == "sync")
+
+    def test_a_whole_token_is_refused_without_touching_the_network(self):
+        # The point of refusing rather than trimming: with the key half present this job declines
+        # to run at all, so there is no window in which it holds both halves and a fetched
+        # ciphertext.
+        def explode(*_args, **_kwargs):
+            raise AssertionError("a token carrying its private key must not be used")
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SOTTO_CANARY_TOKEN": "smt_bearer.MT1-privatekey"}
+        ):
+            with unittest.mock.patch.object(probe, "fetch", explode):
+                outcomes = probe.observe("https://example.invalid", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.UNCONFIGURED)
+        self.assertIn("before the dot", outcomes["sync"].detail)
 
     def test_no_token_reports_unconfigured_without_touching_the_network(self):
         def explode(*_args, **_kwargs):
@@ -477,7 +506,7 @@ class CanaryObservation(unittest.TestCase):
                 return response(200, body=grant_body())
             return response(500)
 
-        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x.MT1-y"}):
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
             with unittest.mock.patch.object(probe, "fetch", by_path):
                 outcomes = probe.observe("https://example.invalid", [self.canary()])
         self.assertEqual(outcomes["sync"].state, probe.DOWN)
@@ -491,7 +520,7 @@ class CanaryObservation(unittest.TestCase):
                 return response(200, body=grant_body())
             return response(200, body='{"revision":9,"secrets":[]}')
 
-        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x.MT1-y"}):
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
             with unittest.mock.patch.object(probe, "fetch", emptied):
                 outcomes = probe.observe("https://example.invalid", [self.canary()])
         self.assertEqual(outcomes["sync"].state, probe.DOWN)
@@ -503,14 +532,14 @@ class CanaryObservation(unittest.TestCase):
                 return response(200, body=grant_body())
             return response(200, body='{"revision":4,"secrets":[{"id":"s1"')
 
-        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x.MT1-y"}):
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
             with unittest.mock.patch.object(probe, "fetch", both_fine):
                 outcomes = probe.observe("https://example.invalid", [self.canary()])
         self.assertEqual(outcomes["sync"].state, probe.OK)
 
     def test_no_outcome_detail_can_carry_the_token(self):
         # Details are written to a public branch and kept for ninety days.
-        token = "smt_verysecret.MT1-privatekey"
+        token = "smt_verysecret"
 
         def refuse(*_args, **_kwargs):
             raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
@@ -519,7 +548,6 @@ class CanaryObservation(unittest.TestCase):
             with unittest.mock.patch.object(probe, "fetch", refuse):
                 outcomes = probe.observe("https://example.invalid", [self.canary()])
         self.assertNotIn("smt_verysecret", outcomes["sync"].detail or "")
-        self.assertNotIn("MT1-", outcomes["sync"].detail or "")
 
 
 class Observation(unittest.TestCase):
