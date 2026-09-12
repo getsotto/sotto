@@ -12,9 +12,24 @@ name: Backup restore
 
 on:
   schedule:
-    # The 4th at an odd minute, away from the 1st and away from the top of the hour, where
-    # GitHub's queue is slowest. Monthly, so arriving hours late costs nothing.
-    - cron: "29 3 4 * *"
+    # Weekly, because organisation deletion is irreversible and this is the only thing that checks
+    # its safety net is usable. `backup-freshness` checks daily that backups arrive; nothing but
+    # this checks that what arrived restores, which is the failure a freshness check cannot see by
+    # construction, and the shape that has bitten this deployment before: a thing that reports
+    # success while doing nothing.
+    #
+    # Monthly set that check at roughly the same interval as the 30 day recovery window it
+    # protects, so a deletion requested the day after a run could reach its purge date having
+    # never been covered by one. Weekly gives four independent checks inside any single window.
+    #
+    # Nothing but habit was holding it at monthly: a run takes about two minutes against Cloud
+    # Build's 2,500 free minutes a month, so this moves the bill from two minutes to nine.
+    #
+    # An odd minute away from the top of the hour, where GitHub's queue is slowest, and a Sunday
+    # rather than the Tuesday and Thursday the other weekly jobs use. 03:29 also falls a little
+    # over an hour after the 02:17 backup, so a run restores that morning's object rather than
+    # yesterday's.
+    - cron: "29 3 * * 0"
   workflow_dispatch:
 
 permissions: {}
