@@ -113,6 +113,32 @@ class WrongBaseUrl(unittest.TestCase):
             self.assertEqual(code, 1, "a red run is what stops the heartbeat that follows")
             self.assertEqual(list(Path(d).iterdir()), [], "no invented downtime was recorded")
 
+    def test_one_unconfigured_component_cannot_disable_the_refusal(self):
+        # Not canary-specific, which is why it is here rather than with the canary tests. Any
+        # component that reports itself unconfigured reaches this, and a 503 whose body says
+        # "not configured" has been able to since before there was a canary: one such component
+        # among misdirected ones made the check unreachable and turned a refusal into ninety days
+        # of recorded downtime that never happened.
+        redirect = response(301, {"location": "https://www.example.com/"})
+        probes = [
+            probe.Probe(
+                id="astray", name="A", description="", method="GET", path="/a",
+                judge=probe.judge_web,
+            ),
+            probe.Probe(
+                id="off", name="B", description="", method="GET", path="/b",
+                judge=lambda _r: probe.Outcome(probe.UNCONFIGURED, "switched off"),
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            with unittest.mock.patch.object(probe, "PROBES", probes):
+                with unittest.mock.patch.object(
+                    probe, "fetch", lambda _b, _p: redirect
+                ):
+                    code = self.run_probe("https://example.com", d)
+            self.assertEqual(code, 1)
+            self.assertEqual(list(Path(d).iterdir()), [])
+
     def test_a_real_outage_is_still_recorded_and_still_reports_success(self):
         # The distinction that makes the refusal safe: a deployment that is gone refuses
         # connections, it does not politely redirect them. That must keep being written down,

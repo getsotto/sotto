@@ -454,7 +454,14 @@ def main() -> int:
     for pid, outcome in sorted(outcomes.items()):
         print(f"{pid}: {outcome.state}" + (f" ({outcome.detail})" if outcome.detail else ""))
 
-    if outcomes and all(o.fault for o in outcomes.values()):
+    # Only the probes that actually ran. A component nobody has configured reports UNCONFIGURED
+    # without making a request, so it can be neither misdirected nor right about it, and counting
+    # it here would make this refusal unreachable on any instance that has not switched every
+    # feature on. The canary is the first such component that is off by default, which is how
+    # this surfaced, but a 503 saying "not configured" has always been able to reach the same
+    # place.
+    attempted = [o for o in outcomes.values() if o.state != UNCONFIGURED]
+    if attempted and all(o.fault for o in attempted):
         # Every component at once, and every one of them for a reason that is about this URL
         # rather than about the deployment. That is a wrong setting, not an outage, and
         # writing it down would put ninety days of invented downtime into a record meant to
