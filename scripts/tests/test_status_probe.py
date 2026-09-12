@@ -391,6 +391,55 @@ class CanaryObservation(unittest.TestCase):
     def canary(self):
         return next(p for p in probe.PROBES if p.id == "sync")
 
+    def test_a_misdirected_target_never_sees_the_bearer(self):
+        # The collector already refuses to record a run like this, but it refused after the
+        # requests had gone out. For four probes that costs a wrong reading; for this one it hands
+        # a bearer token to whatever host the typo pointed at, and no later refusal takes it back.
+        def sent(_base, _p, path=None, token=None):
+            if token is not None:
+                raise AssertionError("a credential reached an unconfirmed target")
+            return response(301, {"location": "https://www.example.com/"})
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
+            with unittest.mock.patch.object(probe, "fetch", sent):
+                outcomes = probe.observe("https://example.com", list(probe.PROBES))
+        self.assertEqual(outcomes["sync"].state, probe.UNCONFIGURED)
+        self.assertIn("misdirected", outcomes["sync"].detail)
+
+    def test_a_target_that_is_not_https_never_sees_the_bearer(self):
+        def sent(*_args, **kwargs):
+            if kwargs.get("token") is not None:
+                raise AssertionError("a bearer would have travelled in clear")
+            return response(200, body="ok\n")
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
+            with unittest.mock.patch.object(probe, "fetch", sent):
+                outcomes = probe.observe("http://example.com", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.UNCONFIGURED)
+        self.assertIn("https", outcomes["sync"].detail)
+
+    def test_the_unauthenticated_probes_run_before_the_canary(self):
+        # The order is what makes the check above possible at all, so it is asserted rather than
+        # relied on: a declaration reordered later must not quietly send the credential first.
+        order = []
+
+        def record(_base, p, path=None, token=None):
+            order.append(p.id)
+            if p.id != "sync":
+                return response(200, body="ok\n")
+            if path is None:
+                return response(200, body=grant_body())
+            return response(200, body='{"revision":1,"secrets":[{"id":"s1"')
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
+            with unittest.mock.patch.object(probe, "fetch", record):
+                probe.observe("https://example.test", list(probe.PROBES))
+        # The canary fetches twice, its grant and then its companion, so this asserts that every
+        # one of its requests comes after every unauthenticated one rather than counting them.
+        first = order.index("sync")
+        self.assertNotIn("sync", order[:first])
+        self.assertTrue(all(pid == "sync" for pid in order[first:]), order)
+
     def test_a_whole_token_is_refused_without_touching_the_network(self):
         # The point of refusing rather than trimming: with the key half present this job declines
         # to run at all, so there is no window in which it holds both halves and a fetched

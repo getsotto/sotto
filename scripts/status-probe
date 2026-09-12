@@ -475,11 +475,37 @@ def failing_companion(base_url: str, probe: Probe, token: str | None) -> Outcome
     return None
 
 
+def withheld(base_url: str, outcomes: dict[str, Outcome]) -> str | None:
+    """Why a credential must not be offered to this target, or None when it may be.
+
+    `main` already refuses to *record* a run in which every probe was misdirected, which is how a
+    typo in the configured URL fails loudly instead of inventing downtime. That refusal happens
+    after the requests have gone out, though, and for the four unauthenticated probes the cost of
+    asking the wrong host is a wrong reading. For the canary it is handing a bearer token to a
+    stranger, and no later refusal takes that back.
+
+    So the unauthenticated probes run first and this asks what they found. Not a proof the target
+    is right, but it catches the shape a mistyped hostname actually takes: something answers, and
+    it answers by sending you somewhere else.
+    """
+    if urllib.parse.urlsplit(base_url).scheme != "https":
+        return "the target is not https, so a bearer would travel in clear; nothing was sent"
+    measured = [o for o in outcomes.values() if o.state != UNCONFIGURED]
+    if measured and all(o.fault for o in measured):
+        return "every unauthenticated probe was misdirected, so nothing was sent"
+    return None
+
+
 def observe(base_url: str, probes: list[Probe]) -> dict[str, Outcome]:
     outcomes = {}
-    for probe in probes:
+    # Unauthenticated first, so the target has answered for itself before any credential is
+    # offered to it. `sorted` is stable, so the others keep the order they were declared in.
+    for probe in sorted(probes, key=lambda p: p.token_env is not None):
         token = None
         if probe.token_env is not None:
+            if (reason := withheld(base_url, outcomes)) is not None:
+                outcomes[probe.id] = Outcome(UNCONFIGURED, reason)
+                continue
             raw = os.environ.get(probe.token_env, "")
             if (problem := bearer_problem(raw)) is not None:
                 # Before any request. An instance with no canary must not have one attempted
