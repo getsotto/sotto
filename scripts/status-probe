@@ -22,6 +22,7 @@ remaining unable to decrypt anything itself. A compromise here yields ciphertext
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import http.client
 import json
@@ -99,10 +100,17 @@ class Probe:
     #: having an outage, and counting it as one would drag its published figure down for a
     #: feature it never switched on.
     token_env: str | None = None
-    #: Further paths that must also answer 200 before the verdict above stands. The canary rests
-    #: on two endpoints, because a machine needs its sealed grant and the ciphertext both, and a
-    #: row that went green on half of that would be claiming something it had not checked.
-    also: tuple[str, ...] = ()
+    #: Further `(path, judge)` pairs that must also pass before the verdict above stands. The
+    #: canary rests on two endpoints, because a machine needs its sealed grant and the ciphertext
+    #: both, and a row that went green on half of that would be claiming something it had not
+    #: checked.
+    also: tuple[tuple[str, Callable[[Response], Outcome]], ...] = ()
+    #: How much of the body to keep. The default is a prefix, because a body can carry secrets and
+    #: no public verdict needs one. The canary raises it: its endpoints answer with this project's
+    #: own ciphertext, addressed to a key this job does not hold, so reading the whole of a small
+    #: response there costs nothing that matters and buys a real assertion instead of a guess at
+    #: the first few bytes.
+    body_bytes: int = 64
 
 
 def header(response: Response, name: str) -> str:
@@ -170,6 +178,13 @@ def origin_of(location: str) -> str:
 #: machine's X25519 private key. The server has only ever seen the first half, as a hash.
 MACHINE_TOKEN_PREFIX = "smt_"
 
+#: An X25519 sealed box is `ephemeral_pk ‖ mac ‖ ciphertext`, and the plaintext here is a 32 byte
+#: vault key: 32 + 16 + 32. Nothing in Python can derive that, so `wrap::tests::
+#: a_sealed_vault_key_is_eighty_bytes` in crates/core asserts the same number against the real
+#: implementation. Change the sealed shape and that test fails in CI, which is where it should be
+#: found, rather than here weeks later with the status page quietly red.
+SEALED_VAULT_KEY_LEN = 80
+
 
 def api_half(raw: str) -> str | None:
     """The bearer half of a `SOTTO_TOKEN`, or None if it does not look like one.
@@ -199,12 +214,7 @@ def judge_canary(response: Response) -> Outcome:
         # as the routing mistake it is.
         return Outcome(DOWN, "the web app answered instead of the API")
     if response.status == 200:
-        # Only the first 64 bytes of any body are kept, on purpose, so this is a shape check and
-        # not a parse: enough to tell a grant from something that is not one, and not enough to
-        # write anything worth reading into a record that is public and kept for ninety days.
-        if response.body_prefix.lstrip().startswith('{"env_id"'):
-            return Outcome(OK)
-        return Outcome(DOWN, "200 from the grant endpoint with no grant in it")
+        return grant_verdict(response.body_prefix)
     if response.status in (401, 403):
         # One row carries both the token and its sealed vault key, and the handler answers 401
         # when either has gone. The canary organisation deleted, the token revoked, or the grant
@@ -216,6 +226,59 @@ def judge_canary(response: Response) -> Outcome:
     if (astray := misdirected(response)) is not None:
         return astray
     return Outcome(DOWN, f"expected 200 and a grant, got {response.status}")
+
+
+def grant_verdict(body: str) -> Outcome:
+    """Whether a grant payload is one a machine could actually use.
+
+    A 200 alone would pass on an empty envelope, a truncated key, or whatever a cache decided to
+    serve, and the failure this component exists to catch is precisely the grant being present but
+    unusable. So the sealed key is decoded and measured. What is deliberately not done is opening
+    it: that needs the private key half, which this job does not hold and should not.
+
+    Nothing from the body reaches the returned detail. These strings are published and kept for
+    ninety days, and while the payload here is ciphertext rather than plaintext, quoting a
+    response into a public record is a habit worth not having.
+    """
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return Outcome(DOWN, "the grant endpoint answered 200 with something that is not JSON")
+    if not isinstance(payload, dict) or not payload.get("env_id"):
+        return Outcome(DOWN, "200 from the grant endpoint with no environment in it")
+    try:
+        sealed = base64.b64decode(payload.get("enc_vault_key") or "", validate=True)
+    except (ValueError, TypeError):
+        return Outcome(DOWN, "the sealed vault key is not valid base64")
+    if len(sealed) != SEALED_VAULT_KEY_LEN:
+        # Length rather than content, which is all that can be checked from here, and enough: a
+        # truncated or empty grant is the shape a machine cannot recover from, and it answers 200
+        # exactly like a good one.
+        return Outcome(
+            DOWN,
+            f"the sealed vault key is {len(sealed)} bytes, not {SEALED_VAULT_KEY_LEN}",
+        )
+    return Outcome(OK)
+
+
+def judge_canary_secrets(response: Response) -> Outcome:
+    """Whether the canary environment still has something in it to sync.
+
+    Checked against the start of the payload rather than parsed, unlike the grant. A secret's
+    ciphertext is as long as whatever was encrypted, so a parse here would need the whole response
+    and would fail on truncation rather than on anything real. The serialiser emits `revision`
+    before `secrets`, so an empty environment is visible within a few dozen bytes, and an empty
+    environment is the failure worth catching: a machine that authenticates, gets its grant, and
+    then finds nothing to decrypt is a sync that has stopped working.
+    """
+    if response.status != 200:
+        return Outcome(DOWN, f"/machine/secrets answered {response.status}")
+    body = response.body_prefix.lstrip()
+    if not body.startswith('{"revision":'):
+        return Outcome(DOWN, "/machine/secrets answered 200 without a snapshot")
+    if '"secrets":[]' in body:
+        return Outcome(DOWN, "the canary environment has no secrets left to sync")
+    return Outcome(OK)
 
 
 def judge_api(response: Response) -> Outcome:
@@ -324,7 +387,10 @@ PROBES: list[Probe] = [
         path="/machine/grant",
         judge=judge_canary,
         token_env="SOTTO_CANARY_TOKEN",
-        also=("/machine/secrets",),
+        also=(("/machine/secrets", judge_canary_secrets),),
+        # Enough for a grant: an environment id and a 108 character base64 key, braces and all,
+        # fit several times over. Not enough to be storing a response of consequence in memory.
+        body_bytes=512,
     ),
 ]
 
@@ -356,17 +422,17 @@ def fetch(base_url: str, probe: Probe, path: str | None = None, token: str | Non
     opener = urllib.request.build_opener(NoRedirects)
     try:
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
-            return read(response)
+            return read(response, probe.body_bytes)
     except urllib.error.HTTPError as e:
         # Every non-2xx arrives here, and most of them are the expected answer: 401 from the
         # webhook, 303 from sign-in, 503 from an unconfigured feature.
-        return read(e)
+        return read(e, probe.body_bytes)
 
 
-def read(response) -> Response:
+def read(response, body_bytes: int = 64) -> Response:
     headers = {k.lower(): v for k, v in response.headers.items()}
     try:
-        body = response.read(64).decode("utf-8", "replace")
+        body = response.read(body_bytes).decode("utf-8", "replace")
     except TRANSPORT_FAILURES:  # a body that stops arriving is a transport fact, not a verdict
         body = ""
     return Response(status=response.status, headers=headers, body_prefix=body)
@@ -378,16 +444,17 @@ def read(response) -> Response:
 TRANSPORT_FAILURES = (OSError, http.client.HTTPException)
 
 
-def unanswered_companion(base_url: str, probe: Probe, token: str | None) -> Outcome | None:
-    """The first companion path that does not answer 200, or None when every one does.
+def failing_companion(base_url: str, probe: Probe, token: str | None) -> Outcome | None:
+    """The first companion path whose own judge does not pass, or None when all of them do.
 
-    Only the status is read. The grant is where the content check lives, and repeating one here
-    would be asserting the shape of a payload this job has no business looking inside.
+    Each companion carries its own verdict rather than being checked for a 200, because the two
+    halves of the canary fail in different ways: a grant goes missing or arrives unusable, and an
+    environment empties out. One shared rule would catch neither properly.
     """
-    for path in probe.also:
-        response = fetch(base_url, probe, path=path, token=token)
-        if response.status != 200:
-            return Outcome(DOWN, f"{path} answered {response.status}")
+    for path, judge in probe.also:
+        outcome = judge(fetch(base_url, probe, path=path, token=token))
+        if outcome.state != OK:
+            return outcome
     return None
 
 
@@ -418,7 +485,7 @@ def observe(base_url: str, probes: list[Probe]) -> dict[str, Outcome]:
         outcome = probe.judge(response)
         if outcome.state == OK and probe.also:
             try:
-                outcome = unanswered_companion(base_url, probe, token) or outcome
+                outcome = failing_companion(base_url, probe, token) or outcome
             except TRANSPORT_FAILURES as e:
                 outcome = Outcome(DOWN, f"{type(e).__name__}: {e}"[:200])
         outcomes[probe.id] = outcome

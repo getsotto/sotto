@@ -7,6 +7,7 @@ single-page app answering for the API is the exact shape of a misconfigured depl
 that looks healthy from outside.
 """
 
+import base64
 import contextlib
 import datetime as dt
 import http.client
@@ -295,13 +296,66 @@ class MachineToken(unittest.TestCase):
             self.assertIsNone(probe.api_half(wrong), wrong)
 
 
+def grant_body(sealed_bytes=probe.SEALED_VAULT_KEY_LEN, env_id="env_abc"):
+    key = base64.b64encode(b"k" * sealed_bytes).decode() if sealed_bytes is not None else ""
+    return json.dumps({"env_id": env_id, "enc_vault_key": key})
+
+
 class CanaryVerdict(unittest.TestCase):
-    def test_a_grant_is_recognised_by_its_shape(self):
-        body = '{"env_id":"env_abc","enc_vault_key":"AAAA'
-        self.assertEqual(probe.judge_canary(response(200, body=body)).state, probe.OK)
+    def test_a_usable_grant_passes(self):
+        self.assertEqual(probe.judge_canary(response(200, body=grant_body())).state, probe.OK)
 
     def test_a_200_that_is_not_a_grant_is_not_a_pass(self):
         self.assertEqual(probe.judge_canary(response(200, body='{"ok":true}')).state, probe.DOWN)
+
+    def test_a_grant_that_is_present_but_unusable_is_caught(self):
+        # The failure this component exists for. A truncated or empty sealed key answers 200 and
+        # looks exactly like a good one from the outside, and a machine given it cannot recover:
+        # it authenticates, receives its grant, and then cannot open a single secret.
+        for length in (0, 40, 79, 81):
+            outcome = probe.judge_canary(response(200, body=grant_body(length)))
+            self.assertEqual(outcome.state, probe.DOWN, length)
+            self.assertIn(str(length), outcome.detail)
+
+    def test_a_key_that_is_not_base64_is_caught(self):
+        body = json.dumps({"env_id": "env_abc", "enc_vault_key": "not base64!!"})
+        self.assertIn("base64", probe.judge_canary(response(200, body=body)).detail)
+
+    def test_a_grant_with_no_environment_is_caught(self):
+        body = json.dumps({"enc_vault_key": base64.b64encode(b"k" * 80).decode()})
+        self.assertIn("no environment", probe.judge_canary(response(200, body=body)).detail)
+
+    def test_no_verdict_quotes_the_response_body(self):
+        # Details are written to a public branch and kept for ninety days. The payload here is
+        # ciphertext rather than plaintext, but quoting a response into a public record is a
+        # habit worth not having at all.
+        marker = "MARKERVALUE"
+        bodies = [marker, '{"env_id":"' + marker + '","enc_vault_key":"!!"}', "{" + marker]
+        for body in bodies:
+            detail = probe.judge_canary(response(200, body=body)).detail or ""
+            self.assertNotIn(marker, detail, body)
+
+
+class CanarySecretsVerdict(unittest.TestCase):
+    def test_a_snapshot_with_a_secret_in_it_passes(self):
+        body = '{"revision":4,"secrets":[{"id":"s1","enc_name":"AA","enc_value":"BB"'
+        self.assertEqual(probe.judge_canary_secrets(response(200, body=body)).state, probe.OK)
+
+    def test_an_emptied_environment_is_an_outage_not_a_pass(self):
+        # A machine that authenticates, gets its grant, and finds nothing to decrypt is a sync
+        # that has stopped working, and it answers 200 the whole way.
+        body = '{"revision":9,"secrets":[]}'
+        outcome = probe.judge_canary_secrets(response(200, body=body))
+        self.assertEqual(outcome.state, probe.DOWN)
+        self.assertIn("no secrets left", outcome.detail)
+
+    def test_something_that_is_not_a_snapshot_is_not_a_pass(self):
+        self.assertEqual(
+            probe.judge_canary_secrets(response(200, body="<!doctype html>")).state, probe.DOWN
+        )
+
+    def test_a_non_200_is_reported_with_its_status(self):
+        self.assertIn("503", probe.judge_canary_secrets(response(503)).detail)
 
     def test_a_refusal_names_the_token_rather_than_guessing_the_cause(self):
         # 401 covers the organisation being deleted, the token revoked, and the grant going
@@ -381,12 +435,46 @@ class CanaryObservation(unittest.TestCase):
         self.assertNotIn("MT1-", seen["auth"])
         self.assertNotIn("smt_bearer", seen["url"], "a bearer in a URL reaches proxies and logs")
 
+    def test_the_canary_reads_enough_body_to_parse_a_grant(self):
+        # The default 64 byte prefix cuts a grant in half: it would never parse, the component
+        # would report down for ever, and the cause would look like a server fault rather than a
+        # limit set for a different probe. This asserts the limit travels from the probe into the
+        # read rather than that some larger number was written down somewhere.
+        asked = {}
+
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def read(self, n):
+                asked["n"] = n
+                return grant_body().encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        class FakeOpener:
+            def open(self, _request, timeout=None):
+                return FakeResponse()
+
+        canary = self.canary()
+        with unittest.mock.patch.object(
+            probe.urllib.request, "build_opener", lambda *_: FakeOpener()
+        ):
+            seen = probe.fetch("https://example.test", canary, token="smt_bearer")
+        self.assertEqual(asked["n"], canary.body_bytes)
+        self.assertGreater(canary.body_bytes, len(grant_body()))
+        self.assertEqual(probe.judge_canary(seen).state, probe.OK)
+
     def test_a_companion_path_that_does_not_answer_fails_the_component(self):
         # The grant alone is half the question. A machine that can read its sealed vault key but
         # cannot list any ciphertext has nothing to decrypt, and a green row would say otherwise.
         def by_path(_base, _probe, path=None, token=None):
             if path is None:
-                return response(200, body='{"env_id":"env_abc","enc_vault_key":"AA')
+                return response(200, body=grant_body())
             return response(500)
 
         with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x.MT1-y"}):
@@ -395,11 +483,25 @@ class CanaryObservation(unittest.TestCase):
         self.assertEqual(outcomes["sync"].state, probe.DOWN)
         self.assertIn("/machine/secrets", outcomes["sync"].detail)
 
+    def test_an_emptied_canary_environment_fails_the_component(self):
+        # Both endpoints answer 200 and the grant is perfect. Only the companion's own verdict
+        # separates this from working, which is why companions carry one.
+        def emptied(_base, _probe, path=None, token=None):
+            if path is None:
+                return response(200, body=grant_body())
+            return response(200, body='{"revision":9,"secrets":[]}')
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x.MT1-y"}):
+            with unittest.mock.patch.object(probe, "fetch", emptied):
+                outcomes = probe.observe("https://example.invalid", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.DOWN)
+        self.assertIn("no secrets left", outcomes["sync"].detail)
+
     def test_both_answering_is_the_only_way_through(self):
         def both_fine(_base, _probe, path=None, token=None):
             if path is None:
-                return response(200, body='{"env_id":"env_abc","enc_vault_key":"AA')
-            return response(200, body='{"revision":4,"secrets":[]}')
+                return response(200, body=grant_body())
+            return response(200, body='{"revision":4,"secrets":[{"id":"s1"')
 
         with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x.MT1-y"}):
             with unittest.mock.patch.object(probe, "fetch", both_fine):
