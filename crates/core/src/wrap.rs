@@ -124,6 +124,27 @@ mod tests {
     }
 
     #[test]
+    fn a_sealed_vault_key_is_eighty_bytes() {
+        // `scripts/status-probe` asserts this length against the live grant and cannot derive it:
+        // it is Python, and the composition lives here. A sealed box is
+        // `ephemeral_pk ‖ mac ‖ ciphertext`, so 32 + 16 + KEY_LEN.
+        //
+        // Pinned rather than computed from the constants, for the same reason the accepted Stripe
+        // webhook versions are pinned: a test that derives the number from the code it is checking
+        // only ever proves the code agrees with itself, and this number's whole job is to be the
+        // one thing holding a cross-language constant in step. Change the sealed shape and this
+        // fails in CI, which is where you want to find out, rather than weeks later when the
+        // status page has been quietly red.
+        let member = generate_keypair();
+        let sealed = seal_to_public(&member.public, &[0u8; KEY_LEN]).unwrap();
+        assert_eq!(
+            sealed.len(),
+            80,
+            "scripts/status-probe pins this as SEALED_VAULT_KEY_LEN; change both together"
+        );
+    }
+
+    #[test]
     fn wrong_recipient_cannot_unseal() {
         let member = generate_keypair();
         let intruder = generate_keypair();
