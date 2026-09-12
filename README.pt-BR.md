@@ -85,6 +85,7 @@ macOS, Linux e Windows.
 sotto init                   # create your identity + first project - SAVE the printed Emergency Kit
 sotto set DATABASE_URL       # hidden prompt; encrypted locally before it ever touches disk
 sotto import .env            # optional: pull in an existing file, still encrypted locally
+sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto share DATABASE_URL     # one-time, burn-after-reading link for a single secret
@@ -98,6 +99,8 @@ sotto ls --env staging
 ```
 
 `--env` vale apenas para esse comando; `sotto env use` altera o ambiente padrão.
+
+A exportação escreve texto puro, portanto precisa de `--reveal` em um terminal, assim como `sotto get`.
 
 `sotto login` usa a instância hospedada em [getsotto.co.uk](https://getsotto.co.uk), a menos que você aponte
 para outro lugar com `--server <url>` (consulte [Deploy](deploy/README.md) para hospedar o seu). De todo modo
