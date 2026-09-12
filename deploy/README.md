@@ -684,7 +684,7 @@ presents a machine token, and is described after the table:
 | Web app     | `GET /`                                        | `200` and an HTML content type   |
 | Sign in     | `GET /auth/github/login` with a loopback callback | a redirect to `github.com`    |
 | Billing     | `POST /billing/webhook` with no signature      | `401`                            |
-| Secret sync | `GET /machine/grant` and `GET /machine/secrets` | a usable grant and a non-empty snapshot |
+| Secret sync | `GET /machine/grant` and `GET /machine/secrets` | a usable grant and a usable secret |
 
 Two of those distinguish "not configured" from "broken", because they are not the same thing
 and only one of them belongs in an uptime figure. A `503` from sign-in or billing means the
@@ -725,9 +725,13 @@ is left out of the tally.
 
 What it checks is deliberately short of decrypting. The sealed vault key is decoded and measured,
 because a truncated or empty grant answers `200` and looks exactly like a good one while leaving a
-machine unable to open anything; and the secrets snapshot must not be empty, because a machine
-that authenticates, receives its grant, and then finds nothing to decrypt is a sync that has
-stopped working. Opening the grant would need the private key, which is the thing this is built
+machine unable to open anything; and the secrets snapshot must still hold a secret a machine could
+use, meaning one that is not deleted and carries both its ciphertext and its wrapped data key. An
+empty list is not the only way to have nothing: `/machine/secrets` returns soft-deleted rows as
+well, flagged, so an environment whose secrets have all been removed answers with a full-looking
+list holding nothing usable. Keep the canary environment small, a couple of junk secrets, because
+that snapshot is read whole and a canary that has outgrown the budget reports so rather than
+guessing. Opening the grant would need the private key, which is the thing this is built
 not to have. The credential is also withheld from a target that has not answered for itself:
 unauthenticated probes run first, and if the configured URL is not `https`, or every one of them
 was redirected elsewhere, no token is sent at all.
