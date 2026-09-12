@@ -47,6 +47,24 @@ Windows). Lieber erst ansehen? Lade ein Archiv von der
 [Release-Seite](https://github.com/getsotto/sotto/releases) herunter und verifiziere es manuell gemäß
 [SECURITY.md](SECURITY.md), oder baue aus den Quellen (siehe [Entwicklung](#entwicklung)).
 
+### Shell-Vervollständigungen
+
+`sotto completions <shell>` gibt ein Vervollständigungsskript auf der Standardausgabe aus. Zum Beispiel:
+
+```sh
+# bash
+sotto completions bash > ~/.local/share/bash-completion/completions/sotto
+
+# zsh (add the directory to fpath in ~/.zshrc first)
+sotto completions zsh > ~/.zfunc/_sotto
+
+# fish
+sotto completions fish > ~/.config/fish/completions/sotto.fish
+```
+
+Release-Tarballs und -zips enthalten ebenfalls die passenden Dateien `completions/sotto.*`,
+falls du sie lieber direkt kopieren möchtest.
+
 ### GitHub Actions
 
 Für GitHub Actions verwende die [Sotto-Setup-Action](https://github.com/getsotto/sotto-action), um ein exaktes

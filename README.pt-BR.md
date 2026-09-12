@@ -47,6 +47,24 @@ Windows). Prefere conferir antes? Baixe um arquivo compactado na
 [página de releases](https://github.com/getsotto/sotto/releases) e verifique manualmente conforme
 [SECURITY.md](SECURITY.md), ou compile do código-fonte (consulte [Desenvolvimento](#desenvolvimento)).
 
+### Autocompletar do shell
+
+`sotto completions <shell>` imprime um script de autocompletar na saída padrão. Por exemplo:
+
+```sh
+# bash
+sotto completions bash > ~/.local/share/bash-completion/completions/sotto
+
+# zsh (add the directory to fpath in ~/.zshrc first)
+sotto completions zsh > ~/.zfunc/_sotto
+
+# fish
+sotto completions fish > ~/.config/fish/completions/sotto.fish
+```
+
+Os tarballs e zips das releases também contêm os arquivos correspondentes `completions/sotto.*`
+se você preferir copiá-los diretamente.
+
 ### GitHub Actions
 
 Para GitHub Actions, use a [action Sotto Setup](https://github.com/getsotto/sotto-action) para
