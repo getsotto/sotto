@@ -13,6 +13,7 @@ import http.client
 import importlib.machinery
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -102,7 +103,9 @@ class WrongBaseUrl(unittest.TestCase):
             stack.enter_context(unittest.mock.patch.object(sys, "argv", argv))
             if responses is not None:
                 stack.enter_context(
-                    unittest.mock.patch.object(probe, "fetch", lambda _base, p: responses[p.id])
+                    unittest.mock.patch.object(
+                        probe, "fetch", lambda _base, p, path=None, token=None: responses[p.id]
+                    )
                 )
             return probe.main()
 
@@ -133,7 +136,7 @@ class WrongBaseUrl(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             with unittest.mock.patch.object(probe, "PROBES", probes):
                 with unittest.mock.patch.object(
-                    probe, "fetch", lambda _b, _p: redirect
+                    probe, "fetch", lambda _b, _p, path=None, token=None: redirect
                 ):
                     code = self.run_probe("https://example.com", d)
             self.assertEqual(code, 1)
@@ -273,6 +276,150 @@ class BillingVerdict(unittest.TestCase):
         self.assertIn("did not send", outcome.detail)
 
 
+class MachineToken(unittest.TestCase):
+    """Splitting `SOTTO_TOKEN` into the half that may leave this machine and the half that
+    must not. The private key opens the vault-key grant, so a probe that carried it could
+    decrypt the canary environment, and so could anyone who got at this job's environment."""
+
+    def test_the_key_half_is_dropped_not_merely_unused(self):
+        self.assertEqual(probe.api_half("smt_bearer.MT1-privatekeymaterial"), "smt_bearer")
+
+    def test_a_token_stored_already_trimmed_still_works(self):
+        self.assertEqual(probe.api_half("smt_bearer"), "smt_bearer")
+
+    def test_something_that_is_not_a_machine_token_is_refused(self):
+        # Without the prefix check a passphrase, an API key or an empty variable would be sent
+        # to the server as a bearer token and come back 401, which this would then publish as
+        # the deployment having an outage.
+        for wrong in ("", "   ", "hunter2", "st_session_token", "MT1-onlythekey"):
+            self.assertIsNone(probe.api_half(wrong), wrong)
+
+
+class CanaryVerdict(unittest.TestCase):
+    def test_a_grant_is_recognised_by_its_shape(self):
+        body = '{"env_id":"env_abc","enc_vault_key":"AAAA'
+        self.assertEqual(probe.judge_canary(response(200, body=body)).state, probe.OK)
+
+    def test_a_200_that_is_not_a_grant_is_not_a_pass(self):
+        self.assertEqual(probe.judge_canary(response(200, body='{"ok":true}')).state, probe.DOWN)
+
+    def test_a_refusal_names_the_token_rather_than_guessing_the_cause(self):
+        # 401 covers the organisation being deleted, the token revoked, and the grant going
+        # missing. They are one symptom with three causes and the record should not invent one.
+        outcome = probe.judge_canary(response(401))
+        self.assertEqual(outcome.state, probe.DOWN)
+        self.assertIn("refused", outcome.detail)
+
+    def test_the_web_app_answering_is_a_routing_fault_not_a_missing_grant(self):
+        html = response(200, {"content-type": "text/html"}, "<!doctype html>")
+        self.assertIn("web app", probe.judge_canary(html).detail)
+
+    def test_a_redirect_is_still_a_misdirection(self):
+        astray = response(301, {"location": "https://www.example.com/"})
+        self.assertTrue(probe.judge_canary(astray).fault)
+
+
+class CanaryObservation(unittest.TestCase):
+    def canary(self):
+        return next(p for p in probe.PROBES if p.id == "sync")
+
+    def test_no_token_reports_unconfigured_without_touching_the_network(self):
+        def explode(*_args, **_kwargs):
+            raise AssertionError("a probe with no token must not make a request")
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": ""}):
+            with unittest.mock.patch.object(probe, "fetch", explode):
+                outcomes = probe.observe("https://example.invalid", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.UNCONFIGURED)
+
+    def test_an_unconfigured_canary_does_not_disable_the_misdirection_refusal(self):
+        # The refusal asks whether every probe was misdirected. An unconfigured component can be
+        # neither, so counting it would make that check unreachable on any instance without a
+        # canary, which is most of them, and a wrongly pointed collector would then write ninety
+        # days of invented downtime instead of refusing.
+        redirect = response(301, {"location": "https://www.example.com/"})
+        argv = ["status-probe", "--base-url", "https://example.com", "--data-dir", ""]
+        with tempfile.TemporaryDirectory() as d:
+            argv[-1] = d
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": ""}))
+                stack.enter_context(unittest.mock.patch.object(sys, "argv", argv))
+                stack.enter_context(
+                    unittest.mock.patch.object(
+                        probe, "fetch", lambda _b, _p, path=None, token=None: redirect
+                    )
+                )
+                code = probe.main()
+            self.assertEqual(code, 1, "the collector must refuse, not record")
+            self.assertEqual(list(Path(d).iterdir()), [], "no invented downtime was written")
+
+    def test_the_bearer_reaches_the_request_and_the_private_key_does_not(self):
+        seen = {}
+
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def read(self, _n):
+                return b'{"env_id":"env_abc","enc_vault_key":"AA"}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                seen["auth"] = request.get_header("Authorization")
+                seen["url"] = request.full_url
+                return FakeResponse()
+
+        with unittest.mock.patch.object(probe.urllib.request, "build_opener", lambda *_: FakeOpener()):
+            probe.fetch("https://example.test", self.canary(), token="smt_bearer")
+        self.assertEqual(seen["auth"], "Bearer smt_bearer")
+        self.assertNotIn("MT1-", seen["auth"])
+        self.assertNotIn("smt_bearer", seen["url"], "a bearer in a URL reaches proxies and logs")
+
+    def test_a_companion_path_that_does_not_answer_fails_the_component(self):
+        # The grant alone is half the question. A machine that can read its sealed vault key but
+        # cannot list any ciphertext has nothing to decrypt, and a green row would say otherwise.
+        def by_path(_base, _probe, path=None, token=None):
+            if path is None:
+                return response(200, body='{"env_id":"env_abc","enc_vault_key":"AA')
+            return response(500)
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x.MT1-y"}):
+            with unittest.mock.patch.object(probe, "fetch", by_path):
+                outcomes = probe.observe("https://example.invalid", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.DOWN)
+        self.assertIn("/machine/secrets", outcomes["sync"].detail)
+
+    def test_both_answering_is_the_only_way_through(self):
+        def both_fine(_base, _probe, path=None, token=None):
+            if path is None:
+                return response(200, body='{"env_id":"env_abc","enc_vault_key":"AA')
+            return response(200, body='{"revision":4,"secrets":[]}')
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x.MT1-y"}):
+            with unittest.mock.patch.object(probe, "fetch", both_fine):
+                outcomes = probe.observe("https://example.invalid", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.OK)
+
+    def test_no_outcome_detail_can_carry_the_token(self):
+        # Details are written to a public branch and kept for ninety days.
+        token = "smt_verysecret.MT1-privatekey"
+
+        def refuse(*_args, **_kwargs):
+            raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": token}):
+            with unittest.mock.patch.object(probe, "fetch", refuse):
+                outcomes = probe.observe("https://example.invalid", [self.canary()])
+        self.assertNotIn("smt_verysecret", outcomes["sync"].detail or "")
+        self.assertNotIn("MT1-", outcomes["sync"].detail or "")
+
+
 class Observation(unittest.TestCase):
     def probe_for(self, judge, path="/x"):
         return probe.Probe(id="t", name="T", description="", method="GET", path=path, judge=judge)
@@ -358,10 +505,29 @@ class Summary(unittest.TestCase):
         self.assertEqual(billing["state"], probe.UNCONFIGURED)
 
     def test_a_component_with_no_probe_is_declared_not_omitted(self):
-        summary = probe.merge(probe.empty_summary(), {}, NOW)
-        sync = next(c for c in summary["components"] if c["id"] == "sync")
-        self.assertEqual(sync["state"], probe.UNCONFIGURED)
-        self.assertEqual(sync["days"], [])
+        # Nothing is unprobed today, now that the canary is measured, so this drives the
+        # mechanism with a stand-in rather than deleting the test with the last member. What it
+        # protects is the rule: a page that leaves out what it does not watch implies it watches
+        # everything, and the next component to arrive without a probe needs somewhere honest to
+        # sit while it waits for one.
+        declared = [
+            {
+                "id": "future",
+                "name": "Future",
+                "description": "",
+                "state": probe.UNCONFIGURED,
+                "detail": "no probe yet",
+            }
+        ]
+        with unittest.mock.patch.object(probe, "UNPROBED", declared):
+            summary = probe.merge(probe.empty_summary(), {}, NOW)
+        future = next(c for c in summary["components"] if c["id"] == "future")
+        self.assertEqual(future["state"], probe.UNCONFIGURED)
+        self.assertEqual(future["days"], [])
+
+    def test_secret_sync_is_measured_now_rather_than_declared(self):
+        self.assertIn("sync", {p.id for p in probe.PROBES})
+        self.assertEqual(probe.UNPROBED, [])
 
     def test_history_keeps_ageing_after_a_component_stops_being_probed(self):
         # A deployment that drops Stripe stops producing conclusive billing samples but keeps

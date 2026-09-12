@@ -80,6 +80,14 @@ jobs:
           # The deployment to watch. Absent, the job skips rather than probing a default,
           # so a fork or a self-hoster cannot accidentally point this at someone else.
           BASE_URL: ${{ vars.SOTTO_PUBLIC_URL }}
+          # The canary's machine token, for the one probe that authenticates. Absent, that
+          # component reports itself unconfigured and the rest of the sampling is unaffected,
+          # which is what a fork or a self-hoster without a canary organisation should see.
+          #
+          # Only the bearer half of this ever leaves the runner: the probe splits the token and
+          # discards the private key before building a request, so this job can prove a machine
+          # is able to fetch what it needs to decrypt without being able to decrypt it.
+          SOTTO_CANARY_TOKEN: ${{ secrets.SOTTO_CANARY_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "$BASE_URL" ]; then
