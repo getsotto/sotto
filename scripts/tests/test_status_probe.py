@@ -410,8 +410,22 @@ class CanarySecretsVerdict(unittest.TestCase):
         # a different person.
         big = probe.Response(status=200, headers={}, body_prefix=snapshot_body(), truncated=True)
         outcome = probe.judge_canary_secrets(big)
-        self.assertEqual(outcome.state, probe.DOWN)
+        self.assertEqual(outcome.state, probe.UNCONFIGURED)
         self.assertIn("outgrown", outcome.detail)
+
+    def test_an_outgrown_canary_never_reaches_the_uptime_figure(self):
+        # The reason the verdict above is unconfigured rather than down. It is the only answer in
+        # this file that is not a measurement of the deployment, and counting it would publish an
+        # outage that did not happen. Asserted through `merge`, because the state alone does not
+        # say what the tally does with it.
+        big = probe.Response(status=200, headers={}, body_prefix=snapshot_body(), truncated=True)
+        # Driven from the judge rather than from a handwritten outcome, so that changing the
+        # verdict back to down fails here too. A test that builds its own input only pins what
+        # `merge` does with a state, not that this verdict ever produces it.
+        summary = probe.merge(probe.empty_summary(), {"sync": probe.judge_canary_secrets(big)}, NOW)
+        sync = next(c for c in summary["components"] if c["id"] == "sync")
+        self.assertEqual(sync["days"], [], "nothing was measured, so nothing is counted")
+        self.assertEqual(sync["state"], probe.UNCONFIGURED)
 
     def test_no_secrets_verdict_quotes_the_rows(self):
         marker = "CIPHERTEXTMARKER"

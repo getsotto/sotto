@@ -297,11 +297,19 @@ def judge_canary_secrets(response: Response) -> Outcome:
     if response.status != 200:
         return Outcome(DOWN, f"/machine/secrets answered {response.status}")
     if response.truncated:
-        # Deliberately not a verdict about the deployment, and worded so nobody reads it as one.
-        # The canary environment is meant to hold a couple of junk secrets; one big enough to
-        # overflow this budget is a canary that has been used for something else.
+        # Unconfigured rather than down, which is the same rule the rest of this file follows: a
+        # tally counts what was measured, and this is the one answer here that is not a
+        # measurement of the deployment at all. The canary environment is meant to hold a couple
+        # of junk secrets, and one big enough to overflow the budget is our environment being
+        # wrong, not the server being down. Recording it as downtime would put an outage that
+        # never happened into a figure whose whole purpose is to be believed.
+        #
+        # The cost is that it goes quiet rather than loud: an unconfigured row is grey and alerts
+        # nobody. That is the right way round here, because the only way to reach this is for
+        # somebody to have put things into the canary environment on purpose, and the detail says
+        # plainly what they have to undo.
         return Outcome(
-            DOWN, "the secrets snapshot did not fit; the canary environment has outgrown it"
+            UNCONFIGURED, "the secrets snapshot did not fit; the canary environment has outgrown it"
         )
     try:
         payload = json.loads(response.body_prefix)

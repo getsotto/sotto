@@ -731,7 +731,8 @@ empty list is not the only way to have nothing: `/machine/secrets` returns soft-
 well, flagged, so an environment whose secrets have all been removed answers with a full-looking
 list holding nothing usable. Keep the canary environment small, a couple of junk secrets, because
 that snapshot is read whole and a canary that has outgrown the budget reports so rather than
-guessing. Opening the grant would need the private key, which is the thing this is built
+guessing. That case is recorded as unconfigured rather than down: it is your environment having
+grown, not the deployment having failed, and it has no business in the published uptime figure. Opening the grant would need the private key, which is the thing this is built
 not to have. The credential is also withheld from a target that has not answered for itself:
 unauthenticated probes run first, and if the configured URL is not `https`, or every one of them
 was redirected elsewhere, no token is sent at all.
