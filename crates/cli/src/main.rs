@@ -166,6 +166,9 @@ enum Command {
     /// Remove a secret.
     Rm { name: String },
     /// Show a secret's version history (from the server; run after `login`).
+    #[command(
+        after_help = "Examples:\n  sotto history DATABASE_URL\n  sotto history DATABASE_URL --reveal\n\nHistory and rollback use the server and require login and an unlocked local store. History normally shows version numbers and sizes; --reveal prints plaintext values."
+    )]
     History {
         name: String,
         /// Show each version's value, not just its number and size.
@@ -173,6 +176,9 @@ enum Command {
         reveal: bool,
     },
     /// Restore an old version of a secret as a new version (local until you `push`).
+    #[command(
+        after_help = "Examples:\n  sotto history DATABASE_URL\n  sotto rollback DATABASE_URL 2\n  sotto push\n\nChoose an available version from history and pass its number without the displayed v prefix. Rollback restores that value as a new local version without erasing history; sotto push synchronises it. History and rollback require login and an unlocked local store."
+    )]
     Rollback {
         name: String,
         /// The version to restore (see `sotto history`).
@@ -1425,6 +1431,26 @@ mod tests {
         assert!(help.contains("sotto run --env staging -- npm test"));
         assert!(help.contains("sotto run -- python -c \"print('hello')\""));
         assert!(help.contains("Sotto options go before --"));
+    }
+
+    #[test]
+    fn history_and_rollback_help_explain_versions() {
+        let mut command = Cli::command();
+        let history = command
+            .find_subcommand_mut("history")
+            .expect("history subcommand should exist")
+            .render_long_help()
+            .to_string();
+        assert!(history.contains("sotto history DATABASE_URL --reveal"));
+        assert!(history.contains("--reveal prints plaintext values"));
+
+        let rollback = command
+            .find_subcommand_mut("rollback")
+            .expect("rollback subcommand should exist")
+            .render_long_help()
+            .to_string();
+        assert!(rollback.contains("sotto rollback DATABASE_URL 2"));
+        assert!(rollback.contains("without erasing history"));
     }
 
     #[test]
