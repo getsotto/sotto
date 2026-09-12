@@ -75,6 +75,10 @@ class Response:
     status: int
     headers: dict[str, str]
     body_prefix: str
+    #: Whether more body arrived than was kept. A verdict that parses needs to tell a payload cut
+    #: in half from a malformed one, because they are different problems and naming the wrong one
+    #: sends whoever reads the record to the wrong place.
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -279,22 +283,50 @@ def grant_verdict(body: str) -> Outcome:
 
 
 def judge_canary_secrets(response: Response) -> Outcome:
-    """Whether the canary environment still has something in it to sync.
+    """Whether the canary environment still holds a secret a machine could actually use.
 
-    Checked against the start of the payload rather than parsed, unlike the grant. A secret's
-    ciphertext is as long as whatever was encrypted, so a parse here would need the whole response
-    and would fail on truncation rather than on anything real. The serialiser emits `revision`
-    before `secrets`, so an empty environment is visible within a few dozen bytes, and an empty
-    environment is the failure worth catching: a machine that authenticates, gets its grant, and
-    then finds nothing to decrypt is a sync that has stopped working.
+    Parsed rather than pattern matched, and that is the whole point. `/machine/secrets` returns
+    every row for the environment including soft-deleted ones, each carrying a `deleted` flag, so
+    an environment whose secrets have all been removed answers with a full-looking list holding
+    nothing usable. Testing for an empty array would call that healthy, which is the failure this
+    component exists to notice rather than an edge of it.
+
+    A usable secret is one that is not deleted and carries both its ciphertext and its wrapped
+    data key. Either of those being empty leaves a machine with a row it cannot turn into a value.
     """
     if response.status != 200:
         return Outcome(DOWN, f"/machine/secrets answered {response.status}")
-    body = response.body_prefix.lstrip()
-    if not body.startswith('{"revision":'):
+    if response.truncated:
+        # Deliberately not a verdict about the deployment, and worded so nobody reads it as one.
+        # The canary environment is meant to hold a couple of junk secrets; one big enough to
+        # overflow this budget is a canary that has been used for something else.
+        return Outcome(
+            DOWN, "the secrets snapshot did not fit; the canary environment has outgrown it"
+        )
+    try:
+        payload = json.loads(response.body_prefix)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return Outcome(DOWN, "/machine/secrets answered 200 with something that is not JSON")
+    if not isinstance(payload, dict) or "revision" not in payload:
         return Outcome(DOWN, "/machine/secrets answered 200 without a snapshot")
-    if '"secrets":[]' in body:
-        return Outcome(DOWN, "the canary environment has no secrets left to sync")
+    rows = payload.get("secrets")
+    rows = rows if isinstance(rows, list) else []
+    live = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and not row.get("deleted")
+        and row.get("enc_value")
+        and row.get("enc_data_key")
+    ]
+    if not live:
+        # Counts only. The rows themselves are ciphertext, and a public record is no place for
+        # them even so.
+        return Outcome(
+            DOWN,
+            f"the canary environment has no usable secrets left ({len(rows)} row(s), "
+            "all deleted or incomplete)",
+        )
     return Outcome(OK)
 
 
@@ -405,9 +437,12 @@ PROBES: list[Probe] = [
         judge=judge_canary,
         token_env="SOTTO_CANARY_TOKEN",
         also=(("/machine/secrets", judge_canary_secrets),),
-        # Enough for a grant: an environment id and a 108 character base64 key, braces and all,
-        # fit several times over. Not enough to be storing a response of consequence in memory.
-        body_bytes=512,
+        # A grant needs about 170 bytes. The budget is set by the other endpoint, whose snapshot
+        # has to be parsed whole to tell a live secret from a tombstone, and whose size depends on
+        # what the canary environment holds. Generous for the couple of junk secrets it is meant
+        # to hold, and small enough that overflowing it says something true: this environment is
+        # being used for more than being a canary. Overflow reports that rather than guessing.
+        body_bytes=8192,
     ),
 ]
 
@@ -449,10 +484,16 @@ def fetch(base_url: str, probe: Probe, path: str | None = None, token: str | Non
 def read(response, body_bytes: int = 64) -> Response:
     headers = {k.lower(): v for k, v in response.headers.items()}
     try:
-        body = response.read(body_bytes).decode("utf-8", "replace")
+        # One byte past the limit, so "that was all of it" and "that was as much as we kept" can
+        # be told apart. Sliced back afterwards, so nothing beyond the budget is retained.
+        raw = response.read(body_bytes + 1)
     except TRANSPORT_FAILURES:  # a body that stops arriving is a transport fact, not a verdict
-        body = ""
-    return Response(status=response.status, headers=headers, body_prefix=body)
+        raw = b""
+    truncated = len(raw) > body_bytes
+    body = raw[:body_bytes].decode("utf-8", "replace")
+    return Response(
+        status=response.status, headers=headers, body_prefix=body, truncated=truncated
+    )
 
 
 # What a network can do to a request. `urllib.error.URLError` is an `OSError`, and a truncated

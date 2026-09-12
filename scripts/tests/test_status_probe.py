@@ -310,6 +310,24 @@ class MachineToken(unittest.TestCase):
             self.assertIsNotNone(probe.bearer_problem(wrong), wrong)
 
 
+def secret_row(**overrides):
+    row = {
+        "id": "s1",
+        "enc_name": "AA==",
+        "enc_value": "BB==",
+        "enc_data_key": "CC==",
+        "version": 1,
+        "deleted": False,
+    }
+    row.update(overrides)
+    return row
+
+
+def snapshot_body(secrets=None, revision=4):
+    rows = [secret_row()] if secrets is None else secrets
+    return json.dumps({"revision": revision, "secrets": rows})
+
+
 def grant_body(sealed_bytes=probe.SEALED_VAULT_KEY_LEN, env_id="env_abc"):
     key = base64.b64encode(b"k" * sealed_bytes).decode() if sealed_bytes is not None else ""
     return json.dumps({"env_id": env_id, "enc_vault_key": key})
@@ -352,16 +370,54 @@ class CanaryVerdict(unittest.TestCase):
 
 class CanarySecretsVerdict(unittest.TestCase):
     def test_a_snapshot_with_a_secret_in_it_passes(self):
-        body = '{"revision":4,"secrets":[{"id":"s1","enc_name":"AA","enc_value":"BB"'
+        body = snapshot_body()
         self.assertEqual(probe.judge_canary_secrets(response(200, body=body)).state, probe.OK)
 
     def test_an_emptied_environment_is_an_outage_not_a_pass(self):
         # A machine that authenticates, gets its grant, and finds nothing to decrypt is a sync
         # that has stopped working, and it answers 200 the whole way.
-        body = '{"revision":9,"secrets":[]}'
-        outcome = probe.judge_canary_secrets(response(200, body=body))
+        outcome = probe.judge_canary_secrets(response(200, body=snapshot_body([])))
         self.assertEqual(outcome.state, probe.DOWN)
-        self.assertIn("no secrets left", outcome.detail)
+        self.assertIn("no usable secrets", outcome.detail)
+
+    def test_an_environment_of_tombstones_is_not_a_pass(self):
+        # The finding that made this parse rather than pattern match. `/machine/secrets` returns
+        # soft-deleted rows too, each flagged, so an environment whose secrets have all been
+        # removed answers with a full-looking list holding nothing a machine can use. Testing for
+        # an empty array called that healthy.
+        rows = [secret_row(id="s1", deleted=True), secret_row(id="s2", deleted=True)]
+        outcome = probe.judge_canary_secrets(response(200, body=snapshot_body(rows)))
+        self.assertEqual(outcome.state, probe.DOWN)
+        self.assertIn("2 row(s)", outcome.detail)
+
+    def test_one_live_secret_among_tombstones_is_enough(self):
+        rows = [secret_row(id="s1", deleted=True), secret_row(id="s2")]
+        self.assertEqual(
+            probe.judge_canary_secrets(response(200, body=snapshot_body(rows))).state, probe.OK
+        )
+
+    def test_a_row_with_no_ciphertext_is_not_a_usable_secret(self):
+        # A row a machine cannot turn into a value is not a secret it has. Either field empty
+        # leaves it with an id and nothing else.
+        for missing in ("enc_value", "enc_data_key"):
+            rows = [secret_row(**{missing: ""})]
+            outcome = probe.judge_canary_secrets(response(200, body=snapshot_body(rows)))
+            self.assertEqual(outcome.state, probe.DOWN, missing)
+
+    def test_a_snapshot_too_large_to_check_says_so_rather_than_guessing(self):
+        # Reported as its own thing, because it is not a statement about the deployment: it says
+        # the canary environment has grown past what this can read, which is a different job for
+        # a different person.
+        big = probe.Response(status=200, headers={}, body_prefix=snapshot_body(), truncated=True)
+        outcome = probe.judge_canary_secrets(big)
+        self.assertEqual(outcome.state, probe.DOWN)
+        self.assertIn("outgrown", outcome.detail)
+
+    def test_no_secrets_verdict_quotes_the_rows(self):
+        marker = "CIPHERTEXTMARKER"
+        rows = [secret_row(enc_value=marker, deleted=True)]
+        detail = probe.judge_canary_secrets(response(200, body=snapshot_body(rows))).detail or ""
+        self.assertNotIn(marker, detail)
 
     def test_something_that_is_not_a_snapshot_is_not_a_pass(self):
         self.assertEqual(
@@ -403,7 +459,7 @@ class CanaryObservation(unittest.TestCase):
             seen.append(token)
             if path is None:
                 return response(200, body=grant_body())
-            return response(200, body='{"revision":1,"secrets":[{"id":"s1"')
+            return response(200, body=snapshot_body())
 
         with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "  smt_frombearer  "}):
             with unittest.mock.patch.object(probe, "fetch", capture):
@@ -450,7 +506,7 @@ class CanaryObservation(unittest.TestCase):
                 return response(200, body="ok\n")
             if path is None:
                 return response(200, body=grant_body())
-            return response(200, body='{"revision":1,"secrets":[{"id":"s1"')
+            return response(200, body=snapshot_body())
 
         with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
             with unittest.mock.patch.object(probe, "fetch", record):
@@ -564,7 +620,8 @@ class CanaryObservation(unittest.TestCase):
             probe.urllib.request, "build_opener", lambda *_: FakeOpener()
         ):
             seen = probe.fetch("https://example.test", canary, token="smt_bearer")
-        self.assertEqual(asked["n"], canary.body_bytes)
+        # One past the budget, which is how a truncated body is told from a complete one.
+        self.assertEqual(asked["n"], canary.body_bytes + 1)
         self.assertGreater(canary.body_bytes, len(grant_body()))
         self.assertEqual(probe.judge_canary(seen).state, probe.OK)
 
@@ -588,19 +645,19 @@ class CanaryObservation(unittest.TestCase):
         def emptied(_base, _probe, path=None, token=None):
             if path is None:
                 return response(200, body=grant_body())
-            return response(200, body='{"revision":9,"secrets":[]}')
+            return response(200, body=snapshot_body([]))
 
         with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
             with unittest.mock.patch.object(probe, "fetch", emptied):
                 outcomes = probe.observe("https://example.invalid", [self.canary()])
         self.assertEqual(outcomes["sync"].state, probe.DOWN)
-        self.assertIn("no secrets left", outcomes["sync"].detail)
+        self.assertIn("no usable secrets", outcomes["sync"].detail)
 
     def test_both_answering_is_the_only_way_through(self):
         def both_fine(_base, _probe, path=None, token=None):
             if path is None:
                 return response(200, body=grant_body())
-            return response(200, body='{"revision":4,"secrets":[{"id":"s1"')
+            return response(200, body=snapshot_body())
 
         with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
             with unittest.mock.patch.object(probe, "fetch", both_fine):
@@ -636,6 +693,31 @@ class Observation(unittest.TestCase):
             outcomes = probe.observe("https://example.invalid", [self.probe_for(probe.judge_web)])
         self.assertEqual(outcomes["t"].state, probe.DOWN)
         self.assertIn("URLError", outcomes["t"].detail)
+
+    def test_a_body_longer_than_the_budget_is_marked_truncated(self):
+        # The flag a parsing verdict depends on. Without it a snapshot cut in half would be
+        # reported as malformed, sending somebody to look for a server bug that is not there.
+        class Fake:
+            status = 200
+            headers = {}
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def read(self, n):
+                return self.payload[:n]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        self.assertTrue(probe.read(Fake(b"x" * 100), body_bytes=16).truncated)
+        exact = probe.read(Fake(b"x" * 16), body_bytes=16)
+        self.assertFalse(exact.truncated)
+        self.assertEqual(exact.body_prefix, "x" * 16)
+        self.assertFalse(probe.read(Fake(b"x" * 5), body_bytes=16).truncated)
 
     def test_the_caught_types_are_the_ones_a_network_actually_raises(self):
         # URLError is an OSError and a truncated reply is an HTTPException, so both must land
