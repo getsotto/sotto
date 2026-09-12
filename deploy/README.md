@@ -642,6 +642,8 @@ somewhere else before they age out is the whole of what that takes.
 
 Set the repository variable `SOTTO_PUBLIC_URL` to the deployment to watch. Without it the job
 skips rather than probing a default, so a fork cannot point it at somebody else's deployment.
+Set `SOTTO_CANARY_TOKEN` as well if you want the secret-sync row measured rather than reported
+unconfigured; the probe table above says how.
 
 **In a fork, one line has to change as well.** The job carries
 `if: github.repository == 'getsotto/sotto'`, so a fork of this repository collects nothing and
@@ -673,7 +675,8 @@ record that is meant to be permanent:
   Before that the path falls through to the single-page app, and the API row records real
   downtime for a deployment that is working.
 
-Every probe is unauthenticated and asks only what a visitor could ask:
+Four of the five probes are unauthenticated and ask only what a visitor could ask. The fifth
+presents a machine token, and is described after the table:
 
 | Component   | Probe                                          | Healthy answer                   |
 | ----------- | ---------------------------------------------- | -------------------------------- |
@@ -681,7 +684,7 @@ Every probe is unauthenticated and asks only what a visitor could ask:
 | Web app     | `GET /`                                        | `200` and an HTML content type   |
 | Sign in     | `GET /auth/github/login` with a loopback callback | a redirect to `github.com`    |
 | Billing     | `POST /billing/webhook` with no signature      | `401`                            |
-| Secret sync | not yet probed                                 | -                                |
+| Secret sync | `GET /machine/grant` and `GET /machine/secrets` | a usable grant and a usable secret |
 
 Two of those distinguish "not configured" from "broken", because they are not the same thing
 and only one of them belongs in an uptime figure. A `503` from sign-in or billing means the
@@ -694,11 +697,50 @@ The billing probe deliberately sends an unsigned payload and requires a `401`. A
 would mean signature verification is not happening, so that case is recorded as down rather
 than as a passing request.
 
-Secret sync is listed but not measured. It needs a throwaway organisation holding junk secrets
-and a machine token to read them, and neither exists yet; shipping a probe that has never run
-would repeat the mistake this whole effort was built to catch. It appears as a row so a page
-can say plainly that it is not being watched, rather than implying by omission that everything
-is covered.
+Secret sync is the one probe that authenticates, because the question it asks cannot be asked
+from outside: can a machine still get hold of what it needs to decrypt an environment? Every
+other probe reads a public surface, and a deployment can serve all of them perfectly while the
+grant that makes a CI run work has gone.
+
+It needs a throwaway project holding junk secrets and a machine token scoped to one of its
+environments. A personal project is enough; an organisation is only needed for sharing, and a
+machine token binds an environment rather than an org. Create the token from that project's
+directory, because `sotto` finds its project by walking up from the working directory and will
+otherwise mint a token for whichever project it finds first. Set it as the repository secret
+`SOTTO_CANARY_TOKEN`, and **store only the bearer half**, the
+`smt_...` part before the dot:
+
+```sh
+cd ~/sotto-canary                         # or wherever the canary project lives
+sotto token create --name status-canary   # prints a SOTTO_TOKEN once
+gh secret set SOTTO_CANARY_TOKEN --body 'smt_...'   # the part BEFORE the dot, nothing after it
+```
+
+A `SOTTO_TOKEN` is the server-issued bearer joined to the machine's private key. Only the bearer
+is needed here, because the server authenticates on it alone, and the probe refuses to run with a
+whole token rather than trimming one: trimming would leave the private key in the collector's
+environment, where anything able to read it could pair that key with the ciphertext just fetched
+and decrypt the canary. Refusing is what makes "the collector cannot decrypt" a property of what
+it holds rather than a promise about what it does. If the whole token is stored, the row reports
+unconfigured and says so.
+
+Without the secret the row reports unconfigured and the other four probes are unaffected, which
+is what a self-hoster with no canary should see: an unconfigured component is not an outage and
+is left out of the tally.
+
+What it checks is deliberately short of decrypting. The sealed vault key is decoded and measured,
+because a truncated or empty grant answers `200` and looks exactly like a good one while leaving a
+machine unable to open anything; and the secrets snapshot must still hold a secret a machine could
+use, meaning one that is not deleted and carries both its ciphertext and its wrapped data key. An
+empty list is not the only way to have nothing: `/machine/secrets` returns soft-deleted rows as
+well, flagged, so an environment whose secrets have all been removed answers with a full-looking
+list holding nothing usable. Keep the canary environment small, a couple of junk secrets, because
+that snapshot is read whole and a canary that has outgrown the budget reports so rather than
+guessing. That case is recorded as unconfigured rather than down: it is your environment having
+grown, not the deployment having failed, and it has no business in the published uptime figure. Opening the grant would need the private key, which is the thing this is built
+not to have. The credential is also withheld from a target that has not answered for itself:
+unauthenticated probes run first, and if the configured URL is not `https`, or every one of them
+was redirected elsewhere, no token is sent at all.
 
 The job records and never alerts. A component being down leaves the workflow green, because
 paging belongs to an external monitor that survives this repository being unreachable, and a

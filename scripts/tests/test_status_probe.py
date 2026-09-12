@@ -7,12 +7,14 @@ single-page app answering for the API is the exact shape of a misconfigured depl
 that looks healthy from outside.
 """
 
+import base64
 import contextlib
 import datetime as dt
 import http.client
 import importlib.machinery
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -102,7 +104,9 @@ class WrongBaseUrl(unittest.TestCase):
             stack.enter_context(unittest.mock.patch.object(sys, "argv", argv))
             if responses is not None:
                 stack.enter_context(
-                    unittest.mock.patch.object(probe, "fetch", lambda _base, p: responses[p.id])
+                    unittest.mock.patch.object(
+                        probe, "fetch", lambda _base, p, path=None, token=None: responses[p.id]
+                    )
                 )
             return probe.main()
 
@@ -112,6 +116,32 @@ class WrongBaseUrl(unittest.TestCase):
             code = self.run_probe("https://example.com", d, {p.id: redirect for p in probe.PROBES})
             self.assertEqual(code, 1, "a red run is what stops the heartbeat that follows")
             self.assertEqual(list(Path(d).iterdir()), [], "no invented downtime was recorded")
+
+    def test_one_unconfigured_component_cannot_disable_the_refusal(self):
+        # Not canary-specific, which is why it is here rather than with the canary tests. Any
+        # component that reports itself unconfigured reaches this, and a 503 whose body says
+        # "not configured" has been able to since before there was a canary: one such component
+        # among misdirected ones made the check unreachable and turned a refusal into ninety days
+        # of recorded downtime that never happened.
+        redirect = response(301, {"location": "https://www.example.com/"})
+        probes = [
+            probe.Probe(
+                id="astray", name="A", description="", method="GET", path="/a",
+                judge=probe.judge_web,
+            ),
+            probe.Probe(
+                id="off", name="B", description="", method="GET", path="/b",
+                judge=lambda _r: probe.Outcome(probe.UNCONFIGURED, "switched off"),
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            with unittest.mock.patch.object(probe, "PROBES", probes):
+                with unittest.mock.patch.object(
+                    probe, "fetch", lambda _b, _p, path=None, token=None: redirect
+                ):
+                    code = self.run_probe("https://example.com", d)
+            self.assertEqual(code, 1)
+            self.assertEqual(list(Path(d).iterdir()), [])
 
     def test_a_real_outage_is_still_recorded_and_still_reports_success(self):
         # The distinction that makes the refusal safe: a deployment that is gone refuses
@@ -247,6 +277,420 @@ class BillingVerdict(unittest.TestCase):
         self.assertIn("did not send", outcome.detail)
 
 
+class MachineToken(unittest.TestCase):
+    """Which configured values this job is willing to run with at all.
+
+    The private key half opens the vault-key grant. Sending only the bearer was not enough while
+    the whole string sat in `os.environ`: anything able to read the environment could pair that
+    key with the ciphertext just fetched. So a token carrying its key half is refused rather than
+    trimmed, which is the difference between this job being unable to decrypt and merely not
+    bothering to.
+    """
+
+    def test_a_bearer_on_its_own_is_accepted(self):
+        self.assertIsNone(probe.bearer_problem("smt_bearer"))
+        self.assertIsNone(probe.bearer_problem("  smt_bearer  "))
+
+    def test_a_whole_token_is_refused_rather_than_trimmed(self):
+        problem = probe.bearer_problem("smt_bearer.MT1-privatekeymaterial")
+        self.assertIsNotNone(problem)
+        self.assertIn("before the dot", problem)
+
+    def test_the_refusal_never_repeats_the_token(self):
+        # Details are published and kept for ninety days.
+        problem = probe.bearer_problem("smt_SECRETBEARER.MT1-SECRETKEY")
+        self.assertNotIn("SECRETBEARER", problem)
+        self.assertNotIn("SECRETKEY", problem)
+
+    def test_something_that_is_not_a_machine_token_is_refused(self):
+        # Without the prefix check a passphrase, an API key or an empty variable would be sent
+        # to the server as a bearer token and come back 401, which this would then publish as
+        # the deployment having an outage.
+        for wrong in ("", "   ", "hunter2", "st_session_token", "MT1-onlythekey"):
+            self.assertIsNotNone(probe.bearer_problem(wrong), wrong)
+
+
+def secret_row(**overrides):
+    row = {
+        "id": "s1",
+        "enc_name": "AA==",
+        "enc_value": "BB==",
+        "enc_data_key": "CC==",
+        "version": 1,
+        "deleted": False,
+    }
+    row.update(overrides)
+    return row
+
+
+def snapshot_body(secrets=None, revision=4):
+    rows = [secret_row()] if secrets is None else secrets
+    return json.dumps({"revision": revision, "secrets": rows})
+
+
+def grant_body(sealed_bytes=probe.SEALED_VAULT_KEY_LEN, env_id="env_abc"):
+    key = base64.b64encode(b"k" * sealed_bytes).decode() if sealed_bytes is not None else ""
+    return json.dumps({"env_id": env_id, "enc_vault_key": key})
+
+
+class CanaryVerdict(unittest.TestCase):
+    def test_a_usable_grant_passes(self):
+        self.assertEqual(probe.judge_canary(response(200, body=grant_body())).state, probe.OK)
+
+    def test_a_200_that_is_not_a_grant_is_not_a_pass(self):
+        self.assertEqual(probe.judge_canary(response(200, body='{"ok":true}')).state, probe.DOWN)
+
+    def test_a_grant_that_is_present_but_unusable_is_caught(self):
+        # The failure this component exists for. A truncated or empty sealed key answers 200 and
+        # looks exactly like a good one from the outside, and a machine given it cannot recover:
+        # it authenticates, receives its grant, and then cannot open a single secret.
+        for length in (0, 40, 79, 81):
+            outcome = probe.judge_canary(response(200, body=grant_body(length)))
+            self.assertEqual(outcome.state, probe.DOWN, length)
+            self.assertIn(str(length), outcome.detail)
+
+    def test_a_key_that_is_not_base64_is_caught(self):
+        body = json.dumps({"env_id": "env_abc", "enc_vault_key": "not base64!!"})
+        self.assertIn("base64", probe.judge_canary(response(200, body=body)).detail)
+
+    def test_a_grant_with_no_environment_is_caught(self):
+        body = json.dumps({"enc_vault_key": base64.b64encode(b"k" * 80).decode()})
+        self.assertIn("no environment", probe.judge_canary(response(200, body=body)).detail)
+
+    def test_no_verdict_quotes_the_response_body(self):
+        # Details are written to a public branch and kept for ninety days. The payload here is
+        # ciphertext rather than plaintext, but quoting a response into a public record is a
+        # habit worth not having at all.
+        marker = "MARKERVALUE"
+        bodies = [marker, '{"env_id":"' + marker + '","enc_vault_key":"!!"}', "{" + marker]
+        for body in bodies:
+            detail = probe.judge_canary(response(200, body=body)).detail or ""
+            self.assertNotIn(marker, detail, body)
+
+
+class CanarySecretsVerdict(unittest.TestCase):
+    def test_a_snapshot_with_a_secret_in_it_passes(self):
+        body = snapshot_body()
+        self.assertEqual(probe.judge_canary_secrets(response(200, body=body)).state, probe.OK)
+
+    def test_an_emptied_environment_is_an_outage_not_a_pass(self):
+        # A machine that authenticates, gets its grant, and finds nothing to decrypt is a sync
+        # that has stopped working, and it answers 200 the whole way.
+        outcome = probe.judge_canary_secrets(response(200, body=snapshot_body([])))
+        self.assertEqual(outcome.state, probe.DOWN)
+        self.assertIn("no usable secrets", outcome.detail)
+
+    def test_an_environment_of_tombstones_is_not_a_pass(self):
+        # The finding that made this parse rather than pattern match. `/machine/secrets` returns
+        # soft-deleted rows too, each flagged, so an environment whose secrets have all been
+        # removed answers with a full-looking list holding nothing a machine can use. Testing for
+        # an empty array called that healthy.
+        rows = [secret_row(id="s1", deleted=True), secret_row(id="s2", deleted=True)]
+        outcome = probe.judge_canary_secrets(response(200, body=snapshot_body(rows)))
+        self.assertEqual(outcome.state, probe.DOWN)
+        self.assertIn("2 row(s)", outcome.detail)
+
+    def test_one_live_secret_among_tombstones_is_enough(self):
+        rows = [secret_row(id="s1", deleted=True), secret_row(id="s2")]
+        self.assertEqual(
+            probe.judge_canary_secrets(response(200, body=snapshot_body(rows))).state, probe.OK
+        )
+
+    def test_a_row_with_no_ciphertext_is_not_a_usable_secret(self):
+        # A row a machine cannot turn into a value is not a secret it has. Either field empty
+        # leaves it with an id and nothing else.
+        for missing in ("enc_value", "enc_data_key"):
+            rows = [secret_row(**{missing: ""})]
+            outcome = probe.judge_canary_secrets(response(200, body=snapshot_body(rows)))
+            self.assertEqual(outcome.state, probe.DOWN, missing)
+
+    def test_a_snapshot_too_large_to_check_says_so_rather_than_guessing(self):
+        # Reported as its own thing, because it is not a statement about the deployment: it says
+        # the canary environment has grown past what this can read, which is a different job for
+        # a different person.
+        big = probe.Response(status=200, headers={}, body_prefix=snapshot_body(), truncated=True)
+        outcome = probe.judge_canary_secrets(big)
+        self.assertEqual(outcome.state, probe.UNCONFIGURED)
+        self.assertIn("outgrown", outcome.detail)
+
+    def test_an_outgrown_canary_never_reaches_the_uptime_figure(self):
+        # The reason the verdict above is unconfigured rather than down. It is the only answer in
+        # this file that is not a measurement of the deployment, and counting it would publish an
+        # outage that did not happen. Asserted through `merge`, because the state alone does not
+        # say what the tally does with it.
+        big = probe.Response(status=200, headers={}, body_prefix=snapshot_body(), truncated=True)
+        # Driven from the judge rather than from a handwritten outcome, so that changing the
+        # verdict back to down fails here too. A test that builds its own input only pins what
+        # `merge` does with a state, not that this verdict ever produces it.
+        summary = probe.merge(probe.empty_summary(), {"sync": probe.judge_canary_secrets(big)}, NOW)
+        sync = next(c for c in summary["components"] if c["id"] == "sync")
+        self.assertEqual(sync["days"], [], "nothing was measured, so nothing is counted")
+        self.assertEqual(sync["state"], probe.UNCONFIGURED)
+
+    def test_no_secrets_verdict_quotes_the_rows(self):
+        marker = "CIPHERTEXTMARKER"
+        rows = [secret_row(enc_value=marker, deleted=True)]
+        detail = probe.judge_canary_secrets(response(200, body=snapshot_body(rows))).detail or ""
+        self.assertNotIn(marker, detail)
+
+    def test_something_that_is_not_a_snapshot_is_not_a_pass(self):
+        self.assertEqual(
+            probe.judge_canary_secrets(response(200, body="<!doctype html>")).state, probe.DOWN
+        )
+
+    def test_a_non_200_is_reported_with_its_status(self):
+        self.assertIn("503", probe.judge_canary_secrets(response(503)).detail)
+
+    def test_a_refusal_names_the_token_rather_than_guessing_the_cause(self):
+        # 401 covers the organisation being deleted, the token revoked, and the grant going
+        # missing. They are one symptom with three causes and the record should not invent one.
+        outcome = probe.judge_canary(response(401))
+        self.assertEqual(outcome.state, probe.DOWN)
+        self.assertIn("refused", outcome.detail)
+
+    def test_the_web_app_answering_is_a_routing_fault_not_a_missing_grant(self):
+        html = response(200, {"content-type": "text/html"}, "<!doctype html>")
+        self.assertIn("web app", probe.judge_canary(html).detail)
+
+    def test_a_redirect_is_still_a_misdirection(self):
+        astray = response(301, {"location": "https://www.example.com/"})
+        self.assertTrue(probe.judge_canary(astray).fault)
+
+
+class CanaryObservation(unittest.TestCase):
+    def canary(self):
+        return next(p for p in probe.PROBES if p.id == "sync")
+
+    def test_the_bearer_that_reaches_the_request_is_the_one_that_was_read(self):
+        # The other token tests check `bearer_problem` in isolation and call `fetch` with a value
+        # handed straight to it, so between them they never pin the line that reads the
+        # environment. Something could be read, checked, and then a different thing sent, and
+        # every one of them would still pass. This captures what arrives at the request boundary
+        # on both of the canary's calls.
+        seen = []
+
+        def capture(_base, _p, path=None, token=None):
+            seen.append(token)
+            if path is None:
+                return response(200, body=grant_body())
+            return response(200, body=snapshot_body())
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "  smt_frombearer  "}):
+            with unittest.mock.patch.object(probe, "fetch", capture):
+                outcomes = probe.observe("https://example.test", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.OK)
+        self.assertEqual(len(seen), 2, "the grant and its companion both authenticate")
+        self.assertEqual(set(seen), {"smt_frombearer"})
+
+    def test_a_misdirected_target_never_sees_the_bearer(self):
+        # The collector already refuses to record a run like this, but it refused after the
+        # requests had gone out. For four probes that costs a wrong reading; for this one it hands
+        # a bearer token to whatever host the typo pointed at, and no later refusal takes it back.
+        def sent(_base, _p, path=None, token=None):
+            if token is not None:
+                raise AssertionError("a credential reached an unconfirmed target")
+            return response(301, {"location": "https://www.example.com/"})
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
+            with unittest.mock.patch.object(probe, "fetch", sent):
+                outcomes = probe.observe("https://example.com", list(probe.PROBES))
+        self.assertEqual(outcomes["sync"].state, probe.UNCONFIGURED)
+        self.assertIn("misdirected", outcomes["sync"].detail)
+
+    def test_a_target_that_is_not_https_never_sees_the_bearer(self):
+        def sent(*_args, **kwargs):
+            if kwargs.get("token") is not None:
+                raise AssertionError("a bearer would have travelled in clear")
+            return response(200, body="ok\n")
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
+            with unittest.mock.patch.object(probe, "fetch", sent):
+                outcomes = probe.observe("http://example.com", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.UNCONFIGURED)
+        self.assertIn("https", outcomes["sync"].detail)
+
+    def test_the_unauthenticated_probes_run_before_the_canary(self):
+        # The order is what makes the check above possible at all, so it is asserted rather than
+        # relied on: a declaration reordered later must not quietly send the credential first.
+        order = []
+
+        def record(_base, p, path=None, token=None):
+            order.append(p.id)
+            if p.id != "sync":
+                return response(200, body="ok\n")
+            if path is None:
+                return response(200, body=grant_body())
+            return response(200, body=snapshot_body())
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
+            with unittest.mock.patch.object(probe, "fetch", record):
+                probe.observe("https://example.test", list(probe.PROBES))
+        # The canary fetches twice, its grant and then its companion, so this asserts that every
+        # one of its requests comes after every unauthenticated one rather than counting them.
+        first = order.index("sync")
+        self.assertNotIn("sync", order[:first])
+        self.assertTrue(all(pid == "sync" for pid in order[first:]), order)
+
+    def test_a_whole_token_is_refused_without_touching_the_network(self):
+        # The point of refusing rather than trimming: with the key half present this job declines
+        # to run at all, so there is no window in which it holds both halves and a fetched
+        # ciphertext.
+        def explode(*_args, **_kwargs):
+            raise AssertionError("a token carrying its private key must not be used")
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SOTTO_CANARY_TOKEN": "smt_bearer.MT1-privatekey"}
+        ):
+            with unittest.mock.patch.object(probe, "fetch", explode):
+                outcomes = probe.observe("https://example.invalid", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.UNCONFIGURED)
+        self.assertIn("before the dot", outcomes["sync"].detail)
+
+    def test_no_token_reports_unconfigured_without_touching_the_network(self):
+        def explode(*_args, **_kwargs):
+            raise AssertionError("a probe with no token must not make a request")
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": ""}):
+            with unittest.mock.patch.object(probe, "fetch", explode):
+                outcomes = probe.observe("https://example.invalid", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.UNCONFIGURED)
+
+    def test_an_unconfigured_canary_does_not_disable_the_misdirection_refusal(self):
+        # The refusal asks whether every probe was misdirected. An unconfigured component can be
+        # neither, so counting it would make that check unreachable on any instance without a
+        # canary, which is most of them, and a wrongly pointed collector would then write ninety
+        # days of invented downtime instead of refusing.
+        redirect = response(301, {"location": "https://www.example.com/"})
+        argv = ["status-probe", "--base-url", "https://example.com", "--data-dir", ""]
+        with tempfile.TemporaryDirectory() as d:
+            argv[-1] = d
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": ""}))
+                stack.enter_context(unittest.mock.patch.object(sys, "argv", argv))
+                stack.enter_context(
+                    unittest.mock.patch.object(
+                        probe, "fetch", lambda _b, _p, path=None, token=None: redirect
+                    )
+                )
+                code = probe.main()
+            self.assertEqual(code, 1, "the collector must refuse, not record")
+            self.assertEqual(list(Path(d).iterdir()), [], "no invented downtime was written")
+
+    def test_the_bearer_reaches_the_request_and_the_private_key_does_not(self):
+        seen = {}
+
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def read(self, _n):
+                return b'{"env_id":"env_abc","enc_vault_key":"AA"}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        class FakeOpener:
+            def open(self, request, timeout=None):
+                seen["auth"] = request.get_header("Authorization")
+                seen["url"] = request.full_url
+                return FakeResponse()
+
+        with unittest.mock.patch.object(probe.urllib.request, "build_opener", lambda *_: FakeOpener()):
+            probe.fetch("https://example.test", self.canary(), token="smt_bearer")
+        self.assertEqual(seen["auth"], "Bearer smt_bearer")
+        self.assertNotIn("MT1-", seen["auth"])
+        self.assertNotIn("smt_bearer", seen["url"], "a bearer in a URL reaches proxies and logs")
+
+    def test_the_canary_reads_enough_body_to_parse_a_grant(self):
+        # The default 64 byte prefix cuts a grant in half: it would never parse, the component
+        # would report down for ever, and the cause would look like a server fault rather than a
+        # limit set for a different probe. This asserts the limit travels from the probe into the
+        # read rather than that some larger number was written down somewhere.
+        asked = {}
+
+        class FakeResponse:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            def read(self, n):
+                asked["n"] = n
+                return grant_body().encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        class FakeOpener:
+            def open(self, _request, timeout=None):
+                return FakeResponse()
+
+        canary = self.canary()
+        with unittest.mock.patch.object(
+            probe.urllib.request, "build_opener", lambda *_: FakeOpener()
+        ):
+            seen = probe.fetch("https://example.test", canary, token="smt_bearer")
+        # One past the budget, which is how a truncated body is told from a complete one.
+        self.assertEqual(asked["n"], canary.body_bytes + 1)
+        self.assertGreater(canary.body_bytes, len(grant_body()))
+        self.assertEqual(probe.judge_canary(seen).state, probe.OK)
+
+    def test_a_companion_path_that_does_not_answer_fails_the_component(self):
+        # The grant alone is half the question. A machine that can read its sealed vault key but
+        # cannot list any ciphertext has nothing to decrypt, and a green row would say otherwise.
+        def by_path(_base, _probe, path=None, token=None):
+            if path is None:
+                return response(200, body=grant_body())
+            return response(500)
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
+            with unittest.mock.patch.object(probe, "fetch", by_path):
+                outcomes = probe.observe("https://example.invalid", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.DOWN)
+        self.assertIn("/machine/secrets", outcomes["sync"].detail)
+
+    def test_an_emptied_canary_environment_fails_the_component(self):
+        # Both endpoints answer 200 and the grant is perfect. Only the companion's own verdict
+        # separates this from working, which is why companions carry one.
+        def emptied(_base, _probe, path=None, token=None):
+            if path is None:
+                return response(200, body=grant_body())
+            return response(200, body=snapshot_body([]))
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
+            with unittest.mock.patch.object(probe, "fetch", emptied):
+                outcomes = probe.observe("https://example.invalid", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.DOWN)
+        self.assertIn("no usable secrets", outcomes["sync"].detail)
+
+    def test_both_answering_is_the_only_way_through(self):
+        def both_fine(_base, _probe, path=None, token=None):
+            if path is None:
+                return response(200, body=grant_body())
+            return response(200, body=snapshot_body())
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "smt_x"}):
+            with unittest.mock.patch.object(probe, "fetch", both_fine):
+                outcomes = probe.observe("https://example.invalid", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.OK)
+
+    def test_no_outcome_detail_can_carry_the_token(self):
+        # Details are written to a public branch and kept for ninety days.
+        token = "smt_verysecret"
+
+        def refuse(*_args, **_kwargs):
+            raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": token}):
+            with unittest.mock.patch.object(probe, "fetch", refuse):
+                outcomes = probe.observe("https://example.invalid", [self.canary()])
+        self.assertNotIn("smt_verysecret", outcomes["sync"].detail or "")
+
+
 class Observation(unittest.TestCase):
     def probe_for(self, judge, path="/x"):
         return probe.Probe(id="t", name="T", description="", method="GET", path=path, judge=judge)
@@ -263,6 +707,31 @@ class Observation(unittest.TestCase):
             outcomes = probe.observe("https://example.invalid", [self.probe_for(probe.judge_web)])
         self.assertEqual(outcomes["t"].state, probe.DOWN)
         self.assertIn("URLError", outcomes["t"].detail)
+
+    def test_a_body_longer_than_the_budget_is_marked_truncated(self):
+        # The flag a parsing verdict depends on. Without it a snapshot cut in half would be
+        # reported as malformed, sending somebody to look for a server bug that is not there.
+        class Fake:
+            status = 200
+            headers = {}
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def read(self, n):
+                return self.payload[:n]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        self.assertTrue(probe.read(Fake(b"x" * 100), body_bytes=16).truncated)
+        exact = probe.read(Fake(b"x" * 16), body_bytes=16)
+        self.assertFalse(exact.truncated)
+        self.assertEqual(exact.body_prefix, "x" * 16)
+        self.assertFalse(probe.read(Fake(b"x" * 5), body_bytes=16).truncated)
 
     def test_the_caught_types_are_the_ones_a_network_actually_raises(self):
         # URLError is an OSError and a truncated reply is an HTTPException, so both must land
@@ -332,10 +801,29 @@ class Summary(unittest.TestCase):
         self.assertEqual(billing["state"], probe.UNCONFIGURED)
 
     def test_a_component_with_no_probe_is_declared_not_omitted(self):
-        summary = probe.merge(probe.empty_summary(), {}, NOW)
-        sync = next(c for c in summary["components"] if c["id"] == "sync")
-        self.assertEqual(sync["state"], probe.UNCONFIGURED)
-        self.assertEqual(sync["days"], [])
+        # Nothing is unprobed today, now that the canary is measured, so this drives the
+        # mechanism with a stand-in rather than deleting the test with the last member. What it
+        # protects is the rule: a page that leaves out what it does not watch implies it watches
+        # everything, and the next component to arrive without a probe needs somewhere honest to
+        # sit while it waits for one.
+        declared = [
+            {
+                "id": "future",
+                "name": "Future",
+                "description": "",
+                "state": probe.UNCONFIGURED,
+                "detail": "no probe yet",
+            }
+        ]
+        with unittest.mock.patch.object(probe, "UNPROBED", declared):
+            summary = probe.merge(probe.empty_summary(), {}, NOW)
+        future = next(c for c in summary["components"] if c["id"] == "future")
+        self.assertEqual(future["state"], probe.UNCONFIGURED)
+        self.assertEqual(future["days"], [])
+
+    def test_secret_sync_is_measured_now_rather_than_declared(self):
+        self.assertIn("sync", {p.id for p in probe.PROBES})
+        self.assertEqual(probe.UNPROBED, [])
 
     def test_history_keeps_ageing_after_a_component_stops_being_probed(self):
         # A deployment that drops Stripe stops producing conclusive billing samples but keeps
