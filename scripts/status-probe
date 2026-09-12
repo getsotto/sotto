@@ -14,7 +14,7 @@ component answers, not that it is healthy for a signed-in user, which is the que
 status page asks.
 
 The exception is the canary, which presents a machine token belonging to a throwaway
-organisation. It refuses to run with a token that still carries its private key half, so this
+project. It refuses to run with a token that still carries its private key half, so this
 job can prove that a machine can retrieve what it needs to decrypt an environment while holding
 nothing that could decrypt it. A compromise here yields ciphertext and no way to read it, and
 that is a property of what the process is given rather than of what it chooses to send.

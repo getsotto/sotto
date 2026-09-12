@@ -702,11 +702,16 @@ from outside: can a machine still get hold of what it needs to decrypt an enviro
 other probe reads a public surface, and a deployment can serve all of them perfectly while the
 grant that makes a CI run work has gone.
 
-It needs a throwaway organisation holding junk secrets and a machine token scoped to it. Set the
-token as the repository secret `SOTTO_CANARY_TOKEN`, and **store only the bearer half**, the
+It needs a throwaway project holding junk secrets and a machine token scoped to one of its
+environments. A personal project is enough; an organisation is only needed for sharing, and a
+machine token binds an environment rather than an org. Create the token from that project's
+directory, because `sotto` finds its project by walking up from the working directory and will
+otherwise mint a token for whichever project it finds first. Set it as the repository secret
+`SOTTO_CANARY_TOKEN`, and **store only the bearer half**, the
 `smt_...` part before the dot:
 
 ```sh
+cd ~/sotto-canary                         # or wherever the canary project lives
 sotto token create --name status-canary   # prints a SOTTO_TOKEN once
 gh secret set SOTTO_CANARY_TOKEN --body 'smt_...'   # the part BEFORE the dot, nothing after it
 ```
