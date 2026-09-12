@@ -391,6 +391,27 @@ class CanaryObservation(unittest.TestCase):
     def canary(self):
         return next(p for p in probe.PROBES if p.id == "sync")
 
+    def test_the_bearer_that_reaches_the_request_is_the_one_that_was_read(self):
+        # The other token tests check `bearer_problem` in isolation and call `fetch` with a value
+        # handed straight to it, so between them they never pin the line that reads the
+        # environment. Something could be read, checked, and then a different thing sent, and
+        # every one of them would still pass. This captures what arrives at the request boundary
+        # on both of the canary's calls.
+        seen = []
+
+        def capture(_base, _p, path=None, token=None):
+            seen.append(token)
+            if path is None:
+                return response(200, body=grant_body())
+            return response(200, body='{"revision":1,"secrets":[{"id":"s1"')
+
+        with unittest.mock.patch.dict(os.environ, {"SOTTO_CANARY_TOKEN": "  smt_frombearer  "}):
+            with unittest.mock.patch.object(probe, "fetch", capture):
+                outcomes = probe.observe("https://example.test", [self.canary()])
+        self.assertEqual(outcomes["sync"].state, probe.OK)
+        self.assertEqual(len(seen), 2, "the grant and its companion both authenticate")
+        self.assertEqual(set(seen), {"smt_frombearer"})
+
     def test_a_misdirected_target_never_sees_the_bearer(self):
         # The collector already refuses to record a run like this, but it refused after the
         # requests had gone out. For four probes that costs a wrong reading; for this one it hands
