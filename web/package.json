@@ -12,7 +12,8 @@
     "dev": "npm run build:wasm && vite",
     "preview": "vite preview",
     "smoke": "npm run build:wasm:node && node scripts/smoke.cjs",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "test": "vitest run"
   },
   "dependencies": {
     "react": "^19.1.0",
@@ -20,11 +21,15 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
     "@types/node": "^22.10.0",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "happy-dom": "^20.14.5",
     "typescript": "^5.7.2",
-    "vite": "^6.0.7"
+    "vite": "^6.0.7",
+    "vitest": "^5.0.0"
   }
 }

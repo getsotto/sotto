@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 
+import { startLogin } from "./login";
 import { Shell } from "./Shell";
 
 // After OAuth, the server has set the session cookie and redirected here with `?state=`. Verify it
@@ -18,9 +19,25 @@ export function AuthCallback() {
     window.location.replace("/app");
   }, []);
 
+  // The state we stored is consumed above and the callback is fail-closed, so a retry has to start
+  // a brand new flow rather than reuse what is left in the URL or session storage.
+  function retry() {
+    window.history.replaceState(null, "", "/auth/callback");
+    startLogin();
+  }
+
   return (
     <Shell>
-      {error !== null ? <p role="alert">{error}</p> : <p className="muted">Signing you in…</p>}
+      {error !== null ? (
+        <>
+          <p role="alert">{error}</p>
+          <button className="primary" type="button" onClick={retry}>
+            Try again
+          </button>
+        </>
+      ) : (
+        <p className="muted">Signing you in…</p>
+      )}
     </Shell>
   );
 }

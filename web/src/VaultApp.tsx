@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { fetchAccount, logout, me } from "./api";
+import { startLogin } from "./login";
 import { Shell } from "./Shell";
 import { deriveMasterKey } from "./vault";
 import { VaultView } from "./VaultView";
@@ -11,16 +12,6 @@ type Phase =
   | { kind: "loggedOut" }
   | { kind: "locked"; salt: Uint8Array; encPrivateKeys: Uint8Array }
   | { kind: "unlocked"; master: Uint8Array; encPrivateKeys: Uint8Array };
-
-// Begin the OAuth flow: the server sets an httpOnly cookie and redirects back to /auth/callback.
-function startLogin() {
-  const state = crypto.randomUUID();
-  sessionStorage.setItem("sotto_oauth_state", state);
-  const redirect = `${window.location.origin}/auth/callback`;
-  window.location.assign(
-    `/auth/github/login?redirect_uri=${encodeURIComponent(redirect)}&state=${state}`,
-  );
-}
 
 export function VaultApp() {
   const [phase, setPhase] = useState<Phase>({ kind: "checking" });
