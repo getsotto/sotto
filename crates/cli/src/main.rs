@@ -1041,13 +1041,7 @@ fn history(
     }
     let count = versions.len();
     for mut v in versions {
-        match (&v.value, reveal) {
-            (Some(value), true) => {
-                println!("v{}  {}", v.version, String::from_utf8_lossy(value))
-            }
-            (Some(value), false) => println!("v{}  ({} bytes)", v.version, value.len()),
-            (None, _) => println!("v{}  (unreadable - run `sotto pull` first)", v.version),
-        }
+        println!("{}", history_line(v.version, v.value.as_deref(), reveal));
         // Zeroize each decrypted plaintext as soon as it's printed, so the whole history isn't left
         // resident in memory for the rest of the command.
         if let Some(value) = v.value.as_mut() {
@@ -1282,6 +1276,17 @@ fn display_secret(bytes: &[u8]) -> String {
     }
 }
 
+/// One `history` line. Revealed values are rendered as terminal data (escaped UTF-8, or base64 for
+/// non-UTF-8) so a newline or ANSI sequence inside a secret cannot forge the listing; without
+/// `--reveal` only the byte count is shown.
+fn history_line(version: i64, value: Option<&[u8]>, reveal: bool) -> String {
+    match (value, reveal) {
+        (Some(value), true) => format!("v{version}  {}", display_secret(value)),
+        (Some(value), false) => format!("v{version}  ({} bytes)", value.len()),
+        (None, _) => format!("v{version}  (unreadable - run `sotto pull` first)"),
+    }
+}
+
 /// Decrypt all secrets as UTF-8 text pairs (for injection/export). Errors on non-UTF-8 values.
 fn text_entries(app: &App, config: &Config) -> Result<Vec<(String, String)>> {
     let mut entries = Vec::new();
@@ -1431,7 +1436,7 @@ fn machine_export(token: &str, format: ExportFormat, reveal: bool) -> Result<()>
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{display_secret, Cli, Command};
+    use super::{display_secret, history_line, Cli, Command};
 
     #[test]
     fn run_help_explains_command_forwarding() {
@@ -1523,6 +1528,48 @@ mod tests {
     #[test]
     fn display_secret_keeps_plain_text() {
         assert_eq!(display_secret(b"postgres://prod"), "postgres://prod");
+    }
+
+    #[test]
+    fn history_line_escapes_revealed_control_and_ansi_bytes() {
+        // A newline inside a secret must not split the listing into a second, forged line.
+        assert_eq!(
+            history_line(3, Some(b"line1\nline2"), true),
+            "v3  line1\\nline2"
+        );
+        // An ESC must not reach the terminal, so it cannot start a real ANSI sequence.
+        let rendered = history_line(4, Some(b"\x1b[31mred\x1b[0m"), true);
+        assert!(
+            !rendered.contains('\x1b'),
+            "escape byte must not survive: {rendered}"
+        );
+        assert!(rendered.contains("\\u{1b}"));
+        assert!(rendered.starts_with("v4  "));
+    }
+
+    #[test]
+    fn history_line_base64_encodes_revealed_non_utf8() {
+        let rendered = history_line(2, Some(&[0xff, 0xfe, 0x00]), true);
+        assert!(rendered.starts_with("v2  base64:"));
+        assert!(
+            !rendered.contains('\u{fffd}'),
+            "lossy decoding must not be used: {rendered}"
+        );
+    }
+
+    #[test]
+    fn history_line_hides_value_without_reveal() {
+        let rendered = history_line(7, Some(b"sup3r-s3cret"), false);
+        assert_eq!(rendered, "v7  (12 bytes)");
+        assert!(!rendered.contains("sup3r"));
+    }
+
+    #[test]
+    fn history_line_reports_unreadable_version() {
+        assert_eq!(
+            history_line(1, None, true),
+            "v1  (unreadable - run `sotto pull` first)"
+        );
     }
 
     #[test]
