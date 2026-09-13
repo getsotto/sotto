@@ -1,0 +1,170 @@
+name: Webhook version drift
+
+# Stripe fixes a webhook endpoint's API version when the endpoint is created and will not let it
+# be edited. The server's ACCEPTED_WEBHOOK_API_VERSIONS is the other half of that pair and does
+# move. When they disagree every billing webhook is refused, which is exactly what production did
+# between the v0.5.0 release on 29 August 2026, which first shipped the narrowed version check,
+# and the fix in v0.8.0 on 10 September. Twelve days, unnoticed, surfaced by an unrelated test
+# failure rather than by anything watching billing.
+#
+# The repository side of that pair is already guarded: crates/server/tests/billing.rs pins both
+# versions literally, so CI fails if someone edits the constant and drops one. What nothing
+# guarded until now is the Stripe side, where the endpoint can be recreated, disabled, or deleted
+# without any change here to notice it. That is the whole job of this workflow.
+on:
+  schedule:
+    - cron: "17 5 * * 4"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: webhook-version-drift
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    name: live webhook API version
+    # Only the canonical repository main branch reaches the live credential. Forks and pull
+    # request runs cannot, which is the gate that does the real work here.
+    if: github.repository == 'getsotto/sotto' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # A scheduled check nobody is watching needs somewhere for a failure to be seen.
+      issues: write
+    # Its own environment rather than the one the smoke test uses. That one holds a test-mode key
+    # and has no reviewer rule; this one holds a live credential, and the two should be able to
+    # have different answers to that question later without one inheriting the other's.
+    environment:
+      name: stripe-live-readonly
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags and full history: the check reads the accepted list from the most recent release
+          # as well as from main, and a shallow clone has neither.
+          fetch-depth: 0
+
+      - name: Materialise the accepted lists to compare against
+        id: sources
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sources"
+          cp crates/server/src/billing.rs "$RUNNER_TEMP/sources/main.rs"
+
+          # The most recent release tag stands in for what production runs. It is a proxy, not a
+          # fact: a deployment can lag its latest tag, and this workflow has no way to ask the
+          # host what image it is on. Checking both ends means a version that main accepts but the
+          # last release does not still gets reported, which is the direction that would otherwise
+          # pass while production was refusing every webhook.
+          #
+          # Only the tag name crosses to the next step, never an assembled command line. A tag is
+          # a ref, and git permits $, (, ), backticks and semicolons in ref names: an assembled
+          # string interpolated into a `run:` block would let anyone who can push a tag run
+          # commands in the step that holds the live Stripe key. A newline would be worse still,
+          # since it would forge a second workflow output, and that is the one metacharacter git
+          # does forbid, because ref names may not contain ASCII control characters.
+          if ! tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null)"; then
+            # Refusing rather than quietly checking half of what this claims to check. Falling
+            # back to main alone would still print a reassuring line and exit 0, while the one
+            # direction that actually hurts, main accepting a version the deployed release does
+            # not, went unexamined. A tick that means less than it looks like is the failure this
+            # whole workflow was written to stop.
+            echo "no v* tag found, so the list the deployed release carries cannot be read" >&2
+            exit 1
+          fi
+          git show "${tag}:crates/server/src/billing.rs" > "$RUNNER_TEMP/sources/release.rs"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Compare the live endpoints against them
+        id: check
+        env:
+          STRIPE_LIVE_READ_KEY: ${{ secrets.STRIPE_LIVE_READ_KEY }}
+          # Through the environment, which GitHub sets as data, rather than through `${{ }}` in
+          # the script body, which it splices in as source before bash sees it.
+          RELEASE_TAG: ${{ steps.sources.outputs.tag }}
+        run: |
+          set -uo pipefail
+          # Both sources, always. The step above refuses to continue without a release tag, so
+          # there is no half-configured case left for this to guard against.
+          args=(--billing-source "main=$RUNNER_TEMP/sources/main.rs"
+                --billing-source "$RELEASE_TAG=$RUNNER_TEMP/sources/release.rs")
+
+          # Output is captured rather than only streamed, so the alert can quote what actually
+          # went wrong instead of telling a reader to go and find the log. The script redacts
+          # webhook paths and never prints the key, which is what makes quoting it into a public
+          # issue safe.
+          set +e
+          python3 scripts/check-webhook-versions "${args[@]}" \
+            > "$RUNNER_TEMP/drift.txt" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/drift.txt"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit $status
+
+      - name: Open or update the alert
+        # Any scheduled failure, not only one the check itself reported. Gating on
+        # `steps.check.outcome` meant a failure in checkout or in materialising the sources left
+        # that step skipped rather than failed, so the job went red and nothing opened an issue:
+        # invisible, on the one kind of run where nobody is watching.
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LABEL: webhook-drift
+          STATUS: ${{ steps.check.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "$LABEL" --force --color B60205 \
+            --description "Raised when a live Stripe webhook endpoint drifts from the accepted API versions"
+
+          # Exit 1 is drift, exit 2 is the check running and being unable to tell, and an empty
+          # status is the check never having run at all. None of the three is the other: reporting
+          # a missing credential as a billing outage would send somebody to read billing.rs over
+          # an unset secret, and reporting a checkout failure as either would be worse.
+          case "${STATUS:-}" in
+            1) headline="A live Stripe webhook endpoint no longer sends a version this server accepts." ;;
+            2) headline="The webhook version check ran but could not reach a verdict." ;;
+            *) headline="This job failed before the webhook version check reached a verdict." ;;
+          esac
+
+          {
+            printf '%s\n\nFrom [this run](%s):\n\n' "$headline" "$RUN_URL"
+            if [ -s "$RUNNER_TEMP/drift.txt" ]; then
+              printf '```\n'
+              cat "$RUNNER_TEMP/drift.txt"
+              printf '```\n'
+            else
+              printf 'The check produced no output, so the failure is earlier in the job.\n'
+            fi
+            printf '\nWebhook paths are redacted by the check itself, because this issue is public.\n'
+          } > "$RUNNER_TEMP/body.md"
+
+          existing="$(gh issue list --state open --label "$LABEL" \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh issue create --title "Stripe webhook API version drift" --label "$LABEL" \
+              --body-file "$RUNNER_TEMP/body.md"
+          fi
+
+      - name: Close a resolved alert
+        # On any success, dispatched included: confirming a fix by hand is the moment the alert
+        # should clear, not the following Thursday.
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LABEL: webhook-drift
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # One call rather than a comment and then a close: two of those are two notifications
+          # for one piece of good news.
+          for number in $(gh issue list --state open --label "$LABEL" --json number --jq '.[].number'); do
+            gh issue close "$number" --comment "Agreeing again as of [this run]($RUN_URL)."
+          done

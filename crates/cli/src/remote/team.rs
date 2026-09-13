@@ -12,6 +12,8 @@
 //! ever holds sealed blobs. Invite and share flows also upsert the member's org-key copy, so
 //! whoever can decrypt an environment can also read its name.
 
+use std::collections::HashSet;
+
 use sotto_core::{names, vault, wrap};
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -308,13 +310,15 @@ pub fn rotate_env(
             if Some(holder.as_str()) == revoke {
                 continue;
             }
-            let public_key_b64 = members
-                .iter()
-                .find(|m| m.user_id == holder)
-                .and_then(|m| m.public_key.clone())
-                .ok_or_else(|| {
-                    Error::Input(format!("cannot re-grant `{holder}`: no public key on file"))
-                })?;
+            let Some(member) = members.iter().find(|m| m.user_id == holder) else {
+                // Not a member: a pre-fix removal left a stale row behind. It grants nothing
+                // (access checks deny non-members), so rotation drops it instead of failing on
+                // it - otherwise one stale row would brick rotation for the whole environment.
+                continue;
+            };
+            let public_key_b64 = member.public_key.clone().ok_or_else(|| {
+                Error::Input(format!("cannot re-grant `{holder}`: no public key on file"))
+            })?;
             grants.push(GrantEntry {
                 user_id: holder,
                 enc_vault_key: b64encode(&vault::grant_vault_key(
@@ -357,32 +361,95 @@ pub fn rotate_env(
     ))
 }
 
-/// The outcome of removing a member: which environments were re-keyed, and which were skipped
-/// because this caller holds no grant to them (someone who does must rotate those).
+/// The outcome of removing a member: which environments were re-keyed, and what the server
+/// revoked (its receipt, so the team knows which shared machine tokens to recreate).
+#[derive(Debug, Clone)]
 pub struct RemovalReport {
     pub rotated: Vec<String>,
-    pub skipped: Vec<String>,
+    /// Environments the member alone held a grant to. Nobody else could re-key them, and nobody
+    /// else can write a secret there for the member's cached key to read, so they are not rotated;
+    /// once the removal lands, no remaining member holds a grant to them.
+    pub orphaned: Vec<String>,
+    pub revoked_tokens: Vec<super::api::RevokedTokenInfo>,
+    pub grants_deleted: i64,
 }
 
 /// Remove a member from an org, first rotating every environment they could decrypt (dropping their
 /// grant) so their cached vault keys can't read future writes, then dropping their membership.
+///
+/// An environment this caller holds no grant to is a hard failure, not a warning: removing the
+/// member without re-keying it would leave their cached vault key valid. (The server enforces the
+/// same precondition, so an old client cannot silently skip either.) The exception is an
+/// environment the member alone holds: nobody could re-key it and nobody else can write to it, so
+/// it is reported as orphaned rather than making the member impossible to remove.
+///
+/// Every environment is checked before any is rotated. Rotation must re-seal the new vault key to
+/// every active machine token, the member's own included, and the server revokes those only at
+/// `DELETE`, so a refusal after the first rotation would leave the member's tokens live on the new
+/// key until someone finished the removal.
 pub fn remove_member(
     api: &dyn SyncApi,
     keypair: &wrap::Keypair,
     org_id: &str,
     user_id: &str,
 ) -> Result<RemovalReport> {
-    let mut rotated = Vec::new();
-    let mut skipped = Vec::new();
+    let mut to_rotate = Vec::new();
+    let mut orphaned = Vec::new();
+    let mut blocked = Vec::new();
+    // Who counts as a holder for orphan detection: a pre-fix removal can leave a grant row for
+    // a departed user, and counting it would refuse a removal nobody remaining can re-key for.
+    let members: HashSet<String> = api
+        .list_members(org_id)?
+        .into_iter()
+        .map(|m| m.user_id)
+        .collect();
     for env_id in api.member_env_grants(org_id, user_id)? {
-        match rotate_env(api, keypair, org_id, &env_id, Some(user_id))? {
-            Some(_) => rotated.push(env_id),
-            None => skipped.push(env_id),
+        match api.get_grant(&env_id)? {
+            // Open it as well: a grant we hold but cannot open would fail the rotation part way.
+            Some(grant) => {
+                vault::open_vault_key(keypair, &b64decode(&grant)?)?.zeroize();
+                to_rotate.push(env_id);
+            }
+            None => {
+                let live: Vec<String> = api
+                    .list_grant_holders(&env_id)?
+                    .into_iter()
+                    .filter(|h| members.contains(h))
+                    .collect();
+                if live == [user_id] {
+                    orphaned.push(env_id);
+                } else {
+                    blocked.push(env_id);
+                }
+            }
         }
     }
-    // Finally drop the membership, revoking their API access.
-    api.remove_member(org_id, user_id)?;
-    Ok(RemovalReport { rotated, skipped })
+    if !blocked.is_empty() {
+        return Err(Error::Input(format!(
+            "cannot complete removal: you hold no grant to environment(s) {}; \
+             ask a member who holds them to run `sotto grant <your-user-id>` in each and retry, \
+             or to run this removal themselves",
+            blocked.join(", ")
+        )));
+    }
+    let mut rotated = Vec::new();
+    for env_id in to_rotate {
+        // Checked above, so `None` here means a concurrent rotation dropped our grant in between.
+        if rotate_env(api, keypair, org_id, &env_id, Some(user_id))?.is_none() {
+            return Err(Error::Conflict(format!(
+                "your grant to environment {env_id} was dropped during the removal; retry"
+            )));
+        }
+        rotated.push(env_id);
+    }
+    // Finally drop the membership; the server revokes their grants, tokens, and API access.
+    let receipt = api.remove_member(org_id, user_id)?;
+    Ok(RemovalReport {
+        rotated,
+        orphaned,
+        revoked_tokens: receipt.revoked_tokens,
+        grants_deleted: receipt.grants_deleted,
+    })
 }
 
 /// Create a machine token for an environment: generate the machine's X25519 keypair locally, open

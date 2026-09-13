@@ -387,6 +387,10 @@ fn env_sharing_and_removal_end_to_end_over_http() {
         vec![env_id.clone()],
         "the shared env was rotated on removal"
     );
+    // The rotation already dropped Bob's grant and he created no tokens, so the receipt is
+    // empty - the DELETE-time revocation is the backstop, exercised by the server tests.
+    assert_eq!(report.grants_deleted, 0);
+    assert!(report.revoked_tokens.is_empty());
 
     // Alice adopts the new vault key, still reads the rewrapped secrets, and writes under the new key.
     remote::sync::pull(&alice, &store_a, &config).unwrap();

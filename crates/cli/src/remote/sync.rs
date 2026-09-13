@@ -519,6 +519,8 @@ mod tests {
 
     struct MachineTokenRec {
         env_id: String,
+        name: String,
+        created_by: String,
         public_key: Vec<u8>,
         enc_vault_key: String,
         revoked: bool,
@@ -1033,26 +1035,54 @@ mod tests {
             Ok(super::super::api::RotateResponse { revision: new_rev })
         }
 
-        fn remove_member(&self, org_id: &str, user_id: &str) -> Result<()> {
+        fn remove_member(
+            &self,
+            org_id: &str,
+            user_id: &str,
+        ) -> Result<super::super::api::RemovalReceipt> {
+            // Mirror the server: the grants die with the membership, and so does every token the
+            // target created. (The mock doesn't link projects to orgs, so this is user-global
+            // rather than org-scoped; close enough for client-flow tests. The 409 re-key
+            // precondition lives server-side and is covered by the server's own tests.)
             let mut s = self.state.borrow_mut();
             if let Some(org) = s.orgs.get_mut(org_id) {
                 org.members.remove(user_id);
             }
-            Ok(())
+            let before = s.grants.len();
+            s.grants.retain(|(_, uid), _| uid != user_id);
+            let grants_deleted = (before - s.grants.len()) as i64;
+            let mut revoked_tokens = Vec::new();
+            for (token_id, token) in s.machine_tokens.iter_mut() {
+                if token.created_by == user_id && !token.revoked {
+                    token.revoked = true;
+                    revoked_tokens.push(super::super::api::RevokedTokenInfo {
+                        token_id: token_id.clone(),
+                        name: token.name.clone(),
+                        env_id: token.env_id.clone(),
+                    });
+                }
+            }
+            Ok(super::super::api::RemovalReceipt {
+                revoked_tokens,
+                grants_deleted,
+            })
         }
 
         fn create_machine_token(
             &self,
             env_id: &str,
-            _name: &str,
+            name: &str,
             public_key: &str,
             enc_vault_key: &str,
         ) -> Result<super::super::api::CreatedMachineToken> {
+            let me = self.current_user();
             let token_id = uuid::Uuid::new_v4().to_string();
             self.state.borrow_mut().machine_tokens.insert(
                 token_id.clone(),
                 MachineTokenRec {
                     env_id: env_id.to_string(),
+                    name: name.to_string(),
+                    created_by: me,
                     public_key: b64decode(public_key)?,
                     enc_vault_key: enc_vault_key.to_string(),
                     revoked: false,
@@ -1075,8 +1105,9 @@ mod tests {
                 .filter(|(_, t)| t.env_id == env_id && !t.revoked)
                 .map(|(id, t)| super::super::api::MachineTokenInfo {
                     token_id: id.clone(),
-                    name: "ci".into(),
+                    name: t.name.clone(),
                     public_key: b64encode(&t.public_key),
+                    created_by: Some(t.created_by.clone()),
                 })
                 .collect();
             tokens.sort_by(|a, b| a.token_id.cmp(&b.token_id));
@@ -1557,6 +1588,339 @@ mod tests {
                 Err(Error::Conflict(_))
             ),
             "a member dropped from the grant set must not be able to push"
+        );
+    }
+
+    #[test]
+    fn removal_fails_when_the_caller_cannot_rekey_an_env() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        let carol = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+        api.register_user("carol@example.test", "carol-user", &carol.public);
+
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        team::invite(&api, &alice, &org_id, "carol@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // Alice loses her own grant (another rotation dropped her): she can no longer open the env.
+        // Carol is a member and still holds it, so it is not Bob's alone and someone could
+        // still re-key it.
+        api.state
+            .borrow_mut()
+            .grants
+            .remove(&(env_id.clone(), "test-user".to_string()));
+        api.state.borrow_mut().grants.insert(
+            (env_id.clone(), "carol-user".to_string()),
+            "opaque".to_string(),
+        );
+
+        // Removal is a hard failure naming the env - and Bob's membership survives it, so the
+        // admin knows the offboarding did not happen rather than believing it succeeded.
+        let err = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap_err();
+        assert!(
+            matches!(&err, Error::Input(_)),
+            "expected Error::Input, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(&env_id),
+            "the error names the un-rotatable env: {err}"
+        );
+        // The recovery it prescribes must actually unblock a retry. Rotating would not: it
+        // preserves every holder and grants the remover nothing, so the retry would fail the
+        // same way forever. Being shared the env (or handing the removal over) does.
+        assert!(
+            err.to_string().contains("sotto grant"),
+            "the error points at sharing: {err}"
+        );
+        assert!(
+            !err.to_string().contains("rotate"),
+            "the error must not prescribe a futile rotation: {err}"
+        );
+        assert!(
+            api.list_members(&org_id)
+                .unwrap()
+                .iter()
+                .any(|m| m.user_id == "bob-user"),
+            "a failed removal must retain the membership"
+        );
+        assert_eq!(
+            api.member_env_grants(&org_id, "bob-user").unwrap(),
+            vec![env_id],
+            "a failed removal must retain the grants"
+        );
+    }
+
+    #[test]
+    fn removal_report_carries_the_tokens_it_revoked() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // Bob clones the env, then creates a machine token the team might share.
+        api.as_user("bob-user");
+        let store_b = Store::open_in_memory().unwrap();
+        let bob_config = team::clone_env(
+            &api,
+            &store_b,
+            &bob,
+            &project.id,
+            &env_id,
+            Some("acme"),
+            Some("dev"),
+            Some(&org_id),
+        )
+        .unwrap();
+        team::create_machine_token(&api, &store_b, &bob, &bob_config, "bob-ci").unwrap();
+
+        // Alice removes Bob: the rotation re-seals the token, then the removal revokes it and
+        // reports it, so the team knows what to recreate.
+        api.as_user("test-user");
+        let report = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap();
+        assert_eq!(report.rotated, vec![env_id.clone()]);
+        assert_eq!(report.revoked_tokens.len(), 1);
+        assert_eq!(report.revoked_tokens[0].name, "bob-ci");
+        assert_eq!(report.revoked_tokens[0].env_id, env_id);
+        assert!(
+            api.list_machine_tokens(&env_id).unwrap().is_empty(),
+            "the removed member's token is revoked, not re-sealed and live"
+        );
+    }
+
+    #[test]
+    fn removal_completes_when_the_member_alone_holds_an_env() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // An env only Bob holds: nobody else could re-key it, and nobody else can write to it.
+        api.state.borrow_mut().grants.insert(
+            ("zz-bob-alone".to_string(), "bob-user".to_string()),
+            "opaque".to_string(),
+        );
+
+        // The removal completes rather than leaving Bob impossible to remove: the shared env is
+        // rotated, his own env is reported, and his grant to it goes with the membership.
+        let report = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap();
+        assert_eq!(report.rotated, vec![env_id]);
+        assert_eq!(report.orphaned, vec!["zz-bob-alone".to_string()]);
+        assert!(api
+            .member_env_grants(&org_id, "bob-user")
+            .unwrap()
+            .is_empty());
+        assert!(!api
+            .list_members(&org_id)
+            .unwrap()
+            .iter()
+            .any(|m| m.user_id == "bob-user"));
+    }
+
+    #[test]
+    fn a_departed_holders_stale_grant_does_not_block_orphan_removal() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // Bob's own env, plus a stale grant row for a departed non-member: nobody remaining but
+        // Bob holds it, so it is still his alone.
+        api.state.borrow_mut().grants.insert(
+            ("zz-bob-alone".to_string(), "bob-user".to_string()),
+            "opaque".to_string(),
+        );
+        api.state.borrow_mut().grants.insert(
+            ("zz-bob-alone".to_string(), "ghost-user".to_string()),
+            "opaque".to_string(),
+        );
+
+        let report = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap();
+        assert_eq!(report.rotated, vec![env_id]);
+        assert_eq!(report.orphaned, vec!["zz-bob-alone".to_string()]);
+    }
+
+    #[test]
+    fn rotation_drops_a_departed_holders_stale_grant() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // A stale grant row for a departed non-member on the shared env: rotation must drop it
+        // rather than abort on the missing public key, or no removal touching this env could
+        // complete.
+        api.state.borrow_mut().grants.insert(
+            (env_id.clone(), "ghost-user".to_string()),
+            "opaque".to_string(),
+        );
+
+        let report = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap();
+        assert_eq!(report.rotated, vec![env_id.clone()]);
+        assert!(
+            !api.state
+                .borrow()
+                .grants
+                .contains_key(&(env_id, "ghost-user".to_string())),
+            "rotation drops the stale grant instead of failing on it"
+        );
+    }
+
+    #[test]
+    fn a_refused_removal_rotates_nothing() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store_a, master_a, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store_a, &master_a);
+        let bob = sotto_core::wrap::generate_keypair();
+        let carol = sotto_core::wrap::generate_keypair();
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        api.register_user("bob@example.test", "bob-user", &bob.public);
+        api.register_user("carol@example.test", "carol-user", &carol.public);
+
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        team::invite(&api, &alice, &org_id, "bob@example.test").unwrap();
+        team::invite(&api, &alice, &org_id, "carol@example.test").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store_a, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store_a, &master_a, &config).unwrap();
+        let env_id = team::share_env(&api, &store_a, &alice, &org_id, "bob-user", &config).unwrap();
+
+        // Bob clones the env Alice can open, and creates a machine token on it.
+        api.as_user("bob-user");
+        let store_b = Store::open_in_memory().unwrap();
+        let bob_config = team::clone_env(
+            &api,
+            &store_b,
+            &bob,
+            &project.id,
+            &env_id,
+            Some("acme"),
+            Some("dev"),
+            Some(&org_id),
+        )
+        .unwrap();
+        team::create_machine_token(&api, &store_b, &bob, &bob_config, "bob-ci").unwrap();
+        api.as_user("test-user");
+
+        // A second env, shared between Bob and Carol, that Alice cannot open.
+        for holder in ["bob-user", "carol-user"] {
+            api.state.borrow_mut().grants.insert(
+                ("zz-alice-cannot-open".to_string(), holder.to_string()),
+                "opaque".to_string(),
+            );
+        }
+        let bob_token = |api: &MockApi| {
+            let s = api.state.borrow();
+            let t = s.machine_tokens.values().find(|t| t.name == "bob-ci");
+            t.map(|t| (t.revoked, t.enc_vault_key.clone())).unwrap()
+        };
+        let before = bob_token(&api);
+
+        // The refusal comes before any rotation. Rotating the env Alice can open would re-seal the
+        // new key onto Bob's still-live token, which he would keep until someone finished the job.
+        let err = team::remove_member(&api, &alice, &org_id, "bob-user").unwrap_err();
+        assert!(err.to_string().contains("zz-alice-cannot-open"), "{err}");
+        assert_eq!(
+            bob_token(&api),
+            before,
+            "no rotation re-sealed the member's token"
+        );
+        assert!(
+            api.member_env_grants(&org_id, "bob-user")
+                .unwrap()
+                .contains(&env_id),
+            "the env Alice could open was not rotated either"
         );
     }
 

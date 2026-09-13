@@ -10,7 +10,7 @@
 //! `GET /machine/secrets`, both authenticated by the machine token alone. They cannot reach any
 //! other endpoint, and user sessions cannot reach these (different token namespace).
 
-use axum::extract::{FromRequestParts, Path, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -75,6 +75,15 @@ struct TokenView {
     name: String,
     /// The machine's public key (base64) - rotation re-seals the new vault key to this.
     public_key: String,
+    /// The user who created the token, if still known (`NULL` once their account is gone).
+    created_by: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct TokenListParams {
+    /// Only tokens created by this user (member-removal review, hand remediation).
+    #[serde(default)]
+    created_by: Option<String>,
 }
 
 /// `POST /environments/{env_id}/tokens` - create a machine token for this environment (admin+ or
@@ -146,11 +155,13 @@ async fn create_token(
 }
 
 /// `GET /environments/{env_id}/tokens` - the environment's *active* machine tokens (admin+). A
-/// rotation uses these public keys to re-seal every machine's grant.
+/// rotation uses these public keys to re-seal every machine's grant. `?created_by=` narrows the
+/// listing to one creator's tokens.
 async fn list_tokens(
     State(state): State<AppState>,
     user: AuthUser,
     Path(env_id): Path<String>,
+    Query(params): Query<TokenListParams>,
 ) -> Result<Json<Vec<TokenView>>> {
     let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
     if !access.can_manage_structure() {
@@ -158,19 +169,34 @@ async fn list_tokens(
             "must be an admin or owner to list machine tokens".into(),
         ));
     }
-    let rows: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
-        "SELECT id, name, public_key FROM machine_tokens \
-         WHERE env_id = $1 AND revoked_at IS NULL ORDER BY id",
-    )
-    .bind(&env_id)
-    .fetch_all(&state.pool)
-    .await?;
+    let rows: Vec<(String, String, Vec<u8>, Option<String>)> = match &params.created_by {
+        Some(creator) => {
+            sqlx::query_as(
+                "SELECT id, name, public_key, created_by FROM machine_tokens \
+                 WHERE env_id = $1 AND revoked_at IS NULL AND created_by = $2 ORDER BY id",
+            )
+            .bind(&env_id)
+            .bind(creator)
+            .fetch_all(&state.pool)
+            .await?
+        }
+        None => {
+            sqlx::query_as(
+                "SELECT id, name, public_key, created_by FROM machine_tokens \
+                 WHERE env_id = $1 AND revoked_at IS NULL ORDER BY id",
+            )
+            .bind(&env_id)
+            .fetch_all(&state.pool)
+            .await?
+        }
+    };
     Ok(Json(
         rows.into_iter()
-            .map(|(token_id, name, public_key)| TokenView {
+            .map(|(token_id, name, public_key, created_by)| TokenView {
                 token_id,
                 name,
                 public_key: encoding::encode(&public_key),
+                created_by,
             })
             .collect(),
     ))

@@ -459,3 +459,62 @@ async fn personal_project_tokens_work() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("mt-pers-s1"));
 }
+
+#[tokio::test]
+async fn token_listing_reports_creators_and_filters_by_them() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-cb-o", "mt-cb-p", "mt-cb-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-cb-owner").await;
+    let admin = fresh_session(&pool, "mt-cb-admin", "mt-cb-admin-s").await;
+    post(
+        &pool,
+        &owner,
+        &format!("/orgs/{o}/members"),
+        member_body("mt-cb-admin", "admin"),
+    )
+    .await;
+
+    let (owner_token, _) = create_token(&pool, &owner, e, b"g").await;
+    let (admin_token, _) = create_token(&pool, &admin, e, b"g").await;
+
+    // Every row carries its creator, so the current state is remediable by hand.
+    let (status, body) = get(&pool, &owner, &format!("/environments/{e}/tokens")).await;
+    assert_eq!(status, StatusCode::OK);
+    let tokens: Value = serde_json::from_str(&body).expect("tokens json");
+    let by_id = |id: &str| {
+        tokens
+            .as_array()
+            .expect("token array")
+            .iter()
+            .find(|t| t["token_id"].as_str() == Some(id))
+            .unwrap_or_else(|| panic!("token {id} listed: {body}"))
+            .clone()
+    };
+    assert_eq!(
+        by_id(&owner_token)["created_by"].as_str(),
+        Some("mt-cb-owner")
+    );
+    assert_eq!(
+        by_id(&admin_token)["created_by"].as_str(),
+        Some("mt-cb-admin")
+    );
+
+    // `?created_by=` narrows to one creator's tokens (member-removal review).
+    let (status, body) = get(
+        &pool,
+        &owner,
+        &format!("/environments/{e}/tokens?created_by=mt-cb-admin"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let tokens: Value = serde_json::from_str(&body).expect("filtered json");
+    let ids: Vec<&str> = tokens
+        .as_array()
+        .expect("token array")
+        .iter()
+        .map(|t| t["token_id"].as_str().expect("token_id"))
+        .collect();
+    assert_eq!(ids, vec![admin_token.as_str()]);
+}

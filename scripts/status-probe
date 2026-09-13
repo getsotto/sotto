@@ -9,14 +9,21 @@ carries every individual observation, so the tallies can be recomputed if the ag
 here ever turns out to be wrong. A number nobody can recompute is a number nobody should
 publish, and this is a file whose whole purpose is to be believed.
 
-Every probe is unauthenticated and reads what any visitor could read. None of them proves
-a component is healthy for a signed-in user; they prove the component answers, which is the
-question a status page asks.
+All but one probe is unauthenticated and reads what any visitor could read. They prove a
+component answers, not that it is healthy for a signed-in user, which is the question a
+status page asks.
+
+The exception is the canary, which presents a machine token belonging to a throwaway
+project. It refuses to run with a token that still carries its private key half, so this
+job can prove that a machine can retrieve what it needs to decrypt an environment while holding
+nothing that could decrypt it. A compromise here yields ciphertext and no way to read it, and
+that is a property of what the process is given rather than of what it chooses to send.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import http.client
 import json
@@ -68,6 +75,10 @@ class Response:
     status: int
     headers: dict[str, str]
     body_prefix: str
+    #: Whether more body arrived than was kept. A verdict that parses needs to tell a payload cut
+    #: in half from a malformed one, because they are different problems and naming the wrong one
+    #: sends whoever reads the record to the wrong place.
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,6 +100,22 @@ class Probe:
     method: str
     path: str
     judge: Callable[[Response], Outcome]
+    #: Environment variable holding a machine token. A probe that names one and cannot find it
+    #: reports UNCONFIGURED rather than DOWN: an instance that has not set up a canary is not
+    #: having an outage, and counting it as one would drag its published figure down for a
+    #: feature it never switched on.
+    token_env: str | None = None
+    #: Further `(path, judge)` pairs that must also pass before the verdict above stands. The
+    #: canary rests on two endpoints, because a machine needs its sealed grant and the ciphertext
+    #: both, and a row that went green on half of that would be claiming something it had not
+    #: checked.
+    also: tuple[tuple[str, Callable[[Response], Outcome]], ...] = ()
+    #: How much of the body to keep. The default is a prefix, because a body can carry secrets and
+    #: no public verdict needs one. The canary raises it: its endpoints answer with this project's
+    #: own ciphertext, addressed to a key this job does not hold, so reading the whole of a small
+    #: response there costs nothing that matters and buys a real assertion instead of a guess at
+    #: the first few bytes.
+    body_bytes: int = 64
 
 
 def header(response: Response, name: str) -> str:
@@ -150,6 +177,165 @@ def origin_of(location: str) -> str:
     if not parts.netloc:
         return "a location with no origin"
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+
+
+#: A machine token string is `<smt_api-token>.<MT1-…>`: the server-issued bearer joined with the
+#: machine's X25519 private key. The server has only ever seen the first half, as a hash.
+MACHINE_TOKEN_PREFIX = "smt_"
+
+#: An X25519 sealed box is `ephemeral_pk ‖ mac ‖ ciphertext`, and the plaintext here is a 32 byte
+#: vault key: 32 + 16 + 32. Nothing in Python can derive that, so `wrap::tests::
+#: a_sealed_vault_key_is_eighty_bytes` in crates/core asserts the same number against the real
+#: implementation. Change the sealed shape and that test fails in CI, which is where it should be
+#: found, rather than here weeks later with the status page quietly red.
+SEALED_VAULT_KEY_LEN = 80
+
+
+def bearer_problem(raw: str) -> str | None:
+    """Why a configured machine token must not be sent, or None when it can be.
+
+    A `SOTTO_TOKEN` is `<smt_api-token>.<MT1-…>`: the server-issued bearer joined with the
+    machine's X25519 private key. An earlier version of this split the string and sent only the
+    left half, which was not enough and was worse than not enough, because it read as though the
+    private key were handled when it was merely unused. The whole string was still in this
+    process's environment, and anything able to read `os.environ` could pair that key with the
+    ciphertext this job had just fetched and decrypt the canary environment.
+
+    So the key half is refused rather than dropped. "This job cannot decrypt" is only true if the
+    private key is not here at all, and the only way to make that true is to decline to run with
+    it. A secret holding the whole token reports unconfigured, with a detail saying what to do.
+    """
+    value = raw.strip()
+    if not value:
+        return "is not set"
+    if not value.startswith(MACHINE_TOKEN_PREFIX):
+        return f"does not look like a machine token; it should begin {MACHINE_TOKEN_PREFIX}"
+    if "." in value:
+        # Never the token itself, which would put the thing being complained about into a public
+        # record ninety days deep.
+        return (
+            "still carries its private key half; store only the part before the dot, so this job "
+            "cannot decrypt what it fetches"
+        )
+    return None
+
+
+def judge_canary(response: Response) -> Outcome:
+    """Whether a machine can still get at what it needs to decrypt its environment.
+
+    This does not decrypt anything, and the component says so. Decryption happens offline in the
+    client with a key this job deliberately does not hold, so what a status page can honestly
+    report is that the server handed over the sealed grant and the ciphertext. Claiming more than
+    that on a public page would be inventing assurance.
+    """
+    if media_type(response) == "text/html":
+        # Ahead of the status checks, unlike the other judges, because the shape this one is
+        # guarding against answers 200. A reverse proxy with no route for /machine/* serves the
+        # single-page app, and "no grant in it" would describe that as a server bug rather than
+        # as the routing mistake it is.
+        return Outcome(DOWN, "the web app answered instead of the API")
+    if response.status == 200:
+        return grant_verdict(response.body_prefix)
+    if response.status in (401, 403):
+        # One row carries both the token and its sealed vault key, and the handler answers 401
+        # when either has gone. The canary organisation deleted, the token revoked, or the grant
+        # itself vanishing all arrive here: different causes, one symptom, and every one of them
+        # means a machine can no longer read its environment.
+        return Outcome(DOWN, "the canary machine token was refused")
+    if response.status == 503:
+        return Outcome(DOWN, FOREIGN_503)
+    if (astray := misdirected(response)) is not None:
+        return astray
+    return Outcome(DOWN, f"expected 200 and a grant, got {response.status}")
+
+
+def grant_verdict(body: str) -> Outcome:
+    """Whether a grant payload is one a machine could actually use.
+
+    A 200 alone would pass on an empty envelope, a truncated key, or whatever a cache decided to
+    serve, and the failure this component exists to catch is precisely the grant being present but
+    unusable. So the sealed key is decoded and measured. What is deliberately not done is opening
+    it: that needs the private key half, which this job does not hold and should not.
+
+    Nothing from the body reaches the returned detail. These strings are published and kept for
+    ninety days, and while the payload here is ciphertext rather than plaintext, quoting a
+    response into a public record is a habit worth not having.
+    """
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return Outcome(DOWN, "the grant endpoint answered 200 with something that is not JSON")
+    if not isinstance(payload, dict) or not payload.get("env_id"):
+        return Outcome(DOWN, "200 from the grant endpoint with no environment in it")
+    try:
+        sealed = base64.b64decode(payload.get("enc_vault_key") or "", validate=True)
+    except (ValueError, TypeError):
+        return Outcome(DOWN, "the sealed vault key is not valid base64")
+    if len(sealed) != SEALED_VAULT_KEY_LEN:
+        # Length rather than content, which is all that can be checked from here, and enough: a
+        # truncated or empty grant is the shape a machine cannot recover from, and it answers 200
+        # exactly like a good one.
+        return Outcome(
+            DOWN,
+            f"the sealed vault key is {len(sealed)} bytes, not {SEALED_VAULT_KEY_LEN}",
+        )
+    return Outcome(OK)
+
+
+def judge_canary_secrets(response: Response) -> Outcome:
+    """Whether the canary environment still holds a secret a machine could actually use.
+
+    Parsed rather than pattern matched, and that is the whole point. `/machine/secrets` returns
+    every row for the environment including soft-deleted ones, each carrying a `deleted` flag, so
+    an environment whose secrets have all been removed answers with a full-looking list holding
+    nothing usable. Testing for an empty array would call that healthy, which is the failure this
+    component exists to notice rather than an edge of it.
+
+    A usable secret is one that is not deleted and carries both its ciphertext and its wrapped
+    data key. Either of those being empty leaves a machine with a row it cannot turn into a value.
+    """
+    if response.status != 200:
+        return Outcome(DOWN, f"/machine/secrets answered {response.status}")
+    if response.truncated:
+        # Unconfigured rather than down, which is the same rule the rest of this file follows: a
+        # tally counts what was measured, and this is the one answer here that is not a
+        # measurement of the deployment at all. The canary environment is meant to hold a couple
+        # of junk secrets, and one big enough to overflow the budget is our environment being
+        # wrong, not the server being down. Recording it as downtime would put an outage that
+        # never happened into a figure whose whole purpose is to be believed.
+        #
+        # The cost is that it goes quiet rather than loud: an unconfigured row is grey and alerts
+        # nobody. That is the right way round here, because the only way to reach this is for
+        # somebody to have put things into the canary environment on purpose, and the detail says
+        # plainly what they have to undo.
+        return Outcome(
+            UNCONFIGURED, "the secrets snapshot did not fit; the canary environment has outgrown it"
+        )
+    try:
+        payload = json.loads(response.body_prefix)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return Outcome(DOWN, "/machine/secrets answered 200 with something that is not JSON")
+    if not isinstance(payload, dict) or "revision" not in payload:
+        return Outcome(DOWN, "/machine/secrets answered 200 without a snapshot")
+    rows = payload.get("secrets")
+    rows = rows if isinstance(rows, list) else []
+    live = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and not row.get("deleted")
+        and row.get("enc_value")
+        and row.get("enc_data_key")
+    ]
+    if not live:
+        # Counts only. The rows themselves are ciphertext, and a public record is no place for
+        # them even so.
+        return Outcome(
+            DOWN,
+            f"the canary environment has no usable secrets left ({len(rows)} row(s), "
+            "all deleted or incomplete)",
+        )
+    return Outcome(OK)
 
 
 def judge_api(response: Response) -> Outcome:
@@ -250,21 +436,29 @@ PROBES: list[Probe] = [
         path="/billing/webhook",
         judge=judge_billing,
     ),
+    Probe(
+        id="sync",
+        name="Secret sync",
+        description="A canary machine token can retrieve its grant and its secrets",
+        method="GET",
+        path="/machine/grant",
+        judge=judge_canary,
+        token_env="SOTTO_CANARY_TOKEN",
+        also=(("/machine/secrets", judge_canary_secrets),),
+        # A grant needs about 170 bytes. The budget is set by the other endpoint, whose snapshot
+        # has to be parsed whole to tell a live secret from a tombstone, and whose size depends on
+        # what the canary environment holds. Generous for the couple of junk secrets it is meant
+        # to hold, and small enough that overflowing it says something true: this environment is
+        # being used for more than being a canary. Overflow reports that rather than guessing.
+        body_bytes=8192,
+    ),
 ]
 
-# Declared but not probed yet. The canary needs a throwaway organisation and a machine token
-# that do not exist, and shipping a probe that has never run once is the failure this whole
-# effort exists to prevent. It appears as a row so the page can say plainly that it is not
-# being watched, rather than implying by omission that everything is.
-UNPROBED = [
-    {
-        "id": "sync",
-        "name": "Secret sync",
-        "description": "A canary secret can be fetched and decrypted",
-        "state": UNCONFIGURED,
-        "detail": "no canary organisation is configured",
-    }
-]
+# Declared but not probed. Nothing is, now that the canary has a throwaway project and a
+# machine token behind it, but the mechanism stays: it is how a component says plainly that it
+# is not being watched, rather than implying by omission that everything is. A future component
+# with no probe yet belongs here rather than being left off the page.
+UNPROBED: list[dict] = []
 
 
 class NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -275,30 +469,39 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def fetch(base_url: str, probe: Probe) -> Response:
+def fetch(base_url: str, probe: Probe, path: str | None = None, token: str | None = None) -> Response:
+    headers = {"User-Agent": "sotto-status-probe"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(
-        base_url.rstrip("/") + probe.path,
+        base_url.rstrip("/") + (probe.path if path is None else path),
         method=probe.method,
         data=b"{}" if probe.method == "POST" else None,
-        headers={"User-Agent": "sotto-status-probe"},
+        headers=headers,
     )
     opener = urllib.request.build_opener(NoRedirects)
     try:
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:
-            return read(response)
+            return read(response, probe.body_bytes)
     except urllib.error.HTTPError as e:
         # Every non-2xx arrives here, and most of them are the expected answer: 401 from the
         # webhook, 303 from sign-in, 503 from an unconfigured feature.
-        return read(e)
+        return read(e, probe.body_bytes)
 
 
-def read(response) -> Response:
+def read(response, body_bytes: int = 64) -> Response:
     headers = {k.lower(): v for k, v in response.headers.items()}
     try:
-        body = response.read(64).decode("utf-8", "replace")
+        # One byte past the limit, so "that was all of it" and "that was as much as we kept" can
+        # be told apart. Sliced back afterwards, so nothing beyond the budget is retained.
+        raw = response.read(body_bytes + 1)
     except TRANSPORT_FAILURES:  # a body that stops arriving is a transport fact, not a verdict
-        body = ""
-    return Response(status=response.status, headers=headers, body_prefix=body)
+        raw = b""
+    truncated = len(raw) > body_bytes
+    body = raw[:body_bytes].decode("utf-8", "replace")
+    return Response(
+        status=response.status, headers=headers, body_prefix=body, truncated=truncated
+    )
 
 
 # What a network can do to a request. `urllib.error.URLError` is an `OSError`, and a truncated
@@ -307,11 +510,61 @@ def read(response) -> Response:
 TRANSPORT_FAILURES = (OSError, http.client.HTTPException)
 
 
+def failing_companion(base_url: str, probe: Probe, token: str | None) -> Outcome | None:
+    """The first companion path whose own judge does not pass, or None when all of them do.
+
+    Each companion carries its own verdict rather than being checked for a 200, because the two
+    halves of the canary fail in different ways: a grant goes missing or arrives unusable, and an
+    environment empties out. One shared rule would catch neither properly.
+    """
+    for path, judge in probe.also:
+        outcome = judge(fetch(base_url, probe, path=path, token=token))
+        if outcome.state != OK:
+            return outcome
+    return None
+
+
+def withheld(base_url: str, outcomes: dict[str, Outcome]) -> str | None:
+    """Why a credential must not be offered to this target, or None when it may be.
+
+    `main` already refuses to *record* a run in which every probe was misdirected, which is how a
+    typo in the configured URL fails loudly instead of inventing downtime. That refusal happens
+    after the requests have gone out, though, and for the four unauthenticated probes the cost of
+    asking the wrong host is a wrong reading. For the canary it is handing a bearer token to a
+    stranger, and no later refusal takes that back.
+
+    So the unauthenticated probes run first and this asks what they found. Not a proof the target
+    is right, but it catches the shape a mistyped hostname actually takes: something answers, and
+    it answers by sending you somewhere else.
+    """
+    if urllib.parse.urlsplit(base_url).scheme != "https":
+        return "the target is not https, so a bearer would travel in clear; nothing was sent"
+    measured = [o for o in outcomes.values() if o.state != UNCONFIGURED]
+    if measured and all(o.fault for o in measured):
+        return "every unauthenticated probe was misdirected, so nothing was sent"
+    return None
+
+
 def observe(base_url: str, probes: list[Probe]) -> dict[str, Outcome]:
     outcomes = {}
-    for probe in probes:
+    # Unauthenticated first, so the target has answered for itself before any credential is
+    # offered to it. `sorted` is stable, so the others keep the order they were declared in.
+    for probe in sorted(probes, key=lambda p: p.token_env is not None):
+        token = None
+        if probe.token_env is not None:
+            if (reason := withheld(base_url, outcomes)) is not None:
+                outcomes[probe.id] = Outcome(UNCONFIGURED, reason)
+                continue
+            raw = os.environ.get(probe.token_env, "")
+            if (problem := bearer_problem(raw)) is not None:
+                # Before any request. An instance with no canary must not have one attempted
+                # against it with an empty bearer, which the server would answer 401 and this
+                # would then publish as somebody's outage.
+                outcomes[probe.id] = Outcome(UNCONFIGURED, f"{probe.token_env} {problem}")
+                continue
+            token = raw.strip()
         try:
-            response = fetch(base_url, probe)
+            response = fetch(base_url, probe, token=token)
         except TRANSPORT_FAILURES as e:
             # A transport failure is indistinguishable from the component being gone, which
             # is the honest reading: nobody could have used it either.
@@ -320,7 +573,13 @@ def observe(base_url: str, probes: list[Probe]) -> dict[str, Outcome]:
         # Deliberately outside the handler. A bug in a verdict is not an outage, and recording
         # it as one would publish our own defect on a status page as somebody else's downtime
         # while leaving this job green. Let it raise and turn the run red instead.
-        outcomes[probe.id] = probe.judge(response)
+        outcome = probe.judge(response)
+        if outcome.state == OK and probe.also:
+            try:
+                outcome = failing_companion(base_url, probe, token) or outcome
+            except TRANSPORT_FAILURES as e:
+                outcome = Outcome(DOWN, f"{type(e).__name__}: {e}"[:200])
+        outcomes[probe.id] = outcome
     return outcomes
 
 
@@ -454,7 +713,14 @@ def main() -> int:
     for pid, outcome in sorted(outcomes.items()):
         print(f"{pid}: {outcome.state}" + (f" ({outcome.detail})" if outcome.detail else ""))
 
-    if outcomes and all(o.fault for o in outcomes.values()):
+    # Only the probes that actually ran. A component nobody has configured reports UNCONFIGURED
+    # without making a request, so it can be neither misdirected nor right about it, and counting
+    # it here would make this refusal unreachable on any instance that has not switched every
+    # feature on. The canary is the first such component that is off by default, which is how
+    # this surfaced, but a 503 saying "not configured" has always been able to reach the same
+    # place.
+    attempted = [o for o in outcomes.values() if o.state != UNCONFIGURED]
+    if attempted and all(o.fault for o in attempted):
         # Every component at once, and every one of them for a reason that is about this URL
         # rather than about the deployment. That is a wrong setting, not an outage, and
         # writing it down would put ninety days of invented downtime into a record meant to

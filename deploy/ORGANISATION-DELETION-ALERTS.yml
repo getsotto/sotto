@@ -1,6 +1,25 @@
 # Starter Prometheus rules for the protected organisation-deletion exporter.
 # Load these rules only when the scrape target is configured; tune notification routing per fleet.
 # Prometheus is the default format; adapt the expressions to another monitoring system as needed.
+#
+# You do not need Prometheus for three of these five. `scripts/check-deletion-metrics` implements
+# SottoOrganisationDeletionFailed, SottoOrganisationDeletionPurgeDue and
+# SottoOrganisationDeletionBillingStuck from a single scrape, because the server computes those
+# conditions in SQL and exports them as gauges: deciding them needs no history and no query
+# engine. `.github/workflows/deletion-alerts.yml` runs it six-hourly and raises a labelled issue.
+#
+# The other two, SottoOrganisationDeletionWorkerRaces and SottoOrganisationDeletionPurgeFailed,
+# are deliberately not implemented there, and for one shared reason: both read `increase(...)`
+# over an hour, which is the change in a monotonic counter, and deciding that needs the previous
+# reading kept somewhere between runs. A single scrape cannot answer either.
+#
+# WorkerRaces additionally needs a threshold nobody can yet choose. `> 3` reclaimed leases or
+# rejected compare-and-sets per hour was written before any deletion had ever been requested, and
+# an alert nobody can calibrate is one that gets ignored. PurgeFailed has no such problem: its
+# threshold is `> 0`, because any failed purge matters. It is held back only by the history.
+#
+# Implement them when a deployment has the throughput to tune the first and somewhere to keep a
+# previous reading for both, or load this file into Prometheus if you already run one.
 
 groups:
   - name: sotto-organisation-deletion

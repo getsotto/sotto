@@ -1,0 +1,169 @@
+name: Deletion alerts
+
+# Organisation deletion is the one operation in Sotto that cannot be undone from inside the
+# product, and it advances in a background worker where nothing is watching. The runbook has
+# listed alerting as a prerequisite since deletion was built, pointing at
+# deploy/ORGANISATION-DELETION-ALERTS.yml, which is Prometheus rules for a Prometheus this
+# deployment does not run. So the prerequisite has never been satisfiable as written.
+#
+# This implements the three of those five rules that a single scrape can decide, because the
+# server already does the work in SQL: an operation in `failed`, a billing cancellation that has
+# not converged in a day, and a retention operation past its purge deadline. The other two need
+# the change in a counter between two scrapes and thresholds nothing has yet calibrated; they stay
+# in the rules file with that recorded.
+on:
+  # Six-hourly. The conditions are not urgent in the minutes sense: a failed operation waits for a
+  # person either way, and the billing rule already has a day of tolerance built into it. What
+  # this bounds is how long "somebody is being charged for an organisation they asked to delete"
+  # can run before anyone knows, which at this cadence is about thirty hours rather than however
+  # long until someone thinks to look.
+  #
+  # An odd minute, and offset from the status page's :23 so the two do not queue together.
+  schedule:
+    - cron: "53 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deletion-alerts
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: organisation-deletion conditions
+    # Only the canonical repository main branch reaches the credential. Forks and pull request
+    # runs cannot, which is the gate doing the real work here.
+    if: github.repository == 'getsotto/sotto' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # A scheduled check nobody is watching needs somewhere for a failure to be seen.
+      issues: write
+    steps:
+      # First, and deliberately before the checkout: this reads two environment values and needs
+      # nothing from the repository. Ordered the other way, a checkout failure skipped it, left
+      # its output unset, and every gate below that asked for `== 'true'` went quiet. The job went
+      # red and no issue was opened, which is the exact shape this workflow exists to prevent.
+      - name: Check whether deletion alerting is configured
+        id: config
+        env:
+          DELETION_METRICS_TOKEN: ${{ secrets.SOTTO_DELETION_METRICS_TOKEN }}
+          BASE_URL: ${{ vars.SOTTO_PUBLIC_URL }}
+        run: |
+          set -euo pipefail
+          # Skip rather than fail when unconfigured, matching backup-freshness, so merging this
+          # cannot turn a healthy repository red. A fork inherits the schedule and not the secret,
+          # and so does this repository until the secret is set: filing an issue every six hours
+          # about a check nobody asked for is the alert fatigue the whole file exists to avoid.
+          #
+          # The cost is that a secret deleted later goes quiet rather than loud. That is the trade
+          # the sibling already makes, and the alternative punishes every fork for ever to catch
+          # one unlikely local mistake. An exporter that is configured and then stops answering
+          # still alerts, which is the case that matters.
+          if [ -z "${DELETION_METRICS_TOKEN:-}" ] || [ -z "${BASE_URL:-}" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Deletion alerting is not configured; see deploy/README.md, Enabling" >&2
+            echo "organisation deletion. Both SOTTO_DELETION_METRICS_TOKEN and SOTTO_PUBLIC_URL" >&2
+            echo "are needed, and neither is inherited by a fork." >&2
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.config.outputs.configured == 'true'
+
+      - name: Check the deletion exporter
+        id: check
+        if: steps.config.outputs.configured == 'true'
+        env:
+          # Read-only by construction: the exporter exposes aggregate counts and ages, and
+          # DELETION-METRICS.md records that no organisation id, provider message or secret value
+          # is stored in a metric row. That is why this sits at repository level rather than in an
+          # environment, matching SOTTO_CANARY_TOKEN: with no branch protection on main, an
+          # environment without protection rules would be scoping a credential against somebody
+          # who could edit the scoping, and this one leaks counters.
+          DELETION_METRICS_TOKEN: ${{ secrets.SOTTO_DELETION_METRICS_TOKEN }}
+          BASE_URL: ${{ vars.SOTTO_PUBLIC_URL }}
+        run: |
+          set -uo pipefail
+          # Captured as well as streamed, so the alert can quote what actually went wrong rather
+          # than telling a reader to go and find the log. The script prints counts and ages only.
+          set +e
+          python3 scripts/check-deletion-metrics \
+            --url "${BASE_URL%/}/ops/organisation-deletion/metrics" \
+            > "$RUNNER_TEMP/deletion.txt" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/deletion.txt"
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit $status
+
+      # Any scheduled failure, not only one the check itself reported. Gating on the step's own
+      # outcome would leave a checkout failure invisible: the job red and no issue opened, on the
+      # one kind of run where nobody is watching.
+      - name: Open or update the alert
+        # `!= 'false'` rather than `== 'true'`, and the difference is the whole point: an unset
+        # output means the configuration step did not get to run, which is a failure to report,
+        # not a reason to stay quiet. Only a step that positively said "nobody configured this"
+        # silences the alert.
+        if: failure() && steps.config.outputs.configured != 'false' && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LABEL: deletion-alert
+          STATUS: ${{ steps.check.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh label create "$LABEL" --force --color B60205 \
+            --description "Raised when an organisation deletion needs a person"
+
+          # Exit 1 is a deletion needing attention, exit 2 is the check being unable to tell, and
+          # an empty status is the job failing before the check ran. Conflating them would send
+          # somebody to the recovery runbook over a network blip.
+          case "${STATUS:-}" in
+            1) headline="An organisation deletion needs attention." ;;
+            2) headline="The deletion check ran but could not reach a verdict." ;;
+            *) headline="This job failed before the deletion check reached a verdict." ;;
+          esac
+
+          {
+            printf '%s\n\nFrom [this run](%s):\n\n' "$headline" "$RUN_URL"
+            if [ -s "$RUNNER_TEMP/deletion.txt" ]; then
+              printf '```\n'
+              cat "$RUNNER_TEMP/deletion.txt"
+              printf '```\n'
+            else
+              printf 'The check produced no output, so the failure is earlier in the job.\n'
+            fi
+            printf '\nThe recovery procedure is in `deploy/ORGANISATION-DELETION-RUNBOOK.md`.\n'
+          } > "$RUNNER_TEMP/body.md"
+
+          existing="$(gh issue list --state open --label "$LABEL" \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh issue create --title "Organisation deletion needs attention" --label "$LABEL" \
+              --body-file "$RUNNER_TEMP/body.md"
+          fi
+
+      - name: Close a resolved alert
+        # On any success, dispatched included: confirming a fix by hand is the moment the alert
+        # should clear, not six hours later. Gated on the configuration too, because otherwise
+        # removing the secret would close a standing alert rather than leaving it be.
+        if: success() && steps.config.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LABEL: deletion-alert
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # One call rather than a comment and then a close: two of those are two notifications
+          # for one piece of good news.
+          for number in $(gh issue list --state open --label "$LABEL" --json number --jq '.[].number'); do
+            gh issue close "$number" --comment "Clear again as of [this run]($RUN_URL)."
+          done

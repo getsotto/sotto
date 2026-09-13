@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Check the protected organisation-deletion exporter for conditions that need a person.
+
+Usage: scripts/check-deletion-metrics --url https://example.com/ops/organisation-deletion/metrics
+
+Organisation deletion is the one operation in Sotto that cannot be undone from inside the product,
+and it runs in a background worker where nothing is watching. These are the three conditions from
+deploy/ORGANISATION-DELETION-ALERTS.yml that a single scrape can decide, because the server already
+computes them in SQL: an operation that has failed, a billing cancellation that has not converged,
+and a retention operation whose purge deadline has passed without the purge starting.
+
+What a poll cannot reproduce is the `for:` soak on those rules, which tells Prometheus to hold a
+condition for five or fifteen minutes before believing it. This fires on first sighting instead.
+Of the three, only the purge-deadline one can be briefly true on a healthy deployment: an
+operation crosses its deadline and the worker claims it on its next pass seconds later, so the
+window is seconds wide and a six-hourly sample is very unlikely to land in it. If one ever does,
+the next run closes the alert on its own. The case worth keeping is the one that does not clear,
+because an operation stuck past its deadline is a worker that has stopped.
+
+The other two rules need the change in a counter between two scrapes, so they need somewhere to
+keep the previous reading. They measure worker contention and purge-failure rate, and their
+thresholds were written before any deletion existed, so there is nothing yet to calibrate them
+against. They stay in the alert rules file with that noted.
+
+Exits 0 when nothing needs attention, 1 when something does, and 2 when the check could not run.
+The workflow branches on that difference: reporting an unreachable endpoint as a deletion failure
+would send somebody to the recovery runbook over a network blip.
+
+The bearer token is read from DELETION_METRICS_TOKEN and never printed. Neither is the payload.
+The exporter carries no organisation id, provider text or secret value by design, but a detail
+written here reaches a public issue, so it carries counts and ages and nothing else.
+"""
+
+import argparse
+import dataclasses
+import http.client
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+#: Matching scripts/status-probe. Without one, a stalled connection holds the job until the
+#: scheduler kills it, and a killed job never reaches the step that would say so.
+TIMEOUT_SECONDS = 15
+
+#: From the `SottoOrganisationDeletionBillingStuck` rule, and the only tunable number here: the
+#: other two conditions are "more than none". A day is long enough that the provider retry ladder
+#: has certainly finished, so anything still in this state has stopped making progress rather than
+#: being slow, and short enough that somebody is charged for an organisation they asked to delete
+#: for hours rather than weeks.
+BILLING_STUCK_SECONDS = 24 * 60 * 60
+
+#: The one series the exporter writes unconditionally. Every other series comes from `GROUP BY
+#: state` over the operations table, so on a healthy deployment with no deletions none of them is
+#: emitted at all. That makes absence useless as a signal and makes this the only way to tell "the
+#: exporter answered and had nothing to report" from "something else answered". Without it a login
+#: page, a proxy error or an empty body would parse to nothing and read as perfect health.
+ALWAYS_PRESENT = "sotto_organisation_deletion_purge_due_count"
+
+OPERATIONS = "sotto_organisation_deletion_operations"
+OLDEST_AGE = "sotto_organisation_deletion_oldest_age_seconds"
+
+#: What a network can do to a request, matching scripts/status-probe. `urllib.error.URLError` is
+#: an `OSError`, but a body that stops arriving part-way raises `http.client.IncompleteRead`, which
+#: is an `HTTPException` and is not. Catching only `OSError` therefore let a truncated response
+#: escape as a traceback, exit 1, and be published as a deletion needing attention: a peer closing
+#: a socket reported as somebody's organisation stuck mid-delete.
+TRANSPORT_FAILURES = (OSError, http.client.HTTPException)
+
+SAMPLE = re.compile(
+    r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)(?:\{(?P<labels>[^}]*)\})?[ \t]+(?P<value>\S+)$"
+)
+LABEL = re.compile(r'(?P<key>[A-Za-z_][A-Za-z0-9_]*)="(?P<value>(?:[^"\\]|\\.)*)"')
+
+
+@dataclasses.dataclass(frozen=True)
+class Reading:
+    """A parsed scrape: the series that were readable, and the keys of those that were not.
+
+    The two are kept apart because on this exporter they mean opposite things. A series that is
+    absent is healthy, since every per-state series comes from a `GROUP BY` over an empty table.
+    A series that is present and unreadable is not healthy and is not absent, and folding it into
+    the first would answer every threshold below with silence.
+    """
+
+    values: dict
+    unreadable: frozenset
+
+
+#: The series any rule below reads, with the words to use when one of them cannot be read.
+WATCHED = (
+    ((OPERATIONS, (("state", "failed"),)), "the count of failed operations"),
+    ((ALWAYS_PRESENT, ()), "the count of operations due for purge"),
+    ((OLDEST_AGE, (("state", "cancelling_billing"),)), "the age of the oldest billing cancellation"),
+)
+
+
+def parse(text):
+    """Prometheus text into a [`Reading`].
+
+    Lenient about lines it does not recognise and strict about values. A sample whose value is not
+    a finite number is recorded as unreadable rather than kept: `NaN > 0` is false, so keeping one
+    would let it answer every threshold with "no, nothing is wrong". Dropping it silently would do
+    the same thing by a longer route, because an absent series is read as zero.
+    """
+    values = {}
+    unreadable = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = SAMPLE.match(line)
+        if match is None:
+            continue
+        labels = tuple(
+            sorted(
+                (found.group("key"), re.sub(r"\\(.)", r"\1", found.group("value")))
+                for found in LABEL.finditer(match.group("labels") or "")
+            )
+        )
+        key = (match.group("name"), labels)
+        try:
+            number = float(match.group("value"))
+        except ValueError:
+            unreadable.add(key)
+            continue
+        if number != number or number in (float("inf"), float("-inf")):
+            unreadable.add(key)
+            continue
+        values[key] = number
+    return Reading(values=values, unreadable=frozenset(unreadable))
+
+
+def value(reading, name, **labels):
+    """One series, or None when it was not emitted."""
+    return reading.values.get((name, tuple(sorted(labels.items()))))
+
+
+def unreadable_watched(reading):
+    """The rules that cannot be decided from this scrape, in words. Empty when all of them can.
+
+    Only the series a rule actually reads. An unknown metric arriving as rubbish says nothing
+    about deletion and should not stop the three that can still be answered.
+    """
+    return [words for key, words in WATCHED if key in reading.unreadable]
+
+
+def is_exporter_output(reading):
+    """Whether this reading came from the exporter at all. See ALWAYS_PRESENT."""
+    return (ALWAYS_PRESENT, ()) in reading.values or (ALWAYS_PRESENT, ()) in reading.unreadable
+
+
+def findings(reading):
+    """Everything that needs a person, worst first. Empty means nothing does."""
+    out = []
+
+    failed = value(reading, OPERATIONS, state="failed") or 0
+    if failed > 0:
+        out.append(
+            f"{failed:.0f} deletion operation(s) are in the failed state. An owner asked for a "
+            "deletion that has stopped, and nothing else will tell you: see the recovery runbook."
+        )
+
+    purge_due = value(reading, ALWAYS_PRESENT) or 0
+    if purge_due > 0:
+        # The silent direction. From outside the organisation is already gone, while its rows are
+        # still there. It is also the only one of these that would notice the worker stopping.
+        out.append(
+            f"{purge_due:.0f} retention operation(s) passed their purge deadline without purging. "
+            "Data promised destroyed still exists, and the worker may have stopped."
+        )
+
+    billing_age = value(reading, OLDEST_AGE, state="cancelling_billing") or 0
+    if billing_age > BILLING_STUCK_SECONDS:
+        out.append(
+            f"a billing cancellation has been in progress for {billing_age / 3600:.1f} hours "
+            f"(limit {BILLING_STUCK_SECONDS / 3600:.0f}). Somebody is still being charged for an "
+            "organisation they asked to delete."
+        )
+
+    return out
+
+
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow a redirect while carrying a bearer token.
+
+    urllib copies request headers onto the redirected request, so a `302` to another host arrives
+    there with `Authorization` intact. Checked rather than assumed: `redirect_request` on a stock
+    handler hands the header straight to the new origin. The URL here comes from a configured
+    variable, so a typo or a proxy that bounces to a login page is enough to send the credential
+    somewhere it was never meant to go, and no later verdict takes that back.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+def fetch(url, token, opener=None):
+    """Scrape the exporter. The token goes in a header and never into a URL or a log."""
+    if urllib.parse.urlsplit(url).scheme != "https":
+        # Before the request is built, not after. A bearer on a cleartext hop is spent the moment
+        # it leaves, whatever this returns.
+        raise ValueError("refusing to send a bearer token to a URL that is not https")
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    open_it = opener if opener is not None else urllib.request.build_opener(NoRedirects).open
+    with open_it(request, timeout=TIMEOUT_SECONDS) as response:
+        return response.read().decode("utf-8", "replace")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--url", required=True, help="the protected metrics endpoint")
+    args = parser.parse_args(argv)
+
+    token = os.environ.get("DELETION_METRICS_TOKEN", "").strip()
+    if not token:
+        print("DELETION_METRICS_TOKEN is unset; nothing to check with", file=sys.stderr)
+        return 2
+
+    try:
+        text = fetch(args.url, token)
+    except ValueError as error:
+        # The https guard, and anything else `fetch` refuses before sending. Not an alert: nothing
+        # was asked, so nothing is known about the deployment.
+        print(f"{error}", file=sys.stderr)
+        return 2
+    except urllib.error.HTTPError as error:
+        # A 503 here is the endpoint saying its own token is unconfigured, which is a deployment
+        # fact rather than a deletion problem. The body is not quoted back: it can echo a request.
+        print(f"the exporter refused the request: HTTP {error.code}", file=sys.stderr)
+        return 2
+    except TRANSPORT_FAILURES as error:
+        print(f"could not read the exporter: {type(error).__name__}", file=sys.stderr)
+        return 2
+
+    reading = parse(text)
+    if not is_exporter_output(reading):
+        print(
+            f"the response carried no {ALWAYS_PRESENT}, so it was not the exporter",
+            file=sys.stderr,
+        )
+        return 2
+
+    if blind := unreadable_watched(reading):
+        # Present but unreadable, which is neither absent nor fine. Saying nothing here would
+        # publish "no deletion needs attention" on the strength of a number nobody could read.
+        print(
+            f"the exporter answered but {', '.join(blind)} could not be read",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(f"read {len(reading.values)} series; retention operations due for purge: "
+          f"{value(reading, ALWAYS_PRESENT):.0f}")
+    problems = findings(reading)
+    if not problems:
+        print("no deletion operation needs attention")
+        return 0
+    for problem in problems:
+        print(f"ATTENTION: {problem}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -4,6 +4,7 @@
 //! are **not** stripped - a `$` or `#` inside a value is never mangled. Supported syntax:
 //! - `KEY=value` and `export KEY=value`
 //! - `#` comment lines and blank lines (skipped)
+//! - one optional UTF-8 byte-order mark (U+FEFF) at the very start is ignored
 //! - single-quoted values (literal) and double-quoted values (interpret `\n \r \t \\ \"`)
 //! - unquoted values: surrounding whitespace is trimmed (the usual `.env` convention, so a
 //!   `KEY= value` line imports `value`); quote the value to preserve leading/trailing spaces.
@@ -15,6 +16,9 @@ use crate::error::{Error, Result};
 /// Parse `.env` text into `(key, value)` pairs.
 pub fn parse(text: &str) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
+    // Some tools save UTF-8 files with a byte-order mark; ignore one optional
+    // U+FEFF at the very start. Inside values it is ordinary data.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for (number, raw) in text.lines().enumerate() {
         let line = raw.trim_start();
         if line.is_empty() || line.starts_with('#') {
@@ -155,5 +159,46 @@ export BAZ=qux
     fn invalid_lines_error() {
         assert!(matches!(parse("NOEQUALS"), Err(Error::Input(_))));
         assert!(matches!(parse("1BAD=x"), Err(Error::Input(_))));
+    }
+
+    #[test]
+    fn leading_bom_is_ignored() {
+        // BOM before an assignment, LF endings.
+        assert_eq!(
+            parse("\u{feff}NAME=value\n").unwrap(),
+            vec![("NAME".to_string(), "value".to_string())]
+        );
+        // BOM before a blank first line.
+        assert_eq!(
+            parse("\u{feff}\nNAME=value").unwrap(),
+            vec![("NAME".to_string(), "value".to_string())]
+        );
+        // BOM before a comment, CRLF endings.
+        assert_eq!(
+            parse("\u{feff}# comment\r\nNAME=value\r\n").unwrap(),
+            vec![("NAME".to_string(), "value".to_string())]
+        );
+        // BOM-only input behaves like an empty file.
+        assert!(parse("\u{feff}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn bom_beyond_the_first_character_is_preserved() {
+        // U+FEFF inside a secret value is ordinary data, not a marker.
+        assert_eq!(
+            parse("NAME=before\u{feff}after").unwrap(),
+            vec![("NAME".to_string(), "before\u{feff}after".to_string())]
+        );
+        // A BOM opening a later line stays part of that line, so the key is
+        // still rejected with the real line number.
+        let err = parse("A=1\n\u{feff}B=2").unwrap_err().to_string();
+        assert!(err.contains("line 2"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn bom_stripping_keeps_error_line_numbers() {
+        // Stripping the leading BOM must not shift reported line numbers.
+        let err = parse("\u{feff}A=1\nNOPE").unwrap_err().to_string();
+        assert!(err.contains("line 2"), "unexpected error: {err}");
     }
 }

@@ -12,6 +12,8 @@
 //! [`crate::sync::grants`] - cryptography is not access control, so both layers check. `enc_name`
 //! here is server-opaque ciphertext, exactly like `projects.enc_name`.
 
+use std::collections::HashSet;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -488,6 +490,26 @@ async fn list_members(
     Ok(Json(members))
 }
 
+/// Delete a user's grants across an org's environments, joining through projects so their
+/// personal environments are untouched. Returns the rows removed.
+async fn delete_org_grants(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: &str,
+    user_id: &str,
+) -> Result<u64> {
+    let deleted = sqlx::query(
+        "DELETE FROM environment_grants eg \
+         USING environments e, projects p \
+         WHERE eg.env_id = e.id AND e.project_id = p.id AND p.org_id = $1 AND eg.user_id = $2",
+    )
+    .bind(org_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    Ok(deleted)
+}
+
 /// `POST /orgs/{org_id}/members` - add an existing user (admin+). Granting `owner` requires the
 /// caller to be an owner. 409 if already a member; 404 if the user does not exist.
 async fn add_member(
@@ -542,6 +564,10 @@ async fn add_member(
 
     match inserted {
         Ok(Some(_)) => {
+            // A removal from before the revocation fix could leave this user's grant rows
+            // behind; without this delete, re-adding them would silently restore their old
+            // vault key. A rejoin starts grantless - only an explicit re-share restores access.
+            delete_org_grants(&mut tx, &org_id, &body.user_id).await?;
             audit::record_tx(
                 &mut tx,
                 &org_id,
@@ -623,6 +649,8 @@ async fn invite_member(
     if inserted.is_none() {
         return Err(Error::Conflict("user is already a member".into()));
     }
+    // Same stale-grant wipe as `add_member`: an invite is the other path back in.
+    delete_org_grants(&mut tx, &org_id, &target_id).await?;
     audit::record_tx(
         &mut tx,
         &org_id,
@@ -739,13 +767,39 @@ async fn update_member(
     Ok(StatusCode::OK)
 }
 
+/// A machine token revoked by a member removal (names, never secrets - the raw token is
+/// shown only at creation and must never appear here).
+#[derive(Serialize)]
+struct RevokedTokenRef {
+    token_id: String,
+    name: String,
+    env_id: String,
+}
+
+/// The removal receipt: what a member removal revoked, so the team knows which shared machine
+/// tokens to recreate.
+#[derive(Serialize)]
+struct RemovalReceipt {
+    revoked_tokens: Vec<RevokedTokenRef>,
+    grants_deleted: i64,
+}
+
 /// `DELETE /orgs/{org_id}/members/{user_id}` - remove a member (admin+). Removing an owner requires
 /// the caller to be an owner; the last owner cannot be removed.
+///
+/// Removal revokes every access path the member had, atomically: their `environment_grants` rows
+/// and every machine token they created in the org's environments are revoked in the same
+/// transaction as the membership delete, so a partial failure cannot leave a half-revoked state.
+/// The caller must hold a grant to every environment the target could decrypt that someone else
+/// also holds - otherwise the removal fails with `409` naming those environments, rather than
+/// proceeding with silently skipped rotations. This checks for the grant row a caller able to
+/// re-key would have; the server cannot tell whether a sealed key opens, so it catches a client
+/// that skipped a rotation, not an admin set on getting past it.
 async fn remove_member(
     State(state): State<AppState>,
     user: AuthUser,
     Path((org_id, target)): Path<(String, String)>,
-) -> Result<StatusCode> {
+) -> Result<(StatusCode, Json<RemovalReceipt>)> {
     let caller = access(&state.pool, &org_id, &user.user_id).await?;
     caller.require_write()?;
     let caller = caller.role();
@@ -779,11 +833,98 @@ async fn remove_member(
         }
     }
 
+    // The caller must be able to re-key every environment the target could decrypt: without a
+    // rotation the target's cached vault keys stay valid, so an environment the caller cannot
+    // open is a hard failure naming it, never a silent skip. The exception is an environment
+    // nobody else holds: nobody could re-key it, and nobody else can write a secret there for the
+    // target's key to read, so demanding a rotation would only make the target unremovable. Only
+    // current members count as holders here: a pre-fix removal can leave a grant row for a
+    // departed user, and counting it would 409 a removal nobody remaining can re-key for.
+    let target_envs: Vec<String> = sqlx::query_scalar(
+        "SELECT eg.env_id FROM environment_grants eg \
+         JOIN environments e ON eg.env_id = e.id JOIN projects p ON e.project_id = p.id \
+         WHERE p.org_id = $1 AND eg.user_id = $2 \
+           AND EXISTS (SELECT 1 FROM environment_grants peer \
+                       JOIN organization_memberships m \
+                         ON m.org_id = $1 AND m.user_id = peer.user_id \
+                       WHERE peer.env_id = eg.env_id AND peer.user_id <> $2) \
+         ORDER BY eg.env_id",
+    )
+    .bind(&org_id)
+    .bind(&target)
+    .fetch_all(&mut *tx)
+    .await?;
+    if !target_envs.is_empty() {
+        let caller_envs: Vec<String> = sqlx::query_scalar(
+            "SELECT eg.env_id FROM environment_grants eg \
+             JOIN environments e ON eg.env_id = e.id JOIN projects p ON e.project_id = p.id \
+             WHERE p.org_id = $1 AND eg.user_id = $2",
+        )
+        .bind(&org_id)
+        .bind(&user.user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let held: HashSet<&str> = caller_envs.iter().map(String::as_str).collect();
+        let missing: Vec<&str> = target_envs
+            .iter()
+            .map(String::as_str)
+            .filter(|env| !held.contains(env))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::Conflict(format!(
+                "cannot complete removal: you hold no grant to environment(s) {}; \
+                 ask a member who holds them to share each environment with you and retry, \
+                 or to perform the removal themselves",
+                missing.join(", ")
+            )));
+        }
+    }
+
+    // The target's grants die with the membership: re-adding them later starts grantless, and
+    // only an explicit re-share restores decryption capability.
+    let grants_deleted = delete_org_grants(&mut tx, &org_id, &target).await?;
+
+    // Every machine token the target created in this org's environments dies too: they saw the
+    // raw token and generated the machine keypair, so only revocation evicts them. Personal
+    // (non-org) environments are not ours to revoke and are left untouched.
+    let revoked: Vec<(String, String, String)> = sqlx::query_as(
+        "UPDATE machine_tokens mt SET revoked_at = now() \
+         FROM environments e, projects p \
+         WHERE mt.env_id = e.id AND e.project_id = p.id AND p.org_id = $1 \
+           AND mt.created_by = $2 AND mt.revoked_at IS NULL \
+         RETURNING mt.id, mt.name, mt.env_id",
+    )
+    .bind(&org_id)
+    .bind(&target)
+    .fetch_all(&mut *tx)
+    .await?;
+
     sqlx::query("DELETE FROM organization_memberships WHERE org_id = $1 AND user_id = $2")
         .bind(&org_id)
         .bind(&target)
         .execute(&mut *tx)
         .await?;
+    // Each revoked token audits as `token.revoked` like a manual revocation (plus the token
+    // name, so the team knows what to recreate); the removal itself carries the counts.
+    for (token_id, name, env_id) in &revoked {
+        audit::record_tx(
+            &mut tx,
+            &org_id,
+            &user.user_id,
+            "token.revoked",
+            audit::Context {
+                target: Some(token_id),
+                env_id: Some(env_id),
+                detail: Some(name),
+            },
+        )
+        .await?;
+    }
+    let detail = format!(
+        "removed {} grant(s), revoked {} token(s)",
+        grants_deleted,
+        revoked.len()
+    );
     audit::record_tx(
         &mut tx,
         &org_id,
@@ -791,12 +932,26 @@ async fn remove_member(
         "member.removed",
         audit::Context {
             target: Some(&target),
+            detail: Some(&detail),
             ..Default::default()
         },
     )
     .await?;
     tx.commit().await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok((
+        StatusCode::OK,
+        Json(RemovalReceipt {
+            revoked_tokens: revoked
+                .into_iter()
+                .map(|(token_id, name, env_id)| RevokedTokenRef {
+                    token_id,
+                    name,
+                    env_id,
+                })
+                .collect(),
+            grants_deleted: grants_deleted as i64,
+        }),
+    ))
 }
 
 /// True only for the `user_id` foreign-key violation - the referenced user does not exist. Scoped

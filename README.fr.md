@@ -85,10 +85,22 @@ macOS, Linux et Windows.
 sotto init                   # create your identity + first project - SAVE the printed Emergency Kit
 sotto set DATABASE_URL       # hidden prompt; encrypted locally before it ever touches disk
 sotto import .env            # optional: pull in an existing file, still encrypted locally
+sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto share DATABASE_URL     # one-time, burn-after-reading link for a single secret
 ```
+
+Utilisez `--env` pour sélectionner un environnement pour une seule commande sans modifier celui par défaut du projet :
+
+```sh
+sotto run --env staging -- npm test
+sotto ls --env staging
+```
+
+`--env` ne s'applique qu'à cette commande ; `sotto env use` modifie l'environnement par défaut.
+
+L'export écrit en clair ; il nécessite donc `--reveal` dans un terminal, comme `sotto get`.
 
 `sotto login` utilise l'instance hébergée sur [getsotto.co.uk](https://getsotto.co.uk) sauf si vous le faites pointer
 ailleurs avec `--server <url>` (voir [Déploiement](deploy/README.md) pour héberger le vôtre). Dans tous les cas,
@@ -104,6 +116,16 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user
 sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
+
+### Un autre appareil
+
+```sh
+sotto login                  # same account as the first machine
+sotto setup                  # unpack the Emergency Kit onto this device
+sotto pull                   # download the ciphertext you already pushed
+```
+
+Vous avez besoin de l'Emergency Kit imprimé par `sotto init` ; sans lui, un nouvel appareil ne peut pas déchiffrer le coffre.
 
 ## Architecture
 

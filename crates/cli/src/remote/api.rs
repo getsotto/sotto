@@ -163,6 +163,24 @@ pub struct MachineTokenInfo {
     pub name: String,
     /// The machine's X25519 public key (base64).
     pub public_key: String,
+    /// The user who created the token, if still known.
+    pub created_by: Option<String>,
+}
+
+/// A machine token revoked by a member removal (names, never the raw token).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RevokedTokenInfo {
+    pub token_id: String,
+    pub name: String,
+    pub env_id: String,
+}
+
+/// The member-removal receipt: what the server revoked, so the team knows which shared
+/// machine tokens to recreate.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemovalReceipt {
+    pub revoked_tokens: Vec<RevokedTokenInfo>,
+    pub grants_deleted: i64,
 }
 
 /// A freshly created machine token: its id + the raw API token (shown by the server exactly once).
@@ -337,8 +355,8 @@ pub trait SyncApi {
     fn org_audit(&self, org_id: &str, limit: Option<i64>) -> Result<Vec<AuditEvent>>;
     /// An org's plan (tier, trial, limits), visible to any member.
     fn org_entitlements(&self, org_id: &str) -> Result<Entitlements>;
-    /// Remove a member from an org (revokes their API access).
-    fn remove_member(&self, org_id: &str, user_id: &str) -> Result<()>;
+    /// Remove a member from an org (revokes their grants, tokens, and API access).
+    fn remove_member(&self, org_id: &str, user_id: &str) -> Result<RemovalReceipt>;
     /// Store (or replace) a member's sealed copy of the org key (display-name access).
     fn grant_org_key(&self, org_id: &str, user_id: &str, enc_org_key: &str) -> Result<()>;
     /// Create a machine token for an environment (public key + sealed grant are client-generated).

@@ -5,7 +5,9 @@ on:
     types: [opened]
   # pull_request_target, not pull_request: fork PRs get a read-only token under
   # pull_request, so posting the greeting would 403. Safe: this job only posts a
-  # comment and never checks out PR code.
+  # comment and never runs PR code - the checkout below resolves the base
+  # branch, so the script it loads is repository-controlled, and event values
+  # reach it as data (context.payload and env), never as interpolated script.
   pull_request_target:
     types: [opened]
 
@@ -18,10 +20,10 @@ jobs:
     name: Greet first-time contributors
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/first-interaction@v3
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          issue_message: |
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ISSUE_MESSAGE: |
             Thanks for opening your first issue in Sotto, and welcome.
 
             A quick note on where things belong:
@@ -31,7 +33,7 @@ jobs:
             - Something security sensitive? Please report it privately per [SECURITY.md](https://github.com/getsotto/sotto/blob/main/SECURITY.md), never as a public issue.
 
             The full contributor guide is in [CONTRIBUTING.md](https://github.com/getsotto/sotto/blob/main/CONTRIBUTING.md).
-          pr_message: |
+          PR_MESSAGE: |
             Thanks for your first pull request to Sotto, and welcome.
 
             Two things that trip up newcomers:
@@ -40,3 +42,13 @@ jobs:
             - Please run `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` before pushing, and add tests for new behaviour (`cargo test --workspace` runs the suite).
 
             The full guide is in [CONTRIBUTING.md](https://github.com/getsotto/sotto/blob/main/CONTRIBUTING.md) - a maintainer will review shortly.
+        with:
+          script: |
+            const greet = require(process.env.GITHUB_WORKSPACE + "/.github/scripts/greet-first-contribution.js");
+            await greet.run({
+              github,
+              context,
+              core,
+              issueMessage: process.env.ISSUE_MESSAGE,
+              prMessage: process.env.PR_MESSAGE,
+            });

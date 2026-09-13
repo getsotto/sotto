@@ -27,6 +27,7 @@ deploy/rehearsals/
 
 # Internal planning docs - kept out of the public open-core repo.
 docs/
+backlog/
 
 # Python bytecode. CONTRIBUTING.md runs the script tests with -B so none is written; this is
 # for the times a bare python3 invocation makes some anyway.
