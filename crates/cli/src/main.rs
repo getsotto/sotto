@@ -1581,7 +1581,9 @@ fn machine_export(token: &str, format: ExportFormat, reveal: bool) -> Result<()>
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{display_secret, login_config, set_confirmation, Cli, Command, ThemeCommand};
+    use super::{
+        display_secret, history_line, login_config, set_confirmation, Cli, Command, ThemeCommand,
+    };
 
     #[test]
     fn run_help_explains_command_forwarding() {
