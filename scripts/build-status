@@ -9,20 +9,35 @@ day. The workflow does the fetching.
 
 The output is one self-contained file. No scripts, no external assets, no fonts to fail to
 load: a status page whose own availability depends on a CDN is a joke told at its own expense,
-and Sordino asks that everything degrade to legible text anyway.
+and Sordino asks that everything degrade to legible text anyway. The icon is inlined for the
+same reason, and reused from the web app so the two cannot drift.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import html
 import json
 import os
+import pathlib
 import sys
 
 # The window the collector retains, and so the most the page can show.
 SPAN_DAYS = 90
+
+# The web app's icon, reused here and inlined rather than linked.
+#
+# Inlined because this page is served from a different origin to the app: `/favicon.svg` does not
+# resolve here, and the absolute URL would have the status page fetch an asset from the service it
+# exists to report on, so on the one morning it matters the icon fails along with everything else.
+# That is the same reasoning that keeps the fonts and styles in the file.
+#
+# Read from the app's own copy at build time rather than pasted in, so the two cannot drift and a
+# redesign of one is a redesign of both. It is well under a kilobyte, which is cheaper than the
+# request it saves.
+FAVICON_SOURCE = pathlib.Path(__file__).resolve().parents[1] / "web/public/favicon.svg"
 
 OK, DOWN, UNCONFIGURED = "ok", "down", "unconfigured"
 
@@ -359,6 +374,26 @@ def render_incident(incident: dict) -> str:
 """
 
 
+def favicon_link(source: pathlib.Path = FAVICON_SOURCE) -> str:
+    """The icon as a `<link>` carrying its own bytes, or an empty string if it cannot be read.
+
+    Degrades rather than failing. An icon is decoration, and refusing to publish a status page
+    because a decorative file moved would take the page down over the one thing it is not about,
+    on a day when the page is quite possibly the only thing still working. The warning goes to
+    stderr so a build that quietly lost the icon still says so.
+    """
+    try:
+        svg = source.read_bytes()
+    except OSError as error:
+        print(
+            f"no icon at {source} ({type(error).__name__}); the page will have none",
+            file=sys.stderr,
+        )
+        return ""
+    inline = base64.b64encode(svg).decode("ascii")
+    return f'<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,{inline}">'
+
+
 def render(model: dict, now: dt.datetime) -> str:
     components = "".join(render_component(r) for r in model["rows"])
     if model.get("incidents_unavailable"):
@@ -395,6 +430,7 @@ def render(model: dict, now: dt.datetime) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>Sotto status</title>
+{favicon_link()}
 <style>{STYLE}</style>
 </head>
 <body>

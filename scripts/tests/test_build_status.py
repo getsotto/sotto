@@ -6,9 +6,13 @@ support: a day nobody checked drawn as a good day, a percentage with no denomina
 unconfigured component voting on whether the service is up.
 """
 
+import base64
+import contextlib
 import datetime as dt
 import importlib.machinery
 import importlib.util
+import io
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -226,6 +230,39 @@ class Rendering(unittest.TestCase):
         self.assertIn("100.00% of 4 checks", out)
         self.assertIn("sampled, not measured continuously", out)
         self.assertIn("shown blank rather than green", out)
+
+    def test_the_page_carries_its_icon_rather_than_linking_to_one(self):
+        out = page.render(page.build(self.summary(), [], TODAY),
+                          dt.datetime(2026, 9, 9, tzinfo=dt.timezone.utc))
+        self.assertIn('rel="icon"', out)
+        self.assertIn("data:image/svg+xml;base64,", out)
+
+    def test_the_icon_is_the_web_app_s_own_and_not_a_second_copy(self):
+        # The anti-drift property. Pasting the bytes in would work today and be wrong the first
+        # time somebody redesigns the app's icon, leaving the status page showing the old one
+        # with nothing to notice.
+        inline = page.favicon_link().split("base64,")[1].rstrip('">')
+        self.assertEqual(base64.b64decode(inline), page.FAVICON_SOURCE.read_bytes())
+
+    def test_nothing_on_the_page_is_fetched_from_anywhere_else(self):
+        # The property the workflow's own comment claims: "no scripts and no external assets, so
+        # it has no failure domain of its own". A status page that fetches its icon from the
+        # service it reports on loses the icon on the one morning anyone looks.
+        out = page.render(page.build(self.summary(), [], TODAY),
+                          dt.datetime(2026, 9, 9, tzinfo=dt.timezone.utc))
+        for subresource in ("<script", 'rel="stylesheet"', "<img", "@import", "url(http"):
+            self.assertNotIn(subresource, out, subresource)
+        for href in re.findall(r'<link[^>]*href="([^"]*)"', out):
+            self.assertTrue(href.startswith("data:"), f"a link fetches {href}")
+
+    def test_a_missing_icon_does_not_take_the_page_down_with_it(self):
+        # Decoration must not be able to stop a status page publishing. It degrades, loudly
+        # enough to see in a build log and quietly enough to still serve the page.
+        missing = page.FAVICON_SOURCE.parent / "does-not-exist.svg"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(page.favicon_link(missing), "")
+        self.assertIn("the page will have none", stderr.getvalue())
 
     def test_content_from_the_collector_is_escaped(self):
         # Details are written by the probe and can quote a redirect target or an error, so they
