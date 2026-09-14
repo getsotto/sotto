@@ -164,6 +164,8 @@ jobs:
         run: npm run build:wasm
       - name: Typecheck
         run: npm run typecheck
+      - name: Unit tests (vitest)
+        run: npm test
       - name: Build (vite bundle)
         run: npx vite build
       - name: WASM smoke (crypto core loads)
