@@ -17,13 +17,17 @@ const SERVER_ENV: &str = "SOTTO_SERVER";
 /// `login --server <url>`, `SOTTO_SERVER`, or the saved config.
 pub const DEFAULT_SERVER: &str = "https://getsotto.co.uk";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalConfig {
-    pub server_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_url: Option<String>,
     /// Origin of the web app, for building share links. Falls back to `server_url` when unset
     /// (same-origin deploy).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_url: Option<String>,
+    /// Active CLI theme (e.g. "nord", "sordino", "terminal", "monochrome", "tokyo-night").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
 }
 
 impl GlobalConfig {
@@ -79,7 +83,7 @@ pub fn explicit_server_url(
     config_path: &Path,
 ) -> Result<Option<String>> {
     let env_url = std::env::var(SERVER_ENV).ok();
-    let configured = GlobalConfig::load_from(config_path)?.map(|c| c.server_url);
+    let configured = GlobalConfig::load_from(config_path)?.and_then(|c| c.server_url);
     Ok(resolve(override_url, env_url, configured))
 }
 
@@ -105,8 +109,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let config = GlobalConfig {
-            server_url: "https://api.sotto.dev".into(),
+            server_url: Some("https://api.sotto.dev".into()),
             web_url: Some("https://app.sotto.dev".into()),
+            theme: None,
         };
         config.save_to(&path).unwrap();
         assert_eq!(GlobalConfig::load_from(&path).unwrap().unwrap(), config);
@@ -159,8 +164,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         GlobalConfig {
-            server_url: "https://self.hosted".into(),
+            server_url: Some("https://self.hosted".into()),
             web_url: None,
+            theme: None,
         }
         .save_to(&path)
         .unwrap();
