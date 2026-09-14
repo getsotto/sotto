@@ -69,6 +69,16 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(config_file(&data_dir()?))
 }
 
+/// The themes directory inside a given data directory.
+pub fn themes_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("themes")
+}
+
+/// The resolved themes directory.
+pub fn themes_path() -> Result<PathBuf> {
+    Ok(themes_dir(&data_dir()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +86,10 @@ mod tests {
     #[test]
     fn store_file_is_under_data_dir() {
         assert_eq!(store_file(Path::new("/data")), Path::new("/data/store.db"));
+    }
+
+    #[test]
+    fn themes_dir_is_under_data_dir() {
+        assert_eq!(themes_dir(Path::new("/data")), Path::new("/data/themes"));
     }
 }
