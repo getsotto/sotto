@@ -931,9 +931,22 @@ tag. The full operator procedure, including the rehearsal record you must comple
    document applies to the deployment variable itself.
 
    ```sh
-   # Run where deploy/.env lives. `gh secret set` reads standard input when --body is omitted, so
-   # the value is never an argument and never echoed.
-   grep -m1 '^SOTTO_ORGANISATION_DELETION_METRICS_TOKEN=' .env | cut -d= -f2- \
+   # Run where deploy/.env lives. Refuse a missing, empty, or duplicate assignment before `gh`
+   # starts, so an ambiguous file cannot overwrite the repository secret with the wrong value.
+   count=$(grep -c '^SOTTO_ORGANISATION_DELETION_METRICS_TOKEN=' .env 2>/dev/null || true)
+   count=${count:-0}
+   if [ "$count" -ne 1 ]; then
+     echo 'expected exactly one SOTTO_ORGANISATION_DELETION_METRICS_TOKEN assignment in .env' >&2
+     exit 1
+   fi
+   if grep -q '^SOTTO_ORGANISATION_DELETION_METRICS_TOKEN=$' .env; then
+     echo 'SOTTO_ORGANISATION_DELETION_METRICS_TOKEN must not be empty' >&2
+     exit 1
+   fi
+
+   # `gh secret set` reads standard input when --body is omitted, so the value is never an argument,
+   # never echoed, and does not enter shell history.
+   sed -n 's/^SOTTO_ORGANISATION_DELETION_METRICS_TOKEN=//p' .env \
      | gh secret set SOTTO_DELETION_METRICS_TOKEN --repo <owner>/<repo>
 
    # The URL is not a secret.

@@ -45,6 +45,24 @@ Windows). Prefer to look first? Grab an archive from the
 [releases page](https://github.com/getsotto/sotto/releases) and verify it manually per
 [SECURITY.md](SECURITY.md), or build from source (see [Developing](#developing)).
 
+### Shell completions
+
+`sotto completions <shell>` prints a completion script to stdout. For example:
+
+```sh
+# bash
+sotto completions bash > ~/.local/share/bash-completion/completions/sotto
+
+# zsh (add the directory to fpath in ~/.zshrc first)
+sotto completions zsh > ~/.zfunc/_sotto
+
+# fish
+sotto completions fish > ~/.config/fish/completions/sotto.fish
+```
+
+Release tarballs and zips also contain the matching `completions/sotto.*` files if you prefer to
+copy them directly.
+
 ### GitHub Actions
 
 For GitHub Actions, use the [Sotto Setup action](https://github.com/getsotto/sotto-action) to
