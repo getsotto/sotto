@@ -289,7 +289,11 @@ enum OrgCommand {
     /// Create an organisation; prints its id.
     Create { name: String },
     /// List your organisations.
-    Ls,
+    Ls {
+        /// Output as a stable JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Invite an existing Sotto user into an org by email; prints their user id.
     Invite { org_id: String, email: String },
     /// List an org's members and their ids.
@@ -636,12 +640,17 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
             println!("{id}");
             Ok(())
         }
-        OrgCommand::Ls => {
+        OrgCommand::Ls { json } => {
             ensure_unlocked(store, keychain)?;
             let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
             let keypair = session::account_keypair(store, &master)?;
-            for org in remote::team::list_orgs(&client, &keypair)? {
-                println!("{}  {}  ({})", org.id, org.name, org.role);
+            let orgs = remote::team::list_orgs(&client, &keypair)?;
+            if json {
+                println!("{}", to_json(&orgs)?);
+            } else {
+                for org in orgs {
+                    println!("{}  {}  ({})", org.id, org.name, org.role);
+                }
             }
             Ok(())
         }
@@ -1582,7 +1591,8 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{
-        display_secret, history_line, login_config, set_confirmation, Cli, Command, ThemeCommand,
+        display_secret, history_line, login_config, set_confirmation, to_json, Cli, Command,
+        OrgCommand, ThemeCommand,
     };
 
     #[test]
@@ -1714,6 +1724,29 @@ mod tests {
         // Bare `sotto theme` defaults to listing.
         let cli = Cli::try_parse_from(["sotto", "theme"]).expect("bare theme should parse");
         assert!(matches!(cli.command, Command::Theme { command: None }));
+    }
+
+    #[test]
+    fn org_ls_json_flag_parses_and_shape_is_stable() {
+        let cli = Cli::try_parse_from(["sotto", "org", "ls", "--json"])
+            .expect("org ls --json should parse");
+        let Command::Org { command } = cli.command else {
+            panic!("expected org command");
+        };
+        assert!(matches!(command, OrgCommand::Ls { json: true }));
+
+        let rendered = to_json(&vec![sotto_cli::remote::team::OrgListing {
+            id: "org-1".to_string(),
+            name: "Acme Team".to_string(),
+            role: "owner".to_string(),
+        }])
+        .expect("organisation list should serialize");
+
+        assert_eq!(
+            rendered,
+            r#"[{"id":"org-1","name":"Acme Team","role":"owner"}]"#
+        );
+        assert!(!rendered.contains('\x1b'));
     }
 
     #[test]
