@@ -14,6 +14,8 @@
 
 use std::collections::HashSet;
 
+use serde::Serialize;
+
 use sotto_core::{names, vault, wrap};
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -36,6 +38,7 @@ fn decode_public_key(b64: &str) -> Result<[u8; wrap::PUBLIC_KEY_LEN]> {
 const ROTATE_ATTEMPTS: usize = 5;
 
 /// An organisation with its decrypted name and the caller's role in it.
+#[derive(Serialize)]
 pub struct OrgListing {
     pub id: String,
     pub name: String,
