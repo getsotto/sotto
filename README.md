@@ -143,6 +143,49 @@ sotto pull                   # download the ciphertext you already pushed
 
 You need the Emergency Kit printed by `sotto init`; without it, a new device cannot decrypt the vault.
 
+### Themes and output styling
+
+Sotto supports built-in and custom colour themes for terminal output:
+
+```sh
+sotto theme ls           # list available presets (nord, sordino, terminal, monochrome, tokyo-night)
+sotto theme set sordino  # persist your preferred theme in config.toml
+sotto theme current      # display the active theme name
+```
+
+#### Precedence and overrides
+
+The active theme resolves in the following order:
+
+1. `--theme <name>`: command-line flag overriding any setting for a single invocation.
+2. `SOTTO_THEME=<name>`: environment variable override for the current shell session.
+3. Persistent choice saved via `sotto theme set <name>`.
+4. Default preset: `nord`.
+
+If an unrecognised theme name is specified via flag or environment variable, Sotto prints a warning and falls back to `nord`.
+
+#### Disabling styling for scripts and automation
+
+- `--plain`: suppresses colours and decorative formatting for a single command.
+- `NO_COLOR`: honours the standard environment variable to disable ANSI colour codes.
+- Non-interactive output: when standard output is redirected or piped to another tool, Sotto automatically strips all ANSI escape codes.
+
+#### Custom themes
+
+Custom themes can be defined as TOML files inside the `themes/` directory within the platform data directory (`~/.local/share/sotto/themes/` on Linux, `~/Library/Application Support/sotto/themes/` on macOS, or `%APPDATA%\sotto\themes\` on Windows). The file stem becomes the theme name:
+
+```toml
+# Example: themes/synth.toml
+bg = "#120024"
+fg = "#ffffff"
+accent = "#ff007f"
+success = "#00ff66"
+warning = "#ffaa00"
+error = "#ff0033"
+muted = "#775588"
+border = "#331144"
+```
+
 ## Architecture
 
 ```text
