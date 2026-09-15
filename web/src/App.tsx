@@ -3,6 +3,7 @@ import { Landing } from "./Landing";
 import { RecipientPage } from "./RecipientPage";
 import { SeoPage } from "./seo/SeoPage";
 import { guideBySlug, type SeoPageData } from "./seo/pages";
+import { SharePendingGuard } from "./SharePendingGuard";
 import { VaultApp } from "./VaultApp";
 
 // Minimal path routing (no router dependency):
@@ -50,6 +51,11 @@ export function App() {
     case "guide":
       return <SeoPage page={current.page} />;
     case "vault":
-      return <VaultApp />;
+      return (
+        <>
+          <SharePendingGuard />
+          <VaultApp />
+        </>
+      );
   }
 }
