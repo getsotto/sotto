@@ -143,6 +143,56 @@ sotto pull                   # download the ciphertext you already pushed
 
 You need the Emergency Kit printed by `sotto init`; without it, a new device cannot decrypt the vault.
 
+## CLI themes
+
+The CLI styles interactive output with a colour theme. Built-in presets are `nord`
+(the default), `sordino`, `terminal`, `monochrome`, and `tokyo-night`. Custom
+themes can be added as TOML files.
+
+```sh
+sotto theme ls          # list built-in presets and any custom themes
+sotto theme current     # print the theme that would be used
+sotto theme set sordino # persist a preference in the global config
+sotto ls --theme tokyo-night   # one-off override for this command
+```
+
+Selection precedence (first non-empty name wins):
+
+1. `--theme <name>` on the command
+2. `SOTTO_THEME`
+3. the name saved by `sotto theme set`
+4. `nord` if none of the above is set, or the named theme is unknown
+
+Styling is disabled, even when a theme is selected, whenever any of these apply:
+
+- `--plain`
+- `NO_COLOR` set to a non-empty value (the [no-color.org](https://no-color.org/) contract)
+- a CI environment (`CI` set to a value other than empty, `0`, or `false`)
+- standard output or standard input is not a TTY (piped or redirected)
+
+Use `--plain` or `NO_COLOR=1` in scripts so logs never contain ANSI escapes.
+
+Custom themes live in a `themes/` directory next to the global config, inside
+the Sotto data directory (`SOTTO_DATA_DIR` if set; otherwise the usual
+platform data directory). Each `*.toml` file is one theme. The optional
+`name` field is the selector; if it is omitted the filename stem is used.
+A custom theme cannot replace a built-in name.
+
+```toml
+name = "paper"
+fg = "#1a1a1a"
+accent = "#0b57d0"
+success = "#0b7a3b"
+warning = "#9a6700"
+error = "#c62828"
+muted = "#5f6368"
+border = "#dadce0"
+bg = "#f8f9fa"
+```
+
+Colours accept `#RRGGBB`, a named ANSI colour such as `cyan`, or `ansi(200)`.
+Broken custom files are skipped and never prevent the CLI from starting.
+
 ## Architecture
 
 ```text

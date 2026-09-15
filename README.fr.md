@@ -145,6 +145,56 @@ sotto pull                   # download the ciphertext you already pushed
 
 Vous avez besoin de l'Emergency Kit imprimé par `sotto init` ; sans lui, un nouvel appareil ne peut pas déchiffrer le coffre.
 
+## Thèmes CLI
+
+La CLI applique un thème de couleur à la sortie interactive. Les préréglages intégrés sont `nord`
+(par défaut), `sordino`, `terminal`, `monochrome` et `tokyo-night`. Des thèmes
+personnalisés peuvent être ajoutés sous forme de fichiers TOML.
+
+```sh
+sotto theme ls          # list built-in presets and any custom themes
+sotto theme current     # print the theme that would be used
+sotto theme set sordino # persist a preference in the global config
+sotto ls --theme tokyo-night   # one-off override for this command
+```
+
+Ordre de précédence (le premier nom non vide l'emporte) :
+
+1. `--theme <name>` sur la commande
+2. `SOTTO_THEME`
+3. le nom enregistré par `sotto theme set`
+4. `nord` si aucun des éléments ci-dessus n'est défini, ou si le thème nommé est inconnu
+
+Le style est désactivé, même lorsqu'un thème est sélectionné, dès que l'un de ces cas s'applique :
+
+- `--plain`
+- `NO_COLOR` défini à une valeur non vide (le contrat [no-color.org](https://no-color.org/))
+- un environnement CI (`CI` défini à une valeur autre que vide, `0` ou `false`)
+- la sortie standard ou l'entrée standard n'est pas un TTY (pipeline ou redirection)
+
+Utilisez `--plain` ou `NO_COLOR=1` dans les scripts pour que les journaux ne contiennent jamais d'échappements ANSI.
+
+Les thèmes personnalisés se trouvent dans un répertoire `themes/` à côté de la configuration globale, dans
+le répertoire de données Sotto (`SOTTO_DATA_DIR` s'il est défini ; sinon le répertoire de données
+habituel de la plateforme). Chaque fichier `*.toml` est un thème. Le champ facultatif
+`name` est le sélecteur ; s'il est omis, la racine du nom de fichier est utilisée.
+Un thème personnalisé ne peut pas remplacer un nom intégré.
+
+```toml
+name = "paper"
+fg = "#1a1a1a"
+accent = "#0b57d0"
+success = "#0b7a3b"
+warning = "#9a6700"
+error = "#c62828"
+muted = "#5f6368"
+border = "#dadce0"
+bg = "#f8f9fa"
+```
+
+Les couleurs acceptent `#RRGGBB`, une couleur ANSI nommée telle que `cyan`, ou `ansi(200)`.
+Les fichiers personnalisés invalides sont ignorés et n'empêchent jamais le démarrage de la CLI.
+
 ## Architecture
 
 ```text

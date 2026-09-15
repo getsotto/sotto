@@ -147,6 +147,56 @@ sotto pull                   # download the ciphertext you already pushed
 
 Du brauchst das von `sotto init` ausgegebene Emergency Kit. Ohne es kann ein neues Gerät den Tresor nicht entschlüsseln.
 
+## CLI-Themes
+
+Die CLI gestaltet interaktive Ausgaben mit einem Farbthema. Eingebaute Vorgaben sind `nord`
+(Standard), `sordino`, `terminal`, `monochrome` und `tokyo-night`. Eigene
+Themes können als TOML-Dateien hinzugefügt werden.
+
+```sh
+sotto theme ls          # list built-in presets and any custom themes
+sotto theme current     # print the theme that would be used
+sotto theme set sordino # persist a preference in the global config
+sotto ls --theme tokyo-night   # one-off override for this command
+```
+
+Auswahlreihenfolge (der erste nicht leere Name gewinnt):
+
+1. `--theme <name>` am Befehl
+2. `SOTTO_THEME`
+3. der mit `sotto theme set` gespeicherte Name
+4. `nord`, wenn keines der oben genannten gesetzt ist oder das genannte Theme unbekannt ist
+
+Styling ist deaktiviert, auch wenn ein Theme gewählt ist, sobald einer dieser Fälle zutrifft:
+
+- `--plain`
+- `NO_COLOR` auf einen nicht leeren Wert gesetzt (der [no-color.org](https://no-color.org/)-Vertrag)
+- eine CI-Umgebung (`CI` auf einen anderen Wert als leer, `0` oder `false` gesetzt)
+- die Standardausgabe oder Standardeingabe ist kein TTY (Pipe oder Umleitung)
+
+Verwende `--plain` oder `NO_COLOR=1` in Skripten, damit Protokolle keine ANSI-Escapes enthalten.
+
+Eigene Themes liegen in einem Verzeichnis `themes/` neben der globalen Konfiguration, im
+Sotto-Datenverzeichnis (`SOTTO_DATA_DIR`, falls gesetzt; sonst das übliche
+Plattform-Datenverzeichnis). Jede `*.toml`-Datei ist ein Theme. Das optionale
+Feld `name` ist der Selektor; fehlt es, wird der Dateiname ohne Endung verwendet.
+Ein eigenes Theme kann keinen eingebauten Namen ersetzen.
+
+```toml
+name = "paper"
+fg = "#1a1a1a"
+accent = "#0b57d0"
+success = "#0b7a3b"
+warning = "#9a6700"
+error = "#c62828"
+muted = "#5f6368"
+border = "#dadce0"
+bg = "#f8f9fa"
+```
+
+Farben akzeptieren `#RRGGBB`, eine benannte ANSI-Farbe wie `cyan` oder `ansi(200)`.
+Beschädigte eigene Dateien werden übersprungen und verhindern nie den Start der CLI.
+
 ## Architektur
 
 ```text

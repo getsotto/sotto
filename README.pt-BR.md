@@ -145,6 +145,56 @@ sotto pull                   # download the ciphertext you already pushed
 
 Você precisa do Emergency Kit exibido por `sotto init`; sem ele, um novo dispositivo não consegue descriptografar o cofre.
 
+## Temas da CLI
+
+A CLI estiliza a saída interativa com um tema de cores. Os presets integrados são `nord`
+(o padrão), `sordino`, `terminal`, `monochrome` e `tokyo-night`. Temas
+personalizados podem ser adicionados como arquivos TOML.
+
+```sh
+sotto theme ls          # list built-in presets and any custom themes
+sotto theme current     # print the theme that would be used
+sotto theme set sordino # persist a preference in the global config
+sotto ls --theme tokyo-night   # one-off override for this command
+```
+
+Precedência de seleção (vence o primeiro nome não vazio):
+
+1. `--theme <name>` no comando
+2. `SOTTO_THEME`
+3. o nome salvo por `sotto theme set`
+4. `nord` se nenhum dos anteriores estiver definido, ou o tema nomeado for desconhecido
+
+O estilo é desativado, mesmo quando um tema está selecionado, sempre que qualquer um destes casos se aplicar:
+
+- `--plain`
+- `NO_COLOR` definido com um valor não vazio (o contrato de [no-color.org](https://no-color.org/))
+- um ambiente de CI (`CI` definido com um valor diferente de vazio, `0` ou `false`)
+- a saída padrão ou a entrada padrão não é um TTY (encanada ou redirecionada)
+
+Use `--plain` ou `NO_COLOR=1` em scripts para que os logs nunca contenham escapes ANSI.
+
+Temas personalizados ficam em um diretório `themes/` ao lado da configuração global, dentro
+do diretório de dados do Sotto (`SOTTO_DATA_DIR` se definido; caso contrário, o diretório de dados
+usual da plataforma). Cada arquivo `*.toml` é um tema. O campo opcional
+`name` é o seletor; se omitido, usa-se o nome do arquivo sem extensão.
+Um tema personalizado não pode substituir um nome integrado.
+
+```toml
+name = "paper"
+fg = "#1a1a1a"
+accent = "#0b57d0"
+success = "#0b7a3b"
+warning = "#9a6700"
+error = "#c62828"
+muted = "#5f6368"
+border = "#dadce0"
+bg = "#f8f9fa"
+```
+
+As cores aceitam `#RRGGBB`, uma cor ANSI nomeada como `cyan`, ou `ansi(200)`.
+Arquivos personalizados quebrados são ignorados e nunca impedem a CLI de iniciar.
+
 ## Arquitetura
 
 ```text

@@ -145,6 +145,56 @@ sotto pull                   # download the ciphertext you already pushed
 
 Necesitas el Emergency Kit que imprime `sotto init`; sin él, un dispositivo nuevo no puede descifrar la bóveda.
 
+## Temas de la CLI
+
+La CLI aplica un tema de color a la salida interactiva. Los ajustes predefinidos son `nord`
+(el predeterminado), `sordino`, `terminal`, `monochrome` y `tokyo-night`. Se pueden añadir
+temas personalizados como archivos TOML.
+
+```sh
+sotto theme ls          # list built-in presets and any custom themes
+sotto theme current     # print the theme that would be used
+sotto theme set sordino # persist a preference in the global config
+sotto ls --theme tokyo-night   # one-off override for this command
+```
+
+Precedencia de selección (gana el primer nombre no vacío):
+
+1. `--theme <name>` en el comando
+2. `SOTTO_THEME`
+3. el nombre guardado por `sotto theme set`
+4. `nord` si no se define ninguno de los anteriores, o el tema indicado es desconocido
+
+El estilo se desactiva, incluso cuando hay un tema seleccionado, siempre que ocurra alguno de estos casos:
+
+- `--plain`
+- `NO_COLOR` con un valor no vacío (el contrato de [no-color.org](https://no-color.org/))
+- un entorno CI (`CI` con un valor distinto de vacío, `0` o `false`)
+- la salida estándar o la entrada estándar no es un TTY (canalizada o redirigida)
+
+Usa `--plain` o `NO_COLOR=1` en scripts para que los registros no contengan escapes ANSI.
+
+Los temas personalizados viven en un directorio `themes/` junto a la configuración global, dentro
+del directorio de datos de Sotto (`SOTTO_DATA_DIR` si está definido; si no, el directorio de datos
+habitual de la plataforma). Cada archivo `*.toml` es un tema. El campo opcional
+`name` es el selector; si se omite, se usa el nombre del archivo sin extensión.
+Un tema personalizado no puede reemplazar un nombre integrado.
+
+```toml
+name = "paper"
+fg = "#1a1a1a"
+accent = "#0b57d0"
+success = "#0b7a3b"
+warning = "#9a6700"
+error = "#c62828"
+muted = "#5f6368"
+border = "#dadce0"
+bg = "#f8f9fa"
+```
+
+Los colores aceptan `#RRGGBB`, un color ANSI con nombre como `cyan`, o `ansi(200)`.
+Los archivos personalizados rotos se omiten y nunca impiden que arranque la CLI.
+
 ## Arquitectura
 
 ```text
