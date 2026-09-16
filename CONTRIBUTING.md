@@ -139,6 +139,9 @@ do not establish. Keep normal tests alongside those proofs.
 - For the merge-required assurance checks, see the [assurance guide](.ci/assurance.md).
   It explains same-run completion validation, the required-check manifest and local fixtures.
 
+- For server authorisation and transaction assurance, see the [server assurance guide](.ci/server-assurance.md).
+  It explains the required Postgres mode, scenario completion marker and current coverage boundary.
+
 ## Supply-chain policy
 
 This repository includes `deny.toml` for dependency and licence checks. Validate the supply-chain policy locally with:

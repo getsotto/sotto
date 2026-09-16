@@ -3,6 +3,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -81,7 +82,11 @@ class AssuranceTests(unittest.TestCase):
             path = Path(directory) / "run.json"
             names = assurance.load_manifest()["groups"]["kani"]["required_jobs"]
             path.write_text(json.dumps(fixture("kani", names)), encoding="utf-8")
-            self.assertEqual(assurance.main(["--group", "kani", "--jobs-file", str(path), "--expected-sha", "abc123"]), 0)
+            # --run-attempt defaults from GITHUB_RUN_ATTEMPT, so pin it: a re-run
+            # workflow would otherwise compare the fixture's attempt 1 against 2+.
+            with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "1"}):
+                argv = ["--group", "kani", "--jobs-file", str(path), "--expected-sha", "abc123"]
+                self.assertEqual(assurance.main(argv), 0)
 
     def test_fetch_uses_latest_attempt_and_paginates(self):
         responses = [

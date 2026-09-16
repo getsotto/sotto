@@ -195,16 +195,30 @@ pub(crate) async fn access_for_update(
     org_id: &str,
     user_id: &str,
 ) -> Result<OrgAccess> {
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT m.role, o.lifecycle_state \
-         FROM organizations o JOIN organization_memberships m ON m.org_id = o.id \
-         WHERE o.id = $1 AND m.user_id = $2 FOR UPDATE OF o",
+    // Lock the organisation in its own statement before reading membership.  A joined
+    // `SELECT ... FOR UPDATE OF o` can take its membership snapshot before waiting for this row;
+    // after the wait it may therefore return a membership that was removed by the transaction
+    // that released the lock.  The second statement gets a fresh Read Committed snapshot while
+    // the organisation lock is held, so every writer observes the same current authority.  The
+    // share lock also prevents a membership row from changing between this validation and the
+    // mutation for any writer that does not take the organisation lock first.
+    let lifecycle: Option<String> =
+        sqlx::query_scalar("SELECT lifecycle_state FROM organizations WHERE id = $1 FOR UPDATE")
+            .bind(org_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(lifecycle) = lifecycle else {
+        return Err(Error::NotFound("organisation not found".into()));
+    };
+    let role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM organization_memberships \
+         WHERE org_id = $1 AND user_id = $2 FOR SHARE",
     )
     .bind(org_id)
     .bind(user_id)
     .fetch_optional(&mut **tx)
     .await?;
-    access_from_row(row)
+    access_from_row(role.map(|role| (role, lifecycle)))
 }
 
 fn access_from_row(row: Option<(String, String)>) -> Result<OrgAccess> {

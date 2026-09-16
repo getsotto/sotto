@@ -218,6 +218,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Server + end-to-end tests (with Postgres)
         run: cargo test -p sotto-server -p sotto-cli
+      - name: Server authorisation and transaction assurance
+        run: |
+          set -euo pipefail
+          cargo test -p sotto-server --test authorisation_transactions -- --test-threads=1 --nocapture 2>&1 | tee server-assurance.log
+          grep -Eq '^SERVER_ASSURANCE_DONE 7$' server-assurance.log
       - name: Restore checker meets a real database
         # Its assertions are unit tested, but its queries are not: left alone they would only
         # ever meet a database when the monthly restore runs, which is a poor place to discover
@@ -330,7 +335,14 @@ jobs:
       - name: Reject skipped funnel tests
         working-directory: web
         run: |
-          node -e 'const report = require("./test-results/playwright.json"); const skipped = report.stats?.skipped ?? 0; if (skipped !== 0) { console.error(`funnel suite skipped ${skipped} test(s)`); process.exit(1); }'
+          node <<'NODE'
+          const report = require("./test-results/playwright.json");
+          const skipped = report.stats?.skipped ?? 0;
+          if (skipped !== 0) {
+            console.error(`funnel suite skipped ${skipped} test(s)`);
+            process.exit(1);
+          }
+          NODE
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: failure()
