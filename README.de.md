@@ -142,6 +142,52 @@ sotto grant <user-id>                      # share the active environment (they 
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
+### Zwischenablage-Unterstützung
+
+`sotto get -c` und das automatische Kopieren in `sotto share` nutzen die Zwischenablage deines
+Desktops. Zusätzliche Software ist nicht nötig; die CLI wählt das Backend anhand deiner Sitzung.
+
+| Plattform | Backend | Sitzungsvoraussetzung |
+| --- | --- | --- |
+| macOS | System-Zwischenablage (`NSPasteboard`) | eine angemeldete Desktop-Sitzung |
+| Windows | native Win32-Zwischenablage | eine angemeldete Desktop-Sitzung |
+| Linux (Wayland) | Wayland-Datenkontrolle (`ext-data-control` oder `wlr-data-control`) | ein Compositor, der data-control implementiert, mit gesetztem `WAYLAND_DISPLAY` |
+| Linux (X11) | X11-Auswahl über x11rb | ein erreichbarer X-Server, mit gesetztem `DISPLAY` |
+
+Unter Linux versucht die CLI bei gesetztem `WAYLAND_DISPLAY` zuerst das Wayland-Backend und
+greift auf die X11-Zwischenablage zurück, wenn der Compositor data-control nicht anbietet;
+XWayland deckt solche Compositors ab.
+
+Das Löschen erfolgt nach bestem Bemühen und geschieht nach 45 Sekunden: Der Hilfsprozess löscht
+die Zwischenablage nur, wenn sie noch genau den kopierten Text enthält; ersetzter oder
+unlesbarer Inhalt bleibt unangetastet. Zwischenablage-Manager können eine Verlaufskopie
+behalten, die dieses Löschen nicht erreicht.
+
+Fehlerfälle:
+
+- `sotto get -c` ist eine ausdrückliche Anforderung: Schlägt das Backend fehl, wird das Geheimnis
+  nicht ausgegeben, der Fehler erscheint als `error: i/o error: opening clipboard: ...`, und der
+  Befehl endet mit Status 5.
+- `sotto share` kopiert nur automatisch, wenn Standardeingabe und Standardausgabe Terminals sind
+  und `CI` nicht gesetzt ist. Schlägt diese Kopie fehl, erscheint
+  `warning: could not copy share link: ...`, der Link wird trotzdem ausgegeben, und der Befehl
+  ist erfolgreich. `sotto share --copy` macht denselben Fehler zum Fehlerfall.
+- Eine Sitzung ohne `DISPLAY` und ohne `WAYLAND_DISPLAY` schlägt mit
+  `X11 server connection timed out because it was unreachable` fehl.
+- Der übergeordnete Prozess wartet bis zu fünf Sekunden auf die Bestätigung des Hilfsprozesses;
+  ein hängendes Backend erscheint als `clipboard helper timed out`.
+- Geheimnis-Bytes, die kein gültiges UTF-8 sind, lassen sich nicht kopieren und schlagen mit
+  `clipboard requires valid UTF-8 text` fehl.
+
+Fehlerbehebung:
+
+- Prüfe zuerst deine Sitzung: `echo "$WAYLAND_DISPLAY"` und `echo "$DISPLAY"`.
+- Stelle unter Wayland sicher, dass der Compositor data-control implementiert, oder aktiviere
+  XWayland.
+- Lass in CI oder über SSH `sotto share` den Link ausgeben, statt ihn zu kopieren.
+- Fehlermeldungen enthalten nie den Geheimniswert; füge keine Geheimniswerte oder
+  Zwischenablage-Inhalte in Issues und Logs ein.
+
 ### Ein weiteres Gerät
 
 ```sh

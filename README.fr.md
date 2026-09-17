@@ -142,6 +142,52 @@ sotto grant <user-id>                      # share the active environment (they 
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
+### Prise en charge du presse-papiers
+
+`sotto get -c` et la copie automatique de `sotto share` utilisent le presse-papiers de votre
+bureau. Aucun logiciel supplémentaire n'est requis ; la CLI choisit le backend selon votre
+session.
+
+| Plateforme | Backend | Condition de session |
+| --- | --- | --- |
+| macOS | presse-papiers du système (`NSPasteboard`) | une session de bureau ouverte |
+| Windows | presse-papiers natif Win32 | une session de bureau ouverte |
+| Linux (Wayland) | contrôle des données Wayland (`ext-data-control` ou `wlr-data-control`) | un compositeur qui implémente data-control, avec `WAYLAND_DISPLAY` défini |
+| Linux (X11) | sélection X11 via x11rb | un serveur X joignable, avec `DISPLAY` défini |
+
+Sous Linux, quand `WAYLAND_DISPLAY` est défini, la CLI essaie d'abord le backend Wayland et
+revient au presse-papiers X11 lorsque le compositeur n'offre pas data-control ; XWayland couvre
+donc les compositeurs qui en sont dépourvus.
+
+L'effacement est une mesure de meilleur effort et intervient après 45 secondes : le processus
+auxiliaire efface le presse-papiers uniquement s'il contient encore exactement le texte copié,
+donc un contenu remplacé ou illisible n'est pas modifié. Les gestionnaires de presse-papiers
+peuvent conserver une copie d'historique que cet effacement n'atteint pas.
+
+Modes d'échec :
+
+- `sotto get -c` est une demande explicite : si le backend échoue, le secret n'est pas imprimé,
+  l'erreur s'affiche sous la forme `error: i/o error: opening clipboard: ...` et la commande
+  quitte avec le statut 5.
+- `sotto share` ne copie automatiquement que lorsque l'entrée et la sortie standard sont des
+  terminaux et que `CI` n'est pas défini. Si cette copie échoue, vous voyez
+  `warning: could not copy share link: ...`, le lien est quand même imprimé et la commande
+  réussit. `sotto share --copy` transforme le même échec en erreur.
+- Une session sans `DISPLAY` ni `WAYLAND_DISPLAY` échoue avec
+  `X11 server connection timed out because it was unreachable`.
+- Le processus parent attend jusqu'à cinq secondes la confirmation du processus auxiliaire ; un
+  backend bloqué se manifeste par `clipboard helper timed out`.
+- Les octets d'un secret qui ne sont pas de l'UTF-8 valide ne peuvent pas être copiés et
+  échouent avec `clipboard requires valid UTF-8 text`.
+
+Dépannage :
+
+- Vérifiez d'abord votre session : `echo "$WAYLAND_DISPLAY"` et `echo "$DISPLAY"`.
+- Sous Wayland, confirmez que le compositeur implémente data-control, ou activez XWayland.
+- En CI ou via SSH, laissez `sotto share` imprimer le lien au lieu de le copier.
+- Les messages d'erreur ne contiennent jamais la valeur du secret ; ne collez pas de valeurs de
+  secrets ni de contenu de presse-papiers dans les tickets et les journaux.
+
 ### Un autre appareil
 
 ```sh
