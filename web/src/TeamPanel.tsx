@@ -76,6 +76,7 @@ export function TeamPanel({
   const [orgs, setOrgs] = useState<NamedOrg[] | null>(null);
   const [openOrg, setOpenOrg] = useState<NamedOrg | null>(null);
   const [members, setMembers] = useState<Member[] | null>(null);
+  const [membersLoading, setMembersLoading] = useState(false);
   const [audit, setAudit] = useState<AuditEvent[] | null>(null);
   const [plan, setPlan] = useState<Entitlements | null>(null);
   const [email, setEmail] = useState("");
@@ -110,6 +111,7 @@ export function TeamPanel({
     setNotice(null);
     setOpenOrg(no);
     setMembers(null);
+    setMembersLoading(true);
     setAudit(null);
     setPlan(null);
     setDeletionActive(false);
@@ -117,6 +119,7 @@ export function TeamPanel({
       const nextMembers = await fetchMembers(no.org.id);
       if (!isCurrent()) return;
       setMembers(nextMembers);
+      setMembersLoading(false);
       const entitlements = await fetchEntitlements(no.org.id);
       if (!isCurrent()) return;
       setPlan(entitlements);
@@ -132,6 +135,7 @@ export function TeamPanel({
     } catch (e) {
       if (isCurrent()) {
         setError(message(e));
+        setMembersLoading(false);
       }
     }
   }
@@ -258,9 +262,10 @@ export function TeamPanel({
             />
           )}
           <h3>Members of {openOrg.name}</h3>
-          {members === null ? (
+          {membersLoading && (
             <p className="muted">Loading…</p>
-          ) : (
+          )}
+          {members !== null && (
             <ul className="items">
               {members.map((m) => (
                 <li key={m.userId}>
