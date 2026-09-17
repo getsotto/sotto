@@ -140,6 +140,49 @@ sotto grant <user-id>                      # share the active environment (they 
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
+### Clipboard support
+
+`sotto get -c` and the automatic copy in `sotto share` use your desktop clipboard. No extra
+software is needed; the CLI selects the backend from your session.
+
+| Platform | Backend | Session requirement |
+| --- | --- | --- |
+| macOS | built-in pasteboard (`NSPasteboard`) | a desktop login session |
+| Windows | built-in Win32 clipboard | a desktop login session |
+| Linux (Wayland) | Wayland data-control (`ext-data-control` or `wlr-data-control`) | a compositor that implements data-control, with `WAYLAND_DISPLAY` set |
+| Linux (X11) | X11 selection via x11rb | a reachable X server, with `DISPLAY` set |
+
+On Linux, when `WAYLAND_DISPLAY` is set the CLI tries the Wayland backend first and falls back to
+the X11 clipboard when the compositor does not offer data-control, so XWayland covers compositors
+without it.
+
+Clearing is best effort and happens after 45 seconds: the helper clears the clipboard only if it
+still contains exactly the copied text, so replaced or unreadable content is left untouched.
+Clipboard managers may keep a history copy that this clear cannot reach.
+
+Failure modes:
+
+- `sotto get -c` is an explicit request: if the backend fails, the secret is not printed, the
+  error is reported as `error: i/o error: opening clipboard: ...`, and the command exits with
+  status 5.
+- `sotto share` copies automatically only when both stdin and stdout are terminals and `CI` is
+  unset. If that copy fails you see `warning: could not copy share link: ...`, the link still
+  prints, and the command succeeds. `sotto share --copy` turns the same failure into an error.
+- A session with neither `DISPLAY` nor `WAYLAND_DISPLAY` fails with
+  `X11 server connection timed out because it was unreachable`.
+- The parent waits up to five seconds for the helper to acknowledge the copy; a stuck backend
+  surfaces as `clipboard helper timed out`.
+- Secret bytes that are not valid UTF-8 cannot be copied and fail with
+  `clipboard requires valid UTF-8 text`.
+
+Troubleshooting:
+
+- Inspect your session first: `echo "$WAYLAND_DISPLAY"` and `echo "$DISPLAY"`.
+- On Wayland, confirm the compositor implements data-control, or provide XWayland.
+- In CI or over SSH, let `sotto share` print the link instead of copying it.
+- Error messages never include the secret value; do not paste secret values or clipboard contents
+  into issues and logs.
+
 ### Another device
 
 ```sh
