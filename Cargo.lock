@@ -2767,6 +2767,7 @@ dependencies = [
  "clap_complete",
  "indicatif",
  "keyring",
+ "nix",
  "reqwest",
  "rpassword",
  "rusqlite",

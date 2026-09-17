@@ -56,3 +56,8 @@ sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "postgres",
 ] }
+
+# Spinner tests need a pseudo terminal to make the child's streams interactive; the `term`
+# feature carries `nix::pty` (openpty) and termios. Unix only: Windows has no openpty.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.29", features = ["term"] }
