@@ -13,11 +13,13 @@
 //! - [`error`] - CLI errors with documented exit codes
 
 pub mod account;
+pub mod clipboard;
 pub mod commands;
 pub mod config;
 pub mod dotenv;
 pub mod error;
 pub mod export;
+pub mod feedback;
 pub mod keychain;
 pub mod paths;
 pub mod remote;

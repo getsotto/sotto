@@ -473,13 +473,17 @@ fn no_color_set() -> bool {
 
 /// CI environments are headless by definition, so styling stays off even on the rare CI
 /// runner with a PTY. `CI=0`, `CI=false`, and empty values count as unset.
-fn ci_set() -> bool {
-    std::env::var("CI")
+pub fn ci_enabled(value: Option<&str>) -> bool {
+    value
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
             !v.is_empty() && v != "0" && v != "false"
         })
         .unwrap_or(false)
+}
+
+fn ci_set() -> bool {
+    ci_enabled(std::env::var("CI").ok().as_deref())
 }
 
 /// Resolve the active theme by precedence (see [`pick_theme_name`]), defaulting to `nord`
@@ -645,6 +649,16 @@ mod tests {
         assert!(!styling_active(false, false, true, true, true)); // CI
         assert!(!styling_active(false, false, false, false, true)); // piped stdout
         assert!(!styling_active(false, false, false, true, false)); // redirected stdin
+    }
+
+    #[test]
+    fn ci_enabled_ignores_empty_and_false_values() {
+        assert!(!ci_enabled(None));
+        assert!(!ci_enabled(Some("")));
+        assert!(!ci_enabled(Some("0")));
+        assert!(!ci_enabled(Some(" false ")));
+        assert!(ci_enabled(Some("true")));
+        assert!(ci_enabled(Some("github")));
     }
 
     #[test]

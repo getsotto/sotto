@@ -13,6 +13,7 @@ use base64::Engine;
 use clap::{CommandFactory, Parser, Subcommand};
 use zeroize::{Zeroize, Zeroizing};
 
+use sotto_cli::clipboard;
 use sotto_cli::commands::App;
 use sotto_cli::config::{self, Config};
 use sotto_cli::dotenv;
@@ -121,6 +122,12 @@ enum Command {
         /// Protect the link with a passphrase (prompted; a second factor beyond the link).
         #[arg(long)]
         passphrase: bool,
+        /// Copy the generated share URL to the clipboard.
+        #[arg(short = 'c', long)]
+        copy: bool,
+        /// Disable the default clipboard copy in an interactive terminal.
+        #[arg(long)]
+        no_copy: bool,
     },
     /// Upload local changes for the active environment to the server.
     Push,
@@ -162,6 +169,9 @@ enum Command {
         /// Allow printing the secret to a terminal.
         #[arg(long)]
         reveal: bool,
+        /// Copy the secret to the clipboard instead of printing it.
+        #[arg(short = 'c', long, conflicts_with = "reveal")]
+        copy: bool,
     },
     /// List secret names in the active environment.
     Ls {
@@ -248,10 +258,17 @@ enum ThemeCommand {
 #[derive(Subcommand)]
 enum EnvCommand {
     /// List the project's environments (the active one is marked).
-    Ls,
+    Ls {
+        /// Output as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Set the active environment for this project.
     Use { name: String },
     /// Compare two environments key by key (presence + "differs" markers).
+    #[command(
+        after_help = "Examples:\n  sotto env diff dev staging\n  sotto env diff dev staging --reveal\n\nMarkers:\n  =  key exists in both environments with the same value\n  !  key exists in both environments with different values\n  <  key exists only in the left (first) environment\n  >  key exists only in the right (second) environment\n\nValues are hidden by default. --reveal displays plaintext values for keys that differ in both environments."
+    )]
     Diff {
         left: String,
         right: String,
@@ -315,7 +332,30 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // The clipboard owner is an implementation detail, intercepted before Clap so it cannot
+    // appear in help or generated completions and cannot initialise the vault.
+    if std::env::args().nth(1).as_deref() == Some("__clipboard-helper") {
+        return clipboard::run_helper();
+    }
     let cli = Cli::parse();
+
+    match &cli.command {
+        Command::Share {
+            copy: true,
+            no_copy: true,
+            ..
+        } => {
+            return Err(Error::Input("--copy conflicts with --no-copy".into()));
+        }
+        Command::Get {
+            copy: true,
+            reveal: true,
+            ..
+        } => {
+            return Err(Error::Input("--copy conflicts with --reveal".into()));
+        }
+        _ => {}
+    }
 
     // Completions need neither the store nor the keychain - handle before touching either.
     if let Command::Completions { shell } = &cli.command {
@@ -433,17 +473,34 @@ fn run() -> Result<()> {
             views,
             expire,
             passphrase,
+            copy,
+            no_copy,
         } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
-            share(&app, &keychain, &config, &name, views, expire, passphrase)
+            share(
+                &app,
+                &keychain,
+                &config,
+                &name,
+                ShareCommandOptions {
+                    views,
+                    expire,
+                    passphrase,
+                    copy,
+                    no_copy,
+                },
+            )
         }
         Command::Push => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
             let master = session::current_master_key(&keychain)?.ok_or(Error::Locked)?;
             let client = sync_client(&keychain)?;
-            let revision = remote::sync::push(&client, &store, master.as_bytes(), &config)?;
+            let revision = {
+                let _spinner = sotto_cli::feedback::spinner("Pushing...");
+                remote::sync::push(&client, &store, master.as_bytes(), &config)?
+            };
             eprintln!(
                 "pushed {}/{} - revision {revision}",
                 config.project, config.environment
@@ -453,7 +510,10 @@ fn run() -> Result<()> {
         Command::Pull => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             let client = sync_client(&keychain)?;
-            let revision = remote::sync::pull(&client, &store, &config)?;
+            let revision = {
+                let _spinner = sotto_cli::feedback::spinner("Pulling...");
+                remote::sync::pull(&client, &store, &config)?
+            };
             eprintln!(
                 "pulled {}/{} - revision {revision}",
                 config.project, config.environment
@@ -483,11 +543,20 @@ fn run() -> Result<()> {
             eprintln!("set {name} ({}/{})", config.project, config.environment);
             Ok(())
         }
-        Command::Get { name, reveal } => {
+        Command::Get { name, reveal, copy } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
             let mut value = app.get(&config, &name)?;
-            let result = write_value(&value, reveal);
+            let result = if copy {
+                match std::str::from_utf8(&value) {
+                    Ok(text) => clipboard::copy(text).map(|()| {
+                        eprintln!("Copied to clipboard; will attempt to clear after 45 seconds.");
+                    }),
+                    Err(_) => Err(Error::Input("clipboard requires valid UTF-8 text".into())),
+                }
+            } else {
+                write_value(&value, reveal)
+            };
             value.zeroize();
             result
         }
@@ -537,15 +606,20 @@ fn run() -> Result<()> {
             import_dotenv(&app, &config, &file)
         }
         Command::Env { command } => match command {
-            EnvCommand::Ls => {
+            EnvCommand::Ls { json } => {
                 let config = effective_config(&cwd, cli.env.as_deref())?;
-                for env in app.env_list(&config)? {
-                    let marker = if env == config.environment {
-                        theme.marker()
-                    } else {
-                        " ".to_string()
-                    };
-                    println!("{marker} {env}");
+                let environments = app.env_list(&config)?;
+                if json {
+                    println!("{}", env_list_json(&environments, &config.environment)?);
+                } else {
+                    for env in environments {
+                        let marker = if env == config.environment {
+                            theme.marker()
+                        } else {
+                            " ".to_string()
+                        };
+                        println!("{marker} {env}");
+                    }
                 }
                 Ok(())
             }
@@ -586,7 +660,10 @@ fn init(
 
     if store.get_identity()?.is_none() {
         let mut password = read_new_password()?;
-        let kit = session::init(store, keychain, &password, SESSION_TTL);
+        let kit = {
+            let _spinner = sotto_cli::feedback::spinner("Deriving key...");
+            session::init(store, keychain, &password, SESSION_TTL)
+        };
         password.zeroize();
         let kit = kit?;
         eprintln!();
@@ -870,30 +947,39 @@ fn setup(store: &Store, keychain: &dyn Keychain, cwd: &Path) -> Result<()> {
     }
     let (config, _dir) = Config::discover(cwd)?;
     let client = sync_client(keychain)?;
-    let bundle = remote::SyncApi::get_account(&client)?.ok_or_else(|| {
-        Error::Input(
-            "no account on the server; run `sotto init` then `sotto push` on your first device"
-                .into(),
-        )
-    })?;
+    let bundle = {
+        let _spinner = sotto_cli::feedback::spinner("Downloading account...");
+        remote::SyncApi::get_account(&client)?.ok_or_else(|| {
+            Error::Input(
+                "no account on the server; run `sotto init` then `sotto push` on your first device"
+                    .into(),
+            )
+        })?
+    };
 
     let mut secret_key = read_secret_key()?;
     let mut password = read_password("Master password: ")?;
-    let result = remote::sync::restore_account(
-        store,
-        keychain,
-        &bundle,
-        &secret_key,
-        &password,
-        SESSION_TTL,
-    );
+    let result = {
+        let _spinner = sotto_cli::feedback::spinner("Deriving key...");
+        remote::sync::restore_account(
+            store,
+            keychain,
+            &bundle,
+            &secret_key,
+            &password,
+            SESSION_TTL,
+        )
+    };
     secret_key.zeroize();
     password.zeroize();
     result?;
 
     let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
-    remote::sync::pull_environments(&client, store, master.as_bytes(), &config)?;
-    let revision = remote::sync::pull(&client, store, &config)?;
+    let revision = {
+        let _spinner = sotto_cli::feedback::spinner("Pulling environments...");
+        remote::sync::pull_environments(&client, store, master.as_bytes(), &config)?;
+        remote::sync::pull(&client, store, &config)?
+    };
     eprintln!(
         "set up {} ({}) from the server - revision {revision}",
         config.project, config.environment
@@ -924,7 +1010,10 @@ fn reset(store: &Store, keychain: &dyn Keychain, yes: bool) -> Result<()> {
     }
 
     let mut password = read_new_password()?;
-    let kit = session::reinit(store, keychain, &password, SESSION_TTL);
+    let kit = {
+        let _spinner = sotto_cli::feedback::spinner("Deriving key...");
+        session::reinit(store, keychain, &password, SESSION_TTL)
+    };
     password.zeroize();
     let kit = kit?;
 
@@ -1013,42 +1102,75 @@ fn login_config(
 }
 
 /// Seal a secret, upload it as a share link, and print the link (the fragment key never leaves).
+struct ShareCommandOptions {
+    views: i32,
+    expire: Option<i64>,
+    passphrase: bool,
+    copy: bool,
+    no_copy: bool,
+}
+
 fn share(
     app: &App,
     keychain: &dyn Keychain,
     config: &Config,
     name: &str,
-    views: i32,
-    expire: Option<i64>,
-    passphrase: bool,
+    command: ShareCommandOptions,
 ) -> Result<()> {
-    let mut value = app.get(config, name)?;
+    let mut value = Zeroizing::new(app.get(config, name)?);
     let client = sync_client(keychain)?;
     let web_base = remote::config::web_base(&sotto_cli::paths::config_path()?)?;
 
-    let passphrase = if passphrase {
+    let passphrase = if command.passphrase {
         Some(read_share_passphrase()?)
     } else {
         None
     };
     let opts = remote::share::ShareOptions {
-        max_views: views,
-        ttl_seconds: expire,
+        max_views: command.views,
+        ttl_seconds: command.expire,
         passphrase,
     };
-    let result = remote::share::create(&client, &web_base, &value, &opts);
+    let result = {
+        let _spinner = sotto_cli::feedback::spinner("Creating share...");
+        remote::share::create(&client, &web_base, &value, &opts)
+    };
     value.zeroize();
     if let Some(mut passphrase) = opts.passphrase {
         passphrase.zeroize();
     }
-    let link = result?;
+    let mut link = result?;
 
     eprintln!(
-        "share link ({}/{}) - burns after {views} view(s):",
-        config.project, config.environment
+        "share link ({}/{}) - burns after {} view(s):",
+        config.project, config.environment, command.views
     );
     println!("{link}");
-    Ok(())
+    let automatic_copy = !command.no_copy
+        && !command.copy
+        && io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && !sotto_cli::theme::ci_enabled(std::env::var("CI").ok().as_deref());
+    let copy_result = if command.copy || automatic_copy {
+        match clipboard::copy(&link) {
+            Ok(()) => {
+                eprintln!("Copied to clipboard; will attempt to clear after 45 seconds.");
+                Ok(())
+            }
+            Err(error) if automatic_copy => {
+                eprintln!("warning: could not copy share link: {error}");
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!("share created, but copying to clipboard failed: {error}");
+                Err(error)
+            }
+        }
+    } else {
+        Ok(())
+    };
+    link.zeroize();
+    copy_result
 }
 
 /// Read a share passphrase from a hidden prompt (never `SOTTO_PASSWORD`, which is the master).
@@ -1325,6 +1447,19 @@ fn to_json<T: serde::Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).map_err(|e| Error::Io(e.to_string()))
 }
 
+/// Stable machine-readable shape for `sotto env ls --json`.
+///
+/// Returns a JSON array of `{"name": <str>, "active": <bool>}` objects — one per environment,
+/// in the order returned by the store. Stdout contains JSON only; diagnostics stay on stderr.
+/// An empty project yields `[]`.
+fn env_list_json(environments: &[String], active: &str) -> Result<String> {
+    let value: Vec<_> = environments
+        .iter()
+        .map(|name| serde_json::json!({ "name": name, "active": name == active }))
+        .collect();
+    to_json(&value)
+}
+
 fn ensure_unlocked(store: &Store, keychain: &dyn Keychain) -> Result<()> {
     if session::current_master_key(keychain)?.is_some() {
         return Ok(());
@@ -1333,6 +1468,7 @@ fn ensure_unlocked(store: &Store, keychain: &dyn Keychain) -> Result<()> {
         return Err(Error::NoIdentity);
     }
     let mut password = read_password("Master password: ")?;
+    let _spinner = sotto_cli::feedback::spinner("Deriving key...");
     let result = session::unlock(store, keychain, &password, SESSION_TTL);
     password.zeroize();
     result
@@ -1592,8 +1728,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        display_secret, history_line, import_dotenv, login_config, set_confirmation, Cli, Command,
-        ThemeCommand,
+        display_secret, env_list_json, history_line, import_dotenv, login_config, set_confirmation,
+        Cli, Command, EnvCommand, ThemeCommand,
     };
 
     #[test]
@@ -1801,6 +1937,38 @@ mod tests {
     }
 
     #[test]
+    fn copy_flags_parse_for_get_and_share() {
+        let cli = Cli::try_parse_from(["sotto", "get", "KEY", "-c"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Get {
+                copy: true,
+                reveal: false,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--copy"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Share {
+                copy: true,
+                no_copy: false,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--no-copy"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Share {
+                copy: false,
+                no_copy: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn display_secret_keeps_plain_text() {
         assert_eq!(display_secret(b"postgres://prod"), "postgres://prod");
     }
@@ -1866,5 +2034,41 @@ mod tests {
         let b = display_secret(&[0xfe, 0x00]);
         assert!(a.starts_with("base64:"));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn env_ls_json_parser_parses_flag() {
+        let cli = Cli::try_parse_from(["sotto", "env", "ls", "--json"])
+            .expect("sotto env ls --json should parse");
+        let Command::Env {
+            command: EnvCommand::Ls { json },
+        } = cli.command
+        else {
+            panic!("expected EnvCommand::Ls");
+        };
+        assert!(json);
+
+        let cli = Cli::try_parse_from(["sotto", "env", "ls"]).expect("sotto env ls should parse");
+        let Command::Env {
+            command: EnvCommand::Ls { json },
+        } = cli.command
+        else {
+            panic!("expected EnvCommand::Ls");
+        };
+        assert!(!json);
+    }
+
+    #[test]
+    fn env_ls_json_renders_empty_project() {
+        assert_eq!(env_list_json(&[], "dev").unwrap(), "[]");
+    }
+
+    #[test]
+    fn env_ls_json_marks_active_environment() {
+        let environments = vec!["dev".to_string(), "prod".to_string(), "staging".to_string()];
+        assert_eq!(
+            env_list_json(&environments, "staging").unwrap(),
+            r#"[{"active":false,"name":"dev"},{"active":false,"name":"prod"},{"active":true,"name":"staging"}]"#
+        );
     }
 }

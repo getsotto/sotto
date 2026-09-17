@@ -53,12 +53,15 @@ Windows). ¿Prefieres revisar antes? Descarga un archivo comprimido desde la
 
 ```sh
 # bash
+mkdir -p ~/.local/share/bash-completion/completions
 sotto completions bash > ~/.local/share/bash-completion/completions/sotto
 
 # zsh (add the directory to fpath in ~/.zshrc first)
+mkdir -p ~/.zfunc
 sotto completions zsh > ~/.zfunc/_sotto
 
 # fish
+mkdir -p ~/.config/fish/completions
 sotto completions fish > ~/.config/fish/completions/sotto.fish
 ```
 
@@ -106,7 +109,8 @@ sotto import .env            # optional: pull in an existing file, still encrypt
 sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
-sotto share DATABASE_URL     # one-time, burn-after-reading link for a single secret
+sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
+sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
 ```
 
 Usa `--env` para elegir un entorno para un solo comando sin cambiar el entorno predeterminado del proyecto:
@@ -119,6 +123,9 @@ sotto ls --env staging
 `--env` se aplica solo a ese comando; `sotto env use` cambia el entorno predeterminado.
 
 Exportar escribe texto plano, por lo que necesita `--reveal` en un terminal, igual que `sotto get`.
+Usa `sotto share --no-copy` para desactivar la copia interactiva, o `--copy` para solicitarla explícitamente.
+El borrado del portapapeles es una medida de mejor esfuerzo: si reemplazas el contenido se protege el nuevo valor,
+mientras que los gestores del portapapeles, la suspensión o la terminación del proceso auxiliar pueden conservar una copia.
 
 `sotto login` usa la instancia alojada en [getsotto.co.uk](https://getsotto.co.uk) salvo que apuntes
 a otro lugar con `--server <url>` (consulta [Despliegue](deploy/README.md) para alojar el tuyo). En cualquier caso

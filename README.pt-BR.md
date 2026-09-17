@@ -53,12 +53,15 @@ Windows). Prefere conferir antes? Baixe um arquivo compactado na
 
 ```sh
 # bash
+mkdir -p ~/.local/share/bash-completion/completions
 sotto completions bash > ~/.local/share/bash-completion/completions/sotto
 
 # zsh (add the directory to fpath in ~/.zshrc first)
+mkdir -p ~/.zfunc
 sotto completions zsh > ~/.zfunc/_sotto
 
 # fish
+mkdir -p ~/.config/fish/completions
 sotto completions fish > ~/.config/fish/completions/sotto.fish
 ```
 
@@ -106,7 +109,8 @@ sotto import .env            # optional: pull in an existing file, still encrypt
 sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
-sotto share DATABASE_URL     # one-time, burn-after-reading link for a single secret
+sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
+sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
 ```
 
 Use `--env` para selecionar um ambiente para um único comando sem alterar o padrão do projeto:
@@ -119,6 +123,9 @@ sotto ls --env staging
 `--env` vale apenas para esse comando; `sotto env use` altera o ambiente padrão.
 
 A exportação escreve texto puro, portanto precisa de `--reveal` em um terminal, assim como `sotto get`.
+Use `sotto share --no-copy` para desativar a cópia interativa, ou `--copy` para solicitá-la explicitamente.
+A limpeza da área de transferência é uma medida de melhor esforço: substituir o conteúdo protege o novo valor,
+enquanto gerenciadores da área de transferência, suspensão ou encerramento do processo auxiliar podem manter uma cópia.
 
 `sotto login` usa a instância hospedada em [getsotto.co.uk](https://getsotto.co.uk), a menos que você aponte
 para outro lugar com `--server <url>` (consulte [Deploy](deploy/README.md) para hospedar o seu). De todo modo

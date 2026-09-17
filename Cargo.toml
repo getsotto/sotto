@@ -32,6 +32,8 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
+indicatif = "0.18"
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 
 # Server
 axum = "0.8"
