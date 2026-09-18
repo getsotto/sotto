@@ -142,6 +142,49 @@ sotto grant <user-id>                      # share the active environment (they 
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
+### Temas de salida
+
+La CLI incluye cinco temas integrados: `nord` (el predeterminado), `sordino`, `terminal`,
+`monochrome` y `tokyo-night`. Gestiónalos con `sotto theme`:
+
+```sh
+sotto theme ls        # list available themes; the active one is marked
+sotto theme set nord  # save a preference for later commands
+sotto theme current   # print the theme this shell resolves to
+```
+
+`--theme <name>` elige un tema para un solo comando. `SOTTO_THEME` lo fija para un shell y
+`sotto theme set` lo guarda. La precedencia es `--theme`, luego `SOTTO_THEME`, luego la
+preferencia guardada y por último `nord`; un nombre desconocido avisa por la salida de error
+estándar y vuelve a `nord`.
+
+El estilo solo se aplica en terminales interactivos. `--plain`, un `NO_COLOR` no vacío (el
+contrato de [no-color.org](https://no-color.org)), los entornos de CI, la salida estándar en
+una tubería y la entrada estándar redirigida suprimen cada uno el color y la decoración, pero
+conservan la paleta elegida, así que los scripts y los registros se leen en texto plano.
+
+Los temas personalizados son archivos TOML en el directorio `themes` dentro del directorio de
+datos de tu plataforma: `~/Library/Application Support/sotto` en macOS, `%APPDATA%\sotto` en
+Windows y `$XDG_DATA_HOME/sotto` o `~/.local/share/sotto` en Linux (`SOTTO_DATA_DIR` mueve ese
+directorio). Cada archivo `*.toml` necesita los tokens de abajo y toma su nombre del campo
+`name`, o del nombre del archivo cuando ese campo no está; un archivo que no se pueda
+interpretar se omite. Los colores aceptan valores hexadecimales, nombres de colores ANSI,
+índices `ansi(<index>)` y `default`.
+
+```toml
+bg = "#120024"
+fg = "#ffffff"
+accent = "#ff007f"
+success = "#00ff66"
+warning = "#ffaa00"
+error = "#ff0033"
+muted = "#775588"
+border = "#331144"
+```
+
+Guardado como `synth.toml`, ese archivo añade un tema `synth`. Aplícalo con
+`sotto theme set synth`, o para un solo comando con `sotto --theme synth <command>`.
+
 ### Otro dispositivo
 
 ```sh

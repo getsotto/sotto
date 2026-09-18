@@ -320,7 +320,7 @@ export const guidePages: SeoPageData[] = [
       },
     ],
     closingTitle: "Your box, your ciphertext",
-    closingBody: "Apache-2.0, free forever. Self-hosting has no tiers.",
+    closingBody: "Apache-2.0 and self-hostable. Organisations use the same plan limits by default: Free allows up to 3 members and 1 shared project. Operators can assign tiers manually; see the [deployment runbook](https://github.com/getsotto/sotto/blob/main/deploy/README.md#billing-optional).",
   },
 ];
 

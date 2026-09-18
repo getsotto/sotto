@@ -136,7 +136,7 @@ export function Landing() {
         </div>
         <p className="muted">
           Or run it yourself: the <a href={`${REPO}/blob/main/deploy/README.md`}>server is
-            self-hostable</a> and Apache-2.0. Self-hosting has no tiers.
+            self-hostable</a> and Apache-2.0. Self-hosted organisations use the same plan limits by default: up to 3 members and 1 shared project on Free. Operators can assign tiers manually; see the deployment runbook.
         </p>
       </section>
 

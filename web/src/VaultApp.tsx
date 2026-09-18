@@ -62,6 +62,9 @@ export function VaultApp() {
       return (
         <Shell>
           <p role="alert">{phase.message}</p>
+          <button className="primary" type="button" onClick={() => window.location.reload()}>
+            Reload
+          </button>
         </Shell>
       );
     case "loggedOut":

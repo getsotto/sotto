@@ -173,14 +173,38 @@ class EvidenceTests(unittest.TestCase):
             mocked.assert_not_called()
 
     def test_failed_seed_replay_does_not_pass(self):
-        result = SimpleNamespace(returncode=1, stdout="", stderr="crash")
+        build = SimpleNamespace(returncode=0, stdout="built", stderr="")
+        failed = SimpleNamespace(returncode=7, stdout="replay stdout", stderr="sanitizer crash")
         with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
             output = Path(directory)
             evidence = runner.new_evidence("pr", "base32_codec", output, "none")
-            with patch.object(runner, "command", return_value=result):
+            with patch.object(runner, "command", side_effect=[build, failed]):
                 with self.assertRaises(runner.CampaignError):
                     runner.run_campaign("pr", "base32_codec", output, evidence, "none")
             self.assertEqual(evidence["status"], "failed")
+            replay = evidence["seed_replay"][-1]
+            self.assertEqual(replay["exit_code"], 7)
+            self.assertIn("-runs=1", replay["command"])
+            self.assertEqual((output / replay["stdout_log"]).read_text(), "replay stdout")
+            self.assertEqual((output / replay["stderr_log"]).read_text(), "sanitizer crash")
+
+    def test_seed_replay_timeout_retains_partial_output(self):
+        import subprocess
+
+        build = SimpleNamespace(returncode=0, stdout="built", stderr="")
+        timeout = subprocess.TimeoutExpired("cargo", 120, output=b"partial stdout", stderr="partial stderr")
+        with tempfile.TemporaryDirectory(dir=TEST_TARGET_ROOT) as directory:
+            output = Path(directory)
+            evidence = runner.new_evidence("pr", "base32_codec", output, "none")
+            with patch.object(runner, "command", side_effect=[build, timeout]):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    runner.run_campaign("pr", "base32_codec", output, evidence, "none")
+            replay = evidence["seed_replay"][-1]
+            self.assertTrue(replay["timed_out"])
+            self.assertTrue(replay["input"].startswith("tracked:"))
+            self.assertIn("-runs=1", replay["command"])
+            self.assertEqual((output / replay["stdout_log"]).read_text(), "partial stdout")
+            self.assertEqual((output / replay["stderr_log"]).read_text(), "partial stderr")
 
     def test_campaign_timeout_does_not_pass(self):
         import subprocess

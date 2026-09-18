@@ -110,6 +110,8 @@ authoritative and wins on any discrepancy; each translation says so in its heade
 
 ## Tests
 
+- For repeatable manual journey checks, use the [UX validation session template](UX-VALIDATION.md).
+  It records environment, evidence levels, failure and recovery paths without exposing real secrets.
 - Add tests for new behaviour and regressions.
 - Run the workspace test suite locally:
 

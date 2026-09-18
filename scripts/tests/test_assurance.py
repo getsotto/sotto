@@ -89,15 +89,59 @@ class AssuranceTests(unittest.TestCase):
                 self.assertEqual(assurance.main(argv), 0)
 
     def test_fetch_uses_latest_attempt_and_paginates(self):
+        first_page = [{"name": f"job-{index}", "conclusion": "success"} for index in range(100)]
+        second_page = [{"name": "job-100", "conclusion": "success"}]
         responses = [
             {"id": 42, "status": "completed", "run_attempt": 2, "head_sha": "abc123", "path": ".github/workflows/kani.yml"},
-            {"jobs": [{"name": "core parser proofs", "conclusion": "success"}]},
+            {"jobs": first_page},
+            {"jobs": second_page},
         ]
         with patch.object(assurance, "_get_json", side_effect=responses) as get_json:
             run, jobs = assurance.fetch_run("getsotto/sotto", 42, "token")
         self.assertEqual(run["run_attempt"], 2)
-        self.assertEqual(len(jobs), 1)
-        self.assertIn("filter=latest", get_json.call_args_list[1].args[0])
+        self.assertEqual(jobs, first_page + second_page)
+        self.assertEqual(get_json.call_args_list[1].args[0], "https://api.github.com/repos/getsotto/sotto/actions/runs/42/jobs?filter=latest&per_page=100&page=1")
+        self.assertEqual(get_json.call_args_list[2].args[0], "https://api.github.com/repos/getsotto/sotto/actions/runs/42/jobs?filter=latest&per_page=100&page=2")
+
+    def test_fetch_exact_multiple_requests_empty_final_page(self):
+        page = [{"name": f"job-{index}", "conclusion": "success"} for index in range(100)]
+        responses = [
+            {"id": 42, "status": "completed", "run_attempt": 1, "head_sha": "abc123", "path": ".github/workflows/kani.yml"},
+            {"jobs": page},
+            {"jobs": []},
+        ]
+        with patch.object(assurance, "_get_json", side_effect=responses) as get_json:
+            _, jobs = assurance.fetch_run("getsotto/sotto", 42, "token")
+        self.assertEqual(jobs, page)
+        self.assertEqual(len(get_json.call_args_list), 3)
+        self.assertIn("page=2", get_json.call_args_list[2].args[0])
+
+    def test_second_page_required_failure_reaches_validator(self):
+        manifest = {
+            "groups": {
+                "test": {
+                    "workflow": ".github/workflows/test.yml",
+                    "completion": "assurance complete",
+                    "required_jobs": ["first", "required-second"],
+                    "ignored_jobs": ["ignored"],
+                }
+            }
+        }
+        run_response = {"id": 42, "status": "completed", "run_attempt": 1, "head_sha": "abc123", "path": ".github/workflows/test.yml"}
+        filler = [{"name": "ignored", "conclusion": "success"} for _ in range(98)]
+        first_page = [{"name": "first", "conclusion": "success"}, *filler, {"name": "assurance complete", "conclusion": "success"}]
+
+        for conclusion, should_pass in (("failure", False), ("success", True)):
+            with self.subTest(conclusion=conclusion):
+                responses = [run_response, {"jobs": first_page}, {"jobs": [{"name": "required-second", "conclusion": conclusion}]}]
+                with patch.object(assurance, "_get_json", side_effect=responses):
+                    run, jobs = assurance.fetch_run("getsotto/sotto", 42, "token")
+                if should_pass:
+                    verdict = assurance.validate_run(manifest, "test", run, jobs)
+                    self.assertEqual(verdict["status"], "passed")
+                else:
+                    with self.assertRaisesRegex(assurance.AssuranceError, "required-second concluded 'failure'"):
+                        assurance.validate_run(manifest, "test", run, jobs)
 
 
 if __name__ == "__main__":

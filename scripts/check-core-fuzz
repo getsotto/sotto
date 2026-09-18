@@ -261,8 +261,31 @@ def run_campaign(
                 "cargo", f"+{TOOLCHAIN}", "fuzz", "run", "--sanitizer", sanitizer, target,
                 str(seed), "--", "-runs=1", f"-seed={rng_seed}", f"-max_len={MAX_LEN}", "-timeout=10",
             ]
-            replay_result = command(replay_args, timeout=120)
-            replay_results.append({"input": name, "exit_code": replay_result.returncode, "sha256": digest})
+            replay_index = len(replay_results)
+            stdout_log = output / f"seed-replay-{replay_index}.stdout.log"
+            stderr_log = output / f"seed-replay-{replay_index}.stderr.log"
+            try:
+                replay_result = command(replay_args, timeout=120)
+            except subprocess.TimeoutExpired as error:
+                stdout = error.stdout.decode(errors="replace") if isinstance(error.stdout, bytes) else (error.stdout or "")
+                stderr = error.stderr.decode(errors="replace") if isinstance(error.stderr, bytes) else (error.stderr or "")
+                stdout_log.write_text(stdout, encoding="utf-8")
+                stderr_log.write_text(stderr, encoding="utf-8")
+                replay_results.append({
+                    "input": name, "exit_code": None, "sha256": digest, "command": replay_args,
+                    "stdout_log": stdout_log.name, "stderr_log": stderr_log.name, "timed_out": True,
+                })
+                evidence["outcome"] = "seed_replay_failure"
+                evidence["seed_replay"] = replay_results
+                raise
+            replay_record = {"input": name, "exit_code": replay_result.returncode, "sha256": digest}
+            if replay_result.returncode != 0:
+                stdout_log.write_text(replay_result.stdout, encoding="utf-8")
+                stderr_log.write_text(replay_result.stderr, encoding="utf-8")
+                replay_record.update({
+                    "command": replay_args, "stdout_log": stdout_log.name, "stderr_log": stderr_log.name,
+                })
+            replay_results.append(replay_record)
             if replay_result.returncode != 0:
                 evidence["outcome"] = "seed_replay_failure"
                 evidence["seed_replay"] = replay_results

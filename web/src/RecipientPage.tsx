@@ -14,6 +14,7 @@ type State =
 export function RecipientPage({ token }: { token: string }) {
   const [state, setState] = useState<State>({ kind: "idle" });
   const [passphrase, setPassphrase] = useState("");
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "failed">("idle");
 
   // Runs once per click. The fetch burns a view, so it must not run on mount or a prefetch.
   async function reveal() {
@@ -53,6 +54,18 @@ export function RecipientPage({ token }: { token: string }) {
     }
   }
 
+  async function copySecret(secret: string) {
+    try {
+      if (!navigator.clipboard?.writeText) {
+        throw new Error("clipboard unavailable");
+      }
+      await navigator.clipboard.writeText(secret);
+      setCopyStatus("copied");
+    } catch {
+      setCopyStatus("failed");
+    }
+  }
+
   if (state.kind === "revealed") {
     return (
       <Shell>
@@ -68,6 +81,13 @@ export function RecipientPage({ token }: { token: string }) {
           rows={4}
           spellCheck={false}
         />
+        <button className="primary" type="button" onClick={() => void copySecret(state.secret)}>
+          Copy secret
+        </button>
+        {copyStatus === "copied" && <p role="status">Copied to clipboard.</p>}
+        {copyStatus === "failed" && (
+          <p role="alert">Copy failed. Select the secret above and copy it manually.</p>
+        )}
       </Shell>
     );
   }
