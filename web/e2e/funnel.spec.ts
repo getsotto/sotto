@@ -240,48 +240,48 @@ test.describe("landing page prerender (no scripting)", () => {
   });
 
   // One entry per guide route, loaded by file name: the bytes the build emits, which Caddy serves
-  // at the clean path. With scripting off, only the prerendered copy can satisfy these.
-  const guides = [
-    {
-      slug: "share-secrets-securely",
-      h1: "Share secrets securely.",
-      faq: "Can Sotto read the secrets I share?",
-    },
-    {
-      slug: "share-env-files",
-      h1: "Share .env files without the screenshot dance.",
-      faq: "Do I have to delete my .env file?",
-    },
-    {
-      slug: "one-time-secret-links",
-      h1: "One-time links that burn after reading.",
-      faq: "Can the secret be read twice?",
-    },
-    {
-      slug: "share-api-keys-securely",
-      h1: "Share API keys without pasting them into chat.",
-      faq: "How does CI get secrets?",
-    },
-    {
-      slug: "send-password-securely",
-      h1: "Send a password that can only be read once.",
-      faq: "Does my mum need to install anything?",
-    },
-    {
-      slug: "self-hosted-secret-management",
-      h1: "Secret management you can self-host.",
-      faq: "What leaves my box?",
-    },
-  ] as const;
-
-  for (const guide of guides) {
+  // at the clean path. With scripting off, only the prerendered copy can satisfy these. Head
+  // tags come from `guidePages`: an exact title/description match fails if a guide kept the
+  // homepage values (`Sotto: end-to-end encrypted secret sync` / the landing description).
+  for (const guide of guidePages) {
     test(`${guide.slug} serves its own prerendered page`, async ({ page }) => {
       await page.goto(`/${guide.slug}.html`);
       await expect(page.getByRole("heading", { name: guide.h1, exact: true })).toBeVisible();
-      await expect(page.getByText(guide.faq, { exact: false })).toBeVisible();
-      await expect(page.locator('link[rel="canonical"]')).toHaveAttribute(
-        "href",
-        new RegExp(`/${guide.slug}$`),
+      await expect(page.getByText(guide.faqs[0].q, { exact: false })).toBeVisible();
+
+      const canonical = page.locator('link[rel="canonical"]');
+      await expect(canonical).toHaveCount(1);
+      const canonicalHref = await canonical.getAttribute("href");
+      expect(canonicalHref).toBeTruthy();
+      const canonicalUrl = new URL(canonicalHref!);
+      expect(canonicalUrl.pathname).toBe(`/${guide.slug}`);
+      expect(canonicalUrl.search).toBe("");
+      expect(canonicalUrl.hash).toBe("");
+
+      await expect(page.locator("head title")).toHaveCount(1);
+      await expect(page).toHaveTitle(guide.tabTitle);
+
+      const description = page.locator('meta[name="description"]');
+      await expect(description).toHaveCount(1);
+      await expect(description).toHaveAttribute("content", guide.description);
+
+      const ogUrl = page.locator('meta[property="og:url"]');
+      await expect(ogUrl).toHaveCount(1);
+      await expect(ogUrl).toHaveAttribute("content", canonicalHref!);
+      await expect(page.locator('meta[property="og:title"]')).toHaveCount(1);
+      await expect(page.locator('meta[property="og:title"]')).toHaveAttribute("content", guide.tabTitle);
+      await expect(page.locator('meta[property="og:description"]')).toHaveCount(1);
+      await expect(page.locator('meta[property="og:description"]')).toHaveAttribute(
+        "content",
+        guide.description,
+      );
+
+      await expect(page.locator('meta[name="twitter:title"]')).toHaveCount(1);
+      await expect(page.locator('meta[name="twitter:title"]')).toHaveAttribute("content", guide.tabTitle);
+      await expect(page.locator('meta[name="twitter:description"]')).toHaveCount(1);
+      await expect(page.locator('meta[name="twitter:description"]')).toHaveAttribute(
+        "content",
+        guide.description,
       );
     });
   }
