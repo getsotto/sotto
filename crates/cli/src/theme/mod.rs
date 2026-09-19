@@ -102,19 +102,34 @@ impl Color {
         // Try hex RGB
         let hex = trimmed.strip_prefix('#').unwrap_or(trimmed);
         if hex.len() == 6 {
-            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            let bytes = hex.as_bytes();
+            let r = hex_byte(bytes[0], bytes[1])?;
+            let g = hex_byte(bytes[2], bytes[3])?;
+            let b = hex_byte(bytes[4], bytes[5])?;
             Some(Color::Rgb(r, g, b))
         } else if hex.len() == 3 {
-            let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
-            let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
-            let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
+            let bytes = hex.as_bytes();
+            let r = hex_digit(bytes[0])?;
+            let g = hex_digit(bytes[1])?;
+            let b = hex_digit(bytes[2])?;
             Some(Color::Rgb(r * 17, g * 17, b * 17))
         } else {
             None
         }
     }
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_byte(high: u8, low: u8) -> Option<u8> {
+    Some(hex_digit(high)? * 16 + hex_digit(low)?)
 }
 
 impl Serialize for Color {
@@ -566,6 +581,17 @@ mod tests {
         assert_eq!(Color::parse(""), None);
         assert_eq!(Color::parse("#12"), None);
         assert_eq!(Color::parse("#gggggg"), None);
+    }
+
+    #[test]
+    fn color_parsing_rejects_non_ascii_hex_without_panicking() {
+        for value in ["#éa", "#aé000"] {
+            assert_eq!(
+                Color::parse(value),
+                None,
+                "invalid colour should be rejected: {value}"
+            );
+        }
     }
 
     #[test]
