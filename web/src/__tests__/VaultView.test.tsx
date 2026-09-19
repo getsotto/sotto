@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "../api";
 import type { Environment, Project } from "../api";
+import { bytesToUrlSafeB64 } from "../base64";
 import { VaultView } from "../VaultView";
 import * as vault from "../vault";
 import type { SecretEntry } from "../vault";
@@ -253,5 +254,72 @@ describe("VaultView selection loading", () => {
       expect(screen.getByRole("button", { name: "Share" })).toBeEnabled();
     });
     expect(memberSelect).toBeEnabled();
+  });
+
+  it("sends only one createShare request when the one-time link button is clicked twice", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("super-secret");
+    vi.mocked(vault.sealForShare).mockReturnValue({
+      encBlob: new Uint8Array([10]),
+      fragmentKey: new Uint8Array([11, 12]),
+    });
+
+    const shareRequest = deferred<string>();
+    vi.mocked(api.createShare).mockReturnValue(shareRequest.promise);
+
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "secret-a" }));
+    const createButton = await screen.findByRole("button", { name: "Create one-time share link" });
+
+    await act(async () => {
+      fireEvent.click(createButton);
+      fireEvent.click(createButton);
+    });
+
+    expect(api.createShare).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Creating…" })).toBeDisabled();
+
+    await act(async () => {
+      shareRequest.resolve("share-token");
+    });
+
+    const fragment = bytesToUrlSafeB64(new Uint8Array([11, 12]));
+    expect(await screen.findByLabelText("Share link (burns after one view):")).toHaveValue(
+      `${window.location.origin}/s/share-token#${fragment}`,
+    );
+    expect(screen.queryByRole("button", { name: /Create one-time share link|Creating…/ })).not.toBeInTheDocument();
+  });
+
+  it("restores the one-time link button after a failed createShare", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("super-secret");
+    vi.mocked(vault.sealForShare).mockReturnValue({
+      encBlob: new Uint8Array([10]),
+      fragmentKey: new Uint8Array([11, 12]),
+    });
+
+    const shareRequest = deferred<string>();
+    vi.mocked(api.createShare).mockReturnValue(shareRequest.promise);
+
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "secret-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Create one-time share link" }));
+
+    expect(await screen.findByRole("button", { name: "Creating…" })).toBeDisabled();
+
+    await act(async () => {
+      shareRequest.reject(new Error("share failed"));
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("share failed");
+    expect(screen.getByRole("button", { name: "Create one-time share link" })).toBeEnabled();
   });
 });
