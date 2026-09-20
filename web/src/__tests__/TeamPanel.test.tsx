@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
 import type { Entitlements, Member, Org } from "../api";
 import { TeamPanel } from "../TeamPanel";
+import * as vault from "../vault";
 
 vi.mock("../api", () => ({
   createCheckout: vi.fn(),
@@ -208,4 +209,80 @@ describe("TeamPanel invitations", () => {
     expect(input).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "Invite" })).toBeEnabled();
   });
+
+  it.each(["success", "failure"] as const)(
+    "ignores an invitation %s after switching organisations and restores the form",
+    async (outcome) => {
+      const pending = deferred<{ userId: string; publicKey: Uint8Array | null }>();
+      const orgKey = new Uint8Array([2]);
+      const publicKey = new Uint8Array([3]);
+      const sealedKey = new Uint8Array([4]);
+      vi.mocked(api.fetchOrgs).mockResolvedValue([
+        { ...adminOrg, encOrgKey: new Uint8Array([1]) },
+        { ...adminOrg, id: "org-b" },
+      ]);
+      vi.mocked(vault.decryptOrgName).mockReturnValue("org-a");
+      vi.mocked(vault.openOrgKey).mockReturnValue(orgKey);
+      vi.mocked(vault.sealGrantTo).mockReturnValue(sealedKey);
+      vi.mocked(api.fetchMembers).mockImplementation(async (orgId) => [member(`member-${orgId}`)]);
+      vi.mocked(api.inviteMember).mockReturnValue(pending.promise);
+      const input = await openInviteForm();
+      fireEvent.change(input, { target: { value: "teammate@example.com" } });
+      fireEvent.submit(input.closest("form")!);
+      fireEvent.click(screen.getByRole("button", { name: /org-b/ }));
+      await screen.findByText("member-org-b");
+
+      await act(async () => {
+        if (outcome === "success") pending.resolve({ userId: "user-c", publicKey });
+        else pending.reject(new Error("stale invitation failure"));
+      });
+
+      expect(screen.getByRole("heading", { name: "Members of org-b" })).toBeInTheDocument();
+      expect(screen.getByText("member-org-b")).toBeInTheDocument();
+      expect(screen.queryByText("member-org-a")).not.toBeInTheDocument();
+      expect(screen.queryByText(/invited teammate/)).not.toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(input).toHaveValue("teammate@example.com");
+      expect(input).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Invite" })).toBeEnabled();
+      expect(api.inviteMember).toHaveBeenCalledExactlyOnceWith("org-a", "teammate@example.com");
+      if (outcome === "success") {
+        expect(vault.sealGrantTo).toHaveBeenCalledWith(publicKey, orgKey);
+        expect(api.grantOrgKey).toHaveBeenCalledExactlyOnceWith("org-a", "user-c", sealedKey);
+      }
+    },
+  );
+
+  it.each(["success", "failure"] as const)(
+    "ignores an invitation's member refresh %s after switching organisations",
+    async (outcome) => {
+      const refresh = deferred<Member[]>();
+      vi.mocked(api.fetchOrgs).mockResolvedValue([adminOrg, { ...adminOrg, id: "org-b" }]);
+      vi.mocked(api.fetchMembers)
+        .mockResolvedValueOnce([member("member-a")])
+        .mockReturnValueOnce(refresh.promise)
+        .mockResolvedValueOnce([member("member-b")]);
+      vi.mocked(api.inviteMember).mockResolvedValue({ userId: "user-c", publicKey: null });
+      const input = await openInviteForm();
+      fireEvent.change(input, { target: { value: "teammate@example.com" } });
+      fireEvent.submit(input.closest("form")!);
+      await screen.findByText("invited teammate@example.com (user-c)");
+      expect(api.fetchMembers).toHaveBeenNthCalledWith(2, "org-a");
+      fireEvent.click(screen.getByRole("button", { name: /org-b/ }));
+      await screen.findByText("member-b");
+
+      await act(async () => {
+        if (outcome === "success") refresh.resolve([member("new-member-a")]);
+        else refresh.reject(new Error("stale refresh failure"));
+      });
+
+      expect(screen.getByRole("heading", { name: "Members of org-b" })).toBeInTheDocument();
+      expect(screen.getByText("member-b")).toBeInTheDocument();
+      expect(screen.queryByText("new-member-a")).not.toBeInTheDocument();
+      expect(screen.queryByText(/invited teammate/)).not.toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(input).toHaveValue("");
+      expect(input).toBeEnabled();
+    },
+  );
 });
