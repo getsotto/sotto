@@ -264,6 +264,45 @@ async fn projection_snapshot(
     (head, revisions, facts, attempts)
 }
 
+async fn assert_projection_state(
+    fixture: &Fixture,
+    revision: i64,
+    operation_id: &str,
+    evidence_reference: &str,
+    projection: &CoverageProjection,
+    expected_attempts: usize,
+) {
+    let (head, revisions, facts, attempts) = projection_snapshot(fixture).await;
+    assert_eq!(head, Some(revision));
+    assert_eq!(revisions.len(), 1);
+    assert_eq!(attempts.len(), expected_attempts);
+    assert_eq!(revisions[0].0, revision);
+    assert_eq!(revisions[0].1, operation_id);
+    assert_eq!(revisions[0].2, evidence_reference);
+    match projection {
+        CoverageProjection::Complete { paid_intervals } => {
+            assert_eq!(revisions[0].3, "complete");
+            assert_eq!(revisions[0].4, None);
+            assert_eq!(revisions[0].5, paid_intervals.len() as i64);
+            assert_eq!(facts.len(), paid_intervals.len());
+            for (actual, expected) in facts.iter().zip(paid_intervals) {
+                assert_eq!(actual.0, revision);
+                assert_eq!(actual.1, expected.coverage_id);
+                assert_eq!(actual.2, expected.source_id);
+                assert_eq!(actual.3, expected.starts_at);
+                assert_eq!(actual.4, expected.paid_until);
+                assert_eq!(actual.5, expected.failed_renewal_id);
+            }
+        }
+        CoverageProjection::Unavailable { reason } => {
+            assert_eq!(revisions[0].3, "unavailable");
+            assert_eq!(revisions[0].4.as_deref(), Some(reason.to_string().as_str()));
+            assert_eq!(revisions[0].5, 0);
+            assert!(facts.is_empty());
+        }
+    }
+}
+
 async fn transaction_pid(tx: &mut Transaction<'_, Postgres>) -> i32 {
     sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut **tx)
@@ -314,7 +353,9 @@ async fn held_registration(
     let pid = transaction_pid(&mut tx).await;
     let result = register_source(&mut tx, &operation_id, &source).await;
     ready.send(pid).expect("signal held registration");
-    release.notified().await;
+    tokio::time::timeout(Duration::from_secs(10), release.notified())
+        .await
+        .expect("timed out waiting to release held registration");
     match result {
         Ok(receipt) => {
             tx.commit().await.expect("commit held registration");
@@ -322,6 +363,123 @@ async fn held_registration(
         }
         Err(error) => {
             tx.rollback().await.expect("rollback held registration");
+            Err(error)
+        }
+    }
+}
+
+async fn held_coordinator_insert(
+    pool: PgPool,
+    beneficiary_id: String,
+    ready: oneshot::Sender<i32>,
+    release: Arc<Notify>,
+) {
+    let mut tx = pool.begin().await.expect("begin held coordinator insert");
+    sqlx::query("INSERT INTO cloud_coverage_coordinators (beneficiary_id) VALUES ($1)")
+        .bind(&beneficiary_id)
+        .execute(&mut *tx)
+        .await
+        .expect("insert held coordinator");
+    let pid = transaction_pid(&mut tx).await;
+    ready.send(pid).expect("signal held coordinator insert");
+    tokio::time::timeout(Duration::from_secs(10), release.notified())
+        .await
+        .expect("timed out waiting to release held coordinator insert");
+    tx.commit().await.expect("commit held coordinator insert");
+}
+
+async fn held_publication(
+    pool: PgPool,
+    beneficiary_id: String,
+    operation_id: String,
+    evidence_reference: String,
+    projection: CoverageProjection,
+    ready: oneshot::Sender<i32>,
+    release: Arc<Notify>,
+) -> Result<sotto_server::cloud_coverage_store::PublicationReceipt, StoreError> {
+    let mut tx = pool.begin().await.expect("begin held publication");
+    let receipt = publish(
+        &mut tx,
+        &beneficiary_id,
+        None,
+        &operation_id,
+        &evidence_reference,
+        &projection,
+    )
+    .await;
+    let pid = transaction_pid(&mut tx).await;
+    ready.send(pid).expect("signal held publication");
+    tokio::time::timeout(Duration::from_secs(10), release.notified())
+        .await
+        .expect("timed out waiting to release held publication");
+    match receipt {
+        Ok(receipt) => {
+            tx.commit().await.expect("commit held publication");
+            Ok(receipt)
+        }
+        Err(error) => {
+            tx.rollback().await.expect("rollback held publication");
+            Err(error)
+        }
+    }
+}
+
+async fn held_begin_collection(
+    pool: PgPool,
+    beneficiary_id: String,
+    attempt_id: String,
+    ready: oneshot::Sender<i32>,
+    release: Arc<Notify>,
+) -> sotto_server::cloud_coverage_reconciliation::CollectionTicket {
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin held replacement collection");
+    let ticket = begin_collection(&mut tx, &beneficiary_id, &attempt_id)
+        .await
+        .expect("begin held replacement collection");
+    let pid = transaction_pid(&mut tx).await;
+    ready.send(pid).expect("signal held replacement collection");
+    tokio::time::timeout(Duration::from_secs(10), release.notified())
+        .await
+        .expect("timed out waiting to release held replacement collection");
+    tx.commit()
+        .await
+        .expect("commit held replacement collection");
+    ticket
+}
+
+async fn held_finish_collection(
+    pool: PgPool,
+    ticket: sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    aggregate_evidence_reference: String,
+    observations: Vec<SourceObservation>,
+    ready: oneshot::Sender<i32>,
+    release: Arc<Notify>,
+) -> Result<sotto_server::cloud_coverage_reconciliation::ReconciliationReceipt, ReconciliationError>
+{
+    let mut tx = pool.begin().await.expect("begin held replacement finish");
+    let result = finish_collection(
+        &mut tx,
+        &ticket,
+        &aggregate_evidence_reference,
+        &observations,
+    )
+    .await;
+    let pid = transaction_pid(&mut tx).await;
+    ready.send(pid).expect("signal held replacement finish");
+    tokio::time::timeout(Duration::from_secs(10), release.notified())
+        .await
+        .expect("timed out waiting to release held replacement finish");
+    match result {
+        Ok(receipt) => {
+            tx.commit().await.expect("commit held replacement finish");
+            Ok(receipt)
+        }
+        Err(error) => {
+            tx.rollback()
+                .await
+                .expect("rollback held replacement finish");
             Err(error)
         }
     }
@@ -802,6 +960,334 @@ async fn registration_rejects_adopting_an_unmanaged_projection() {
     ));
     assert!(load(&fixture.pool, &fixture.beneficiary_id).await.is_ok());
     cleanup(&fixture).await;
+}
+
+async fn publication_before_coordinator_lock(
+    fixture: &Fixture,
+    projection: CoverageProjection,
+    suffix: &str,
+) {
+    let source = binding(
+        fixture,
+        &format!("bootstrap-before-source-{suffix}"),
+        &format!("bootstrap-before-allocation-{suffix}"),
+    );
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder = tokio::spawn(held_coordinator_insert(
+        fixture.pool.clone(),
+        fixture.beneficiary_id.clone(),
+        holder_ready,
+        release.clone(),
+    ));
+    let holder_pid = receive_pid(holder_ready_rx, "receive bootstrap coordinator pid").await;
+
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = fixture.pool.clone();
+    let waiter_source = source.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool
+            .begin()
+            .await
+            .expect("begin bootstrap registration");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready
+            .send(pid)
+            .expect("signal bootstrap registration");
+        let result =
+            register_source(&mut tx, "bootstrap-before-registration", &waiter_source).await;
+        tx.rollback()
+            .await
+            .expect("rollback bootstrap registration");
+        result
+    });
+    let waiter_pid = receive_pid(waiter_ready_rx, "receive bootstrap registration pid").await;
+    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+
+    let mut publisher_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin bootstrap publisher");
+    let publication = publish(
+        &mut publisher_tx,
+        &fixture.beneficiary_id,
+        None,
+        &format!("bootstrap-before-publication-{suffix}"),
+        &format!("bootstrap-before-evidence-{suffix}"),
+        &projection,
+    )
+    .await
+    .expect("publish bootstrap projection");
+    publisher_tx
+        .commit()
+        .await
+        .expect("commit bootstrap projection");
+    release.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("bootstrap coordinator holder finished")
+        .expect("join bootstrap coordinator holder");
+    let registration = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("bootstrap registration finished")
+        .expect("join bootstrap registration");
+    assert!(matches!(
+        registration,
+        Err(ReconciliationError::BootstrapConflict)
+    ));
+
+    let coordinator: (i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT source_set_generation, collection_epoch, current_attempt_id \
+         FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read bootstrap coordinator");
+    assert_eq!(coordinator, (0, 0, None));
+    let source_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+            .bind(&fixture.beneficiary_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count rejected bootstrap sources");
+    assert_eq!(source_count, 0);
+    assert_projection_state(
+        fixture,
+        publication.revision,
+        &format!("bootstrap-before-publication-{suffix}"),
+        &format!("bootstrap-before-evidence-{suffix}"),
+        &projection,
+        0,
+    )
+    .await;
+    assert_eq!(head_revision(fixture).await, publication.revision);
+    let operation: (String, String) = sqlx::query_as(
+        "SELECT operation_id, evidence_reference FROM cloud_coverage_revisions \
+         WHERE beneficiary_id = $1 AND revision = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(publication.revision)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read unmanaged bootstrap revision");
+    assert_eq!(
+        operation,
+        (
+            format!("bootstrap-before-publication-{suffix}"),
+            format!("bootstrap-before-evidence-{suffix}")
+        )
+    );
+    match projection {
+        CoverageProjection::Complete { paid_intervals } => {
+            let loaded = load(&fixture.pool, &fixture.beneficiary_id)
+                .await
+                .expect("load unmanaged complete bootstrap projection");
+            assert_eq!(loaded.revision, publication.revision);
+            assert_eq!(loaded.coverage.paid_intervals, paid_intervals);
+        }
+        CoverageProjection::Unavailable { reason } => assert!(matches!(
+            load(&fixture.pool, &fixture.beneficiary_id).await,
+            Err(StoreError::ProjectionUnavailable(actual)) if actual == reason
+        )),
+    }
+    cleanup(fixture).await;
+}
+
+#[tokio::test]
+async fn registration_rejects_complete_publication_before_coordinator_lock() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    publication_before_coordinator_lock(
+        &fixture,
+        CoverageProjection::Complete {
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: "bootstrap-before-complete-fact".into(),
+                source_id: "bootstrap-before-unmanaged-source".into(),
+                starts_at: 0,
+                paid_until: 100,
+                failed_renewal_id: None,
+            }],
+        },
+        "complete",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn registration_rejects_unavailable_publication_before_coordinator_lock() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    publication_before_coordinator_lock(
+        &fixture,
+        CoverageProjection::Unavailable {
+            reason: UnavailableReason::ConflictingEvidence,
+        },
+        "unavailable",
+    )
+    .await;
+}
+
+async fn publication_after_revision_anchor(
+    fixture: &Fixture,
+    projection: CoverageProjection,
+    suffix: &str,
+) {
+    let release = Arc::new(Notify::new());
+    let (publisher_ready, publisher_ready_rx) = oneshot::channel();
+    let publisher = tokio::spawn(held_publication(
+        fixture.pool.clone(),
+        fixture.beneficiary_id.clone(),
+        format!("bootstrap-after-publication-{suffix}"),
+        format!("bootstrap-after-evidence-{suffix}"),
+        projection.clone(),
+        publisher_ready,
+        release.clone(),
+    ));
+    let publisher_pid = receive_pid(publisher_ready_rx, "receive bootstrap publisher pid").await;
+
+    let source = binding(
+        fixture,
+        &format!("bootstrap-after-source-{suffix}"),
+        &format!("bootstrap-after-allocation-{suffix}"),
+    );
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = fixture.pool.clone();
+    let waiter_source = source.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool
+            .begin()
+            .await
+            .expect("begin anchored bootstrap registration");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready
+            .send(pid)
+            .expect("signal anchored bootstrap registration");
+        let result = register_source(&mut tx, "bootstrap-after-registration", &waiter_source).await;
+        tx.rollback()
+            .await
+            .expect("rollback anchored bootstrap registration");
+        result
+    });
+    let waiter_pid = receive_pid(
+        waiter_ready_rx,
+        "receive anchored bootstrap registration pid",
+    )
+    .await;
+    wait_for_specific_block(&fixture.pool, waiter_pid, publisher_pid).await;
+    release.notify_one();
+
+    let publication = tokio::time::timeout(Duration::from_secs(10), publisher)
+        .await
+        .expect("bootstrap publisher finished")
+        .expect("join bootstrap publisher")
+        .expect("bootstrap publication applied");
+    let registration = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("anchored bootstrap registration finished")
+        .expect("join anchored bootstrap registration");
+    assert!(matches!(
+        registration,
+        Err(ReconciliationError::Store(StoreError::RevisionConflict {
+            expected: None,
+            actual: Some(actual),
+        })) if actual == publication.revision
+    ));
+    assert_eq!(head_revision(fixture).await, publication.revision);
+    let source_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+            .bind(&fixture.beneficiary_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("count anchored bootstrap sources");
+    assert_eq!(source_count, 0);
+    let coordinator_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count rolled back bootstrap coordinators");
+    assert_eq!(coordinator_count, 0);
+    assert_projection_state(
+        fixture,
+        publication.revision,
+        &format!("bootstrap-after-publication-{suffix}"),
+        &format!("bootstrap-after-evidence-{suffix}"),
+        &projection,
+        0,
+    )
+    .await;
+
+    let before_replay = projection_snapshot(fixture).await;
+    let mut replay_tx = fixture.pool.begin().await.expect("begin bootstrap replay");
+    let replay = publish(
+        &mut replay_tx,
+        &fixture.beneficiary_id,
+        None,
+        &format!("bootstrap-after-publication-{suffix}"),
+        &format!("bootstrap-after-evidence-{suffix}"),
+        &projection,
+    )
+    .await
+    .expect("replay bootstrap publication");
+    replay_tx.commit().await.expect("commit bootstrap replay");
+    assert_eq!(replay.revision, publication.revision);
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(projection_snapshot(fixture).await, before_replay);
+    match projection {
+        CoverageProjection::Complete { paid_intervals } => {
+            let loaded = load(&fixture.pool, &fixture.beneficiary_id)
+                .await
+                .expect("load anchored complete projection");
+            assert_eq!(loaded.coverage.paid_intervals, paid_intervals);
+        }
+        CoverageProjection::Unavailable { reason } => assert!(matches!(
+            load(&fixture.pool, &fixture.beneficiary_id).await,
+            Err(StoreError::ProjectionUnavailable(actual)) if actual == reason
+        )),
+    }
+    cleanup(fixture).await;
+}
+
+#[tokio::test]
+async fn registration_rejects_complete_publication_after_revision_anchor() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    publication_after_revision_anchor(
+        &fixture,
+        CoverageProjection::Complete {
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: "bootstrap-after-complete-fact".into(),
+                source_id: "bootstrap-after-unmanaged-source".into(),
+                starts_at: 0,
+                paid_until: 100,
+                failed_renewal_id: None,
+            }],
+        },
+        "complete",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn registration_rejects_unavailable_publication_after_revision_anchor() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    publication_after_revision_anchor(
+        &fixture,
+        CoverageProjection::Unavailable {
+            reason: UnavailableReason::NeedsReconciliation,
+        },
+        "unavailable",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1486,6 +1972,406 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
     assert_eq!(replay.revision, completion.revision);
     assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
     assert_eq!(head_revision(&fixture).await, 3);
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn superseded_finish_waits_for_a_pending_replacement() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(
+        &fixture,
+        "superseded-pending-source",
+        "superseded-pending-allocation",
+    );
+    register(&fixture, &source, "superseded-pending-registration").await;
+    let first_ticket = begin(&fixture, &attempt_id(&fixture, "superseded-pending-first")).await;
+    let first_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "superseded-pending-first-evidence".into(),
+        paid_intervals: vec![],
+    };
+    let second_attempt_id = attempt_id(&fixture, "superseded-pending-second");
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder = tokio::spawn(held_begin_collection(
+        fixture.pool.clone(),
+        fixture.beneficiary_id.clone(),
+        second_attempt_id.clone(),
+        holder_ready,
+        release.clone(),
+    ));
+    let holder_pid = receive_pid(holder_ready_rx, "receive pending replacement pid").await;
+
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = fixture.pool.clone();
+    let waiter_ticket = first_ticket.clone();
+    let waiter_observation = first_observation.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool
+            .begin()
+            .await
+            .expect("begin superseded pending finish");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready
+            .send(pid)
+            .expect("signal superseded pending finish");
+        let result = finish_collection(
+            &mut tx,
+            &waiter_ticket,
+            "superseded-pending-first-aggregate",
+            &[waiter_observation],
+        )
+        .await;
+        tx.rollback()
+            .await
+            .expect("rollback superseded pending finish");
+        result
+    });
+    let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded pending finish pid").await;
+    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+    release.notify_one();
+
+    let second_ticket = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("pending replacement finished")
+        .expect("join pending replacement");
+    let first_result = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("superseded pending finish finished")
+        .expect("join superseded pending finish");
+    assert!(matches!(
+        first_result,
+        Err(ReconciliationError::AttemptSuperseded)
+    ));
+    assert_eq!(second_ticket.attempt_id, second_attempt_id);
+    let statuses: Vec<(String, String)> = sqlx::query_as(
+        "SELECT attempt_id, status FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 ORDER BY collection_epoch",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read pending replacement statuses");
+    assert_eq!(
+        statuses,
+        vec![
+            (first_ticket.attempt_id.clone(), "superseded".into()),
+            (second_ticket.attempt_id.clone(), "pending".into()),
+        ]
+    );
+    let current_attempt: Option<String> = sqlx::query_scalar(
+        "SELECT current_attempt_id FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read pending replacement current attempt");
+    assert_eq!(current_attempt, Some(second_ticket.attempt_id.clone()));
+    assert_eq!(head_revision(&fixture).await, 1);
+    let coordinator: (i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT source_set_generation, collection_epoch, current_attempt_id \
+         FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read pending replacement coordinator");
+    assert_eq!(coordinator, (1, 2, Some(second_ticket.attempt_id.clone())));
+    let (snapshot_head, revisions, facts, attempts) = projection_snapshot(&fixture).await;
+    assert_eq!(snapshot_head, Some(1));
+    assert_eq!(revisions.len(), 1);
+    assert!(facts.is_empty());
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].4, "superseded");
+    assert_eq!(attempts[1].4, "pending");
+
+    let second_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "superseded-pending-second-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "superseded-pending-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 100,
+            failed_renewal_id: None,
+        }],
+    };
+    let mut finish_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin pending replacement finish");
+    let second_receipt = finish_collection(
+        &mut finish_tx,
+        &second_ticket,
+        "superseded-pending-second-aggregate",
+        std::slice::from_ref(&second_observation),
+    )
+    .await
+    .expect("finish pending replacement");
+    finish_tx
+        .commit()
+        .await
+        .expect("commit pending replacement finish");
+    assert_eq!(second_receipt.revision, 2);
+    let before_replay = projection_snapshot(&fixture).await;
+    let mut replay_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin pending replacement replay");
+    let replay = finish_collection(
+        &mut replay_tx,
+        &second_ticket,
+        "superseded-pending-second-aggregate",
+        std::slice::from_ref(&second_observation),
+    )
+    .await
+    .expect("replay pending replacement finish");
+    replay_tx
+        .commit()
+        .await
+        .expect("commit pending replacement replay");
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(replay.revision, second_receipt.revision);
+    assert_eq!(projection_snapshot(&fixture).await, before_replay);
+    let (snapshot_head, revisions, facts, attempts) = projection_snapshot(&fixture).await;
+    assert_eq!(snapshot_head, Some(second_receipt.revision));
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(facts.len(), 1);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[1].4, "completed");
+    assert_eq!(attempts[1].7, Some(second_receipt.revision));
+    assert_eq!(
+        revisions[1].1,
+        format!("collection:{}", second_ticket.attempt_id)
+    );
+    assert_eq!(revisions[1].2, "superseded-pending-second-aggregate");
+    let loaded = load(&fixture.pool, &fixture.beneficiary_id)
+        .await
+        .expect("load pending replacement projection");
+    assert_eq!(loaded.revision, second_receipt.revision);
+    assert_eq!(
+        loaded.coverage.paid_intervals[0].coverage_id,
+        "superseded-pending-coverage"
+    );
+
+    let mut stale_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin superseded pending retry");
+    let stale = finish_collection(
+        &mut stale_tx,
+        &first_ticket,
+        "superseded-pending-first-aggregate",
+        std::slice::from_ref(&first_observation),
+    )
+    .await;
+    stale_tx
+        .rollback()
+        .await
+        .expect("rollback superseded pending retry");
+    assert!(matches!(stale, Err(ReconciliationError::AttemptSuperseded)));
+    assert_eq!(head_revision(&fixture).await, second_receipt.revision);
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn superseded_finish_waits_for_a_completing_replacement() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let source = binding(
+        &fixture,
+        "superseded-completing-source",
+        "superseded-completing-allocation",
+    );
+    register(&fixture, &source, "superseded-completing-registration").await;
+    let first_ticket = begin(
+        &fixture,
+        &attempt_id(&fixture, "superseded-completing-first"),
+    )
+    .await;
+    let second_ticket = begin(
+        &fixture,
+        &attempt_id(&fixture, "superseded-completing-second"),
+    )
+    .await;
+    let first_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "superseded-completing-first-evidence".into(),
+        paid_intervals: vec![],
+    };
+    let second_observation = SourceObservation::Complete {
+        source_id: source.source_id.clone(),
+        evidence_reference: "superseded-completing-second-evidence".into(),
+        paid_intervals: vec![ConfirmedPaidInterval {
+            coverage_id: "superseded-completing-coverage".into(),
+            source_id: source.source_id.clone(),
+            starts_at: 0,
+            paid_until: 100,
+            failed_renewal_id: None,
+        }],
+    };
+    let release = Arc::new(Notify::new());
+    let (holder_ready, holder_ready_rx) = oneshot::channel();
+    let holder = tokio::spawn(held_finish_collection(
+        fixture.pool.clone(),
+        second_ticket.clone(),
+        "superseded-completing-second-aggregate".into(),
+        vec![second_observation.clone()],
+        holder_ready,
+        release.clone(),
+    ));
+    let holder_pid = receive_pid(holder_ready_rx, "receive completing replacement pid").await;
+
+    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+    let waiter_pool = fixture.pool.clone();
+    let waiter_ticket = first_ticket.clone();
+    let waiter_observation = first_observation.clone();
+    let waiter = tokio::spawn(async move {
+        let mut tx = waiter_pool
+            .begin()
+            .await
+            .expect("begin superseded completing finish");
+        let pid = transaction_pid(&mut tx).await;
+        waiter_ready
+            .send(pid)
+            .expect("signal superseded completing finish");
+        let result = finish_collection(
+            &mut tx,
+            &waiter_ticket,
+            "superseded-completing-first-aggregate",
+            &[waiter_observation],
+        )
+        .await;
+        tx.rollback()
+            .await
+            .expect("rollback superseded completing finish");
+        result
+    });
+    let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded completing finish pid").await;
+    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+    release.notify_one();
+
+    let second_result = tokio::time::timeout(Duration::from_secs(10), holder)
+        .await
+        .expect("completing replacement finished")
+        .expect("join completing replacement")
+        .expect("completing replacement applied");
+    let first_result = tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("superseded completing finish finished")
+        .expect("join superseded completing finish");
+    assert!(matches!(
+        first_result,
+        Err(ReconciliationError::AttemptSuperseded)
+    ));
+    assert_eq!(second_result.revision, 2);
+    assert_eq!(second_result.outcome, PublicationOutcome::Applied);
+    let statuses: Vec<(String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT attempt_id, status, projection_revision \
+         FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 ORDER BY collection_epoch",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("read completing replacement statuses");
+    assert_eq!(
+        statuses,
+        vec![
+            (first_ticket.attempt_id.clone(), "superseded".into(), None),
+            (
+                second_ticket.attempt_id.clone(),
+                "completed".into(),
+                Some(2)
+            ),
+        ]
+    );
+    let current_attempt: Option<String> = sqlx::query_scalar(
+        "SELECT current_attempt_id FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read completing replacement current attempt");
+    assert_eq!(current_attempt, None);
+    let coordinator: (i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT source_set_generation, collection_epoch, current_attempt_id \
+         FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read completing replacement coordinator");
+    assert_eq!(coordinator, (1, 2, None));
+    let (snapshot_head, revisions, facts, attempts) = projection_snapshot(&fixture).await;
+    assert_eq!(snapshot_head, Some(second_result.revision));
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(facts.len(), 1);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].4, "superseded");
+    assert_eq!(attempts[0].7, None);
+    assert_eq!(attempts[1].4, "completed");
+    assert_eq!(
+        attempts[1].5,
+        Some("superseded-completing-second-aggregate".into())
+    );
+    assert_eq!(attempts[1].7, Some(second_result.revision));
+    assert!(attempts[1]
+        .6
+        .as_deref()
+        .is_some_and(|result| result.contains("superseded-completing-coverage")));
+    let loaded = load(&fixture.pool, &fixture.beneficiary_id)
+        .await
+        .expect("load completing replacement projection");
+    assert_eq!(loaded.revision, second_result.revision);
+    assert_eq!(
+        loaded.coverage.paid_intervals[0].coverage_id,
+        "superseded-completing-coverage"
+    );
+
+    let before_replay = projection_snapshot(&fixture).await;
+    let mut replay_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin completing replacement replay");
+    let replay = finish_collection(
+        &mut replay_tx,
+        &second_ticket,
+        "superseded-completing-second-aggregate",
+        std::slice::from_ref(&second_observation),
+    )
+    .await
+    .expect("replay completing replacement");
+    replay_tx
+        .commit()
+        .await
+        .expect("commit completing replacement replay");
+    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(projection_snapshot(&fixture).await, before_replay);
+    let mut stale_tx = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin superseded completing retry");
+    let stale = finish_collection(
+        &mut stale_tx,
+        &first_ticket,
+        "superseded-completing-first-aggregate",
+        std::slice::from_ref(&first_observation),
+    )
+    .await;
+    stale_tx
+        .rollback()
+        .await
+        .expect("rollback superseded completing retry");
+    assert!(matches!(stale, Err(ReconciliationError::AttemptSuperseded)));
+    assert_eq!(head_revision(&fixture).await, second_result.revision);
     cleanup(&fixture).await;
 }
 
