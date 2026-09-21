@@ -2025,6 +2025,29 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_err());
         }
+
+        let cli = Cli::try_parse_from(["sotto", "share", "KEY"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Share {
+                views: 1,
+                expire: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn share_help_explains_supported_limits() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("share")
+            .expect("share subcommand should exist")
+            .render_long_help()
+            .to_string();
+
+        assert!(help.contains("1-100"), "{help}");
+        assert!(help.contains("1-2592000"), "{help}");
     }
 
     #[test]
