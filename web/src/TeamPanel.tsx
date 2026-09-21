@@ -146,6 +146,8 @@ export function TeamPanel({
     if (inviteInFlight.current) return;
     const submittedEmail = email.trim();
     if (submittedEmail === "") return;
+    const generation = orgLoadGeneration.current;
+    const isCurrent = () => generation === orgLoadGeneration.current;
     setError(null);
     setNotice(null);
     inviteInFlight.current = true;
@@ -164,11 +166,13 @@ export function TeamPanel({
           // Best-effort only.
         }
       }
+      if (!isCurrent()) return;
       setNotice(`invited ${submittedEmail} (${invited.userId})`);
       setEmail("");
-      setMembers(await fetchMembers(no.org.id));
+      const nextMembers = await fetchMembers(no.org.id);
+      if (isCurrent()) setMembers(nextMembers);
     } catch (e) {
-      setError(message(e));
+      if (isCurrent()) setError(message(e));
     } finally {
       inviteInFlight.current = false;
       setInviteBusy(false);
