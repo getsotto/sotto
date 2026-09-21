@@ -13,6 +13,11 @@ use crate::error::Result;
 
 use super::api::{b64encode, NewShare, SyncApi};
 
+/// The maximum number of views allowed for a share link.
+pub const MAX_VIEWS: i32 = 100;
+/// The maximum lifetime of a share link, in seconds.
+pub const MAX_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
+
 /// Options for a new share link.
 pub struct ShareOptions {
     pub max_views: i32,
@@ -28,9 +33,6 @@ pub fn create(
     value: &[u8],
     opts: &ShareOptions,
 ) -> Result<String> {
-    const MAX_VIEWS: i32 = 100;
-    const MAX_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
-
     if !(1..=MAX_VIEWS).contains(&opts.max_views) {
         return Err(crate::error::Error::Input(format!(
             "views must be between 1 and {MAX_VIEWS}"

@@ -113,11 +113,18 @@ enum Command {
     Share {
         /// The secret name to share.
         name: String,
-        /// How many times the link may be viewed before it burns.
-        #[arg(long, default_value_t = 1)]
+        /// How many times the link may be viewed before it burns (1-100).
+        #[arg(
+            long,
+            default_value_t = 1,
+            value_parser = clap::value_parser!(i32).range(1..=sotto_cli::remote::share::MAX_VIEWS as i64)
+        )]
         views: i32,
-        /// Link lifetime in seconds (default: no expiry).
-        #[arg(long)]
+        /// Link lifetime in seconds (1-2592000; default: no expiry).
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(i64).range(1..=sotto_cli::remote::share::MAX_TTL_SECONDS)
+        )]
         expire: Option<i64>,
         /// Protect the link with a passphrase (prompted; a second factor beyond the link).
         #[arg(long)]
@@ -1991,6 +1998,33 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn share_limits_parse_and_reject_invalid_values_before_setup() {
+        for views in [1, sotto_cli::remote::share::MAX_VIEWS] {
+            let value = views.to_string();
+            let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--views", &value]).unwrap();
+            assert!(matches!(cli.command, Command::Share { views: parsed, .. } if parsed == views));
+        }
+        for expire in [1, sotto_cli::remote::share::MAX_TTL_SECONDS] {
+            let value = expire.to_string();
+            let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--expire", &value]).unwrap();
+            assert!(
+                matches!(cli.command, Command::Share { expire: Some(parsed), .. } if parsed == expire)
+            );
+        }
+
+        for args in [
+            vec!["sotto", "share", "KEY", "--views", "0"],
+            vec!["sotto", "share", "KEY", "--views", "101"],
+            vec!["sotto", "share", "KEY", "--views=-1"],
+            vec!["sotto", "share", "KEY", "--expire", "0"],
+            vec!["sotto", "share", "KEY", "--expire", "2592001"],
+            vec!["sotto", "share", "KEY", "--expire=-1"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
 
     #[test]
