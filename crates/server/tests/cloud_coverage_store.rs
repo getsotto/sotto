@@ -39,7 +39,8 @@ use std::{
 };
 
 use sotto_server::cloud_coverage::{
-    evaluate, ConfirmedPaidInterval, CoverageState, PersonCoverage,
+    evaluate, ConfirmedPaidInterval, CoverageDecision, CoverageState, InvalidCoverage,
+    PersonCoverage,
 };
 use sotto_server::cloud_coverage_store::{
     load, publish, CoverageProjection, LoadedCoverage, PublicationOutcome, PublicationReceipt,
@@ -2378,4 +2379,178 @@ async fn corrupt_projection_fails_closed_while_unrelated_beneficiary_progresses(
     )
     .await;
     result.expect("supervised corruption controls");
+}
+
+#[tokio::test]
+async fn max_ending_interval_round_trip_defers_export_overflow_until_evaluation() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let receipt = committed_publish(
+        &fixture,
+        None,
+        "max-round-trip",
+        "max-round-trip-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![paid("max-fact", "personal", i64::MAX - 1, i64::MAX)],
+        },
+    )
+    .await
+    .expect("publish max-ending interval");
+    assert_eq!(receipt.revision, 1);
+
+    let loaded = load(&fixture.pool, &fixture.beneficiary_id)
+        .await
+        .expect("load max-ending interval");
+    assert_eq!(loaded.revision, 1);
+    assert_eq!(
+        evaluate(&loaded.coverage, i64::MAX - 1).unwrap(),
+        CoverageDecision {
+            state: CoverageState::Paid,
+            active_until: Some(i64::MAX),
+            recovery_until: None,
+            export_until: None,
+        }
+    );
+    assert_eq!(
+        evaluate(&loaded.coverage, i64::MAX).unwrap_err(),
+        InvalidCoverage::ExportDeadlineOverflow
+    );
+
+    let stored: (i64, i64) = sqlx::query_as(
+        "SELECT starts_at, paid_until FROM cloud_coverage_revision_facts \
+         WHERE beneficiary_id = $1 AND revision = 1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read stored max fact");
+    assert_eq!(stored, (i64::MAX - 1, i64::MAX));
+    let reloaded = load(&fixture.pool, &fixture.beneficiary_id)
+        .await
+        .expect("reload max-ending interval after overflow evaluation");
+    assert_eq!(reloaded, loaded);
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn recovery_overflow_through_publisher_writes_nothing_durable() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let Some(unrelated) = Fixture::create().await else {
+        return;
+    };
+    committed_publish(
+        &unrelated,
+        None,
+        "overflow-unrelated-base",
+        "overflow-unrelated-base-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![paid("overflow-unrelated-a", "personal", 0, 30 * DAY)],
+        },
+    )
+    .await
+    .expect("publish unrelated base");
+
+    let mut owner = RaceTaskOwner::new();
+    for (pool, beneficiary_id) in [
+        (fixture.pool.clone(), fixture.beneficiary_id.clone()),
+        (unrelated.pool.clone(), unrelated.beneficiary_id.clone()),
+    ] {
+        owner.register_cleanup(
+            move || async move { cleanup_result_for(&pool, &beneficiary_id).await },
+        );
+    }
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                let unrelated_pool = unrelated.pool.clone();
+                let unrelated_beneficiary = unrelated.beneficiary_id.clone();
+                let mut progress = Some(owner.spawn(async move {
+                    let mut tx = unrelated_pool
+                        .begin()
+                        .await
+                        .expect("begin unrelated publication");
+                    let receipt = publish(
+                        &mut tx,
+                        &unrelated_beneficiary,
+                        Some(1),
+                        "overflow-unrelated-next",
+                        "overflow-unrelated-next-evidence",
+                        &CoverageProjection::Complete {
+                            paid_intervals: vec![paid(
+                                "overflow-unrelated-b",
+                                "sponsor",
+                                30 * DAY,
+                                60 * DAY,
+                            )],
+                        },
+                    )
+                    .await
+                    .expect("publish unrelated revision");
+                    tx.commit().await.expect("commit unrelated publication");
+                    let loaded = load(&unrelated_pool, &unrelated_beneficiary)
+                        .await
+                        .expect("load unrelated revision");
+                    (receipt, loaded)
+                }));
+
+                let before = projection_snapshot(&fixture.pool, &fixture.beneficiary_id).await;
+                let mut tx = fixture.pool.begin().await.expect("begin overflow attempt");
+                let attempt = publish(
+                    &mut tx,
+                    &fixture.beneficiary_id,
+                    None,
+                    "overflow-attempt",
+                    "overflow-attempt-evidence",
+                    &CoverageProjection::Complete {
+                        paid_intervals: vec![recovery(
+                            "overflow-fact",
+                            "personal",
+                            0,
+                            i64::MAX,
+                            "renewal-overflow",
+                        )],
+                    },
+                )
+                .await;
+                assert!(matches!(
+                    attempt,
+                    Err(StoreError::InvalidCoverage(
+                        InvalidCoverage::RecoveryDeadlineOverflow
+                    ))
+                ));
+                tx.commit()
+                    .await
+                    .expect("commit after typed overflow error");
+                assert_eq!(
+                    projection_snapshot(&fixture.pool, &fixture.beneficiary_id).await,
+                    before
+                );
+                let operations: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_revisions \
+                     WHERE beneficiary_id = $1 AND operation_id = 'overflow-attempt'",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count overflow operation rows");
+                assert_eq!(operations, 0);
+
+                let (receipt, unrelated_loaded) =
+                    receive_owned(&mut progress, "unrelated progress")
+                        .await
+                        .expect("unrelated progress task completed");
+                assert_eq!(receipt.outcome, PublicationOutcome::Applied);
+                assert_eq!(receipt.revision, 2);
+                assert_eq!(unrelated_loaded.revision, 2);
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised overflow no-write");
 }
