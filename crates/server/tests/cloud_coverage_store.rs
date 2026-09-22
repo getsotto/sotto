@@ -5,10 +5,10 @@ use sotto_server::cloud_coverage_store::{
     load, publish, CoverageProjection, PublicationOutcome, StoreError, UnavailableReason,
 };
 use sotto_server::db;
-use sqlx::postgres::PgConnectOptions;
-use sqlx::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::{PgPool, Postgres, Transaction};
 use tokio::sync::{oneshot, Barrier, Notify};
-use tokio::time::Duration;
+use tokio::time::{sleep, timeout, Duration, Instant};
 use uuid::Uuid;
 
 mod support;
@@ -159,6 +159,78 @@ fn recovery(
     ConfirmedPaidInterval {
         failed_renewal_id: Some(renewal.into()),
         ..paid(id, source, starts_at, paid_until)
+    }
+}
+
+/// A dedicated single-connection pool that identifies the loader backend.
+///
+/// `load` checks out its own pooled connection, so the observation tests give that connection
+/// a unique application name and acknowledge the exact pause point through `pg_stat_activity`
+/// instead of adding a hook to the production reader.
+async fn loader_pool(application_name: &str) -> PgPool {
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL is required for loader pool");
+    let options = PgConnectOptions::from_str(&database_url)
+        .expect("parse DATABASE_URL for loader pool")
+        .application_name(application_name);
+    PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("connect loader pool")
+}
+
+/// Hold the table lock that pauses the loader at one read boundary.
+///
+/// `ACCESS EXCLUSIVE` is the only table lock that blocks the loader's plain `SELECT`s. The
+/// writer takes it after its publication writes, so the loader completes every earlier read
+/// and then waits at this table until the writer commits or rolls back.
+async fn hold_exclusive_table_lock(tx: &mut Transaction<'_, Postgres>, table: &'static str) {
+    assert!(
+        matches!(
+            table,
+            "cloud_coverage_revisions" | "cloud_coverage_revision_facts"
+        ),
+        "refusing loader pause on unexpected table"
+    );
+    sqlx::query(&format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
+        .execute(&mut **tx)
+        .await
+        .expect("lock loader observation table");
+}
+
+/// Wait until the backend running under `application_name` blocks behind `holder_pid`.
+///
+/// The loader observation tests identify the loader backend by its unique application name
+/// because `load` checks out its own pooled connection instead of reporting a pid. Bounded
+/// readiness only: callers must commit or roll back the holder afterwards so the observed
+/// backend is released on every path.
+async fn wait_for_blocked_backend(pool: &PgPool, application_name: &str, holder_pid: i32) -> i32 {
+    let deadline = Instant::now() + RACE_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("timed out waiting for backend '{application_name}' to block on {holder_pid}");
+        }
+        let waiter = timeout(
+            remaining,
+            sqlx::query_scalar::<_, i32>(
+                "SELECT pid FROM pg_stat_activity \
+                 WHERE datname = current_database() AND application_name = $1 \
+                 AND $2 = ANY(pg_blocking_pids(pid)) \
+                 ORDER BY pid LIMIT 1",
+            )
+            .bind(application_name)
+            .bind(holder_pid)
+            .fetch_optional(pool),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("timed out inspecting loader blocking"))
+        .unwrap_or_else(|error| panic!("failed to inspect loader blocking: {error}"));
+        if let Some(waiter) = waiter {
+            return waiter;
+        }
+        sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -1351,4 +1423,99 @@ async fn unavailable_projection_with_stored_facts_fails_closed() {
         Err(StoreError::CorruptProjection(_))
     ));
     cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn loader_pause_acknowledges_between_metadata_and_facts_reads() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let base = committed_publish(
+        &fixture,
+        None,
+        "pause-base",
+        "pause-base-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![
+                paid("pause-old-a", "personal", 0, 30 * DAY),
+                paid("pause-old-b", "personal", 30 * DAY, 60 * DAY),
+            ],
+        },
+    )
+    .await
+    .expect("publish pause base");
+    assert_eq!(base.revision, 1);
+
+    let mut owner = RaceTaskOwner::new();
+    let cleanup_pool = fixture.pool.clone();
+    let cleanup_beneficiary = fixture.beneficiary_id.clone();
+    owner.register_cleanup(move || async move {
+        cleanup_result_for(&cleanup_pool, &cleanup_beneficiary).await
+    });
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                let mut writer = fixture.pool.begin().await.expect("begin held publication");
+                let held = publish(
+                    &mut writer,
+                    &fixture.beneficiary_id,
+                    Some(1),
+                    "pause-next",
+                    "pause-next-evidence",
+                    &CoverageProjection::Complete {
+                        paid_intervals: vec![
+                            paid("pause-new-a", "personal", 0, 30 * DAY),
+                            paid("pause-new-b", "personal", 30 * DAY, 60 * DAY),
+                        ],
+                    },
+                )
+                .await
+                .expect("publish held revision");
+                assert_eq!(held.revision, 2);
+                let before = load(&fixture.pool, &fixture.beneficiary_id)
+                    .await
+                    .expect("load before lock");
+                assert_eq!(before.revision, 1);
+
+                hold_exclusive_table_lock(&mut writer, "cloud_coverage_revision_facts").await;
+                let writer_pid = transaction_pid(&mut writer).await;
+
+                let loader_app = format!("coverage-loader-pause-{}", Uuid::new_v4());
+                let loader_pool = loader_pool(&loader_app).await;
+                let load_pool = loader_pool.clone();
+                let beneficiary_id = fixture.beneficiary_id.clone();
+                let mut loader =
+                    Some(owner.spawn(async move { load(&load_pool, &beneficiary_id).await }));
+                let loader_pid =
+                    wait_for_blocked_backend(&fixture.pool, &loader_app, writer_pid).await;
+                assert_ne!(loader_pid, writer_pid);
+                let loader_query: String =
+                    sqlx::query_scalar("SELECT query FROM pg_stat_activity WHERE pid = $1")
+                        .bind(loader_pid)
+                        .fetch_one(&fixture.pool)
+                        .await
+                        .expect("read paused loader query");
+                assert!(
+                    loader_query.contains("FROM cloud_coverage_revision_facts"),
+                    "paused loader waits at the facts read, observed: {loader_query}"
+                );
+
+                writer.commit().await.expect("commit held publication");
+                let paused = receive_owned(&mut loader, "paused loader")
+                    .await
+                    .expect("paused loader task completed")
+                    .expect("paused load succeeded");
+                assert_eq!(paused.revision, 1);
+                let after = load(&fixture.pool, &fixture.beneficiary_id)
+                    .await
+                    .expect("load after commit");
+                assert_eq!(after.revision, 2);
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised loader pause");
 }
