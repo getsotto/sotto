@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { fetchShare, ShareUnavailable } from "./api";
 import { urlSafeB64ToBytes } from "./base64";
@@ -14,7 +14,8 @@ type State =
 export function RecipientPage({ token }: { token: string }) {
   const [state, setState] = useState<State>({ kind: "idle" });
   const [passphrase, setPassphrase] = useState("");
-  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "failed">("idle");
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copying" | "copied" | "failed">("idle");
+  const copyingRef = useRef(false);
 
   // Runs once per click. The fetch burns a view, so it must not run on mount or a prefetch.
   async function reveal() {
@@ -55,6 +56,11 @@ export function RecipientPage({ token }: { token: string }) {
   }
 
   async function copySecret(secret: string) {
+    if (copyingRef.current) {
+      return;
+    }
+    copyingRef.current = true;
+    setCopyStatus("copying");
     try {
       if (!navigator.clipboard?.writeText) {
         throw new Error("clipboard unavailable");
@@ -63,6 +69,8 @@ export function RecipientPage({ token }: { token: string }) {
       setCopyStatus("copied");
     } catch {
       setCopyStatus("failed");
+    } finally {
+      copyingRef.current = false;
     }
   }
 
@@ -81,8 +89,13 @@ export function RecipientPage({ token }: { token: string }) {
           rows={4}
           spellCheck={false}
         />
-        <button className="primary" type="button" onClick={() => void copySecret(state.secret)}>
-          Copy secret
+        <button
+          className="primary"
+          type="button"
+          disabled={copyStatus === "copying"}
+          onClick={() => void copySecret(state.secret)}
+        >
+          {copyStatus === "copying" ? "Copying…" : "Copy secret"}
         </button>
         {copyStatus === "copied" && <p role="status">Copied to clipboard.</p>}
         {copyStatus === "failed" && (

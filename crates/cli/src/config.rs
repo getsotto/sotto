@@ -33,10 +33,10 @@ impl Config {
         let text = std::fs::read_to_string(&path).map_err(|e| match e.kind() {
             // A genuinely-absent file is "no config"; anything else (permission denied, invalid
             // UTF-8, …) is a real I/O fault and must not masquerade as a missing config.
-            std::io::ErrorKind::NotFound => Error::NoConfig(path),
+            std::io::ErrorKind::NotFound => Error::NoConfig(path.clone()),
             _ => Error::Io(e.to_string()),
         })?;
-        toml::from_str(&text).map_err(|e| Error::Config(e.to_string()))
+        toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
     }
 
     /// Write the config to `dir/sotto.toml`.
@@ -97,5 +97,36 @@ mod tests {
             Config::discover(empty.path()),
             Err(Error::NoConfig(_))
         ));
+    }
+
+    #[test]
+    fn parse_error_names_parent_discovered_file() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("my project");
+        std::fs::create_dir_all(&project).unwrap();
+        let config_path = project.join(CONFIG_FILE);
+        let broken = "project = [\n";
+        std::fs::write(&config_path, broken).unwrap();
+
+        let child = project.join("nested").join("child");
+        std::fs::create_dir_all(&child).unwrap();
+
+        let error = Config::discover(&child).unwrap_err();
+        assert_eq!(error.exit_code(), 1);
+        let rendered = error.to_string();
+        let path = config_path.display().to_string();
+        assert!(
+            matches!(error, Error::Config(message) if message.contains(&path)),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("TOML parse error at line 1, column 13"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains(&child.display().to_string()),
+            "{rendered}"
+        );
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), broken);
     }
 }

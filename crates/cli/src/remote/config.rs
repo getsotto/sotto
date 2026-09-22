@@ -40,7 +40,7 @@ impl GlobalConfig {
         match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text)
                 .map(Some)
-                .map_err(|e| Error::Config(e.to_string())),
+                .map_err(|e| Error::Config(format!("{}: {e}", path.display()))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Error::Io(e.to_string())),
         }
@@ -128,6 +128,30 @@ mod tests {
         assert!(GlobalConfig::load_from(&dir.path().join("nope.toml"))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn parse_error_names_path_with_spaces() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("global config");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let broken = "theme = [\n";
+        std::fs::write(&path, broken).unwrap();
+
+        let error = GlobalConfig::load_from(&path).unwrap_err();
+        assert_eq!(error.exit_code(), 1);
+        let rendered = error.to_string();
+        let path_text = path.display().to_string();
+        assert!(
+            matches!(error, Error::Config(message) if message.contains(&path_text)),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("TOML parse error at line 1, column 11"),
+            "{rendered}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
     }
 
     #[test]
