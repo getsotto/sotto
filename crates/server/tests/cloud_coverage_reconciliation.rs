@@ -601,6 +601,157 @@ async fn setup_completed_pair(
     (ticket, observations, evidence, first, second)
 }
 
+type CoordinatorRow = (i64, i64, Option<String>);
+type SourceRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+);
+type AttemptRow = (
+    String,
+    i64,
+    i64,
+    Option<i64>,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+type RevisionRow = (i64, String, String, String, Option<String>, i64);
+type FactRow = (i64, String, String, i64, i64, Option<String>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct DurableSnapshot {
+    coordinator: Option<CoordinatorRow>,
+    sources: Vec<SourceRow>,
+    attempts: Vec<AttemptRow>,
+    head: Option<i64>,
+    revisions: Vec<RevisionRow>,
+    facts: Vec<FactRow>,
+}
+
+async fn durable_snapshot(fixture: &Fixture) -> DurableSnapshot {
+    let coordinator = sqlx::query_as(
+        "SELECT source_set_generation, collection_epoch, current_attempt_id \
+         FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_optional(&fixture.pool)
+    .await
+    .expect("snapshot coordinator");
+    let sources = sqlx::query_as(
+        "SELECT source_id, beneficiary_id, provider_namespace, external_allocation_reference, \
+                ownership_evidence_reference, registration_operation_id, \
+                registration_source_set_generation, registration_projection_revision \
+         FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("snapshot sources");
+    let attempts = sqlx::query_as(
+        "SELECT attempt_id, collection_epoch, source_set_generation, \
+                expected_projection_revision, source_bindings::text, status, \
+                aggregate_evidence_reference, canonical_result::text, projection_revision \
+         FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 \
+         ORDER BY collection_epoch",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("snapshot attempts");
+    let head = sqlx::query_scalar(
+        "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_optional(&fixture.pool)
+    .await
+    .expect("snapshot head");
+    let revisions = sqlx::query_as(
+        "SELECT revision, operation_id, evidence_reference, status, unavailable_reason, fact_count \
+         FROM cloud_coverage_revisions WHERE beneficiary_id = $1 ORDER BY revision",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("snapshot revisions");
+    let facts = sqlx::query_as(
+        "SELECT revision, coverage_id, source_id, starts_at, paid_until, failed_renewal_id \
+         FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1 \
+         ORDER BY revision, coverage_id",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("snapshot facts");
+    DurableSnapshot {
+        coordinator,
+        sources,
+        attempts,
+        head,
+        revisions,
+        facts,
+    }
+}
+
+async fn user_present(fixture: &Fixture) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")
+        .bind(&fixture.beneficiary_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("check user row")
+}
+
+async fn complete_unrelated_operation(unrelated: &Fixture) {
+    let source = binding(unrelated, "progress-source", "progress-allocation");
+    register(unrelated, &source, "progress-registration").await;
+    let ticket = begin(unrelated, &attempt_id(unrelated, "progress-attempt")).await;
+    let observations = vec![complete_observation(
+        &source.source_id,
+        "progress-evidence",
+        "progress-coverage",
+    )];
+    let receipt = complete(unrelated, &ticket, "progress-aggregate", &observations).await;
+    assert_eq!(receipt.outcome, PublicationOutcome::Applied);
+    let loaded = load(&unrelated.pool, &unrelated.beneficiary_id)
+        .await
+        .expect("load unrelated projection");
+    assert_eq!(loaded.revision, receipt.revision);
+}
+
+async fn coordinator_generation(fixture: &Fixture) -> i64 {
+    sqlx::query_scalar(
+        "SELECT source_set_generation FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read source generation")
+}
+
+async fn assert_scoped_cleanup(
+    fixture: &Fixture,
+    unrelated: &Fixture,
+    bystander: &Fixture,
+    bystander_before: &DurableSnapshot,
+) {
+    assert_no_beneficiary_rows(fixture).await;
+    assert_no_beneficiary_rows(unrelated).await;
+    assert!(!user_present(fixture).await);
+    assert!(!user_present(unrelated).await);
+    assert!(user_present(bystander).await);
+    assert_eq!(&durable_snapshot(bystander).await, bystander_before);
+    cleanup(bystander).await;
+    assert_no_beneficiary_rows(bystander).await;
+    assert!(!user_present(bystander).await);
+}
+
 async fn head_revision(fixture: &Fixture) -> i64 {
     sqlx::query_scalar(
         "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
@@ -5051,6 +5202,567 @@ async fn stored_blank_observation_source_is_canonical_corruption() {
     )
     .await;
     result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn binding_shape_validation_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let source = binding(&fixture, "read-only-source", "read-only-allocation");
+            register(&fixture, &source, "read-only-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "read-only-attempt")).await;
+            corrupt_bindings(&fixture, &ticket, serde_json::json!([])).await;
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::BindingShape
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            assert_eq!(stored_bindings_text(&fixture, &ticket).await, "[]");
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn binding_ownership_validation_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let source = binding(&fixture, "ownership-source", "ownership-allocation");
+            register(&fixture, &source, "ownership-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "ownership-attempt")).await;
+            let mut foreign = source.clone();
+            foreign.beneficiary_id = unrelated.beneficiary_id.clone();
+            corrupt_bindings(&fixture, &ticket, serde_json::json!([foreign.clone()])).await;
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::BindingOwnership
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            let stored: serde_json::Value =
+                serde_json::from_str(&stored_bindings_text(&fixture, &ticket).await)
+                    .expect("parse stored bindings");
+            assert_eq!(stored, serde_json::json!([foreign]));
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn binding_source_set_validation_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let source = binding(&fixture, "source-set-source", "source-set-allocation");
+            register(&fixture, &source, "source-set-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "source-set-attempt")).await;
+            sqlx::query("DELETE FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+                .bind(&fixture.beneficiary_id)
+                .execute(&fixture.pool)
+                .await
+                .expect("delete authoritative sources");
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::BindingSourceSet
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            assert!(registration_operations(&fixture).await.is_empty());
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await.4,
+                "pending"
+            );
+            assert_eq!(head_revision(&fixture).await, head_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn receipt_combination_rejection_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "receipt-read-only").await;
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            let mut tx = fixture
+                .pool
+                .begin()
+                .await
+                .expect("begin rejected receipt write");
+            let update = sqlx::query(
+                "UPDATE cloud_coverage_collection_attempts \
+                 SET aggregate_evidence_reference = NULL \
+                 WHERE beneficiary_id = $1 AND attempt_id = $2",
+            )
+            .bind(&fixture.beneficiary_id)
+            .bind(&ticket.attempt_id)
+            .execute(&mut *tx)
+            .await;
+            let error = match update {
+                Err(error) => error,
+                Ok(_) => panic!("receipt combination must be rejected"),
+            };
+            assert_sqlstate(&error, "23514");
+            tx.rollback()
+                .await
+                .expect("rollback rejected receipt write");
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                (
+                    fixture_before.attempts[0].6.clone(),
+                    fixture_before.attempts[0].7.clone(),
+                    fixture_before.attempts[0].8,
+                )
+            );
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn result_shape_validation_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let (ticket, _, _, source) = setup_completed_attempt(&fixture, "shape-read-only").await;
+            let mut mutated = stored_result_json(&fixture, &ticket).await;
+            mutated
+                .as_object_mut()
+                .expect("result is an object")
+                .remove("sources");
+            let mutated_text = mutated.to_string();
+            try_set_result(&fixture, &ticket, &mutated_text)
+                .await
+                .expect("store mutated result");
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            let stored: serde_json::Value = serde_json::from_str(
+                &read_receipt_columns(&fixture, &ticket)
+                    .await
+                    .1
+                    .expect("mutated result is available"),
+            )
+            .expect("parse stored result");
+            assert_eq!(stored, mutated);
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn result_evidence_validation_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let (ticket, _, _, source) =
+                setup_completed_attempt(&fixture, "evidence-read-only").await;
+            let mut mutated = stored_result_json(&fixture, &ticket).await;
+            mutated
+                .as_object_mut()
+                .expect("result is an object")
+                .insert(
+                    "aggregate_evidence_reference".into(),
+                    serde_json::json!("different-aggregate"),
+                );
+            let mutated_text = mutated.to_string();
+            try_set_result(&fixture, &ticket, &mutated_text)
+                .await
+                .expect("store mutated result");
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultEvidence
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            let stored: serde_json::Value = serde_json::from_str(
+                &read_receipt_columns(&fixture, &ticket)
+                    .await
+                    .1
+                    .expect("mutated result is available"),
+            )
+            .expect("parse stored result");
+            assert_eq!(stored, mutated);
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn canonical_form_validation_is_read_only() {
+    let Some(bystander) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        cleanup(&bystander).await;
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let bystander_source = binding(&bystander, "bystander-source", "bystander-allocation");
+            register(&bystander, &bystander_source, "bystander-registration").await;
+
+            let (ticket, _, _, source) =
+                setup_completed_attempt(&fixture, "canonical-read-only").await;
+            let mut mutated = stored_result_json(&fixture, &ticket).await;
+            let sources = mutated["sources"]
+                .as_array_mut()
+                .expect("sources is an array");
+            sources.push(sources[0].clone());
+            let mutated_text = mutated.to_string();
+            try_set_result(&fixture, &ticket, &mutated_text)
+                .await
+                .expect("store mutated result");
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let bystander_before = durable_snapshot(&bystander).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(durable_snapshot(&bystander).await, bystander_before);
+            let stored: serde_json::Value = serde_json::from_str(
+                &read_receipt_columns(&fixture, &ticket)
+                    .await
+                    .1
+                    .expect("mutated result is available"),
+            )
+            .expect("parse stored result");
+            assert_eq!(stored, mutated);
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<_, String>(bystander_before)
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    let bystander_before = result.expect("supervised read-only case");
+    assert_scoped_cleanup(&fixture, &unrelated, &bystander, &bystander_before).await;
+}
+
+#[tokio::test]
+async fn database_failure_rolls_back_without_corruption_classification() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "database-source", "database-allocation");
+            register(&fixture, &source, "database-registration").await;
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+            let head_before = head_revision(&fixture).await;
+            let generation_before = coordinator_generation(&fixture).await;
+
+            let unknown_beneficiary = format!("coverage-reconciliation-test-{}", Uuid::new_v4());
+            let unknown = SourceBinding {
+                beneficiary_id: unknown_beneficiary.clone(),
+                source_id: format!("{unknown_beneficiary}:database-source"),
+                provider_namespace: format!("stripe:test:{unknown_beneficiary}"),
+                external_allocation_reference: "database-allocation".into(),
+                ownership_evidence_reference: "evidence:database-allocation".into(),
+            };
+            let mut tx = fixture
+                .pool
+                .begin()
+                .await
+                .expect("begin failing registration");
+            let result = register_source(&mut tx, "database-operation", &unknown).await;
+            match result {
+                Err(ReconciliationError::Database(error)) => assert_sqlstate(&error, "23503"),
+                other => panic!("expected database error, got {other:?}"),
+            }
+            tx.rollback().await.expect("rollback failing registration");
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(head_revision(&fixture).await, head_before);
+            assert_eq!(coordinator_generation(&fixture).await, generation_before);
+
+            complete_unrelated_operation(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised database failure case");
+    assert_no_beneficiary_rows(&fixture).await;
+    assert_no_beneficiary_rows(&unrelated).await;
+    assert!(!user_present(&fixture).await);
+    assert!(!user_present(&unrelated).await);
 }
 
 #[tokio::test]
