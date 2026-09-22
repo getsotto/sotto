@@ -209,19 +209,20 @@ where
     C: FnOnce() -> CF,
     CF: Future<Output = Result<(), String>>,
 {
-    let scenario_result = {
-        let scenario = scenario(owner);
-        match timeout(
-            scenario_budget,
-            std::panic::AssertUnwindSafe(scenario).catch_unwind(),
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(panic)) => Err(format!("scenario panicked: {}", panic_message(panic))),
-            Err(_) => Err("scenario timed out".into()),
-        }
-    };
+    let scenario_result =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scenario(owner))) {
+            Ok(scenario) => match timeout(
+                scenario_budget,
+                std::panic::AssertUnwindSafe(scenario).catch_unwind(),
+            )
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(panic)) => Err(format!("scenario panicked: {}", panic_message(panic))),
+                Err(_) => Err("scenario timed out".into()),
+            },
+            Err(panic) => Err(format!("scenario panicked: {}", panic_message(panic))),
+        };
     run_with_teardown_with_budgets(
         owner,
         async move { scenario_result },
