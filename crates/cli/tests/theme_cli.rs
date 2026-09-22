@@ -185,3 +185,35 @@ fn custom_theme_file_is_listed_and_selectable() {
     let current = run(dir.path(), &["theme", "current"], &[]);
     assert_eq!(stdout(&current), "synth\n");
 }
+
+#[test]
+fn invalid_non_ascii_custom_themes_are_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let themes = dir.path().join("themes");
+    std::fs::create_dir(&themes).unwrap();
+
+    let theme = |fg: &str| {
+        format!(
+            "name = \"probe-{fg}\"\n\
+             fg = \"{fg}\"\n\
+             accent = \"#ffffff\"\n\
+             success = \"#ffffff\"\n\
+             warning = \"#ffffff\"\n\
+             error = \"#ffffff\"\n\
+             muted = \"#ffffff\"\n\
+             border = \"#ffffff\"\n"
+        )
+    };
+    std::fs::write(themes.join("short.toml"), theme("#éa")).unwrap();
+    std::fs::write(themes.join("long.toml"), theme("#aé000")).unwrap();
+
+    let ls = run(dir.path(), &["theme", "ls"], &[]);
+
+    assert!(ls.status.success(), "stderr: {}", stderr(&ls));
+    assert!(!stdout(&ls).contains("probe-#éa"), "stdout: {}", stdout(&ls));
+    assert!(
+        !stdout(&ls).contains("probe-#aé000"),
+        "stdout: {}",
+        stdout(&ls)
+    );
+}
