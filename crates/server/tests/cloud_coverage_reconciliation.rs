@@ -120,6 +120,33 @@ impl Fixture {
             beneficiary_id,
         }
     }
+
+    async fn add_beneficiary_owned(&self, owner: &mut RaceTaskOwner) -> Result<Self, String> {
+        let beneficiary_id = format!("coverage-reconciliation-test-{}", Uuid::new_v4());
+        let cleanup_pool = self.pool.clone();
+        let cleanup_beneficiary = beneficiary_id.clone();
+        owner.register_cleanup(move || async move {
+            cleanup_result_for(&cleanup_pool, &cleanup_beneficiary).await
+        });
+        let insert_result = sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'reconciliation-test', $2)",
+        )
+        .bind(&beneficiary_id)
+        .bind(&beneficiary_id)
+        .execute(&self.pool)
+        .await;
+        if let Err(error) = insert_result {
+            let error = format!("insert second reconciliation test user: {error}");
+            return match owner.cleanup_registered().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; cleanup: {cleanup}")),
+            };
+        }
+        Ok(Self {
+            pool: self.pool.clone(),
+            beneficiary_id,
+        })
+    }
 }
 
 async fn cleanup(fixture: &Fixture) {
@@ -1628,133 +1655,166 @@ async fn a_new_source_supersedes_a_pending_collection() {
 
 #[tokio::test]
 async fn competing_source_claims_preserve_provider_allocation_ownership() {
-    let Some(first) = Fixture::create().await else {
+    let mut owner = RaceTaskOwner::new();
+    let Some(first) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
         return;
     };
-    let second = first.add_beneficiary().await;
+    let second = first
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
     let first_source = binding(&first, "owner-a", "shared-allocation");
     let mut second_source = binding(&second, "owner-b", "shared-allocation");
     second_source.provider_namespace = first_source.provider_namespace.clone();
 
     let release = Arc::new(Notify::new());
-    let (holder_ready, holder_ready_rx) = oneshot::channel();
-    let mut owner = RaceTaskOwner::new();
-    let mut holder = Some(owner.spawn(held_registration(
-        first.pool.clone(),
-        "owner-a-registration".into(),
-        first_source.clone(),
-        holder_ready,
-        release.clone(),
-    )));
-    let holder_pid = receive_pid(holder_ready_rx, "receive allocation holder pid").await;
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                let (holder_ready, holder_ready_rx) = oneshot::channel();
+                let mut holder = Some(owner.spawn(held_registration(
+                    first.pool.clone(),
+                    "owner-a-registration".into(),
+                    first_source.clone(),
+                    holder_ready,
+                    release.clone(),
+                )));
+                let holder_pid =
+                    receive_pid(holder_ready_rx, "receive allocation holder pid").await;
 
-    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
-    let waiter_pool = second.pool.clone();
-    let waiter_source = second_source.clone();
-    let mut waiter = Some(owner.spawn(async move {
-        let mut tx = waiter_pool.begin().await.expect("begin allocation waiter");
-        let pid = transaction_pid(&mut tx).await;
-        waiter_ready.send(pid).expect("signal allocation waiter");
-        let result = register_source(&mut tx, "owner-b-registration", &waiter_source).await;
-        tx.rollback().await.expect("rollback allocation waiter");
-        result
-    }));
-    let waiter_pid = receive_pid(waiter_ready_rx, "receive allocation waiter pid").await;
-    wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
-    release.notify_one();
+                let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+                let waiter_pool = second.pool.clone();
+                let waiter_source = second_source.clone();
+                let mut waiter = Some(owner.spawn(async move {
+                    let mut tx = waiter_pool.begin().await.expect("begin allocation waiter");
+                    let pid = transaction_pid(&mut tx).await;
+                    waiter_ready.send(pid).expect("signal allocation waiter");
+                    let result =
+                        register_source(&mut tx, "owner-b-registration", &waiter_source).await;
+                    tx.rollback().await.expect("rollback allocation waiter");
+                    result
+                }));
+                let waiter_pid =
+                    receive_pid(waiter_ready_rx, "receive allocation waiter pid").await;
+                wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
+                release.notify_one();
 
-    let first_receipt = receive_owned(&mut holder, "allocation holder")
-        .await
-        .expect("allocation holder task completed")
-        .expect("first allocation claim applied");
-    let second_result = receive_owned(&mut waiter, "allocation waiter")
-        .await
-        .expect("allocation waiter task completed");
-    owner.join_all().await.expect("join allocation race tasks");
-    assert_eq!(first_receipt.outcome, RegistrationOutcome::Applied);
-    assert!(matches!(
-        second_result,
-        Err(ReconciliationError::SourceBindingConflict)
-    ));
-    assert_no_beneficiary_rows(&second).await;
+                let first_receipt = receive_owned(&mut holder, "allocation holder")
+                    .await
+                    .expect("allocation holder task completed")
+                    .expect("first allocation claim applied");
+                let second_result = receive_owned(&mut waiter, "allocation waiter")
+                    .await
+                    .expect("allocation waiter task completed");
+                assert_eq!(first_receipt.outcome, RegistrationOutcome::Applied);
+                assert!(matches!(
+                    second_result,
+                    Err(ReconciliationError::SourceBindingConflict)
+                ));
+                assert_no_beneficiary_rows(&second).await;
 
-    let mut replay_tx = first.pool.begin().await.expect("begin allocation replay");
-    let replay = register_source(&mut replay_tx, "owner-a-registration", &first_source)
-        .await
-        .expect("replay winning allocation claim");
-    replay_tx.commit().await.expect("commit allocation replay");
-    assert_eq!(replay.outcome, RegistrationOutcome::AlreadyApplied);
-    assert_eq!(
-        replay.projection_revision,
-        first_receipt.projection_revision
-    );
-    cleanup(&second).await;
-    cleanup(&first).await;
+                let mut replay_tx = first.pool.begin().await.expect("begin allocation replay");
+                let replay = register_source(&mut replay_tx, "owner-a-registration", &first_source)
+                    .await
+                    .expect("replay winning allocation claim");
+                replay_tx.commit().await.expect("commit allocation replay");
+                assert_eq!(replay.outcome, RegistrationOutcome::AlreadyApplied);
+                assert_eq!(
+                    replay.projection_revision,
+                    first_receipt.projection_revision
+                );
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised allocation race");
 }
 
 #[tokio::test]
 async fn competing_source_claims_preserve_global_source_identity() {
-    let Some(first) = Fixture::create().await else {
+    let mut owner = RaceTaskOwner::new();
+    let Some(first) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
         return;
     };
-    let second = first.add_beneficiary().await;
+    let second = first
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
     let first_source = binding(&first, "shared-source", "allocation-a");
     let mut second_source = binding(&second, "different-source", "allocation-b");
     second_source.source_id = first_source.source_id.clone();
 
     let release = Arc::new(Notify::new());
-    let (holder_ready, holder_ready_rx) = oneshot::channel();
-    let mut owner = RaceTaskOwner::new();
-    let mut holder = Some(owner.spawn(held_registration(
-        first.pool.clone(),
-        "identity-a-registration".into(),
-        first_source.clone(),
-        holder_ready,
-        release.clone(),
-    )));
-    let holder_pid = receive_pid(holder_ready_rx, "receive identity holder pid").await;
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                let (holder_ready, holder_ready_rx) = oneshot::channel();
+                let mut holder = Some(owner.spawn(held_registration(
+                    first.pool.clone(),
+                    "identity-a-registration".into(),
+                    first_source.clone(),
+                    holder_ready,
+                    release.clone(),
+                )));
+                let holder_pid = receive_pid(holder_ready_rx, "receive identity holder pid").await;
 
-    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
-    let waiter_pool = second.pool.clone();
-    let waiter_source = second_source.clone();
-    let mut waiter = Some(owner.spawn(async move {
-        let mut tx = waiter_pool.begin().await.expect("begin identity waiter");
-        let pid = transaction_pid(&mut tx).await;
-        waiter_ready.send(pid).expect("signal identity waiter");
-        let result = register_source(&mut tx, "identity-b-registration", &waiter_source).await;
-        tx.rollback().await.expect("rollback identity waiter");
-        result
-    }));
-    let waiter_pid = receive_pid(waiter_ready_rx, "receive identity waiter pid").await;
-    wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
-    release.notify_one();
+                let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+                let waiter_pool = second.pool.clone();
+                let waiter_source = second_source.clone();
+                let mut waiter = Some(owner.spawn(async move {
+                    let mut tx = waiter_pool.begin().await.expect("begin identity waiter");
+                    let pid = transaction_pid(&mut tx).await;
+                    waiter_ready.send(pid).expect("signal identity waiter");
+                    let result =
+                        register_source(&mut tx, "identity-b-registration", &waiter_source).await;
+                    tx.rollback().await.expect("rollback identity waiter");
+                    result
+                }));
+                let waiter_pid = receive_pid(waiter_ready_rx, "receive identity waiter pid").await;
+                wait_for_specific_block(&first.pool, waiter_pid, holder_pid).await;
+                release.notify_one();
 
-    let first_receipt = receive_owned(&mut holder, "identity holder")
-        .await
-        .expect("identity holder task completed")
-        .expect("first identity claim applied");
-    let second_result = receive_owned(&mut waiter, "identity waiter")
-        .await
-        .expect("identity waiter task completed");
-    owner.join_all().await.expect("join identity race tasks");
-    assert_eq!(first_receipt.outcome, RegistrationOutcome::Applied);
-    assert!(matches!(
-        second_result,
-        Err(ReconciliationError::SourceBindingConflict)
-    ));
-    assert_no_beneficiary_rows(&second).await;
-    let mut replay_tx = first.pool.begin().await.expect("begin identity replay");
-    let replay = register_source(&mut replay_tx, "identity-a-registration", &first_source)
-        .await
-        .expect("replay winning identity claim");
-    replay_tx.commit().await.expect("commit identity replay");
-    assert_eq!(replay.outcome, RegistrationOutcome::AlreadyApplied);
-    assert_eq!(
-        replay.projection_revision,
-        first_receipt.projection_revision
-    );
-    cleanup(&second).await;
-    cleanup(&first).await;
+                let first_receipt = receive_owned(&mut holder, "identity holder")
+                    .await
+                    .expect("identity holder task completed")
+                    .expect("first identity claim applied");
+                let second_result = receive_owned(&mut waiter, "identity waiter")
+                    .await
+                    .expect("identity waiter task completed");
+                assert_eq!(first_receipt.outcome, RegistrationOutcome::Applied);
+                assert!(matches!(
+                    second_result,
+                    Err(ReconciliationError::SourceBindingConflict)
+                ));
+                assert_no_beneficiary_rows(&second).await;
+                let mut replay_tx = first.pool.begin().await.expect("begin identity replay");
+                let replay =
+                    register_source(&mut replay_tx, "identity-a-registration", &first_source)
+                        .await
+                        .expect("replay winning identity claim");
+                replay_tx.commit().await.expect("commit identity replay");
+                assert_eq!(replay.outcome, RegistrationOutcome::AlreadyApplied);
+                assert_eq!(
+                    replay.projection_revision,
+                    first_receipt.projection_revision
+                );
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised identity race");
 }
 
 #[tokio::test]
