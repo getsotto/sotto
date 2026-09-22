@@ -4,8 +4,8 @@ use sotto_server::cloud_coverage::{
     evaluate, ConfirmedPaidInterval, CoverageState, PersonCoverage,
 };
 use sotto_server::cloud_coverage_store::{
-    load, publish, CoverageProjection, LoadedCoverage, PublicationOutcome, StoreError,
-    UnavailableReason,
+    load, publish, CoverageProjection, LoadedCoverage, PublicationOutcome, PublicationReceipt,
+    StoreError, UnavailableReason,
 };
 use sotto_server::db;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -171,6 +171,10 @@ fn recovery(
 /// a unique application name and acknowledge the exact pause point through `pg_stat_activity`
 /// instead of adding a hook to the production reader.
 async fn loader_pool(application_name: &str) -> PgPool {
+    debug_assert!(
+        application_name.len() <= 63,
+        "PostgreSQL truncates application_name past 63 bytes, breaking backend lookup"
+    );
     let database_url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL is required for loader pool");
     let options = PgConnectOptions::from_str(&database_url)
@@ -183,12 +187,25 @@ async fn loader_pool(application_name: &str) -> PgPool {
         .expect("connect loader pool")
 }
 
-/// Hold the table lock that pauses the loader at one read boundary.
+/// Begin a writer transaction holding the loader observation lock.
 ///
 /// `ACCESS EXCLUSIVE` is the only table lock that blocks the loader's plain `SELECT`s. The
 /// writer takes it after its publication writes, so the loader completes every earlier read
-/// and then waits at this table until the writer commits or rolls back.
-async fn hold_exclusive_table_lock(tx: &mut Transaction<'_, Postgres>, table: &'static str) {
+/// and then waits at this table until the writer commits or rolls back. A blocking lock
+/// request would deadlock against overlapping writers upgrading from their own publication
+/// locks, so take the lock with `NOWAIT` and retry on a fresh transaction while the table
+/// is contended. Failed `NOWAIT` attempts never queue, so no other test can wait behind
+/// this writer and no lock cycle can form. Callers prove uncommitted invisibility in a
+/// separate probe transaction first, so the pause choreography after the lock never retries.
+async fn begin_locked_writer(
+    pool: &PgPool,
+    beneficiary_id: &str,
+    expected_revision: Option<i64>,
+    operation_id: &str,
+    evidence_reference: &str,
+    projection: &CoverageProjection,
+    table: &'static str,
+) -> (Transaction<'static, Postgres>, PublicationReceipt) {
     assert!(
         matches!(
             table,
@@ -196,10 +213,51 @@ async fn hold_exclusive_table_lock(tx: &mut Transaction<'_, Postgres>, table: &'
         ),
         "refusing loader pause on unexpected table"
     );
-    sqlx::query(&format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
-        .execute(&mut **tx)
+    let deadline = Instant::now() + RACE_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            panic!("timed out acquiring loader observation lock on {table}");
+        }
+        let mut tx = pool.begin().await.expect("begin locked writer");
+        let receipt = match publish(
+            &mut tx,
+            beneficiary_id,
+            expected_revision,
+            operation_id,
+            evidence_reference,
+            projection,
+        )
         .await
-        .expect("lock loader observation table");
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                tx.rollback()
+                    .await
+                    .expect("roll back failed locked publication");
+                panic!("publish locked revision: {error}");
+            }
+        };
+        let lock = sqlx::query(&format!(
+            "LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE NOWAIT"
+        ))
+        .execute(&mut *tx)
+        .await;
+        match lock {
+            Ok(_) => return (tx, receipt),
+            Err(error) if is_lock_unavailable(&error) => {
+                tx.rollback().await.expect("roll back contended writer");
+                sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => {
+                tx.rollback().await.expect("roll back failed lock");
+                panic!("lock loader observation table: {error}");
+            }
+        }
+    }
+}
+
+fn is_lock_unavailable(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(db) if db.code().as_deref() == Some("55P03"))
 }
 
 /// Wait until the backend running under `application_name` blocks behind `holder_pid`.
@@ -235,6 +293,42 @@ async fn wait_for_blocked_backend(pool: &PgPool, application_name: &str, holder_
         }
         sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// The durable projection state used to prove a failed load repairs nothing.
+async fn projection_snapshot(
+    pool: &PgPool,
+    beneficiary_id: &str,
+) -> (
+    Option<Option<i64>>,
+    Vec<(i64, String, Option<String>, i64)>,
+    Vec<(i64, String, String, i64, i64, Option<String>)>,
+) {
+    let head: Option<Option<i64>> = sqlx::query_scalar(
+        "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
+    )
+    .bind(beneficiary_id)
+    .fetch_optional(pool)
+    .await
+    .expect("snapshot corrupt head");
+    let revisions: Vec<(i64, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT revision, status, unavailable_reason, fact_count \
+         FROM cloud_coverage_revisions WHERE beneficiary_id = $1 ORDER BY revision",
+    )
+    .bind(beneficiary_id)
+    .fetch_all(pool)
+    .await
+    .expect("snapshot corrupt revisions");
+    let facts: Vec<(i64, String, String, i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT revision, coverage_id, source_id, starts_at, paid_until, failed_renewal_id \
+         FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1 \
+         ORDER BY revision, coverage_id",
+    )
+    .bind(beneficiary_id)
+    .fetch_all(pool)
+    .await
+    .expect("snapshot corrupt facts");
+    (head, revisions, facts)
 }
 
 async fn committed_publish(
@@ -1459,32 +1553,50 @@ async fn loader_pause_acknowledges_between_metadata_and_facts_reads() {
         &mut owner,
         |owner| {
             Box::pin(async move {
-                let mut writer = fixture.pool.begin().await.expect("begin held publication");
-                let held = publish(
-                    &mut writer,
+                let next = CoverageProjection::Complete {
+                    paid_intervals: vec![
+                        paid("pause-new-a", "personal", 0, 30 * DAY),
+                        paid("pause-new-b", "personal", 30 * DAY, 60 * DAY),
+                    ],
+                };
+                let mut probe = fixture
+                    .pool
+                    .begin()
+                    .await
+                    .expect("begin invisibility probe");
+                publish(
+                    &mut probe,
                     &fixture.beneficiary_id,
                     Some(1),
                     "pause-next",
                     "pause-next-evidence",
-                    &CoverageProjection::Complete {
-                        paid_intervals: vec![
-                            paid("pause-new-a", "personal", 0, 30 * DAY),
-                            paid("pause-new-b", "personal", 30 * DAY, 60 * DAY),
-                        ],
-                    },
+                    &next,
                 )
                 .await
-                .expect("publish held revision");
-                assert_eq!(held.revision, 2);
+                .expect("publish probe revision");
                 let before = load(&fixture.pool, &fixture.beneficiary_id)
                     .await
                     .expect("load before lock");
                 assert_eq!(before.revision, 1);
+                probe
+                    .rollback()
+                    .await
+                    .expect("roll back invisibility probe");
 
-                hold_exclusive_table_lock(&mut writer, "cloud_coverage_revision_facts").await;
+                let (mut writer, held) = begin_locked_writer(
+                    &fixture.pool,
+                    &fixture.beneficiary_id,
+                    Some(1),
+                    "pause-next",
+                    "pause-next-evidence",
+                    &next,
+                    "cloud_coverage_revision_facts",
+                )
+                .await;
+                assert_eq!(held.revision, 2);
                 let writer_pid = transaction_pid(&mut writer).await;
 
-                let loader_app = format!("coverage-loader-pause-{}", Uuid::new_v4());
+                let loader_app = format!("coverage-loader-pause-{}", Uuid::new_v4().simple());
                 let loader_pool = loader_pool(&loader_app).await;
                 let load_pool = loader_pool.clone();
                 let beneficiary_id = fixture.beneficiary_id.clone();
@@ -1510,6 +1622,7 @@ async fn loader_pause_acknowledges_between_metadata_and_facts_reads() {
                     .expect("paused loader task completed")
                     .expect("paused load succeeded");
                 assert_eq!(paused.revision, 1);
+                loader_pool.close().await;
                 let after = load(&fixture.pool, &fixture.beneficiary_id)
                     .await
                     .expect("load after commit");
@@ -1565,32 +1678,50 @@ async fn complete_load_returns_one_committed_snapshot_across_writer_commit() {
         &mut owner,
         |owner| {
             Box::pin(async move {
-                let mut writer = fixture.pool.begin().await.expect("begin held publication");
-                let held = publish(
-                    &mut writer,
+                let next = CoverageProjection::Complete {
+                    paid_intervals: vec![
+                        paid("snap-new-a", "sponsor", 90 * DAY, 120 * DAY),
+                        paid("snap-new-B", "personal", 120 * DAY, 150 * DAY),
+                    ],
+                };
+                let mut probe = fixture
+                    .pool
+                    .begin()
+                    .await
+                    .expect("begin invisibility probe");
+                publish(
+                    &mut probe,
                     &fixture.beneficiary_id,
                     Some(1),
                     "snapshot-next",
                     "snapshot-next-evidence",
-                    &CoverageProjection::Complete {
-                        paid_intervals: vec![
-                            paid("snap-new-a", "sponsor", 90 * DAY, 120 * DAY),
-                            paid("snap-new-B", "personal", 120 * DAY, 150 * DAY),
-                        ],
-                    },
+                    &next,
                 )
                 .await
-                .expect("publish held revision");
-                assert_eq!(held.revision, 2);
+                .expect("publish probe revision");
                 let before = load(&fixture.pool, &fixture.beneficiary_id)
                     .await
                     .expect("load before lock");
                 assert_eq!(before, expected_old);
+                probe
+                    .rollback()
+                    .await
+                    .expect("roll back invisibility probe");
 
-                hold_exclusive_table_lock(&mut writer, "cloud_coverage_revision_facts").await;
+                let (mut writer, held) = begin_locked_writer(
+                    &fixture.pool,
+                    &fixture.beneficiary_id,
+                    Some(1),
+                    "snapshot-next",
+                    "snapshot-next-evidence",
+                    &next,
+                    "cloud_coverage_revision_facts",
+                )
+                .await;
+                assert_eq!(held.revision, 2);
                 let writer_pid = transaction_pid(&mut writer).await;
 
-                let loader_app = format!("coverage-loader-snapshot-{}", Uuid::new_v4());
+                let loader_app = format!("coverage-loader-snapshot-{}", Uuid::new_v4().simple());
                 let loader_pool = loader_pool(&loader_app).await;
                 let load_pool = loader_pool.clone();
                 let beneficiary_id = fixture.beneficiary_id.clone();
@@ -1606,6 +1737,7 @@ async fn complete_load_returns_one_committed_snapshot_across_writer_commit() {
                     .expect("paused loader task completed")
                     .expect("paused load succeeded");
                 assert_eq!(paused, expected_old);
+                loader_pool.close().await;
                 assert!(
                     paused
                         .coverage
@@ -1683,4 +1815,508 @@ async fn complete_load_returns_one_committed_snapshot_across_writer_commit() {
     )
     .await;
     result.expect("supervised snapshot interleaving");
+}
+
+#[tokio::test]
+async fn unavailable_load_never_mixes_with_committed_replacement() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    committed_publish(
+        &fixture,
+        None,
+        "unavailable-base",
+        "unavailable-base-evidence",
+        &CoverageProjection::Unavailable {
+            reason: UnavailableReason::NeedsReconciliation,
+        },
+    )
+    .await
+    .expect("publish unavailable base");
+
+    let mut owner = RaceTaskOwner::new();
+    let cleanup_pool = fixture.pool.clone();
+    let cleanup_beneficiary = fixture.beneficiary_id.clone();
+    owner.register_cleanup(move || async move {
+        cleanup_result_for(&cleanup_pool, &cleanup_beneficiary).await
+    });
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                let next = CoverageProjection::Complete {
+                    paid_intervals: vec![
+                        paid("replace-a", "personal", 0, 30 * DAY),
+                        paid("replace-b", "sponsor", 30 * DAY, 60 * DAY),
+                    ],
+                };
+                let mut probe = fixture
+                    .pool
+                    .begin()
+                    .await
+                    .expect("begin invisibility probe");
+                publish(
+                    &mut probe,
+                    &fixture.beneficiary_id,
+                    Some(1),
+                    "unavailable-replacement",
+                    "unavailable-replacement-evidence",
+                    &next,
+                )
+                .await
+                .expect("publish probe replacement");
+                // The probe load early-returns without committing, leaving its rollback
+                // queued on its pooled connection; close the check pool so the lingering
+                // table lock is released before the writer takes its observation lock.
+                let check_pool = loader_pool(&format!(
+                    "coverage-loader-unavail-check-{}",
+                    Uuid::new_v4().simple()
+                ))
+                .await;
+                assert!(matches!(
+                    load(&check_pool, &fixture.beneficiary_id).await,
+                    Err(StoreError::ProjectionUnavailable(
+                        UnavailableReason::NeedsReconciliation
+                    ))
+                ));
+                check_pool.close().await;
+                probe
+                    .rollback()
+                    .await
+                    .expect("roll back invisibility probe");
+
+                let (mut writer, held) = begin_locked_writer(
+                    &fixture.pool,
+                    &fixture.beneficiary_id,
+                    Some(1),
+                    "unavailable-replacement",
+                    "unavailable-replacement-evidence",
+                    &next,
+                    "cloud_coverage_revisions",
+                )
+                .await;
+                assert_eq!(held.revision, 2);
+                let writer_pid = transaction_pid(&mut writer).await;
+
+                let loader_app = format!("coverage-loader-unavailable-{}", Uuid::new_v4().simple());
+                let loader_pool = loader_pool(&loader_app).await;
+                let load_pool = loader_pool.clone();
+                let beneficiary_id = fixture.beneficiary_id.clone();
+                let mut loader =
+                    Some(owner.spawn(async move { load(&load_pool, &beneficiary_id).await }));
+                let loader_pid =
+                    wait_for_blocked_backend(&fixture.pool, &loader_app, writer_pid).await;
+                assert_ne!(loader_pid, writer_pid);
+                let loader_query: String =
+                    sqlx::query_scalar("SELECT query FROM pg_stat_activity WHERE pid = $1")
+                        .bind(loader_pid)
+                        .fetch_one(&fixture.pool)
+                        .await
+                        .expect("read paused loader query");
+                assert!(
+                    loader_query.contains("FROM cloud_coverage_revisions"),
+                    "paused loader waits at the metadata read, observed: {loader_query}"
+                );
+
+                writer.commit().await.expect("commit held replacement");
+                let paused = receive_owned(&mut loader, "paused loader")
+                    .await
+                    .expect("paused loader task completed");
+                loader_pool.close().await;
+                assert!(matches!(
+                    paused,
+                    Err(StoreError::ProjectionUnavailable(
+                        UnavailableReason::NeedsReconciliation
+                    ))
+                ));
+
+                let after = load(&fixture.pool, &fixture.beneficiary_id)
+                    .await
+                    .expect("load after commit");
+                assert_eq!(
+                    after,
+                    LoadedCoverage {
+                        revision: 2,
+                        coverage: PersonCoverage {
+                            beneficiary_id: fixture.beneficiary_id.clone(),
+                            paid_intervals: vec![
+                                paid("replace-a", "personal", 0, 30 * DAY),
+                                paid("replace-b", "sponsor", 30 * DAY, 60 * DAY),
+                            ],
+                        },
+                    }
+                );
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised unavailable interleaving");
+}
+
+#[tokio::test]
+async fn rolled_back_publication_preserves_old_snapshot_and_retry_applies_once() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let Some(unrelated) = Fixture::create().await else {
+        return;
+    };
+    let old_intervals = vec![
+        paid("rollback-old-a", "personal", 0, 30 * DAY),
+        paid("rollback-old-b", "sponsor", 30 * DAY, 60 * DAY),
+    ];
+    committed_publish(
+        &fixture,
+        None,
+        "rollback-base",
+        "rollback-base-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: old_intervals.clone(),
+        },
+    )
+    .await
+    .expect("publish rollback base");
+    committed_publish(
+        &unrelated,
+        None,
+        "rollback-unrelated-base",
+        "rollback-unrelated-base-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![paid("rollback-unrelated-a", "personal", 0, 30 * DAY)],
+        },
+    )
+    .await
+    .expect("publish unrelated base");
+
+    let mut owner = RaceTaskOwner::new();
+    for (pool, beneficiary_id) in [
+        (fixture.pool.clone(), fixture.beneficiary_id.clone()),
+        (unrelated.pool.clone(), unrelated.beneficiary_id.clone()),
+    ] {
+        owner.register_cleanup(
+            move || async move { cleanup_result_for(&pool, &beneficiary_id).await },
+        );
+    }
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                let next = CoverageProjection::Complete {
+                    paid_intervals: vec![paid("rollback-new-a", "personal", 0, 30 * DAY)],
+                };
+                let mut probe = fixture
+                    .pool
+                    .begin()
+                    .await
+                    .expect("begin invisibility probe");
+                publish(
+                    &mut probe,
+                    &fixture.beneficiary_id,
+                    Some(1),
+                    "rollback-next",
+                    "rollback-next-evidence",
+                    &next,
+                )
+                .await
+                .expect("publish probe revision");
+                let before = load(&fixture.pool, &fixture.beneficiary_id)
+                    .await
+                    .expect("load before lock");
+                assert_eq!(before.revision, 1);
+                assert_eq!(before.coverage.paid_intervals, old_intervals);
+                probe
+                    .rollback()
+                    .await
+                    .expect("roll back invisibility probe");
+
+                let (mut writer, held) = begin_locked_writer(
+                    &fixture.pool,
+                    &fixture.beneficiary_id,
+                    Some(1),
+                    "rollback-next",
+                    "rollback-next-evidence",
+                    &next,
+                    "cloud_coverage_revision_facts",
+                )
+                .await;
+                assert_eq!(held.revision, 2);
+                let writer_pid = transaction_pid(&mut writer).await;
+
+                let loader_app = format!("coverage-loader-rollback-{}", Uuid::new_v4().simple());
+                let loader_pool = loader_pool(&loader_app).await;
+                let load_pool = loader_pool.clone();
+                let beneficiary_id = fixture.beneficiary_id.clone();
+                let mut loader =
+                    Some(owner.spawn(async move { load(&load_pool, &beneficiary_id).await }));
+                let loader_pid =
+                    wait_for_blocked_backend(&fixture.pool, &loader_app, writer_pid).await;
+                assert_ne!(loader_pid, writer_pid);
+
+                let unrelated_pool = unrelated.pool.clone();
+                let unrelated_beneficiary = unrelated.beneficiary_id.clone();
+                let mut progress = Some(owner.spawn(async move {
+                    let mut tx = unrelated_pool
+                        .begin()
+                        .await
+                        .expect("begin unrelated publication");
+                    let receipt = publish(
+                        &mut tx,
+                        &unrelated_beneficiary,
+                        Some(1),
+                        "rollback-unrelated-next",
+                        "rollback-unrelated-next-evidence",
+                        &CoverageProjection::Complete {
+                            paid_intervals: vec![paid(
+                                "rollback-unrelated-b",
+                                "sponsor",
+                                30 * DAY,
+                                60 * DAY,
+                            )],
+                        },
+                    )
+                    .await
+                    .expect("publish unrelated revision");
+                    tx.commit().await.expect("commit unrelated publication");
+                    let loaded = load(&unrelated_pool, &unrelated_beneficiary)
+                        .await
+                        .expect("load unrelated revision");
+                    (receipt, loaded)
+                }));
+
+                writer.rollback().await.expect("roll back held publication");
+                let paused = receive_owned(&mut loader, "paused loader")
+                    .await
+                    .expect("paused loader task completed")
+                    .expect("paused load succeeded");
+                assert_eq!(paused.revision, 1);
+                assert_eq!(paused.coverage.paid_intervals, old_intervals);
+                loader_pool.close().await;
+
+                let (receipt, unrelated_loaded) =
+                    receive_owned(&mut progress, "unrelated progress")
+                        .await
+                        .expect("unrelated progress task completed");
+                assert_eq!(receipt.outcome, PublicationOutcome::Applied);
+                assert_eq!(receipt.revision, 2);
+                assert_eq!(unrelated_loaded.revision, 2);
+
+                let aborted: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_revisions \
+                     WHERE beneficiary_id = $1 AND operation_id = 'rollback-next'",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count aborted revision");
+                assert_eq!(aborted, 0);
+
+                let retry = committed_publish(
+                    &fixture,
+                    Some(1),
+                    "rollback-next",
+                    "rollback-next-evidence",
+                    &CoverageProjection::Complete {
+                        paid_intervals: vec![paid("rollback-new-a", "personal", 0, 30 * DAY)],
+                    },
+                )
+                .await
+                .expect("retry after rollback");
+                assert_eq!(retry.outcome, PublicationOutcome::Applied);
+                assert_eq!(retry.revision, 2);
+                let head: Option<i64> = sqlx::query_scalar(
+                    "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("read retry head");
+                assert_eq!(head, Some(2));
+                let orphans: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_revision_facts AS facts \
+                     WHERE beneficiary_id = $1 AND NOT EXISTS (
+                         SELECT 1 FROM cloud_coverage_revisions AS revisions \
+                         WHERE revisions.beneficiary_id = facts.beneficiary_id \
+                         AND revisions.revision = facts.revision
+                     )",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count orphan facts");
+                assert_eq!(orphans, 0);
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised rollback interleaving");
+}
+
+#[tokio::test]
+async fn corrupt_projection_fails_closed_while_unrelated_beneficiary_progresses() {
+    let Some(missing) = Fixture::create().await else {
+        return;
+    };
+    let Some(miscounted) = Fixture::create().await else {
+        return;
+    };
+    let Some(status) = Fixture::create().await else {
+        return;
+    };
+    let Some(unrelated) = Fixture::create().await else {
+        return;
+    };
+    for fixture in [&missing, &miscounted, &status] {
+        committed_publish(
+            fixture,
+            None,
+            "corrupt-base",
+            "corrupt-base-evidence",
+            &CoverageProjection::Complete {
+                paid_intervals: vec![paid("corrupt-fact", "personal", 0, 30 * DAY)],
+            },
+        )
+        .await
+        .expect("publish corrupt base");
+    }
+    committed_publish(
+        &unrelated,
+        None,
+        "corrupt-unrelated-base",
+        "corrupt-unrelated-base-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![paid("corrupt-unrelated-a", "personal", 0, 30 * DAY)],
+        },
+    )
+    .await
+    .expect("publish unrelated base");
+    sqlx::query(
+        "UPDATE cloud_coverage_revisions SET fact_count = 999 \
+         WHERE beneficiary_id = $1 AND revision = 1",
+    )
+    .bind(&miscounted.beneficiary_id)
+    .execute(&miscounted.pool)
+    .await
+    .expect("corrupt stored fact count");
+
+    let mut owner = RaceTaskOwner::new();
+    for (pool, beneficiary_id) in [
+        (missing.pool.clone(), missing.beneficiary_id.clone()),
+        (miscounted.pool.clone(), miscounted.beneficiary_id.clone()),
+        (status.pool.clone(), status.beneficiary_id.clone()),
+        (unrelated.pool.clone(), unrelated.beneficiary_id.clone()),
+    ] {
+        owner.register_cleanup(
+            move || async move { cleanup_result_for(&pool, &beneficiary_id).await },
+        );
+    }
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                let unrelated_pool = unrelated.pool.clone();
+                let unrelated_beneficiary = unrelated.beneficiary_id.clone();
+                let mut progress = Some(owner.spawn(async move {
+                    let mut tx = unrelated_pool
+                        .begin()
+                        .await
+                        .expect("begin unrelated publication");
+                    let receipt = publish(
+                        &mut tx,
+                        &unrelated_beneficiary,
+                        Some(1),
+                        "corrupt-unrelated-next",
+                        "corrupt-unrelated-next-evidence",
+                        &CoverageProjection::Complete {
+                            paid_intervals: vec![
+                                paid("corrupt-unrelated-b", "sponsor", 30 * DAY, 60 * DAY),
+                            ],
+                        },
+                    )
+                    .await
+                    .expect("publish unrelated revision");
+                    tx.commit().await.expect("commit unrelated publication");
+                    let loaded = load(&unrelated_pool, &unrelated_beneficiary)
+                        .await
+                        .expect("load unrelated revision");
+                    (receipt, loaded)
+                }));
+
+                // A head pointing at a missing revision cannot exist durably: the
+                // head-to-revision foreign key rejects the corrupting write, so the
+                // loader's missing-revision arm stays unreachable and the projection
+                // keeps loading.
+                let missing_before =
+                    projection_snapshot(&missing.pool, &missing.beneficiary_id).await;
+                let missing_head = sqlx::query(
+                    "UPDATE cloud_coverage_heads SET current_revision = 999 \
+                     WHERE beneficiary_id = $1",
+                )
+                .bind(&missing.beneficiary_id)
+                .execute(&missing.pool)
+                .await;
+                assert!(
+                    matches!(&missing_head, Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("23503")),
+                    "head at missing revision violates the head foreign key, observed: {missing_head:?}"
+                );
+                assert_eq!(
+                    projection_snapshot(&missing.pool, &missing.beneficiary_id).await,
+                    missing_before
+                );
+                let missing_loaded = load(&missing.pool, &missing.beneficiary_id)
+                    .await
+                    .expect("load after rejected head corruption");
+                assert_eq!(missing_loaded.revision, 1);
+
+                let miscounted_before =
+                    projection_snapshot(&miscounted.pool, &miscounted.beneficiary_id).await;
+                let miscounted_result = load(&miscounted.pool, &miscounted.beneficiary_id).await;
+                assert!(matches!(
+                    miscounted_result,
+                    Err(StoreError::CorruptProjection(message))
+                        if message == "revision 1 declares 999 facts but stores 1"
+                ));
+                assert_eq!(
+                    projection_snapshot(&miscounted.pool, &miscounted.beneficiary_id).await,
+                    miscounted_before
+                );
+
+                let status_before =
+                    projection_snapshot(&status.pool, &status.beneficiary_id).await;
+                let invalid_status = sqlx::query(
+                    "UPDATE cloud_coverage_revisions SET status = 'bogus' \
+                     WHERE beneficiary_id = $1 AND revision = 1",
+                )
+                .bind(&status.beneficiary_id)
+                .execute(&status.pool)
+                .await;
+                assert!(
+                    matches!(&invalid_status, Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("23514")),
+                    "invalid status violates the status check, observed: {invalid_status:?}"
+                );
+                assert_eq!(
+                    projection_snapshot(&status.pool, &status.beneficiary_id).await,
+                    status_before
+                );
+
+                let (receipt, unrelated_loaded) = receive_owned(&mut progress, "unrelated progress")
+                    .await
+                    .expect("unrelated progress task completed");
+                assert_eq!(receipt.outcome, PublicationOutcome::Applied);
+                assert_eq!(receipt.revision, 2);
+                assert_eq!(unrelated_loaded.revision, 2);
+                assert_eq!(
+                    unrelated_loaded.coverage.paid_intervals,
+                    vec![paid("corrupt-unrelated-b", "sponsor", 30 * DAY, 60 * DAY)]
+                );
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised corruption controls");
 }
