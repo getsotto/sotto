@@ -601,7 +601,7 @@ async fn setup_completed_pair(
     (ticket, observations, evidence, first, second)
 }
 
-type CoordinatorRow = (i64, i64, Option<String>);
+type CoordinatorRow = (i64, i64, Option<String>, String);
 type SourceRow = (
     String,
     String,
@@ -611,6 +611,7 @@ type SourceRow = (
     String,
     i64,
     Option<i64>,
+    String,
 );
 type AttemptRow = (
     String,
@@ -622,6 +623,8 @@ type AttemptRow = (
     Option<String>,
     Option<String>,
     Option<i64>,
+    String,
+    Option<String>,
 );
 type RevisionRow = (i64, String, String, String, Option<String>, i64);
 type FactRow = (i64, String, String, i64, i64, Option<String>);
@@ -638,7 +641,8 @@ struct DurableSnapshot {
 
 async fn durable_snapshot(fixture: &Fixture) -> DurableSnapshot {
     let coordinator = sqlx::query_as(
-        "SELECT source_set_generation, collection_epoch, current_attempt_id \
+        "SELECT source_set_generation, collection_epoch, current_attempt_id, \
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
          FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
     )
     .bind(&fixture.beneficiary_id)
@@ -648,7 +652,8 @@ async fn durable_snapshot(fixture: &Fixture) -> DurableSnapshot {
     let sources = sqlx::query_as(
         "SELECT source_id, beneficiary_id, provider_namespace, external_allocation_reference, \
                 ownership_evidence_reference, registration_operation_id, \
-                registration_source_set_generation, registration_projection_revision \
+                registration_source_set_generation, registration_projection_revision, \
+                to_char(registered_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
          FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id",
     )
     .bind(&fixture.beneficiary_id)
@@ -658,7 +663,9 @@ async fn durable_snapshot(fixture: &Fixture) -> DurableSnapshot {
     let attempts = sqlx::query_as(
         "SELECT attempt_id, collection_epoch, source_set_generation, \
                 expected_projection_revision, source_bindings::text, status, \
-                aggregate_evidence_reference, canonical_result::text, projection_revision \
+                aggregate_evidence_reference, canonical_result::text, projection_revision, \
+                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'), \
+                to_char(completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
          FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 \
          ORDER BY collection_epoch",
     )
