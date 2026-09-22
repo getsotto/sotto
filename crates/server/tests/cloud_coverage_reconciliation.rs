@@ -5766,6 +5766,200 @@ async fn database_failure_rolls_back_without_corruption_classification() {
 }
 
 #[tokio::test]
+async fn historical_replay_returns_stored_receipt_after_later_registration() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let first = binding(&fixture, "historical-first", "historical-allocation-first");
+            register(&fixture, &first, "historical-first-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "historical-attempt")).await;
+            let observations = vec![complete_observation(
+                &first.source_id,
+                "historical-evidence",
+                "historical-coverage",
+            )];
+            let completed =
+                complete(&fixture, &ticket, "historical-aggregate", &observations).await;
+            assert_eq!(completed.revision, 2);
+            let second = binding(
+                &fixture,
+                "historical-second",
+                "historical-allocation-second",
+            );
+            register(&fixture, &second, "historical-second-registration").await;
+            assert_eq!(coordinator_generation(&fixture).await, 2);
+            assert_eq!(head_revision(&fixture).await, 3);
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+
+            let replayed =
+                committed_finish(&fixture, &ticket, "historical-aggregate", &observations).await;
+            let replayed = replayed.expect("replay historical completion");
+            assert_eq!(replayed.outcome, PublicationOutcome::AlreadyApplied);
+            assert_eq!(replayed.revision, completed.revision);
+            let ticket_replay = committed_begin(&fixture, &ticket.attempt_id)
+                .await
+                .expect("replay historical ticket");
+            assert_eq!(ticket_replay.completed_revision, Some(completed.revision));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(head_revision(&fixture).await, 3);
+            assert_eq!(coordinator_generation(&fixture).await, 2);
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised historical replay case");
+    assert_no_beneficiary_rows(&fixture).await;
+    assert_no_beneficiary_rows(&unrelated).await;
+    assert!(!user_present(&fixture).await);
+    assert!(!user_present(&unrelated).await);
+}
+
+#[tokio::test]
+async fn historical_replay_with_changed_arguments_is_an_operation_conflict() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let first = binding(&fixture, "historical-first", "historical-allocation-first");
+            register(&fixture, &first, "historical-first-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "historical-attempt")).await;
+            let observations = vec![complete_observation(
+                &first.source_id,
+                "historical-evidence",
+                "historical-coverage",
+            )];
+            complete(&fixture, &ticket, "historical-aggregate", &observations).await;
+            let second = binding(
+                &fixture,
+                "historical-second",
+                "historical-allocation-second",
+            );
+            register(&fixture, &second, "historical-second-registration").await;
+
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&first.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::OperationConflict)
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(head_revision(&fixture).await, 3);
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised historical conflict case");
+    assert_no_beneficiary_rows(&fixture).await;
+    assert_no_beneficiary_rows(&unrelated).await;
+    assert!(!user_present(&fixture).await);
+    assert!(!user_present(&unrelated).await);
+}
+
+#[tokio::test]
+async fn tampered_historical_generation_is_source_set_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let first = binding(&fixture, "historical-first", "historical-allocation-first");
+            register(&fixture, &first, "historical-first-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "historical-attempt")).await;
+            let observations = vec![complete_observation(
+                &first.source_id,
+                "historical-evidence",
+                "historical-coverage",
+            )];
+            complete(&fixture, &ticket, "historical-aggregate", &observations).await;
+            let second = binding(
+                &fixture,
+                "historical-second",
+                "historical-allocation-second",
+            );
+            register(&fixture, &second, "historical-second-registration").await;
+
+            corrupt_generation(&fixture, &ticket, 2).await;
+            let fixture_before = durable_snapshot(&fixture).await;
+            let unrelated_before = durable_snapshot(&unrelated).await;
+
+            assert!(matches!(
+                committed_finish(&fixture, &ticket, "historical-aggregate", &observations).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::BindingSourceSet
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::BindingSourceSet
+                ))
+            ));
+
+            assert_eq!(durable_snapshot(&fixture).await, fixture_before);
+            assert_eq!(durable_snapshot(&unrelated).await, unrelated_before);
+            assert_eq!(head_revision(&fixture).await, 3);
+            assert_eq!(coordinator_generation(&fixture).await, 2);
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised tampered generation case");
+    assert_no_beneficiary_rows(&fixture).await;
+    assert_no_beneficiary_rows(&unrelated).await;
+    assert!(!user_present(&fixture).await);
+    assert!(!user_present(&unrelated).await);
+}
+
+#[tokio::test]
 async fn beneficiaries_can_independently_use_the_same_attempt_id() {
     let Some(first) = Fixture::create().await else {
         return;
