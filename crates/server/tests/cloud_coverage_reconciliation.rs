@@ -442,6 +442,165 @@ fn changed_observation(source_id: &str) -> SourceObservation {
     }
 }
 
+async fn try_set_receipt(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    evidence: Option<&str>,
+    result: Option<&str>,
+    revision: Option<i64>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET aggregate_evidence_reference = $3, \
+                canonical_result = $4::jsonb, projection_revision = $5 \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(evidence)
+    .bind(result)
+    .bind(revision)
+    .execute(&fixture.pool)
+    .await
+    .map(|_| ())
+}
+
+async fn try_set_result(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    raw: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET canonical_result = $3::jsonb \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(raw)
+    .execute(&fixture.pool)
+    .await
+    .map(|_| ())
+}
+
+async fn try_set_evidence(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    evidence: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET aggregate_evidence_reference = $3 \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(evidence)
+    .execute(&fixture.pool)
+    .await
+    .map(|_| ())
+}
+
+async fn try_set_revision(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    revision: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE cloud_coverage_collection_attempts SET projection_revision = $3 \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .bind(revision)
+    .execute(&fixture.pool)
+    .await
+    .map(|_| ())
+}
+
+async fn read_receipt_columns(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+) -> (Option<String>, Option<String>, Option<i64>) {
+    sqlx::query_as(
+        "SELECT aggregate_evidence_reference, canonical_result::text, projection_revision \
+         FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read receipt columns")
+}
+
+async fn stored_result_json(
+    fixture: &Fixture,
+    ticket: &sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+) -> serde_json::Value {
+    let text: String = sqlx::query_scalar(
+        "SELECT canonical_result::text FROM cloud_coverage_collection_attempts \
+         WHERE beneficiary_id = $1 AND attempt_id = $2",
+    )
+    .bind(&fixture.beneficiary_id)
+    .bind(&ticket.attempt_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("read stored canonical result");
+    serde_json::from_str(&text).expect("parse stored canonical result")
+}
+
+async fn setup_completed_attempt(
+    fixture: &Fixture,
+    label: &str,
+) -> (
+    sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    Vec<SourceObservation>,
+    String,
+    SourceBinding,
+) {
+    let source = binding(
+        fixture,
+        &format!("{label}-source"),
+        &format!("{label}-allocation"),
+    );
+    register(fixture, &source, &format!("{label}-registration")).await;
+    let ticket = begin(fixture, &attempt_id(fixture, &format!("{label}-attempt"))).await;
+    let observations = vec![complete_observation(
+        &source.source_id,
+        &format!("{label}-evidence"),
+        &format!("{label}-coverage"),
+    )];
+    let evidence = format!("{label}-aggregate");
+    complete(fixture, &ticket, &evidence, &observations).await;
+    (ticket, observations, evidence, source)
+}
+
+async fn setup_completed_pair(
+    fixture: &Fixture,
+    label: &str,
+) -> (
+    sotto_server::cloud_coverage_reconciliation::CollectionTicket,
+    Vec<SourceObservation>,
+    String,
+    SourceBinding,
+    SourceBinding,
+) {
+    let (first, second) = register_pair(fixture, label).await;
+    let ticket = begin(fixture, &attempt_id(fixture, &format!("{label}-attempt"))).await;
+    let observations = vec![
+        complete_observation(
+            &first.source_id,
+            &format!("{label}-evidence-a"),
+            &format!("{label}-coverage-a"),
+        ),
+        complete_observation(
+            &second.source_id,
+            &format!("{label}-evidence-b"),
+            &format!("{label}-coverage-b"),
+        ),
+    ];
+    let evidence = format!("{label}-aggregate");
+    complete(fixture, &ticket, &evidence, &observations).await;
+    (ticket, observations, evidence, first, second)
+}
+
 async fn head_revision(fixture: &Fixture) -> i64 {
     sqlx::query_scalar(
         "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
@@ -2242,6 +2401,2656 @@ async fn lowered_stored_generation_is_source_set_corruption() {
     )
     .await;
     result.expect("supervised lowered generation case");
+}
+
+#[tokio::test]
+async fn completed_attempt_missing_receipt_evidence_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-evidence").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let (Some(_), Some(result_json), Some(revision)) = &receipt_before else {
+                panic!("completed attempt must store a full receipt");
+            };
+            let error =
+                try_set_receipt(&fixture, &ticket, None, Some(result_json), Some(*revision))
+                    .await
+                    .expect_err("missing receipt evidence must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn completed_attempt_missing_receipt_result_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-result").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let (Some(evidence), Some(_), Some(revision)) = &receipt_before else {
+                panic!("completed attempt must store a full receipt");
+            };
+            let error = try_set_receipt(&fixture, &ticket, Some(evidence), None, Some(*revision))
+                .await
+                .expect_err("missing receipt result must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn completed_attempt_missing_receipt_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-revision").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let (Some(evidence), Some(result_json), Some(_)) = &receipt_before else {
+                panic!("completed attempt must store a full receipt");
+            };
+            let error = try_set_receipt(&fixture, &ticket, Some(evidence), Some(result_json), None)
+                .await
+                .expect_err("missing receipt revision must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn completed_attempt_missing_full_receipt_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-absent").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(&fixture, &ticket, None, None, None)
+                .await
+                .expect_err("absent receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn completed_attempt_keeping_only_receipt_evidence_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-only-evidence").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let (Some(evidence), Some(_), Some(_)) = &receipt_before else {
+                panic!("completed attempt must store a full receipt");
+            };
+            let error = try_set_receipt(&fixture, &ticket, Some(evidence), None, None)
+                .await
+                .expect_err("evidence-only receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn completed_attempt_keeping_only_receipt_result_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-only-result").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let (Some(_), Some(result_json), Some(_)) = &receipt_before else {
+                panic!("completed attempt must store a full receipt");
+            };
+            let error = try_set_receipt(&fixture, &ticket, None, Some(result_json), None)
+                .await
+                .expect_err("result-only receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn completed_attempt_keeping_only_receipt_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "combo-only-revision").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let (Some(_), Some(_), Some(revision)) = &receipt_before else {
+                panic!("completed attempt must store a full receipt");
+            };
+            let error = try_set_receipt(&fixture, &ticket, None, None, Some(*revision))
+                .await
+                .expect_err("revision-only receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised completed combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_only_receipt_evidence_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(&fixture, &ticket, Some("combo-evidence"), None, None)
+                .await
+                .expect_err("evidence-only pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_only_receipt_result_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                None,
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                None,
+            )
+            .await
+            .expect_err("result-only pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_only_receipt_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(&fixture, &ticket, None, None, Some(revision))
+                .await
+                .expect_err("revision-only pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_receipt_evidence_and_result_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                Some("combo-evidence"),
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                None,
+            )
+            .await
+            .expect_err("evidence-and-result pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_receipt_evidence_and_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                Some("combo-evidence"),
+                None,
+                Some(revision),
+            )
+            .await
+            .expect_err("evidence-and-revision pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_receipt_result_and_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                None,
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                Some(revision),
+            )
+            .await
+            .expect_err("result-and-revision pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn pending_attempt_with_full_receipt_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "pending-combo-source", "pending-combo-allocation");
+            register(&fixture, &source, "pending-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "pending-combo-attempt")).await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                Some("combo-evidence"),
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                Some(revision),
+            )
+            .await
+            .expect_err("full pending receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised pending combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_only_receipt_evidence_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(&fixture, &ticket, Some("combo-evidence"), None, None)
+                .await
+                .expect_err("evidence-only superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_only_receipt_result_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                None,
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                None,
+            )
+            .await
+            .expect_err("result-only superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_only_receipt_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(&fixture, &ticket, None, None, Some(revision))
+                .await
+                .expect_err("revision-only superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_receipt_evidence_and_result_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                Some("combo-evidence"),
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                None,
+            )
+            .await
+            .expect_err("evidence-and-result superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_receipt_evidence_and_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                Some("combo-evidence"),
+                None,
+                Some(revision),
+            )
+            .await
+            .expect_err("evidence-and-revision superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_receipt_result_and_revision_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                None,
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                Some(revision),
+            )
+            .await
+            .expect_err("result-and-revision superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn superseded_attempt_with_full_receipt_is_rejected() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "superseded-combo-source",
+                "superseded-combo-allocation",
+            );
+            register(&fixture, &source, "superseded-combo-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "superseded-combo-attempt")).await;
+            begin(
+                &fixture,
+                &attempt_id(&fixture, "superseded-combo-replacement"),
+            )
+            .await;
+            let revision = head_revision(&fixture).await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            let error = try_set_receipt(
+                &fixture,
+                &ticket,
+                Some("combo-evidence"),
+                Some(r#"{"aggregate_evidence_reference":"combo-evidence","sources":[]}"#),
+                Some(revision),
+            )
+            .await
+            .expect_err("full superseded receipt must be rejected");
+            assert_sqlstate(&error, "23514");
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised superseded combo case");
+}
+
+#[tokio::test]
+async fn stored_result_rejects_non_object_json_at_the_database() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "raw-result").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            for (raw, code) in [
+                ("[]", "23514"),
+                ("\"result\"", "23514"),
+                ("not json{{", "22P02"),
+            ] {
+                let error = match try_set_result(&fixture, &ticket, raw).await {
+                    Err(error) => error,
+                    Ok(()) => panic!("result {raw} must be rejected"),
+                };
+                assert_sqlstate(&error, code);
+            }
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised raw result case");
+}
+
+#[tokio::test]
+async fn stored_revision_rejects_non_positive_values_at_the_database() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "raw-revision").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            for revision in [0, -1] {
+                let error = match try_set_revision(&fixture, &ticket, revision).await {
+                    Err(error) => error,
+                    Ok(()) => panic!("revision {revision} must be rejected"),
+                };
+                assert_sqlstate(&error, "23514");
+            }
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised raw revision case");
+}
+
+#[tokio::test]
+async fn stored_evidence_rejects_blank_values_at_the_database() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, _, _, _) = setup_completed_attempt(&fixture, "raw-evidence").await;
+            let receipt_before = read_receipt_columns(&fixture, &ticket).await;
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            for blank in ["", "  "] {
+                let error = match try_set_evidence(&fixture, &ticket, Some(blank)).await {
+                    Err(error) => error,
+                    Ok(()) => panic!("blank evidence must be rejected"),
+                };
+                assert_sqlstate(&error, "23514");
+            }
+            assert_eq!(
+                read_receipt_columns(&fixture, &ticket).await,
+                receipt_before
+            );
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised raw evidence case");
+}
+
+#[tokio::test]
+async fn stored_result_missing_aggregate_key_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "result-keys").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            assert_eq!(control.revision, head_revision(&fixture).await);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored
+                .as_object_mut()
+                .expect("result is an object")
+                .remove("aggregate_evidence_reference");
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised result keys case");
+}
+
+#[tokio::test]
+async fn stored_result_missing_sources_key_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "result-sources-key").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored
+                .as_object_mut()
+                .expect("result is an object")
+                .remove("sources");
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised result keys case");
+}
+
+#[tokio::test]
+async fn stored_result_extra_key_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "result-extra-key").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored
+                .as_object_mut()
+                .expect("result is an object")
+                .insert("unknown_key".into(), serde_json::json!("unexpected"));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised result keys case");
+}
+
+#[tokio::test]
+async fn stored_result_blank_evidence_is_evidence_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "result-blank-evidence").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored.as_object_mut().expect("result is an object").insert(
+                "aggregate_evidence_reference".into(),
+                serde_json::json!("  "),
+            );
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultEvidence
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultEvidence
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised result evidence case");
+}
+
+#[tokio::test]
+async fn stored_result_mismatched_evidence_is_evidence_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "result-mismatch").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored.as_object_mut().expect("result is an object").insert(
+                "aggregate_evidence_reference".into(),
+                serde_json::json!("different-aggregate"),
+            );
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultEvidence
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultEvidence
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised result evidence case");
+}
+
+#[tokio::test]
+async fn stored_result_non_array_sources_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "result-sources-source",
+                "result-sources-allocation",
+            );
+            register(&fixture, &source, "result-sources-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "result-sources-evidence",
+                "result-sources-coverage",
+            )];
+            for (label, sources) in [
+                ("object", serde_json::json!({})),
+                ("string", serde_json::json!("sources")),
+            ] {
+                let ticket = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("result-sources-{label}")),
+                )
+                .await;
+                let evidence = format!("result-sources-aggregate-{label}");
+                complete(&fixture, &ticket, &evidence, &observations).await;
+                let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                    .await
+                    .expect("replay valid completion");
+                assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+                let mut stored = stored_result_json(&fixture, &ticket).await;
+                stored
+                    .as_object_mut()
+                    .expect("result is an object")
+                    .insert("sources".into(), sources);
+                try_set_result(&fixture, &ticket, &stored.to_string())
+                    .await
+                    .expect("store mutated result");
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        &ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised result sources case");
+}
+
+#[tokio::test]
+async fn stored_observation_missing_evidence_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "observation-evidence").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]
+                .as_object_mut()
+                .expect("observation is an object")
+                .remove("evidence_reference");
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised observation case");
+}
+
+#[tokio::test]
+async fn stored_observation_extra_field_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "observation-extra").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]
+                .as_object_mut()
+                .expect("observation is an object")
+                .insert("unknown_field".into(), serde_json::json!("unexpected"));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised observation case");
+}
+
+#[tokio::test]
+async fn stored_observation_unsupported_status_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "observation-status").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]
+                .as_object_mut()
+                .expect("observation is an object")
+                .insert("status".into(), serde_json::json!("partial"));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised observation case");
+}
+
+#[tokio::test]
+async fn stored_observation_unsupported_reason_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "observation-reason-source",
+                "observation-reason-allocation",
+            );
+            register(&fixture, &source, "observation-reason-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "observation-reason-evidence",
+                "observation-reason-coverage",
+            )];
+            for (label, reason) in [
+                ("text", serde_json::json!("other")),
+                ("number", serde_json::json!(42)),
+            ] {
+                let ticket = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("observation-reason-{label}")),
+                )
+                .await;
+                let evidence = format!("observation-reason-aggregate-{label}");
+                complete(&fixture, &ticket, &evidence, &observations).await;
+                let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                    .await
+                    .expect("replay valid completion");
+                assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+                let mut stored = stored_result_json(&fixture, &ticket).await;
+                let observation = stored["sources"][0]
+                    .as_object_mut()
+                    .expect("observation is an object");
+                observation.insert("status".into(), serde_json::json!("unavailable"));
+                observation.remove("paid_intervals");
+                observation.insert("reason".into(), reason);
+                try_set_result(&fixture, &ticket, &stored.to_string())
+                    .await
+                    .expect("store mutated result");
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        &ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised observation case");
+}
+
+#[tokio::test]
+async fn stored_interval_missing_field_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "interval-field").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]["paid_intervals"][0]
+                .as_object_mut()
+                .expect("interval is an object")
+                .remove("paid_until");
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised interval case");
+}
+
+#[tokio::test]
+async fn stored_interval_wrong_field_type_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "interval-type-source", "interval-type-allocation");
+            register(&fixture, &source, "interval-type-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "interval-type-evidence",
+                "interval-type-coverage",
+            )];
+            for (label, field, value) in [
+                ("string", "starts_at", serde_json::json!("soon")),
+                ("float", "paid_until", serde_json::json!(1.5)),
+            ] {
+                let ticket = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("interval-type-{label}")),
+                )
+                .await;
+                let evidence = format!("interval-type-aggregate-{label}");
+                complete(&fixture, &ticket, &evidence, &observations).await;
+                let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                    .await
+                    .expect("replay valid completion");
+                assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+                let mut stored = stored_result_json(&fixture, &ticket).await;
+                stored["sources"][0]["paid_intervals"][0]
+                    .as_object_mut()
+                    .expect("interval is an object")
+                    .insert(field.into(), value);
+                try_set_result(&fixture, &ticket, &stored.to_string())
+                    .await
+                    .expect("store mutated result");
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        &ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised interval case");
+}
+
+#[tokio::test]
+async fn stored_interval_extra_field_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "interval-extra").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]["paid_intervals"][0]
+                .as_object_mut()
+                .expect("interval is an object")
+                .insert("unknown_field".into(), serde_json::json!("unexpected"));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultShape
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised interval case");
+}
+
+#[tokio::test]
+async fn stored_interval_renewal_wrong_type_is_shape_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "interval-renewal-source",
+                "interval-renewal-allocation",
+            );
+            register(&fixture, &source, "interval-renewal-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "interval-renewal-evidence",
+                "interval-renewal-coverage",
+            )];
+            for (label, value) in [
+                ("number", serde_json::json!(42)),
+                ("boolean", serde_json::json!(false)),
+            ] {
+                let ticket = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("interval-renewal-{label}")),
+                )
+                .await;
+                let evidence = format!("interval-renewal-aggregate-{label}");
+                complete(&fixture, &ticket, &evidence, &observations).await;
+                let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                    .await
+                    .expect("replay valid completion");
+                assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+                let mut stored = stored_result_json(&fixture, &ticket).await;
+                stored["sources"][0]["paid_intervals"][0]
+                    .as_object_mut()
+                    .expect("interval is an object")
+                    .insert("failed_renewal_id".into(), value);
+                try_set_result(&fixture, &ticket, &stored.to_string())
+                    .await
+                    .expect("store mutated result");
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        &ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised interval case");
+}
+
+#[tokio::test]
+async fn stored_duplicate_observations_are_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "duplicate-observations").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            let sources = stored["sources"]
+                .as_array_mut()
+                .expect("sources is an array");
+            sources.push(sources[0].clone());
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_missing_observation_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, first, _) =
+                setup_completed_pair(&fixture, "missing-observation").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"]
+                .as_array_mut()
+                .expect("sources is an array")
+                .remove(1);
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&first.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_extra_observation_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, first, _) =
+                setup_completed_pair(&fixture, "extra-observation").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            let sources = stored["sources"]
+                .as_array_mut()
+                .expect("sources is an array");
+            sources.push(sources[0].clone());
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&first.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_foreign_observation_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "foreign-observation").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]
+                .as_object_mut()
+                .expect("observation is an object")
+                .insert("source_id".into(), serde_json::json!("foreign-source"));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_misattributed_fact_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "misattributed-fact").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]["paid_intervals"][0]
+                .as_object_mut()
+                .expect("interval is an object")
+                .insert("source_id".into(), serde_json::json!("other-source"));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_unordered_observations_are_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, first, _) =
+                setup_completed_pair(&fixture, "unordered-observations").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"]
+                .as_array_mut()
+                .expect("sources is an array")
+                .swap(0, 1);
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&first.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_unordered_intervals_are_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(&fixture, "intervals-source", "intervals-allocation");
+            register(&fixture, &source, "intervals-registration").await;
+            let ticket = begin(&fixture, &attempt_id(&fixture, "intervals-attempt")).await;
+            let observations = vec![SourceObservation::Complete {
+                source_id: source.source_id.clone(),
+                evidence_reference: "intervals-evidence".into(),
+                paid_intervals: vec![
+                    ConfirmedPaidInterval {
+                        coverage_id: "intervals-b".into(),
+                        source_id: source.source_id.clone(),
+                        starts_at: 100,
+                        paid_until: 200,
+                        failed_renewal_id: None,
+                    },
+                    ConfirmedPaidInterval {
+                        coverage_id: "intervals-a".into(),
+                        source_id: source.source_id.clone(),
+                        starts_at: 0,
+                        paid_until: 100,
+                        failed_renewal_id: None,
+                    },
+                ],
+            }];
+            complete(&fixture, &ticket, "intervals-aggregate", &observations).await;
+            let control = committed_finish(&fixture, &ticket, "intervals-aggregate", &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            let intervals = stored["sources"][0]["paid_intervals"]
+                .as_array_mut()
+                .expect("intervals is an array");
+            assert_eq!(intervals.len(), 2);
+            assert_eq!(
+                intervals[0]["coverage_id"],
+                serde_json::json!("intervals-a")
+            );
+            intervals.swap(0, 1);
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_invalid_interval_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let source = binding(
+                &fixture,
+                "invalid-interval-source",
+                "invalid-interval-allocation",
+            );
+            register(&fixture, &source, "invalid-interval-registration").await;
+            let observations = vec![complete_observation(
+                &source.source_id,
+                "invalid-interval-evidence",
+                "invalid-interval-coverage",
+            )];
+            for (label, field, value) in [
+                ("bounds", "paid_until", serde_json::json!(0)),
+                ("coverage", "coverage_id", serde_json::json!("")),
+            ] {
+                let ticket = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("invalid-interval-{label}")),
+                )
+                .await;
+                let evidence = format!("invalid-interval-aggregate-{label}");
+                complete(&fixture, &ticket, &evidence, &observations).await;
+                let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                    .await
+                    .expect("replay valid completion");
+                assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+                let mut stored = stored_result_json(&fixture, &ticket).await;
+                stored["sources"][0]["paid_intervals"][0]
+                    .as_object_mut()
+                    .expect("interval is an object")
+                    .insert(field.into(), value);
+                try_set_result(&fixture, &ticket, &stored.to_string())
+                    .await
+                    .expect("store mutated result");
+                let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+                assert!(matches!(
+                    committed_finish(
+                        &fixture,
+                        &ticket,
+                        "changed-aggregate",
+                        &[changed_observation(&source.source_id)],
+                    )
+                    .await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultCanonical
+                    ))
+                ));
+                assert!(matches!(
+                    committed_begin(&fixture, &ticket.attempt_id).await,
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultCanonical
+                    ))
+                ));
+                assert_eq!(
+                    attempt_identity(&fixture, &ticket.attempt_id).await,
+                    identity_before
+                );
+            }
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_blank_observation_evidence_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "blank-observation").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]
+                .as_object_mut()
+                .expect("observation is an object")
+                .insert("evidence_reference".into(), serde_json::json!("  "));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
+}
+
+#[tokio::test]
+async fn stored_blank_observation_source_is_canonical_corruption() {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
+        return;
+    };
+    let unrelated = fixture
+        .add_beneficiary_owned(&mut owner)
+        .await
+        .expect("create owned beneficiary");
+    let result = run_with_teardown(
+        &mut owner,
+        async {
+            let (ticket, observations, evidence, source) =
+                setup_completed_attempt(&fixture, "blank-observation-source").await;
+            let control = committed_finish(&fixture, &ticket, &evidence, &observations)
+                .await
+                .expect("replay valid completion");
+            assert_eq!(control.outcome, PublicationOutcome::AlreadyApplied);
+            let mut stored = stored_result_json(&fixture, &ticket).await;
+            stored["sources"][0]
+                .as_object_mut()
+                .expect("observation is an object")
+                .insert("source_id".into(), serde_json::json!(""));
+            try_set_result(&fixture, &ticket, &stored.to_string())
+                .await
+                .expect("store mutated result");
+            let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
+            assert!(matches!(
+                committed_finish(
+                    &fixture,
+                    &ticket,
+                    "changed-aggregate",
+                    &[changed_observation(&source.source_id)],
+                )
+                .await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert!(matches!(
+                committed_begin(&fixture, &ticket.attempt_id).await,
+                Err(ReconciliationError::CorruptAttempt(
+                    CorruptAttemptReason::ResultCanonical
+                ))
+            ));
+            assert_eq!(
+                attempt_identity(&fixture, &ticket.attempt_id).await,
+                identity_before
+            );
+            assert_no_beneficiary_rows(&unrelated).await;
+            Ok::<(), String>(())
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised canonical case");
 }
 
 #[tokio::test]

@@ -1151,50 +1151,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn completion_receipts_require_all_fields_for_completed_attempts() {
-        let valid = stored_completion_receipt(
+    fn completion_receipt_matrix_covers_every_nullable_combination() {
+        for status in [
+            CollectionStatus::Pending,
+            CollectionStatus::Superseded,
             CollectionStatus::Completed,
-            Some("aggregate-evidence".into()),
-            Some("{}".into()),
-            Some(1),
-        )
-        .expect("accept complete receipt")
-        .expect("return complete receipt");
-        assert_eq!(valid, ("aggregate-evidence".into(), "{}".into(), 1));
-
-        for (evidence, result, revision) in [
-            (None, Some("{}".into()), Some(1)),
-            (Some("aggregate-evidence".into()), None, Some(1)),
-            (Some("aggregate-evidence".into()), Some("{}".into()), None),
         ] {
-            assert!(matches!(
-                stored_completion_receipt(CollectionStatus::Completed, evidence, result, revision),
-                Err(ReconciliationError::CorruptAttempt(
-                    CorruptAttemptReason::CompletionReceipt
-                ))
-            ));
+            for present in 0..8u8 {
+                let evidence = (present & 0b100 != 0).then(|| "aggregate-evidence".to_string());
+                let result = (present & 0b010 != 0).then(|| "{}".to_string());
+                let revision = (present & 0b001 != 0).then_some(1);
+                let receipt = stored_completion_receipt(status, evidence, result, revision);
+                let complete = status == CollectionStatus::Completed;
+                if complete && present == 0b111 {
+                    assert_eq!(
+                        receipt
+                            .expect("accept complete receipt")
+                            .expect("return complete receipt"),
+                        ("aggregate-evidence".to_string(), "{}".to_string(), 1)
+                    );
+                } else if !complete && present == 0 {
+                    assert_eq!(receipt.expect("accept empty incomplete receipt"), None);
+                } else {
+                    assert!(
+                        matches!(
+                            receipt,
+                            Err(ReconciliationError::CorruptAttempt(
+                                CorruptAttemptReason::CompletionReceipt
+                            ))
+                        ),
+                        "status {status:?} with fields {present:03b} must be a receipt corruption"
+                    );
+                }
+            }
         }
     }
 
     #[test]
-    fn pending_and_superseded_attempts_reject_completion_receipts() {
-        for status in [CollectionStatus::Pending, CollectionStatus::Superseded] {
-            assert_eq!(
-                stored_completion_receipt(status, None, None, None)
-                    .expect("accept empty incomplete receipt"),
-                None
-            );
-            assert!(matches!(
-                stored_completion_receipt(
-                    status,
-                    Some("aggregate-evidence".into()),
-                    Some("{}".into()),
-                    Some(1),
+    fn stored_bindings_reject_unparseable_and_non_array_json() {
+        for raw in [
+            "not json{{",
+            "{}",
+            "\"bindings\"",
+            "42",
+            "null",
+            "true",
+            "[]",
+            "[42]",
+        ] {
+            assert!(
+                matches!(
+                    parse_stored_bindings(raw, "beneficiary"),
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::BindingShape
+                    ))
                 ),
-                Err(ReconciliationError::CorruptAttempt(
-                    CorruptAttemptReason::CompletionReceipt
-                ))
-            ));
+                "stored bindings {raw} must be a shape corruption"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_result_rejects_blank_evidence_and_non_object_json() {
+        let ticket = CollectionTicket {
+            beneficiary_id: "beneficiary".into(),
+            attempt_id: "attempt".into(),
+            collection_epoch: 1,
+            source_set_generation: 1,
+            expected_projection_revision: None,
+            source_bindings: Vec::new(),
+            status: CollectionStatus::Completed,
+            completed_revision: Some(1),
+        };
+        assert!(matches!(
+            validate_stored_result(&ticket, "  ", "{}"),
+            Err(ReconciliationError::CorruptAttempt(
+                CorruptAttemptReason::ResultEvidence
+            ))
+        ));
+        for raw in ["[]", "\"result\"", "42", "null", "not json{{"] {
+            assert!(
+                matches!(
+                    validate_stored_result(&ticket, "aggregate-evidence", raw),
+                    Err(ReconciliationError::CorruptAttempt(
+                        CorruptAttemptReason::ResultShape
+                    ))
+                ),
+                "stored result {raw} must be a shape corruption"
+            );
         }
     }
 }
