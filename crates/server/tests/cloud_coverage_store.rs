@@ -680,7 +680,7 @@ async fn canonical_order_fixture(pool: &PgPool, beneficiary_id: &str) -> Vec<Str
         "collation-evidence-2",
         &CoverageProjection::Complete {
             paid_intervals: vec![
-                fact_b,
+                fact_b.clone(),
                 fact_a.clone(),
                 fact_d.clone(),
                 fact_c.clone(),
@@ -710,7 +710,7 @@ async fn canonical_order_fixture(pool: &PgPool, beneficiary_id: &str) -> Vec<Str
             "collation-op-1",
             "collation-evidence-1",
             &CoverageProjection::Complete {
-                paid_intervals: vec![changed_a, fact_c, fact_d],
+                paid_intervals: vec![fact_b, changed_a, fact_c, fact_d],
             },
         )
         .await,
