@@ -23,7 +23,9 @@
 //! Coordination uses no production hook: the writer holds `ACCESS EXCLUSIVE ... NOWAIT` on
 //! one table, the loader runs on a dedicated pool with a unique application name, and the
 //! test acknowledges the pause through bounded `pg_stat_activity`/`pg_blocking_pids`
-//! readiness before committing or rolling back the writer.
+//! readiness before committing or rolling back the writer. Overlapping observation writers
+//! serialize on an in-process mutex so publication writes never queue behind another test's
+//! held table lock.
 //!
 //! Sensitivity (isolated checkout, restored before validation): removing `REPEATABLE READ`
 //! or replacing the transaction with separate autocommit queries still passes, because
@@ -31,7 +33,10 @@
 //! refreshes the head after the facts read fails with a new-head/old-facts mix, which is
 //! the regression these tests guard.
 
-use std::{str::FromStr, sync::Arc};
+use std::{
+    str::FromStr,
+    sync::{Arc, OnceLock},
+};
 
 use sotto_server::cloud_coverage::{
     evaluate, ConfirmedPaidInterval, CoverageState, PersonCoverage,
@@ -43,7 +48,7 @@ use sotto_server::cloud_coverage_store::{
 use sotto_server::db;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Postgres, Transaction};
-use tokio::sync::{oneshot, Barrier, Notify};
+use tokio::sync::{oneshot, Barrier, Mutex, Notify};
 use tokio::time::{sleep, timeout, Duration, Instant};
 use uuid::Uuid;
 
@@ -220,6 +225,21 @@ async fn loader_pool(application_name: &str) -> PgPool {
         .expect("connect loader pool")
 }
 
+static OBSERVATION_SERIALIZER: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Serialize observation writers across pause tests.
+///
+/// The `NOWAIT` lock never queues, but the publication writes before it would queue behind
+/// another test's held observation lock. Hold this guard across the probe, lock, pause and
+/// commit so overlapping observation writers serialize in-process instead of in PostgreSQL.
+/// Bounded like every other readiness wait; unrelated progress tasks must not acquire it.
+async fn acquire_observation() -> tokio::sync::MutexGuard<'static, ()> {
+    let serializer = OBSERVATION_SERIALIZER.get_or_init(|| Mutex::new(()));
+    timeout(RACE_TIMEOUT, serializer.lock())
+        .await
+        .unwrap_or_else(|_| panic!("timed out acquiring observation serialization"))
+}
+
 /// Begin a writer transaction holding the loader observation lock.
 ///
 /// `ACCESS EXCLUSIVE` is the only table lock that blocks the loader's plain `SELECT`s. The
@@ -228,8 +248,10 @@ async fn loader_pool(application_name: &str) -> PgPool {
 /// request would deadlock against overlapping writers upgrading from their own publication
 /// locks, so take the lock with `NOWAIT` and retry on a fresh transaction while the table
 /// is contended. Failed `NOWAIT` attempts never queue, so no other test can wait behind
-/// this writer and no lock cycle can form. Callers prove uncommitted invisibility in a
-/// separate probe transaction first, so the pause choreography after the lock never retries.
+/// this writer and no lock cycle can form. Callers hold the observation serializer across
+/// the pause, so retries here only cover millisecond ordinary-test contention. Callers
+/// prove uncommitted invisibility in a separate probe transaction first, so the pause
+/// choreography after the lock never retries.
 async fn begin_locked_writer(
     pool: &PgPool,
     beneficiary_id: &str,
@@ -1586,6 +1608,7 @@ async fn loader_pause_acknowledges_between_metadata_and_facts_reads() {
         &mut owner,
         |owner| {
             Box::pin(async move {
+                let _observation = acquire_observation().await;
                 let next = CoverageProjection::Complete {
                     paid_intervals: vec![
                         paid("pause-new-a", "personal", 0, 30 * DAY),
@@ -1711,6 +1734,7 @@ async fn complete_load_returns_one_committed_snapshot_across_writer_commit() {
         &mut owner,
         |owner| {
             Box::pin(async move {
+                let _observation = acquire_observation().await;
                 let next = CoverageProjection::Complete {
                     paid_intervals: vec![
                         paid("snap-new-a", "sponsor", 90 * DAY, 120 * DAY),
@@ -1877,6 +1901,7 @@ async fn unavailable_load_never_mixes_with_committed_replacement() {
         &mut owner,
         |owner| {
             Box::pin(async move {
+                let _observation = acquire_observation().await;
                 let next = CoverageProjection::Complete {
                     paid_intervals: vec![
                         paid("replace-a", "personal", 0, 30 * DAY),
@@ -2036,6 +2061,7 @@ async fn rolled_back_publication_preserves_old_snapshot_and_retry_applies_once()
         &mut owner,
         |owner| {
             Box::pin(async move {
+                let _observation = acquire_observation().await;
                 let next = CoverageProjection::Complete {
                     paid_intervals: vec![paid("rollback-new-a", "personal", 0, 30 * DAY)],
                 };
