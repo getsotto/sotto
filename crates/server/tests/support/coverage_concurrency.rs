@@ -19,7 +19,7 @@ pub struct RaceTaskOwner {
     cleanups: Vec<CleanupCallback>,
 }
 
-pub type ScenarioFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + 'a>>;
+pub type ScenarioFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
 type CleanupCallback = Box<dyn FnOnce() -> CleanupFuture + Send>;
 type CleanupFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
@@ -62,20 +62,6 @@ impl RaceTaskOwner {
             handle.abort();
         }
         self.settle_within(budget, true).await
-    }
-
-    #[allow(dead_code)]
-    pub async fn join_all(&mut self) -> Result<(), String> {
-        let result = self.join_all_within(RACE_TIMEOUT).await;
-        if let Err(error) = result {
-            let cleanup = self.abort_and_join().await;
-            match cleanup {
-                Ok(()) => Err(error),
-                Err(cleanup) => Err(format!("{error}; {cleanup}")),
-            }
-        } else {
-            Ok(())
-        }
     }
 
     pub async fn join_all_within(&mut self, budget: Duration) -> Result<(), String> {
@@ -223,6 +209,8 @@ where
             },
             Err(panic) => Err(format!("scenario panicked: {}", panic_message(panic))),
         };
+    // The completed scenario result is already available, so zero lets Tokio poll it
+    // immediately before teardown begins while preserving the shared teardown path.
     run_with_teardown_with_budgets(
         owner,
         async move { scenario_result },
@@ -521,6 +509,35 @@ mod tests {
         )
         .await;
         assert_eq!(result, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn context_panic_aborts_children_and_runs_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let mut owner = RaceTaskOwner::new();
+        let cleaned_by_callback = Arc::clone(&cleaned);
+        owner.register_cleanup(move || async move {
+            cleaned_by_callback.store(true, Ordering::SeqCst);
+            Err("context cleanup failure".into())
+        });
+        let result = run_with_context(
+            &mut owner,
+            |owner| {
+                Box::pin(async move {
+                    let _task = owner.spawn(async { std::future::pending::<()>().await });
+                    panic!("context scenario failure");
+                    #[allow(unreachable_code)]
+                    Ok::<(), String>(())
+                })
+            },
+            || async { Ok::<(), String>(()) },
+        )
+        .await;
+        assert_eq!(
+            result,
+            Err("scenario: scenario panicked: context scenario failure; cleanup: context cleanup failure".into())
+        );
+        assert!(cleaned.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
