@@ -566,6 +566,7 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
             Box::pin(async move {
                 let (ready, ready_rx) = oneshot::channel();
                 let (release, release_rx) = oneshot::channel();
+                let (finished, finished_rx) = oneshot::channel();
                 let pool = fixture.pool.clone();
                 let beneficiary_id = fixture.beneficiary_id.clone();
                 let _task = owner.spawn(async move {
@@ -584,12 +585,16 @@ async fn aborted_owned_publication_task_rolls_back_before_fixture_cleanup() {
                     .expect("publish owned publication");
                     ready.send(()).expect("signal owned publication");
                     release_rx.await.expect("release owned publication");
+                    finished
+                        .send(())
+                        .expect("signal owned publication completion");
                 });
                 tokio::time::timeout(RACE_TIMEOUT, ready_rx)
                     .await
                     .expect("owned publication became ready")
                     .expect("owned publication task exited before readiness");
                 release.send(()).expect("release owned publication");
+                finished_rx.await.expect("owned publication task completed");
                 let receipt = committed_publish(
                     &fixture,
                     None,
