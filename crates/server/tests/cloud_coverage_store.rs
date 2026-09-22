@@ -32,6 +32,20 @@
 //! publication is atomic and revision rows are immutable and key-chained; a loader that
 //! refreshes the head after the facts read fails with a new-head/old-facts mix, which is
 //! the regression these tests guard.
+//!
+//! Timestamp and ordering boundary acceptance:
+//!
+//! - `max_ending_interval_round_trip_defers_export_overflow_until_evaluation`: the
+//!   `[i64::MAX - 1, i64::MAX)` interval stores without eager export arithmetic and reports
+//!   typed export overflow only when evaluated at its end; the stored rows stay intact.
+//! - `recovery_overflow_through_publisher_writes_nothing_durable`: recovery overflow is
+//!   rejected before any write; the error transaction is deliberately committed and the
+//!   snapshot is unchanged while an unrelated beneficiary progresses.
+//! - `canonical_ordering_is_bytewise_across_database_collations`: permuted inputs with
+//!   identical duplicates load the same exact bytewise projection on the normal database
+//!   and on a disposable explicitly linguistic-collation database; each operation replays
+//!   `AlreadyApplied` with an unchanged head, a changed fact stays `OperationConflict`,
+//!   and a default-order control proves the linguistic collation is really active.
 
 use std::{
     str::FromStr,
