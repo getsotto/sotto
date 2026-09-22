@@ -204,7 +204,8 @@ enum Command {
     )]
     Rollback {
         name: String,
-        /// The version to restore (see `sotto history`).
+        /// The version to restore (1 or greater; see `sotto history`).
+        #[arg(value_parser = clap::value_parser!(i64).range(1..))]
         version: i64,
     },
     /// Run a command with the environment's secrets injected as environment variables.
@@ -1819,6 +1820,42 @@ mod tests {
             .to_string();
         assert!(rollback.contains("sotto rollback DATABASE_URL 2"));
         assert!(rollback.contains("without erasing history"));
+        assert!(rollback.contains("1 or greater"), "{rollback}");
+    }
+
+    #[test]
+    fn rollback_parser_accepts_positive_versions_and_rejects_non_positive() {
+        for version in [1_i64, 42, i64::MAX] {
+            let value = version.to_string();
+            let cli = Cli::try_parse_from(["sotto", "rollback", "DATABASE_URL", &value])
+                .unwrap_or_else(|err| panic!("version {version} should parse: {err}"));
+            assert!(matches!(
+                cli.command,
+                Command::Rollback {
+                    version: parsed,
+                    ..
+                } if parsed == version
+            ));
+        }
+
+        for args in [
+            vec!["sotto", "rollback", "DATABASE_URL", "0"],
+            vec!["sotto", "rollback", "DATABASE_URL", "--", "-1"],
+        ] {
+            let err = match Cli::try_parse_from(&args) {
+                Ok(_) => panic!("non-positive version should fail: {args:?}"),
+                Err(err) => err,
+            };
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("<VERSION>"),
+                "diagnostic should name the version argument: {rendered}"
+            );
+            assert!(
+                rendered.contains("1..9223372036854775807"),
+                "diagnostic should state the positive range: {rendered}"
+            );
+        }
     }
 
     #[test]
