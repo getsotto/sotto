@@ -351,6 +351,148 @@ async fn wait_for_blocked_backend(pool: &PgPool, application_name: &str, holder_
     }
 }
 
+#[derive(Clone, Copy)]
+enum CollationProvider {
+    Libc,
+    Icu,
+}
+
+struct LinguisticCollation {
+    provider: CollationProvider,
+    locale: &'static str,
+}
+
+/// Select an installed linguistic collation for the ordering database.
+///
+/// Probes a small preference list so the test works wherever at least one linguistic
+/// collation exists. When none is installed the opted-in run fails clearly instead of
+/// skipping the assertion.
+async fn select_linguistic_collation(pool: &PgPool) -> LinguisticCollation {
+    const CANDIDATES: &[(CollationProvider, &str, &str)] = &[
+        (CollationProvider::Libc, "en_US.UTF-8", "en_US.UTF-8"),
+        (CollationProvider::Libc, "en_US.utf8", "en_US.utf8"),
+        (CollationProvider::Icu, "en-US", "en-US"),
+        (CollationProvider::Icu, "und", "und-x-icu"),
+    ];
+    for (provider, locale, catalog) in CANDIDATES {
+        let present: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_collation WHERE collname = $1)")
+                .bind(catalog)
+                .fetch_one(pool)
+                .await
+                .expect("probe linguistic collation");
+        if present {
+            return LinguisticCollation {
+                provider: *provider,
+                locale,
+            };
+        }
+    }
+    panic!(
+        "no linguistic collation installed (probed en_US.UTF-8, en_US.utf8, en-US, und-x-icu); \
+         the opted-in collation case cannot run without one"
+    );
+}
+
+/// Create an empty database with the requested linguistic collation.
+///
+/// Uses an explicit template and locale without touching cluster defaults or the shared
+/// test database. Callers open the database through `open_linguistic_database`, which
+/// drops it again when any setup step fails.
+async fn create_linguistic_database(
+    admin_pool: &PgPool,
+    collation: &LinguisticCollation,
+) -> String {
+    let name = format!("sotto_collation_{}", Uuid::new_v4().simple());
+    let create = match collation.provider {
+        CollationProvider::Libc => format!(
+            "CREATE DATABASE \"{name}\" TEMPLATE template0 LOCALE_PROVIDER libc LOCALE '{}'",
+            collation.locale
+        ),
+        CollationProvider::Icu => format!(
+            "CREATE DATABASE \"{name}\" TEMPLATE template0 LOCALE_PROVIDER icu ICU_LOCALE '{}'",
+            collation.locale
+        ),
+    };
+    sqlx::query(&create)
+        .execute(admin_pool)
+        .await
+        .expect("create linguistic database");
+    name
+}
+
+/// Connect, migrate and verify the linguistic database, dropping it on any failure.
+async fn open_linguistic_database(
+    admin_pool: &PgPool,
+    name: &str,
+    collation: &LinguisticCollation,
+) -> PgPool {
+    match try_open_linguistic_database(name, collation).await {
+        Ok(pool) => pool,
+        Err(error) => {
+            let drop = sqlx::query(&format!("DROP DATABASE \"{name}\" WITH (FORCE)"))
+                .execute(admin_pool)
+                .await;
+            panic!("open linguistic database: {error}; cleanup: {drop:?}");
+        }
+    }
+}
+
+async fn try_open_linguistic_database(
+    name: &str,
+    collation: &LinguisticCollation,
+) -> Result<PgPool, String> {
+    let database_url = std::env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL is required for collation database".to_string())?;
+    let options = PgConnectOptions::from_str(&database_url)
+        .map_err(|error| format!("parse DATABASE_URL for collation database: {error}"))?
+        .database(name);
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await
+        .map_err(|error| format!("connect linguistic database: {error}"))?;
+    db::migrate(&pool)
+        .await
+        .map_err(|error| format!("migrate linguistic database: {error}"))?;
+    let active: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT datcollate, daticulocale FROM pg_database WHERE datname = current_database()",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|error| format!("read linguistic database locale: {error}"))?;
+    match collation.provider {
+        CollationProvider::Libc => {
+            if active.0.as_deref() != Some(collation.locale) {
+                return Err(format!(
+                    "linguistic database locale is not active, observed: {active:?}"
+                ));
+            }
+        }
+        CollationProvider::Icu => {
+            if active.1.as_deref() != Some(collation.locale) {
+                return Err(format!(
+                    "linguistic database locale is not active, observed: {active:?}"
+                ));
+            }
+        }
+    }
+    Ok(pool)
+}
+
+async fn drop_linguistic_database(
+    admin_pool: &PgPool,
+    name: &str,
+    pool: PgPool,
+) -> Result<(), String> {
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE \"{name}\" WITH (FORCE)"))
+        .execute(admin_pool)
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("drop linguistic database: {error}"))
+}
+
 /// The durable projection state used to prove a failed load repairs nothing.
 async fn projection_snapshot(
     pool: &PgPool,
@@ -385,6 +527,190 @@ async fn projection_snapshot(
     .await
     .expect("snapshot corrupt facts");
     (head, revisions, facts)
+}
+
+/// Publish permuted inputs on one database and prove bytewise canonical results.
+///
+/// Asserts the exact coverage-ID order, source-ID order and loaded projection (never a set
+/// comparison), `AlreadyApplied` replay of each operation with an unchanged head, and
+/// `OperationConflict` for a changed fact. Returns the database-default fact order so the
+/// caller can prove a linguistic collation is really active.
+async fn canonical_order_fixture(pool: &PgPool, beneficiary_id: &str) -> Vec<String> {
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'coverage-test', $2) \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(beneficiary_id)
+    .bind(beneficiary_id)
+    .execute(pool)
+    .await
+    .expect("insert collation test user");
+    let fixture = Fixture {
+        pool: pool.clone(),
+        beneficiary_id: beneficiary_id.to_owned(),
+    };
+
+    let fact_b = paid("ord-B", "src-m", 0, 30 * DAY);
+    let fact_d = paid("ord-D", "src-q", 30 * DAY, 60 * DAY);
+    let fact_a = paid("ord-a", "src-Z", 60 * DAY, 90 * DAY);
+    let fact_c = paid("ord-c", "src-A", 90 * DAY, 120 * DAY);
+    let canonical = vec![
+        fact_b.clone(),
+        fact_d.clone(),
+        fact_a.clone(),
+        fact_c.clone(),
+    ];
+
+    let first = committed_publish(
+        &fixture,
+        None,
+        "collation-op-1",
+        "collation-evidence-1",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![
+                fact_c.clone(),
+                fact_a.clone(),
+                fact_b.clone(),
+                fact_a.clone(),
+                fact_d.clone(),
+            ],
+        },
+    )
+    .await
+    .expect("publish first ordering revision");
+    assert_eq!(first.outcome, PublicationOutcome::Applied);
+    assert_eq!(first.revision, 1);
+
+    let loaded = load(pool, beneficiary_id)
+        .await
+        .expect("load first ordering revision");
+    assert_eq!(
+        loaded,
+        LoadedCoverage {
+            revision: 1,
+            coverage: PersonCoverage {
+                beneficiary_id: beneficiary_id.to_owned(),
+                paid_intervals: canonical.clone(),
+            },
+        }
+    );
+    let coverage_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT coverage_id FROM cloud_coverage_revision_facts \
+         WHERE beneficiary_id = $1 AND revision = 1 \
+         ORDER BY coverage_id COLLATE \"C\"",
+    )
+    .bind(beneficiary_id)
+    .fetch_all(pool)
+    .await
+    .expect("read canonical coverage order");
+    assert_eq!(coverage_ids, vec!["ord-B", "ord-D", "ord-a", "ord-c"]);
+    let source_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT source_id FROM cloud_coverage_revision_facts \
+         WHERE beneficiary_id = $1 AND revision = 1 \
+         ORDER BY coverage_id COLLATE \"C\"",
+    )
+    .bind(beneficiary_id)
+    .fetch_all(pool)
+    .await
+    .expect("read canonical source order");
+    assert_eq!(source_ids, vec!["src-m", "src-q", "src-Z", "src-A"]);
+
+    let second = committed_publish(
+        &fixture,
+        Some(1),
+        "collation-op-2",
+        "collation-evidence-2",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![
+                fact_d.clone(),
+                fact_d.clone(),
+                fact_b.clone(),
+                fact_c.clone(),
+                fact_a.clone(),
+            ],
+        },
+    )
+    .await
+    .expect("publish second ordering revision");
+    assert_eq!(second.outcome, PublicationOutcome::Applied);
+    assert_eq!(second.revision, 2);
+    let reloaded = load(pool, beneficiary_id)
+        .await
+        .expect("load second ordering revision");
+    assert_eq!(reloaded.revision, 2);
+    assert_eq!(reloaded.coverage.paid_intervals, canonical);
+
+    let replay_first = committed_publish(
+        &fixture,
+        None,
+        "collation-op-1",
+        "collation-evidence-1",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![
+                fact_a.clone(),
+                fact_c.clone(),
+                fact_d.clone(),
+                fact_b.clone(),
+                fact_b.clone(),
+            ],
+        },
+    )
+    .await
+    .expect("replay first ordering operation");
+    assert_eq!(replay_first.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(replay_first.revision, 1);
+    let replay_second = committed_publish(
+        &fixture,
+        Some(1),
+        "collation-op-2",
+        "collation-evidence-2",
+        &CoverageProjection::Complete {
+            paid_intervals: vec![
+                fact_b,
+                fact_a.clone(),
+                fact_d.clone(),
+                fact_c.clone(),
+                fact_c.clone(),
+            ],
+        },
+    )
+    .await
+    .expect("replay second ordering operation");
+    assert_eq!(replay_second.outcome, PublicationOutcome::AlreadyApplied);
+    assert_eq!(replay_second.revision, 2);
+    let head: i64 = sqlx::query_scalar(
+        "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
+    )
+    .bind(beneficiary_id)
+    .fetch_one(pool)
+    .await
+    .expect("read ordering head");
+    assert_eq!(head, 2);
+
+    let mut changed_a = fact_a;
+    changed_a.paid_until += 1;
+    assert!(matches!(
+        committed_publish(
+            &fixture,
+            None,
+            "collation-op-1",
+            "collation-evidence-1",
+            &CoverageProjection::Complete {
+                paid_intervals: vec![changed_a, fact_c, fact_d],
+            },
+        )
+        .await,
+        Err(StoreError::OperationConflict)
+    ));
+
+    sqlx::query_scalar(
+        "SELECT coverage_id FROM cloud_coverage_revision_facts \
+         WHERE beneficiary_id = $1 AND revision = 2 ORDER BY coverage_id",
+    )
+    .bind(beneficiary_id)
+    .fetch_all(pool)
+    .await
+    .expect("read database-default fact order")
 }
 
 async fn committed_publish(
@@ -2553,4 +2879,54 @@ async fn recovery_overflow_through_publisher_writes_nothing_durable() {
     )
     .await;
     result.expect("supervised overflow no-write");
+}
+
+#[tokio::test]
+async fn canonical_ordering_is_bytewise_across_database_collations() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let mut owner = RaceTaskOwner::new();
+    let cleanup_pool = fixture.pool.clone();
+    let cleanup_beneficiary = fixture.beneficiary_id.clone();
+    owner.register_cleanup(move || async move {
+        cleanup_result_for(&cleanup_pool, &cleanup_beneficiary).await
+    });
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                canonical_order_fixture(&fixture.pool, &fixture.beneficiary_id).await;
+
+                let collation = select_linguistic_collation(&fixture.pool).await;
+                let database_name = create_linguistic_database(&fixture.pool, &collation).await;
+                let linguistic_pool =
+                    open_linguistic_database(&fixture.pool, &database_name, &collation).await;
+                let drop_pool = fixture.pool.clone();
+                let drop_name = database_name.clone();
+                let drop_pool_handle = linguistic_pool.clone();
+                owner.register_cleanup(move || async move {
+                    drop_linguistic_database(&drop_pool, &drop_name, drop_pool_handle).await
+                });
+
+                let beneficiary_id = format!("coverage-collation-test-{}", Uuid::new_v4().simple());
+                let default_order =
+                    canonical_order_fixture(&linguistic_pool, &beneficiary_id).await;
+                let bytewise = vec![
+                    "ord-B".to_string(),
+                    "ord-D".to_string(),
+                    "ord-a".to_string(),
+                    "ord-c".to_string(),
+                ];
+                assert_ne!(
+                    default_order, bytewise,
+                    "linguistic collation orders facts non-bytewise, observed: {default_order:?}"
+                );
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised collation ordering");
 }
