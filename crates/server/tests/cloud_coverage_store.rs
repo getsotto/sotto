@@ -504,7 +504,7 @@ async fn drop_linguistic_database(
         .execute(admin_pool)
         .await
         .map(|_| ())
-        .map_err(|error| format!("drop linguistic database: {error}"))
+        .map_err(|error| format!("drop linguistic database {name}: {error}"))
 }
 
 /// The durable projection state used to prove a failed load repairs nothing.
