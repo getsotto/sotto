@@ -25,10 +25,12 @@ const secret = "  synthetic first line\nsecond line  ";
 
 function deferred() {
   let resolve!: () => void;
-  const promise = new Promise<void>((res) => {
+  let reject!: (err?: unknown) => void;
+  const promise = new Promise<void>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 async function revealSecret() {
@@ -96,6 +98,72 @@ describe("RecipientPage copy", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("copy it manually");
     expect(textarea).toHaveValue(secret);
+    expect(api.fetchShare).toHaveBeenCalledTimes(1);
+  });
+
+  it("prevents overlapping clipboard writes during repeated activation and indicates copying state", async () => {
+    const write = deferred();
+    const writeText = vi.fn(() => write.promise);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    await revealSecret();
+
+    const copyBtn = screen.getByRole("button", { name: "Copy secret" });
+    fireEvent.click(copyBtn);
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText).toHaveBeenCalledWith(secret);
+
+    // Repeated clicks while in flight do not trigger additional clipboard writes
+    const copyingBtn = screen.getByRole("button", { name: "Copying…" });
+    expect(copyingBtn).toBeDisabled();
+    fireEvent.click(copyingBtn);
+    expect(writeText).toHaveBeenCalledTimes(1);
+
+    await act(async () => write.resolve());
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Copied to clipboard.");
+    expect(screen.getByRole("button", { name: "Copy secret" })).toBeEnabled();
+    expect(api.fetchShare).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears previous failure feedback on retry and announces the successful result", async () => {
+    const firstWrite = deferred();
+    const secondWrite = deferred();
+    const writeText = vi
+      .fn()
+      .mockImplementationOnce(() => firstWrite.promise)
+      .mockImplementationOnce(() => secondWrite.promise);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+
+    await revealSecret();
+
+    // First attempt fails
+    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+    expect(writeText).toHaveBeenCalledTimes(1);
+    await act(async () => firstWrite.reject(new Error("write failed")));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("copy it manually");
+    const retryBtn = screen.getByRole("button", { name: "Copy secret" });
+    expect(retryBtn).toBeEnabled();
+
+    // Retry attempt clears failure alert and shows copying state
+    fireEvent.click(retryBtn);
+    expect(writeText).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copying…" })).toBeDisabled();
+
+    // Successful completion announces success and re-enables control
+    await act(async () => secondWrite.resolve());
+    expect(await screen.findByRole("status")).toHaveTextContent("Copied to clipboard.");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy secret" })).toBeEnabled();
     expect(api.fetchShare).toHaveBeenCalledTimes(1);
   });
 });
