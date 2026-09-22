@@ -1,8 +1,11 @@
 use std::{str::FromStr, sync::Arc};
 
-use sotto_server::cloud_coverage::{evaluate, ConfirmedPaidInterval, CoverageState};
+use sotto_server::cloud_coverage::{
+    evaluate, ConfirmedPaidInterval, CoverageState, PersonCoverage,
+};
 use sotto_server::cloud_coverage_store::{
-    load, publish, CoverageProjection, PublicationOutcome, StoreError, UnavailableReason,
+    load, publish, CoverageProjection, LoadedCoverage, PublicationOutcome, StoreError,
+    UnavailableReason,
 };
 use sotto_server::db;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -1518,4 +1521,166 @@ async fn loader_pause_acknowledges_between_metadata_and_facts_reads() {
     )
     .await;
     result.expect("supervised loader pause");
+}
+
+#[tokio::test]
+async fn complete_load_returns_one_committed_snapshot_across_writer_commit() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let old_intervals = vec![
+        paid("snap-old-A", "personal", 0, 30 * DAY),
+        recovery("snap-old-b", "sponsor", 30 * DAY, 60 * DAY, "renewal-7"),
+        paid("snap-old-c", "personal", 60 * DAY, 90 * DAY),
+    ];
+    let mut published_old = old_intervals.clone();
+    published_old.reverse();
+    let base = committed_publish(
+        &fixture,
+        None,
+        "snapshot-base",
+        "snapshot-base-evidence",
+        &CoverageProjection::Complete {
+            paid_intervals: published_old,
+        },
+    )
+    .await
+    .expect("publish snapshot base");
+    assert_eq!(base.revision, 1);
+    let expected_old = LoadedCoverage {
+        revision: 1,
+        coverage: PersonCoverage {
+            beneficiary_id: fixture.beneficiary_id.clone(),
+            paid_intervals: old_intervals,
+        },
+    };
+
+    let mut owner = RaceTaskOwner::new();
+    let cleanup_pool = fixture.pool.clone();
+    let cleanup_beneficiary = fixture.beneficiary_id.clone();
+    owner.register_cleanup(move || async move {
+        cleanup_result_for(&cleanup_pool, &cleanup_beneficiary).await
+    });
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                let mut writer = fixture.pool.begin().await.expect("begin held publication");
+                let held = publish(
+                    &mut writer,
+                    &fixture.beneficiary_id,
+                    Some(1),
+                    "snapshot-next",
+                    "snapshot-next-evidence",
+                    &CoverageProjection::Complete {
+                        paid_intervals: vec![
+                            paid("snap-new-a", "sponsor", 90 * DAY, 120 * DAY),
+                            paid("snap-new-B", "personal", 120 * DAY, 150 * DAY),
+                        ],
+                    },
+                )
+                .await
+                .expect("publish held revision");
+                assert_eq!(held.revision, 2);
+                let before = load(&fixture.pool, &fixture.beneficiary_id)
+                    .await
+                    .expect("load before lock");
+                assert_eq!(before, expected_old);
+
+                hold_exclusive_table_lock(&mut writer, "cloud_coverage_revision_facts").await;
+                let writer_pid = transaction_pid(&mut writer).await;
+
+                let loader_app = format!("coverage-loader-snapshot-{}", Uuid::new_v4());
+                let loader_pool = loader_pool(&loader_app).await;
+                let load_pool = loader_pool.clone();
+                let beneficiary_id = fixture.beneficiary_id.clone();
+                let mut loader =
+                    Some(owner.spawn(async move { load(&load_pool, &beneficiary_id).await }));
+                let loader_pid =
+                    wait_for_blocked_backend(&fixture.pool, &loader_app, writer_pid).await;
+                assert_ne!(loader_pid, writer_pid);
+
+                writer.commit().await.expect("commit held publication");
+                let paused = receive_owned(&mut loader, "paused loader")
+                    .await
+                    .expect("paused loader task completed")
+                    .expect("paused load succeeded");
+                assert_eq!(paused, expected_old);
+                assert!(
+                    paused
+                        .coverage
+                        .paid_intervals
+                        .iter()
+                        .all(|interval| interval.coverage_id.starts_with("snap-old-")),
+                    "paused load carries no replacement facts"
+                );
+
+                let after = load(&fixture.pool, &fixture.beneficiary_id)
+                    .await
+                    .expect("load after commit");
+                let expected_new = LoadedCoverage {
+                    revision: 2,
+                    coverage: PersonCoverage {
+                        beneficiary_id: fixture.beneficiary_id.clone(),
+                        paid_intervals: vec![
+                            paid("snap-new-B", "personal", 120 * DAY, 150 * DAY),
+                            paid("snap-new-a", "sponsor", 90 * DAY, 120 * DAY),
+                        ],
+                    },
+                };
+                assert_eq!(after, expected_new);
+                assert!(
+                    after
+                        .coverage
+                        .paid_intervals
+                        .iter()
+                        .all(|interval| interval.coverage_id.starts_with("snap-new-")),
+                    "replacement load carries no old facts"
+                );
+
+                let head: i64 = sqlx::query_scalar(
+                    "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("read snapshot head");
+                assert_eq!(head, 2);
+                let metadata: (String, String, String, i64) = sqlx::query_as(
+                    "SELECT operation_id, evidence_reference, status, fact_count \
+                     FROM cloud_coverage_revisions WHERE beneficiary_id = $1 AND revision = 2",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("read snapshot metadata");
+                assert_eq!(
+                    metadata,
+                    (
+                        "snapshot-next".into(),
+                        "snapshot-next-evidence".into(),
+                        "complete".into(),
+                        2
+                    )
+                );
+                let stored_ids: Vec<String> = sqlx::query_scalar(
+                    "SELECT coverage_id FROM cloud_coverage_revision_facts \
+                     WHERE beneficiary_id = $1 AND revision = 2 \
+                     ORDER BY coverage_id COLLATE \"C\"",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_all(&fixture.pool)
+                .await
+                .expect("read snapshot facts");
+                assert_eq!(
+                    stored_ids,
+                    vec!["snap-new-B".to_string(), "snap-new-a".to_string()]
+                );
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
+    )
+    .await;
+    result.expect("supervised snapshot interleaving");
 }
