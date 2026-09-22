@@ -374,6 +374,10 @@ async fn attempt_identity(
     .expect("read attempt identity")
 }
 
+async fn assert_attempt_status(fixture: &Fixture, attempt_id: &str, status: &str) {
+    assert_eq!(attempt_identity(fixture, attempt_id).await.4, status);
+}
+
 async fn registration_operations(fixture: &Fixture) -> Vec<(String, String)> {
     sqlx::query_as(
         "SELECT source_id, registration_operation_id FROM cloud_coverage_sources \
@@ -1232,7 +1236,6 @@ async fn stored_empty_bindings_reject_completed_replay_as_shape_corruption() {
         async {
             let source = binding(&fixture, "empty-source", "empty-allocation");
             register(&fixture, &source, "empty-registration").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "empty-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "empty-completed")).await;
             let observations = vec![complete_observation(
                 &source.source_id,
@@ -1240,6 +1243,9 @@ async fn stored_empty_bindings_reject_completed_replay_as_shape_corruption() {
                 "empty-coverage",
             )];
             complete(&fixture, &completed, "empty-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "empty-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
 
             for ticket in [&pending, &completed] {
                 corrupt_bindings(&fixture, ticket, serde_json::json!([])).await;
@@ -1302,11 +1308,6 @@ async fn stored_non_object_binding_elements_are_shape_corruption() {
                 "element-coverage",
             )];
             for (index, element) in ["1", "\"x\"", "null", "true"].iter().enumerate() {
-                let pending = begin(
-                    &fixture,
-                    &attempt_id(&fixture, &format!("element-pending-{index}")),
-                )
-                .await;
                 let completed = begin(
                     &fixture,
                     &attempt_id(&fixture, &format!("element-completed-{index}")),
@@ -1319,6 +1320,13 @@ async fn stored_non_object_binding_elements_are_shape_corruption() {
                     &observations,
                 )
                 .await;
+                let pending = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("element-pending-{index}")),
+                )
+                .await;
+                assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+                assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
                 let bindings: serde_json::Value =
                     serde_json::from_str(&format!("[{element}]")).expect("build element bindings");
                 for ticket in [&pending, &completed] {
@@ -1393,11 +1401,6 @@ async fn stored_binding_missing_field_is_shape_corruption() {
                     .clone();
                 object.remove(missing);
                 let bindings = serde_json::Value::Array(vec![serde_json::Value::Object(object)]);
-                let pending = begin(
-                    &fixture,
-                    &attempt_id(&fixture, &format!("missing-pending-{missing}")),
-                )
-                .await;
                 let completed = begin(
                     &fixture,
                     &attempt_id(&fixture, &format!("missing-completed-{missing}")),
@@ -1410,6 +1413,13 @@ async fn stored_binding_missing_field_is_shape_corruption() {
                     &observations,
                 )
                 .await;
+                let pending = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("missing-pending-{missing}")),
+                )
+                .await;
+                assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+                assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
                 for ticket in [&pending, &completed] {
                     corrupt_bindings(&fixture, ticket, bindings.clone()).await;
                     let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
@@ -1485,11 +1495,6 @@ async fn stored_binding_wrong_field_type_is_shape_corruption() {
                     .clone();
                 object.insert(field.into(), value);
                 let bindings = serde_json::Value::Array(vec![serde_json::Value::Object(object)]);
-                let pending = begin(
-                    &fixture,
-                    &attempt_id(&fixture, &format!("type-pending-{label}")),
-                )
-                .await;
                 let completed = begin(
                     &fixture,
                     &attempt_id(&fixture, &format!("type-completed-{label}")),
@@ -1502,6 +1507,13 @@ async fn stored_binding_wrong_field_type_is_shape_corruption() {
                     &observations,
                 )
                 .await;
+                let pending = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("type-pending-{label}")),
+                )
+                .await;
+                assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+                assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
                 for ticket in [&pending, &completed] {
                     corrupt_bindings(&fixture, ticket, bindings.clone()).await;
                     let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
@@ -1572,11 +1584,6 @@ async fn stored_binding_blank_identifier_is_shape_corruption() {
                     .clone();
                 object.insert(field.into(), serde_json::json!(blank));
                 let bindings = serde_json::Value::Array(vec![serde_json::Value::Object(object)]);
-                let pending = begin(
-                    &fixture,
-                    &attempt_id(&fixture, &format!("blank-pending-{label}")),
-                )
-                .await;
                 let completed = begin(
                     &fixture,
                     &attempt_id(&fixture, &format!("blank-completed-{label}")),
@@ -1589,6 +1596,13 @@ async fn stored_binding_blank_identifier_is_shape_corruption() {
                     &observations,
                 )
                 .await;
+                let pending = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("blank-pending-{label}")),
+                )
+                .await;
+                assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+                assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
                 for ticket in [&pending, &completed] {
                     corrupt_bindings(&fixture, ticket, bindings.clone()).await;
                     let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
@@ -1643,7 +1657,6 @@ async fn stored_binding_extra_field_is_shape_corruption() {
         async {
             let source = binding(&fixture, "extra-source", "extra-allocation");
             register(&fixture, &source, "extra-registration").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "extra-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "extra-completed")).await;
             let observations = vec![complete_observation(
                 &source.source_id,
@@ -1651,6 +1664,9 @@ async fn stored_binding_extra_field_is_shape_corruption() {
                 "extra-coverage",
             )];
             complete(&fixture, &completed, "extra-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "extra-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             let mut object = serde_json::to_value(&source)
                 .expect("serialize binding")
                 .as_object()
@@ -1711,7 +1727,6 @@ async fn stored_foreign_beneficiary_binding_is_ownership_corruption() {
         async {
             let source = binding(&fixture, "foreign-source", "foreign-allocation");
             register(&fixture, &source, "foreign-registration").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "foreign-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "foreign-completed")).await;
             let observations = vec![complete_observation(
                 &source.source_id,
@@ -1719,6 +1734,9 @@ async fn stored_foreign_beneficiary_binding_is_ownership_corruption() {
                 "foreign-coverage",
             )];
             complete(&fixture, &completed, "foreign-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "foreign-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             let mut foreign = source.clone();
             foreign.beneficiary_id = unrelated.beneficiary_id.clone();
             for ticket in [&pending, &completed] {
@@ -1774,7 +1792,6 @@ async fn stored_blank_beneficiary_binding_is_ownership_corruption() {
         async {
             let source = binding(&fixture, "blank-owner-source", "blank-owner-allocation");
             register(&fixture, &source, "blank-owner-registration").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "blank-owner-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "blank-owner-completed")).await;
             let observations = vec![complete_observation(
                 &source.source_id,
@@ -1782,6 +1799,9 @@ async fn stored_blank_beneficiary_binding_is_ownership_corruption() {
                 "blank-owner-coverage",
             )];
             complete(&fixture, &completed, "blank-owner-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "blank-owner-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             let mut blanked = source.clone();
             blanked.beneficiary_id = String::new();
             for ticket in [&pending, &completed] {
@@ -1837,7 +1857,6 @@ async fn stored_duplicate_source_binding_is_shape_corruption() {
         async {
             let source = binding(&fixture, "duplicate-source", "duplicate-allocation");
             register(&fixture, &source, "duplicate-registration").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "duplicate-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "duplicate-completed")).await;
             let observations = vec![complete_observation(
                 &source.source_id,
@@ -1845,6 +1864,9 @@ async fn stored_duplicate_source_binding_is_shape_corruption() {
                 "duplicate-coverage",
             )];
             complete(&fixture, &completed, "duplicate-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "duplicate-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             let duplicated = serde_json::json!([source.clone(), source.clone()]);
             for ticket in [&pending, &completed] {
                 corrupt_bindings(&fixture, ticket, duplicated.clone()).await;
@@ -1899,7 +1921,6 @@ async fn stored_duplicate_allocation_binding_is_source_set_corruption() {
         async {
             let source = binding(&fixture, "allocation-source", "shared-allocation");
             register(&fixture, &source, "allocation-registration").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "allocation-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "allocation-completed")).await;
             let observations = vec![complete_observation(
                 &source.source_id,
@@ -1907,6 +1928,9 @@ async fn stored_duplicate_allocation_binding_is_source_set_corruption() {
                 "allocation-coverage",
             )];
             complete(&fixture, &completed, "allocation-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "allocation-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             let mut second = source.clone();
             second.source_id = format!("{}-zzz", source.source_id);
             let duplicated = serde_json::json!([source, second]);
@@ -1962,7 +1986,6 @@ async fn stored_unordered_bindings_are_shape_corruption() {
         &mut owner,
         async {
             let (first, second) = register_pair(&fixture, "unordered").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "unordered-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "unordered-completed")).await;
             let observations = vec![
                 complete_observation(
@@ -1977,6 +2000,9 @@ async fn stored_unordered_bindings_are_shape_corruption() {
                 ),
             ];
             complete(&fixture, &completed, "unordered-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "unordered-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             let swapped = serde_json::json!([second, first]);
             for ticket in [&pending, &completed] {
                 corrupt_bindings(&fixture, ticket, swapped.clone()).await;
@@ -2052,11 +2078,6 @@ async fn stored_changed_binding_field_is_source_set_corruption() {
                     .clone();
                 object.insert(field.into(), serde_json::json!(value));
                 let bindings = serde_json::Value::Array(vec![serde_json::Value::Object(object)]);
-                let pending = begin(
-                    &fixture,
-                    &attempt_id(&fixture, &format!("changed-pending-{label}")),
-                )
-                .await;
                 let completed = begin(
                     &fixture,
                     &attempt_id(&fixture, &format!("changed-completed-{label}")),
@@ -2069,6 +2090,13 @@ async fn stored_changed_binding_field_is_source_set_corruption() {
                     &observations,
                 )
                 .await;
+                let pending = begin(
+                    &fixture,
+                    &attempt_id(&fixture, &format!("changed-pending-{label}")),
+                )
+                .await;
+                assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+                assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
                 for ticket in [&pending, &completed] {
                     corrupt_bindings(&fixture, ticket, bindings.clone()).await;
                     let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
@@ -2122,7 +2150,6 @@ async fn stored_missing_binding_is_source_set_corruption() {
         &mut owner,
         async {
             let (first, second) = register_pair(&fixture, "omitted").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "omitted-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "omitted-completed")).await;
             let observations = vec![
                 complete_observation(&first.source_id, "omitted-evidence-a", "omitted-coverage-a"),
@@ -2133,6 +2160,9 @@ async fn stored_missing_binding_is_source_set_corruption() {
                 ),
             ];
             complete(&fixture, &completed, "omitted-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "omitted-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             let partial = serde_json::json!([first]);
             for ticket in [&pending, &completed] {
                 corrupt_bindings(&fixture, ticket, partial.clone()).await;
@@ -2187,7 +2217,6 @@ async fn stored_extra_binding_is_source_set_corruption() {
         async {
             let source = binding(&fixture, "added-source", "added-allocation");
             register(&fixture, &source, "added-registration").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "added-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "added-completed")).await;
             let observations = vec![complete_observation(
                 &source.source_id,
@@ -2195,6 +2224,9 @@ async fn stored_extra_binding_is_source_set_corruption() {
                 "added-coverage",
             )];
             complete(&fixture, &completed, "added-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "added-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             let extra = SourceBinding {
                 beneficiary_id: fixture.beneficiary_id.clone(),
                 source_id: format!("{}-zzz", source.source_id),
@@ -2256,7 +2288,6 @@ async fn stored_bindings_reject_non_array_json_at_the_database() {
         async {
             let source = binding(&fixture, "raw-source", "raw-allocation");
             register(&fixture, &source, "raw-registration").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "raw-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "raw-completed")).await;
             let observations = vec![complete_observation(
                 &source.source_id,
@@ -2264,6 +2295,9 @@ async fn stored_bindings_reject_non_array_json_at_the_database() {
                 "raw-coverage",
             )];
             complete(&fixture, &completed, "raw-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "raw-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             for ticket in [&pending, &completed] {
                 let bindings_before = stored_bindings_text(&fixture, ticket).await;
                 let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
@@ -2311,7 +2345,6 @@ async fn deleted_authoritative_sources_are_source_set_corruption() {
         async {
             let source = binding(&fixture, "absent-source", "absent-allocation");
             register(&fixture, &source, "absent-registration").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "absent-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "absent-completed")).await;
             let observations = vec![complete_observation(
                 &source.source_id,
@@ -2319,6 +2352,9 @@ async fn deleted_authoritative_sources_are_source_set_corruption() {
                 "absent-coverage",
             )];
             complete(&fixture, &completed, "absent-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "absent-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             sqlx::query("DELETE FROM cloud_coverage_sources WHERE beneficiary_id = $1")
                 .bind(&fixture.beneficiary_id)
                 .execute(&fixture.pool)
@@ -2376,7 +2412,6 @@ async fn changed_authoritative_source_is_source_set_corruption() {
         async {
             let source = binding(&fixture, "drifted-source", "drifted-allocation");
             register(&fixture, &source, "drifted-registration").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "drifted-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "drifted-completed")).await;
             let observations = vec![complete_observation(
                 &source.source_id,
@@ -2384,6 +2419,9 @@ async fn changed_authoritative_source_is_source_set_corruption() {
                 "drifted-coverage",
             )];
             complete(&fixture, &completed, "drifted-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "drifted-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             sqlx::query(
                 "UPDATE cloud_coverage_sources SET ownership_evidence_reference = $2 \
                  WHERE source_id = $1",
@@ -2446,7 +2484,6 @@ async fn partial_authoritative_sources_are_source_set_corruption() {
         &mut owner,
         async {
             let (first, second) = register_pair(&fixture, "partial").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "partial-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "partial-completed")).await;
             let observations = vec![
                 complete_observation(&first.source_id, "partial-evidence-a", "partial-coverage-a"),
@@ -2457,6 +2494,9 @@ async fn partial_authoritative_sources_are_source_set_corruption() {
                 ),
             ];
             complete(&fixture, &completed, "partial-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "partial-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             sqlx::query("DELETE FROM cloud_coverage_sources WHERE source_id = $1")
                 .bind(&second.source_id)
                 .execute(&fixture.pool)
@@ -2513,7 +2553,6 @@ async fn lowered_stored_generation_is_source_set_corruption() {
         &mut owner,
         async {
             let (first, second) = register_pair(&fixture, "lowered").await;
-            let pending = begin(&fixture, &attempt_id(&fixture, "lowered-pending")).await;
             let completed = begin(&fixture, &attempt_id(&fixture, "lowered-completed")).await;
             let observations = vec![
                 complete_observation(&first.source_id, "lowered-evidence-a", "lowered-coverage-a"),
@@ -2524,6 +2563,9 @@ async fn lowered_stored_generation_is_source_set_corruption() {
                 ),
             ];
             complete(&fixture, &completed, "lowered-aggregate", &observations).await;
+            let pending = begin(&fixture, &attempt_id(&fixture, "lowered-pending")).await;
+            assert_attempt_status(&fixture, &pending.attempt_id, "pending").await;
+            assert_attempt_status(&fixture, &completed.attempt_id, "completed").await;
             for ticket in [&pending, &completed] {
                 corrupt_generation(&fixture, ticket, ticket.source_set_generation - 1).await;
                 let identity_before = attempt_identity(&fixture, &ticket.attempt_id).await;
