@@ -1,3 +1,36 @@
+//! Loader snapshot-consistency acceptance for cloud coverage projections.
+//!
+//! `load` reads head, revision metadata and facts keyed off one head value in a single
+//! `REPEATABLE READ` transaction. These tests deterministically force a writer commit or
+//! rollback between those internal reads and prove every result is one committed snapshot:
+//!
+//! - `loader_pause_acknowledges_between_metadata_and_facts_reads`: the observation point
+//!   itself; the loader blocks at the facts read behind the writer and observes old-then-new
+//!   revisions.
+//! - `complete_load_returns_one_committed_snapshot_across_writer_commit`: the paused load
+//!   returns the exact old snapshot (revision, metadata, fact count, all fact fields,
+//!   canonical order) and the next load the exact replacement; no facts cross revisions.
+//! - `unavailable_load_never_mixes_with_committed_replacement`: a loader paused at the
+//!   metadata read observes the old typed unavailable outcome, never replacement facts,
+//!   and the next load returns the exact complete replacement.
+//! - `rolled_back_publication_preserves_old_snapshot_and_retry_applies_once`: rollback
+//!   preserves the exact old snapshot while an unrelated beneficiary publishes and loads;
+//!   retry applies once with no orphan facts and no empty head.
+//! - `corrupt_projection_fails_closed_while_unrelated_beneficiary_progresses`: small
+//!   controls proving rejected head/status corruption, an exact fact-count reason, no
+//!   repair write and unrelated progress.
+//!
+//! Coordination uses no production hook: the writer holds `ACCESS EXCLUSIVE ... NOWAIT` on
+//! one table, the loader runs on a dedicated pool with a unique application name, and the
+//! test acknowledges the pause through bounded `pg_stat_activity`/`pg_blocking_pids`
+//! readiness before committing or rolling back the writer.
+//!
+//! Sensitivity (isolated checkout, restored before validation): removing `REPEATABLE READ`
+//! or replacing the transaction with separate autocommit queries still passes, because
+//! publication is atomic and revision rows are immutable and key-chained; a loader that
+//! refreshes the head after the facts read fails with a new-head/old-facts mix, which is
+//! the regression these tests guard.
+
 use std::{str::FromStr, sync::Arc};
 
 use sotto_server::cloud_coverage::{
