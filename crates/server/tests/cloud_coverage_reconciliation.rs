@@ -630,7 +630,16 @@ type AttemptRow = (
     String,
     Option<String>,
 );
-type RevisionRow = (i64, String, String, String, Option<String>, i64);
+type RevisionRow = (
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    Option<i64>,
+    String,
+);
 type FactRow = (i64, String, String, i64, i64, Option<String>);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -685,7 +694,9 @@ async fn durable_snapshot(fixture: &Fixture) -> DurableSnapshot {
     .await
     .expect("snapshot head");
     let revisions = sqlx::query_as(
-        "SELECT revision, operation_id, evidence_reference, status, unavailable_reason, fact_count \
+        "SELECT revision, operation_id, evidence_reference, status, unavailable_reason, fact_count, \
+                expected_revision, \
+                to_char(recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
          FROM cloud_coverage_revisions WHERE beneficiary_id = $1 ORDER BY revision",
     )
     .bind(&fixture.beneficiary_id)
