@@ -1819,7 +1819,11 @@ async fn competing_source_claims_preserve_global_source_identity() {
 
 #[tokio::test]
 async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator() {
-    let Some(fixture) = Fixture::create().await else {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
         return;
     };
     let first_source = binding(
@@ -1842,120 +1846,132 @@ async fn registration_first_supersedes_a_completion_waiting_on_the_coordinator()
     };
 
     let release = Arc::new(Notify::new());
-    let (holder_ready, holder_ready_rx) = oneshot::channel();
-    let mut owner = RaceTaskOwner::new();
-    let mut holder = Some(owner.spawn(held_registration(
-        fixture.pool.clone(),
-        "registration-race-second-op".into(),
-        second_source,
-        holder_ready,
-        release.clone(),
-    )));
-    let holder_pid = receive_pid(holder_ready_rx, "receive registration holder pid").await;
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                let (holder_ready, holder_ready_rx) = oneshot::channel();
+                let mut holder = Some(owner.spawn(held_registration(
+                    fixture.pool.clone(),
+                    "registration-race-second-op".into(),
+                    second_source,
+                    holder_ready,
+                    release.clone(),
+                )));
+                let holder_pid =
+                    receive_pid(holder_ready_rx, "receive registration holder pid").await;
 
-    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
-    let waiter_pool = fixture.pool.clone();
-    let waiter_ticket = ticket.clone();
-    let mut waiter = Some(owner.spawn(async move {
-        let mut tx = waiter_pool.begin().await.expect("begin superseded finish");
-        let pid = transaction_pid(&mut tx).await;
-        waiter_ready.send(pid).expect("signal superseded finish");
-        let result = finish_collection(
-            &mut tx,
-            &waiter_ticket,
-            "registration-race-aggregate",
-            &[observation],
-        )
-        .await;
-        tx.rollback().await.expect("rollback superseded finish");
-        result
-    }));
-    let waiter_pid = receive_pid(waiter_ready_rx, "receive superseded finish pid").await;
-    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
-    release.notify_one();
+                let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+                let waiter_pool = fixture.pool.clone();
+                let waiter_ticket = ticket.clone();
+                let mut waiter = Some(owner.spawn(async move {
+                    let mut tx = waiter_pool.begin().await.expect("begin superseded finish");
+                    let pid = transaction_pid(&mut tx).await;
+                    waiter_ready.send(pid).expect("signal superseded finish");
+                    let result = finish_collection(
+                        &mut tx,
+                        &waiter_ticket,
+                        "registration-race-aggregate",
+                        &[observation],
+                    )
+                    .await;
+                    tx.rollback().await.expect("rollback superseded finish");
+                    result
+                }));
+                let waiter_pid =
+                    receive_pid(waiter_ready_rx, "receive superseded finish pid").await;
+                wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+                release.notify_one();
 
-    let registration = receive_owned(&mut holder, "registration holder")
-        .await
-        .expect("registration holder task completed")
-        .expect("second registration applied");
-    let finish = receive_owned(&mut waiter, "superseded finish")
-        .await
-        .expect("superseded finish task completed");
-    owner
-        .join_all()
-        .await
-        .expect("join registration race tasks");
-    assert_eq!(registration.source_set_generation, 2);
-    assert!(matches!(
-        finish,
-        Err(ReconciliationError::AttemptSuperseded)
-    ));
-    let status: String = sqlx::query_scalar(
-        "SELECT status FROM cloud_coverage_collection_attempts \
-         WHERE beneficiary_id = $1 AND attempt_id = $2",
+                let registration = receive_owned(&mut holder, "registration holder")
+                    .await
+                    .expect("registration holder task completed")
+                    .expect("second registration applied");
+                let finish = receive_owned(&mut waiter, "superseded finish")
+                    .await
+                    .expect("superseded finish task completed");
+                assert_eq!(registration.source_set_generation, 2);
+                assert!(matches!(
+                    finish,
+                    Err(ReconciliationError::AttemptSuperseded)
+                ));
+                let status: String = sqlx::query_scalar(
+                    "SELECT status FROM cloud_coverage_collection_attempts \
+                     WHERE beneficiary_id = $1 AND attempt_id = $2",
+                )
+                .bind(&fixture.beneficiary_id)
+                .bind(&ticket.attempt_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("read superseded registration race status");
+                assert_eq!(status, "superseded");
+                assert_eq!(head_revision(&fixture).await, 2);
+                let source_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count registration race sources");
+                assert_eq!(source_count, 2);
+                let source_ids: Vec<String> = sqlx::query_scalar(
+                    "SELECT source_id FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_all(&fixture.pool)
+                .await
+                .expect("read registration race sources");
+                assert_eq!(
+                    source_ids,
+                    vec![first_source.source_id.clone(), second_source_id]
+                );
+                let revision_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_revisions WHERE beneficiary_id = $1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count registration race revisions");
+                assert_eq!(revision_count, 2);
+                let unavailable_fact_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_revision_facts \
+                     WHERE beneficiary_id = $1 AND revision = 2",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count registration race unavailable facts");
+                assert_eq!(unavailable_fact_count, 0);
+                let current_attempt: Option<String> = sqlx::query_scalar(
+                    "SELECT current_attempt_id FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("read registration race current attempt");
+                assert_eq!(current_attempt, None);
+                assert!(matches!(
+                    load(&fixture.pool, &fixture.beneficiary_id).await,
+                    Err(StoreError::ProjectionUnavailable(
+                        UnavailableReason::NeedsReconciliation
+                    ))
+                ));
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
     )
-    .bind(&fixture.beneficiary_id)
-    .bind(&ticket.attempt_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("read superseded registration race status");
-    assert_eq!(status, "superseded");
-    assert_eq!(head_revision(&fixture).await, 2);
-    let source_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1")
-            .bind(&fixture.beneficiary_id)
-            .fetch_one(&fixture.pool)
-            .await
-            .expect("count registration race sources");
-    assert_eq!(source_count, 2);
-    let source_ids: Vec<String> = sqlx::query_scalar(
-        "SELECT source_id FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_all(&fixture.pool)
-    .await
-    .expect("read registration race sources");
-    assert_eq!(
-        source_ids,
-        vec![first_source.source_id.clone(), second_source_id]
-    );
-    let revision_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM cloud_coverage_revisions WHERE beneficiary_id = $1",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("count registration race revisions");
-    assert_eq!(revision_count, 2);
-    let unavailable_fact_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM cloud_coverage_revision_facts \
-         WHERE beneficiary_id = $1 AND revision = 2",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("count registration race unavailable facts");
-    assert_eq!(unavailable_fact_count, 0);
-    let current_attempt: Option<String> = sqlx::query_scalar(
-        "SELECT current_attempt_id FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("read registration race current attempt");
-    assert_eq!(current_attempt, None);
-    assert!(matches!(
-        load(&fixture.pool, &fixture.beneficiary_id).await,
-        Err(StoreError::ProjectionUnavailable(
-            UnavailableReason::NeedsReconciliation
-        ))
-    ));
-    cleanup(&fixture).await;
+    .await;
+    result.expect("supervised registration race");
 }
 
 #[tokio::test]
 async fn completion_first_allows_registration_and_preserves_historical_replay() {
-    let Some(fixture) = Fixture::create().await else {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
         return;
     };
     let first_source = binding(
@@ -1984,149 +2000,162 @@ async fn completion_first_allows_registration_and_preserves_historical_replay() 
     }];
 
     let release = Arc::new(Notify::new());
-    let (holder_ready, holder_ready_rx) = oneshot::channel();
-    let holder_pool = fixture.pool.clone();
-    let holder_ticket = ticket.clone();
-    let holder_observations = observations.clone();
-    let holder_release = release.clone();
-    let mut owner = RaceTaskOwner::new();
-    let mut holder = Some(owner.spawn(async move {
-        let mut tx = holder_pool
-            .begin()
-            .await
-            .expect("begin held completion race");
-        let pid = transaction_pid(&mut tx).await;
-        let result = finish_collection(
-            &mut tx,
-            &holder_ticket,
-            "completion-race-aggregate",
-            &holder_observations,
-        )
-        .await;
-        holder_ready.send(pid).expect("signal held completion race");
-        holder_release.notified().await;
-        match result {
-            Ok(receipt) => {
-                tx.commit().await.expect("commit held completion race");
-                Ok(receipt)
-            }
-            Err(error) => {
-                tx.rollback().await.expect("rollback held completion race");
-                Err(error)
-            }
-        }
-    }));
-    let holder_pid = receive_pid(holder_ready_rx, "receive completion holder pid").await;
+    let result = run_with_context(
+        &mut owner,
+        |owner| {
+            Box::pin(async move {
+                let (holder_ready, holder_ready_rx) = oneshot::channel();
+                let holder_pool = fixture.pool.clone();
+                let holder_ticket = ticket.clone();
+                let holder_observations = observations.clone();
+                let holder_release = release.clone();
+                let mut holder = Some(owner.spawn(async move {
+                    let mut tx = holder_pool
+                        .begin()
+                        .await
+                        .expect("begin held completion race");
+                    let pid = transaction_pid(&mut tx).await;
+                    let result = finish_collection(
+                        &mut tx,
+                        &holder_ticket,
+                        "completion-race-aggregate",
+                        &holder_observations,
+                    )
+                    .await;
+                    holder_ready.send(pid).expect("signal held completion race");
+                    holder_release.notified().await;
+                    match result {
+                        Ok(receipt) => {
+                            tx.commit().await.expect("commit held completion race");
+                            Ok(receipt)
+                        }
+                        Err(error) => {
+                            tx.rollback().await.expect("rollback held completion race");
+                            Err(error)
+                        }
+                    }
+                }));
+                let holder_pid =
+                    receive_pid(holder_ready_rx, "receive completion holder pid").await;
 
-    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
-    let waiter_pool = fixture.pool.clone();
-    let mut waiter = Some(owner.spawn(async move {
-        let mut tx = waiter_pool
-            .begin()
-            .await
-            .expect("begin blocked registration race");
-        let pid = transaction_pid(&mut tx).await;
-        waiter_ready
-            .send(pid)
-            .expect("signal blocked registration race");
-        let result = register_source(&mut tx, "completion-race-second-op", &second_source).await;
-        match result {
-            Ok(receipt) => {
-                tx.commit().await.expect("commit blocked registration race");
-                Ok(receipt)
-            }
-            Err(error) => {
-                tx.rollback()
+                let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+                let waiter_pool = fixture.pool.clone();
+                let mut waiter = Some(owner.spawn(async move {
+                    let mut tx = waiter_pool
+                        .begin()
+                        .await
+                        .expect("begin blocked registration race");
+                    let pid = transaction_pid(&mut tx).await;
+                    waiter_ready
+                        .send(pid)
+                        .expect("signal blocked registration race");
+                    let result =
+                        register_source(&mut tx, "completion-race-second-op", &second_source).await;
+                    match result {
+                        Ok(receipt) => {
+                            tx.commit().await.expect("commit blocked registration race");
+                            Ok(receipt)
+                        }
+                        Err(error) => {
+                            tx.rollback()
+                                .await
+                                .expect("rollback blocked registration race");
+                            Err(error)
+                        }
+                    }
+                }));
+                let waiter_pid =
+                    receive_pid(waiter_ready_rx, "receive registration waiter pid").await;
+                wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+                release.notify_one();
+
+                let completion = receive_owned(&mut holder, "held completion race")
                     .await
-                    .expect("rollback blocked registration race");
-                Err(error)
-            }
-        }
-    }));
-    let waiter_pid = receive_pid(waiter_ready_rx, "receive registration waiter pid").await;
-    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
-    release.notify_one();
-
-    let completion = receive_owned(&mut holder, "held completion race")
-        .await
-        .expect("held completion race task completed")
-        .expect("completion race applied");
-    let registration = receive_owned(&mut waiter, "registration race")
-        .await
-        .expect("registration race task completed")
-        .expect("registration race applied");
-    owner.join_all().await.expect("join completion race tasks");
-    assert_eq!(completion.revision, 2);
-    assert_eq!(completion.outcome, PublicationOutcome::Applied);
-    assert_eq!(registration.source_set_generation, 2);
-    assert_eq!(registration.projection_revision, Some(3));
-    assert_eq!(head_revision(&fixture).await, 3);
-    let source_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1")
-            .bind(&fixture.beneficiary_id)
-            .fetch_one(&fixture.pool)
-            .await
-            .expect("count completion race sources");
-    assert_eq!(source_count, 2);
-    let source_ids: Vec<String> = sqlx::query_scalar(
-        "SELECT source_id FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id",
+                    .expect("held completion race task completed")
+                    .expect("completion race applied");
+                let registration = receive_owned(&mut waiter, "registration race")
+                    .await
+                    .expect("registration race task completed")
+                    .expect("registration race applied");
+                assert_eq!(completion.revision, 2);
+                assert_eq!(completion.outcome, PublicationOutcome::Applied);
+                assert_eq!(registration.source_set_generation, 2);
+                assert_eq!(registration.projection_revision, Some(3));
+                assert_eq!(head_revision(&fixture).await, 3);
+                let source_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count completion race sources");
+                assert_eq!(source_count, 2);
+                let source_ids: Vec<String> = sqlx::query_scalar(
+                    "SELECT source_id FROM cloud_coverage_sources WHERE beneficiary_id = $1 ORDER BY source_id",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_all(&fixture.pool)
+                .await
+                .expect("read completion race sources");
+                assert_eq!(
+                    source_ids,
+                    vec![first_source.source_id.clone(), second_source_id]
+                );
+                let revision_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_revisions WHERE beneficiary_id = $1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count completion race revisions");
+                assert_eq!(revision_count, 3);
+                let unavailable_fact_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_revision_facts \
+                     WHERE beneficiary_id = $1 AND revision = 3",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count completion race unavailable facts");
+                assert_eq!(unavailable_fact_count, 0);
+                let completed_fact_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_revision_facts \
+                     WHERE beneficiary_id = $1 AND revision = 2",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count completion race historical facts");
+                assert_eq!(completed_fact_count, 1);
+                let current_attempt: Option<String> = sqlx::query_scalar(
+                    "SELECT current_attempt_id FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("read completion race current attempt");
+                assert_eq!(current_attempt, None);
+                let mut replay_tx =
+                    fixture.pool.begin().await.expect("begin completed replay");
+                let replay = finish_collection(
+                    &mut replay_tx,
+                    &ticket,
+                    "completion-race-aggregate",
+                    &observations,
+                )
+                .await
+                .expect("replay completed historical collection");
+                replay_tx.commit().await.expect("commit completed replay");
+                assert_eq!(replay.revision, completion.revision);
+                assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+                assert_eq!(head_revision(&fixture).await, 3);
+                Ok(())
+            })
+        },
+        || async { Ok::<(), String>(()) },
     )
-    .bind(&fixture.beneficiary_id)
-    .fetch_all(&fixture.pool)
-    .await
-    .expect("read completion race sources");
-    assert_eq!(
-        source_ids,
-        vec![first_source.source_id.clone(), second_source_id]
-    );
-    let revision_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM cloud_coverage_revisions WHERE beneficiary_id = $1",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("count completion race revisions");
-    assert_eq!(revision_count, 3);
-    let unavailable_fact_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM cloud_coverage_revision_facts \
-         WHERE beneficiary_id = $1 AND revision = 3",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("count completion race unavailable facts");
-    assert_eq!(unavailable_fact_count, 0);
-    let completed_fact_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM cloud_coverage_revision_facts \
-         WHERE beneficiary_id = $1 AND revision = 2",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("count completion race historical facts");
-    assert_eq!(completed_fact_count, 1);
-    let current_attempt: Option<String> = sqlx::query_scalar(
-        "SELECT current_attempt_id FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("read completion race current attempt");
-    assert_eq!(current_attempt, None);
-    let mut replay_tx = fixture.pool.begin().await.expect("begin completed replay");
-    let replay = finish_collection(
-        &mut replay_tx,
-        &ticket,
-        "completion-race-aggregate",
-        &observations,
-    )
-    .await
-    .expect("replay completed historical collection");
-    replay_tx.commit().await.expect("commit completed replay");
-    assert_eq!(replay.revision, completion.revision);
-    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
-    assert_eq!(head_revision(&fixture).await, 3);
-    cleanup(&fixture).await;
+    .await;
+    result.expect("supervised completion race");
 }
 
 #[tokio::test]
