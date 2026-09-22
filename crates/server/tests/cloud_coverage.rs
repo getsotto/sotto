@@ -1,6 +1,6 @@
 use sotto_server::cloud_coverage::{
-    evaluate, ConfirmedPaidInterval, CoverageState, InvalidCoverage, PersonCoverage,
-    EXPORT_WINDOW_SECONDS, RENEWAL_RECOVERY_SECONDS,
+    evaluate, ConfirmedPaidInterval, CoverageDecision, CoverageState, InvalidCoverage,
+    PersonCoverage, EXPORT_WINDOW_SECONDS, RENEWAL_RECOVERY_SECONDS,
 };
 
 const DAY: i64 = 24 * 60 * 60;
@@ -224,6 +224,83 @@ fn malformed_input_fails_closed() {
         )
         .unwrap_err(),
         InvalidCoverage::ConflictingRenewal
+    );
+}
+
+#[test]
+fn max_ending_interval_is_valid_before_and_during_but_overflows_export_at_end() {
+    let input = coverage(vec![paid("max", "personal", i64::MAX - 1, i64::MAX)]);
+    assert_eq!(
+        evaluate(&input, i64::MAX - 2).unwrap(),
+        CoverageDecision {
+            state: CoverageState::Free,
+            active_until: None,
+            recovery_until: None,
+            export_until: None,
+        }
+    );
+    assert_eq!(
+        evaluate(&input, i64::MAX - 1).unwrap(),
+        CoverageDecision {
+            state: CoverageState::Paid,
+            active_until: Some(i64::MAX),
+            recovery_until: None,
+            export_until: None,
+        }
+    );
+    assert_eq!(
+        evaluate(&input, i64::MAX).unwrap_err(),
+        InvalidCoverage::ExportDeadlineOverflow
+    );
+}
+
+#[test]
+fn export_deadline_fits_exactly_at_max_and_overflows_one_second_later() {
+    let end = i64::MAX - EXPORT_WINDOW_SECONDS;
+    let fitting = coverage(vec![paid("fitting", "personal", 0, end)]);
+    let at_end = evaluate(&fitting, end).unwrap();
+    assert_eq!(at_end.state, CoverageState::ExportOnly);
+    assert_eq!(at_end.export_until, Some(i64::MAX));
+    let expired = evaluate(&fitting, i64::MAX).unwrap();
+    assert_eq!(expired.state, CoverageState::Expired);
+    assert_eq!(expired.export_until, Some(i64::MAX));
+
+    let overflowing = coverage(vec![paid("overflowing", "personal", 0, end + 1)]);
+    assert_eq!(
+        evaluate(&overflowing, end + 1).unwrap_err(),
+        InvalidCoverage::ExportDeadlineOverflow
+    );
+}
+
+#[test]
+fn recovery_deadline_fits_exactly_at_max_and_overflows_one_second_later() {
+    let paid_until = i64::MAX - RENEWAL_RECOVERY_SECONDS;
+    let fitting = coverage(vec![recovery(
+        "fitting",
+        "personal",
+        0,
+        paid_until,
+        "renewal-fitting",
+    )]);
+    let recovering = evaluate(&fitting, paid_until).unwrap();
+    assert_eq!(recovering.state, CoverageState::RenewalRecovery);
+    assert_eq!(recovering.active_until, Some(i64::MAX));
+    assert_eq!(recovering.recovery_until, Some(i64::MAX));
+    assert_eq!(
+        evaluate(&fitting, i64::MAX).unwrap_err(),
+        InvalidCoverage::ExportDeadlineOverflow
+    );
+
+    let overflowing = coverage(vec![recovery(
+        "overflowing",
+        "personal",
+        0,
+        paid_until + 1,
+        "renewal-overflowing",
+    )]);
+    assert_eq!(
+        evaluate(&overflowing, 1).unwrap_err(),
+        InvalidCoverage::RecoveryDeadlineOverflow
     );
 }
 
