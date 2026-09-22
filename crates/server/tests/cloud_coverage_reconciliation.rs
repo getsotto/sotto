@@ -18,7 +18,8 @@ use uuid::Uuid;
 mod support;
 
 use support::coverage_concurrency::{
-    receive_owned, receive_pid, transaction_pid, wait_for_specific_block, RaceTaskOwner,
+    receive_owned, receive_pid, run_with_context, transaction_pid, wait_for_specific_block,
+    RaceTaskOwner,
 };
 
 struct Fixture {
@@ -57,6 +58,53 @@ impl Fixture {
         })
     }
 
+    async fn create_owned(owner: &mut RaceTaskOwner) -> Result<Option<Self>, String> {
+        if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            eprintln!("skipping cloud coverage reconciliation test: set SOTTO_RUN_DB_TESTS=1");
+            return Ok(None);
+        }
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| "DATABASE_URL is required when SOTTO_RUN_DB_TESTS=1".to_string())?;
+        let options = PgConnectOptions::from_str(&database_url)
+            .map_err(|error| format!("parse DATABASE_URL: {error}"))?;
+        if !matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1") {
+            return Err(format!(
+                "refusing reconciliation tests against non-local host: {}",
+                options.get_host()
+            ));
+        }
+        let pool = db::connect(&database_url)
+            .await
+            .map_err(|error| format!("connect: {error}"))?;
+        db::migrate(&pool)
+            .await
+            .map_err(|error| format!("migrate: {error}"))?;
+        let beneficiary_id = format!("coverage-reconciliation-test-{}", Uuid::new_v4());
+        let cleanup_pool = pool.clone();
+        let cleanup_beneficiary = beneficiary_id.clone();
+        owner.register_cleanup(move || async move {
+            cleanup_result_for(&cleanup_pool, &cleanup_beneficiary).await
+        });
+        let insert_result = sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'reconciliation-test', $2)",
+        )
+        .bind(&beneficiary_id)
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await;
+        if let Err(error) = insert_result {
+            let error = format!("insert reconciliation test user: {error}");
+            return match owner.cleanup_registered().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(format!("{error}; cleanup: {cleanup}")),
+            };
+        }
+        Ok(Some(Self {
+            pool,
+            beneficiary_id,
+        }))
+    }
+
     async fn add_beneficiary(&self) -> Self {
         let beneficiary_id = format!("coverage-reconciliation-test-{}", Uuid::new_v4());
         sqlx::query(
@@ -75,48 +123,59 @@ impl Fixture {
 }
 
 async fn cleanup(fixture: &Fixture) {
+    cleanup_result(fixture)
+        .await
+        .expect("delete reconciliation test fixture");
+}
+
+async fn cleanup_result(fixture: &Fixture) -> Result<(), String> {
+    cleanup_result_for(&fixture.pool, &fixture.beneficiary_id).await
+}
+
+async fn cleanup_result_for(pool: &PgPool, beneficiary_id: &str) -> Result<(), String> {
     sqlx::query("DELETE FROM cloud_coverage_heads WHERE beneficiary_id = $1")
-        .bind(&fixture.beneficiary_id)
-        .execute(&fixture.pool)
+        .bind(beneficiary_id)
+        .execute(pool)
         .await
-        .expect("delete coverage head");
+        .map_err(|error| format!("delete coverage head: {error}"))?;
     sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
-        .bind(&fixture.beneficiary_id)
-        .execute(&fixture.pool)
+        .bind(beneficiary_id)
+        .execute(pool)
         .await
-        .expect("delete coverage facts");
+        .map_err(|error| format!("delete coverage facts: {error}"))?;
     sqlx::query(
         "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1",
     )
-    .bind(&fixture.beneficiary_id)
-    .execute(&fixture.pool)
+    .bind(beneficiary_id)
+    .execute(pool)
     .await
-    .expect("clear current collection attempt");
+    .map_err(|error| format!("clear current collection attempt: {error}"))?;
     sqlx::query("DELETE FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1")
-        .bind(&fixture.beneficiary_id)
-        .execute(&fixture.pool)
+        .bind(beneficiary_id)
+        .execute(pool)
         .await
-        .expect("delete collection attempts");
+        .map_err(|error| format!("delete collection attempts: {error}"))?;
     sqlx::query("DELETE FROM cloud_coverage_sources WHERE beneficiary_id = $1")
-        .bind(&fixture.beneficiary_id)
-        .execute(&fixture.pool)
+        .bind(beneficiary_id)
+        .execute(pool)
         .await
-        .expect("delete coverage sources");
+        .map_err(|error| format!("delete coverage sources: {error}"))?;
     sqlx::query("DELETE FROM cloud_coverage_revisions WHERE beneficiary_id = $1")
-        .bind(&fixture.beneficiary_id)
-        .execute(&fixture.pool)
+        .bind(beneficiary_id)
+        .execute(pool)
         .await
-        .expect("delete coverage revisions");
+        .map_err(|error| format!("delete coverage revisions: {error}"))?;
     sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id = $1")
-        .bind(&fixture.beneficiary_id)
-        .execute(&fixture.pool)
+        .bind(beneficiary_id)
+        .execute(pool)
         .await
-        .expect("delete coverage coordinator");
+        .map_err(|error| format!("delete coverage coordinator: {error}"))?;
     sqlx::query("DELETE FROM users WHERE id = $1")
-        .bind(&fixture.beneficiary_id)
-        .execute(&fixture.pool)
+        .bind(beneficiary_id)
+        .execute(pool)
         .await
-        .expect("delete reconciliation test user");
+        .map_err(|error| format!("delete reconciliation test user: {error}"))?;
+    Ok(())
 }
 
 fn binding(fixture: &Fixture, source_id: &str, external: &str) -> SourceBinding {
@@ -931,6 +990,7 @@ async fn registration_rejects_adopting_an_unmanaged_projection() {
 }
 
 async fn publication_before_coordinator_lock(
+    owner: &mut RaceTaskOwner,
     fixture: &Fixture,
     projection: CoverageProjection,
     suffix: &str,
@@ -941,135 +1001,161 @@ async fn publication_before_coordinator_lock(
         &format!("bootstrap-before-allocation-{suffix}"),
     );
     let release = Arc::new(Notify::new());
-    let (holder_ready, holder_ready_rx) = oneshot::channel();
-    let mut owner = RaceTaskOwner::new();
-    let mut holder = Some(owner.spawn(held_coordinator_insert(
-        fixture.pool.clone(),
-        fixture.beneficiary_id.clone(),
-        holder_ready,
-        release.clone(),
-    )));
-    let holder_pid = receive_pid(holder_ready_rx, "receive bootstrap coordinator pid").await;
+    let pool = fixture.pool.clone();
+    let beneficiary_id = fixture.beneficiary_id.clone();
+    let suffix = suffix.to_owned();
+    let result = run_with_context(
+        owner,
+        |owner| {
+            Box::pin(async move {
+                let fixture = Fixture {
+                    pool,
+                    beneficiary_id,
+                };
+                let fixture = &fixture;
+                let (holder_ready, holder_ready_rx) = oneshot::channel();
+                let mut holder = Some(owner.spawn(held_coordinator_insert(
+                    fixture.pool.clone(),
+                    fixture.beneficiary_id.clone(),
+                    holder_ready,
+                    release.clone(),
+                )));
+                let holder_pid =
+                    receive_pid(holder_ready_rx, "receive bootstrap coordinator pid").await;
 
-    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
-    let waiter_pool = fixture.pool.clone();
-    let waiter_source = source.clone();
-    let mut waiter = Some(owner.spawn(async move {
-        let mut tx = waiter_pool
-            .begin()
-            .await
-            .expect("begin bootstrap registration");
-        let pid = transaction_pid(&mut tx).await;
-        waiter_ready
-            .send(pid)
-            .expect("signal bootstrap registration");
-        let result =
-            register_source(&mut tx, "bootstrap-before-registration", &waiter_source).await;
-        tx.rollback()
-            .await
-            .expect("rollback bootstrap registration");
-        result
-    }));
-    let waiter_pid = receive_pid(waiter_ready_rx, "receive bootstrap registration pid").await;
-    wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
+                let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+                let waiter_pool = fixture.pool.clone();
+                let waiter_source = source.clone();
+                let mut waiter = Some(owner.spawn(async move {
+                    let mut tx = waiter_pool
+                        .begin()
+                        .await
+                        .expect("begin bootstrap registration");
+                    let pid = transaction_pid(&mut tx).await;
+                    waiter_ready
+                        .send(pid)
+                        .expect("signal bootstrap registration");
+                    let result =
+                        register_source(&mut tx, "bootstrap-before-registration", &waiter_source)
+                            .await;
+                    tx.rollback()
+                        .await
+                        .expect("rollback bootstrap registration");
+                    result
+                }));
+                let waiter_pid =
+                    receive_pid(waiter_ready_rx, "receive bootstrap registration pid").await;
+                wait_for_specific_block(&fixture.pool, waiter_pid, holder_pid).await;
 
-    let mut publisher_tx = fixture
-        .pool
-        .begin()
-        .await
-        .expect("begin bootstrap publisher");
-    let publication = publish(
-        &mut publisher_tx,
-        &fixture.beneficiary_id,
-        None,
-        &format!("bootstrap-before-publication-{suffix}"),
-        &format!("bootstrap-before-evidence-{suffix}"),
-        &projection,
+                let mut publisher_tx = fixture
+                    .pool
+                    .begin()
+                    .await
+                    .expect("begin bootstrap publisher");
+                let publication = publish(
+                    &mut publisher_tx,
+                    &fixture.beneficiary_id,
+                    None,
+                    &format!("bootstrap-before-publication-{suffix}"),
+                    &format!("bootstrap-before-evidence-{suffix}"),
+                    &projection,
+                )
+                .await
+                .expect("publish bootstrap projection");
+                publisher_tx
+                    .commit()
+                    .await
+                    .expect("commit bootstrap projection");
+                release.notify_one();
+
+                receive_owned(&mut holder, "bootstrap coordinator holder")
+                    .await
+                    .expect("bootstrap coordinator holder completed");
+                let registration = receive_owned(&mut waiter, "bootstrap registration")
+                    .await
+                    .expect("bootstrap registration task completed");
+
+                let coordinator: (i64, i64, Option<String>) = sqlx::query_as(
+                    "SELECT source_set_generation, collection_epoch, current_attempt_id \
+                     FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("read bootstrap coordinator");
+                assert_eq!(coordinator, (0, 0, None));
+                let source_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count rejected bootstrap sources");
+                assert_eq!(source_count, 0);
+                assert_projection_state(
+                    fixture,
+                    publication.revision,
+                    &format!("bootstrap-before-publication-{suffix}"),
+                    &format!("bootstrap-before-evidence-{suffix}"),
+                    &projection,
+                    0,
+                )
+                .await;
+                assert_eq!(head_revision(fixture).await, publication.revision);
+                let operation: (String, String) = sqlx::query_as(
+                    "SELECT operation_id, evidence_reference FROM cloud_coverage_revisions \
+                     WHERE beneficiary_id = $1 AND revision = $2",
+                )
+                .bind(&fixture.beneficiary_id)
+                .bind(publication.revision)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("read unmanaged bootstrap revision");
+                assert_eq!(
+                    operation,
+                    (
+                        format!("bootstrap-before-publication-{suffix}"),
+                        format!("bootstrap-before-evidence-{suffix}")
+                    )
+                );
+                match projection {
+                    CoverageProjection::Complete { paid_intervals } => {
+                        let loaded = load(&fixture.pool, &fixture.beneficiary_id)
+                            .await
+                            .expect("load unmanaged complete bootstrap projection");
+                        assert_eq!(loaded.revision, publication.revision);
+                        assert_eq!(loaded.coverage.paid_intervals, paid_intervals);
+                    }
+                    CoverageProjection::Unavailable { reason } => assert!(matches!(
+                        load(&fixture.pool, &fixture.beneficiary_id).await,
+                        Err(StoreError::ProjectionUnavailable(actual)) if actual == reason
+                    )),
+                }
+                Ok((publication, registration))
+            })
+        },
+        || async { Ok::<(), String>(()) },
     )
-    .await
-    .expect("publish bootstrap projection");
-    publisher_tx
-        .commit()
-        .await
-        .expect("commit bootstrap projection");
-    release.notify_one();
-
-    receive_owned(&mut holder, "bootstrap coordinator holder")
-        .await
-        .expect("bootstrap coordinator holder completed");
-    let registration = receive_owned(&mut waiter, "bootstrap registration")
-        .await
-        .expect("bootstrap registration task completed");
-    owner.join_all().await.expect("join bootstrap race tasks");
+    .await;
+    let (publication, registration) = result.expect("supervised bootstrap race");
+    assert_eq!(publication.outcome, PublicationOutcome::Applied);
     assert!(matches!(
         registration,
         Err(ReconciliationError::BootstrapConflict)
     ));
-
-    let coordinator: (i64, i64, Option<String>) = sqlx::query_as(
-        "SELECT source_set_generation, collection_epoch, current_attempt_id \
-         FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("read bootstrap coordinator");
-    assert_eq!(coordinator, (0, 0, None));
-    let source_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1")
-            .bind(&fixture.beneficiary_id)
-            .fetch_one(&fixture.pool)
-            .await
-            .expect("count rejected bootstrap sources");
-    assert_eq!(source_count, 0);
-    assert_projection_state(
-        fixture,
-        publication.revision,
-        &format!("bootstrap-before-publication-{suffix}"),
-        &format!("bootstrap-before-evidence-{suffix}"),
-        &projection,
-        0,
-    )
-    .await;
-    assert_eq!(head_revision(fixture).await, publication.revision);
-    let operation: (String, String) = sqlx::query_as(
-        "SELECT operation_id, evidence_reference FROM cloud_coverage_revisions \
-         WHERE beneficiary_id = $1 AND revision = $2",
-    )
-    .bind(&fixture.beneficiary_id)
-    .bind(publication.revision)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("read unmanaged bootstrap revision");
-    assert_eq!(
-        operation,
-        (
-            format!("bootstrap-before-publication-{suffix}"),
-            format!("bootstrap-before-evidence-{suffix}")
-        )
-    );
-    match projection {
-        CoverageProjection::Complete { paid_intervals } => {
-            let loaded = load(&fixture.pool, &fixture.beneficiary_id)
-                .await
-                .expect("load unmanaged complete bootstrap projection");
-            assert_eq!(loaded.revision, publication.revision);
-            assert_eq!(loaded.coverage.paid_intervals, paid_intervals);
-        }
-        CoverageProjection::Unavailable { reason } => assert!(matches!(
-            load(&fixture.pool, &fixture.beneficiary_id).await,
-            Err(StoreError::ProjectionUnavailable(actual)) if actual == reason
-        )),
-    }
-    cleanup(fixture).await;
 }
 
 #[tokio::test]
 async fn registration_rejects_complete_publication_before_coordinator_lock() {
-    let Some(fixture) = Fixture::create().await else {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
         return;
     };
     publication_before_coordinator_lock(
+        &mut owner,
         &fixture,
         CoverageProjection::Complete {
             paid_intervals: vec![ConfirmedPaidInterval {
@@ -1087,10 +1173,15 @@ async fn registration_rejects_complete_publication_before_coordinator_lock() {
 
 #[tokio::test]
 async fn registration_rejects_unavailable_publication_before_coordinator_lock() {
-    let Some(fixture) = Fixture::create().await else {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
         return;
     };
     publication_before_coordinator_lock(
+        &mut owner,
         &fixture,
         CoverageProjection::Unavailable {
             reason: UnavailableReason::ConflictingEvidence,
@@ -1101,66 +1192,140 @@ async fn registration_rejects_unavailable_publication_before_coordinator_lock() 
 }
 
 async fn publication_after_revision_anchor(
+    owner: &mut RaceTaskOwner,
     fixture: &Fixture,
     projection: CoverageProjection,
     suffix: &str,
 ) {
-    let release = Arc::new(Notify::new());
-    let (publisher_ready, publisher_ready_rx) = oneshot::channel();
-    let mut owner = RaceTaskOwner::new();
-    let mut publisher = Some(owner.spawn(held_publication(
-        fixture.pool.clone(),
-        fixture.beneficiary_id.clone(),
-        format!("bootstrap-after-publication-{suffix}"),
-        format!("bootstrap-after-evidence-{suffix}"),
-        projection.clone(),
-        publisher_ready,
-        release.clone(),
-    )));
-    let publisher_pid = receive_pid(publisher_ready_rx, "receive bootstrap publisher pid").await;
-
     let source = binding(
         fixture,
         &format!("bootstrap-after-source-{suffix}"),
         &format!("bootstrap-after-allocation-{suffix}"),
     );
-    let (waiter_ready, waiter_ready_rx) = oneshot::channel();
-    let waiter_pool = fixture.pool.clone();
-    let waiter_source = source.clone();
-    let mut waiter = Some(owner.spawn(async move {
-        let mut tx = waiter_pool
-            .begin()
-            .await
-            .expect("begin anchored bootstrap registration");
-        let pid = transaction_pid(&mut tx).await;
-        waiter_ready
-            .send(pid)
-            .expect("signal anchored bootstrap registration");
-        let result = register_source(&mut tx, "bootstrap-after-registration", &waiter_source).await;
-        tx.rollback()
-            .await
-            .expect("rollback anchored bootstrap registration");
-        result
-    }));
-    let waiter_pid = receive_pid(
-        waiter_ready_rx,
-        "receive anchored bootstrap registration pid",
+    let release = Arc::new(Notify::new());
+    let pool = fixture.pool.clone();
+    let beneficiary_id = fixture.beneficiary_id.clone();
+    let suffix = suffix.to_owned();
+    let result = run_with_context(
+        owner,
+        |owner| {
+            Box::pin(async move {
+                let fixture = Fixture {
+                    pool,
+                    beneficiary_id,
+                };
+                let fixture = &fixture;
+                let (publisher_ready, publisher_ready_rx) = oneshot::channel();
+                let mut publisher = Some(owner.spawn(held_publication(
+                    fixture.pool.clone(),
+                    fixture.beneficiary_id.clone(),
+                    format!("bootstrap-after-publication-{suffix}"),
+                    format!("bootstrap-after-evidence-{suffix}"),
+                    projection.clone(),
+                    publisher_ready,
+                    release.clone(),
+                )));
+                let publisher_pid =
+                    receive_pid(publisher_ready_rx, "receive bootstrap publisher pid").await;
+
+                let (waiter_ready, waiter_ready_rx) = oneshot::channel();
+                let waiter_pool = fixture.pool.clone();
+                let waiter_source = source.clone();
+                let mut waiter = Some(owner.spawn(async move {
+                    let mut tx = waiter_pool
+                        .begin()
+                        .await
+                        .expect("begin anchored bootstrap registration");
+                    let pid = transaction_pid(&mut tx).await;
+                    waiter_ready
+                        .send(pid)
+                        .expect("signal anchored bootstrap registration");
+                    let result =
+                        register_source(&mut tx, "bootstrap-after-registration", &waiter_source)
+                            .await;
+                    tx.rollback()
+                        .await
+                        .expect("rollback anchored bootstrap registration");
+                    result
+                }));
+                let waiter_pid = receive_pid(
+                    waiter_ready_rx,
+                    "receive anchored bootstrap registration pid",
+                )
+                .await;
+                wait_for_specific_block(&fixture.pool, waiter_pid, publisher_pid).await;
+                release.notify_one();
+
+                let publication = receive_owned(&mut publisher, "bootstrap publisher")
+                    .await
+                    .expect("bootstrap publisher task completed")
+                    .expect("bootstrap publication applied");
+                let registration = receive_owned(&mut waiter, "anchored bootstrap registration")
+                    .await
+                    .expect("anchored bootstrap registration task completed");
+                assert_eq!(head_revision(fixture).await, publication.revision);
+                let source_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count anchored bootstrap sources");
+                assert_eq!(source_count, 0);
+                let coordinator_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+                )
+                .bind(&fixture.beneficiary_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("count rolled back bootstrap coordinators");
+                assert_eq!(coordinator_count, 0);
+                assert_projection_state(
+                    fixture,
+                    publication.revision,
+                    &format!("bootstrap-after-publication-{suffix}"),
+                    &format!("bootstrap-after-evidence-{suffix}"),
+                    &projection,
+                    0,
+                )
+                .await;
+
+                let before_replay = projection_snapshot(fixture).await;
+                let mut replay_tx = fixture.pool.begin().await.expect("begin bootstrap replay");
+                let replay = publish(
+                    &mut replay_tx,
+                    &fixture.beneficiary_id,
+                    None,
+                    &format!("bootstrap-after-publication-{suffix}"),
+                    &format!("bootstrap-after-evidence-{suffix}"),
+                    &projection,
+                )
+                .await
+                .expect("replay bootstrap publication");
+                replay_tx.commit().await.expect("commit bootstrap replay");
+                assert_eq!(replay.revision, publication.revision);
+                assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
+                assert_eq!(projection_snapshot(fixture).await, before_replay);
+                match projection {
+                    CoverageProjection::Complete { paid_intervals } => {
+                        let loaded = load(&fixture.pool, &fixture.beneficiary_id)
+                            .await
+                            .expect("load anchored complete projection");
+                        assert_eq!(loaded.coverage.paid_intervals, paid_intervals);
+                    }
+                    CoverageProjection::Unavailable { reason } => assert!(matches!(
+                        load(&fixture.pool, &fixture.beneficiary_id).await,
+                        Err(StoreError::ProjectionUnavailable(actual)) if actual == reason
+                    )),
+                }
+                Ok((publication, registration))
+            })
+        },
+        || async { Ok::<(), String>(()) },
     )
     .await;
-    wait_for_specific_block(&fixture.pool, waiter_pid, publisher_pid).await;
-    release.notify_one();
-
-    let publication = receive_owned(&mut publisher, "bootstrap publisher")
-        .await
-        .expect("bootstrap publisher task completed")
-        .expect("bootstrap publication applied");
-    let registration = receive_owned(&mut waiter, "anchored bootstrap registration")
-        .await
-        .expect("anchored bootstrap registration task completed");
-    owner
-        .join_all()
-        .await
-        .expect("join anchored bootstrap tasks");
+    let (publication, registration) = result.expect("supervised anchored bootstrap race");
+    assert_eq!(publication.outcome, PublicationOutcome::Applied);
     assert!(matches!(
         registration,
         Err(ReconciliationError::Store(StoreError::RevisionConflict {
@@ -1168,69 +1333,19 @@ async fn publication_after_revision_anchor(
             actual: Some(actual),
         })) if actual == publication.revision
     ));
-    assert_eq!(head_revision(fixture).await, publication.revision);
-    let source_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE beneficiary_id = $1")
-            .bind(&fixture.beneficiary_id)
-            .fetch_one(&fixture.pool)
-            .await
-            .expect("count anchored bootstrap sources");
-    assert_eq!(source_count, 0);
-    let coordinator_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
-    )
-    .bind(&fixture.beneficiary_id)
-    .fetch_one(&fixture.pool)
-    .await
-    .expect("count rolled back bootstrap coordinators");
-    assert_eq!(coordinator_count, 0);
-    assert_projection_state(
-        fixture,
-        publication.revision,
-        &format!("bootstrap-after-publication-{suffix}"),
-        &format!("bootstrap-after-evidence-{suffix}"),
-        &projection,
-        0,
-    )
-    .await;
-
-    let before_replay = projection_snapshot(fixture).await;
-    let mut replay_tx = fixture.pool.begin().await.expect("begin bootstrap replay");
-    let replay = publish(
-        &mut replay_tx,
-        &fixture.beneficiary_id,
-        None,
-        &format!("bootstrap-after-publication-{suffix}"),
-        &format!("bootstrap-after-evidence-{suffix}"),
-        &projection,
-    )
-    .await
-    .expect("replay bootstrap publication");
-    replay_tx.commit().await.expect("commit bootstrap replay");
-    assert_eq!(replay.revision, publication.revision);
-    assert_eq!(replay.outcome, PublicationOutcome::AlreadyApplied);
-    assert_eq!(projection_snapshot(fixture).await, before_replay);
-    match projection {
-        CoverageProjection::Complete { paid_intervals } => {
-            let loaded = load(&fixture.pool, &fixture.beneficiary_id)
-                .await
-                .expect("load anchored complete projection");
-            assert_eq!(loaded.coverage.paid_intervals, paid_intervals);
-        }
-        CoverageProjection::Unavailable { reason } => assert!(matches!(
-            load(&fixture.pool, &fixture.beneficiary_id).await,
-            Err(StoreError::ProjectionUnavailable(actual)) if actual == reason
-        )),
-    }
-    cleanup(fixture).await;
 }
 
 #[tokio::test]
 async fn registration_rejects_complete_publication_after_revision_anchor() {
-    let Some(fixture) = Fixture::create().await else {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
         return;
     };
     publication_after_revision_anchor(
+        &mut owner,
         &fixture,
         CoverageProjection::Complete {
             paid_intervals: vec![ConfirmedPaidInterval {
@@ -1248,10 +1363,15 @@ async fn registration_rejects_complete_publication_after_revision_anchor() {
 
 #[tokio::test]
 async fn registration_rejects_unavailable_publication_after_revision_anchor() {
-    let Some(fixture) = Fixture::create().await else {
+    let mut owner = RaceTaskOwner::new();
+    let Some(fixture) = Fixture::create_owned(&mut owner)
+        .await
+        .expect("create owned fixture")
+    else {
         return;
     };
     publication_after_revision_anchor(
+        &mut owner,
         &fixture,
         CoverageProjection::Unavailable {
             reason: UnavailableReason::NeedsReconciliation,
