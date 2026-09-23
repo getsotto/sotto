@@ -586,6 +586,9 @@ async fn collect_provider_history_inner<C: ProviderHistoryClient + ?Sized>(
     let mut observations = Vec::with_capacity(bindings.len());
     let mut total_fact_count = 0;
     for binding in bindings {
+        if binding.provider_namespace != context.namespace {
+            return Err(ProviderCollectionError::ContextMismatch);
+        }
         if binding.beneficiary_id.trim().is_empty()
             || binding.source_id.trim().is_empty()
             || binding.provider_namespace.trim().is_empty()
@@ -1388,6 +1391,22 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ProviderCollectionError::RepeatedCursor));
+    }
+
+    #[tokio::test]
+    async fn rejects_bindings_from_another_provider_namespace() {
+        let context =
+            ProviderContext::new("stripe", "acct_test", ProviderEnvironment::Test).unwrap();
+        let mut mismatched = binding();
+        mismatched.provider_namespace = "github".into();
+        let mut client = FakeClient {
+            pages: vec![],
+            index: 0,
+        };
+        let error = collect_provider_history(&mut client, &context, &[mismatched], limits())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderCollectionError::ContextMismatch));
     }
 
     struct SlowClient;
