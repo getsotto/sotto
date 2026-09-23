@@ -3,10 +3,12 @@ from importlib.machinery import SourceFileLoader
 import io
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "check-cloud-coverage-races"
@@ -92,6 +94,79 @@ class CloudCoverageRaceRunnerTests(unittest.TestCase):
         )
 
 
+class DiscoveryTests(unittest.TestCase):
+    """Manifest and selection checks without starting Cargo."""
+
+    def listed(self, stdout):
+        completed = subprocess.CompletedProcess(
+            ["cargo", "test", "--", "--list"], 0, stdout, ""
+        )
+        with mock.patch.object(MODULE, "run", return_value=completed) as runner:
+            names = MODULE.discover("cloud_coverage_store", {}, 30)
+        runner.assert_called_once()
+        return names
+
+    def test_discover_parses_listed_tests(self):
+        self.assertEqual(
+            self.listed("alpha: test\nbeta: test\ntest result: ok. 2 listed\n"),
+            {"alpha", "beta"},
+        )
+
+    def test_discover_with_zero_tests_selects_nothing(self):
+        self.assertEqual(self.listed(""), set())
+
+    def test_manifest_rejects_misspelled_name(self):
+        discovered = {}
+        for target, name in MODULE.SCENARIOS:
+            discovered.setdefault(target, set()).add(name)
+        victim_target, victim_name = MODULE.SCENARIOS[0]
+        discovered[victim_target].discard(victim_name)
+        discovered[victim_target].add(victim_name + "-misspelled")
+        with self.assertRaisesRegex(RuntimeError, "scenario discovery failed"):
+            MODULE.check_manifest(discovered)
+
+    def test_manifest_accepts_complete_discovery(self):
+        discovered = {}
+        for target, name in MODULE.SCENARIOS:
+            discovered.setdefault(target, set()).add(name)
+        MODULE.check_manifest(discovered)
+
+    def test_zero_selected_tests_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "selected zero tests"):
+            MODULE.assert_tests_selected(
+                "test result: ok. 0 passed; 0 failed; 0 ignored\n", "empty-case"
+            )
+
+    def test_missing_summary_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "selected zero tests"):
+            MODULE.assert_tests_selected(" Compiling nothing\n", "mystery-case")
+
+    def test_executed_tests_pass_selection(self):
+        MODULE.assert_tests_selected(
+            "test result: ok. 5 passed; 0 failed; 0 ignored\n", "full-case"
+        )
+
+    def test_rejects_non_positive_rounds(self):
+        with mock.patch.object(sys, "argv", ["races", "--rounds", "0"]):
+            with self.assertRaises(SystemExit):
+                MODULE.main()
+
+    def test_rejects_non_positive_timeout(self):
+        with mock.patch.object(sys, "argv", ["races", "--timeout", "0"]):
+            with self.assertRaises(SystemExit):
+                MODULE.main()
+
+    def test_positive_arguments_reach_database_validation(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            sys, "argv", ["races", "--rounds", "1", "--timeout", "1"]
+        ):
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with redirect_stdout(out), redirect_stderr(err):
+                    self.assertEqual(MODULE.main(), 1)
+        self.assertIn("SOTTO_RUN_DB_TESTS", err.getvalue())
+
+
 @unittest.skipIf(os.name == "nt", "process-group termination is POSIX-only")
 class ProcessTreeTimeoutTests(unittest.TestCase):
     """Timeout ownership without Cargo, a database or sleep-based races."""
@@ -166,6 +241,22 @@ class ProcessTreeTimeoutTests(unittest.TestCase):
 
 
 class CommandResultTests(unittest.TestCase):
+    def test_failure_renders_exactly_once(self):
+        error = MODULE.CommandFailed(
+            "exact-test", ["cargo", "test"], 3, False, 30, "out-part", "err-part"
+        )
+        self.assertEqual(
+            str(error),
+            "=== exact-test ===\n"
+            "command: cargo test\n"
+            "exit: 3\n"
+            "--- stdout ---\n"
+            "out-part\n"
+            "--- stderr ---\n"
+            "err-part",
+        )
+        self.assertEqual(error.command, ["cargo", "test"])
+
     def test_nonzero_exit_carries_label_and_both_streams(self):
         script = (
             "import sys; print('out-word'); "

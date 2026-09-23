@@ -184,17 +184,19 @@ class CommandFailed(RuntimeError):
         stdout: str,
         stderr: str,
     ) -> None:
+        # `.args` on BaseException is a tuple-coercing descriptor, so the command
+        # list lives under `.command` instead.
+        super().__init__()
         self.label = label
-        self.args = args
+        self.command = args
         self.returncode = returncode
         self.timed_out = timed_out
         self.timeout_seconds = timeout_seconds
         self.stdout = stdout
         self.stderr = stderr
-        super().__init__(str(self))
 
     def __str__(self) -> str:
-        lines = [f"=== {self.label} ===", f"command: {' '.join(self.args)}"]
+        lines = [f"=== {self.label} ===", f"command: {' '.join(self.command)}"]
         if self.timed_out:
             lines.append(f"timed out after {self.timeout_seconds}s")
         else:
@@ -247,23 +249,46 @@ def run_parallel(
     commands: list[tuple[str, list[str]]],
     env: dict[str, str],
     timeout_seconds: int,
-) -> None:
+) -> list[tuple[str, subprocess.CompletedProcess[str]]]:
     """Run labelled commands concurrently, reporting every failure grouped by label."""
     with ThreadPoolExecutor(max_workers=len(commands)) as executor:
         futures = [
             (label, executor.submit(run, args, env, timeout_seconds, label))
             for label, args in commands
         ]
+        results = []
         failures = []
-        for _, future in futures:
+        for label, future in futures:
             try:
-                future.result()
+                results.append((label, future.result()))
             except Exception as error:  # noqa: BLE001 - preserve every subprocess failure
                 failures.append(str(error))
         if failures:
             raise RuntimeError(
                 f"parallel target failures ({len(failures)}):\n\n" + "\n\n".join(failures)
             )
+        return results
+
+
+def assert_tests_selected(stdout: str, label: str) -> None:
+    """Fail closed when a test command reports zero executed tests.
+
+    A misspelled exact filter exits successfully with `ok. 0 passed`; accepting
+    that output would report a skipped database run as successful acceptance.
+    """
+    if "test result:" not in stdout or "test result: ok. 0 passed" in stdout:
+        raise RuntimeError(f"{label}: selected zero tests; refusing to report acceptance")
+
+
+def check_manifest(discovered: dict[str, set[str]]) -> None:
+    """Reject scenario names missing from discovery before running anything."""
+    missing = [
+        f"{target}::{name}"
+        for target, name in SCENARIOS
+        if name not in discovered.get(target, set())
+    ]
+    if missing:
+        raise RuntimeError("scenario discovery failed: " + ", ".join(missing))
 
 
 def discover(target: str, env: dict[str, str], timeout_seconds: int) -> set[str]:
@@ -293,27 +318,23 @@ def main() -> int:
         validate_database(env)
         targets = {target for target, _ in SCENARIOS}
         discovered = {target: discover(target, env, parsed.timeout) for target in targets}
-        missing = [
-            f"{target}::{name}"
-            for target, name in SCENARIOS
-            if name not in discovered[target]
-        ]
-        if missing:
-            raise RuntimeError("scenario discovery failed: " + ", ".join(missing))
+        check_manifest(discovered)
 
         for target, name in SCENARIOS:
-            run(
+            label = f"{target}::{name}"
+            result = run(
                 [
                     "cargo", "test", "-p", "sotto-server", "--test", target,
                     name, "--", "--exact", "--nocapture", "--test-threads=4",
                 ],
                 env,
                 parsed.timeout,
-                label=f"{target}::{name}",
+                label=label,
             )
+            assert_tests_selected(result.stdout, label)
         for round_number in range(1, parsed.rounds + 1):
             print(f"race repetition round {round_number}/{parsed.rounds}", flush=True)
-            run_parallel(
+            results = run_parallel(
                 [
                     (
                         f"round:{round_number}:{target}",
@@ -327,6 +348,8 @@ def main() -> int:
                 env,
                 parsed.timeout,
             )
+            for label, result in results:
+                assert_tests_selected(result.stdout, label)
     except (OSError, ValueError, RuntimeError) as error:
         print(f"cloud coverage race checks failed: {error}", file=sys.stderr)
         return 1
