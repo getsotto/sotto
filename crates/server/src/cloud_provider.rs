@@ -272,6 +272,7 @@ pub struct CollectionPreparation {
 /// Bounds applied to one provider history collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CollectionLimits {
+    pub total_timeout: Duration,
     pub max_pages_per_source: usize,
     pub max_sources: usize,
     pub max_facts: usize,
@@ -283,6 +284,7 @@ impl Default for CollectionLimits {
     fn default() -> Self {
         // Keep one collection bounded even when an adapter does not provide a tighter policy.
         Self {
+            total_timeout: Duration::from_secs(120),
             max_pages_per_source: 64,
             max_sources: 32,
             max_facts: 10_000,
@@ -298,6 +300,7 @@ impl CollectionLimits {
             || self.max_sources == 0
             || self.max_facts == 0
             || self.max_evidence_bytes == 0
+            || self.total_timeout.is_zero()
             || self.request_timeout.is_zero()
         {
             return Err(ProviderCollectionError::InvalidLimits);
@@ -553,6 +556,20 @@ pub async fn collect_provider_history<C: ProviderHistoryClient + ?Sized>(
         .validate()
         .map_err(|error| ProviderCollectionError::InvalidEvidence(error.to_string()))?;
     limits.validate()?;
+    timeout(
+        limits.total_timeout,
+        collect_provider_history_inner(client, context, bindings, limits),
+    )
+    .await
+    .map_err(|_| ProviderCollectionError::Timeout)?
+}
+
+async fn collect_provider_history_inner<C: ProviderHistoryClient + ?Sized>(
+    client: &mut C,
+    context: &ProviderContext,
+    bindings: &[SourceBinding],
+    limits: CollectionLimits,
+) -> Result<VerifiedCollection, ProviderCollectionError> {
     if bindings.is_empty() || bindings.len() > limits.max_sources {
         return Err(ProviderCollectionError::BoundExceeded);
     }
@@ -1233,6 +1250,7 @@ mod tests {
 
     fn limits() -> CollectionLimits {
         CollectionLimits {
+            total_timeout: Duration::from_secs(2),
             max_pages_per_source: 4,
             max_sources: 2,
             max_facts: 8,
