@@ -1372,6 +1372,36 @@ mod tests {
         assert!(matches!(error, ProviderCollectionError::RepeatedCursor));
     }
 
+    struct SlowClient;
+
+    #[async_trait]
+    impl ProviderHistoryClient for SlowClient {
+        async fn fetch_page(
+            &mut self,
+            _context: &ProviderContext,
+            _binding: &SourceBinding,
+            _cursor: Option<&str>,
+        ) -> Result<ProviderHistoryPage, ProviderCollectionError> {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            unreachable!("the request should be cancelled by the collection timeout");
+        }
+    }
+
+    #[tokio::test]
+    async fn bounds_each_provider_request() {
+        let context =
+            ProviderContext::new("stripe", "acct_test", ProviderEnvironment::Test).unwrap();
+        let mut client = SlowClient;
+        let short_limits = CollectionLimits {
+            request_timeout: Duration::from_millis(1),
+            ..limits()
+        };
+        let error = collect_provider_history(&mut client, &context, &[binding()], short_limits)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderCollectionError::Timeout));
+    }
+
     #[tokio::test]
     async fn accepts_authoritative_empty_history_and_rejects_empty_continuation() {
         let context =
