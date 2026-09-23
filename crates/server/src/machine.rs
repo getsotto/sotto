@@ -35,6 +35,32 @@ const TOKEN_PREFIX: &str = "smt_";
 const PUBLIC_KEY_LEN: usize = 32;
 /// Cap on a token's human label.
 const MAX_NAME: usize = 128;
+/// Lifetime of a new token, in days. Long enough to cover a quarterly release cycle and act on
+/// the expiry warning, short enough that a forgotten token dies within a quarter.
+const DEFAULT_LIFETIME_DAYS: i32 = 90;
+
+/// SQL: the token can still authenticate, meaning not revoked and not yet past its end date.
+/// Every query that means "active" splices in this one fragment (auth, the grant re-read, the
+/// listing, rotation coverage), so they cannot drift apart: a listing that kept an expired token
+/// would make rotation re-seal a dead grant, and one that dropped a live token would strand its
+/// CI on the old key. Columns are unqualified, so a query using it must not join another table
+/// that has a `revoked_at` or `expires_at` column.
+macro_rules! active_token_sql {
+    () => {
+        "revoked_at IS NULL AND expires_at > now()"
+    };
+}
+pub(crate) use active_token_sql;
+
+/// SQL: a token's end date as `(expires_at, expires_in_days)`. The timestamp is UTC in the audit
+/// log's format; the days left are whole days rounded down, computed here so that no client does
+/// date arithmetic against its own clock (a CI runner's is the least trustworthy one involved).
+macro_rules! expiry_columns_sql {
+    () => {
+        "to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), \
+         floor(extract(epoch FROM expires_at - now()) / 86400)::bigint"
+    };
+}
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -77,7 +103,14 @@ struct TokenView {
     public_key: String,
     /// The user who created the token, if still known (`NULL` once their account is gone).
     created_by: Option<String>,
+    /// When the token stops authenticating (UTC, RFC 3339).
+    expires_at: String,
+    /// Whole days until then, rounded down.
+    expires_in_days: i64,
 }
+
+/// Listing row: `(id, name, public_key, created_by, expires_at, expires_in_days)`.
+type TokenRow = (String, String, Vec<u8>, Option<String>, String, i64);
 
 #[derive(Deserialize, Default)]
 struct TokenListParams {
@@ -121,9 +154,11 @@ async fn create_token(
             "must be an admin or owner to create a machine token",
         )
         .await?;
+    // The end date comes from the database clock, the same one every expiry check reads.
     sqlx::query(
-        "INSERT INTO machine_tokens (id, env_id, name, token_hash, public_key, enc_vault_key, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO machine_tokens \
+         (id, env_id, name, token_hash, public_key, enc_vault_key, created_by, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(days => $8))",
     )
     .bind(&token_id)
     .bind(&env_id)
@@ -132,6 +167,7 @@ async fn create_token(
     .bind(&public_key)
     .bind(&enc_vault_key)
     .bind(&user.user_id)
+    .bind(DEFAULT_LIFETIME_DAYS)
     .execute(&mut *tx)
     .await?;
     // Personal environments have no org, hence no audit log to write to.
@@ -154,9 +190,9 @@ async fn create_token(
     Ok((StatusCode::CREATED, Json(CreatedToken { token_id, token })))
 }
 
-/// `GET /environments/{env_id}/tokens` - the environment's *active* machine tokens (admin+). A
-/// rotation uses these public keys to re-seal every machine's grant. `?created_by=` narrows the
-/// listing to one creator's tokens.
+/// `GET /environments/{env_id}/tokens` - the environment's *active* machine tokens (admin+), so
+/// revoked and expired ones are left out. A rotation uses these public keys to re-seal every
+/// machine's grant. `?created_by=` narrows the listing to one creator's tokens.
 async fn list_tokens(
     State(state): State<AppState>,
     user: AuthUser,
@@ -169,35 +205,29 @@ async fn list_tokens(
             "must be an admin or owner to list machine tokens".into(),
         ));
     }
-    let rows: Vec<(String, String, Vec<u8>, Option<String>)> = match &params.created_by {
-        Some(creator) => {
-            sqlx::query_as(
-                "SELECT id, name, public_key, created_by FROM machine_tokens \
-                 WHERE env_id = $1 AND revoked_at IS NULL AND created_by = $2 ORDER BY id",
-            )
-            .bind(&env_id)
-            .bind(creator)
-            .fetch_all(&state.pool)
-            .await?
-        }
-        None => {
-            sqlx::query_as(
-                "SELECT id, name, public_key, created_by FROM machine_tokens \
-                 WHERE env_id = $1 AND revoked_at IS NULL ORDER BY id",
-            )
-            .bind(&env_id)
-            .fetch_all(&state.pool)
-            .await?
-        }
-    };
+    let rows: Vec<TokenRow> = sqlx::query_as(concat!(
+        "SELECT id, name, public_key, created_by, ",
+        expiry_columns_sql!(),
+        " FROM machine_tokens WHERE env_id = $1 AND ",
+        active_token_sql!(),
+        " AND ($2::text IS NULL OR created_by = $2) ORDER BY id",
+    ))
+    .bind(&env_id)
+    .bind(&params.created_by)
+    .fetch_all(&state.pool)
+    .await?;
     Ok(Json(
         rows.into_iter()
-            .map(|(token_id, name, public_key, created_by)| TokenView {
-                token_id,
-                name,
-                public_key: encoding::encode(&public_key),
-                created_by,
-            })
+            .map(
+                |(token_id, name, public_key, created_by, expires_at, expires_in_days)| TokenView {
+                    token_id,
+                    name,
+                    public_key: encoding::encode(&public_key),
+                    created_by,
+                    expires_at,
+                    expires_in_days,
+                },
+            )
             .collect(),
     ))
 }
@@ -265,14 +295,15 @@ impl FromRequestParts<AppState> for MachineAuth {
         if !token.starts_with(TOKEN_PREFIX) {
             return Err(Error::Unauthorized);
         }
-        let row: Option<(String, String)> = sqlx::query_as(
+        let row: Option<(String, String)> = sqlx::query_as(concat!(
             "SELECT mt.id, mt.env_id FROM machine_tokens mt \
              JOIN environments e ON e.id = mt.env_id \
              JOIN projects p ON p.id = e.project_id \
              LEFT JOIN organizations o ON o.id = p.org_id \
-             WHERE mt.token_hash = $1 AND mt.revoked_at IS NULL \
-               AND (o.id IS NULL OR o.lifecycle_state <> 'deleted')",
-        )
+             WHERE mt.token_hash = $1 AND ",
+            active_token_sql!(),
+            " AND (o.id IS NULL OR o.lifecycle_state <> 'deleted')",
+        ))
         .bind(session::hash_token(&token))
         .fetch_optional(&state.pool)
         .await?;
@@ -294,11 +325,13 @@ async fn machine_grant(
     State(state): State<AppState>,
     machine: MachineAuth,
 ) -> Result<Json<MachineGrant>> {
-    // Fail closed: if the token row vanished (e.g. an env-deletion cascade in the window after auth)
-    // or was revoked, answer 401 rather than letting `RowNotFound` bubble up as a 500.
-    let enc_vault_key: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT enc_vault_key FROM machine_tokens WHERE id = $1 AND revoked_at IS NULL",
-    )
+    // Fail closed: if the token row vanished (e.g. an env-deletion cascade in the window after auth),
+    // was revoked, or expired in between, answer 401 rather than letting `RowNotFound` bubble up
+    // as a 500.
+    let enc_vault_key: Option<Vec<u8>> = sqlx::query_scalar(concat!(
+        "SELECT enc_vault_key FROM machine_tokens WHERE id = $1 AND ",
+        active_token_sql!(),
+    ))
     .bind(&machine.token_id)
     .fetch_optional(&state.pool)
     .await?;

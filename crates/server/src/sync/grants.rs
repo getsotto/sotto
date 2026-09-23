@@ -24,6 +24,7 @@ use crate::audit;
 use crate::auth::AuthUser;
 use crate::encoding;
 use crate::error::{Error, Result};
+use crate::machine::active_token_sql;
 use crate::org;
 use crate::state::AppState;
 use crate::sync::access::env_access;
@@ -385,10 +386,12 @@ async fn rotate(
     }
 
     // Machine grants must cover exactly the env's *active* tokens: leaving one out would strand its
-    // CI on the old key with no way to notice (revoke a token first to genuinely drop it).
-    let active_tokens: Vec<String> = sqlx::query_scalar(
-        "SELECT id FROM machine_tokens WHERE env_id = $1 AND revoked_at IS NULL",
-    )
+    // CI on the old key with no way to notice (revoke a token first to genuinely drop it). Expired
+    // tokens are not active, matching the listing clients build this set from.
+    let active_tokens: Vec<String> = sqlx::query_scalar(concat!(
+        "SELECT id FROM machine_tokens WHERE env_id = $1 AND ",
+        active_token_sql!(),
+    ))
     .bind(&env_id)
     .fetch_all(&mut *tx)
     .await?;

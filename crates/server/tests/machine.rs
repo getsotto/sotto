@@ -519,3 +519,112 @@ async fn token_listing_reports_creators_and_filters_by_them() {
         .collect();
     assert_eq!(ids, vec![admin_token.as_str()]);
 }
+
+/// Move a token's end date into the past. `created_at` moves too, so the row still satisfies the
+/// `expires_at > created_at` constraint: this simulates a token that lived its life, not one that
+/// was born expired.
+async fn expire(pool: &PgPool, token_id: &str) {
+    sqlx::query(
+        "UPDATE machine_tokens \
+         SET created_at = now() - interval '2 days', expires_at = now() - interval '1 second' \
+         WHERE id = $1",
+    )
+    .bind(token_id)
+    .execute(pool)
+    .await
+    .expect("expire token");
+}
+
+/// The listed tokens on `env`, as JSON objects.
+async fn listed(pool: &PgPool, session: &str, uri: &str) -> Vec<Value> {
+    let (status, body) = get(pool, session, uri).await;
+    assert_eq!(status, StatusCode::OK, "list tokens: {body}");
+    serde_json::from_str::<Value>(&body)
+        .expect("tokens json")
+        .as_array()
+        .expect("token array")
+        .clone()
+}
+
+#[tokio::test]
+async fn expired_token_is_rejected() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-exp-o", "mt-exp-p", "mt-exp-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-exp-owner").await;
+    let (token_id, api_token) = create_token(&pool, &owner, e, b"g").await;
+    assert_eq!(
+        get(&pool, &api_token, "/machine/secrets").await.0,
+        StatusCode::OK
+    );
+
+    expire(&pool, &token_id).await;
+    // Indistinguishable from a revoked or unknown token: no oracle about why it failed.
+    for path in ["/machine/grant", "/machine/secrets"] {
+        let (status, body) = get(&pool, &api_token, path).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn expired_token_leaves_listing() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-expl-o", "mt-expl-p", "mt-expl-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-expl-owner").await;
+    let (live, _) = create_token(&pool, &owner, e, b"g").await;
+    let (lapsed, _) = create_token(&pool, &owner, e, b"g").await;
+    expire(&pool, &lapsed).await;
+
+    // Rotation clients re-seal exactly this listing, so it must hold only tokens that can still
+    // authenticate, with or without the creator filter.
+    for uri in [
+        format!("/environments/{e}/tokens"),
+        format!("/environments/{e}/tokens?created_by=mt-expl-owner"),
+    ] {
+        let ids: Vec<String> = listed(&pool, &owner, &uri)
+            .await
+            .iter()
+            .map(|t| t["token_id"].as_str().expect("token_id").to_string())
+            .collect();
+        assert_eq!(ids, vec![live.clone()], "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn creation_defaults_to_ninety_days() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-def-o", "mt-def-p", "mt-def-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-def-owner").await;
+    let (token_id, _) = create_token(&pool, &owner, e, b"g").await;
+
+    let tokens = listed(&pool, &owner, &format!("/environments/{e}/tokens")).await;
+    let token = &tokens[0];
+    assert_eq!(token["token_id"].as_str(), Some(token_id.as_str()));
+    // Whole days left, rounded down: 89 a moment after creation, never more than 90.
+    let days = token["expires_in_days"].as_i64().expect("expires_in_days");
+    assert!((89..=90).contains(&days), "expires_in_days = {days}");
+
+    // The listed timestamp is the stored one, in the audit log's UTC format.
+    let stored: String = sqlx::query_scalar(
+        "SELECT to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+         FROM machine_tokens WHERE id = $1",
+    )
+    .bind(&token_id)
+    .fetch_one(&pool)
+    .await
+    .expect("stored expiry");
+    assert_eq!(token["expires_at"].as_str(), Some(stored.as_str()));
+    let exact: bool = sqlx::query_scalar(
+        "SELECT expires_at - created_at = interval '90 days' FROM machine_tokens WHERE id = $1",
+    )
+    .bind(&token_id)
+    .fetch_one(&pool)
+    .await
+    .expect("lifetime");
+    assert!(exact, "default lifetime is exactly 90 days from creation");
+}
