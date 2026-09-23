@@ -9,9 +9,9 @@ use std::str::FromStr;
 use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::SourceObservation;
 use sotto_server::cloud_provider::{
-    apply_verified_event, record_verified_event, AllocationState, ApplyDisposition,
-    EventDisposition, PayerKind, ProviderContext, ProviderEnvironment, VerifiedAllocation,
-    VerifiedCollection, VerifiedProviderEvent,
+    apply_verified_event, record_verified_event, reject_verified_event, AllocationState,
+    ApplyDisposition, EventDisposition, PayerKind, ProviderContext, ProviderEnvironment,
+    RejectionDisposition, VerifiedAllocation, VerifiedCollection, VerifiedProviderEvent,
 };
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
@@ -95,8 +95,42 @@ async fn verified_event_receipts_are_idempotent_and_conflicts_are_rejected() {
     ));
     conflict.rollback().await.unwrap();
 
+    let rejected_event_id = format!("rejected-{}", Uuid::new_v4());
+    let rejected_event = event(&rejected_event_id);
+    let mut record_rejected = pool.begin().await.unwrap();
+    record_verified_event(&mut record_rejected, &context, &rejected_event)
+        .await
+        .unwrap();
+    record_rejected.commit().await.unwrap();
+    let mut reject = pool.begin().await.unwrap();
+    assert_eq!(
+        reject_verified_event(&mut reject, &context, &rejected_event, "unsupported_event")
+            .await
+            .unwrap(),
+        RejectionDisposition::Rejected
+    );
+    reject.commit().await.unwrap();
+    let mut reject_replay = pool.begin().await.unwrap();
+    assert_eq!(
+        reject_verified_event(
+            &mut reject_replay,
+            &context,
+            &rejected_event,
+            "unsupported_event",
+        )
+        .await
+        .unwrap(),
+        RejectionDisposition::AlreadyRejected
+    );
+    reject_replay.commit().await.unwrap();
+
     sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
         .bind(&original.event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+        .bind(&rejected_event_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -177,6 +211,44 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
     assert_eq!(first.outcome, ApplyDisposition::Applied);
     assert!(first.revision > 0);
 
+    let mut record_applied = pool.begin().await.unwrap();
+    assert_eq!(
+        record_verified_event(&mut record_applied, &context, &event)
+            .await
+            .unwrap(),
+        EventDisposition::AlreadyApplied
+    );
+    record_applied.commit().await.unwrap();
+
+    let renewal_event_id = format!("renewal-{suffix}");
+    let renewal_event = VerifiedProviderEvent::from_payload(
+        &renewal_event_id,
+        "invoice.paid",
+        1_700_000_001,
+        Some(subscription_id.clone()),
+        Some(external_reference.clone()),
+        br#"{"status":"paid","renewal":true}"#,
+    )
+    .unwrap();
+    let mut record_renewal = pool.begin().await.unwrap();
+    record_verified_event(&mut record_renewal, &context, &renewal_event)
+        .await
+        .unwrap();
+    record_renewal.commit().await.unwrap();
+    let mut apply_renewal = pool.begin().await.unwrap();
+    let renewal = apply_verified_event(
+        &mut apply_renewal,
+        &context,
+        &renewal_event,
+        &allocation,
+        &collection,
+    )
+    .await
+    .unwrap();
+    apply_renewal.commit().await.unwrap();
+    assert_eq!(renewal.outcome, ApplyDisposition::Applied);
+    assert!(renewal.revision > first.revision);
+
     let mut changed_allocation = allocation.clone();
     changed_allocation.provider_item_id = "different_item".into();
     let mut allocation_conflict = pool.begin().await.unwrap();
@@ -223,13 +295,135 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
     assert_eq!(second.outcome, ApplyDisposition::AlreadyApplied);
     assert_eq!(second.revision, first.revision);
 
+    let second_source_id = format!("second-source-{suffix}");
+    let second_allocation_id = format!("second-allocation-{suffix}");
+    let second_event_id = format!("second-event-{suffix}");
+    let second_subscription_id = format!("second-subscription-{suffix}");
+    let second_external_reference = format!("second-external-{suffix}");
+    let second_allocation = VerifiedAllocation::new(
+        &second_allocation_id,
+        &payer_id,
+        format!("cus-{suffix}"),
+        PayerKind::Personal,
+        &beneficiary_id,
+        &second_subscription_id,
+        "price_cloud",
+        &second_external_reference,
+        &second_source_id,
+        0,
+        None,
+        AllocationState::Active,
+        format!("second-ownership-{suffix}"),
+    )
+    .unwrap();
+    let second_event = VerifiedProviderEvent::from_payload(
+        &second_event_id,
+        "invoice.paid",
+        1_700_000_002,
+        Some(second_subscription_id),
+        Some(second_external_reference),
+        br#"{"status":"paid","source":2}"#,
+    )
+    .unwrap();
+    let mut record_second = pool.begin().await.unwrap();
+    record_verified_event(&mut record_second, &context, &second_event)
+        .await
+        .unwrap();
+    record_second.commit().await.unwrap();
+
+    let incomplete = VerifiedCollection {
+        aggregate_evidence_reference: format!("incomplete-{suffix}"),
+        observations: vec![SourceObservation::Complete {
+            source_id: second_source_id.clone(),
+            evidence_reference: format!("second-evidence-{suffix}"),
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: format!("second-coverage-{suffix}"),
+                source_id: second_source_id.clone(),
+                starts_at: 0,
+                paid_until: 100,
+                failed_renewal_id: None,
+            }],
+        }],
+    };
+    let mut incomplete_apply = pool.begin().await.unwrap();
+    let incomplete_result = apply_verified_event(
+        &mut incomplete_apply,
+        &context,
+        &second_event,
+        &second_allocation,
+        &incomplete,
+    )
+    .await;
+    assert!(matches!(
+        incomplete_result,
+        Err(sotto_server::cloud_provider::ProviderAdapterError::IncompleteCollection)
+    ));
+    incomplete_apply.rollback().await.unwrap();
+    let pending_status: String =
+        sqlx::query_scalar("SELECT status FROM cloud_provider_event_receipts WHERE event_id = $1")
+            .bind(&second_event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pending_status, "pending");
+    let allocation_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_allocations WHERE allocation_id = $1",
+    )
+    .bind(&second_allocation_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(allocation_count, 0);
+    let source_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE source_id = $1")
+            .bind(&second_source_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(source_count, 0);
+
+    let complete = VerifiedCollection {
+        aggregate_evidence_reference: format!("second-aggregate-{suffix}"),
+        observations: vec![
+            collection.observations[0].clone(),
+            incomplete.observations[0].clone(),
+        ],
+    };
+    let mut second_apply = pool.begin().await.unwrap();
+    let second_source = apply_verified_event(
+        &mut second_apply,
+        &context,
+        &second_event,
+        &second_allocation,
+        &complete,
+    )
+    .await
+    .unwrap();
+    second_apply.commit().await.unwrap();
+    assert_eq!(second_source.outcome, ApplyDisposition::Applied);
+
     sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
         .bind(&event_id)
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+        .bind(&renewal_event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+        .bind(&second_event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
         .bind(&allocation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
+        .bind(&second_allocation_id)
         .execute(&pool)
         .await
         .unwrap();
