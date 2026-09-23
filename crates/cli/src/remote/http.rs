@@ -363,16 +363,22 @@ impl SyncApi for HttpClient {
         name: &str,
         public_key: &str,
         enc_vault_key: &str,
+        expires_in_days: Option<u32>,
     ) -> Result<CreatedMachineToken> {
+        let mut body = serde_json::json!({
+            "name": name,
+            "public_key": public_key,
+            "enc_vault_key": enc_vault_key,
+        });
+        // Only when asked: the lifetime policy (default and range) lives on the server.
+        if let Some(days) = expires_in_days {
+            body["expires_in_days"] = days.into();
+        }
         let resp = self
             .http
             .post(self.url(&format!("/environments/{env_id}/tokens")))
             .bearer_auth(&self.token)
-            .json(&serde_json::json!({
-                "name": name,
-                "public_key": public_key,
-                "enc_vault_key": enc_vault_key,
-            }))
+            .json(&body)
             .send()
             .map_err(net)?;
         parse(resp)

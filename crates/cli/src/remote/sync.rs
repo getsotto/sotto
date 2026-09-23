@@ -1087,6 +1087,7 @@ mod tests {
             name: &str,
             public_key: &str,
             enc_vault_key: &str,
+            _expires_in_days: Option<u32>,
         ) -> Result<super::super::api::CreatedMachineToken> {
             let me = self.current_user();
             let token_id = uuid::Uuid::new_v4().to_string();
@@ -1105,6 +1106,7 @@ mod tests {
             Ok(super::super::api::CreatedMachineToken {
                 token_id,
                 token: format!("smt_mock_{}", uuid::Uuid::new_v4()),
+                expires_at: None,
             })
         }
 
@@ -1122,6 +1124,8 @@ mod tests {
                     name: t.name.clone(),
                     public_key: b64encode(&t.public_key),
                     created_by: Some(t.created_by.clone()),
+                    expires_at: None,
+                    expires_in_days: None,
                 })
                 .collect();
             tokens.sort_by(|a, b| a.token_id.cmp(&b.token_id));
@@ -1724,7 +1728,7 @@ mod tests {
             Some(&org_id),
         )
         .unwrap();
-        team::create_machine_token(&api, &store_b, &bob, &bob_config, "bob-ci").unwrap();
+        team::create_machine_token(&api, &store_b, &bob, &bob_config, "bob-ci", None).unwrap();
 
         // Alice removes Bob: the rotation re-seals the token, then the removal revokes it and
         // reports it, so the team knows what to recreate.
@@ -1758,8 +1762,8 @@ mod tests {
             .set("API_KEY", b"s3cr3t")
             .unwrap();
         push(&api, &store, &master, &config).unwrap();
-        team::create_machine_token(&api, &store, &alice, &config, "deploy").unwrap();
-        team::create_machine_token(&api, &store, &alice, &config, "nightly").unwrap();
+        team::create_machine_token(&api, &store, &alice, &config, "deploy", None).unwrap();
+        team::create_machine_token(&api, &store, &alice, &config, "nightly", None).unwrap();
         let env_id = store
             .get_environment(&project.id, "dev")
             .unwrap()
@@ -1962,7 +1966,7 @@ mod tests {
             Some(&org_id),
         )
         .unwrap();
-        team::create_machine_token(&api, &store_b, &bob, &bob_config, "bob-ci").unwrap();
+        team::create_machine_token(&api, &store_b, &bob, &bob_config, "bob-ci", None).unwrap();
         api.as_user("test-user");
 
         // A second env, shared between Bob and Carol, that Alice cannot open.
@@ -2021,7 +2025,9 @@ mod tests {
             .unwrap();
 
         // Create a machine token; its grant opens to the same vault key the env uses.
-        let token_str = team::create_machine_token(&api, &store_a, &alice, &config, "ci").unwrap();
+        let token_str = team::create_machine_token(&api, &store_a, &alice, &config, "ci", None)
+            .unwrap()
+            .token;
         let machine_token = machine::parse_token(&token_str).unwrap();
         let read_machine_grant = |api: &MockApi| -> Vec<u8> {
             let s = api.state.borrow();
