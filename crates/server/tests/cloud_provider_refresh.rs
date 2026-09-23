@@ -25,6 +25,7 @@ use sotto_server::db;
 
 enum ClientAction {
     Page(ProviderHistoryPage),
+    Pages(Vec<ProviderHistoryPage>),
     Fail(String),
     Block {
         entered: Arc<Notify>,
@@ -42,11 +43,18 @@ impl ProviderHistoryClient for ScriptedClient {
     async fn fetch_page(
         &mut self,
         _context: &ProviderContext,
-        _binding: &SourceBinding,
+        binding: &SourceBinding,
         _cursor: Option<&str>,
     ) -> Result<ProviderHistoryPage, ProviderCollectionError> {
         match &self.action {
             ClientAction::Page(page) => Ok(page.clone()),
+            ClientAction::Pages(pages) => pages
+                .iter()
+                .find(|page| page.source_id == binding.source_id)
+                .cloned()
+                .ok_or_else(|| {
+                    ProviderCollectionError::Fetch("missing scripted source page".into())
+                }),
             ClientAction::Fail(message) => Err(ProviderCollectionError::Fetch(message.clone())),
             ClientAction::Block {
                 entered,
@@ -151,13 +159,50 @@ async fn record_event(pool: &PgPool, event: &VerifiedProviderEvent) {
     tx.commit().await.expect("commit event");
 }
 
+fn second_event_and_allocation(
+    fixture: &Fixture,
+) -> (VerifiedProviderEvent, VerifiedAllocation, String, String) {
+    let suffix = Uuid::new_v4().to_string();
+    let source_id = format!("provider-refresh-second-source-{suffix}");
+    let allocation_id = format!("provider-refresh-second-allocation-{suffix}");
+    let subscription_id = format!("provider-refresh-second-subscription-{suffix}");
+    let external_reference = format!("provider-refresh-second-external-{suffix}");
+    let event_id = format!("provider-refresh-second-event-{suffix}");
+    let event = VerifiedProviderEvent::from_payload(
+        &event_id,
+        "invoice.paid",
+        1_700_100_001,
+        Some(subscription_id.clone()),
+        Some(external_reference.clone()),
+        br#"{"status":"paid","source":2}"#,
+    )
+    .unwrap();
+    let allocation = VerifiedAllocation::new(
+        &allocation_id,
+        &fixture.payer_id,
+        format!("customer-{}", fixture.beneficiary_id),
+        sotto_server::cloud_provider::PayerKind::Personal,
+        &fixture.beneficiary_id,
+        &subscription_id,
+        "price_cloud",
+        &external_reference,
+        &source_id,
+        0,
+        None,
+        AllocationState::Active,
+        format!("ownership-second-{}", fixture.beneficiary_id),
+    )
+    .unwrap();
+    (event, allocation, event_id, allocation_id)
+}
+
 fn page(context: &ProviderContext, source_id: &str) -> ProviderHistoryPage {
     ProviderHistoryPage {
         context: context.clone(),
         source_id: source_id.into(),
         evidence_reference: "provider-page-evidence".into(),
         paid_intervals: vec![ConfirmedPaidInterval {
-            coverage_id: "provider-refresh-coverage".into(),
+            coverage_id: format!("provider-refresh-coverage-{source_id}"),
             source_id: source_id.into(),
             starts_at: 0,
             paid_until: 100,
@@ -169,16 +214,7 @@ fn page(context: &ProviderContext, source_id: &str) -> ProviderHistoryPage {
 }
 
 async fn cleanup(pool: &PgPool, fixture: &Fixture) {
-    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
-        .bind(&fixture.event_id)
-        .execute(pool)
-        .await
-        .expect("delete fixture receipt");
-    sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
-        .bind(&fixture.allocation_id)
-        .execute(pool)
-        .await
-        .expect("delete fixture allocation");
+    cleanup_event_and_allocation(pool, &fixture.event_id, &fixture.allocation_id).await;
     sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
         .bind(&fixture.beneficiary_id)
         .execute(pool)
@@ -226,6 +262,19 @@ async fn cleanup(pool: &PgPool, fixture: &Fixture) {
         .execute(pool)
         .await
         .expect("delete fixture user");
+}
+
+async fn cleanup_event_and_allocation(pool: &PgPool, event_id: &str, allocation_id: &str) {
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+        .bind(event_id)
+        .execute(pool)
+        .await
+        .expect("delete fixture receipt");
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
+        .bind(allocation_id)
+        .execute(pool)
+        .await
+        .expect("delete fixture allocation");
 }
 
 #[tokio::test]
@@ -358,6 +407,276 @@ async fn invalid_limits_do_not_start_preparation_or_provider_fetch() {
     .expect("read receipt count");
     assert_eq!(receipt_count, 0);
 
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn receipt_update_failure_rolls_back_projection_and_retry_applies_once() {
+    let Some(pool) = pool_or_skip(8).await else {
+        return;
+    };
+    let (fixture, event, allocation) = fixture(&pool).await;
+    record_event(&pool, &event).await;
+    let suffix = Uuid::new_v4().to_string().replace('-', "_");
+    let function_name = format!("provider_refresh_fail_{suffix}");
+    let trigger_name = format!("provider_refresh_fail_trigger_{suffix}");
+    sqlx::query(&format!(
+        "CREATE FUNCTION public.{function_name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'provider refresh test failure'; END; $$"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create receipt failure function");
+    sqlx::query(&format!(
+        "CREATE TRIGGER {trigger_name} BEFORE UPDATE OF status ON cloud_provider_event_receipts FOR EACH ROW WHEN (NEW.status = 'applied') EXECUTE FUNCTION public.{function_name}()"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create receipt failure trigger");
+
+    let context = context();
+    let mut client = ScriptedClient {
+        action: ClientAction::Page(page(&context, &fixture.source_id)),
+    };
+    let failed = refresh_verified_event(
+        &pool,
+        &mut client,
+        &context,
+        &event,
+        &allocation,
+        CollectionLimits::default(),
+    )
+    .await;
+    sqlx::query(&format!(
+        "DROP TRIGGER {trigger_name} ON cloud_provider_event_receipts"
+    ))
+    .execute(&pool)
+    .await
+    .expect("drop receipt failure trigger");
+    sqlx::query(&format!("DROP FUNCTION public.{function_name}()"))
+        .execute(&pool)
+        .await
+        .expect("drop receipt failure function");
+
+    assert!(matches!(failed, Err(ProviderRefreshError::Completion(_))));
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM cloud_provider_event_receipts WHERE event_id = $1")
+            .bind(&fixture.event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read rolled back receipt");
+    assert_eq!(status, "pending");
+    let revision_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_revisions WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read rolled back revisions");
+    assert_eq!(
+        revision_count, 1,
+        "registration revision survives completion rollback"
+    );
+    let attempt_status: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read rolled back attempt");
+    assert_eq!(attempt_status, "pending");
+
+    let mut retry_client = ScriptedClient {
+        action: ClientAction::Page(page(&context, &fixture.source_id)),
+    };
+    let retry = refresh_verified_event(
+        &pool,
+        &mut retry_client,
+        &context,
+        &event,
+        &allocation,
+        CollectionLimits::default(),
+    )
+    .await
+    .expect("retry after rollback succeeds");
+    assert_eq!(
+        retry.outcome,
+        sotto_server::cloud_provider::ApplyDisposition::Applied
+    );
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn rejection_during_fetch_stays_terminal_and_cannot_publish() {
+    let Some(pool) = pool_or_skip(8).await else {
+        return;
+    };
+    let (fixture, event, allocation) = fixture(&pool).await;
+    record_event(&pool, &event).await;
+    let context = context();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut client = ScriptedClient {
+        action: ClientAction::Block {
+            entered: entered.clone(),
+            release: release.clone(),
+            page: page(&context, &fixture.source_id),
+        },
+    };
+    let refresh_pool = pool.clone();
+    let refresh_context = context.clone();
+    let refresh_event = event.clone();
+    let refresh_allocation = allocation.clone();
+    let entered_wait = entered.notified();
+    let task = tokio::spawn(async move {
+        refresh_verified_event(
+            &refresh_pool,
+            &mut client,
+            &refresh_context,
+            &refresh_event,
+            &refresh_allocation,
+            CollectionLimits::default(),
+        )
+        .await
+    });
+    timeout(Duration::from_secs(5), entered_wait)
+        .await
+        .expect("provider request entered");
+
+    let mut reject = pool.begin().await.expect("begin rejection");
+    sotto_server::cloud_provider::reject_verified_event(
+        &mut reject,
+        &context,
+        &event,
+        "unsupported_event",
+    )
+    .await
+    .expect("reject pending event");
+    reject.commit().await.expect("commit rejection");
+    release.notify_waiters();
+
+    let result = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("refresh task completes")
+        .expect("refresh task joins");
+    assert!(matches!(
+        result,
+        Err(ProviderRefreshError::Completion(
+            sotto_server::cloud_provider::ProviderAdapterError::EventNotPending
+        ))
+    ));
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM cloud_provider_event_receipts WHERE event_id = $1")
+            .bind(&fixture.event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read rejected receipt");
+    assert_eq!(status, "rejected");
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn newer_source_registration_supersedes_paused_refresh_and_retries_complete_set() {
+    let Some(pool) = pool_or_skip(8).await else {
+        return;
+    };
+    let (fixture, event, allocation) = fixture(&pool).await;
+    record_event(&pool, &event).await;
+    let (second_event, second_allocation, second_event_id, second_allocation_id) =
+        second_event_and_allocation(&fixture);
+    record_event(&pool, &second_event).await;
+    let context = context();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut paused_client = ScriptedClient {
+        action: ClientAction::Block {
+            entered: entered.clone(),
+            release: release.clone(),
+            page: page(&context, &fixture.source_id),
+        },
+    };
+    let refresh_pool = pool.clone();
+    let refresh_context = context.clone();
+    let refresh_event = event.clone();
+    let refresh_allocation = allocation.clone();
+    let entered_wait = entered.notified();
+    let paused = tokio::spawn(async move {
+        refresh_verified_event(
+            &refresh_pool,
+            &mut paused_client,
+            &refresh_context,
+            &refresh_event,
+            &refresh_allocation,
+            CollectionLimits::default(),
+        )
+        .await
+    });
+    timeout(Duration::from_secs(5), entered_wait)
+        .await
+        .expect("first provider request entered");
+
+    let mut prepare_new_source = pool.begin().await.expect("begin new source preparation");
+    sotto_server::cloud_provider::prepare_verified_event(
+        &mut prepare_new_source,
+        &context,
+        &second_event,
+        &second_allocation,
+        "manual-new-source-run",
+    )
+    .await
+    .expect("register and prepare second source");
+    prepare_new_source
+        .commit()
+        .await
+        .expect("commit second source preparation");
+    release.notify_waiters();
+
+    let stale = timeout(Duration::from_secs(5), paused)
+        .await
+        .expect("paused refresh completes")
+        .expect("paused refresh joins");
+    assert!(matches!(
+        stale,
+        Err(ProviderRefreshError::Completion(
+            sotto_server::cloud_provider::ProviderAdapterError::CollectionSuperseded
+        ))
+    ));
+
+    let mut retry_client = ScriptedClient {
+        action: ClientAction::Pages(vec![
+            page(&context, &fixture.source_id),
+            page(&context, &second_allocation.source_id),
+        ]),
+    };
+    let retry = refresh_verified_event(
+        &pool,
+        &mut retry_client,
+        &context,
+        &second_event,
+        &second_allocation,
+        CollectionLimits::default(),
+    )
+    .await
+    .expect("expanded source set refresh succeeds");
+    assert_eq!(
+        retry.outcome,
+        sotto_server::cloud_provider::ApplyDisposition::Applied
+    );
+    let first_status: String =
+        sqlx::query_scalar("SELECT status FROM cloud_provider_event_receipts WHERE event_id = $1")
+            .bind(&fixture.event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read stale event status");
+    assert_eq!(first_status, "pending");
+    let second_status: String =
+        sqlx::query_scalar("SELECT status FROM cloud_provider_event_receipts WHERE event_id = $1")
+            .bind(&second_event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read new event status");
+    assert_eq!(second_status, "applied");
+
+    cleanup_event_and_allocation(&pool, &second_event_id, &second_allocation_id).await;
     cleanup(&pool, &fixture).await;
 }
 
