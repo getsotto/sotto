@@ -4,12 +4,15 @@
 //! normalized, verified evidence, records an idempotent receipt, and applies the evidence through
 //! the existing caller-owned reconciliation transaction. It never stores raw provider payloads.
 
-use std::fmt;
+use std::{collections::BTreeSet, fmt, time::Duration};
 
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
 use thiserror::Error;
+use tokio::time::timeout;
 
+use crate::cloud_coverage::{normalise_confirmed_intervals, ConfirmedPaidInterval, PersonCoverage};
 use crate::cloud_coverage_reconciliation::{
     begin_collection, finish_collection, register_source, CollectionStatus, ReconciliationError,
     SourceBinding, SourceObservation,
@@ -258,6 +261,95 @@ pub struct VerifiedCollection {
     pub observations: Vec<SourceObservation>,
 }
 
+/// The durable ticket that must be captured before provider history is fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionPreparation {
+    pub run_id: String,
+    pub attempt_id: String,
+    pub ticket: crate::cloud_coverage_reconciliation::CollectionTicket,
+}
+
+/// Bounds applied to one provider history collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectionLimits {
+    pub max_pages_per_source: usize,
+    pub max_sources: usize,
+    pub max_facts: usize,
+    pub max_evidence_bytes: usize,
+    pub request_timeout: Duration,
+}
+
+impl Default for CollectionLimits {
+    fn default() -> Self {
+        // Keep one collection bounded even when an adapter does not provide a tighter policy.
+        Self {
+            max_pages_per_source: 64,
+            max_sources: 32,
+            max_facts: 10_000,
+            max_evidence_bytes: 1024 * 1024,
+            request_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
+impl CollectionLimits {
+    fn validate(self) -> Result<(), ProviderCollectionError> {
+        if self.max_pages_per_source == 0
+            || self.max_sources == 0
+            || self.max_facts == 0
+            || self.max_evidence_bytes == 0
+            || self.request_timeout.is_zero()
+        {
+            return Err(ProviderCollectionError::InvalidLimits);
+        }
+        Ok(())
+    }
+}
+
+/// One normalized page from a provider history endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderHistoryPage {
+    pub context: ProviderContext,
+    pub source_id: String,
+    pub evidence_reference: String,
+    pub paid_intervals: Vec<ConfirmedPaidInterval>,
+    pub next_cursor: Option<String>,
+    pub authoritative_end: bool,
+}
+
+/// Provider-neutral history transport. Implementations perform no database work.
+#[async_trait]
+pub trait ProviderHistoryClient: Send {
+    async fn fetch_page(
+        &mut self,
+        context: &ProviderContext,
+        binding: &SourceBinding,
+        cursor: Option<&str>,
+    ) -> Result<ProviderHistoryPage, ProviderCollectionError>;
+}
+
+#[derive(Debug, Error)]
+pub enum ProviderCollectionError {
+    #[error("provider collection limits must be nonzero")]
+    InvalidLimits,
+    #[error("provider history request timed out")]
+    Timeout,
+    #[error("provider history fetch failed: {0}")]
+    Fetch(String),
+    #[error("provider history page has the wrong context")]
+    ContextMismatch,
+    #[error("provider history page has the wrong source")]
+    SourceMismatch,
+    #[error("provider history pagination is incomplete")]
+    MissingEnd,
+    #[error("provider history cursor repeated or did not advance")]
+    RepeatedCursor,
+    #[error("provider history collection exceeded its configured bound")]
+    BoundExceeded,
+    #[error("provider history evidence is invalid: {0}")]
+    InvalidEvidence(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventDisposition {
     Pending,
@@ -301,6 +393,8 @@ pub enum ProviderAdapterError {
     AllocationConflict,
     #[error("provider collection must include one observation for every registered source")]
     IncompleteCollection,
+    #[error("provider collection attempt was superseded")]
+    CollectionSuperseded,
     #[error("provider event is missing")]
     EventMissing,
 }
@@ -448,8 +542,326 @@ pub async fn reject_verified_event(
     }
 }
 
-/// Apply one pending event and normalized collection atomically with reconciliation.
-pub async fn apply_verified_event(
+/// Fetch a complete normalized history for every captured source without holding a SQL transaction.
+pub async fn collect_provider_history<C: ProviderHistoryClient + ?Sized>(
+    client: &mut C,
+    context: &ProviderContext,
+    bindings: &[SourceBinding],
+    limits: CollectionLimits,
+) -> Result<VerifiedCollection, ProviderCollectionError> {
+    context
+        .validate()
+        .map_err(|error| ProviderCollectionError::InvalidEvidence(error.to_string()))?;
+    limits.validate()?;
+    if bindings.is_empty() || bindings.len() > limits.max_sources {
+        return Err(ProviderCollectionError::BoundExceeded);
+    }
+    let expected_sources = bindings
+        .iter()
+        .map(|binding| binding.source_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if expected_sources.len() != bindings.len() {
+        return Err(ProviderCollectionError::InvalidEvidence(
+            "provider collection contains duplicate sources".into(),
+        ));
+    }
+
+    let mut observations = Vec::with_capacity(bindings.len());
+    let mut total_fact_count = 0;
+    for binding in bindings {
+        if binding.beneficiary_id.trim().is_empty()
+            || binding.source_id.trim().is_empty()
+            || binding.provider_namespace.trim().is_empty()
+            || binding.external_allocation_reference.trim().is_empty()
+            || binding.ownership_evidence_reference.trim().is_empty()
+        {
+            return Err(ProviderCollectionError::InvalidEvidence(
+                "provider source binding contains an empty identifier".into(),
+            ));
+        }
+        let mut cursor = None;
+        let mut seen_cursors = BTreeSet::new();
+        let mut page_count = 0;
+        let mut fact_count = 0;
+        let mut intervals = Vec::new();
+        let mut evidence_references = Vec::new();
+        loop {
+            page_count += 1;
+            if page_count > limits.max_pages_per_source {
+                return Err(ProviderCollectionError::BoundExceeded);
+            }
+            let page = timeout(
+                limits.request_timeout,
+                client.fetch_page(context, binding, cursor.as_deref()),
+            )
+            .await
+            .map_err(|_| ProviderCollectionError::Timeout)??;
+            if page.context != *context {
+                return Err(ProviderCollectionError::ContextMismatch);
+            }
+            if page.source_id != binding.source_id {
+                return Err(ProviderCollectionError::SourceMismatch);
+            }
+            if page.evidence_reference.trim().is_empty()
+                || page.paid_intervals.iter().any(|interval| {
+                    interval.source_id != binding.source_id
+                        || interval.coverage_id.trim().is_empty()
+                        || interval.starts_at >= interval.paid_until
+                })
+            {
+                return Err(ProviderCollectionError::InvalidEvidence(
+                    "provider history page contains invalid source facts".into(),
+                ));
+            }
+            if page.paid_intervals.is_empty() && page.next_cursor.is_some() {
+                return Err(ProviderCollectionError::MissingEnd);
+            }
+            fact_count += page.paid_intervals.len();
+            total_fact_count += page.paid_intervals.len();
+            if fact_count > limits.max_facts || total_fact_count > limits.max_facts {
+                return Err(ProviderCollectionError::BoundExceeded);
+            }
+            intervals.extend(page.paid_intervals);
+            evidence_references.push(page.evidence_reference);
+            match (page.authoritative_end, page.next_cursor) {
+                (true, None) => break,
+                (true, Some(_)) => return Err(ProviderCollectionError::MissingEnd),
+                (false, None) => return Err(ProviderCollectionError::MissingEnd),
+                (false, Some(next_cursor)) => {
+                    if next_cursor.trim().is_empty()
+                        || cursor.as_deref() == Some(next_cursor.as_str())
+                        || !seen_cursors.insert(next_cursor.clone())
+                    {
+                        return Err(ProviderCollectionError::RepeatedCursor);
+                    }
+                    cursor = Some(next_cursor);
+                }
+            }
+        }
+        let normalized = normalise_confirmed_intervals(&PersonCoverage {
+            beneficiary_id: binding.beneficiary_id.clone(),
+            paid_intervals: intervals,
+        })
+        .map_err(|error| ProviderCollectionError::InvalidEvidence(error.to_string()))?;
+        let evidence_material = serde_json::to_vec(&evidence_references)
+            .map_err(|error| ProviderCollectionError::InvalidEvidence(error.to_string()))?;
+        observations.push(SourceObservation::Complete {
+            source_id: binding.source_id.clone(),
+            evidence_reference: format!("provider-source-v1:{}", hex_sha256(&evidence_material)),
+            paid_intervals: normalized,
+        });
+    }
+
+    let aggregate_material = observations
+        .iter()
+        .map(|observation| match observation {
+            SourceObservation::Complete {
+                source_id,
+                evidence_reference,
+                paid_intervals,
+            } => serde_json::json!({
+                "source_id": source_id,
+                "evidence_reference": evidence_reference,
+                "paid_intervals": paid_intervals,
+            }),
+            SourceObservation::Unavailable { .. } => serde_json::json!({
+                "source_id": "unavailable",
+            }),
+        })
+        .collect::<Vec<_>>();
+    let aggregate_material = serde_json::to_vec(&aggregate_material)
+        .map_err(|error| ProviderCollectionError::InvalidEvidence(error.to_string()))?;
+    if aggregate_material.len() > limits.max_evidence_bytes {
+        return Err(ProviderCollectionError::BoundExceeded);
+    }
+    Ok(VerifiedCollection {
+        aggregate_evidence_reference: format!(
+            "provider-collection-v1:{}",
+            hex_sha256(&aggregate_material)
+        ),
+        observations,
+    })
+}
+
+/// Prepare and durably capture a collection attempt before any provider history is fetched.
+pub async fn prepare_verified_event(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+    run_id: &str,
+) -> Result<CollectionPreparation, ProviderAdapterError> {
+    context.validate()?;
+    event.validate()?;
+    allocation.validate()?;
+    validate_identifier(run_id, "collection run")?;
+    validate_event_allocation(event, allocation)?;
+    let receipt = sqlx::query(
+        "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
+                normalized_payload_hash, status, collection_beneficiary_id, \
+                collection_attempt_id, collection_run_id \
+         FROM cloud_provider_event_receipts \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 FOR UPDATE",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ProviderAdapterError::EventMissing)?;
+    verify_stored_event(&receipt, event)?;
+    let status: String = receipt.try_get("status")?;
+    if status != "pending" {
+        return Err(ProviderAdapterError::EventNotPending);
+    }
+
+    let attempt_id = scoped_identity(
+        "provider-collection-v1",
+        &[
+            &context.namespace,
+            &context.account_id,
+            context.environment.as_str(),
+            &event.event_id,
+            run_id,
+        ],
+    );
+    ensure_payer(tx, context, allocation).await?;
+    ensure_allocation(tx, context, allocation).await?;
+    let binding = source_binding(context, allocation);
+    register_source(
+        tx,
+        &scoped_identity("provider-source-v1", &[&allocation.allocation_id]),
+        &binding,
+    )
+    .await?;
+    let ticket = begin_collection(tx, &allocation.beneficiary_id, &attempt_id).await?;
+    if ticket.status != crate::cloud_coverage_reconciliation::CollectionStatus::Pending {
+        return Err(ProviderAdapterError::EventConflict);
+    }
+    let updated = sqlx::query(
+        "UPDATE cloud_provider_event_receipts SET collection_beneficiary_id = $5, \
+                collection_attempt_id = $6, collection_run_id = $7 \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 AND status = 'pending'",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .bind(&allocation.beneficiary_id)
+    .bind(&attempt_id)
+    .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ProviderAdapterError::EventNotPending);
+    }
+    Ok(CollectionPreparation {
+        run_id: run_id.into(),
+        attempt_id,
+        ticket,
+    })
+}
+
+/// Complete the exact prepared attempt after provider history collection has committed outside SQL.
+pub async fn complete_verified_event(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+    preparation: &CollectionPreparation,
+    collection: &VerifiedCollection,
+) -> Result<ApplyReceipt, ProviderAdapterError> {
+    context.validate()?;
+    event.validate()?;
+    allocation.validate()?;
+    validate_collection(collection)?;
+    validate_event_allocation(event, allocation)?;
+    if preparation.ticket.status != CollectionStatus::Pending
+        || preparation.ticket.completed_revision.is_some()
+    {
+        return Err(ProviderAdapterError::CollectionSuperseded);
+    }
+    let receipt = sqlx::query(
+        "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
+                normalized_payload_hash, status, collection_beneficiary_id, \
+                collection_attempt_id, collection_run_id \
+         FROM cloud_provider_event_receipts \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 FOR UPDATE",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ProviderAdapterError::EventMissing)?;
+    verify_stored_event(&receipt, event)?;
+    let status: String = receipt.try_get("status")?;
+    if status != "pending" {
+        return Err(ProviderAdapterError::EventNotPending);
+    }
+    let stored_beneficiary: Option<String> = receipt.try_get("collection_beneficiary_id")?;
+    let stored_attempt: Option<String> = receipt.try_get("collection_attempt_id")?;
+    let stored_run: Option<String> = receipt.try_get("collection_run_id")?;
+    if stored_beneficiary.as_deref() != Some(allocation.beneficiary_id.as_str())
+        || stored_attempt.as_deref() != Some(preparation.attempt_id.as_str())
+        || stored_run.as_deref() != Some(preparation.run_id.as_str())
+        || preparation.ticket.attempt_id != preparation.attempt_id
+    {
+        return Err(ProviderAdapterError::CollectionSuperseded);
+    }
+    ensure_payer(tx, context, allocation).await?;
+    ensure_allocation(tx, context, allocation).await?;
+    validate_collection_sources(collection, &preparation.ticket.source_bindings)?;
+    let completed = finish_collection(
+        tx,
+        &preparation.ticket,
+        &collection.aggregate_evidence_reference,
+        &collection.observations,
+    )
+    .await
+    .map_err(|error| match error {
+        ReconciliationError::AttemptSuperseded | ReconciliationError::CollectionConflict => {
+            ProviderAdapterError::CollectionSuperseded
+        }
+        other => ProviderAdapterError::Reconciliation(other),
+    })?;
+    let updated = sqlx::query(
+        "UPDATE cloud_provider_event_receipts SET status = 'applied', processed_at = now(), \
+                allocation_id = $5, coverage_source_id = $6, projection_revision = $7 \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 AND status = 'pending'",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .bind(&allocation.allocation_id)
+    .bind(&allocation.source_id)
+    .bind(completed.revision)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ProviderAdapterError::EventNotPending);
+    }
+    Ok(ApplyReceipt {
+        event_id: event.event_id.clone(),
+        allocation_id: allocation.allocation_id.clone(),
+        source_id: allocation.source_id.clone(),
+        revision: completed.revision,
+        outcome: match completed.outcome {
+            PublicationOutcome::Applied => ApplyDisposition::Applied,
+            PublicationOutcome::AlreadyApplied => ApplyDisposition::AlreadyApplied,
+        },
+    })
+}
+
+/// Replay an already-applied event without fetching or creating a new collection attempt.
+pub async fn replay_verified_event(
     tx: &mut Transaction<'_, Postgres>,
     context: &ProviderContext,
     event: &VerifiedProviderEvent,
@@ -460,25 +872,12 @@ pub async fn apply_verified_event(
     event.validate()?;
     allocation.validate()?;
     validate_collection(collection)?;
-    if event
-        .subscription_id
-        .as_deref()
-        .is_some_and(|subscription_id| subscription_id != allocation.subscription_id)
-    {
-        return Err(ProviderAdapterError::EventConflict);
-    }
-    if event
-        .allocation_reference
-        .as_deref()
-        .is_some_and(|reference| reference != allocation.external_allocation_reference)
-    {
-        return Err(ProviderAdapterError::EventConflict);
-    }
+    validate_event_allocation(event, allocation)?;
 
     let receipt = sqlx::query(
         "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
                 normalized_payload_hash, status, allocation_id, coverage_source_id, \
-                projection_revision \
+                projection_revision, collection_beneficiary_id, collection_attempt_id \
          FROM cloud_provider_event_receipts \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
            AND provider_environment = $3 AND event_id = $4 \
@@ -505,73 +904,30 @@ pub async fn apply_verified_event(
         return Err(ProviderAdapterError::EventConflict);
     }
     let status: String = receipt.try_get("status")?;
-    if status == "applied" {
-        let allocation_id: String = receipt.try_get("allocation_id")?;
-        let source_id: String = receipt.try_get("coverage_source_id")?;
-        let revision: i64 = receipt.try_get("projection_revision")?;
-        if allocation_id != allocation.allocation_id || source_id != allocation.source_id {
-            return Err(ProviderAdapterError::AllocationConflict);
-        }
-        ensure_payer(tx, context, allocation).await?;
-        ensure_allocation(tx, context, allocation).await?;
-        let binding = SourceBinding {
-            beneficiary_id: allocation.beneficiary_id.clone(),
-            source_id: allocation.source_id.clone(),
-            provider_namespace: context.namespace.clone(),
-            external_allocation_reference: allocation.external_allocation_reference.clone(),
-            ownership_evidence_reference: allocation.ownership_evidence_reference.clone(),
-        };
-        register_source(tx, &format!("provider-event:{}", event.event_id), &binding).await?;
-        let ticket = begin_collection(
-            tx,
-            &allocation.beneficiary_id,
-            &format!("provider-event:{}", event.event_id),
-        )
-        .await?;
-        if ticket.status != CollectionStatus::Completed {
-            return Err(ProviderAdapterError::EventConflict);
-        }
-        validate_collection_sources(collection, &ticket.source_bindings)?;
-        let completed = finish_collection(
-            tx,
-            &ticket,
-            &collection.aggregate_evidence_reference,
-            &collection.observations,
-        )
-        .await?;
-        if completed.revision != revision || completed.outcome != PublicationOutcome::AlreadyApplied
-        {
-            return Err(ProviderAdapterError::EventConflict);
-        }
-        return Ok(ApplyReceipt {
-            event_id: event.event_id.clone(),
-            allocation_id,
-            source_id,
-            revision,
-            outcome: ApplyDisposition::AlreadyApplied,
-        });
-    }
-    if status != "pending" {
+    if status != "applied" {
         return Err(ProviderAdapterError::EventNotPending);
     }
-
+    let allocation_id: String = receipt.try_get("allocation_id")?;
+    let source_id: String = receipt.try_get("coverage_source_id")?;
+    let revision: i64 = receipt.try_get("projection_revision")?;
+    let beneficiary_id: String = receipt
+        .try_get::<Option<String>, _>("collection_beneficiary_id")?
+        .ok_or(ProviderAdapterError::EventConflict)?;
+    let attempt_id: String = receipt
+        .try_get::<Option<String>, _>("collection_attempt_id")?
+        .ok_or(ProviderAdapterError::EventConflict)?;
+    if allocation_id != allocation.allocation_id
+        || source_id != allocation.source_id
+        || beneficiary_id != allocation.beneficiary_id
+    {
+        return Err(ProviderAdapterError::AllocationConflict);
+    }
     ensure_payer(tx, context, allocation).await?;
     ensure_allocation(tx, context, allocation).await?;
-    let binding = SourceBinding {
-        beneficiary_id: allocation.beneficiary_id.clone(),
-        source_id: allocation.source_id.clone(),
-        provider_namespace: context.namespace.clone(),
-        external_allocation_reference: allocation.external_allocation_reference.clone(),
-        ownership_evidence_reference: allocation.ownership_evidence_reference.clone(),
-    };
-    let registration =
-        register_source(tx, &format!("provider-event:{}", event.event_id), &binding).await?;
-    let ticket = begin_collection(
-        tx,
-        &allocation.beneficiary_id,
-        &format!("provider-event:{}", event.event_id),
-    )
-    .await?;
+    let ticket = begin_collection(tx, &beneficiary_id, &attempt_id).await?;
+    if ticket.status != CollectionStatus::Completed {
+        return Err(ProviderAdapterError::EventConflict);
+    }
     validate_collection_sources(collection, &ticket.source_bindings)?;
     let completed = finish_collection(
         tx,
@@ -580,34 +936,15 @@ pub async fn apply_verified_event(
         &collection.observations,
     )
     .await?;
-    let updated = sqlx::query(
-        "UPDATE cloud_provider_event_receipts SET status = 'applied', processed_at = now(), \
-                allocation_id = $5, coverage_source_id = $6, projection_revision = $7 \
-         WHERE provider_namespace = $1 AND provider_account_id = $2 \
-           AND provider_environment = $3 AND event_id = $4 AND status = 'pending'",
-    )
-    .bind(&context.namespace)
-    .bind(&context.account_id)
-    .bind(context.environment.as_str())
-    .bind(&event.event_id)
-    .bind(&allocation.allocation_id)
-    .bind(&allocation.source_id)
-    .bind(completed.revision)
-    .execute(&mut **tx)
-    .await?;
-    if updated.rows_affected() != 1 {
-        return Err(ProviderAdapterError::EventNotPending);
+    if completed.revision != revision || completed.outcome != PublicationOutcome::AlreadyApplied {
+        return Err(ProviderAdapterError::EventConflict);
     }
-    let outcome = match (registration.outcome, completed.outcome) {
-        (_, PublicationOutcome::AlreadyApplied) => ApplyDisposition::AlreadyApplied,
-        _ => ApplyDisposition::Applied,
-    };
     Ok(ApplyReceipt {
         event_id: event.event_id.clone(),
-        allocation_id: allocation.allocation_id.clone(),
-        source_id: allocation.source_id.clone(),
-        revision: completed.revision,
-        outcome,
+        allocation_id,
+        source_id,
+        revision,
+        outcome: ApplyDisposition::AlreadyApplied,
     })
 }
 
@@ -765,6 +1102,54 @@ fn validate_collection(collection: &VerifiedCollection) -> Result<(), ProviderAd
     Ok(())
 }
 
+fn validate_event_allocation(
+    event: &VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+) -> Result<(), ProviderAdapterError> {
+    if event
+        .subscription_id
+        .as_deref()
+        .is_some_and(|subscription_id| subscription_id != allocation.subscription_id)
+        || event
+            .allocation_reference
+            .as_deref()
+            .is_some_and(|reference| reference != allocation.external_allocation_reference)
+    {
+        return Err(ProviderAdapterError::EventConflict);
+    }
+    Ok(())
+}
+
+fn source_binding(context: &ProviderContext, allocation: &VerifiedAllocation) -> SourceBinding {
+    SourceBinding {
+        beneficiary_id: allocation.beneficiary_id.clone(),
+        source_id: allocation.source_id.clone(),
+        provider_namespace: context.namespace.clone(),
+        external_allocation_reference: allocation.external_allocation_reference.clone(),
+        ownership_evidence_reference: allocation.ownership_evidence_reference.clone(),
+    }
+}
+
+fn verify_stored_event(
+    row: &sqlx::postgres::PgRow,
+    event: &VerifiedProviderEvent,
+) -> Result<(), ProviderAdapterError> {
+    let stored_hash: String = row.try_get("normalized_payload_hash")?;
+    let stored_type: String = row.try_get("event_type")?;
+    let stored_created: i64 = row.try_get("provider_created_at")?;
+    let stored_subscription: Option<String> = row.try_get("subscription_id")?;
+    let stored_allocation: Option<String> = row.try_get("allocation_reference")?;
+    if stored_hash != event.normalized_payload_hash
+        || stored_type != event.event_type
+        || stored_created != event.provider_created_at
+        || stored_subscription != event.subscription_id
+        || stored_allocation != event.allocation_reference
+    {
+        return Err(ProviderAdapterError::EventConflict);
+    }
+    Ok(())
+}
+
 fn validate_collection_sources(
     collection: &VerifiedCollection,
     bindings: &[SourceBinding],
@@ -814,9 +1199,104 @@ fn hex_sha256(payload: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn scoped_identity(prefix: &str, parts: &[&str]) -> String {
+    let mut material = Vec::new();
+    for part in parts {
+        material.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        material.extend_from_slice(part.as_bytes());
+    }
+    format!("{prefix}:{}", hex_sha256(&material))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ProviderContext, ProviderEnvironment, VerifiedProviderEvent};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
+    use super::{
+        collect_provider_history, CollectionLimits, ProviderCollectionError, ProviderContext,
+        ProviderEnvironment, ProviderHistoryClient, ProviderHistoryPage, SourceBinding,
+        VerifiedProviderEvent,
+    };
+    use crate::cloud_coverage::ConfirmedPaidInterval;
+
+    fn binding() -> SourceBinding {
+        SourceBinding {
+            beneficiary_id: "person_1".into(),
+            source_id: "source_1".into(),
+            provider_namespace: "stripe".into(),
+            external_allocation_reference: "allocation_1".into(),
+            ownership_evidence_reference: "ownership_1".into(),
+        }
+    }
+
+    fn limits() -> CollectionLimits {
+        CollectionLimits {
+            max_pages_per_source: 4,
+            max_sources: 2,
+            max_facts: 8,
+            max_evidence_bytes: 4096,
+            request_timeout: Duration::from_secs(1),
+        }
+    }
+
+    struct FakeClient {
+        pages: Vec<ProviderHistoryPage>,
+        index: usize,
+    }
+
+    #[async_trait]
+    impl ProviderHistoryClient for FakeClient {
+        async fn fetch_page(
+            &mut self,
+            _context: &ProviderContext,
+            _binding: &SourceBinding,
+            _cursor: Option<&str>,
+        ) -> Result<ProviderHistoryPage, ProviderCollectionError> {
+            let page = self.pages[self.index].clone();
+            self.index += 1;
+            Ok(page)
+        }
+    }
+
+    fn page(
+        context: &ProviderContext,
+        evidence_reference: &str,
+        paid_until: i64,
+        next_cursor: Option<&str>,
+        authoritative_end: bool,
+    ) -> ProviderHistoryPage {
+        ProviderHistoryPage {
+            context: context.clone(),
+            source_id: "source_1".into(),
+            evidence_reference: evidence_reference.into(),
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: format!("coverage_{paid_until}"),
+                source_id: "source_1".into(),
+                starts_at: paid_until - 10,
+                paid_until,
+                failed_renewal_id: None,
+            }],
+            next_cursor: next_cursor.map(str::to_owned),
+            authoritative_end,
+        }
+    }
+
+    fn empty_page(
+        context: &ProviderContext,
+        next_cursor: Option<&str>,
+        authoritative_end: bool,
+    ) -> ProviderHistoryPage {
+        ProviderHistoryPage {
+            context: context.clone(),
+            source_id: "source_1".into(),
+            evidence_reference: "empty-evidence".into(),
+            paid_intervals: Vec::new(),
+            next_cursor: next_cursor.map(str::to_owned),
+            authoritative_end,
+        }
+    }
 
     #[test]
     fn hashes_normalized_payload_without_retaining_it() {
@@ -846,5 +1326,78 @@ mod tests {
             ProviderEnvironment::Test
         );
         assert!(ProviderEnvironment::parse("sandbox").is_err());
+    }
+
+    #[tokio::test]
+    async fn collects_every_page_to_an_authoritative_end() {
+        let context =
+            ProviderContext::new("stripe", "acct_test", ProviderEnvironment::Test).unwrap();
+        let mut client = FakeClient {
+            pages: vec![
+                page(&context, "evidence_1", 10, Some("cursor_1"), false),
+                page(&context, "evidence_2", 20, None, true),
+            ],
+            index: 0,
+        };
+        let collection = collect_provider_history(&mut client, &context, &[binding()], limits())
+            .await
+            .unwrap();
+        assert_eq!(collection.observations.len(), 1);
+        assert!(collection
+            .aggregate_evidence_reference
+            .starts_with("provider-collection-v1:"));
+        match &collection.observations[0] {
+            crate::cloud_coverage_reconciliation::SourceObservation::Complete {
+                paid_intervals,
+                ..
+            } => assert_eq!(paid_intervals.len(), 2),
+            _ => panic!("expected complete source observation"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_non_progressing_pagination() {
+        let context =
+            ProviderContext::new("stripe", "acct_test", ProviderEnvironment::Test).unwrap();
+        let mut client = FakeClient {
+            pages: vec![
+                page(&context, "evidence_1", 10, Some("cursor_1"), false),
+                page(&context, "evidence_2", 20, Some("cursor_1"), false),
+            ],
+            index: 0,
+        };
+        let error = collect_provider_history(&mut client, &context, &[binding()], limits())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderCollectionError::RepeatedCursor));
+    }
+
+    #[tokio::test]
+    async fn accepts_authoritative_empty_history_and_rejects_empty_continuation() {
+        let context =
+            ProviderContext::new("stripe", "acct_test", ProviderEnvironment::Test).unwrap();
+        let mut empty = FakeClient {
+            pages: vec![empty_page(&context, None, true)],
+            index: 0,
+        };
+        let collection = collect_provider_history(&mut empty, &context, &[binding()], limits())
+            .await
+            .unwrap();
+        match &collection.observations[0] {
+            crate::cloud_coverage_reconciliation::SourceObservation::Complete {
+                paid_intervals,
+                ..
+            } => assert!(paid_intervals.is_empty()),
+            _ => panic!("expected complete empty source observation"),
+        }
+
+        let mut incomplete = FakeClient {
+            pages: vec![empty_page(&context, Some("cursor_1"), false)],
+            index: 0,
+        };
+        let error = collect_provider_history(&mut incomplete, &context, &[binding()], limits())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderCollectionError::MissingEnd));
     }
 }
