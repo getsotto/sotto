@@ -248,6 +248,10 @@ impl VerifiedAllocation {
 }
 
 /// Normalized provider facts handed to the existing reconciliation boundary.
+///
+/// `observations` is a complete beneficiary snapshot: it must contain one observation for every
+/// registered source. A provider event for one allocation therefore carries verified, carried
+/// forward observations for sibling allocations rather than publishing a partial projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedCollection {
     pub aggregate_evidence_reference: String,
@@ -258,6 +262,12 @@ pub struct VerifiedCollection {
 pub enum EventDisposition {
     Pending,
     AlreadyApplied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionDisposition {
+    Rejected,
+    AlreadyRejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +299,8 @@ pub enum ProviderAdapterError {
     EventNotPending,
     #[error("provider allocation conflicts with an existing owner")]
     AllocationConflict,
+    #[error("provider collection must include one observation for every registered source")]
+    IncompleteCollection,
     #[error("provider event is missing")]
     EventMissing,
 }
@@ -360,6 +372,79 @@ pub async fn record_verified_event(
         Ok(EventDisposition::Pending)
     } else {
         Err(ProviderAdapterError::EventNotPending)
+    }
+}
+
+/// Permanently reject a recorded event after verified processing determines it cannot be applied.
+///
+/// Rejection is explicit and idempotent so poison events do not remain retry loops. The caller
+/// owns the transaction and must commit the returned state transition.
+pub async fn reject_verified_event(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+    rejection_code: &str,
+) -> Result<RejectionDisposition, ProviderAdapterError> {
+    context.validate()?;
+    event.validate()?;
+    validate_identifier(rejection_code, "rejection code")?;
+    let receipt = sqlx::query(
+        "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
+                normalized_payload_hash, status, rejection_code \
+         FROM cloud_provider_event_receipts \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 FOR UPDATE",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ProviderAdapterError::EventMissing)?;
+    let stored_hash: String = receipt.try_get("normalized_payload_hash")?;
+    let stored_type: String = receipt.try_get("event_type")?;
+    let stored_created: i64 = receipt.try_get("provider_created_at")?;
+    let stored_subscription: Option<String> = receipt.try_get("subscription_id")?;
+    let stored_allocation: Option<String> = receipt.try_get("allocation_reference")?;
+    if stored_hash != event.normalized_payload_hash
+        || stored_type != event.event_type
+        || stored_created != event.provider_created_at
+        || stored_subscription != event.subscription_id
+        || stored_allocation != event.allocation_reference
+    {
+        return Err(ProviderAdapterError::EventConflict);
+    }
+    let status: String = receipt.try_get("status")?;
+    match status.as_str() {
+        "pending" => {
+            let updated = sqlx::query(
+                "UPDATE cloud_provider_event_receipts SET status = 'rejected', \
+                        rejection_code = $5, processed_at = now() \
+                 WHERE provider_namespace = $1 AND provider_account_id = $2 \
+                   AND provider_environment = $3 AND event_id = $4 AND status = 'pending'",
+            )
+            .bind(&context.namespace)
+            .bind(&context.account_id)
+            .bind(context.environment.as_str())
+            .bind(&event.event_id)
+            .bind(rejection_code)
+            .execute(&mut **tx)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(ProviderAdapterError::EventNotPending);
+            }
+            Ok(RejectionDisposition::Rejected)
+        }
+        "rejected" => {
+            let stored_code: String = receipt.try_get("rejection_code")?;
+            if stored_code == rejection_code {
+                Ok(RejectionDisposition::AlreadyRejected)
+            } else {
+                Err(ProviderAdapterError::EventConflict)
+            }
+        }
+        _ => Err(ProviderAdapterError::EventNotPending),
     }
 }
 
@@ -446,6 +531,7 @@ pub async fn apply_verified_event(
         if ticket.status != CollectionStatus::Completed {
             return Err(ProviderAdapterError::EventConflict);
         }
+        validate_collection_sources(collection, &ticket.source_bindings)?;
         let completed = finish_collection(
             tx,
             &ticket,
@@ -486,6 +572,7 @@ pub async fn apply_verified_event(
         &format!("provider-event:{}", event.event_id),
     )
     .await?;
+    validate_collection_sources(collection, &ticket.source_bindings)?;
     let completed = finish_collection(
         tx,
         &ticket,
@@ -553,7 +640,8 @@ async fn ensure_payer(
     .bind(&allocation.provider_customer_id)
     .bind(allocation.payer_kind.as_str())
     .execute(&mut **tx)
-    .await?;
+    .await
+    .map_err(map_provider_database_error)?;
     if result.rows_affected() == 1 {
         return Ok(());
     }
@@ -646,8 +734,21 @@ async fn ensure_allocation(
                 Err(ProviderAdapterError::AllocationConflict)
             }
         }
-        Err(sqlx::Error::Database(_)) => Err(ProviderAdapterError::AllocationConflict),
-        Err(error) => Err(ProviderAdapterError::Database(error)),
+        Err(error) => Err(map_provider_database_error(error)),
+    }
+}
+
+fn map_provider_database_error(error: sqlx::Error) -> ProviderAdapterError {
+    let code = match &error {
+        sqlx::Error::Database(database) => database.code().map(|code| code.into_owned()),
+        _ => None,
+    };
+    match code.as_deref() {
+        Some("23505") => ProviderAdapterError::AllocationConflict,
+        Some("23503" | "23514") => ProviderAdapterError::InvalidEvidence(
+            "provider allocation references missing or invalid ownership data".into(),
+        ),
+        _ => ProviderAdapterError::Database(error),
     }
 }
 
@@ -660,6 +761,28 @@ fn validate_collection(collection: &VerifiedCollection) -> Result<(), ProviderAd
         return Err(ProviderAdapterError::InvalidEvidence(
             "provider collection must contain one observation per registered source".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_collection_sources(
+    collection: &VerifiedCollection,
+    bindings: &[SourceBinding],
+) -> Result<(), ProviderAdapterError> {
+    let expected = bindings
+        .iter()
+        .map(|binding| binding.source_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let observed = collection
+        .observations
+        .iter()
+        .map(|observation| match observation {
+            SourceObservation::Complete { source_id, .. }
+            | SourceObservation::Unavailable { source_id, .. } => source_id.as_str(),
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if observed != expected {
+        return Err(ProviderAdapterError::IncompleteCollection);
     }
     Ok(())
 }

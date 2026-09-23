@@ -256,13 +256,33 @@ pub async fn register_source(
         return Err(ReconciliationError::RegistrationConflict);
     }
 
-    let source_id_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM cloud_coverage_sources WHERE source_id = $1)",
+    if let Some(row) = sqlx::query(
+        "SELECT beneficiary_id, source_id, provider_namespace, external_allocation_reference, \
+                ownership_evidence_reference, registration_source_set_generation, \
+                registration_projection_revision \
+         FROM cloud_coverage_sources WHERE source_id = $1",
     )
     .bind(&binding.source_id)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await
-    .map_err(ReconciliationError::Database)?;
+    .map_err(ReconciliationError::Database)?
+    {
+        let stored = source_binding_from_row(&row)?;
+        if &stored != binding {
+            return Err(ReconciliationError::SourceBindingConflict);
+        }
+        let projection_revision: Option<i64> = row.try_get("registration_projection_revision")?;
+        let Some(projection_revision) = projection_revision else {
+            return Err(ReconciliationError::CorruptRegistration);
+        };
+        return Ok(RegistrationReceipt {
+            source_id: stored.source_id,
+            source_set_generation: row.try_get("registration_source_set_generation")?,
+            projection_revision: Some(projection_revision),
+            outcome: RegistrationOutcome::AlreadyApplied,
+        });
+    }
+
     let external_exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM cloud_coverage_sources \
                         WHERE provider_namespace = $1 AND external_allocation_reference = $2)",
@@ -272,7 +292,7 @@ pub async fn register_source(
     .fetch_one(&mut **tx)
     .await
     .map_err(ReconciliationError::Database)?;
-    if source_id_exists || external_exists {
+    if external_exists {
         return Err(ReconciliationError::SourceBindingConflict);
     }
 
