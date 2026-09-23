@@ -342,6 +342,12 @@ struct MachineGrant {
     env_id: String,
     /// The vault key sealed to this machine's public key (base64).
     enc_vault_key: String,
+    /// The token's human label, so a warning in a CI log names which token to replace.
+    name: String,
+    /// When the token stops authenticating (UTC, RFC 3339).
+    expires_at: String,
+    /// Whole days until then, rounded down.
+    expires_in_days: i64,
 }
 
 /// `GET /machine/grant` - the calling machine's environment id + its own current vault-key grant
@@ -353,17 +359,22 @@ async fn machine_grant(
     // Fail closed: if the token row vanished (e.g. an env-deletion cascade in the window after auth),
     // was revoked, or expired in between, answer 401 rather than letting `RowNotFound` bubble up
     // as a 500.
-    let enc_vault_key: Option<Vec<u8>> = sqlx::query_scalar(concat!(
-        "SELECT enc_vault_key FROM machine_tokens WHERE id = $1 AND ",
+    let row: Option<(Vec<u8>, String, String, i64)> = sqlx::query_as(concat!(
+        "SELECT enc_vault_key, name, ",
+        expiry_columns_sql!(),
+        " FROM machine_tokens WHERE id = $1 AND ",
         active_token_sql!(),
     ))
     .bind(&machine.token_id)
     .fetch_optional(&state.pool)
     .await?;
-    let enc_vault_key = enc_vault_key.ok_or(Error::Unauthorized)?;
+    let (enc_vault_key, name, expires_at, expires_in_days) = row.ok_or(Error::Unauthorized)?;
     Ok(Json(MachineGrant {
         env_id: machine.env_id,
         enc_vault_key: encoding::encode(&enc_vault_key),
+        name,
+        expires_at,
+        expires_in_days,
     }))
 }
 

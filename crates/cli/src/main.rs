@@ -1734,8 +1734,13 @@ fn machine_server_url() -> Result<String> {
 fn machine_entries(token: &str) -> Result<Vec<(String, String)>> {
     let token = remote::machine::parse_token(token)?;
     let server = machine_server_url()?;
+    let fetched = remote::machine::fetch_entries(&server, &token)?;
+    // stderr only, and never an error: a warning must not change what the job does.
+    if let Some(warning) = fetched.expiry_warning {
+        eprintln!("{warning}");
+    }
     let mut entries = Vec::new();
-    for (name, value) in remote::machine::fetch_entries(&server, &token)? {
+    for (name, value) in fetched.entries {
         let value = String::from_utf8(value).map_err(|_| {
             Error::Input(format!(
                 "secret `{name}` is not valid UTF-8; cannot inject or export it as text"

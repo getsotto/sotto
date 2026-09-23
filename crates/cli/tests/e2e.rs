@@ -592,8 +592,15 @@ fn machine_token_end_to_end_over_http() {
         remote::team::create_machine_token(&client, &store, &keypair, &config, "ci", None).unwrap();
     let token_str = issued.token;
     let machine = remote::machine::parse_token(&token_str).unwrap();
-    let entries = remote::machine::fetch_entries(&server.url, &machine).unwrap();
-    assert_eq!(entries, vec![("CI_KEY".to_string(), b"ci-value".to_vec())]);
+    let fetched = remote::machine::fetch_entries(&server.url, &machine).unwrap();
+    assert_eq!(
+        fetched.entries,
+        vec![("CI_KEY".to_string(), b"ci-value".to_vec())]
+    );
+    assert_eq!(
+        fetched.expiry_warning, None,
+        "90 days out is no cause for alarm"
+    );
 
     // It carries the server's default lifetime, and a custom one round-trips to the listing.
     let env = store.get_environment(&project.id, "dev").unwrap().unwrap();
@@ -606,6 +613,16 @@ fn machine_token_end_to_end_over_http() {
     assert!(matches!(listed("ci").expires_in_days, Some(89..=90)));
     assert_eq!(short.expires_at, listed("short").expires_at);
     assert!(matches!(listed("short").expires_in_days, Some(6..=7)));
+
+    // A week out, the same fetch that serves CI also warns it, naming the token to replace.
+    let short_machine = remote::machine::parse_token(&short.token).unwrap();
+    let fetched = remote::machine::fetch_entries(&server.url, &short_machine).unwrap();
+    let warning = fetched.expiry_warning.expect("warned inside two weeks");
+    assert!(warning.contains("`short`"), "{warning}");
+    assert!(
+        warning.contains(short.expires_at.as_deref().unwrap()),
+        "{warning}"
+    );
 
     // Revoke the token: the machine path dies immediately.
     let ci = listed("ci").token_id.clone();

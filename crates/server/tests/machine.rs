@@ -824,3 +824,31 @@ async fn member_removal_revokes_their_expired_tokens_too() {
     );
     assert!(revoked_at(&pool, &token_id).await.is_some());
 }
+
+#[tokio::test]
+async fn grant_reports_the_tokens_expiry() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-gx-o", "mt-gx-p", "mt-gx-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-gx-owner").await;
+    let (status, body) = post(
+        &pool,
+        &owner,
+        &format!("/environments/{e}/tokens"),
+        token_body_with_lifetime("10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let created: Value = serde_json::from_str(&body).expect("json");
+    let api_token = created["token"].as_str().expect("token");
+
+    // CI sees which token it is using and how long it has left, by the server's clock, so the
+    // CLI can warn in the job log before the token dies.
+    let (status, body) = get(&pool, api_token, "/machine/grant").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let grant: Value = serde_json::from_str(&body).expect("grant json");
+    assert_eq!(grant["name"].as_str(), Some("ci"));
+    assert_eq!(grant["expires_at"], created["expires_at"]);
+    assert_eq!(grant["expires_in_days"].as_i64(), Some(9));
+}
