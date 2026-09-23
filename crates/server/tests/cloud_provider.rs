@@ -9,9 +9,10 @@ use std::str::FromStr;
 use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::SourceObservation;
 use sotto_server::cloud_provider::{
-    apply_verified_event, record_verified_event, reject_verified_event, AllocationState,
-    ApplyDisposition, EventDisposition, PayerKind, ProviderContext, ProviderEnvironment,
-    RejectionDisposition, VerifiedAllocation, VerifiedCollection, VerifiedProviderEvent,
+    complete_verified_event, prepare_verified_event, record_verified_event, reject_verified_event,
+    replay_verified_event, AllocationState, ApplyDisposition, EventDisposition, PayerKind,
+    ProviderContext, ProviderEnvironment, RejectionDisposition, VerifiedAllocation,
+    VerifiedCollection, VerifiedProviderEvent,
 };
 use sotto_server::db;
 use sqlx::postgres::PgConnectOptions;
@@ -50,6 +51,34 @@ fn event(id: &str) -> VerifiedProviderEvent {
         br#"{"amount":299,"status":"paid"}"#,
     )
     .unwrap()
+}
+
+async fn prepare_and_complete(
+    pool: &PgPool,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+    collection: &VerifiedCollection,
+    run_id: &str,
+) -> sotto_server::cloud_provider::ApplyReceipt {
+    let mut prepare = pool.begin().await.unwrap();
+    let preparation = prepare_verified_event(&mut prepare, context, event, allocation, run_id)
+        .await
+        .unwrap();
+    prepare.commit().await.unwrap();
+    let mut complete = pool.begin().await.unwrap();
+    let receipt = complete_verified_event(
+        &mut complete,
+        context,
+        event,
+        allocation,
+        &preparation,
+        collection,
+    )
+    .await
+    .unwrap();
+    complete.commit().await.unwrap();
+    receipt
 }
 
 #[tokio::test]
@@ -203,11 +232,15 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
         .unwrap();
     record.commit().await.unwrap();
 
-    let mut apply = pool.begin().await.unwrap();
-    let first = apply_verified_event(&mut apply, &context, &event, &allocation, &collection)
-        .await
-        .unwrap();
-    apply.commit().await.unwrap();
+    let first = prepare_and_complete(
+        &pool,
+        &context,
+        &event,
+        &allocation,
+        &collection,
+        "initial-run",
+    )
+    .await;
     assert_eq!(first.outcome, ApplyDisposition::Applied);
     assert!(first.revision > 0);
 
@@ -235,24 +268,22 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
         .await
         .unwrap();
     record_renewal.commit().await.unwrap();
-    let mut apply_renewal = pool.begin().await.unwrap();
-    let renewal = apply_verified_event(
-        &mut apply_renewal,
+    let renewal = prepare_and_complete(
+        &pool,
         &context,
         &renewal_event,
         &allocation,
         &collection,
+        "renewal-run",
     )
-    .await
-    .unwrap();
-    apply_renewal.commit().await.unwrap();
+    .await;
     assert_eq!(renewal.outcome, ApplyDisposition::Applied);
     assert!(renewal.revision > first.revision);
 
     let mut changed_allocation = allocation.clone();
     changed_allocation.provider_item_id = "different_item".into();
     let mut allocation_conflict = pool.begin().await.unwrap();
-    let allocation_result = apply_verified_event(
+    let allocation_result = replay_verified_event(
         &mut allocation_conflict,
         &context,
         &event,
@@ -269,7 +300,7 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
     let mut changed_collection = collection.clone();
     changed_collection.aggregate_evidence_reference = format!("changed-{suffix}");
     let mut collection_conflict = pool.begin().await.unwrap();
-    let collection_result = apply_verified_event(
+    let collection_result = replay_verified_event(
         &mut collection_conflict,
         &context,
         &event,
@@ -288,7 +319,7 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
     collection_conflict.rollback().await.unwrap();
 
     let mut replay = pool.begin().await.unwrap();
-    let second = apply_verified_event(&mut replay, &context, &event, &allocation, &collection)
+    let second = replay_verified_event(&mut replay, &context, &event, &allocation, &collection)
         .await
         .unwrap();
     replay.commit().await.unwrap();
@@ -345,12 +376,24 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
             }],
         }],
     };
+    let mut incomplete_prepare = pool.begin().await.unwrap();
+    let incomplete_preparation = prepare_verified_event(
+        &mut incomplete_prepare,
+        &context,
+        &second_event,
+        &second_allocation,
+        "second-run",
+    )
+    .await
+    .unwrap();
+    incomplete_prepare.commit().await.unwrap();
     let mut incomplete_apply = pool.begin().await.unwrap();
-    let incomplete_result = apply_verified_event(
+    let incomplete_result = complete_verified_event(
         &mut incomplete_apply,
         &context,
         &second_event,
         &second_allocation,
+        &incomplete_preparation,
         &incomplete,
     )
     .await;
@@ -373,14 +416,14 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(allocation_count, 0);
+    assert_eq!(allocation_count, 1);
     let source_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM cloud_coverage_sources WHERE source_id = $1")
             .bind(&second_source_id)
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(source_count, 0);
+    assert_eq!(source_count, 1);
 
     let complete = VerifiedCollection {
         aggregate_evidence_reference: format!("second-aggregate-{suffix}"),
@@ -389,17 +432,15 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
             incomplete.observations[0].clone(),
         ],
     };
-    let mut second_apply = pool.begin().await.unwrap();
-    let second_source = apply_verified_event(
-        &mut second_apply,
+    let second_source = prepare_and_complete(
+        &pool,
         &context,
         &second_event,
         &second_allocation,
         &complete,
+        "second-run-retry",
     )
-    .await
-    .unwrap();
-    second_apply.commit().await.unwrap();
+    .await;
     assert_eq!(second_source.outcome, ApplyDisposition::Applied);
 
     sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
@@ -424,6 +465,188 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
         .unwrap();
     sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
         .bind(&second_allocation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for table in [
+        "cloud_coverage_collection_attempts",
+        "cloud_coverage_sources",
+        "cloud_coverage_coordinators",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(&beneficiary_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "UPDATE cloud_coverage_heads SET current_revision = NULL WHERE beneficiary_id = $1",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for table in ["cloud_coverage_revisions", "cloud_coverage_heads"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(&beneficiary_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_id = $1")
+        .bind(&payer_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn prepared_attempt_is_completed_after_external_collection() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let context = context();
+    let suffix = Uuid::new_v4().to_string();
+    let beneficiary_id = format!("prepared-provider-test-{suffix}");
+    let payer_id = format!("prepared-payer-{suffix}");
+    let allocation_id = format!("prepared-allocation-{suffix}");
+    let source_id = format!("prepared-source-{suffix}");
+    let event_id = format!("prepared-event-{suffix}");
+    let subscription_id = format!("prepared-subscription-{suffix}");
+    let external_reference = format!("prepared-external-{suffix}");
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'cloud-provider-test', $1)",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let event = VerifiedProviderEvent::from_payload(
+        &event_id,
+        "invoice.paid",
+        1_700_000_100,
+        Some(subscription_id.clone()),
+        Some(external_reference.clone()),
+        br#"{"status":"paid"}"#,
+    )
+    .unwrap();
+    let allocation = VerifiedAllocation::new(
+        &allocation_id,
+        &payer_id,
+        format!("prepared-customer-{suffix}"),
+        PayerKind::Personal,
+        &beneficiary_id,
+        &subscription_id,
+        "price_cloud",
+        &external_reference,
+        &source_id,
+        0,
+        None,
+        AllocationState::Active,
+        format!("prepared-ownership-{suffix}"),
+    )
+    .unwrap();
+    let collection = VerifiedCollection {
+        aggregate_evidence_reference: format!("prepared-aggregate-{suffix}"),
+        observations: vec![SourceObservation::Complete {
+            source_id: source_id.clone(),
+            evidence_reference: format!("prepared-evidence-{suffix}"),
+            paid_intervals: vec![ConfirmedPaidInterval {
+                coverage_id: format!("prepared-coverage-{suffix}"),
+                source_id: source_id.clone(),
+                starts_at: 0,
+                paid_until: 100,
+                failed_renewal_id: None,
+            }],
+        }],
+    };
+    let mut record = pool.begin().await.unwrap();
+    record_verified_event(&mut record, &context, &event)
+        .await
+        .unwrap();
+    record.commit().await.unwrap();
+
+    let mut prepare = pool.begin().await.unwrap();
+    let preparation = prepare_verified_event(&mut prepare, &context, &event, &allocation, "run-1")
+        .await
+        .unwrap();
+    prepare.commit().await.unwrap();
+    assert_eq!(preparation.run_id, "run-1");
+
+    let mut retry_prepare = pool.begin().await.unwrap();
+    let retry_preparation =
+        prepare_verified_event(&mut retry_prepare, &context, &event, &allocation, "run-1")
+            .await
+            .unwrap();
+    retry_prepare.commit().await.unwrap();
+    assert_eq!(retry_preparation, preparation);
+
+    let mut superseding_prepare = pool.begin().await.unwrap();
+    let superseding = prepare_verified_event(
+        &mut superseding_prepare,
+        &context,
+        &event,
+        &allocation,
+        "run-2",
+    )
+    .await
+    .unwrap();
+    superseding_prepare.commit().await.unwrap();
+
+    let mut stale_complete = pool.begin().await.unwrap();
+    let stale_result = complete_verified_event(
+        &mut stale_complete,
+        &context,
+        &event,
+        &allocation,
+        &preparation,
+        &collection,
+    )
+    .await;
+    assert!(matches!(
+        stale_result,
+        Err(sotto_server::cloud_provider::ProviderAdapterError::CollectionSuperseded)
+    ));
+    stale_complete.rollback().await.unwrap();
+
+    let mut complete = pool.begin().await.unwrap();
+    let receipt = complete_verified_event(
+        &mut complete,
+        &context,
+        &event,
+        &allocation,
+        &superseding,
+        &collection,
+    )
+    .await
+    .unwrap();
+    complete.commit().await.unwrap();
+    assert_eq!(receipt.outcome, ApplyDisposition::Applied);
+
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+        .bind(&event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
+        .bind(&allocation_id)
         .execute(&pool)
         .await
         .unwrap();
