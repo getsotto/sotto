@@ -7,13 +7,18 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
 from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TIMEOUT = 120
+# Bounded wait between SIGTERM and SIGKILL when a command exceeds its timeout.
+KILL_GRACE_SECONDS = 5.0
+KILL_POLL_SECONDS = 0.025
 SCENARIOS = (
     ("cloud_coverage_reconciliation", "registration_rejects_complete_publication_before_coordinator_lock"),
     ("cloud_coverage_reconciliation", "registration_rejects_complete_publication_after_revision_anchor"),
@@ -49,36 +54,149 @@ def validate_database(env: dict[str, str]) -> None:
         )
 
 
-def run(args: list[str], env: dict[str, str], timeout_seconds: int) -> subprocess.CompletedProcess[str]:
-    print("+", " ".join(args), flush=True)
+def emit(value: str | bytes | None, stream: object) -> None:
+    if value:
+        if isinstance(value, bytes):
+            value = value.decode(errors="replace")
+        print(value, end="", file=stream)
 
-    def emit(value: str | bytes | None, stream: object) -> None:
-        if value:
-            if isinstance(value, bytes):
-                value = value.decode(errors="replace")
-            print(value, end="", file=stream)
 
-    try:
-        result = subprocess.run(
+def spawn_owned(args: list[str], env: dict[str, str]) -> subprocess.Popen[bytes]:
+    """Start a command in its own process group so timeouts can own the whole tree."""
+    if os.name == "nt":
+        return subprocess.Popen(
             args,
             cwd=ROOT,
             env=env,
-            text=True,
-            check=False,
-            capture_output=True,
-            timeout=timeout_seconds,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
+    return subprocess.Popen(
+        args,
+        cwd=ROOT,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+
+def group_exited(pgid: int) -> bool:
+    """Check whether a POSIX process group has no members left.
+
+    A group whose members are all zombies reports PermissionError on some
+    platforms instead of ProcessLookupError; treat that as still present and
+    let the signal step below tolerate it.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def signal_group(pgid: int, signum: int) -> None:
+    """Signal a private process group, tolerating zombies and races.
+
+    Every member of our own session group runs as our user, so PermissionError
+    can only come from already-dead members that some platforms refuse to
+    signal; they need no further action.
+    """
+    try:
+        os.killpg(pgid, signum)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def wait_for_group_exit(proc: subprocess.Popen[bytes], pgid: int, deadline: float) -> bool:
+    while time.monotonic() < deadline:
+        # Reap the direct child while waiting so its zombie never masks group state.
+        proc.poll()
+        if group_exited(pgid):
+            return True
+        time.sleep(KILL_POLL_SECONDS)
+    proc.poll()
+    return group_exited(pgid)
+
+
+def terminate_tree(proc: subprocess.Popen[bytes]) -> None:
+    """Terminate a timed-out command and all descendants, then escalate to a hard kill."""
+    if os.name == "nt":
+        terminate_tree_windows(proc)
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    # Reap an already-exited direct child so its zombie does not mask group state.
+    proc.poll()
+    if not group_exited(pgid):
+        signal_group(pgid, signal.SIGTERM)
+    if wait_for_group_exit(proc, pgid, time.monotonic() + KILL_GRACE_SECONDS):
+        return
+    if not group_exited(pgid):
+        signal_group(pgid, signal.SIGKILL)
+    wait_for_group_exit(proc, pgid, time.monotonic() + KILL_GRACE_SECONDS)
+
+
+def terminate_tree_windows(proc: subprocess.Popen[bytes]) -> None:
+    """Best-effort whole-tree termination on Windows without extra dependencies."""
+    try:
+        subprocess.run(
+            ["taskkill", "/pid", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
+def run(
+    args: list[str],
+    env: dict[str, str],
+    timeout_seconds: int,
+    label: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run one command, owning its process tree, and return captured text output."""
+    tag = label or " ".join(args)
+    print("+", " ".join(args), flush=True)
+    proc = spawn_owned(args, env)
+    try:
+        raw_stdout, raw_stderr = proc.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as error:
-        emit(error.stdout, sys.stdout)
-        emit(error.stderr, sys.stderr)
-        raise RuntimeError(f"timed out after {timeout_seconds}s: {' '.join(args)}") from error
-    if result.returncode:
-        emit(result.stdout, sys.stdout)
-        emit(result.stderr, sys.stderr)
-        raise RuntimeError(f"command exited {result.returncode}: {' '.join(args)}")
-    emit(result.stdout, sys.stdout)
-    emit(result.stderr, sys.stderr)
-    return result
+        terminate_tree(proc)
+        raw_stdout, raw_stderr = proc.communicate()
+        stdout = (raw_stdout or b"").decode(errors="replace")
+        stderr = (raw_stderr or b"").decode(errors="replace")
+        emit(stdout, sys.stdout)
+        emit(stderr, sys.stderr)
+        raise RuntimeError(f"{tag}: timed out after {timeout_seconds}s") from error
+    stdout = (raw_stdout or b"").decode(errors="replace")
+    stderr = (raw_stderr or b"").decode(errors="replace")
+    if proc.returncode:
+        emit(stdout, sys.stdout)
+        emit(stderr, sys.stderr)
+        raise RuntimeError(f"{tag}: command exited {proc.returncode}")
+    emit(stdout, sys.stdout)
+    emit(stderr, sys.stderr)
+    return subprocess.CompletedProcess(args, proc.returncode or 0, stdout, stderr)
 
 
 def discover(target: str, env: dict[str, str], timeout_seconds: int) -> set[str]:
