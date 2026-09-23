@@ -126,6 +126,14 @@ Lines marked `<` are settings nothing reads any more, which usually means a rena
 billing unconfigured, so `POST /billing/webhook` answers `503` instead of `401` and providers
 eventually disable an endpoint that keeps failing. Apply the rename before `up -d`, not after.
 
+**Machine tokens now expire.** Earlier versions let a machine token live until someone revoked it.
+The first upgrade to a version with expiry gives every existing token 90 days, counted from the
+moment the migration runs rather than from when the token was made, so nothing stops working on the
+day you upgrade. After that, each token fails exactly as a revoked one does. Run `sotto token ls` in
+each project that has CI to see the end dates, and replace a token before its date by creating a new
+one, updating the CI secret, and revoking the old one. Machine-mode runs also print a warning in the
+CI log once a token has less than two weeks left.
+
 ## Backups
 
 Postgres holds only ciphertext and metadata, but losing it loses your users' synced vaults.
@@ -725,9 +733,14 @@ otherwise mint a token for whichever project it finds first. Set it as the repos
 
 ```sh
 cd ~/sotto-canary                         # or wherever the canary project lives
-sotto token create --name status-canary   # prints a SOTTO_TOKEN once
+sotto token create --name status-canary --expires-in-days 365   # prints a SOTTO_TOKEN once
 gh secret set SOTTO_CANARY_TOKEN --body 'smt_...'   # the part BEFORE the dot, nothing after it
 ```
+
+The canary token expires like any other, a year at most, and an expired token is refused exactly
+as a revoked one is. The probe cannot tell the two apart, so a lapsed canary token is recorded as
+secret sync being down. `sotto token ls`, run in the canary project, shows its end date; replace
+it before then, and put that date somewhere you will see it, because this job never alerts.
 
 A `SOTTO_TOKEN` is the server-issued bearer joined to the machine's private key. Only the bearer
 is needed here, because the server authenticates on it alone, and the probe refuses to run with a
