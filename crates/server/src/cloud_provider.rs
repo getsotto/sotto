@@ -769,6 +769,9 @@ fn validate_collection_sources(
     collection: &VerifiedCollection,
     bindings: &[SourceBinding],
 ) -> Result<(), ProviderAdapterError> {
+    if collection.observations.len() != bindings.len() {
+        return Err(ProviderAdapterError::IncompleteCollection);
+    }
     let expected = bindings
         .iter()
         .map(|binding| binding.source_id.as_str())
