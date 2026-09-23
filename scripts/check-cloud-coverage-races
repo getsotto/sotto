@@ -130,10 +130,10 @@ def terminate_tree(proc: subprocess.Popen[bytes]) -> None:
     if os.name == "nt":
         terminate_tree_windows(proc)
         return
-    try:
-        pgid = os.getpgid(proc.pid)
-    except ProcessLookupError:
-        return
+    # The child starts its own session, so its pid is the group ID even when the
+    # leader already exited. A descendant can hold the pipes open past the leader's
+    # exit, so cleanup must never be abandoned because the leader is gone.
+    pgid = proc.pid
     # Reap an already-exited direct child so its zombie does not mask group state.
     proc.poll()
     if not group_exited(pgid):
@@ -199,6 +199,8 @@ class CommandFailed(RuntimeError):
         lines = [f"=== {self.label} ===", f"command: {' '.join(self.command)}"]
         if self.timed_out:
             lines.append(f"timed out after {self.timeout_seconds}s")
+        elif self.returncode is None:
+            lines.append("failed to start")
         else:
             lines.append(f"exit: {self.returncode}")
         if self.stdout:
@@ -218,7 +220,12 @@ def run(
     tag = label or " ".join(args)
     with PRINT_LOCK:
         print("+", " ".join(args), flush=True)
-    proc = spawn_owned(args, env)
+    try:
+        proc = spawn_owned(args, env)
+    except OSError as error:
+        raise CommandFailed(
+            tag, args, None, False, timeout_seconds, "", str(error)
+        ) from error
     try:
         raw_stdout, raw_stderr = proc.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired as error:

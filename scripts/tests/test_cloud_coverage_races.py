@@ -40,6 +40,16 @@ TERM_IGNORING_SLEEPER = "; ".join(
     ]
 )
 
+#: Parent records the grandchild pid and exits at once; the grandchild inherits
+#: the pipes and sleeps, so cleanup must own the group without the leader.
+EXITING_SPAWNER = "; ".join(
+    [
+        "import subprocess, sys",
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])",
+        "open(sys.argv[1], 'w').write(str(child.pid))",
+    ]
+)
+
 
 def read_pids(pid_file):
     with open(pid_file, encoding="utf-8") as handle:
@@ -200,6 +210,45 @@ class ProcessTreeTimeoutTests(unittest.TestCase):
     def test_timeout_escalates_past_sigterm_ignore(self):
         self.run_sleeper(TERM_IGNORING_SLEEPER, label="escalation-test")
 
+    def test_timeout_cleans_group_when_leader_exits_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = os.path.join(tmp, "orphan.pid")
+            try:
+                with self.assertRaises(MODULE.CommandFailed) as outcome:
+                    MODULE.run(
+                        [sys.executable, "-c", EXITING_SPAWNER, pid_file],
+                        dict(os.environ),
+                        5,
+                        label="exited-leader-test",
+                    )
+                message = str(outcome.exception)
+                self.assertIn("exited-leader-test", message)
+                self.assertIn("timed out after 5s", message)
+                (grandchild,) = read_pids(pid_file)
+                self.assertFalse(
+                    process_exists(grandchild),
+                    f"process {grandchild} survived the timeout",
+                )
+            finally:
+                kill_best_effort(pid_file)
+
+    def test_cleanup_proceeds_when_the_leader_is_already_reaped(self):
+        proc = mock.Mock()
+        proc.pid = 43210
+        proc.poll.return_value = 0
+        seen = []
+
+        def fake_killpg(pgid, signum):
+            seen.append((pgid, signum))
+            raise ProcessLookupError
+
+        with mock.patch.object(
+            MODULE.os, "getpgid", side_effect=AssertionError("leader pid is the group")
+        ):
+            with mock.patch.object(MODULE.os, "killpg", side_effect=fake_killpg):
+                MODULE.terminate_tree(proc)
+        self.assertEqual(seen, [(43210, 0), (43210, 0)])
+
     def test_timeout_prints_partial_text_and_byte_output(self):
         out, err = io.StringIO(), io.StringIO()
         with tempfile.TemporaryDirectory() as tmp:
@@ -278,6 +327,24 @@ class CommandResultTests(unittest.TestCase):
         self.assertIn("err-word", message)
         self.assertNotIn("out-word", out.getvalue().splitlines())
         self.assertNotIn("err-word", err.getvalue().splitlines())
+
+    def test_spawn_failure_carries_label_and_command(self):
+        missing = os.path.join(
+            "definitely", "missing", "coverage-runner-executable"
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(MODULE.CommandFailed) as outcome:
+                MODULE.run(
+                    [missing],
+                    dict(os.environ),
+                    30,
+                    label="spawn-test",
+                )
+        message = str(outcome.exception)
+        self.assertIn("=== spawn-test ===", message)
+        self.assertIn(missing, message)
+        self.assertIn("failed to start", message)
 
     def test_success_returns_captured_output(self):
         out, err = io.StringIO(), io.StringIO()
