@@ -681,3 +681,86 @@ async fn creation_accepts_custom_lifetime_and_rejects_out_of_range() {
     }
     assert_eq!(listed(&pool, &owner, &tokens_uri).await.len(), 2);
 }
+
+/// A rotation body for a seeded env (one secret, one version) that re-grants the owner and
+/// re-seals the given machine tokens.
+fn rotate_body(base: i64, owner_id: &str, secret_id: &str, machine_tokens: &[&str]) -> String {
+    let machine_grants: Vec<String> = machine_tokens
+        .iter()
+        .map(|id| {
+            format!(
+                r#"{{"token_id":"{id}","enc_vault_key":"{}"}}"#,
+                b64(b"machine-new")
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"base_revision":{base},"grants":[{{"user_id":"{owner_id}","enc_vault_key":"{}"}}],"data_keys":[{{"secret_id":"{secret_id}","enc_data_key":"{}"}}],"history_keys":[{{"secret_id":"{secret_id}","version":1,"enc_data_key":"{}"}}],"machine_grants":[{}]}}"#,
+        b64(b"owner-new"),
+        b64(b"new-dk"),
+        b64(b"new-dk-hist"),
+        machine_grants.join(","),
+    )
+}
+
+#[tokio::test]
+async fn rotation_requires_active_tokens_and_tolerates_expired_ones() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-rotx-o", "mt-rotx-p", "mt-rotx-e");
+    let owner_id = "mt-rotx-owner";
+    let owner = seed_org_env(&pool, o, p, e, owner_id).await;
+    let (live, _) = create_token(&pool, &owner, e, b"g").await;
+    let (lapsed, _) = create_token(&pool, &owner, e, b"g").await;
+    let (revoked, _) = create_token(&pool, &owner, e, b"g").await;
+    delete(
+        &pool,
+        &owner,
+        &format!("/environments/{e}/tokens/{revoked}"),
+    )
+    .await;
+    expire(&pool, &lapsed).await;
+    // A live token in another environment of the same owner.
+    let other_e = "mt-rotx-e2";
+    post(
+        &pool,
+        &owner,
+        &format!("/projects/{p}/environments"),
+        env_body(other_e),
+    )
+    .await;
+    let (foreign, _) = create_token(&pool, &owner, other_e, b"g").await;
+
+    let rotate_uri = format!("/environments/{e}/rotate");
+    let s1 = format!("{e}-s1");
+    let rotate = |base: i64, tokens: &[&str]| rotate_body(base, owner_id, &s1, tokens);
+
+    // Every active token must be covered; an expired one need not be.
+    assert_eq!(
+        post(&pool, &owner, &rotate_uri, rotate(1, &[])).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let (status, body) = post(&pool, &owner, &rotate_uri, rotate(1, &[&live])).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expired token may be omitted: {body}"
+    );
+
+    // A token that expired after the client listed it may still be covered: the listing and the
+    // rotation read the clock at different moments, and failing here would abort a member removal
+    // part-way through its environments.
+    let (status, body) = post(&pool, &owner, &rotate_uri, rotate(2, &[&live, &lapsed])).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expired token may be covered: {body}"
+    );
+
+    // Anything else is still rejected: a revoked token, or another environment's token.
+    for extra in [&revoked, &foreign] {
+        let (status, body) = post(&pool, &owner, &rotate_uri, rotate(3, &[&live, extra])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
+    }
+}

@@ -385,21 +385,30 @@ async fn rotate(
         .await?;
     }
 
-    // Machine grants must cover exactly the env's *active* tokens: leaving one out would strand its
-    // CI on the old key with no way to notice (revoke a token first to genuinely drop it). Expired
-    // tokens are not active, matching the listing clients build this set from.
-    let active_tokens: Vec<String> = sqlx::query_scalar(concat!(
-        "SELECT id FROM machine_tokens WHERE env_id = $1 AND ",
+    // Machine grants must cover every *active* token in the env: leaving one out would strand its
+    // CI on the old key with no way to notice (revoke a token first to genuinely drop it). They may
+    // also cover a token that has since expired: the client built its set from the listing a moment
+    // ago, and a token can lapse in between, which must not fail the rotation (a member removal
+    // rotates environment after environment). Re-sealing to an expired token is harmless, since it
+    // can no longer authenticate. Anything outside the env's unrevoked tokens is still rejected.
+    let unrevoked: Vec<(String, bool)> = sqlx::query_as(concat!(
+        "SELECT id, ",
         active_token_sql!(),
+        " FROM machine_tokens WHERE env_id = $1 AND revoked_at IS NULL",
     ))
     .bind(&env_id)
     .fetch_all(&mut *tx)
     .await?;
-    let active: HashSet<&str> = active_tokens.iter().map(String::as_str).collect();
     let provided: HashSet<&str> = machine_grants.iter().map(|(id, _)| id.as_str()).collect();
-    if provided != active {
+    let covers_active = unrevoked
+        .iter()
+        .filter(|(_, active)| *active)
+        .all(|(id, _)| provided.contains(id.as_str()));
+    let allowed: HashSet<&str> = unrevoked.iter().map(|(id, _)| id.as_str()).collect();
+    if !covers_active || !provided.is_subset(&allowed) {
         return Err(Error::BadRequest(
-            "rotation must re-grant exactly the environment's active machine tokens".into(),
+            "rotation must re-grant every active machine token in the environment, and no others"
+                .into(),
         ));
     }
     for (token_id, enc_vault_key) in &machine_grants {
