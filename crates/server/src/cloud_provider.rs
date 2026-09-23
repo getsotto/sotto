@@ -938,18 +938,32 @@ pub async fn replay_verified_event(
     let allocation_id: String = receipt.try_get("allocation_id")?;
     let source_id: String = receipt.try_get("coverage_source_id")?;
     let revision: i64 = receipt.try_get("projection_revision")?;
-    let beneficiary_id: String = receipt
-        .try_get::<Option<String>, _>("collection_beneficiary_id")?
-        .ok_or(ProviderAdapterError::EventConflict)?;
-    let attempt_id: String = receipt
-        .try_get::<Option<String>, _>("collection_attempt_id")?
-        .ok_or(ProviderAdapterError::EventConflict)?;
+    let beneficiary_id: Option<String> = receipt.try_get("collection_beneficiary_id")?;
+    let attempt_id: Option<String> = receipt.try_get("collection_attempt_id")?;
     if allocation_id != allocation.allocation_id
         || source_id != allocation.source_id
-        || beneficiary_id != allocation.beneficiary_id
+        || beneficiary_id
+            .as_deref()
+            .is_some_and(|beneficiary| beneficiary != allocation.beneficiary_id)
     {
         return Err(ProviderAdapterError::AllocationConflict);
     }
+    let (beneficiary_id, attempt_id) = match (beneficiary_id, attempt_id) {
+        (None, None) => {
+            // Migration 0027 can only associate an applied legacy receipt when its completed
+            // attempt still exists. Preserve terminal idempotency for older rows without
+            // inventing a ticket.
+            return Ok(ApplyReceipt {
+                event_id: event.event_id.clone(),
+                allocation_id,
+                source_id,
+                revision,
+                outcome: ApplyDisposition::AlreadyApplied,
+            });
+        }
+        (Some(beneficiary_id), Some(attempt_id)) => (beneficiary_id, attempt_id),
+        _ => return Err(ProviderAdapterError::EventConflict),
+    };
     ensure_payer(tx, context, allocation).await?;
     ensure_allocation(tx, context, allocation).await?;
     let ticket = begin_collection(tx, &beneficiary_id, &attempt_id).await?;

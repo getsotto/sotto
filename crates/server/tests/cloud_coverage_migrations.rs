@@ -18,6 +18,10 @@ use sotto_server::cloud_coverage_reconciliation::{
     RegistrationOutcome, SourceBinding, SourceObservation,
 };
 use sotto_server::cloud_coverage_store::PublicationOutcome;
+use sotto_server::cloud_provider::{
+    replay_verified_event, AllocationState, PayerKind, ProviderContext, ProviderEnvironment,
+    VerifiedAllocation, VerifiedCollection, VerifiedProviderEvent,
+};
 use sotto_server::db;
 
 static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
@@ -69,11 +73,15 @@ impl DisposableDatabase {
 }
 
 fn old_migrator() -> Migrator {
+    migrator_before(25)
+}
+
+fn migrator_before(version: i64) -> Migrator {
     Migrator {
         migrations: Cow::Owned(
             ALL_MIGRATIONS
                 .iter()
-                .filter(|migration| migration.version < 25)
+                .filter(|migration| migration.version < version)
                 .cloned()
                 .collect(),
         ),
@@ -81,6 +89,153 @@ fn old_migrator() -> Migrator {
         locking: true,
         no_tx: false,
     }
+}
+
+async fn seed_legacy_provider_receipt(
+    pool: &PgPool,
+) -> (
+    ProviderContext,
+    VerifiedProviderEvent,
+    VerifiedAllocation,
+    VerifiedCollection,
+) {
+    let beneficiary = "provider-migration-beneficiary";
+    let payer = "provider-migration-payer";
+    let allocation_id = "provider-migration-allocation";
+    let source_id = "provider-migration-source";
+    let event_id = "provider-migration-event";
+    let subscription_id = "provider-migration-subscription";
+    let external_reference = "provider-migration-external";
+    let context = ProviderContext::new(
+        "legacy-provider",
+        "legacy-account",
+        ProviderEnvironment::Test,
+    )
+    .expect("provider context");
+    let event = VerifiedProviderEvent::from_payload(
+        event_id,
+        "invoice.paid",
+        1_700_000_000,
+        Some(subscription_id.into()),
+        Some(external_reference.into()),
+        br#"{"status":"paid"}"#,
+    )
+    .expect("provider event");
+    let allocation = VerifiedAllocation::new(
+        allocation_id,
+        payer,
+        "provider-migration-customer",
+        PayerKind::Personal,
+        beneficiary,
+        subscription_id,
+        "provider-migration-item",
+        external_reference,
+        source_id,
+        0,
+        None,
+        AllocationState::Active,
+        "provider-migration-ownership",
+    )
+    .expect("provider allocation");
+    let collection = VerifiedCollection {
+        aggregate_evidence_reference: "legacy-aggregate".into(),
+        observations: vec![SourceObservation::Complete {
+            source_id: source_id.into(),
+            evidence_reference: "legacy-evidence".into(),
+            paid_intervals: vec![],
+        }],
+    };
+    let provider_binding = SourceBinding {
+        beneficiary_id: beneficiary.into(),
+        source_id: source_id.into(),
+        provider_namespace: context.namespace.clone(),
+        external_allocation_reference: external_reference.into(),
+        ownership_evidence_reference: "provider-migration-ownership".into(),
+    };
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'migration-provider', $1)",
+    )
+    .bind(beneficiary)
+    .execute(pool)
+    .await
+    .expect("insert provider beneficiary");
+    sqlx::query("INSERT INTO cloud_coverage_revisions (beneficiary_id, revision, operation_id, evidence_reference, status, fact_count) VALUES ($1, 1, 'provider-migration-revision', 'provider-migration-revision-evidence', 'complete', 0)")
+        .bind(beneficiary)
+        .execute(pool)
+        .await
+        .expect("insert provider revision");
+    sqlx::query(
+        "INSERT INTO cloud_coverage_heads (beneficiary_id, current_revision) VALUES ($1, 1)",
+    )
+    .bind(beneficiary)
+    .execute(pool)
+    .await
+    .expect("insert provider head");
+    sqlx::query("INSERT INTO cloud_coverage_coordinators (beneficiary_id, source_set_generation, collection_epoch) VALUES ($1, 1, 1)")
+        .bind(beneficiary)
+        .execute(pool)
+        .await
+        .expect("insert provider coordinator");
+    sqlx::query("INSERT INTO cloud_coverage_sources (source_id, beneficiary_id, provider_namespace, external_allocation_reference, ownership_evidence_reference, registration_operation_id, registration_source_set_generation, registration_projection_revision) VALUES ($1, $2, $3, $4, 'provider-migration-ownership', 'provider-migration-registration', 1, 1)")
+        .bind(source_id)
+        .bind(beneficiary)
+        .bind(&context.namespace)
+        .bind(external_reference)
+        .execute(pool)
+        .await
+        .expect("insert provider source");
+    sqlx::query("INSERT INTO cloud_provider_payers (payer_id, provider_namespace, provider_account_id, provider_environment, provider_customer_id, payer_kind) VALUES ($1, $2, $3, $4, $5, 'personal')")
+        .bind(payer)
+        .bind(&context.namespace)
+        .bind(&context.account_id)
+        .bind(context.environment.as_str())
+        .bind("provider-migration-customer")
+        .execute(pool)
+        .await
+        .expect("insert provider payer");
+    sqlx::query("INSERT INTO cloud_provider_allocations (allocation_id, payer_id, beneficiary_id, provider_namespace, provider_account_id, provider_environment, provider_subscription_id, provider_item_id, external_allocation_reference, coverage_source_id, effective_from, state, ownership_evidence_reference) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 'active', 'provider-migration-ownership')")
+        .bind(allocation_id)
+        .bind(payer)
+        .bind(beneficiary)
+        .bind(&context.namespace)
+        .bind(&context.account_id)
+        .bind(context.environment.as_str())
+        .bind(subscription_id)
+        .bind("provider-migration-item")
+        .bind(external_reference)
+        .bind(source_id)
+        .execute(pool)
+        .await
+        .expect("insert provider allocation");
+    let bindings = serde_json::to_string(&[&provider_binding]).expect("encode provider binding");
+    sqlx::query("INSERT INTO cloud_coverage_collection_attempts (attempt_id, beneficiary_id, collection_epoch, source_set_generation, expected_projection_revision, source_bindings, status, aggregate_evidence_reference, canonical_result, projection_revision, completed_at) VALUES ($1, $2, 2, 1, 1, $3::jsonb, 'completed', 'legacy-aggregate', $4::jsonb, 1, now())")
+        .bind(format!("provider-event:{event_id}"))
+        .bind(beneficiary)
+        .bind(bindings)
+        .bind(canonical_result(
+            &provider_binding,
+            "legacy-aggregate",
+            "legacy-evidence",
+        ))
+        .execute(pool)
+        .await
+        .expect("insert provider attempt");
+    sqlx::query("INSERT INTO cloud_provider_event_receipts (provider_namespace, provider_account_id, provider_environment, event_id, event_type, provider_created_at, subscription_id, allocation_reference, normalized_payload_hash, status, allocation_id, coverage_source_id, projection_revision, processed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'applied', $10, $11, 1, now())")
+        .bind(&context.namespace)
+        .bind(&context.account_id)
+        .bind(context.environment.as_str())
+        .bind(event_id)
+        .bind(&event.event_type)
+        .bind(event.provider_created_at)
+        .bind(event.subscription_id.as_deref())
+        .bind(event.allocation_reference.as_deref())
+        .bind(&event.normalized_payload_hash)
+        .bind(allocation_id)
+        .bind(source_id)
+        .execute(pool)
+        .await
+        .expect("insert provider receipt");
+    (context, event, allocation, collection)
 }
 
 fn binding(beneficiary_id: &str, source_id: &str) -> SourceBinding {
@@ -561,5 +716,71 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
     }
     fresh.cleanup().await;
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn migration_0028_preserves_legacy_provider_replay() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    migrator_before(27)
+        .run(&database.pool)
+        .await
+        .expect("apply migrations through 0026");
+    let (context, event, allocation, collection) =
+        seed_legacy_provider_receipt(&database.pool).await;
+
+    db::migrate(&database.pool)
+        .await
+        .expect("apply migration 0027 and legacy backfill");
+    let association: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT collection_beneficiary_id, collection_attempt_id, collection_run_id \
+         FROM cloud_provider_event_receipts WHERE event_id = $1",
+    )
+    .bind(&event.event_id)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read backfilled receipt association");
+    assert_eq!(
+        association,
+        (
+            Some(allocation.beneficiary_id.clone()),
+            Some(format!("provider-event:{}", event.event_id)),
+            Some("legacy-provider-event-v1".into()),
+        )
+    );
+
+    let mut tx = database.pool.begin().await.expect("begin legacy replay");
+    let replay = replay_verified_event(&mut tx, &context, &event, &allocation, &collection)
+        .await
+        .expect("replay backfilled legacy receipt");
+    tx.commit().await.expect("commit legacy replay");
+    assert_eq!(
+        replay.outcome,
+        sotto_server::cloud_provider::ApplyDisposition::AlreadyApplied
+    );
+
+    sqlx::query(
+        "UPDATE cloud_provider_event_receipts SET collection_beneficiary_id = NULL, \
+                collection_attempt_id = NULL, collection_run_id = NULL WHERE event_id = $1",
+    )
+    .bind(&event.event_id)
+    .execute(&database.pool)
+    .await
+    .expect("clear legacy association");
+    let mut tx = database
+        .pool
+        .begin()
+        .await
+        .expect("begin null-association replay");
+    let replay = replay_verified_event(&mut tx, &context, &event, &allocation, &collection)
+        .await
+        .expect("replay unassociated legacy receipt");
+    tx.commit().await.expect("commit null-association replay");
+    assert_eq!(
+        replay.outcome,
+        sotto_server::cloud_provider::ApplyDisposition::AlreadyApplied
+    );
     database.cleanup().await;
 }
