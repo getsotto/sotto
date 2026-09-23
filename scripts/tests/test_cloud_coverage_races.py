@@ -100,13 +100,16 @@ class ProcessTreeTimeoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             pid_file = os.path.join(tmp, "tree.pid")
             try:
-                with self.assertRaisesRegex(RuntimeError, f"{label}: timed out"):
+                with self.assertRaises(MODULE.CommandFailed) as outcome:
                     MODULE.run(
                         [sys.executable, "-c", script, pid_file],
                         dict(os.environ),
                         timeout_seconds,
                         label=label,
                     )
+                message = str(outcome.exception)
+                self.assertIn(label, message)
+                self.assertIn(f"timed out after {timeout_seconds}s", message)
                 pids = read_pids(pid_file)
                 self.assertEqual(len(pids), 2)
                 for pid in pids:
@@ -128,7 +131,7 @@ class ProcessTreeTimeoutTests(unittest.TestCase):
             pid_file = os.path.join(tmp, "tree.pid")
             try:
                 with redirect_stdout(out), redirect_stderr(err):
-                    with self.assertRaisesRegex(RuntimeError, "partial-test: timed out"):
+                    with self.assertRaises(MODULE.CommandFailed):
                         MODULE.run(
                             [sys.executable, "-c", SPAWNING_SLEEPER, pid_file],
                             dict(os.environ),
@@ -137,23 +140,100 @@ class ProcessTreeTimeoutTests(unittest.TestCase):
                         )
             finally:
                 kill_best_effort(pid_file)
+        self.assertIn("partial-test", out.getvalue())
         self.assertIn("partial-stdout", out.getvalue())
         self.assertIn("\ufffd", out.getvalue())
         self.assertIn("partial-stderr", err.getvalue())
 
+    def test_timeout_embeds_partial_output_in_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = os.path.join(tmp, "tree.pid")
+            try:
+                with self.assertRaises(MODULE.CommandFailed) as outcome:
+                    MODULE.run(
+                        [sys.executable, "-c", SPAWNING_SLEEPER, pid_file],
+                        dict(os.environ),
+                        5,
+                        label="embed-test",
+                    )
+            finally:
+                kill_best_effort(pid_file)
+        message = str(outcome.exception)
+        self.assertIn("=== embed-test ===", message)
+        self.assertIn("timed out after 5s", message)
+        self.assertIn("partial-stdout", message)
+        self.assertIn("partial-stderr", message)
+
 
 class CommandResultTests(unittest.TestCase):
-    def test_nonzero_exit_preserves_both_streams(self):
+    def test_nonzero_exit_carries_label_and_both_streams(self):
         script = (
             "import sys; print('out-word'); "
             "print('err-word', file=sys.stderr); sys.exit(3)"
         )
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
-            with self.assertRaisesRegex(RuntimeError, "command exited 3"):
-                MODULE.run([sys.executable, "-c", script], dict(os.environ), 30)
-        self.assertIn("out-word", out.getvalue())
-        self.assertIn("err-word", err.getvalue())
+            with self.assertRaises(MODULE.CommandFailed) as outcome:
+                MODULE.run(
+                    [sys.executable, "-c", script],
+                    dict(os.environ),
+                    30,
+                    label="exit-test",
+                )
+        message = str(outcome.exception)
+        self.assertIn("=== exit-test ===", message)
+        self.assertIn("exit: 3", message)
+        self.assertIn("out-word", message)
+        self.assertIn("err-word", message)
+        self.assertNotIn("out-word", out.getvalue().splitlines())
+        self.assertNotIn("err-word", err.getvalue().splitlines())
+
+    def test_success_returns_captured_output(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            result = MODULE.run(
+                [sys.executable, "-c", "print('ok-word')"],
+                dict(os.environ),
+                30,
+                label="success-test",
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("ok-word", result.stdout)
+        self.assertIn("ok-word", out.getvalue())
+
+    def test_parallel_failures_report_every_labelled_diagnostic(self):
+        def failing(marker, code):
+            return [
+                sys.executable,
+                "-c",
+                f"import sys; print('{marker}-out'); "
+                f"print('{marker}-err', file=sys.stderr); sys.exit({code})",
+            ]
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(RuntimeError) as outcome:
+                MODULE.run_parallel(
+                    [
+                        ("first-target", failing("first", 3)),
+                        ("second-target", failing("second", 4)),
+                    ],
+                    dict(os.environ),
+                    30,
+                )
+        message = str(outcome.exception)
+        self.assertIn("parallel target failures (2)", message)
+        for expected in (
+            "=== first-target ===",
+            "=== second-target ===",
+            "first-out",
+            "first-err",
+            "second-out",
+            "second-err",
+            "exit: 3",
+            "exit: 4",
+        ):
+            self.assertIn(expected, message)
 
 
 if __name__ == "__main__":

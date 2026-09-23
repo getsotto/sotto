@@ -10,6 +10,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -19,6 +20,8 @@ DEFAULT_TIMEOUT = 120
 # Bounded wait between SIGTERM and SIGKILL when a command exceeds its timeout.
 KILL_GRACE_SECONDS = 5.0
 KILL_POLL_SECONDS = 0.025
+# Serialises printed blocks so parallel commands never interleave mid-diagnostic.
+PRINT_LOCK = threading.Lock()
 SCENARIOS = (
     ("cloud_coverage_reconciliation", "registration_rejects_complete_publication_before_coordinator_lock"),
     ("cloud_coverage_reconciliation", "registration_rejects_complete_publication_after_revision_anchor"),
@@ -168,6 +171,41 @@ def terminate_tree_windows(proc: subprocess.Popen[bytes]) -> None:
                 pass
 
 
+class CommandFailed(RuntimeError):
+    """A command failure carrying its labelled stdout, stderr and exit state."""
+
+    def __init__(
+        self,
+        label: str,
+        args: list[str],
+        returncode: int | None,
+        timed_out: bool,
+        timeout_seconds: int,
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        self.label = label
+        self.args = args
+        self.returncode = returncode
+        self.timed_out = timed_out
+        self.timeout_seconds = timeout_seconds
+        self.stdout = stdout
+        self.stderr = stderr
+        super().__init__(str(self))
+
+    def __str__(self) -> str:
+        lines = [f"=== {self.label} ===", f"command: {' '.join(self.args)}"]
+        if self.timed_out:
+            lines.append(f"timed out after {self.timeout_seconds}s")
+        else:
+            lines.append(f"exit: {self.returncode}")
+        if self.stdout:
+            lines.extend(["--- stdout ---", self.stdout.rstrip("\n")])
+        if self.stderr:
+            lines.extend(["--- stderr ---", self.stderr.rstrip("\n")])
+        return "\n".join(lines)
+
+
 def run(
     args: list[str],
     env: dict[str, str],
@@ -176,7 +214,8 @@ def run(
 ) -> subprocess.CompletedProcess[str]:
     """Run one command, owning its process tree, and return captured text output."""
     tag = label or " ".join(args)
-    print("+", " ".join(args), flush=True)
+    with PRINT_LOCK:
+        print("+", " ".join(args), flush=True)
     proc = spawn_owned(args, env)
     try:
         raw_stdout, raw_stderr = proc.communicate(timeout=timeout_seconds)
@@ -185,18 +224,46 @@ def run(
         raw_stdout, raw_stderr = proc.communicate()
         stdout = (raw_stdout or b"").decode(errors="replace")
         stderr = (raw_stderr or b"").decode(errors="replace")
-        emit(stdout, sys.stdout)
-        emit(stderr, sys.stderr)
-        raise RuntimeError(f"{tag}: timed out after {timeout_seconds}s") from error
+        with PRINT_LOCK:
+            print(f"=== {tag} (timed out after {timeout_seconds}s) ===", flush=True)
+            emit(stdout, sys.stdout)
+            emit(stderr, sys.stderr)
+        raise CommandFailed(
+            tag, args, None, True, timeout_seconds, stdout, stderr
+        ) from error
     stdout = (raw_stdout or b"").decode(errors="replace")
     stderr = (raw_stderr or b"").decode(errors="replace")
     if proc.returncode:
+        raise CommandFailed(
+            tag, args, proc.returncode, False, timeout_seconds, stdout, stderr
+        )
+    with PRINT_LOCK:
         emit(stdout, sys.stdout)
         emit(stderr, sys.stderr)
-        raise RuntimeError(f"{tag}: command exited {proc.returncode}")
-    emit(stdout, sys.stdout)
-    emit(stderr, sys.stderr)
     return subprocess.CompletedProcess(args, proc.returncode or 0, stdout, stderr)
+
+
+def run_parallel(
+    commands: list[tuple[str, list[str]]],
+    env: dict[str, str],
+    timeout_seconds: int,
+) -> None:
+    """Run labelled commands concurrently, reporting every failure grouped by label."""
+    with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+        futures = [
+            (label, executor.submit(run, args, env, timeout_seconds, label))
+            for label, args in commands
+        ]
+        failures = []
+        for _, future in futures:
+            try:
+                future.result()
+            except Exception as error:  # noqa: BLE001 - preserve every subprocess failure
+                failures.append(str(error))
+        if failures:
+            raise RuntimeError(
+                f"parallel target failures ({len(failures)}):\n\n" + "\n\n".join(failures)
+            )
 
 
 def discover(target: str, env: dict[str, str], timeout_seconds: int) -> set[str]:
@@ -204,6 +271,7 @@ def discover(target: str, env: dict[str, str], timeout_seconds: int) -> set[str]
         ["cargo", "test", "-p", "sotto-server", "--test", target, "--", "--list"],
         env,
         timeout_seconds,
+        label=f"discover:{target}",
     )
     return {
         line.split(":", 1)[0]
@@ -241,31 +309,24 @@ def main() -> int:
                 ],
                 env,
                 parsed.timeout,
+                label=f"{target}::{name}",
             )
         for round_number in range(1, parsed.rounds + 1):
             print(f"race repetition round {round_number}/{parsed.rounds}", flush=True)
-            commands = [
+            run_parallel(
                 [
-                    "cargo", "test", "-p", "sotto-server", "--test", target,
-                    "--", "--test-threads=4",
-                ]
-                for target in sorted(targets)
-            ]
-            with ThreadPoolExecutor(max_workers=len(commands)) as executor:
-                futures = [
-                    executor.submit(run, command, env, parsed.timeout)
-                    for command in commands
-                ]
-                failures = []
-                for future in futures:
-                    try:
-                        future.result()
-                    except Exception as error:  # noqa: BLE001 - preserve every subprocess failure
-                        failures.append(str(error))
-                if failures:
-                    raise RuntimeError(
-                        "parallel target failures:\n" + "\n".join(f"- {failure}" for failure in failures)
+                    (
+                        f"round:{round_number}:{target}",
+                        [
+                            "cargo", "test", "-p", "sotto-server", "--test", target,
+                            "--", "--test-threads=4",
+                        ],
                     )
+                    for target in sorted(targets)
+                ],
+                env,
+                parsed.timeout,
+            )
     except (OSError, ValueError, RuntimeError) as error:
         print(f"cloud coverage race checks failed: {error}", file=sys.stderr)
         return 1
