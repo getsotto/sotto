@@ -1468,6 +1468,71 @@ mod tests {
         assert!(matches!(error, ProviderCollectionError::BoundExceeded));
     }
 
+    #[tokio::test]
+    async fn rejects_source_page_and_fact_bounds() {
+        let context =
+            ProviderContext::new("stripe", "acct_test", ProviderEnvironment::Test).unwrap();
+
+        let mut second_binding = binding();
+        second_binding.source_id = "source_2".into();
+        let mut source_client = FakeClient {
+            pages: vec![],
+            index: 0,
+        };
+        let source_limited = CollectionLimits {
+            max_sources: 1,
+            ..limits()
+        };
+        let error = collect_provider_history(
+            &mut source_client,
+            &context,
+            &[binding(), second_binding],
+            source_limited,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ProviderCollectionError::BoundExceeded));
+
+        let mut page_client = FakeClient {
+            pages: vec![
+                page(&context, "evidence_1", 10, Some("cursor_1"), false),
+                page(&context, "evidence_2", 20, None, true),
+            ],
+            index: 0,
+        };
+        let page_limited = CollectionLimits {
+            max_pages_per_source: 1,
+            ..limits()
+        };
+        let error =
+            collect_provider_history(&mut page_client, &context, &[binding()], page_limited)
+                .await
+                .unwrap_err();
+        assert!(matches!(error, ProviderCollectionError::BoundExceeded));
+
+        let mut facts_page = page(&context, "evidence_1", 10, None, true);
+        facts_page.paid_intervals.push(ConfirmedPaidInterval {
+            coverage_id: "coverage_20".into(),
+            source_id: "source_1".into(),
+            starts_at: 10,
+            paid_until: 20,
+            failed_renewal_id: None,
+        });
+        let mut fact_client = FakeClient {
+            pages: vec![facts_page],
+            index: 0,
+        };
+        let fact_limited = CollectionLimits {
+            max_facts: 1,
+            ..limits()
+        };
+        let error =
+            collect_provider_history(&mut fact_client, &context, &[binding()], fact_limited)
+                .await
+                .unwrap_err();
+        assert!(matches!(error, ProviderCollectionError::BoundExceeded));
+    }
+
     struct SlowClient;
 
     #[async_trait]
@@ -1493,6 +1558,17 @@ mod tests {
             ..limits()
         };
         let error = collect_provider_history(&mut client, &context, &[binding()], short_limits)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderCollectionError::Timeout));
+
+        let mut client = SlowClient;
+        let total_limited = CollectionLimits {
+            total_timeout: Duration::from_millis(1),
+            request_timeout: Duration::from_secs(1),
+            ..limits()
+        };
+        let error = collect_provider_history(&mut client, &context, &[binding()], total_limited)
             .await
             .unwrap_err();
         assert!(matches!(error, ProviderCollectionError::Timeout));
