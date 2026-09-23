@@ -177,6 +177,44 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
     assert_eq!(first.outcome, ApplyDisposition::Applied);
     assert!(first.revision > 0);
 
+    let mut changed_allocation = allocation.clone();
+    changed_allocation.provider_item_id = "different_item".into();
+    let mut allocation_conflict = pool.begin().await.unwrap();
+    let allocation_result = apply_verified_event(
+        &mut allocation_conflict,
+        &context,
+        &event,
+        &changed_allocation,
+        &collection,
+    )
+    .await;
+    assert!(matches!(
+        allocation_result,
+        Err(sotto_server::cloud_provider::ProviderAdapterError::AllocationConflict)
+    ));
+    allocation_conflict.rollback().await.unwrap();
+
+    let mut changed_collection = collection.clone();
+    changed_collection.aggregate_evidence_reference = format!("changed-{suffix}");
+    let mut collection_conflict = pool.begin().await.unwrap();
+    let collection_result = apply_verified_event(
+        &mut collection_conflict,
+        &context,
+        &event,
+        &allocation,
+        &changed_collection,
+    )
+    .await;
+    assert!(matches!(
+        collection_result,
+        Err(
+            sotto_server::cloud_provider::ProviderAdapterError::Reconciliation(
+                sotto_server::cloud_coverage_reconciliation::ReconciliationError::OperationConflict
+            )
+        )
+    ));
+    collection_conflict.rollback().await.unwrap();
+
     let mut replay = pool.begin().await.unwrap();
     let second = apply_verified_event(&mut replay, &context, &event, &allocation, &collection)
         .await

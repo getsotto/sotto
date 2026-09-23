@@ -11,8 +11,8 @@ use sqlx::{Postgres, Row, Transaction};
 use thiserror::Error;
 
 use crate::cloud_coverage_reconciliation::{
-    begin_collection, finish_collection, register_source, ReconciliationError, SourceBinding,
-    SourceObservation,
+    begin_collection, finish_collection, register_source, CollectionStatus, ReconciliationError,
+    SourceBinding, SourceObservation,
 };
 use crate::cloud_coverage_store::PublicationOutcome;
 
@@ -426,6 +426,36 @@ pub async fn apply_verified_event(
         let revision: i64 = receipt.try_get("projection_revision")?;
         if allocation_id != allocation.allocation_id || source_id != allocation.source_id {
             return Err(ProviderAdapterError::AllocationConflict);
+        }
+        ensure_payer(tx, context, allocation).await?;
+        ensure_allocation(tx, context, allocation).await?;
+        let binding = SourceBinding {
+            beneficiary_id: allocation.beneficiary_id.clone(),
+            source_id: allocation.source_id.clone(),
+            provider_namespace: context.namespace.clone(),
+            external_allocation_reference: allocation.external_allocation_reference.clone(),
+            ownership_evidence_reference: allocation.ownership_evidence_reference.clone(),
+        };
+        register_source(tx, &format!("provider-event:{}", event.event_id), &binding).await?;
+        let ticket = begin_collection(
+            tx,
+            &allocation.beneficiary_id,
+            &format!("provider-event:{}", event.event_id),
+        )
+        .await?;
+        if ticket.status != CollectionStatus::Completed {
+            return Err(ProviderAdapterError::EventConflict);
+        }
+        let completed = finish_collection(
+            tx,
+            &ticket,
+            &collection.aggregate_evidence_reference,
+            &collection.observations,
+        )
+        .await?;
+        if completed.revision != revision || completed.outcome != PublicationOutcome::AlreadyApplied
+        {
+            return Err(ProviderAdapterError::EventConflict);
         }
         return Ok(ApplyReceipt {
             event_id: event.event_id.clone(),
