@@ -900,7 +900,8 @@ async fn remove_member(
 
     // Every machine token the target created in this org's environments dies too: they saw the
     // raw token and generated the machine keypair, so only revocation evicts them. Personal
-    // (non-org) environments are not ours to revoke and are left untouched.
+    // (non-org) environments are not ours to revoke and are left untouched. Expired tokens are
+    // revoked too (not the active predicate), so "removed member means revoked" has no exceptions.
     let revoked: Vec<(String, String, String)> = sqlx::query_as(
         "UPDATE machine_tokens mt SET revoked_at = now() \
          FROM environments e, projects p \

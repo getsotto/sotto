@@ -764,3 +764,63 @@ async fn rotation_requires_active_tokens_and_tolerates_expired_ones() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
     }
 }
+
+async fn revoked_at(pool: &PgPool, token_id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT revoked_at::text FROM machine_tokens WHERE id = $1")
+        .bind(token_id)
+        .fetch_one(pool)
+        .await
+        .expect("read token")
+}
+
+#[tokio::test]
+async fn admin_can_revoke_an_expired_token() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-revx-o", "mt-revx-p", "mt-revx-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-revx-owner").await;
+    let (token_id, _) = create_token(&pool, &owner, e, b"g").await;
+    expire(&pool, &token_id).await;
+
+    // An expired token is dead but still real: tombstoning it is a deliberate act, not a 404.
+    let revoke_uri = format!("/environments/{e}/tokens/{token_id}");
+    assert_eq!(
+        delete(&pool, &owner, &revoke_uri).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(revoked_at(&pool, &token_id).await.is_some());
+    assert_eq!(
+        delete(&pool, &owner, &revoke_uri).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn member_removal_revokes_their_expired_tokens_too() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-rmx-o", "mt-rmx-p", "mt-rmx-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-rmx-owner").await;
+    let admin = fresh_session(&pool, "mt-rmx-admin", "mt-rmx-admin-s").await;
+    post(
+        &pool,
+        &owner,
+        &format!("/orgs/{o}/members"),
+        member_body("mt-rmx-admin", "admin"),
+    )
+    .await;
+    let (token_id, _) = create_token(&pool, &admin, e, b"g").await;
+    expire(&pool, &token_id).await;
+
+    // "A removed member's tokens are revoked" holds without exceptions: an expired token is
+    // tombstoned as well, whatever expiry does in future.
+    let (status, body) = delete(&pool, &owner, &format!("/orgs/{o}/members/mt-rmx-admin")).await;
+    assert_eq!(status, StatusCode::OK, "remove member: {body}");
+    assert!(
+        body.contains(&token_id),
+        "removal reports the token: {body}"
+    );
+    assert!(revoked_at(&pool, &token_id).await.is_some());
+}

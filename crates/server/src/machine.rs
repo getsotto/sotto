@@ -273,6 +273,8 @@ async fn revoke_token(
             "must be an admin or owner to revoke a machine token",
         )
         .await?;
+    // Not the active predicate: an expired token can still be tombstoned, so an admin who can see
+    // it was real is not told it does not exist.
     let revoked = sqlx::query(
         "UPDATE machine_tokens SET revoked_at = now() \
          WHERE id = $1 AND env_id = $2 AND revoked_at IS NULL",
