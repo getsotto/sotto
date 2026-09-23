@@ -24,6 +24,7 @@ pub mod billing;
 pub mod cloud_coverage;
 pub mod cloud_coverage_reconciliation;
 pub mod cloud_coverage_store;
+pub mod cloud_provider;
 pub mod community;
 pub mod config;
 pub mod db;
