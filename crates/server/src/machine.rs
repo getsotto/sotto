@@ -37,7 +37,10 @@ const PUBLIC_KEY_LEN: usize = 32;
 const MAX_NAME: usize = 128;
 /// Lifetime of a new token, in days. Long enough to cover a quarterly release cycle and act on
 /// the expiry warning, short enough that a forgotten token dies within a quarter.
-const DEFAULT_LIFETIME_DAYS: i32 = 90;
+const DEFAULT_LIFETIME_DAYS: i64 = 90;
+/// Longest lifetime a creator may choose, in days. There is no "never": a token that outlives
+/// everyone's memory of it is the problem expiry exists to solve.
+const MAX_LIFETIME_DAYS: i64 = 365;
 
 /// SQL: the token can still authenticate, meaning not revoked and not yet past its end date.
 /// Every query that means "active" splices in this one fragment (auth, the grant re-read, the
@@ -86,6 +89,10 @@ struct CreateToken {
     public_key: String,
     /// The env vault key sealed to that public key (base64) - the machine's grant.
     enc_vault_key: String,
+    /// Lifetime in days, 1 to `MAX_LIFETIME_DAYS`; `DEFAULT_LIFETIME_DAYS` when omitted, so older
+    /// clients that never send it still get tokens that expire.
+    #[serde(default)]
+    expires_in_days: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -93,6 +100,8 @@ struct CreatedToken {
     token_id: String,
     /// The raw API token, shown exactly once. Only its hash is stored.
     token: String,
+    /// When the token stops authenticating (UTC, RFC 3339).
+    expires_at: String,
 }
 
 #[derive(Serialize)]
@@ -139,6 +148,12 @@ async fn create_token(
         )));
     }
     let enc_vault_key = encoding::decode(&body.enc_vault_key, "enc_vault_key", MAX_ENC_KEY)?;
+    let lifetime_days = body.expires_in_days.unwrap_or(DEFAULT_LIFETIME_DAYS);
+    if !(1..=MAX_LIFETIME_DAYS).contains(&lifetime_days) {
+        return Err(Error::BadRequest(format!(
+            "expires_in_days must be between 1 and {MAX_LIFETIME_DAYS}"
+        )));
+    }
 
     let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
     access.require_manage_structure("must be an admin or owner to create a machine token")?;
@@ -155,10 +170,11 @@ async fn create_token(
         )
         .await?;
     // The end date comes from the database clock, the same one every expiry check reads.
-    sqlx::query(
+    let expires_at: String = sqlx::query_scalar(
         "INSERT INTO machine_tokens \
          (id, env_id, name, token_hash, public_key, enc_vault_key, created_by, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(days => $8))",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(days => $8::int)) \
+         RETURNING to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')",
     )
     .bind(&token_id)
     .bind(&env_id)
@@ -167,8 +183,8 @@ async fn create_token(
     .bind(&public_key)
     .bind(&enc_vault_key)
     .bind(&user.user_id)
-    .bind(DEFAULT_LIFETIME_DAYS)
-    .execute(&mut *tx)
+    .bind(lifetime_days)
+    .fetch_one(&mut *tx)
     .await?;
     // Personal environments have no org, hence no audit log to write to.
     if let Some(org) = &audit_org {
@@ -187,7 +203,14 @@ async fn create_token(
     }
     tx.commit().await?;
 
-    Ok((StatusCode::CREATED, Json(CreatedToken { token_id, token })))
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedToken {
+            token_id,
+            token,
+            expires_at,
+        }),
+    ))
 }
 
 /// `GET /environments/{env_id}/tokens` - the environment's *active* machine tokens (admin+), so

@@ -628,3 +628,56 @@ async fn creation_defaults_to_ninety_days() {
     .expect("lifetime");
     assert!(exact, "default lifetime is exactly 90 days from creation");
 }
+
+fn token_body_with_lifetime(days: &str) -> String {
+    format!(
+        r#"{{"name":"ci","public_key":"{}","enc_vault_key":"{}","expires_in_days":{days}}}"#,
+        b64(&[0xAB; 32]),
+        b64(b"g"),
+    )
+}
+
+#[tokio::test]
+async fn creation_accepts_custom_lifetime_and_rejects_out_of_range() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-life-o", "mt-life-p", "mt-life-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-life-owner").await;
+    let tokens_uri = format!("/environments/{e}/tokens");
+
+    // Both ends of the range are accepted, and the response carries the stored end date so the
+    // creator sees it next to the one-time token.
+    for days in [1, 365] {
+        let (status, body) = post(
+            &pool,
+            &owner,
+            &tokens_uri,
+            token_body_with_lifetime(&days.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{days} days: {body}");
+        let created: Value = serde_json::from_str(&body).expect("json");
+        let token_id = created["token_id"].as_str().expect("token_id");
+        let (exact, stored): (bool, String) = sqlx::query_as(
+            "SELECT expires_at - created_at = make_interval(days => $2), \
+                    to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+             FROM machine_tokens WHERE id = $1",
+        )
+        .bind(token_id)
+        .bind(days)
+        .fetch_one(&pool)
+        .await
+        .expect("stored expiry");
+        assert!(exact, "{days}-day lifetime stored exactly");
+        assert_eq!(created["expires_at"].as_str(), Some(stored.as_str()));
+    }
+
+    // Outside 1-365 is refused before anything is written.
+    for days in ["0", "366", "-1"] {
+        let (status, body) = post(&pool, &owner, &tokens_uri, token_body_with_lifetime(days)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{days} days: {body}");
+        assert!(body.contains("between 1 and 365"), "{body}");
+    }
+    assert_eq!(listed(&pool, &owner, &tokens_uri).await.len(), 2);
+}
