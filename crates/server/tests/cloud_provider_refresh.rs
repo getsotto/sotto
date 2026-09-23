@@ -681,6 +681,94 @@ async fn newer_source_registration_supersedes_paused_refresh_and_retries_complet
 }
 
 #[tokio::test]
+async fn competing_refreshes_use_distinct_runs_and_only_newest_applies() {
+    let Some(pool) = pool_or_skip(8).await else {
+        return;
+    };
+    let (fixture, event, allocation) = fixture(&pool).await;
+    record_event(&pool, &event).await;
+    let context = context();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut old_client = ScriptedClient {
+        action: ClientAction::Block {
+            entered: entered.clone(),
+            release: release.clone(),
+            page: page(&context, &fixture.source_id),
+        },
+    };
+    let old_pool = pool.clone();
+    let old_context = context.clone();
+    let old_event = event.clone();
+    let old_allocation = allocation.clone();
+    let entered_wait = entered.notified();
+    let old_task = tokio::spawn(async move {
+        refresh_verified_event(
+            &old_pool,
+            &mut old_client,
+            &old_context,
+            &old_event,
+            &old_allocation,
+            CollectionLimits::default(),
+        )
+        .await
+    });
+    timeout(Duration::from_secs(5), entered_wait)
+        .await
+        .expect("old provider request entered");
+
+    let mut new_client = ScriptedClient {
+        action: ClientAction::Page(page(&context, &fixture.source_id)),
+    };
+    let new_pool = pool.clone();
+    let new_context = context.clone();
+    let new_event = event.clone();
+    let new_allocation = allocation.clone();
+    let new_task = tokio::spawn(async move {
+        refresh_verified_event(
+            &new_pool,
+            &mut new_client,
+            &new_context,
+            &new_event,
+            &new_allocation,
+            CollectionLimits::default(),
+        )
+        .await
+    });
+    let newest = timeout(Duration::from_secs(5), new_task)
+        .await
+        .expect("new refresh completes")
+        .expect("new refresh joins")
+        .expect("new refresh applies");
+    assert_eq!(
+        newest.outcome,
+        sotto_server::cloud_provider::ApplyDisposition::Applied
+    );
+    release.notify_waiters();
+    let stale = timeout(Duration::from_secs(5), old_task)
+        .await
+        .expect("old refresh completes")
+        .expect("old refresh joins");
+    assert!(matches!(
+        stale,
+        Err(ProviderRefreshError::Completion(
+            sotto_server::cloud_provider::ProviderAdapterError::CollectionSuperseded
+                | sotto_server::cloud_provider::ProviderAdapterError::EventNotPending
+        ))
+    ));
+    let attempt_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_coverage_collection_attempts WHERE beneficiary_id = $1",
+    )
+    .bind(&fixture.beneficiary_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read competing attempts");
+    assert_eq!(attempt_count, 2);
+
+    cleanup(&pool, &fixture).await;
+}
+
+#[tokio::test]
 async fn blocked_provider_fetch_releases_a_one_connection_pool() {
     let Some(pool) = pool_or_skip(1).await else {
         return;
