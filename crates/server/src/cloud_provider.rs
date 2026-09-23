@@ -398,6 +398,8 @@ pub enum ProviderAdapterError {
     IncompleteCollection,
     #[error("provider collection attempt was superseded")]
     CollectionSuperseded,
+    #[error("provider source is not mapped to the requested account and environment")]
+    ProviderContextMismatch,
     #[error("provider event is missing")]
     EventMissing,
 }
@@ -499,19 +501,7 @@ pub async fn reject_verified_event(
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(ProviderAdapterError::EventMissing)?;
-    let stored_hash: String = receipt.try_get("normalized_payload_hash")?;
-    let stored_type: String = receipt.try_get("event_type")?;
-    let stored_created: i64 = receipt.try_get("provider_created_at")?;
-    let stored_subscription: Option<String> = receipt.try_get("subscription_id")?;
-    let stored_allocation: Option<String> = receipt.try_get("allocation_reference")?;
-    if stored_hash != event.normalized_payload_hash
-        || stored_type != event.event_type
-        || stored_created != event.provider_created_at
-        || stored_subscription != event.subscription_id
-        || stored_allocation != event.allocation_reference
-    {
-        return Err(ProviderAdapterError::EventConflict);
-    }
+    verify_stored_event(&receipt, event)?;
     let status: String = receipt.try_get("status")?;
     match status.as_str() {
         "pending" => {
@@ -765,9 +755,16 @@ pub async fn prepare_verified_event(
     )
     .await?;
     let ticket = begin_collection(tx, &allocation.beneficiary_id, &attempt_id).await?;
-    if ticket.status != crate::cloud_coverage_reconciliation::CollectionStatus::Pending {
-        return Err(ProviderAdapterError::EventConflict);
+    match ticket.status {
+        CollectionStatus::Pending => {}
+        CollectionStatus::Superseded => {
+            return Err(ProviderAdapterError::CollectionSuperseded);
+        }
+        CollectionStatus::Completed => {
+            return Err(ProviderAdapterError::EventConflict);
+        }
     }
+    validate_provider_bindings(tx, context, &ticket.source_bindings).await?;
     let updated = sqlx::query(
         "UPDATE cloud_provider_event_receipts SET collection_beneficiary_id = $5, \
                 collection_attempt_id = $6, collection_run_id = $7 \
@@ -844,6 +841,7 @@ pub async fn complete_verified_event(
     }
     ensure_payer(tx, context, allocation).await?;
     ensure_allocation(tx, context, allocation).await?;
+    validate_provider_bindings(tx, context, &preparation.ticket.source_bindings).await?;
     validate_collection_sources(collection, &preparation.ticket.source_bindings)?;
     let completed = finish_collection(
         tx,
@@ -918,19 +916,7 @@ pub async fn replay_verified_event(
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(ProviderAdapterError::EventMissing)?;
-    let stored_hash: String = receipt.try_get("normalized_payload_hash")?;
-    let stored_type: String = receipt.try_get("event_type")?;
-    let stored_created: i64 = receipt.try_get("provider_created_at")?;
-    let stored_subscription: Option<String> = receipt.try_get("subscription_id")?;
-    let stored_allocation: Option<String> = receipt.try_get("allocation_reference")?;
-    if stored_hash != event.normalized_payload_hash
-        || stored_type != event.event_type
-        || stored_created != event.provider_created_at
-        || stored_subscription != event.subscription_id
-        || stored_allocation != event.allocation_reference
-    {
-        return Err(ProviderAdapterError::EventConflict);
-    }
+    verify_stored_event(&receipt, event)?;
     let status: String = receipt.try_get("status")?;
     if status != "applied" {
         return Err(ProviderAdapterError::EventNotPending);
@@ -1170,6 +1156,37 @@ fn source_binding(context: &ProviderContext, allocation: &VerifiedAllocation) ->
         external_allocation_reference: allocation.external_allocation_reference.clone(),
         ownership_evidence_reference: allocation.ownership_evidence_reference.clone(),
     }
+}
+
+async fn validate_provider_bindings(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    bindings: &[SourceBinding],
+) -> Result<(), ProviderAdapterError> {
+    for binding in bindings {
+        if binding.provider_namespace != context.namespace {
+            return Err(ProviderAdapterError::ProviderContextMismatch);
+        }
+        let row = sqlx::query(
+            "SELECT beneficiary_id, provider_namespace, provider_account_id, \
+                    provider_environment, external_allocation_reference \
+             FROM cloud_provider_allocations WHERE coverage_source_id = $1",
+        )
+        .bind(&binding.source_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(ProviderAdapterError::ProviderContextMismatch)?;
+        let matches = row.try_get::<String, _>("beneficiary_id")? == binding.beneficiary_id
+            && row.try_get::<String, _>("provider_namespace")? == context.namespace
+            && row.try_get::<String, _>("provider_account_id")? == context.account_id
+            && row.try_get::<String, _>("provider_environment")? == context.environment.as_str()
+            && row.try_get::<String, _>("external_allocation_reference")?
+                == binding.external_allocation_reference;
+        if !matches {
+            return Err(ProviderAdapterError::ProviderContextMismatch);
+        }
+    }
+    Ok(())
 }
 
 fn verify_stored_event(

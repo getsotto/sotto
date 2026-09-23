@@ -41,6 +41,10 @@ fn context() -> ProviderContext {
     ProviderContext::new("stripe", "acct_test_sotto", ProviderEnvironment::Test).unwrap()
 }
 
+fn live_context() -> ProviderContext {
+    ProviderContext::new("stripe", "acct_live_sotto", ProviderEnvironment::Live).unwrap()
+}
+
 fn event(id: &str) -> VerifiedProviderEvent {
     VerifiedProviderEvent::from_payload(
         id,
@@ -518,6 +522,180 @@ async fn applying_verified_event_commits_allocation_and_projection_once() {
 }
 
 #[tokio::test]
+async fn preparation_rejects_sources_from_another_provider_context() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let test_context = context();
+    let live_context = live_context();
+    let suffix = Uuid::new_v4().to_string();
+    let beneficiary_id = format!("provider-context-test-{suffix}");
+    let test_payer_id = format!("provider-context-test-payer-{suffix}");
+    let live_payer_id = format!("provider-context-live-payer-{suffix}");
+    let test_allocation_id = format!("provider-context-test-allocation-{suffix}");
+    let live_allocation_id = format!("provider-context-live-allocation-{suffix}");
+    let test_source_id = format!("provider-context-test-source-{suffix}");
+    let live_source_id = format!("provider-context-live-source-{suffix}");
+    let test_event_id = format!("provider-context-test-event-{suffix}");
+    let live_event_id = format!("provider-context-live-event-{suffix}");
+    let test_subscription = format!("provider-context-test-subscription-{suffix}");
+    let live_subscription = format!("provider-context-live-subscription-{suffix}");
+    let test_external = format!("provider-context-test-external-{suffix}");
+    let live_external = format!("provider-context-live-external-{suffix}");
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'cloud-provider-test', $1)",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let test_event = VerifiedProviderEvent::from_payload(
+        &test_event_id,
+        "invoice.paid",
+        1_700_000_200,
+        Some(test_subscription.clone()),
+        Some(test_external.clone()),
+        br#"{"status":"paid","environment":"test"}"#,
+    )
+    .unwrap();
+    let live_event = VerifiedProviderEvent::from_payload(
+        &live_event_id,
+        "invoice.paid",
+        1_700_000_201,
+        Some(live_subscription.clone()),
+        Some(live_external.clone()),
+        br#"{"status":"paid","environment":"live"}"#,
+    )
+    .unwrap();
+    let test_allocation = VerifiedAllocation::new(
+        &test_allocation_id,
+        &test_payer_id,
+        format!("provider-context-test-customer-{suffix}"),
+        PayerKind::Personal,
+        &beneficiary_id,
+        &test_subscription,
+        "price_cloud",
+        &test_external,
+        &test_source_id,
+        0,
+        None,
+        AllocationState::Active,
+        format!("provider-context-test-ownership-{suffix}"),
+    )
+    .unwrap();
+    let live_allocation = VerifiedAllocation::new(
+        &live_allocation_id,
+        &live_payer_id,
+        format!("provider-context-live-customer-{suffix}"),
+        PayerKind::Personal,
+        &beneficiary_id,
+        &live_subscription,
+        "price_cloud",
+        &live_external,
+        &live_source_id,
+        0,
+        None,
+        AllocationState::Active,
+        format!("provider-context-live-ownership-{suffix}"),
+    )
+    .unwrap();
+    for (context, event) in [(&test_context, &test_event), (&live_context, &live_event)] {
+        let mut tx = pool.begin().await.unwrap();
+        record_verified_event(&mut tx, context, event)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let mut prepare_test = pool.begin().await.unwrap();
+    prepare_verified_event(
+        &mut prepare_test,
+        &test_context,
+        &test_event,
+        &test_allocation,
+        "test-run",
+    )
+    .await
+    .unwrap();
+    prepare_test.commit().await.unwrap();
+
+    let mut prepare_live = pool.begin().await.unwrap();
+    let result = prepare_verified_event(
+        &mut prepare_live,
+        &live_context,
+        &live_event,
+        &live_allocation,
+        "live-run",
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(sotto_server::cloud_provider::ProviderAdapterError::ProviderContextMismatch)
+    ));
+    prepare_live.rollback().await.unwrap();
+
+    for event_id in [&test_event_id, &live_event_id] {
+        sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+            .bind(event_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
+        .bind(&test_allocation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_revision_facts WHERE beneficiary_id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL WHERE beneficiary_id = $1",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for table in [
+        "cloud_coverage_collection_attempts",
+        "cloud_coverage_sources",
+        "cloud_coverage_coordinators",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(&beneficiary_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "UPDATE cloud_coverage_heads SET current_revision = NULL WHERE beneficiary_id = $1",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for table in ["cloud_coverage_revisions", "cloud_coverage_heads"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE beneficiary_id = $1"))
+            .bind(&beneficiary_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_id = $1")
+        .bind(&test_payer_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn prepared_attempt_is_completed_after_external_collection() {
     let Some(pool) = pool_or_skip().await else {
         return;
@@ -531,6 +709,12 @@ async fn prepared_attempt_is_completed_after_external_collection() {
     let event_id = format!("prepared-event-{suffix}");
     let subscription_id = format!("prepared-subscription-{suffix}");
     let external_reference = format!("prepared-external-{suffix}");
+    let second_payer_id = format!("prepared-second-payer-{suffix}");
+    let second_allocation_id = format!("prepared-second-allocation-{suffix}");
+    let second_source_id = format!("prepared-second-source-{suffix}");
+    let second_event_id = format!("prepared-second-event-{suffix}");
+    let second_subscription_id = format!("prepared-second-subscription-{suffix}");
+    let second_external_reference = format!("prepared-second-external-{suffix}");
     sqlx::query(
         "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'cloud-provider-test', $1)",
     )
@@ -577,11 +761,58 @@ async fn prepared_attempt_is_completed_after_external_collection() {
             }],
         }],
     };
+    let second_event = VerifiedProviderEvent::from_payload(
+        &second_event_id,
+        "invoice.paid",
+        1_700_000_101,
+        Some(second_subscription_id.clone()),
+        Some(second_external_reference.clone()),
+        br#"{"status":"paid","source":2}"#,
+    )
+    .unwrap();
+    let second_allocation = VerifiedAllocation::new(
+        &second_allocation_id,
+        &second_payer_id,
+        format!("prepared-second-customer-{suffix}"),
+        PayerKind::Personal,
+        &beneficiary_id,
+        &second_subscription_id,
+        "price_cloud",
+        &second_external_reference,
+        &second_source_id,
+        0,
+        None,
+        AllocationState::Active,
+        format!("prepared-second-ownership-{suffix}"),
+    )
+    .unwrap();
+    let second_collection = VerifiedCollection {
+        aggregate_evidence_reference: format!("prepared-second-aggregate-{suffix}"),
+        observations: vec![
+            collection.observations[0].clone(),
+            SourceObservation::Complete {
+                source_id: second_source_id.clone(),
+                evidence_reference: format!("prepared-second-evidence-{suffix}"),
+                paid_intervals: vec![ConfirmedPaidInterval {
+                    coverage_id: format!("prepared-second-coverage-{suffix}"),
+                    source_id: second_source_id.clone(),
+                    starts_at: 0,
+                    paid_until: 100,
+                    failed_renewal_id: None,
+                }],
+            },
+        ],
+    };
     let mut record = pool.begin().await.unwrap();
     record_verified_event(&mut record, &context, &event)
         .await
         .unwrap();
     record.commit().await.unwrap();
+    let mut record_second = pool.begin().await.unwrap();
+    record_verified_event(&mut record_second, &context, &second_event)
+        .await
+        .unwrap();
+    record_second.commit().await.unwrap();
 
     let mut prepare = pool.begin().await.unwrap();
     let preparation = prepare_verified_event(&mut prepare, &context, &event, &allocation, "run-1")
@@ -602,13 +833,22 @@ async fn prepared_attempt_is_completed_after_external_collection() {
     let superseding = prepare_verified_event(
         &mut superseding_prepare,
         &context,
-        &event,
-        &allocation,
+        &second_event,
+        &second_allocation,
         "run-2",
     )
     .await
     .unwrap();
     superseding_prepare.commit().await.unwrap();
+
+    let mut stale_prepare = pool.begin().await.unwrap();
+    let stale_preparation =
+        prepare_verified_event(&mut stale_prepare, &context, &event, &allocation, "run-1").await;
+    assert!(matches!(
+        stale_preparation,
+        Err(sotto_server::cloud_provider::ProviderAdapterError::CollectionSuperseded)
+    ));
+    stale_prepare.rollback().await.unwrap();
 
     let mut stale_complete = pool.begin().await.unwrap();
     let stale_result = complete_verified_event(
@@ -630,10 +870,10 @@ async fn prepared_attempt_is_completed_after_external_collection() {
     let receipt = complete_verified_event(
         &mut complete,
         &context,
-        &event,
-        &allocation,
+        &second_event,
+        &second_allocation,
         &superseding,
-        &collection,
+        &second_collection,
     )
     .await
     .unwrap();
@@ -645,8 +885,18 @@ async fn prepared_attempt_is_completed_after_external_collection() {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
+        .bind(&second_event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
         .bind(&allocation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
+        .bind(&second_allocation_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -689,6 +939,11 @@ async fn prepared_attempt_is_completed_after_external_collection() {
     }
     sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_id = $1")
         .bind(&payer_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_id = $1")
+        .bind(&second_payer_id)
         .execute(&pool)
         .await
         .unwrap();
