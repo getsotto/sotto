@@ -636,6 +636,9 @@ async fn collect_provider_history_inner<C: ProviderHistoryClient + ?Sized>(
             if page.paid_intervals.is_empty() && page.next_cursor.is_some() {
                 return Err(ProviderCollectionError::MissingEnd);
             }
+            if page.evidence_reference.len() > limits.max_evidence_bytes {
+                return Err(ProviderCollectionError::BoundExceeded);
+            }
             fact_count += page.paid_intervals.len();
             total_fact_count += page.paid_intervals.len();
             if fact_count > limits.max_facts || total_fact_count > limits.max_facts {
@@ -643,6 +646,11 @@ async fn collect_provider_history_inner<C: ProviderHistoryClient + ?Sized>(
             }
             intervals.extend(page.paid_intervals);
             evidence_references.push(page.evidence_reference);
+            let evidence_material = serde_json::to_vec(&evidence_references)
+                .map_err(|error| ProviderCollectionError::InvalidEvidence(error.to_string()))?;
+            if evidence_material.len() > limits.max_evidence_bytes {
+                return Err(ProviderCollectionError::BoundExceeded);
+            }
             match (page.authoritative_end, page.next_cursor) {
                 (true, None) => break,
                 (true, Some(_)) => return Err(ProviderCollectionError::MissingEnd),
@@ -1407,6 +1415,26 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ProviderCollectionError::ContextMismatch));
+    }
+
+    #[tokio::test]
+    async fn rejects_evidence_references_over_the_configured_bound() {
+        let context =
+            ProviderContext::new("stripe", "acct_test", ProviderEnvironment::Test).unwrap();
+        let mut oversized = page(&context, "evidence_1", 10, None, true);
+        oversized.evidence_reference = "x".repeat(32);
+        let mut client = FakeClient {
+            pages: vec![oversized],
+            index: 0,
+        };
+        let bounded = CollectionLimits {
+            max_evidence_bytes: 8,
+            ..limits()
+        };
+        let error = collect_provider_history(&mut client, &context, &[binding()], bounded)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderCollectionError::BoundExceeded));
     }
 
     struct SlowClient;
