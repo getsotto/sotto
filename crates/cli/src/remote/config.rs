@@ -169,6 +169,18 @@ mod tests {
             Some("https://b".into())
         );
         assert_eq!(
+            resolve(
+                None,
+                Some("  https://b.example///  ".into()),
+                Some("https://c".into())
+            ),
+            Some("https://b.example".into())
+        );
+        assert_eq!(
+            resolve(None, Some("   ".into()), Some("https://c/".into())),
+            Some("https://c".into())
+        );
+        assert_eq!(
             resolve(None, None, Some("https://c".into())),
             Some("https://c".into())
         );

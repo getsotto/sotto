@@ -1705,9 +1705,6 @@ fn export_with_entries(
 /// config written by `sotto login`. Deliberately no hosted-instance fallback - a token must only
 /// ever be sent to a server someone explicitly named.
 fn machine_server_url() -> Result<String> {
-    if let Ok(server) = std::env::var("SOTTO_SERVER") {
-        return Ok(server.trim_end_matches('/').to_string());
-    }
     let config_path = sotto_cli::paths::config_path()?;
     remote::config::explicit_server_url(None, &config_path)?
         .ok_or_else(|| Error::Input("set SOTTO_SERVER to your sync server URL".into()))
