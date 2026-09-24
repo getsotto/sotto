@@ -111,56 +111,59 @@ fn omitted_arguments_in_non_interactive_mode_fail_with_clear_error() {
         String::from_utf8_lossy(&init_out.stderr)
     );
 
-    // sotto get without name in non-interactive session
-    let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+    // Lock session so that unlocking is required if not preflighted.
+    let lock_out = Command::new(env!("CARGO_BIN_EXE_sotto"))
         .current_dir(scratch.path())
-        .args(["get"])
+        .args(["lock"])
         .env("SOTTO_DATA_DIR", &data_dir)
-        .env("SOTTO_PASSWORD", "test-password-123")
         .env_remove("SOTTO_TOKEN")
         .env_remove("SOTTO_THEME")
         .output()
-        .expect("run sotto");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
-    assert!(
-        stderr.contains("missing required argument <NAME>"),
-        "get without arg stderr: {stderr}"
-    );
+        .expect("run sotto lock");
+    assert!(lock_out.status.success());
 
-    // sotto rm without name in non-interactive session
-    let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
-        .current_dir(scratch.path())
-        .args(["rm"])
-        .env("SOTTO_DATA_DIR", &data_dir)
-        .env("SOTTO_PASSWORD", "test-password-123")
-        .env_remove("SOTTO_TOKEN")
-        .env_remove("SOTTO_THEME")
-        .output()
-        .expect("run sotto");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
-    assert!(
-        stderr.contains("missing required argument <NAME>"),
-        "rm without arg stderr: {stderr}"
-    );
+    // When session is locked and SOTTO_PASSWORD is unset, omitted secret name
+    // must fail fast with missing-argument error without prompting for master password on stdin.
+    for cmd in ["get", "rm", "share"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+            .current_dir(scratch.path())
+            .args([cmd])
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env_remove("SOTTO_PASSWORD")
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .output()
+            .expect("run sotto");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+        assert!(
+            stderr.contains("missing required argument <NAME>"),
+            "stderr for {cmd} should mention missing argument: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Master password:"),
+            "stderr for {cmd} should not attempt to prompt for master password: {stderr}"
+        );
+    }
 
-    // sotto share without name in non-interactive session
-    let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
-        .current_dir(scratch.path())
-        .args(["share"])
-        .env("SOTTO_DATA_DIR", &data_dir)
-        .env("SOTTO_PASSWORD", "test-password-123")
-        .env_remove("SOTTO_TOKEN")
-        .env_remove("SOTTO_THEME")
-        .output()
-        .expect("run sotto");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
-    assert!(
-        stderr.contains("missing required argument <NAME>"),
-        "share without arg stderr: {stderr}"
-    );
+    // Even with password supplied, non-interactive omitted arguments still fail with clear error.
+    for cmd in ["get", "rm", "share"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+            .current_dir(scratch.path())
+            .args([cmd])
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("SOTTO_PASSWORD", "test-password-123")
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .output()
+            .expect("run sotto");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+        assert!(
+            stderr.contains("missing required argument <NAME>"),
+            "stderr for {cmd} with password should mention missing argument: {stderr}"
+        );
+    }
 
     // sotto env use without name in non-interactive session
     let output = Command::new(env!("CARGO_BIN_EXE_sotto"))

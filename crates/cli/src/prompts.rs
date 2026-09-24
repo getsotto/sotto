@@ -33,13 +33,20 @@ pub fn can_prompt() -> bool {
     )
 }
 
-/// Prompt the user to select a secret name from the active environment.
-pub fn select_secret_key(app: &App, config: &Config, theme: &Theme) -> Result<String> {
-    if !can_prompt() {
+/// Preflight check for commands requiring a secret name: if omitted and prompting is disabled,
+/// fail immediately without triggering unlock prompts.
+pub fn preflight_secret_name(name: Option<&str>) -> Result<()> {
+    if name.is_none() && !can_prompt() {
         return Err(Error::Input(
             "missing required argument <NAME>; provide a secret name or run in an interactive terminal".into(),
         ));
     }
+    Ok(())
+}
+
+/// Prompt the user to select a secret name from the active environment.
+pub fn select_secret_key(app: &App, config: &Config, theme: &Theme) -> Result<String> {
+    preflight_secret_name(None)?;
 
     let names = app.list(config)?;
     if names.is_empty() {
@@ -128,5 +135,20 @@ mod tests {
         assert!(!allowed(false, false, false, false, false, true, true));
         assert!(!allowed(false, false, false, false, true, false, true));
         assert!(!allowed(false, false, false, false, true, true, false));
+    }
+
+    #[test]
+    fn preflight_secret_name_accepts_present_name() {
+        assert!(preflight_secret_name(Some("DATABASE_URL")).is_ok());
+    }
+
+    #[test]
+    fn preflight_secret_name_rejects_missing_name_in_non_interactive_env() {
+        if !can_prompt() {
+            assert!(matches!(
+                preflight_secret_name(None),
+                Err(Error::Input(msg)) if msg.contains("missing required argument <NAME>")
+            ));
+        }
     }
 }

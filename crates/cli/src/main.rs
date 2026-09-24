@@ -490,6 +490,7 @@ fn run() -> Result<()> {
             copy,
             no_copy,
         } => {
+            prompts::preflight_secret_name(name.as_deref())?;
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
             let name = match name {
@@ -562,6 +563,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Get { name, reveal, copy } => {
+            prompts::preflight_secret_name(name.as_deref())?;
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
             let name = match name {
@@ -596,6 +598,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Rm { name, yes } => {
+            prompts::preflight_secret_name(name.as_deref())?;
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
             let name = match name {
