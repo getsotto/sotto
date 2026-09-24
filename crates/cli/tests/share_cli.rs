@@ -89,3 +89,93 @@ fn invalid_rollback_versions_are_rejected_before_local_setup() {
         "positive control: {stderr}"
     );
 }
+
+#[test]
+fn omitted_arguments_in_non_interactive_mode_fail_with_clear_error() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let data_dir = scratch.path().join("sotto-data");
+
+    // Initialize a project with a valid identity so config and store exist.
+    let init_out = Command::new(env!("CARGO_BIN_EXE_sotto"))
+        .current_dir(scratch.path())
+        .args(["init", "--name", "test-project"])
+        .env("SOTTO_DATA_DIR", &data_dir)
+        .env("SOTTO_PASSWORD", "test-password-123")
+        .env_remove("SOTTO_TOKEN")
+        .env_remove("SOTTO_THEME")
+        .output()
+        .expect("run sotto init");
+    assert!(
+        init_out.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    // sotto get without name in non-interactive session
+    let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+        .current_dir(scratch.path())
+        .args(["get"])
+        .env("SOTTO_DATA_DIR", &data_dir)
+        .env("SOTTO_PASSWORD", "test-password-123")
+        .env_remove("SOTTO_TOKEN")
+        .env_remove("SOTTO_THEME")
+        .output()
+        .expect("run sotto");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(
+        stderr.contains("missing required argument <NAME>"),
+        "get without arg stderr: {stderr}"
+    );
+
+    // sotto rm without name in non-interactive session
+    let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+        .current_dir(scratch.path())
+        .args(["rm"])
+        .env("SOTTO_DATA_DIR", &data_dir)
+        .env("SOTTO_PASSWORD", "test-password-123")
+        .env_remove("SOTTO_TOKEN")
+        .env_remove("SOTTO_THEME")
+        .output()
+        .expect("run sotto");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(
+        stderr.contains("missing required argument <NAME>"),
+        "rm without arg stderr: {stderr}"
+    );
+
+    // sotto share without name in non-interactive session
+    let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+        .current_dir(scratch.path())
+        .args(["share"])
+        .env("SOTTO_DATA_DIR", &data_dir)
+        .env("SOTTO_PASSWORD", "test-password-123")
+        .env_remove("SOTTO_TOKEN")
+        .env_remove("SOTTO_THEME")
+        .output()
+        .expect("run sotto");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(
+        stderr.contains("missing required argument <NAME>"),
+        "share without arg stderr: {stderr}"
+    );
+
+    // sotto env use without name in non-interactive session
+    let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+        .current_dir(scratch.path())
+        .args(["env", "use"])
+        .env("SOTTO_DATA_DIR", &data_dir)
+        .env("SOTTO_PASSWORD", "test-password-123")
+        .env_remove("SOTTO_TOKEN")
+        .env_remove("SOTTO_THEME")
+        .output()
+        .expect("run sotto");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(
+        stderr.contains("missing required argument <NAME>"),
+        "env use without arg stderr: {stderr}"
+    );
+}
