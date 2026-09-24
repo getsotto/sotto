@@ -22,6 +22,7 @@ pub mod export;
 pub mod feedback;
 pub mod keychain;
 pub mod paths;
+pub mod prompts;
 pub mod remote;
 pub mod session;
 pub mod store;

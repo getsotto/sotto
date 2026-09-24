@@ -80,12 +80,17 @@ pub enum Error {
     /// Invalid user input (bad arguments, mismatched passwords, or unsafe output).
     #[error("{0}")]
     Input(String),
+
+    /// A missing required command-line argument in non-interactive mode.
+    #[error("{0}")]
+    MissingArgument(String),
 }
 
 impl Error {
     /// The process exit code for this error (CLI spec §8).
     pub fn exit_code(&self) -> i32 {
         match self {
+            Error::MissingArgument(_) => 2,
             Error::NotFound(_) | Error::NoConfig(_) => 3,
             Error::Locked | Error::Crypto | Error::NoIdentity => 4,
             Error::Store(_) | Error::Io(_) | Error::Keychain(_) => 5,
