@@ -337,6 +337,45 @@ async fn rejects_wrong_account_mode_redirect_and_invalid_pagination() {
             .await,
         Err(StripeReadError::InvalidPagination(_))
     ));
+
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(
+            vec![json!({
+                "id":"in_1","customer":"cus_1","subscription":"sub_other"
+            })],
+            false,
+        ))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .subscription_invoices(&mut session, "sub_1", Some("cus_1"))
+            .await,
+        Err(StripeReadError::ContextMismatch)
+    ));
+
+    let mut responses = HashMap::new();
+    responses.insert(
+        "/v1/account".into(),
+        vec![MockResponse::status(
+            StatusCode::FORBIDDEN,
+            "permission denied",
+        )],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client.account(&mut session).await,
+        Err(StripeReadError::Permission { status: 403 })
+    ));
 }
 
 #[tokio::test]

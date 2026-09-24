@@ -88,6 +88,8 @@ pub enum StripeReadError {
     ContextMismatch,
     #[error("Stripe authentication failed with status {status}")]
     Authentication { status: u16 },
+    #[error("Stripe permission was denied with status {status}")]
+    Permission { status: u16 },
     #[error("Stripe resource was not found")]
     ResourceMissing,
     #[error("Stripe rate limit was reached")]
@@ -327,6 +329,21 @@ impl StripeReadClient {
             .list(session, "v1/invoices", query, parse_invoice)
             .await?;
         for invoice in &invoices {
+            if invoice
+                .subscription_id
+                .as_deref()
+                .is_some_and(|id| id != subscription_id)
+            {
+                return Err(StripeReadError::ContextMismatch);
+            }
+            if customer_id.is_some_and(|customer_id| {
+                invoice
+                    .customer_id
+                    .as_deref()
+                    .is_some_and(|id| id != customer_id)
+            }) {
+                return Err(StripeReadError::ContextMismatch);
+            }
             validate_mode(invoice.livemode, self.environment)?;
         }
         Ok(invoices)
@@ -442,7 +459,7 @@ impl StripeReadClient {
         loop {
             let remaining = session.remaining()?;
             let request = self.execute_once(session, &method, path, query);
-            let result = timeout(remaining, request).await;
+            let result = timeout(remaining.min(self.limits.request_timeout), request).await;
             let result = match result {
                 Ok(result) => result,
                 Err(_) => Err(StripeReadError::Timeout),
@@ -527,7 +544,8 @@ impl StripeReadClient {
         if !(200..300).contains(&status) {
             return Err(match status {
                 300..=399 => StripeReadError::RedirectRejected,
-                401 | 403 => StripeReadError::Authentication { status },
+                401 => StripeReadError::Authentication { status },
+                403 => StripeReadError::Permission { status },
                 404 => StripeReadError::ResourceMissing,
                 429 => StripeReadError::RateLimited { retry_after },
                 500..=599 => StripeReadError::Retryable { status },
@@ -681,7 +699,7 @@ impl StripeInvoicePaymentResource {
 fn parse_subscription(value: &Value) -> Result<StripeSubscriptionResource, StripeReadError> {
     Ok(StripeSubscriptionResource {
         id: required_id(value, "subscription.id")?,
-        customer_id: optional_ref(value.get("customer")),
+        customer_id: optional_validated_ref(value.get("customer"), "subscription.customer")?,
         status: value
             .get("status")
             .and_then(Value::as_str)
@@ -693,8 +711,8 @@ fn parse_subscription(value: &Value) -> Result<StripeSubscriptionResource, Strip
 fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError> {
     Ok(StripeInvoiceResource {
         id: required_id(value, "invoice.id")?,
-        customer_id: optional_ref(value.get("customer")),
-        subscription_id: optional_ref(value.get("subscription")),
+        customer_id: optional_validated_ref(value.get("customer"), "invoice.customer")?,
+        subscription_id: optional_validated_ref(value.get("subscription"), "invoice.subscription")?,
         status: value
             .get("status")
             .and_then(Value::as_str)
@@ -722,10 +740,20 @@ fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, Stripe
     Ok(StripeInvoiceLineResource {
         id: required_id(value, "invoice line.id")?,
         quantity: value.get("quantity").and_then(Value::as_i64),
-        subscription_id: details.and_then(|details| optional_ref(details.get("subscription"))),
+        subscription_id: details
+            .map(|details| optional_validated_ref(details.get("subscription"), "line.subscription"))
+            .transpose()?
+            .flatten(),
         subscription_item_id: details
-            .and_then(|details| optional_ref(details.get("subscription_item"))),
-        price_id: price_details.and_then(|details| optional_ref(details.get("price"))),
+            .map(|details| {
+                optional_validated_ref(details.get("subscription_item"), "line.subscription_item")
+            })
+            .transpose()?
+            .flatten(),
+        price_id: price_details
+            .map(|details| optional_validated_ref(details.get("price"), "line.price"))
+            .transpose()?
+            .flatten(),
         period_start: period.and_then(|period| period.get("start").and_then(Value::as_i64)),
         period_end: period.and_then(|period| period.get("end").and_then(Value::as_i64)),
     })
@@ -744,7 +772,10 @@ fn parse_invoice_payment(value: &Value) -> Result<StripeInvoicePaymentResource, 
         currency: required_string(value, "currency")?,
         livemode: value.get("livemode").and_then(Value::as_bool),
         payment_type: required_string_object(payment, "type", "payment.type")?,
-        payment_intent_id: optional_ref(payment.get("payment_intent")),
+        payment_intent_id: optional_validated_ref(
+            payment.get("payment_intent"),
+            "payment.payment_intent",
+        )?,
     })
 }
 
@@ -784,6 +815,17 @@ fn optional_ref(value: Option<&Value>) -> Option<String> {
         })
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
+}
+
+fn optional_validated_ref(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<String>, StripeReadError> {
+    let reference = optional_ref(value);
+    if let Some(reference) = reference.as_deref() {
+        validate_identifier(reference).map_err(|_| StripeReadError::MalformedResponse(field))?;
+    }
+    Ok(reference)
 }
 
 fn required_string(value: &Value, field: &'static str) -> Result<String, StripeReadError> {
