@@ -39,7 +39,7 @@ fn draw_header(f: &mut Frame, app: &TuiApp, area: Rect) {
         Span::styled("]  [env: ", styles.muted()),
         Span::styled(&app.config.environment, styles.bold_accent()),
         Span::styled("]  [status: ", styles.muted()),
-        Span::styled("synced", styles.success()),
+        Span::styled("unlocked", styles.success()),
         Span::styled("] ", styles.muted()),
     ]);
 
@@ -153,11 +153,13 @@ fn draw_left_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
                     ListItem::new(Line::from(vec![
                         Span::styled("▸ ", styles.bold_accent()),
                         Span::styled(&item.name, styles.bold_accent()),
+                        Span::styled(format!(" v{}", item.version), styles.muted()),
                     ]))
                 } else {
                     ListItem::new(Line::from(vec![
                         Span::raw("  "),
                         Span::styled(&item.name, styles.text()),
+                        Span::styled(format!(" v{}", item.version), styles.muted()),
                     ]))
                 }
             })
@@ -298,7 +300,7 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     let styles = &app.styles;
 
     let popup_width = 54.min(area.width.saturating_sub(4));
-    let popup_height = 16.min(area.height.saturating_sub(2));
+    let popup_height = 18.min(area.height.saturating_sub(2));
 
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -319,6 +321,14 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
         Line::from(vec![
             Span::styled("  ↓ / j       ", styles.bold_accent()),
             Span::styled("Move selection down", styles.text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Home / End  ", styles.bold_accent()),
+            Span::styled("Jump to top / bottom", styles.text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  PgUp / PgDn ", styles.bold_accent()),
+            Span::styled("Jump 10 items up / down", styles.text()),
         ]),
         Line::from(vec![
             Span::styled("  /           ", styles.bold_accent()),
@@ -357,4 +367,58 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
         .alignment(Alignment::Left);
 
     f.render_widget(paragraph, popup_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::App;
+    use crate::config::Config;
+    use crate::keychain::MemoryKeychain;
+    use crate::session;
+    use crate::store::Store;
+    use crate::theme::Theme;
+    use crate::vault::Vault;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::time::Duration;
+
+    fn unlocked() -> (Store, MemoryKeychain, Config) {
+        let store = Store::open_in_memory().unwrap();
+        let keychain = MemoryKeychain::default();
+        session::init(&store, &keychain, b"pw", Duration::from_secs(3600)).unwrap();
+        let master = session::current_master_key(&keychain).unwrap().unwrap();
+        let keypair = session::account_keypair(&store, &master).unwrap();
+        let project = Vault::create_project(&store, &keypair, "acme").unwrap();
+        let config = Config {
+            project_id: project.id,
+            project: "acme".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        (store, keychain, config)
+    }
+
+    #[test]
+    fn render_ui_with_version_and_unlocked_status() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "DATABASE_URL", b"postgres://localhost")
+            .unwrap();
+
+        let tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = format!("{buffer:?}");
+
+        // Verify "unlocked" appears in status
+        assert!(content.contains("unlocked"));
+        // Verify version badge appears in list
+        assert!(content.contains("DATABASE_URL"));
+        assert!(content.contains("v1"));
+    }
 }
