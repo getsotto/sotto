@@ -109,6 +109,158 @@ pub struct StripePaymentSettlement {
     livemode: bool,
 }
 
+/// A validated personal invoice observation assembled from authenticated Stripe resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripePersonalInvoiceObservation {
+    invoice_id: String,
+    customer_id: String,
+    subscription_id: String,
+    provider_item_id: String,
+    allocation_reference: String,
+    payment_intent_id: String,
+    currency: String,
+    amount_paid: i64,
+    interval: StripeInterval,
+    period_start: i64,
+    period_end: i64,
+    evidence_reference: String,
+}
+
+impl StripePersonalInvoiceObservation {
+    pub fn invoice_id(&self) -> &str {
+        &self.invoice_id
+    }
+
+    pub fn customer_id(&self) -> &str {
+        &self.customer_id
+    }
+
+    pub fn subscription_id(&self) -> &str {
+        &self.subscription_id
+    }
+
+    pub fn provider_item_id(&self) -> &str {
+        &self.provider_item_id
+    }
+
+    pub fn allocation_reference(&self) -> &str {
+        &self.allocation_reference
+    }
+
+    pub fn payment_intent_id(&self) -> &str {
+        &self.payment_intent_id
+    }
+
+    pub fn currency(&self) -> &str {
+        &self.currency
+    }
+
+    pub const fn amount_paid(&self) -> i64 {
+        self.amount_paid
+    }
+
+    pub const fn interval(&self) -> StripeInterval {
+        self.interval
+    }
+
+    pub const fn period_start(&self) -> i64 {
+        self.period_start
+    }
+
+    pub const fn period_end(&self) -> i64 {
+        self.period_end
+    }
+
+    pub fn evidence_reference(&self) -> &str {
+        &self.evidence_reference
+    }
+}
+
+/// Parsed invoice facts passed to the shared personal observation validator.
+pub(crate) struct StripePersonalInvoiceFacts {
+    pub(crate) invoice_id: String,
+    pub(crate) customer_id: String,
+    pub(crate) subscription_id: String,
+    pub(crate) provider_item_id: String,
+    pub(crate) invoice_line_id: String,
+    pub(crate) allocation_reference: String,
+    pub(crate) price_id: String,
+    pub(crate) currency: String,
+    pub(crate) amount_paid: i64,
+    pub(crate) amount_due: i64,
+    pub(crate) amount_overpaid: i64,
+    pub(crate) amount_paid_off_stripe: i64,
+    pub(crate) period_start: i64,
+    pub(crate) period_end: i64,
+    pub(crate) settlement: StripePaymentSettlement,
+}
+
+/// Validate the shared personal invoice contract after each input path has parsed its own shape.
+pub(crate) fn validate_personal_invoice_observation(
+    config: &StripeCoverageConfig,
+    binding: &StripeAllocationBinding,
+    facts: StripePersonalInvoiceFacts,
+) -> Result<StripePersonalInvoiceObservation, StripeContractError> {
+    if binding.payer_kind != PayerKind::Personal
+        || facts.customer_id != binding.customer_id
+        || facts.subscription_id != binding.subscription_id
+        || facts.provider_item_id != binding.provider_item_id
+        || facts.allocation_reference != binding.allocation_reference
+    {
+        return Err(StripeContractError::OwnershipMismatch);
+    }
+    if facts.amount_paid <= 0
+        || facts.amount_due <= 0
+        || facts.amount_paid != facts.amount_due
+        || facts.amount_overpaid > 0
+        || facts.amount_paid_off_stripe > 0
+    {
+        return Err(StripeContractError::UnsupportedSettlement(
+            "payment must settle the full positive invoice amount",
+        ));
+    }
+    let interval = if facts.price_id == config.monthly_price_id {
+        StripeInterval::Month
+    } else if facts.price_id == config.annual_price_id {
+        StripeInterval::Year
+    } else {
+        return Err(StripeContractError::UnsupportedPrice);
+    };
+    if facts.period_start < 0 || facts.period_end <= facts.period_start {
+        return Err(StripeContractError::InvalidField("period"));
+    }
+    if facts.currency != STRIPE_CURRENCY {
+        return Err(StripeContractError::InvalidField("currency"));
+    }
+    if facts.settlement.livemode != matches!(config.environment, ProviderEnvironment::Live)
+        || facts.settlement.invoice_id != facts.invoice_id
+        || facts.settlement.currency != facts.currency
+        || facts.settlement.amount_paid != facts.amount_paid
+        || facts.settlement.amount_requested != facts.amount_due
+    {
+        return Err(StripeContractError::UnsupportedSettlement(
+            "fetched settlement does not match the paid invoice",
+        ));
+    }
+    Ok(StripePersonalInvoiceObservation {
+        evidence_reference: format!(
+            "stripe:invoice:{}:line:{}",
+            facts.invoice_id, facts.invoice_line_id
+        ),
+        payment_intent_id: facts.settlement.payment_intent_id.clone(),
+        invoice_id: facts.invoice_id,
+        customer_id: facts.customer_id,
+        subscription_id: facts.subscription_id,
+        provider_item_id: facts.provider_item_id,
+        allocation_reference: facts.allocation_reference,
+        currency: facts.currency,
+        amount_paid: facts.amount_paid,
+        interval,
+        period_start: facts.period_start,
+        period_end: facts.period_end,
+    })
+}
+
 /// Normalised, signature-verified evidence for one personal subscription seat.
 ///
 /// No raw JSON, webhook signature, customer name, email, or payment secret crosses this boundary.
@@ -297,23 +449,10 @@ pub fn decode_paid_invoice(
         return Err(StripeContractError::UnpaidInvoice);
     }
     let currency = required_string(invoice, "currency")?.to_ascii_lowercase();
-    if currency != STRIPE_CURRENCY {
-        return Err(StripeContractError::InvalidField("currency"));
-    }
     let amount_paid = required_i64(invoice, "amount_paid")?;
     let amount_due = required_i64(invoice, "amount_due")?;
     let amount_overpaid = required_i64(invoice, "amount_overpaid")?;
     let amount_paid_off_stripe = required_i64(invoice, "amount_paid_off_stripe")?;
-    if amount_paid <= 0
-        || amount_due <= 0
-        || amount_paid != amount_due
-        || amount_overpaid > 0
-        || amount_paid_off_stripe > 0
-    {
-        return Err(StripeContractError::UnsupportedSettlement(
-            "payment must settle the full positive invoice amount",
-        ));
-    }
 
     let lines = invoice
         .get("lines")
@@ -360,22 +499,12 @@ pub fn decode_paid_invoice(
             "lines.data[0].pricing.price_details",
         ))?;
     let price_id = required_ref(&Value::Object(price_details.clone()), "price")?;
-    let interval = if price_id == config.monthly_price_id {
-        StripeInterval::Month
-    } else if price_id == config.annual_price_id {
-        StripeInterval::Year
-    } else {
-        return Err(StripeContractError::UnsupportedPrice);
-    };
     let period = line
         .get("period")
         .and_then(Value::as_object)
         .ok_or(StripeContractError::MissingField("lines.data[0].period"))?;
     let period_start = required_i64(&Value::Object(period.clone()), "start")?;
     let period_end = required_i64(&Value::Object(period.clone()), "end")?;
-    if period_start < 0 || period_end <= period_start {
-        return Err(StripeContractError::InvalidField("period"));
-    }
     let allocation_reference = invoice
         .get("metadata")
         .and_then(Value::as_object)
@@ -386,32 +515,36 @@ pub fn decode_paid_invoice(
         .ok_or(StripeContractError::MissingField(
             "metadata.sotto_allocation_reference",
         ))?;
-    if customer_id != binding.customer_id
-        || subscription_id != binding.subscription_id
-        || provider_item_id != binding.provider_item_id
-        || allocation_reference != binding.allocation_reference
-    {
-        return Err(StripeContractError::OwnershipMismatch);
-    }
-    if settlement.livemode != matches!(config.environment, ProviderEnvironment::Live)
-        || settlement.invoice_id != invoice_id
-        || settlement.currency != currency
-        || settlement.amount_paid != amount_paid
-        || settlement.amount_requested != amount_due
-    {
-        return Err(StripeContractError::UnsupportedSettlement(
-            "fetched settlement does not match the paid invoice",
-        ));
-    }
+    let observation = validate_personal_invoice_observation(
+        config,
+        binding,
+        StripePersonalInvoiceFacts {
+            invoice_id: invoice_id.clone(),
+            customer_id: customer_id.clone(),
+            subscription_id: subscription_id.clone(),
+            provider_item_id: provider_item_id.clone(),
+            invoice_line_id: invoice_line_id.clone(),
+            allocation_reference: allocation_reference.clone(),
+            price_id: price_id.clone(),
+            currency: currency.clone(),
+            amount_paid,
+            amount_due,
+            amount_overpaid,
+            amount_paid_off_stripe,
+            period_start,
+            period_end,
+            settlement: settlement.clone(),
+        },
+    )?;
 
     // Hash only event identity and trusted ownership. Invoice amounts and periods can change when
     // the provider corrects a remote object; they belong to refreshed history, not event identity.
     let normalized = json!({
-        "allocation_reference": allocation_reference,
+        "allocation_reference": &observation.allocation_reference,
         "event_id": event.id,
         "event_type": event.event_type,
         "provider_created_at": event.created,
-        "subscription_id": subscription_id,
+        "subscription_id": &observation.subscription_id,
     });
     let normalized_bytes = serde_json::to_vec(&normalized)
         .map_err(|_| StripeContractError::NormalizationSerialization)?;
@@ -428,18 +561,18 @@ pub fn decode_paid_invoice(
     Ok(StripeCoverageEvidence {
         event: verified_event,
         account_provenance,
-        invoice_id: invoice_id.clone(),
-        customer_id,
-        subscription_id,
-        provider_item_id: provider_item_id.clone(),
+        invoice_id: observation.invoice_id,
+        customer_id: observation.customer_id,
+        subscription_id: observation.subscription_id,
+        provider_item_id: observation.provider_item_id,
         price_id,
-        allocation_reference,
-        payment_intent_id: settlement.payment_intent_id.clone(),
-        currency,
-        amount_paid,
-        interval,
-        period_start,
-        period_end,
+        allocation_reference: observation.allocation_reference,
+        payment_intent_id: observation.payment_intent_id,
+        currency: observation.currency,
+        amount_paid: observation.amount_paid,
+        interval: observation.interval,
+        period_start: observation.period_start,
+        period_end: observation.period_end,
         evidence_reference: format!("stripe:invoice:{invoice_id}:line:{invoice_line_id}"),
     })
 }
