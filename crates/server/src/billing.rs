@@ -1326,7 +1326,7 @@ async fn org_for_subscription(
 /// HMAC-SHA256 over `"{t}.{payload}"`. Any valid `v1` within the timestamp tolerance passes
 /// (Stripe sends multiples during secret rotation); comparison is constant-time via the `hmac`
 /// crate's `verify_slice`.
-fn verify_signature(secret: &str, header: &str, payload: &str, now: i64) -> bool {
+pub(crate) fn verify_signature(secret: &str, header: &str, payload: &str, now: i64) -> bool {
     let mut timestamp: Option<i64> = None;
     let mut candidates: Vec<Vec<u8>> = Vec::new();
     for part in header.split(',') {
