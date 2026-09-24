@@ -371,8 +371,8 @@ async fn seed_project_tree(pool: &PgPool, org_id: &str, owner_id: &str) -> Proje
     .expect("insert environment grant fixture");
     sqlx::query(
         "INSERT INTO machine_tokens \
-         (id, env_id, name, token_hash, public_key, enc_vault_key, created_by) \
-         VALUES ($1, $2, 'deletion-test', $3, $4, $5, $6)",
+         (id, env_id, name, token_hash, public_key, enc_vault_key, created_by, expires_at) \
+         VALUES ($1, $2, 'deletion-test', $3, $4, $5, $6, now() + interval '90 days')",
     )
     .bind(&machine_token_id)
     .bind(&environment_id)

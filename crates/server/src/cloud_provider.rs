@@ -295,7 +295,7 @@ impl Default for CollectionLimits {
 }
 
 impl CollectionLimits {
-    fn validate(self) -> Result<(), ProviderCollectionError> {
+    pub(crate) fn validate(self) -> Result<(), ProviderCollectionError> {
         if self.max_pages_per_source == 0
             || self.max_sources == 0
             || self.max_facts == 0

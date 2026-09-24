@@ -524,6 +524,8 @@ mod tests {
         public_key: Vec<u8>,
         enc_vault_key: String,
         revoked: bool,
+        /// Past its end date. The mock has no clock, so tests set this directly.
+        expired: bool,
     }
 
     #[derive(Default)]
@@ -539,6 +541,9 @@ mod tests {
         users_by_email: HashMap<String, (String, Option<Vec<u8>>)>,
         /// token_id → machine token record.
         machine_tokens: HashMap<String, MachineTokenRec>,
+        /// A token that expires straight after the next listing, the race between a client
+        /// listing the tokens to re-seal and the server checking coverage.
+        expire_after_list: Option<String>,
         fail_writes: u32,
     }
 
@@ -556,6 +561,9 @@ mod tests {
         }
         fn fail_next_write(&self) {
             self.state.borrow_mut().fail_writes += 1;
+        }
+        fn expire_after_next_list(&self, token_id: &str) {
+            self.state.borrow_mut().expire_after_list = Some(token_id.to_string());
         }
         fn has_account(&self) -> bool {
             self.state.borrow().account.is_some()
@@ -1009,22 +1017,27 @@ mod tests {
                     g.enc_vault_key.clone(),
                 );
             }
-            // Machine grants must cover exactly the env's active tokens (as the server enforces),
-            // and each covered token's stored grant is re-sealed.
-            let active: HashSet<String> = s
-                .machine_tokens
-                .iter()
-                .filter(|(_, t)| t.env_id == env_id && !t.revoked)
-                .map(|(id, _)| id.clone())
-                .collect();
+            // Machine grants must cover every active token in the env and may also cover one that
+            // has since expired, but nothing else (as the server enforces); each covered token's
+            // stored grant is re-sealed.
             let provided: HashSet<String> = req
                 .machine_grants
                 .iter()
                 .map(|m| m.token_id.clone())
                 .collect();
-            if provided != active {
+            let unrevoked = || {
+                s.machine_tokens
+                    .iter()
+                    .filter(|(_, t)| t.env_id == env_id && !t.revoked)
+            };
+            let covers_active = unrevoked()
+                .filter(|(_, t)| !t.expired)
+                .all(|(id, _)| provided.contains(id));
+            let allowed: HashSet<String> = unrevoked().map(|(id, _)| id.clone()).collect();
+            if !covers_active || !provided.is_subset(&allowed) {
                 return Err(Error::Server(
-                    "rotation must re-grant exactly the environment's active machine tokens".into(),
+                    "rotation must re-grant every active machine token in the environment, and no others"
+                        .into(),
                 ));
             }
             for m in &req.machine_grants {
@@ -1074,6 +1087,7 @@ mod tests {
             name: &str,
             public_key: &str,
             enc_vault_key: &str,
+            _expires_in_days: Option<u32>,
         ) -> Result<super::super::api::CreatedMachineToken> {
             let me = self.current_user();
             let token_id = uuid::Uuid::new_v4().to_string();
@@ -1086,11 +1100,13 @@ mod tests {
                     public_key: b64decode(public_key)?,
                     enc_vault_key: enc_vault_key.to_string(),
                     revoked: false,
+                    expired: false,
                 },
             );
             Ok(super::super::api::CreatedMachineToken {
                 token_id,
                 token: format!("smt_mock_{}", uuid::Uuid::new_v4()),
+                expires_at: None,
             })
         }
 
@@ -1098,19 +1114,27 @@ mod tests {
             &self,
             env_id: &str,
         ) -> Result<Vec<super::super::api::MachineTokenInfo>> {
-            let s = self.state.borrow();
+            let mut s = self.state.borrow_mut();
             let mut tokens: Vec<_> = s
                 .machine_tokens
                 .iter()
-                .filter(|(_, t)| t.env_id == env_id && !t.revoked)
+                .filter(|(_, t)| t.env_id == env_id && !t.revoked && !t.expired)
                 .map(|(id, t)| super::super::api::MachineTokenInfo {
                     token_id: id.clone(),
                     name: t.name.clone(),
                     public_key: b64encode(&t.public_key),
                     created_by: Some(t.created_by.clone()),
+                    expires_at: None,
+                    expires_in_days: None,
                 })
                 .collect();
             tokens.sort_by(|a, b| a.token_id.cmp(&b.token_id));
+            if let Some(id) = s.expire_after_list.take() {
+                s.machine_tokens
+                    .get_mut(&id)
+                    .expect("token to expire")
+                    .expired = true;
+            }
             Ok(tokens)
         }
 
@@ -1704,7 +1728,7 @@ mod tests {
             Some(&org_id),
         )
         .unwrap();
-        team::create_machine_token(&api, &store_b, &bob, &bob_config, "bob-ci").unwrap();
+        team::create_machine_token(&api, &store_b, &bob, &bob_config, "bob-ci", None).unwrap();
 
         // Alice removes Bob: the rotation re-seals the token, then the removal revokes it and
         // reports it, so the team knows what to recreate.
@@ -1718,6 +1742,58 @@ mod tests {
             api.list_machine_tokens(&env_id).unwrap().is_empty(),
             "the removed member's token is revoked, not re-sealed and live"
         );
+    }
+
+    #[test]
+    fn rotation_survives_a_token_expiring_mid_flight() {
+        use crate::remote::team;
+        let api = MockApi::default();
+
+        let (store, master, _kit, project, config0) = real_device();
+        let alice = device_keypair(&store, &master);
+        api.register_user("alice@example.test", "test-user", &alice.public);
+        let org_id = team::create_org(&api, &alice, "acme").unwrap();
+        let config = Config {
+            org_id: Some(org_id.clone()),
+            ..config0
+        };
+        Vault::open(&store, &alice, &project.id, "dev")
+            .unwrap()
+            .set("API_KEY", b"s3cr3t")
+            .unwrap();
+        push(&api, &store, &master, &config).unwrap();
+        team::create_machine_token(&api, &store, &alice, &config, "deploy", None).unwrap();
+        team::create_machine_token(&api, &store, &alice, &config, "nightly", None).unwrap();
+        let env_id = store
+            .get_environment(&project.id, "dev")
+            .unwrap()
+            .unwrap()
+            .id;
+        let tokens = api.list_machine_tokens(&env_id).unwrap();
+        let nightly = &tokens
+            .iter()
+            .find(|t| t.name == "nightly")
+            .unwrap()
+            .token_id;
+
+        // "nightly" is listed as active, then lapses before the rotation lands. The rotation
+        // re-seals it anyway and must be accepted, not fail on a token nobody can use.
+        api.expire_after_next_list(nightly);
+        assert!(team::rotate_env(&api, &alice, &org_id, &env_id, None)
+            .unwrap()
+            .is_some());
+
+        // Once expired it leaves the listing, and a rotation without it is accepted too.
+        let names: Vec<String> = api
+            .list_machine_tokens(&env_id)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["deploy".to_string()]);
+        assert!(team::rotate_env(&api, &alice, &org_id, &env_id, None)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -1890,7 +1966,7 @@ mod tests {
             Some(&org_id),
         )
         .unwrap();
-        team::create_machine_token(&api, &store_b, &bob, &bob_config, "bob-ci").unwrap();
+        team::create_machine_token(&api, &store_b, &bob, &bob_config, "bob-ci", None).unwrap();
         api.as_user("test-user");
 
         // A second env, shared between Bob and Carol, that Alice cannot open.
@@ -1949,7 +2025,9 @@ mod tests {
             .unwrap();
 
         // Create a machine token; its grant opens to the same vault key the env uses.
-        let token_str = team::create_machine_token(&api, &store_a, &alice, &config, "ci").unwrap();
+        let token_str = team::create_machine_token(&api, &store_a, &alice, &config, "ci", None)
+            .unwrap()
+            .token;
         let machine_token = machine::parse_token(&token_str).unwrap();
         let read_machine_grant = |api: &MockApi| -> Vec<u8> {
             let s = api.state.borrow();

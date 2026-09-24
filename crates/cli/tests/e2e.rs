@@ -588,16 +588,44 @@ fn machine_token_end_to_end_over_http() {
     remote::sync::push(&client, &store, master_key.as_bytes(), &config).unwrap();
 
     // Mint a machine token and use it exactly as CI would: token string in, plaintext out.
-    let token_str =
-        remote::team::create_machine_token(&client, &store, &keypair, &config, "ci").unwrap();
+    let issued =
+        remote::team::create_machine_token(&client, &store, &keypair, &config, "ci", None).unwrap();
+    let token_str = issued.token;
     let machine = remote::machine::parse_token(&token_str).unwrap();
-    let entries = remote::machine::fetch_entries(&server.url, &machine).unwrap();
-    assert_eq!(entries, vec![("CI_KEY".to_string(), b"ci-value".to_vec())]);
+    let fetched = remote::machine::fetch_entries(&server.url, &machine).unwrap();
+    assert_eq!(
+        fetched.entries,
+        vec![("CI_KEY".to_string(), b"ci-value".to_vec())]
+    );
+    assert_eq!(
+        fetched.expiry_warning, None,
+        "90 days out is no cause for alarm"
+    );
+
+    // It carries the server's default lifetime, and a custom one round-trips to the listing.
+    let env = store.get_environment(&project.id, "dev").unwrap().unwrap();
+    let short =
+        remote::team::create_machine_token(&client, &store, &keypair, &config, "short", Some(7))
+            .unwrap();
+    let tokens = remote::SyncApi::list_machine_tokens(&client, &env.id).unwrap();
+    let listed = |name: &str| tokens.iter().find(|t| t.name == name).unwrap();
+    assert_eq!(issued.expires_at, listed("ci").expires_at);
+    assert!(matches!(listed("ci").expires_in_days, Some(89..=90)));
+    assert_eq!(short.expires_at, listed("short").expires_at);
+    assert!(matches!(listed("short").expires_in_days, Some(6..=7)));
+
+    // A week out, the same fetch that serves CI also warns it, naming the token to replace.
+    let short_machine = remote::machine::parse_token(&short.token).unwrap();
+    let fetched = remote::machine::fetch_entries(&server.url, &short_machine).unwrap();
+    let warning = fetched.expiry_warning.expect("warned inside two weeks");
+    assert!(warning.contains("`short`"), "{warning}");
+    assert!(
+        warning.contains(short.expires_at.as_deref().unwrap()),
+        "{warning}"
+    );
 
     // Revoke the token: the machine path dies immediately.
-    let env = store.get_environment(&project.id, "dev").unwrap().unwrap();
-    let tokens = remote::SyncApi::list_machine_tokens(&client, &env.id).unwrap();
-    assert_eq!(tokens.len(), 1);
-    remote::SyncApi::revoke_machine_token(&client, &env.id, &tokens[0].token_id).unwrap();
+    let ci = listed("ci").token_id.clone();
+    remote::SyncApi::revoke_machine_token(&client, &env.id, &ci).unwrap();
     assert!(remote::machine::fetch_entries(&server.url, &machine).is_err());
 }

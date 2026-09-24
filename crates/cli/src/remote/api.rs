@@ -107,8 +107,9 @@ pub struct HistoryKeyEntry {
 }
 
 /// A rotation request: rewrapped data keys (current + history) + the replacement grant set (users
-/// and machines), at a base revision. `machine_grants` must cover exactly the env's active machine
-/// tokens; `history_keys` exactly its retained versions.
+/// and machines), at a base revision. `machine_grants` must cover every active machine token in the
+/// env and may also cover one that expired after it was listed; `history_keys` must cover exactly
+/// the env's retained versions.
 #[derive(Debug, Clone, Serialize)]
 pub struct RotateRequest {
     pub base_revision: i64,
@@ -165,6 +166,25 @@ pub struct MachineTokenInfo {
     pub public_key: String,
     /// The user who created the token, if still known.
     pub created_by: Option<String>,
+    /// When the token stops authenticating (UTC, RFC 3339). Absent from servers that predate
+    /// token expiry, whose tokens never expire.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// Whole days until then, rounded down, by the server's clock.
+    #[serde(default)]
+    pub expires_in_days: Option<i64>,
+}
+
+impl MachineTokenInfo {
+    /// `expires <timestamp> (in <n>d)` for listings, or `None` against a server that predates
+    /// token expiry. The timestamp is server-sent, so it is escaped onto one line.
+    pub fn expiry_label(&self) -> Option<String> {
+        let at = self.expires_at.as_deref()?.escape_debug();
+        Some(match self.expires_in_days {
+            Some(days) => format!("expires {at} (in {days}d)"),
+            None => format!("expires {at}"),
+        })
+    }
 }
 
 /// A machine token revoked by a member removal (names, never the raw token).
@@ -188,6 +208,9 @@ pub struct RemovalReceipt {
 pub struct CreatedMachineToken {
     pub token_id: String,
     pub token: String,
+    /// When the token stops authenticating; absent from servers that predate token expiry.
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -360,12 +383,14 @@ pub trait SyncApi {
     /// Store (or replace) a member's sealed copy of the org key (display-name access).
     fn grant_org_key(&self, org_id: &str, user_id: &str, enc_org_key: &str) -> Result<()>;
     /// Create a machine token for an environment (public key + sealed grant are client-generated).
+    /// `expires_in_days` of `None` takes the server's default lifetime.
     fn create_machine_token(
         &self,
         env_id: &str,
         name: &str,
         public_key: &str,
         enc_vault_key: &str,
+        expires_in_days: Option<u32>,
     ) -> Result<CreatedMachineToken>;
     /// The environment's active machine tokens (for listings and rotation re-sealing).
     fn list_machine_tokens(&self, env_id: &str) -> Result<Vec<MachineTokenInfo>>;
@@ -420,5 +445,31 @@ mod tests {
             serde_json::from_str::<AccountBundle>(&json).unwrap(),
             bundle
         );
+    }
+
+    #[test]
+    fn machine_token_expiry_label_tolerates_older_servers() {
+        // A server that predates expiry sends neither field; the listing must still parse.
+        let old: MachineTokenInfo = serde_json::from_str(
+            r#"{"token_id":"t","name":"ci","public_key":"pk","created_by":null}"#,
+        )
+        .unwrap();
+        assert_eq!(old.expiry_label(), None);
+
+        let new: MachineTokenInfo = serde_json::from_str(
+            r#"{"token_id":"t","name":"ci","public_key":"pk","created_by":null,"expires_at":"2026-12-22T10:00:00Z","expires_in_days":90}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            new.expiry_label().as_deref(),
+            Some("expires 2026-12-22T10:00:00Z (in 90d)")
+        );
+
+        let forged: MachineTokenInfo = serde_json::from_str(
+            r#"{"token_id":"t","name":"ci","public_key":"pk","created_by":null,"expires_at":"soon\nroot  admin  forged","expires_in_days":1}"#,
+        )
+        .unwrap();
+        let label = forged.expiry_label().unwrap();
+        assert!(!label.chars().any(char::is_control), "{label:?}");
     }
 }

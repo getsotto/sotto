@@ -519,3 +519,336 @@ async fn token_listing_reports_creators_and_filters_by_them() {
         .collect();
     assert_eq!(ids, vec![admin_token.as_str()]);
 }
+
+/// Move a token's end date into the past. `created_at` moves too, so the row still satisfies the
+/// `expires_at > created_at` constraint: this simulates a token that lived its life, not one that
+/// was born expired.
+async fn expire(pool: &PgPool, token_id: &str) {
+    sqlx::query(
+        "UPDATE machine_tokens \
+         SET created_at = now() - interval '2 days', expires_at = now() - interval '1 second' \
+         WHERE id = $1",
+    )
+    .bind(token_id)
+    .execute(pool)
+    .await
+    .expect("expire token");
+}
+
+/// The listed tokens on `env`, as JSON objects.
+async fn listed(pool: &PgPool, session: &str, uri: &str) -> Vec<Value> {
+    let (status, body) = get(pool, session, uri).await;
+    assert_eq!(status, StatusCode::OK, "list tokens: {body}");
+    serde_json::from_str::<Value>(&body)
+        .expect("tokens json")
+        .as_array()
+        .expect("token array")
+        .clone()
+}
+
+#[tokio::test]
+async fn expired_token_is_rejected() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-exp-o", "mt-exp-p", "mt-exp-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-exp-owner").await;
+    let (token_id, api_token) = create_token(&pool, &owner, e, b"g").await;
+    assert_eq!(
+        get(&pool, &api_token, "/machine/secrets").await.0,
+        StatusCode::OK
+    );
+
+    expire(&pool, &token_id).await;
+    // Indistinguishable from a revoked or unknown token: no oracle about why it failed.
+    for path in ["/machine/grant", "/machine/secrets"] {
+        let (status, body) = get(&pool, &api_token, path).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn expired_token_leaves_listing() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-expl-o", "mt-expl-p", "mt-expl-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-expl-owner").await;
+    let (live, _) = create_token(&pool, &owner, e, b"g").await;
+    let (lapsed, _) = create_token(&pool, &owner, e, b"g").await;
+    expire(&pool, &lapsed).await;
+
+    // Rotation clients re-seal exactly this listing, so it must hold only tokens that can still
+    // authenticate, with or without the creator filter.
+    for uri in [
+        format!("/environments/{e}/tokens"),
+        format!("/environments/{e}/tokens?created_by=mt-expl-owner"),
+    ] {
+        let ids: Vec<String> = listed(&pool, &owner, &uri)
+            .await
+            .iter()
+            .map(|t| t["token_id"].as_str().expect("token_id").to_string())
+            .collect();
+        assert_eq!(ids, vec![live.clone()], "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn creation_defaults_to_ninety_days() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-def-o", "mt-def-p", "mt-def-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-def-owner").await;
+    let (token_id, _) = create_token(&pool, &owner, e, b"g").await;
+
+    let tokens = listed(&pool, &owner, &format!("/environments/{e}/tokens")).await;
+    let token = &tokens[0];
+    assert_eq!(token["token_id"].as_str(), Some(token_id.as_str()));
+    // Whole days left, rounded down: 89 a moment after creation, never more than 90.
+    let days = token["expires_in_days"].as_i64().expect("expires_in_days");
+    assert!((89..=90).contains(&days), "expires_in_days = {days}");
+
+    // The listed timestamp is the stored one, in the audit log's UTC format.
+    let stored: String = sqlx::query_scalar(
+        "SELECT to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+         FROM machine_tokens WHERE id = $1",
+    )
+    .bind(&token_id)
+    .fetch_one(&pool)
+    .await
+    .expect("stored expiry");
+    assert_eq!(token["expires_at"].as_str(), Some(stored.as_str()));
+    let exact: bool = sqlx::query_scalar(
+        "SELECT expires_at - created_at = interval '90 days' FROM machine_tokens WHERE id = $1",
+    )
+    .bind(&token_id)
+    .fetch_one(&pool)
+    .await
+    .expect("lifetime");
+    assert!(exact, "default lifetime is exactly 90 days from creation");
+}
+
+fn token_body_with_lifetime(days: &str) -> String {
+    format!(
+        r#"{{"name":"ci","public_key":"{}","enc_vault_key":"{}","expires_in_days":{days}}}"#,
+        b64(&[0xAB; 32]),
+        b64(b"g"),
+    )
+}
+
+#[tokio::test]
+async fn creation_accepts_custom_lifetime_and_rejects_out_of_range() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-life-o", "mt-life-p", "mt-life-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-life-owner").await;
+    let tokens_uri = format!("/environments/{e}/tokens");
+
+    // Both ends of the range are accepted, and the response carries the stored end date so the
+    // creator sees it next to the one-time token.
+    for days in [1, 365] {
+        let (status, body) = post(
+            &pool,
+            &owner,
+            &tokens_uri,
+            token_body_with_lifetime(&days.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{days} days: {body}");
+        let created: Value = serde_json::from_str(&body).expect("json");
+        let token_id = created["token_id"].as_str().expect("token_id");
+        let (exact, stored): (bool, String) = sqlx::query_as(
+            "SELECT expires_at - created_at = make_interval(days => $2), \
+                    to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
+             FROM machine_tokens WHERE id = $1",
+        )
+        .bind(token_id)
+        .bind(days)
+        .fetch_one(&pool)
+        .await
+        .expect("stored expiry");
+        assert!(exact, "{days}-day lifetime stored exactly");
+        assert_eq!(created["expires_at"].as_str(), Some(stored.as_str()));
+    }
+
+    // Outside 1-365 is refused before anything is written.
+    for days in ["0", "366", "-1"] {
+        let (status, body) = post(&pool, &owner, &tokens_uri, token_body_with_lifetime(days)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{days} days: {body}");
+        assert!(body.contains("between 1 and 365"), "{body}");
+    }
+    assert_eq!(listed(&pool, &owner, &tokens_uri).await.len(), 2);
+}
+
+/// A rotation body for a seeded env (one secret, one version) that re-grants the owner and
+/// re-seals the given machine tokens.
+fn rotate_body(base: i64, owner_id: &str, secret_id: &str, machine_tokens: &[&str]) -> String {
+    let machine_grants: Vec<String> = machine_tokens
+        .iter()
+        .map(|id| {
+            format!(
+                r#"{{"token_id":"{id}","enc_vault_key":"{}"}}"#,
+                b64(b"machine-new")
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"base_revision":{base},"grants":[{{"user_id":"{owner_id}","enc_vault_key":"{}"}}],"data_keys":[{{"secret_id":"{secret_id}","enc_data_key":"{}"}}],"history_keys":[{{"secret_id":"{secret_id}","version":1,"enc_data_key":"{}"}}],"machine_grants":[{}]}}"#,
+        b64(b"owner-new"),
+        b64(b"new-dk"),
+        b64(b"new-dk-hist"),
+        machine_grants.join(","),
+    )
+}
+
+#[tokio::test]
+async fn rotation_requires_active_tokens_and_tolerates_expired_ones() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-rotx-o", "mt-rotx-p", "mt-rotx-e");
+    let owner_id = "mt-rotx-owner";
+    let owner = seed_org_env(&pool, o, p, e, owner_id).await;
+    let (live, _) = create_token(&pool, &owner, e, b"g").await;
+    let (lapsed, _) = create_token(&pool, &owner, e, b"g").await;
+    let (revoked, _) = create_token(&pool, &owner, e, b"g").await;
+    delete(
+        &pool,
+        &owner,
+        &format!("/environments/{e}/tokens/{revoked}"),
+    )
+    .await;
+    expire(&pool, &lapsed).await;
+    // A live token in another environment of the same owner.
+    let other_e = "mt-rotx-e2";
+    post(
+        &pool,
+        &owner,
+        &format!("/projects/{p}/environments"),
+        env_body(other_e),
+    )
+    .await;
+    let (foreign, _) = create_token(&pool, &owner, other_e, b"g").await;
+
+    let rotate_uri = format!("/environments/{e}/rotate");
+    let s1 = format!("{e}-s1");
+    let rotate = |base: i64, tokens: &[&str]| rotate_body(base, owner_id, &s1, tokens);
+
+    // Every active token must be covered; an expired one need not be.
+    assert_eq!(
+        post(&pool, &owner, &rotate_uri, rotate(1, &[])).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let (status, body) = post(&pool, &owner, &rotate_uri, rotate(1, &[&live])).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expired token may be omitted: {body}"
+    );
+
+    // A token that expired after the client listed it may still be covered: the listing and the
+    // rotation read the clock at different moments, and failing here would abort a member removal
+    // part-way through its environments.
+    let (status, body) = post(&pool, &owner, &rotate_uri, rotate(2, &[&live, &lapsed])).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expired token may be covered: {body}"
+    );
+
+    // Anything else is still rejected: a revoked token, or another environment's token.
+    for extra in [&revoked, &foreign] {
+        let (status, body) = post(&pool, &owner, &rotate_uri, rotate(3, &[&live, extra])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
+    }
+}
+
+async fn revoked_at(pool: &PgPool, token_id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT revoked_at::text FROM machine_tokens WHERE id = $1")
+        .bind(token_id)
+        .fetch_one(pool)
+        .await
+        .expect("read token")
+}
+
+#[tokio::test]
+async fn admin_can_revoke_an_expired_token() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-revx-o", "mt-revx-p", "mt-revx-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-revx-owner").await;
+    let (token_id, _) = create_token(&pool, &owner, e, b"g").await;
+    expire(&pool, &token_id).await;
+
+    // An expired token is dead but still real: tombstoning it is a deliberate act, not a 404.
+    let revoke_uri = format!("/environments/{e}/tokens/{token_id}");
+    assert_eq!(
+        delete(&pool, &owner, &revoke_uri).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert!(revoked_at(&pool, &token_id).await.is_some());
+    assert_eq!(
+        delete(&pool, &owner, &revoke_uri).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn member_removal_revokes_their_expired_tokens_too() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-rmx-o", "mt-rmx-p", "mt-rmx-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-rmx-owner").await;
+    let admin = fresh_session(&pool, "mt-rmx-admin", "mt-rmx-admin-s").await;
+    post(
+        &pool,
+        &owner,
+        &format!("/orgs/{o}/members"),
+        member_body("mt-rmx-admin", "admin"),
+    )
+    .await;
+    let (token_id, _) = create_token(&pool, &admin, e, b"g").await;
+    expire(&pool, &token_id).await;
+
+    // "A removed member's tokens are revoked" holds without exceptions: an expired token is
+    // tombstoned as well, whatever expiry does in future.
+    let (status, body) = delete(&pool, &owner, &format!("/orgs/{o}/members/mt-rmx-admin")).await;
+    assert_eq!(status, StatusCode::OK, "remove member: {body}");
+    assert!(
+        body.contains(&token_id),
+        "removal reports the token: {body}"
+    );
+    assert!(revoked_at(&pool, &token_id).await.is_some());
+}
+
+#[tokio::test]
+async fn grant_reports_the_tokens_expiry() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let (o, p, e) = ("mt-gx-o", "mt-gx-p", "mt-gx-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-gx-owner").await;
+    let (status, body) = post(
+        &pool,
+        &owner,
+        &format!("/environments/{e}/tokens"),
+        token_body_with_lifetime("10"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let created: Value = serde_json::from_str(&body).expect("json");
+    let api_token = created["token"].as_str().expect("token");
+
+    // CI sees which token it is using and how long it has left, by the server's clock, so the
+    // CLI can warn in the job log before the token dies.
+    let (status, body) = get(&pool, api_token, "/machine/grant").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let grant: Value = serde_json::from_str(&body).expect("grant json");
+    assert_eq!(grant["name"].as_str(), Some("ci"));
+    assert_eq!(grant["expires_at"], created["expires_at"]);
+    assert_eq!(grant["expires_in_days"].as_i64(), Some(9));
+}

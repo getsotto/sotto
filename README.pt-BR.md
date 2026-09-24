@@ -146,6 +146,11 @@ sotto grant <user-id>                      # share the active environment (they 
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
+Tokens de máquina expiram. Um token novo dura 90 dias, a menos que você passe `--expires-in-days`
+com um valor de 1 a 365, e `sotto token ls` mostra quando cada um termina. Duas semanas antes,
+`sotto run` e `sotto export` exibem um aviso no log da CI. Para substituir um token, crie um novo,
+atualize o segredo da CI e depois revogue o antigo com `sotto token revoke`.
+
 ### Temas de saída
 
 A CLI traz cinco temas integrados: `nord` (o padrão), `sordino`, `terminal`, `monochrome` e
