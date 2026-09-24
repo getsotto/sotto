@@ -105,6 +105,8 @@ impl<'a> TuiApp<'a> {
         } else if self.selected_filtered_index >= self.filtered_indices.len() {
             self.selected_filtered_index = self.filtered_indices.len() - 1;
         }
+
+        self.reset_secret_view();
     }
 
     /// Reset any revealed or cached secret cleartext.
@@ -135,6 +137,44 @@ impl<'a> TuiApp<'a> {
         {
             self.selected_filtered_index += 1;
             self.reset_secret_view();
+        }
+    }
+
+    /// Move cursor selection to the beginning of the list.
+    pub fn move_selection_home(&mut self) {
+        if !self.filtered_indices.is_empty() && self.selected_filtered_index > 0 {
+            self.selected_filtered_index = 0;
+            self.reset_secret_view();
+        }
+    }
+
+    /// Move cursor selection to the end of the list.
+    pub fn move_selection_end(&mut self) {
+        if !self.filtered_indices.is_empty() {
+            let last_idx = self.filtered_indices.len() - 1;
+            if self.selected_filtered_index != last_idx {
+                self.selected_filtered_index = last_idx;
+                self.reset_secret_view();
+            }
+        }
+    }
+
+    /// Move cursor selection up by a page step.
+    pub fn page_up(&mut self, step: usize) {
+        if self.selected_filtered_index > 0 {
+            self.selected_filtered_index = self.selected_filtered_index.saturating_sub(step);
+            self.reset_secret_view();
+        }
+    }
+
+    /// Move cursor selection down by a page step.
+    pub fn page_down(&mut self, step: usize) {
+        if !self.filtered_indices.is_empty() {
+            let last_idx = self.filtered_indices.len() - 1;
+            if self.selected_filtered_index < last_idx {
+                self.selected_filtered_index = (self.selected_filtered_index + step).min(last_idx);
+                self.reset_secret_view();
+            }
         }
     }
 
@@ -336,5 +376,72 @@ mod tests {
         assert_eq!(tui_app.config.environment, "staging");
         tui_app.cycle_environment().unwrap();
         assert_eq!(tui_app.config.environment, "dev");
+    }
+
+    #[test]
+    fn app_filter_resets_revealed_cache() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "ALPHA", b"alpha-val").unwrap();
+        app.set(&config, "BETA", b"beta-val").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        // Move to BETA and reveal it
+        tui_app.move_selection_down();
+        assert_eq!(
+            tui_app.selected_secret().map(|s| s.name.as_str()),
+            Some("BETA")
+        );
+        tui_app.toggle_reveal().unwrap();
+        assert!(tui_app.revealed);
+        assert!(tui_app.decrypted_cache.is_some());
+
+        // Narrow filter to ALPHA
+        tui_app.search_query = "ALPHA".into();
+        tui_app.apply_filter();
+        assert_eq!(
+            tui_app.selected_secret().map(|s| s.name.as_str()),
+            Some("ALPHA")
+        );
+        // Reveal state and cache must be reset so BETA's plaintext is not displayed for ALPHA
+        assert!(!tui_app.revealed);
+        assert!(tui_app.decrypted_cache.is_none());
+    }
+
+    #[test]
+    fn app_extended_navigation() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        for i in 0..25 {
+            app.set(&config, &format!("KEY_{i:02}"), b"val").unwrap();
+        }
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert_eq!(tui_app.selected_filtered_index, 0);
+
+        // End moves to last item
+        tui_app.move_selection_end();
+        assert_eq!(tui_app.selected_filtered_index, 24);
+
+        // Home moves to first item
+        tui_app.move_selection_home();
+        assert_eq!(tui_app.selected_filtered_index, 0);
+
+        // Page down moves by step
+        tui_app.page_down(10);
+        assert_eq!(tui_app.selected_filtered_index, 10);
+        tui_app.page_down(10);
+        assert_eq!(tui_app.selected_filtered_index, 20);
+        // Page down clamps to last index
+        tui_app.page_down(10);
+        assert_eq!(tui_app.selected_filtered_index, 24);
+
+        // Page up moves up and clamps to 0
+        tui_app.page_up(10);
+        assert_eq!(tui_app.selected_filtered_index, 14);
+        tui_app.page_up(20);
+        assert_eq!(tui_app.selected_filtered_index, 0);
     }
 }
