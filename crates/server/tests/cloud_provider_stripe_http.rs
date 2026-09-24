@@ -31,6 +31,7 @@ struct MockResponse {
     status: StatusCode,
     headers: Vec<(&'static str, String)>,
     body: String,
+    streamed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +47,7 @@ impl MockResponse {
             status: StatusCode::OK,
             headers: vec![("content-type", "application/json".into())],
             body: serde_json::to_string(&value).unwrap(),
+            streamed: false,
         }
     }
 
@@ -54,6 +56,7 @@ impl MockResponse {
             status,
             headers: Vec::new(),
             body: body.into(),
+            streamed: false,
         }
     }
 
@@ -62,7 +65,13 @@ impl MockResponse {
             status: StatusCode::FOUND,
             headers: vec![("location", target.into())],
             body: String::new(),
+            streamed: false,
         }
+    }
+
+    fn streamed(mut self) -> Self {
+        self.streamed = true;
+        self
     }
 
     fn with_header(mut self, name: &'static str, value: &str) -> Self {
@@ -120,7 +129,18 @@ async fn mock_handler(State(state): State<MockState>, request: Request<Body>) ->
     for (name, value) in response.headers {
         builder = builder.header(name, value);
     }
-    builder.body(Body::from(response.body)).unwrap()
+    if response.streamed {
+        builder
+            .body(Body::from_stream(futures_util::stream::iter([Ok::<
+                _,
+                std::convert::Infallible,
+            >(
+                response.body,
+            )])))
+            .unwrap()
+    } else {
+        builder.body(Body::from(response.body)).unwrap()
+    }
 }
 
 async fn mock_server(responses: HashMap<String, Vec<MockResponse>>) -> MockServer {
@@ -465,6 +485,26 @@ async fn rejects_a_response_body_before_it_can_exceed_the_bound() {
     responses.insert(
         "/v1/account".into(),
         vec![MockResponse::status(StatusCode::OK, &"x".repeat(100))],
+    );
+    let mut bounded = limits();
+    bounded.max_response_bytes = 32;
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), bounded).unwrap();
+    let mut session = client.session();
+    assert!(!format!("{client:?}").contains(API_KEY));
+    assert!(matches!(
+        client.account(&mut session).await,
+        Err(StripeReadError::ResponseTooLarge)
+    ));
+}
+
+#[tokio::test]
+async fn rejects_a_streamed_response_without_content_length() {
+    let mut responses = HashMap::new();
+    responses.insert(
+        "/v1/account".into(),
+        vec![MockResponse::status(StatusCode::OK, &"x".repeat(100)).streamed()],
     );
     let mut bounded = limits();
     bounded.max_response_bytes = 32;

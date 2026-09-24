@@ -367,6 +367,8 @@ impl StripeReadClient {
         self.ensure_account(session).await?;
         validate_identifier(invoice_id)?;
         let path = format!("v1/invoices/{invoice_id}/lines");
+        // Stripe binds this collection to the validated invoice path. Line objects do not expose
+        // livemode, so the session's authenticated account check is the available context guard.
         self.list(session, &path, Vec::new(), parse_invoice_line)
             .await
     }
@@ -476,7 +478,11 @@ impl StripeReadClient {
             };
             match result {
                 Ok(value) => return Ok(value),
-                Err(error) if error.retryable() && retries < self.limits.max_retries => {
+                Err(error)
+                    if method == Method::GET
+                        && error.retryable()
+                        && retries < self.limits.max_retries =>
+                {
                     let backoff = error
                         .retry_after()
                         .unwrap_or_else(|| {
@@ -534,6 +540,17 @@ impl StripeReadClient {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_secs);
+        if !(200..300).contains(&status) {
+            return Err(match status {
+                300..=399 => StripeReadError::RedirectRejected,
+                401 => StripeReadError::Authentication { status },
+                403 => StripeReadError::Permission { status },
+                404 => StripeReadError::ResourceMissing,
+                429 => StripeReadError::RateLimited { retry_after },
+                500..=599 => StripeReadError::Retryable { status },
+                _ => StripeReadError::UnexpectedStatus { status },
+            });
+        }
         if response
             .content_length()
             .is_some_and(|length| length > self.limits.max_response_bytes as u64)
@@ -552,17 +569,6 @@ impl StripeReadClient {
                 return Err(StripeReadError::ResponseTooLarge);
             }
             body.extend_from_slice(&chunk);
-        }
-        if !(200..300).contains(&status) {
-            return Err(match status {
-                300..=399 => StripeReadError::RedirectRejected,
-                401 => StripeReadError::Authentication { status },
-                403 => StripeReadError::Permission { status },
-                404 => StripeReadError::ResourceMissing,
-                429 => StripeReadError::RateLimited { retry_after },
-                500..=599 => StripeReadError::Retryable { status },
-                _ => StripeReadError::UnexpectedStatus { status },
-            });
         }
         serde_json::from_slice(&body).map_err(|_| StripeReadError::MalformedResponse("json"))
     }
@@ -686,6 +692,9 @@ impl StripeInvoicePaymentResource {
         &self,
         config: &StripeCoverageConfig,
     ) -> Result<crate::cloud_provider_stripe::StripePaymentSettlement, StripeReadError> {
+        // Keep decode_invoice_payment as the single settlement authority. If it later requires a
+        // field this transport does not model, the round-trip must fail closed until this DTO is
+        // extended.
         let payload = serde_json::json!({
             "object": "invoice_payment",
             "id": self.id,
