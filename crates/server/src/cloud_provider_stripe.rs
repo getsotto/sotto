@@ -221,6 +221,8 @@ pub enum StripeContractError {
     UnsupportedPrice,
     #[error("provider context is invalid: {0}")]
     ProviderContext(ProviderAdapterError),
+    #[error("provider evidence is invalid: {0}")]
+    ProviderEvidence(ProviderAdapterError),
     #[error("normalised Stripe evidence could not be serialised")]
     NormalizationSerialization,
     #[error("Stripe payment settlement is unsupported or ambiguous: {0}")]
@@ -421,7 +423,7 @@ pub fn decode_paid_invoice(
         Some(allocation_reference.clone()),
         &normalized_bytes,
     )
-    .map_err(StripeContractError::ProviderContext)?;
+    .map_err(StripeContractError::ProviderEvidence)?;
 
     Ok(StripeCoverageEvidence {
         event: verified_event,
