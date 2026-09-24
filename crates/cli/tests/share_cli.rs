@@ -95,32 +95,12 @@ fn omitted_arguments_in_non_interactive_mode_fail_with_clear_error() {
     let scratch = tempfile::tempdir().expect("scratch directory");
     let data_dir = scratch.path().join("sotto-data");
 
-    // Initialize a project with a valid identity so config and store exist.
-    let init_out = Command::new(env!("CARGO_BIN_EXE_sotto"))
-        .current_dir(scratch.path())
-        .args(["init", "--name", "test-project"])
-        .env("SOTTO_DATA_DIR", &data_dir)
-        .env("SOTTO_PASSWORD", "test-password-123")
-        .env_remove("SOTTO_TOKEN")
-        .env_remove("SOTTO_THEME")
-        .output()
-        .expect("run sotto init");
-    assert!(
-        init_out.status.success(),
-        "init failed: {}",
-        String::from_utf8_lossy(&init_out.stderr)
-    );
-
-    // Lock session so that unlocking is required if not preflighted.
-    let lock_out = Command::new(env!("CARGO_BIN_EXE_sotto"))
-        .current_dir(scratch.path())
-        .args(["lock"])
-        .env("SOTTO_DATA_DIR", &data_dir)
-        .env_remove("SOTTO_TOKEN")
-        .env_remove("SOTTO_THEME")
-        .output()
-        .expect("run sotto lock");
-    assert!(lock_out.status.success());
+    // Write project config directly so no OS keychain is needed (keeps tests portable across headless CI).
+    std::fs::write(
+        scratch.path().join("sotto.toml"),
+        "project_id = \"00000000-0000-0000-0000-000000000000\"\nproject = \"test-project\"\nenvironment = \"dev\"\n",
+    )
+    .expect("write sotto.toml");
 
     // When session is locked and SOTTO_PASSWORD is unset, omitted secret name
     // must fail fast with missing-argument error without prompting for master password on stdin.
