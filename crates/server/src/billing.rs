@@ -58,11 +58,12 @@ pub const STRIPE_API_VERSION: &str = "2026-07-29.dahlia";
 /// `checkout.session.completed` was dropped for twelve days, and only an unrelated test failure
 /// surfaced it.
 ///
-/// Widening this is safe because of how little of a payload is actually read. The handlers touch
-/// `client_reference_id`, `customer`, `subscription`, `status`, `metadata.org_id` and `id`, and
-/// [`Event`] says as much: everything else is ignored. Those fields are not what changes between
-/// API versions. Add a version here when Stripe moves and the fields above still mean what they
-/// meant; remove one when it stops being served.
+/// The legacy handlers touch `client_reference_id`, `customer`, `subscription`, `status`,
+/// `metadata.org_id` and `id`, and [`Event`] says as much: everything else is ignored. Provider
+/// coverage adapters consume their own version-sensitive resource shapes and must carry separate
+/// fixture or sandbox evidence before treating an allowlisted version as compatible. Add a version
+/// here when Stripe moves and the legacy fields above still mean what they meant; do not infer
+/// coverage compatibility from this allowlist.
 pub const ACCEPTED_WEBHOOK_API_VERSIONS: &[&str] = &[
     "2026-06-24.dahlia",
     "2026-07-29.dahlia",
