@@ -373,8 +373,8 @@ impl StripeReadClient {
         self.ensure_account(session).await?;
         validate_identifier(invoice_id)?;
         let path = format!("v1/invoices/{invoice_id}/lines");
-        // Stripe binds this collection to the validated invoice path. Line objects do not expose
-        // livemode, so the session's authenticated account check is the available context guard.
+        // Stripe binds this collection to the validated invoice path. The line's livemode is
+        // preserved and checked by personal_invoice_observation against the account context.
         self.list(session, &path, Vec::new(), parse_invoice_line)
             .await
     }
@@ -464,6 +464,7 @@ impl StripeReadClient {
                 customer_id: invoice
                     .customer_id
                     .ok_or(StripeReadError::MalformedResponse("invoice.customer"))?,
+                invoice_subscription_id: invoice.subscription_id,
                 subscription_id: line
                     .subscription_id
                     .clone()

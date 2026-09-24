@@ -180,6 +180,7 @@ impl StripePersonalInvoiceObservation {
 pub(crate) struct StripePersonalInvoiceFacts {
     pub(crate) invoice_id: String,
     pub(crate) customer_id: String,
+    pub(crate) invoice_subscription_id: Option<String>,
     pub(crate) subscription_id: String,
     pub(crate) provider_item_id: String,
     pub(crate) invoice_line_id: String,
@@ -203,6 +204,10 @@ pub(crate) fn validate_personal_invoice_observation(
 ) -> Result<StripePersonalInvoiceObservation, StripeContractError> {
     if binding.payer_kind != PayerKind::Personal
         || facts.customer_id != binding.customer_id
+        || facts
+            .invoice_subscription_id
+            .as_deref()
+            .is_some_and(|id| id != binding.subscription_id)
         || facts.subscription_id != binding.subscription_id
         || facts.provider_item_id != binding.provider_item_id
         || facts.allocation_reference != binding.allocation_reference
@@ -521,6 +526,7 @@ pub fn decode_paid_invoice(
         StripePersonalInvoiceFacts {
             invoice_id: invoice_id.clone(),
             customer_id: customer_id.clone(),
+            invoice_subscription_id: None,
             subscription_id: subscription_id.clone(),
             provider_item_id: provider_item_id.clone(),
             invoice_line_id: invoice_line_id.clone(),

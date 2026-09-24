@@ -205,6 +205,7 @@ fn paid_invoice() -> Value {
     json!({
         "id":"in_1",
         "customer":"cus_1",
+        "subscription":"sub_1",
         "status":"paid",
         "currency":"gbp",
         "amount_paid":299,
@@ -370,6 +371,35 @@ async fn rejects_unpaid_invoice_and_untrusted_binding_before_observation() {
 
     let mut responses = HashMap::new();
     responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    let mut contradictory_invoice = paid_invoice();
+    contradictory_invoice["subscription"] = json!("sub_other");
+    responses.insert(
+        "/v1/invoices/in_1".into(),
+        vec![MockResponse::json(contradictory_invoice)],
+    );
+    responses.insert(
+        "/v1/invoices/in_1/lines".into(),
+        vec![MockResponse::json(list(vec![personal_line("il_1")], false))],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![MockResponse::json(list(vec![paid_payment()], false))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+            .await,
+        Err(StripeReadError::Observation(
+            sotto_server::cloud_provider_stripe::StripeContractError::OwnershipMismatch
+        ))
+    ));
+
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
     responses.insert(
         "/v1/invoices/in_1".into(),
         vec![MockResponse::json(paid_invoice())],
@@ -396,6 +426,29 @@ async fn rejects_unpaid_invoice_and_untrusted_binding_before_observation() {
         Err(StripeReadError::Observation(
             sotto_server::cloud_provider_stripe::StripeContractError::OwnershipMismatch
         ))
+    ));
+}
+
+#[tokio::test]
+async fn rejects_malformed_present_invoice_fields_instead_of_treating_them_as_absent() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    let mut malformed_invoice = paid_invoice();
+    malformed_invoice["amount_paid"] = json!("299");
+    responses.insert(
+        "/v1/invoices/in_1".into(),
+        vec![MockResponse::json(malformed_invoice)],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    assert!(matches!(
+        client
+            .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+            .await,
+        Err(StripeReadError::MalformedResponse("invoice.amount_paid"))
     ));
 }
 
