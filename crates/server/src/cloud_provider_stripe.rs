@@ -234,7 +234,7 @@ pub(crate) fn validate_personal_invoice_observation(
     if facts.period_start < 0 || facts.period_end <= facts.period_start {
         return Err(StripeContractError::InvalidField("period"));
     }
-    if facts.currency != STRIPE_CURRENCY {
+    if facts.currency.to_ascii_lowercase() != STRIPE_CURRENCY {
         return Err(StripeContractError::InvalidField("currency"));
     }
     if facts.settlement.livemode != matches!(config.environment, ProviderEnvironment::Live)
@@ -258,7 +258,7 @@ pub(crate) fn validate_personal_invoice_observation(
         subscription_id: facts.subscription_id,
         provider_item_id: facts.provider_item_id,
         allocation_reference: facts.allocation_reference,
-        currency: facts.currency,
+        currency: facts.currency.to_ascii_lowercase(),
         amount_paid: facts.amount_paid,
         interval,
         period_start: facts.period_start,
@@ -453,7 +453,7 @@ pub fn decode_paid_invoice(
     if invoice.get("status").and_then(Value::as_str) != Some("paid") {
         return Err(StripeContractError::UnpaidInvoice);
     }
-    let currency = required_string(invoice, "currency")?.to_ascii_lowercase();
+    let currency = required_string(invoice, "currency")?;
     let amount_paid = required_i64(invoice, "amount_paid")?;
     let amount_due = required_i64(invoice, "amount_due")?;
     let amount_overpaid = required_i64(invoice, "amount_overpaid")?;

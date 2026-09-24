@@ -856,8 +856,7 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
         customer_id: optional_validated_ref(value.get("customer"), "invoice.customer")?,
         subscription_id: optional_validated_ref(value.get("subscription"), "invoice.subscription")?,
         status: optional_string(value.get("status"), "invoice.status")?,
-        currency: optional_string(value.get("currency"), "invoice.currency")?
-            .map(|currency| currency.to_ascii_lowercase()),
+        currency: optional_string(value.get("currency"), "invoice.currency")?,
         amount_paid: optional_i64(value.get("amount_paid"), "invoice.amount_paid")?,
         amount_due: optional_i64(value.get("amount_due"), "invoice.amount_due")?,
         amount_overpaid: optional_i64(value.get("amount_overpaid"), "invoice.amount_overpaid")?,
@@ -927,7 +926,7 @@ fn parse_invoice_payment(value: &Value) -> Result<StripeInvoicePaymentResource, 
         status: required_string(value, "status")?,
         amount_paid: required_i64(value, "amount_paid")?,
         amount_requested: required_i64(value, "amount_requested")?,
-        currency: required_string(value, "currency")?.to_ascii_lowercase(),
+        currency: required_string(value, "currency")?,
         livemode: optional_bool(value.get("livemode"), "invoice payment.livemode")?,
         payment_type: required_string_object(payment, "type", "payment.type")?,
         payment_intent_id: optional_validated_ref(

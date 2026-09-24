@@ -453,6 +453,39 @@ async fn rejects_malformed_present_invoice_fields_instead_of_treating_them_as_ab
 }
 
 #[tokio::test]
+async fn rejects_mixed_invoice_and_payment_currency_casing() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    let mut invoice = paid_invoice();
+    invoice["currency"] = json!("GBP");
+    responses.insert(
+        "/v1/invoices/in_1".into(),
+        vec![MockResponse::json(invoice)],
+    );
+    responses.insert(
+        "/v1/invoices/in_1/lines".into(),
+        vec![MockResponse::json(list(vec![personal_line("il_1")], false))],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![MockResponse::json(list(vec![paid_payment()], false))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    assert!(matches!(
+        client
+            .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+            .await,
+        Err(StripeReadError::Observation(
+            sotto_server::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(_)
+        ))
+    ));
+}
+
+#[tokio::test]
 async fn reads_resources_with_authentication_and_complete_pagination() {
     let mut responses = HashMap::new();
     responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
