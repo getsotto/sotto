@@ -3,14 +3,9 @@
 //! This target is deliberately database-gated. It creates its own database so the pre-0025
 //! schema can be populated without rewinding the database used by the other integration tests.
 
-use std::borrow::Cow;
-use std::str::FromStr;
-
 use serde_json::Value;
 use sqlx::migrate::Migrator;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
-use uuid::Uuid;
 
 use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::{
@@ -24,71 +19,16 @@ use sotto_server::cloud_provider::{
 };
 use sotto_server::db;
 
-static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
-
-struct DisposableDatabase {
-    admin: PgPool,
-    name: String,
-    pool: PgPool,
+// Only the migration helpers: `support/mod.rs` also carries the race harness, which this target
+// does not use, and pulling it in would fail the build on dead code.
+mod support {
+    pub mod migrations;
 }
 
-impl DisposableDatabase {
-    async fn create() -> Option<Self> {
-        if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
-            return None;
-        }
-        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
-        let base = PgConnectOptions::from_str(&url).expect("parse DATABASE_URL");
-        assert!(
-            matches!(base.get_host(), "localhost" | "127.0.0.1" | "::1"),
-            "refusing migration test against non-local host: {}",
-            base.get_host()
-        );
-        let admin = PgPoolOptions::new()
-            .max_connections(2)
-            .connect_with(base.clone().database("postgres"))
-            .await
-            .expect("connect to postgres maintenance database");
-        let name = format!("sotto_cloud_upgrade_{}", Uuid::new_v4().simple());
-        sqlx::query(&format!("CREATE DATABASE \"{name}\""))
-            .execute(&admin)
-            .await
-            .expect("create disposable migration database");
-        let pool = PgPoolOptions::new()
-            .max_connections(8)
-            .connect_with(base.database(&name))
-            .await
-            .expect("connect to disposable migration database");
-        Some(Self { admin, name, pool })
-    }
-
-    async fn cleanup(self) {
-        self.pool.close().await;
-        sqlx::query(&format!("DROP DATABASE \"{}\" WITH (FORCE)", self.name))
-            .execute(&self.admin)
-            .await
-            .expect("drop disposable migration database");
-        self.admin.close().await;
-    }
-}
+use support::migrations::{migrator_before, DisposableDatabase};
 
 fn old_migrator() -> Migrator {
     migrator_before(25)
-}
-
-fn migrator_before(version: i64) -> Migrator {
-    Migrator {
-        migrations: Cow::Owned(
-            ALL_MIGRATIONS
-                .iter()
-                .filter(|migration| migration.version < version)
-                .cloned()
-                .collect(),
-        ),
-        ignore_missing: false,
-        locking: true,
-        no_tx: false,
-    }
 }
 
 async fn seed_legacy_provider_receipt(

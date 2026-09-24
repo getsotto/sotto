@@ -302,6 +302,9 @@ enum TokenCommand {
         /// Human label for the token ("github-actions").
         #[arg(long, default_value = "ci")]
         name: String,
+        /// Days until the token stops working (the server allows 1 to 365; default 90).
+        #[arg(long)]
+        expires_in_days: Option<u32>,
     },
     /// List the active environment's machine tokens.
     Ls,
@@ -831,23 +834,40 @@ fn token_command(
         .get_environment(&config.project_id, &config.environment)?
         .ok_or_else(|| Error::NotFound(format!("environment `{}`", config.environment)))?;
     match command {
-        TokenCommand::Create { name } => {
+        TokenCommand::Create {
+            name,
+            expires_in_days,
+        } => {
             ensure_unlocked(store, keychain)?;
             let master = session::current_master_key(keychain)?.ok_or(Error::Locked)?;
             let keypair = session::account_keypair(store, &master)?;
-            let token =
-                remote::team::create_machine_token(&client, store, &keypair, config, &name)?;
+            let issued = remote::team::create_machine_token(
+                &client,
+                store,
+                &keypair,
+                config,
+                &name,
+                expires_in_days,
+            )?;
+            let expiry = issued
+                .expires_at
+                .map(|at| format!(", expires {}", at.escape_debug()))
+                .unwrap_or_default();
             eprintln!(
-                "machine token `{name}` for {}/{} - save it now; it is never shown again:",
+                "machine token `{name}` for {}/{}{expiry} - save it now; it is never shown again:",
                 config.project, config.environment
             );
-            println!("{token}");
+            println!("{}", issued.token);
             Ok(())
         }
         TokenCommand::Ls => {
             for t in remote::SyncApi::list_machine_tokens(&client, &env.id)? {
+                let expiry = t
+                    .expiry_label()
+                    .map(|label| format!("  {label}"))
+                    .unwrap_or_default();
                 println!(
-                    "{}  {}  {}",
+                    "{}  {}  {}{expiry}",
                     t.token_id,
                     t.name,
                     t.created_by.as_deref().unwrap_or("(unknown creator)")
@@ -1714,8 +1734,13 @@ fn machine_server_url() -> Result<String> {
 fn machine_entries(token: &str) -> Result<Vec<(String, String)>> {
     let token = remote::machine::parse_token(token)?;
     let server = machine_server_url()?;
+    let fetched = remote::machine::fetch_entries(&server, &token)?;
+    // stderr only, and never an error: a warning must not change what the job does.
+    if let Some(warning) = fetched.expiry_warning {
+        eprintln!("{warning}");
+    }
     let mut entries = Vec::new();
-    for (name, value) in remote::machine::fetch_entries(&server, &token)? {
+    for (name, value) in fetched.entries {
         let value = String::from_utf8(value).map_err(|_| {
             Error::Input(format!(
                 "secret `{name}` is not valid UTF-8; cannot inject or export it as text"

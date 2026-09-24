@@ -452,16 +452,25 @@ pub fn remove_member(
     })
 }
 
+/// A freshly issued machine token: the `SOTTO_TOKEN` string (shown once) and its end date, if the
+/// server reports one.
+pub struct IssuedMachineToken {
+    pub token: String,
+    pub expires_at: Option<String>,
+}
+
 /// Create a machine token for an environment: generate the machine's X25519 keypair locally, open
 /// our own grant, re-seal the vault key to the machine, upload the public half, and assemble the
-/// `SOTTO_TOKEN` string. The machine's private key never reaches the server.
+/// `SOTTO_TOKEN` string. The machine's private key never reaches the server. `expires_in_days` of
+/// `None` takes the server's default lifetime.
 pub fn create_machine_token(
     api: &dyn SyncApi,
     store: &Store,
     keypair: &wrap::Keypair,
     config: &Config,
     name: &str,
-) -> Result<String> {
+    expires_in_days: Option<u32>,
+) -> Result<IssuedMachineToken> {
     let env = store
         .get_environment(&config.project_id, &config.environment)?
         .ok_or_else(|| Error::NotFound(format!("environment `{}`", config.environment)))?;
@@ -476,9 +485,10 @@ pub fn create_machine_token(
         name,
         &b64encode(&machine.public),
         &b64encode(&machine_grant),
+        expires_in_days,
     )?;
-    Ok(super::machine::assemble_token(
-        &created.token,
-        &machine.secret,
-    ))
+    Ok(IssuedMachineToken {
+        token: super::machine::assemble_token(&created.token, &machine.secret),
+        expires_at: created.expires_at,
+    })
 }

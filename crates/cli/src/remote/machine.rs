@@ -20,6 +20,9 @@ use super::api::b64decode;
 /// Prefix + version of the machine-key half of the token string.
 const KEY_PREFIX: &str = "MT";
 const KEY_VERSION: u8 = 1;
+/// Warn in the job log once a token has fewer than this many whole days left. Two weeks spans a
+/// holiday and a sprint, so whoever owns the pipeline sees it at least once before it breaks.
+const EXPIRY_WARNING_DAYS: i64 = 14;
 
 /// A parsed machine token: the API bearer + the machine keypair recovered from its private key.
 pub struct MachineToken {
@@ -64,6 +67,13 @@ pub fn parse_token(token: &str) -> Result<MachineToken> {
 struct GrantResponse {
     env_id: String,
     enc_vault_key: String,
+    // Absent from servers that predate token expiry, whose tokens never expire.
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    expires_in_days: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -81,9 +91,34 @@ struct SnapshotResponse {
     secrets: Vec<SecretEntry>,
 }
 
-/// Fetch the machine's grant + env snapshot and decrypt every live secret in memory, returning
-/// sorted `(name, value)` pairs. The vault key and plaintexts never touch disk.
-pub fn fetch_entries(server: &str, token: &MachineToken) -> Result<Vec<(String, Vec<u8>)>> {
+/// What a machine fetch yields: the decrypted secrets, and a warning to print if the token is
+/// close to expiry.
+pub struct MachineFetch {
+    /// Sorted `(name, value)` pairs.
+    pub entries: Vec<(String, Vec<u8>)>,
+    pub expiry_warning: Option<String>,
+}
+
+/// The one-line warning for a token with `days_left` whole days to go, or `None` while it still
+/// has at least `EXPIRY_WARNING_DAYS`. Days come from the server, never this machine's clock.
+///
+/// `name` and `expires_at` come from the server too, which the zero-knowledge model does not
+/// trust, and this line lands in a CI log. Escaping keeps it one line: a raw newline would let the
+/// server start a line the runner obeys as a workflow command, and an escape sequence could
+/// rewrite output already shown.
+pub fn expiry_warning(name: &str, expires_at: &str, days_left: i64) -> Option<String> {
+    (days_left < EXPIRY_WARNING_DAYS).then(|| {
+        let (name, expires_at) = (name.escape_debug(), expires_at.escape_debug());
+        format!(
+            "warning: machine token `{name}` expires {expires_at} ({days_left}d left); \
+             issue a replacement with `sotto token create`"
+        )
+    })
+}
+
+/// Fetch the machine's grant + env snapshot and decrypt every live secret in memory. The vault
+/// key and plaintexts never touch disk.
+pub fn fetch_entries(server: &str, token: &MachineToken) -> Result<MachineFetch> {
     let http = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -96,7 +131,7 @@ pub fn fetch_entries(server: &str, token: &MachineToken) -> Result<Vec<(String, 
             .map_err(|e| Error::Network(e.to_string()))?;
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(Error::Input(
-                "SOTTO_TOKEN was rejected (revoked or invalid)".into(),
+                "SOTTO_TOKEN was rejected (revoked, expired, or invalid)".into(),
             ));
         }
         if !resp.status().is_success() {
@@ -135,7 +170,14 @@ pub fn fetch_entries(server: &str, token: &MachineToken) -> Result<Vec<(String, 
         entries.push((name, value));
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(entries)
+    let expiry_warning = match (&grant.name, &grant.expires_at, grant.expires_in_days) {
+        (Some(name), Some(at), Some(days)) => expiry_warning(name, at, days),
+        _ => None,
+    };
+    Ok(MachineFetch {
+        entries,
+        expiry_warning,
+    })
 }
 
 #[cfg(test)]
@@ -151,6 +193,42 @@ mod tests {
         assert_eq!(
             parsed.keypair.public,
             wrap::keypair_from_secret(&secret).public
+        );
+    }
+
+    #[test]
+    fn expiry_warning_starts_two_weeks_out() {
+        let at = "2026-12-22T10:00:00Z";
+        assert_eq!(expiry_warning("ci", at, 14), None);
+        assert_eq!(
+            expiry_warning("ci", at, 13).as_deref(),
+            Some(
+                "warning: machine token `ci` expires 2026-12-22T10:00:00Z (13d left); \
+                 issue a replacement with `sotto token create`"
+            )
+        );
+        assert!(expiry_warning("ci", at, 0).is_some());
+    }
+
+    #[test]
+    fn expiry_warning_cannot_forge_ci_log_lines() {
+        // Both strings come from the server, which the zero-knowledge model does not trust. A
+        // newline would start a line the CI runner reads as its own (`::error::` and friends), and
+        // an escape sequence could rewrite what is already on screen.
+        let warning = expiry_warning(
+            "ci\n::error::forged\u{1b}[2K",
+            "2026-12-22T10:00:00Z\r\n::add-mask::x",
+            3,
+        )
+        .expect("warned");
+        assert!(!warning.chars().any(char::is_control), "{warning:?}");
+        assert!(
+            warning.contains(r"ci\n::error::forged\u{1b}[2K"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(r"2026-12-22T10:00:00Z\r\n::add-mask::x"),
+            "{warning}"
         );
     }
 
