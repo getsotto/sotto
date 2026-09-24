@@ -1323,11 +1323,23 @@ async fn org_for_subscription(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignatureVerificationError {
+    Malformed,
+    Stale,
+    Invalid,
+}
+
 /// Verify a `Stripe-Signature` header: `t=<unix>,v1=<hex hmac>[,v1=…]`, where the MAC is
 /// HMAC-SHA256 over `"{t}.{payload}"`. Any valid `v1` within the timestamp tolerance passes
 /// (Stripe sends multiples during secret rotation); comparison is constant-time via the `hmac`
 /// crate's `verify_slice`.
-pub(crate) fn verify_signature(secret: &str, header: &str, payload: &str, now: i64) -> bool {
+pub(crate) fn verify_signature_detailed(
+    secret: &str,
+    header: &str,
+    payload: &str,
+    now: i64,
+) -> std::result::Result<(), SignatureVerificationError> {
     let mut timestamp: Option<i64> = None;
     let mut candidates: Vec<Vec<u8>> = Vec::new();
     for part in header.split(',') {
@@ -1341,18 +1353,33 @@ pub(crate) fn verify_signature(secret: &str, header: &str, payload: &str, now: i
             _ => {}
         }
     }
-    let Some(t) = timestamp else { return false };
+    let Some(t) = timestamp else {
+        return Err(SignatureVerificationError::Malformed);
+    };
     if (now - t).abs() > SIGNATURE_TOLERANCE_SECS || candidates.is_empty() {
-        return false;
+        return Err(if candidates.is_empty() {
+            SignatureVerificationError::Malformed
+        } else {
+            SignatureVerificationError::Stale
+        });
     }
     let mut mac =
         Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(t.to_string().as_bytes());
     mac.update(b".");
     mac.update(payload.as_bytes());
-    candidates
+    if candidates
         .into_iter()
         .any(|candidate| mac.clone().verify_slice(&candidate).is_ok())
+    {
+        Ok(())
+    } else {
+        Err(SignatureVerificationError::Invalid)
+    }
+}
+
+pub(crate) fn verify_signature(secret: &str, header: &str, payload: &str, now: i64) -> bool {
+    verify_signature_detailed(secret, header, payload, now).is_ok()
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {

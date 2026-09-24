@@ -11,7 +11,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use crate::billing::webhook_version_accepted;
+use crate::billing::{
+    verify_signature_detailed, webhook_version_accepted, SignatureVerificationError,
+};
 use crate::cloud_provider::{
     PayerKind, ProviderAdapterError, ProviderContext, ProviderEnvironment, VerifiedProviderEvent,
 };
@@ -191,6 +193,10 @@ impl StripeAllocationBinding {
 pub enum StripeContractError {
     #[error("invalid Stripe configuration: {0}")]
     InvalidConfig(&'static str),
+    #[error("Stripe webhook signature is malformed")]
+    MalformedSignature,
+    #[error("Stripe webhook signature is stale")]
+    StaleSignature,
     #[error("Stripe webhook signature is invalid")]
     InvalidSignature,
     #[error("Stripe webhook payload is malformed")]
@@ -244,6 +250,9 @@ struct RawEventData {
 }
 
 /// Verify and normalise a supported `invoice.paid` event with separately fetched settlement.
+///
+/// The webhook secret binds this event to the configured operator account. Direct events omit
+/// `event.account`; any present account or Connect context is rejected by this contract.
 pub fn decode_paid_invoice(
     raw_payload: &[u8],
     signature_header: &str,
@@ -255,9 +264,13 @@ pub fn decode_paid_invoice(
 ) -> Result<StripeCoverageEvidence, StripeContractError> {
     let payload =
         std::str::from_utf8(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;
-    if !crate::billing::verify_signature(webhook_secret, signature_header, payload, now) {
-        return Err(StripeContractError::InvalidSignature);
-    }
+    verify_signature_detailed(webhook_secret, signature_header, payload, now).map_err(|error| {
+        match error {
+            SignatureVerificationError::Malformed => StripeContractError::MalformedSignature,
+            SignatureVerificationError::Stale => StripeContractError::StaleSignature,
+            SignatureVerificationError::Invalid => StripeContractError::InvalidSignature,
+        }
+    })?;
 
     let event: RawStripeEvent =
         serde_json::from_slice(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;

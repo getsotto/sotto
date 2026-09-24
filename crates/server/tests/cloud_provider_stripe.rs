@@ -176,6 +176,20 @@ fn signature_and_timestamp_fail_before_payload_is_interpreted() {
             &binding(),
             &settlement(),
         ),
+        Err(StripeContractError::StaleSignature)
+    ));
+
+    let malformed = b"not json";
+    assert!(matches!(
+        decode_paid_invoice(
+            malformed,
+            "t=1700000000,v1=00",
+            SECRET,
+            NOW,
+            &config(),
+            &binding(),
+            &settlement(),
+        ),
         Err(StripeContractError::InvalidSignature)
     ));
 }
