@@ -6,6 +6,9 @@ The examples are synthetic loopback fixtures; they are not claims about a connec
 The field names and endpoint relationships were checked against the Stripe API reference with the
 repository's Stripe documentation workflow on 24 September 2026. The client pins the outbound
 version separately in `billing::STRIPE_API_VERSION`; this document does not change that pin.
+The references used were [retrieve an invoice](https://docs.stripe.com/api/invoices/retrieve),
+[retrieve invoice line items](https://docs.stripe.com/api/invoice-line-item/retrieve), and [list
+invoice payments](https://docs.stripe.com/api/invoice-payment/list).
 
 | Resource | Required fields used | Provenance and rejection rule |
 | --- | --- | --- |
