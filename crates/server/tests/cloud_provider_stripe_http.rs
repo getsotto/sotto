@@ -314,7 +314,7 @@ async fn reads_all_payment_pages_before_rejecting_ambiguous_settlement() {
                     "id":"inpay_2",
                     "invoice":"in_1",
                     "status":"canceled",
-                    "amount_paid":0,
+                    "amount_paid":null,
                     "amount_requested":299,
                     "currency":"gbp",
                     "livemode":false,
