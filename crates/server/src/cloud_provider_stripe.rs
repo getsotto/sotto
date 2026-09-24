@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::billing::webhook_version_accepted;
 use crate::cloud_provider::{
-    ProviderAdapterError, ProviderContext, ProviderEnvironment, VerifiedProviderEvent,
+    PayerKind, ProviderAdapterError, ProviderContext, ProviderEnvironment, VerifiedProviderEvent,
 };
 
 pub const STRIPE_NAMESPACE: &str = "stripe";
@@ -121,16 +121,18 @@ pub enum StripeAccountProvenance {
     DeclaredAccount(String),
 }
 
-/// Durable ownership resolved by the caller before evidence can authorise coverage.
+/// Durable personal ownership resolved by the caller before evidence can authorise coverage.
 ///
 /// The value copied from invoice metadata is only a claim. It must match this trusted binding;
-/// metadata alone never establishes a beneficiary or allocation.
+/// metadata alone never establishes a beneficiary or allocation. Sponsor allocations are rejected
+/// until their quantity and multi-beneficiary receipt contract is implemented.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeAllocationBinding {
-    pub allocation_reference: String,
-    pub customer_id: String,
-    pub subscription_id: String,
-    pub provider_item_id: String,
+    allocation_reference: String,
+    customer_id: String,
+    subscription_id: String,
+    provider_item_id: String,
+    payer_kind: PayerKind,
 }
 
 impl StripeAllocationBinding {
@@ -139,12 +141,17 @@ impl StripeAllocationBinding {
         customer_id: impl Into<String>,
         subscription_id: impl Into<String>,
         provider_item_id: impl Into<String>,
+        payer_kind: PayerKind,
     ) -> Result<Self, StripeContractError> {
+        if payer_kind != PayerKind::Personal {
+            return Err(StripeContractError::UnsupportedPayerKind);
+        }
         let binding = Self {
             allocation_reference: allocation_reference.into(),
             customer_id: customer_id.into(),
             subscription_id: subscription_id.into(),
             provider_item_id: provider_item_id.into(),
+            payer_kind,
         };
         for (value, name) in [
             (&binding.allocation_reference, "allocation reference"),
@@ -157,6 +164,10 @@ impl StripeAllocationBinding {
             }
         }
         Ok(binding)
+    }
+
+    pub const fn payer_kind(&self) -> PayerKind {
+        self.payer_kind
     }
 }
 
@@ -194,6 +205,8 @@ pub enum StripeContractError {
     UnsupportedSettlement(&'static str),
     #[error("Stripe evidence does not match the trusted allocation binding")]
     OwnershipMismatch,
+    #[error("Stripe coverage currently supports personal allocations only")]
+    UnsupportedPayerKind,
 }
 
 #[derive(Debug, Deserialize)]

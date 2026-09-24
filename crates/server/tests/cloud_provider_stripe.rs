@@ -5,7 +5,7 @@
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use sotto_server::cloud_provider::ProviderEnvironment;
+use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
 use sotto_server::cloud_provider_stripe::{
     decode_paid_invoice, StripeAccountProvenance, StripeAllocationBinding, StripeContractError,
     StripeCoverageConfig, StripeInterval,
@@ -30,6 +30,7 @@ fn binding() -> StripeAllocationBinding {
         "cus_contract_person",
         "sub_contract_person",
         "si_contract_person",
+        PayerKind::Personal,
     )
     .unwrap()
 }
@@ -319,6 +320,16 @@ fn malformed_and_invalid_configuration_fail_closed() {
         Err(StripeContractError::InvalidConfig(
             "monthly and annual Stripe prices must differ"
         ))
+    ));
+    assert!(matches!(
+        StripeAllocationBinding::new(
+            "allocation_sponsor",
+            "cus_sponsor",
+            "sub_sponsor",
+            "si_sponsor",
+            PayerKind::Sponsor,
+        ),
+        Err(StripeContractError::UnsupportedPayerKind)
     ));
 
     let (raw, signature) = signed_payload(&json!({"not": "an event"}), NOW);
