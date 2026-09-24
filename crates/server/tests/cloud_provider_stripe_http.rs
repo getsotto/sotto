@@ -10,8 +10,8 @@ use axum::response::Response;
 use axum::routing::any;
 use axum::Router;
 use serde_json::{json, Value};
-use sotto_server::cloud_provider::ProviderEnvironment;
-use sotto_server::cloud_provider_stripe::StripeCoverageConfig;
+use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
+use sotto_server::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
 use sotto_server::cloud_provider_stripe_http::{
     StripeReadClient, StripeReadError, StripeReadLimits,
 };
@@ -195,6 +195,208 @@ fn limits() -> StripeReadLimits {
         max_retries: 1,
         max_retry_after: std::time::Duration::from_millis(10),
     }
+}
+
+fn personal_binding() -> StripeAllocationBinding {
+    StripeAllocationBinding::new("alloc_1", "cus_1", "sub_1", "si_1", PayerKind::Personal).unwrap()
+}
+
+fn paid_invoice() -> Value {
+    json!({
+        "id":"in_1",
+        "customer":"cus_1",
+        "status":"paid",
+        "currency":"gbp",
+        "amount_paid":299,
+        "amount_due":299,
+        "amount_overpaid":0,
+        "amount_paid_off_stripe":0,
+        "livemode":false,
+        "metadata":{"sotto_allocation_reference":"alloc_1"}
+    })
+}
+
+fn personal_line(id: &str) -> Value {
+    json!({
+        "id":id,
+        "quantity":1,
+        "livemode":false,
+        "parent":{
+            "type":"subscription_item_details",
+            "subscription_item_details":{
+                "subscription":"sub_1",
+                "subscription_item":"si_1"
+            }
+        },
+        "pricing":{
+            "type":"price_details",
+            "price_details":{"price":"price_month"}
+        },
+        "period":{"start":1700000000,"end":1702592000}
+    })
+}
+
+fn paid_payment() -> Value {
+    json!({
+        "id":"inpay_1",
+        "invoice":"in_1",
+        "status":"paid",
+        "amount_paid":299,
+        "amount_requested":299,
+        "currency":"gbp",
+        "livemode":false,
+        "payment":{"type":"payment_intent","payment_intent":"pi_1"}
+    })
+}
+
+#[tokio::test]
+async fn assembles_a_personal_invoice_observation_from_complete_reads() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/invoices/in_1".into(),
+        vec![MockResponse::json(paid_invoice())],
+    );
+    responses.insert(
+        "/v1/invoices/in_1/lines".into(),
+        vec![MockResponse::json(list(vec![personal_line("il_1")], false))],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![MockResponse::json(list(vec![paid_payment()], false))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    let observation = client
+        .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+        .await
+        .unwrap();
+
+    assert_eq!(observation.invoice_id(), "in_1");
+    assert_eq!(observation.customer_id(), "cus_1");
+    assert_eq!(observation.subscription_id(), "sub_1");
+    assert_eq!(observation.provider_item_id(), "si_1");
+    assert_eq!(observation.allocation_reference(), "alloc_1");
+    assert_eq!(observation.payment_intent_id(), "pi_1");
+    assert_eq!(observation.currency(), "gbp");
+    assert_eq!(observation.amount_paid(), 299);
+    assert_eq!(observation.interval().to_string(), "month");
+    assert_eq!(observation.period_start(), 1_700_000_000);
+    assert_eq!(observation.period_end(), 1_702_592_000);
+    assert_eq!(
+        observation.evidence_reference(),
+        "stripe:invoice:in_1:line:il_1"
+    );
+}
+
+#[tokio::test]
+async fn reads_all_payment_pages_before_rejecting_ambiguous_settlement() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/invoices/in_1".into(),
+        vec![MockResponse::json(paid_invoice())],
+    );
+    responses.insert(
+        "/v1/invoices/in_1/lines".into(),
+        vec![MockResponse::json(list(vec![personal_line("il_1")], false))],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![
+            MockResponse::json(list(vec![paid_payment()], true)),
+            MockResponse::json(list(
+                vec![json!({
+                    "id":"inpay_2",
+                    "invoice":"in_1",
+                    "status":"canceled",
+                    "amount_paid":0,
+                    "amount_requested":299,
+                    "currency":"gbp",
+                    "livemode":false,
+                    "payment":{"type":"payment_intent","payment_intent":"pi_2"}
+                })],
+                false,
+            )),
+        ],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    assert!(matches!(
+        client
+            .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+            .await,
+        Err(StripeReadError::Observation(
+            sotto_server::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(_)
+        ))
+    ));
+    assert!(server
+        .state
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|call| call.path_and_query.contains("starting_after=inpay_1")));
+}
+
+#[tokio::test]
+async fn rejects_unpaid_invoice_and_untrusted_binding_before_observation() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    let mut unpaid_invoice = paid_invoice();
+    unpaid_invoice["status"] = json!("open");
+    responses.insert(
+        "/v1/invoices/in_1".into(),
+        vec![MockResponse::json(unpaid_invoice)],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+            .await,
+        Err(StripeReadError::Observation(
+            sotto_server::cloud_provider_stripe::StripeContractError::UnpaidInvoice
+        ))
+    ));
+
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/invoices/in_1".into(),
+        vec![MockResponse::json(paid_invoice())],
+    );
+    responses.insert(
+        "/v1/invoices/in_1/lines".into(),
+        vec![MockResponse::json(list(vec![personal_line("il_1")], false))],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![MockResponse::json(list(vec![paid_payment()], false))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    let wrong_binding =
+        StripeAllocationBinding::new("alloc_other", "cus_1", "sub_1", "si_1", PayerKind::Personal)
+            .unwrap();
+    assert!(matches!(
+        client
+            .personal_invoice_observation(&mut session, "in_1", &wrong_binding)
+            .await,
+        Err(StripeReadError::Observation(
+            sotto_server::cloud_provider_stripe::StripeContractError::OwnershipMismatch
+        ))
+    ));
 }
 
 #[tokio::test]
