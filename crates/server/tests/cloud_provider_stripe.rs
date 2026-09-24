@@ -75,6 +75,16 @@ fn paid_personal_invoice_accepts_expanded_references_and_normalizes_evidence() {
 }
 
 #[test]
+fn annual_standard_price_maps_to_a_year_interval() {
+    let mut annual = fixture();
+    annual["data"]["object"]["lines"]["data"][0]["price"]["id"] = json!("price_contract_year");
+    annual["data"]["object"]["lines"]["data"][0]["price"]["recurring"]["interval"] = json!("year");
+    let evidence = decode(&annual).unwrap();
+    assert_eq!(evidence.interval, StripeInterval::Year);
+    assert_eq!(evidence.price_id, "price_contract_year");
+}
+
+#[test]
 fn irrelevant_payload_changes_do_not_change_the_event_hash() {
     let original = fixture();
     let mut changed = fixture();
