@@ -107,8 +107,9 @@ pub struct HistoryKeyEntry {
 }
 
 /// A rotation request: rewrapped data keys (current + history) + the replacement grant set (users
-/// and machines), at a base revision. `machine_grants` must cover exactly the env's active machine
-/// tokens; `history_keys` exactly its retained versions.
+/// and machines), at a base revision. `machine_grants` must cover every active machine token in the
+/// env and may also cover one that expired after it was listed; `history_keys` must cover exactly
+/// the env's retained versions.
 #[derive(Debug, Clone, Serialize)]
 pub struct RotateRequest {
     pub base_revision: i64,

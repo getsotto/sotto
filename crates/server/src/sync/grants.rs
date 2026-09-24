@@ -180,8 +180,9 @@ struct RotateRequest {
     grants: Vec<GrantEntry>,
     /// Every current secret's data key, rewrapped under the new vault key.
     data_keys: Vec<DataKeyEntry>,
-    /// The new vault key re-sealed to every *active* machine token's public key. Must cover exactly
-    /// the env's active tokens (revoke a token first to drop it), so rotation never strands CI.
+    /// The new vault key re-sealed to every *active* machine token's public key. Must cover every
+    /// active token in the env (revoke a token first to drop it), so rotation never strands CI, and
+    /// may also cover one that expired after the client listed it; nothing else is accepted.
     #[serde(default)]
     machine_grants: Vec<MachineGrantEntry>,
     /// Every retained history version's data key, rewrapped under the new vault key. Must cover
