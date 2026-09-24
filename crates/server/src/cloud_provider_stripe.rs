@@ -100,13 +100,13 @@ impl StripeCoverageConfig {
 /// expanded payment objects, so the transport layer must authenticate this response independently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripePaymentSettlement {
-    pub invoice_payment_id: String,
-    pub invoice_id: String,
-    pub payment_intent_id: String,
-    pub amount_paid: i64,
-    pub amount_requested: i64,
-    pub currency: String,
-    pub livemode: bool,
+    invoice_payment_id: String,
+    invoice_id: String,
+    payment_intent_id: String,
+    amount_paid: i64,
+    amount_requested: i64,
+    currency: String,
+    livemode: bool,
 }
 
 /// Normalised, signature-verified evidence for one personal subscription seat.
