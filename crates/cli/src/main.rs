@@ -851,7 +851,7 @@ fn token_command(
             )?;
             let expiry = issued
                 .expires_at
-                .map(|at| format!(", expires {at}"))
+                .map(|at| format!(", expires {}", at.escape_debug()))
                 .unwrap_or_default();
             eprintln!(
                 "machine token `{name}` for {}/{}{expiry} - save it now; it is never shown again:",

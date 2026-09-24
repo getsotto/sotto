@@ -101,8 +101,14 @@ pub struct MachineFetch {
 
 /// The one-line warning for a token with `days_left` whole days to go, or `None` while it still
 /// has at least `EXPIRY_WARNING_DAYS`. Days come from the server, never this machine's clock.
+///
+/// `name` and `expires_at` come from the server too, which the zero-knowledge model does not
+/// trust, and this line lands in a CI log. Escaping keeps it one line: a raw newline would let the
+/// server start a line the runner obeys as a workflow command, and an escape sequence could
+/// rewrite output already shown.
 pub fn expiry_warning(name: &str, expires_at: &str, days_left: i64) -> Option<String> {
     (days_left < EXPIRY_WARNING_DAYS).then(|| {
+        let (name, expires_at) = (name.escape_debug(), expires_at.escape_debug());
         format!(
             "warning: machine token `{name}` expires {expires_at} ({days_left}d left); \
              issue a replacement with `sotto token create`"
@@ -202,6 +208,28 @@ mod tests {
             )
         );
         assert!(expiry_warning("ci", at, 0).is_some());
+    }
+
+    #[test]
+    fn expiry_warning_cannot_forge_ci_log_lines() {
+        // Both strings come from the server, which the zero-knowledge model does not trust. A
+        // newline would start a line the CI runner reads as its own (`::error::` and friends), and
+        // an escape sequence could rewrite what is already on screen.
+        let warning = expiry_warning(
+            "ci\n::error::forged\u{1b}[2K",
+            "2026-12-22T10:00:00Z\r\n::add-mask::x",
+            3,
+        )
+        .expect("warned");
+        assert!(!warning.chars().any(char::is_control), "{warning:?}");
+        assert!(
+            warning.contains(r"ci\n::error::forged\u{1b}[2K"),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(r"2026-12-22T10:00:00Z\r\n::add-mask::x"),
+            "{warning}"
+        );
     }
 
     #[test]

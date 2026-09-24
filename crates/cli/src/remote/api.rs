@@ -176,9 +176,9 @@ pub struct MachineTokenInfo {
 
 impl MachineTokenInfo {
     /// `expires <timestamp> (in <n>d)` for listings, or `None` against a server that predates
-    /// token expiry.
+    /// token expiry. The timestamp is server-sent, so it is escaped onto one line.
     pub fn expiry_label(&self) -> Option<String> {
-        let at = self.expires_at.as_deref()?;
+        let at = self.expires_at.as_deref()?.escape_debug();
         Some(match self.expires_in_days {
             Some(days) => format!("expires {at} (in {days}d)"),
             None => format!("expires {at}"),
@@ -463,5 +463,12 @@ mod tests {
             new.expiry_label().as_deref(),
             Some("expires 2026-12-22T10:00:00Z (in 90d)")
         );
+
+        let forged: MachineTokenInfo = serde_json::from_str(
+            r#"{"token_id":"t","name":"ci","public_key":"pk","created_by":null,"expires_at":"soon\nroot  admin  forged","expires_in_days":1}"#,
+        )
+        .unwrap();
+        let label = forged.expiry_label().unwrap();
+        assert!(!label.chars().any(char::is_control), "{label:?}");
     }
 }
