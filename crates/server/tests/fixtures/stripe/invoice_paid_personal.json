@@ -14,6 +14,13 @@
       "paid": true,
       "currency": "gbp",
       "amount_paid": 299,
+      "amount_due": 299,
+      "payment_intent": {
+        "id": "pi_contract_payment",
+        "status": "succeeded",
+        "amount_received": 299,
+        "currency": "gbp"
+      },
       "metadata": {
         "sotto_allocation_reference": "allocation_contract_person",
         "irrelevant_customer_note": "fixture only"

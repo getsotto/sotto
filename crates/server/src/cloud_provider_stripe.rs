@@ -92,24 +92,72 @@ impl StripeCoverageConfig {
     }
 }
 
-/// Normalized, signature-verified evidence for one personal subscription seat.
+/// Normalised, signature-verified evidence for one personal subscription seat.
 ///
 /// No raw JSON, webhook signature, customer name, email, or payment secret crosses this boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeCoverageEvidence {
     pub event: VerifiedProviderEvent,
+    pub account_provenance: StripeAccountProvenance,
     pub invoice_id: String,
     pub customer_id: String,
     pub subscription_id: String,
     pub provider_item_id: String,
     pub price_id: String,
     pub allocation_reference: String,
+    pub payment_intent_id: String,
     pub currency: String,
     pub amount_paid: i64,
     pub interval: StripeInterval,
     pub period_start: i64,
     pub period_end: i64,
     pub evidence_reference: String,
+}
+
+/// How the event identified the Stripe account that supplied it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeAccountProvenance {
+    OperatorAccount,
+    DeclaredAccount(String),
+}
+
+/// Durable ownership resolved by the caller before evidence can authorise coverage.
+///
+/// The value copied from invoice metadata is only a claim. It must match this trusted binding;
+/// metadata alone never establishes a beneficiary or allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeAllocationBinding {
+    pub allocation_reference: String,
+    pub customer_id: String,
+    pub subscription_id: String,
+    pub provider_item_id: String,
+}
+
+impl StripeAllocationBinding {
+    pub fn new(
+        allocation_reference: impl Into<String>,
+        customer_id: impl Into<String>,
+        subscription_id: impl Into<String>,
+        provider_item_id: impl Into<String>,
+    ) -> Result<Self, StripeContractError> {
+        let binding = Self {
+            allocation_reference: allocation_reference.into(),
+            customer_id: customer_id.into(),
+            subscription_id: subscription_id.into(),
+            provider_item_id: provider_item_id.into(),
+        };
+        for (value, name) in [
+            (&binding.allocation_reference, "allocation reference"),
+            (&binding.customer_id, "customer"),
+            (&binding.subscription_id, "subscription"),
+            (&binding.provider_item_id, "provider item"),
+        ] {
+            if value.trim().is_empty() {
+                return Err(StripeContractError::InvalidConfig(name));
+            }
+        }
+        Ok(binding)
+    }
 }
 
 /// Errors are intentionally typed so the caller can reject permanent evidence failures and retry
@@ -140,8 +188,12 @@ pub enum StripeContractError {
     UnsupportedPrice,
     #[error("provider context is invalid: {0}")]
     ProviderContext(ProviderAdapterError),
-    #[error("normalized Stripe evidence could not be serialized")]
+    #[error("normalised Stripe evidence could not be serialised")]
     NormalizationSerialization,
+    #[error("Stripe payment settlement is unsupported or ambiguous: {0}")]
+    UnsupportedSettlement(&'static str),
+    #[error("Stripe evidence does not match the trusted allocation binding")]
+    OwnershipMismatch,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,6 +204,7 @@ struct RawStripeEvent {
     #[serde(rename = "type")]
     event_type: String,
     account: Option<String>,
+    context: Option<Value>,
     livemode: bool,
     data: RawEventData,
 }
@@ -161,13 +214,14 @@ struct RawEventData {
     object: Value,
 }
 
-/// Verify and normalize a supported `invoice.paid` event.
+/// Verify and normalise a supported `invoice.paid` event.
 pub fn decode_paid_invoice(
     raw_payload: &[u8],
     signature_header: &str,
     webhook_secret: &str,
     now: i64,
     config: &StripeCoverageConfig,
+    binding: &StripeAllocationBinding,
 ) -> Result<StripeCoverageEvidence, StripeContractError> {
     let payload =
         std::str::from_utf8(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;
@@ -177,7 +231,7 @@ pub fn decode_paid_invoice(
 
     let event: RawStripeEvent =
         serde_json::from_slice(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;
-    validate_event_context(&event, config)?;
+    let account_provenance = validate_event_context(&event, config)?;
     let api_version = event
         .api_version
         .as_deref()
@@ -205,9 +259,13 @@ pub fn decode_paid_invoice(
         return Err(StripeContractError::InvalidField("currency"));
     }
     let amount_paid = required_i64(invoice, "amount_paid")?;
-    if amount_paid < 0 {
-        return Err(StripeContractError::InvalidField("amount_paid"));
+    let amount_due = required_i64(invoice, "amount_due")?;
+    if amount_paid <= 0 || amount_due <= 0 || amount_paid != amount_due {
+        return Err(StripeContractError::UnsupportedSettlement(
+            "payment must settle the full positive invoice amount",
+        ));
     }
+    let payment_intent_id = required_payment_intent(invoice, amount_paid, &currency)?;
 
     let lines = invoice
         .get("lines")
@@ -260,20 +318,21 @@ pub fn decode_paid_invoice(
         .ok_or(StripeContractError::MissingField(
             "metadata.sotto_allocation_reference",
         ))?;
+    if customer_id != binding.customer_id
+        || subscription_id != binding.subscription_id
+        || provider_item_id != binding.provider_item_id
+        || allocation_reference != binding.allocation_reference
+    {
+        return Err(StripeContractError::OwnershipMismatch);
+    }
 
+    // Hash only event identity and trusted ownership. Invoice amounts and periods can change when
+    // the provider corrects a remote object; they belong to refreshed history, not event identity.
     let normalized = json!({
-        "amount_paid": amount_paid,
         "allocation_reference": allocation_reference,
-        "currency": currency,
-        "customer_id": customer_id,
         "event_id": event.id,
         "event_type": event.event_type,
-        "invoice_id": invoice_id,
-        "interval": interval.as_str(),
-        "period_end": period_end,
-        "period_start": period_start,
-        "price_id": price_id,
-        "provider_item_id": provider_item_id,
+        "provider_created_at": event.created,
         "subscription_id": subscription_id,
     });
     let normalized_bytes = serde_json::to_vec(&normalized)
@@ -290,12 +349,14 @@ pub fn decode_paid_invoice(
 
     Ok(StripeCoverageEvidence {
         event: verified_event,
+        account_provenance,
         invoice_id: invoice_id.clone(),
         customer_id,
         subscription_id,
         provider_item_id: provider_item_id.clone(),
         price_id,
         allocation_reference,
+        payment_intent_id,
         currency,
         amount_paid,
         interval,
@@ -308,16 +369,56 @@ pub fn decode_paid_invoice(
 fn validate_event_context(
     event: &RawStripeEvent,
     config: &StripeCoverageConfig,
-) -> Result<(), StripeContractError> {
+) -> Result<StripeAccountProvenance, StripeContractError> {
     if event
-        .account
-        .as_deref()
-        .is_some_and(|account| account != config.account_id)
+        .context
+        .as_ref()
+        .is_some_and(|context| !context.is_null())
         || event.livemode != matches!(config.environment, ProviderEnvironment::Live)
     {
         return Err(StripeContractError::ContextMismatch);
     }
-    Ok(())
+    match event.account.as_deref() {
+        Some(account) if account == config.account_id => {
+            Ok(StripeAccountProvenance::DeclaredAccount(account.into()))
+        }
+        Some(_) => Err(StripeContractError::ContextMismatch),
+        None => Ok(StripeAccountProvenance::OperatorAccount),
+    }
+}
+
+fn required_payment_intent(
+    invoice: &Value,
+    amount_paid: i64,
+    invoice_currency: &str,
+) -> Result<String, StripeContractError> {
+    let payment_intent = invoice
+        .get("payment_intent")
+        .ok_or(StripeContractError::MissingField("payment_intent"))?;
+    let payment_intent =
+        payment_intent
+            .as_object()
+            .ok_or(StripeContractError::UnsupportedSettlement(
+                "payment intent must be expanded before settlement can be trusted",
+            ))?;
+    let payment_intent = Value::Object(payment_intent.clone());
+    let payment_intent_id = required_ref(&payment_intent, "id")?;
+    if payment_intent.get("status").and_then(Value::as_str) != Some("succeeded") {
+        return Err(StripeContractError::UnsupportedSettlement(
+            "payment intent has not succeeded",
+        ));
+    }
+    let amount_received = required_i64(&payment_intent, "amount_received")?;
+    let payment_currency = required_string(&payment_intent, "currency")?.to_ascii_lowercase();
+    if amount_received <= 0
+        || amount_received != amount_paid
+        || payment_currency != invoice_currency
+    {
+        return Err(StripeContractError::UnsupportedSettlement(
+            "payment intent does not settle the invoice in full",
+        ));
+    }
+    Ok(payment_intent_id)
 }
 
 fn required_string(object: &Value, field: &'static str) -> Result<String, StripeContractError> {

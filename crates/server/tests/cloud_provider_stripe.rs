@@ -1,11 +1,14 @@
 //! Black-box tests for the verified Stripe evidence boundary.
+//!
+//! The included invoice is a synthetic, sanitised fixture; it contains no Stripe sandbox data.
 
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use sotto_server::cloud_provider::ProviderEnvironment;
 use sotto_server::cloud_provider_stripe::{
-    decode_paid_invoice, StripeContractError, StripeCoverageConfig, StripeInterval,
+    decode_paid_invoice, StripeAccountProvenance, StripeAllocationBinding, StripeContractError,
+    StripeCoverageConfig, StripeInterval,
 };
 
 const SECRET: &str = "whsec_contract_test";
@@ -17,6 +20,16 @@ fn config() -> StripeCoverageConfig {
         ProviderEnvironment::Test,
         "price_contract_month",
         "price_contract_year",
+    )
+    .unwrap()
+}
+
+fn binding() -> StripeAllocationBinding {
+    StripeAllocationBinding::new(
+        "allocation_contract_person",
+        "cus_contract_person",
+        "sub_contract_person",
+        "si_contract_person",
     )
     .unwrap()
 }
@@ -42,12 +55,16 @@ fn decode(
     value: &Value,
 ) -> Result<sotto_server::cloud_provider_stripe::StripeCoverageEvidence, StripeContractError> {
     let (payload, signature) = signed_payload(value, NOW);
-    decode_paid_invoice(&payload, &signature, SECRET, NOW, &config())
+    decode_paid_invoice(&payload, &signature, SECRET, NOW, &config(), &binding())
 }
 
 #[test]
-fn paid_personal_invoice_accepts_expanded_references_and_normalizes_evidence() {
+fn paid_personal_invoice_accepts_expanded_references_and_normalises_evidence() {
     let evidence = decode(&fixture()).unwrap();
+    assert_eq!(
+        evidence.account_provenance,
+        StripeAccountProvenance::DeclaredAccount("acct_test_sotto_contract".into())
+    );
     assert_eq!(evidence.invoice_id, "in_contract_invoice");
     assert_eq!(evidence.customer_id, "cus_contract_person");
     assert_eq!(evidence.subscription_id, "sub_contract_person");
@@ -56,6 +73,7 @@ fn paid_personal_invoice_accepts_expanded_references_and_normalizes_evidence() {
     assert_eq!(evidence.allocation_reference, "allocation_contract_person");
     assert_eq!(evidence.currency, "gbp");
     assert_eq!(evidence.amount_paid, 299);
+    assert_eq!(evidence.payment_intent_id, "pi_contract_payment");
     assert_eq!(evidence.interval, StripeInterval::Month);
     assert_eq!(evidence.period_start, NOW);
     assert_eq!(evidence.period_end, 1702592000);
@@ -90,6 +108,10 @@ fn irrelevant_payload_changes_do_not_change_the_event_hash() {
     let mut changed = fixture();
     changed["data"]["object"]["metadata"]["irrelevant_customer_note"] = json!("a different value");
     changed["data"]["object"]["description"] = json!("ignored by the contract");
+    changed["data"]["object"]["amount_paid"] = json!(598);
+    changed["data"]["object"]["amount_due"] = json!(598);
+    changed["data"]["object"]["payment_intent"]["amount_received"] = json!(598);
+    changed["data"]["object"]["lines"]["data"][0]["period"]["end"] = json!(1705184000);
     let first = decode(&original).unwrap();
     let second = decode(&changed).unwrap();
     assert_eq!(
@@ -103,17 +125,41 @@ fn signature_and_timestamp_fail_before_payload_is_interpreted() {
     let payload = fixture();
     let (raw, signature) = signed_payload(&payload, NOW);
     assert!(matches!(
-        decode_paid_invoice(raw.as_slice(), "t=1700000000,v1=00", SECRET, NOW, &config()),
+        decode_paid_invoice(
+            raw.as_slice(),
+            "t=1700000000,v1=00",
+            SECRET,
+            NOW,
+            &config(),
+            &binding(),
+        ),
         Err(StripeContractError::InvalidSignature)
     ));
     assert!(matches!(
-        decode_paid_invoice(&raw, &signature, SECRET, NOW + 301, &config()),
+        decode_paid_invoice(&raw, &signature, SECRET, NOW + 301, &config(), &binding(),),
         Err(StripeContractError::InvalidSignature)
     ));
 }
 
 #[test]
 fn unsupported_versions_types_and_contexts_fail_closed() {
+    for version in [
+        "2026-06-24.dahlia",
+        "2026-07-29.dahlia",
+        "2026-08-26.dahlia",
+    ] {
+        let mut accepted_version = fixture();
+        accepted_version["api_version"] = json!(version);
+        assert!(decode(&accepted_version).is_ok(), "version {version}");
+    }
+
+    let mut missing_version = fixture();
+    missing_version["api_version"] = Value::Null;
+    assert!(matches!(
+        decode(&missing_version),
+        Err(StripeContractError::UnsupportedApiVersion(version)) if version == "missing"
+    ));
+
     let mut unsupported_version = fixture();
     unsupported_version["api_version"] = json!("2099-01-01.dahlia");
     assert!(matches!(
@@ -141,6 +187,21 @@ fn unsupported_versions_types_and_contexts_fail_closed() {
         decode(&wrong_mode),
         Err(StripeContractError::ContextMismatch)
     ));
+
+    let mut unsupported_connect_context = fixture();
+    unsupported_connect_context["context"] = json!("acct_connected");
+    assert!(matches!(
+        decode(&unsupported_connect_context),
+        Err(StripeContractError::ContextMismatch)
+    ));
+
+    let mut own_account = fixture();
+    own_account["account"] = Value::Null;
+    let own_evidence = decode(&own_account).unwrap();
+    assert_eq!(
+        own_evidence.account_provenance,
+        StripeAccountProvenance::OperatorAccount
+    );
 }
 
 #[test]
@@ -182,6 +243,57 @@ fn unpaid_quantity_price_and_missing_allocation_are_not_coverage() {
             "metadata.sotto_allocation_reference"
         ))
     ));
+
+    let mut null_customer = fixture();
+    null_customer["data"]["object"]["customer"] = Value::Null;
+    assert!(matches!(
+        decode(&null_customer),
+        Err(StripeContractError::InvalidField("customer"))
+    ));
+
+    let mut missing_payment_intent = fixture();
+    missing_payment_intent["data"]["object"]["payment_intent"] = Value::Null;
+    assert!(matches!(
+        decode(&missing_payment_intent),
+        Err(StripeContractError::UnsupportedSettlement(_))
+    ));
+
+    let mut unexpanded_payment_intent = fixture();
+    unexpanded_payment_intent["data"]["object"]["payment_intent"] = json!("pi_contract_payment");
+    assert!(matches!(
+        decode(&unexpanded_payment_intent),
+        Err(StripeContractError::UnsupportedSettlement(_))
+    ));
+
+    let mut failed_payment_intent = fixture();
+    failed_payment_intent["data"]["object"]["payment_intent"]["status"] = json!("processing");
+    assert!(matches!(
+        decode(&failed_payment_intent),
+        Err(StripeContractError::UnsupportedSettlement(_))
+    ));
+
+    let mut partial_payment = fixture();
+    partial_payment["data"]["object"]["amount_paid"] = json!(100);
+    assert!(matches!(
+        decode(&partial_payment),
+        Err(StripeContractError::UnsupportedSettlement(_))
+    ));
+
+    let mut zero_payment = fixture();
+    zero_payment["data"]["object"]["amount_paid"] = json!(0);
+    zero_payment["data"]["object"]["amount_due"] = json!(0);
+    assert!(matches!(
+        decode(&zero_payment),
+        Err(StripeContractError::UnsupportedSettlement(_))
+    ));
+
+    let mut forged_metadata = fixture();
+    forged_metadata["data"]["object"]["metadata"]["sotto_allocation_reference"] =
+        json!("allocation_forged");
+    assert!(matches!(
+        decode(&forged_metadata),
+        Err(StripeContractError::OwnershipMismatch)
+    ));
 }
 
 #[test]
@@ -211,7 +323,7 @@ fn malformed_and_invalid_configuration_fail_closed() {
 
     let (raw, signature) = signed_payload(&json!({"not": "an event"}), NOW);
     assert!(matches!(
-        decode_paid_invoice(&raw, &signature, SECRET, NOW, &config()),
+        decode_paid_invoice(&raw, &signature, SECRET, NOW, &config(), &binding()),
         Err(StripeContractError::MalformedPayload)
     ));
 }
