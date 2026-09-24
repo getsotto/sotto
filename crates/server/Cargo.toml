@@ -33,6 +33,7 @@ sqlx = { version = "0.8", default-features = false, features = [
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "native-tls",
+    "stream",
 ] }
 async-trait = "0.1"
 url = "2"
