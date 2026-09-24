@@ -8,18 +8,12 @@
     "object": {
       "id": "in_contract_invoice",
       "customer": { "id": "cus_contract_person" },
-      "subscription": { "id": "sub_contract_person" },
       "status": "paid",
-      "paid": true,
       "currency": "gbp",
       "amount_paid": 299,
       "amount_due": 299,
-      "payment_intent": {
-        "id": "pi_contract_payment",
-        "status": "succeeded",
-        "amount_received": 299,
-        "currency": "gbp"
-      },
+      "amount_overpaid": 0,
+      "amount_paid_off_stripe": 0,
       "metadata": {
         "sotto_allocation_reference": "allocation_contract_person",
         "irrelevant_customer_note": "fixture only"
@@ -28,11 +22,20 @@
         "data": [
           {
             "id": "il_contract_line",
-            "subscription_item": "si_contract_person",
+            "parent": {
+              "type": "subscription_item_details",
+              "subscription_item_details": {
+                "subscription": "sub_contract_person",
+                "subscription_item": "si_contract_person",
+                "proration": false
+              }
+            },
             "quantity": 1,
-            "price": {
-              "id": "price_contract_month",
-              "recurring": { "interval": "month" }
+            "pricing": {
+              "type": "price_details",
+              "price_details": {
+                "price": "price_contract_month"
+              }
             },
             "period": { "start": 1700000000, "end": 1702592000 }
           }

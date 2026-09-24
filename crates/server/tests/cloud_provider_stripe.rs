@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
 use sotto_server::cloud_provider_stripe::{
-    decode_paid_invoice, StripeAccountProvenance, StripeAllocationBinding, StripeContractError,
-    StripeCoverageConfig, StripeInterval,
+    decode_invoice_payment, decode_paid_invoice, StripeAccountProvenance, StripeAllocationBinding,
+    StripeContractError, StripeCoverageConfig, StripeInterval, StripePaymentSettlement,
 };
 
 const SECRET: &str = "whsec_contract_test";
@@ -39,6 +39,15 @@ fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/stripe/invoice_paid_personal.json")).unwrap()
 }
 
+fn payment_fixture() -> Value {
+    serde_json::from_str(include_str!("fixtures/stripe/invoice_payment_paid.json")).unwrap()
+}
+
+fn settlement() -> StripePaymentSettlement {
+    let payment = serde_json::to_vec(&payment_fixture()).unwrap();
+    decode_invoice_payment(&payment, &config()).unwrap()
+}
+
 fn signed_payload(value: &Value, timestamp: i64) -> (Vec<u8>, String) {
     let payload = serde_json::to_vec(value).unwrap();
     let mut mac = Hmac::<Sha256>::new_from_slice(SECRET.as_bytes()).unwrap();
@@ -55,8 +64,23 @@ fn signed_payload(value: &Value, timestamp: i64) -> (Vec<u8>, String) {
 fn decode(
     value: &Value,
 ) -> Result<sotto_server::cloud_provider_stripe::StripeCoverageEvidence, StripeContractError> {
+    decode_with(value, &settlement())
+}
+
+fn decode_with(
+    value: &Value,
+    settlement: &StripePaymentSettlement,
+) -> Result<sotto_server::cloud_provider_stripe::StripeCoverageEvidence, StripeContractError> {
     let (payload, signature) = signed_payload(value, NOW);
-    decode_paid_invoice(&payload, &signature, SECRET, NOW, &config(), &binding())
+    decode_paid_invoice(
+        &payload,
+        &signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        settlement,
+    )
 }
 
 #[test]
@@ -96,8 +120,8 @@ fn paid_personal_invoice_accepts_expanded_references_and_normalises_evidence() {
 #[test]
 fn annual_standard_price_maps_to_a_year_interval() {
     let mut annual = fixture();
-    annual["data"]["object"]["lines"]["data"][0]["price"]["id"] = json!("price_contract_year");
-    annual["data"]["object"]["lines"]["data"][0]["price"]["recurring"]["interval"] = json!("year");
+    annual["data"]["object"]["lines"]["data"][0]["pricing"]["price_details"]["price"] =
+        json!("price_contract_year");
     let evidence = decode(&annual).unwrap();
     assert_eq!(evidence.interval, StripeInterval::Year);
     assert_eq!(evidence.price_id, "price_contract_year");
@@ -111,10 +135,15 @@ fn irrelevant_payload_changes_do_not_change_the_event_hash() {
     changed["data"]["object"]["description"] = json!("ignored by the contract");
     changed["data"]["object"]["amount_paid"] = json!(598);
     changed["data"]["object"]["amount_due"] = json!(598);
-    changed["data"]["object"]["payment_intent"]["amount_received"] = json!(598);
+    changed["data"]["object"]["amount_overpaid"] = json!(0);
     changed["data"]["object"]["lines"]["data"][0]["period"]["end"] = json!(1705184000);
+    let mut changed_payment = payment_fixture();
+    changed_payment["amount_paid"] = json!(598);
+    changed_payment["amount_requested"] = json!(598);
+    let changed_payment = serde_json::to_vec(&changed_payment).unwrap();
+    let changed_settlement = decode_invoice_payment(&changed_payment, &config()).unwrap();
     let first = decode(&original).unwrap();
-    let second = decode(&changed).unwrap();
+    let second = decode_with(&changed, &changed_settlement).unwrap();
     assert_eq!(
         first.event.normalized_payload_hash,
         second.event.normalized_payload_hash
@@ -133,27 +162,26 @@ fn signature_and_timestamp_fail_before_payload_is_interpreted() {
             NOW,
             &config(),
             &binding(),
+            &settlement(),
         ),
         Err(StripeContractError::InvalidSignature)
     ));
     assert!(matches!(
-        decode_paid_invoice(&raw, &signature, SECRET, NOW + 301, &config(), &binding(),),
+        decode_paid_invoice(
+            &raw,
+            &signature,
+            SECRET,
+            NOW + 301,
+            &config(),
+            &binding(),
+            &settlement(),
+        ),
         Err(StripeContractError::InvalidSignature)
     ));
 }
 
 #[test]
 fn unsupported_versions_types_and_contexts_fail_closed() {
-    for version in [
-        "2026-06-24.dahlia",
-        "2026-07-29.dahlia",
-        "2026-08-26.dahlia",
-    ] {
-        let mut accepted_version = fixture();
-        accepted_version["api_version"] = json!(version);
-        assert!(decode(&accepted_version).is_ok(), "version {version}");
-    }
-
     let mut missing_version = fixture();
     missing_version["api_version"] = Value::Null;
     assert!(matches!(
@@ -208,7 +236,7 @@ fn unsupported_versions_types_and_contexts_fail_closed() {
 #[test]
 fn unpaid_quantity_price_and_missing_allocation_are_not_coverage() {
     let mut unpaid = fixture();
-    unpaid["data"]["object"]["paid"] = json!(false);
+    unpaid["data"]["object"]["status"] = json!("open");
     assert!(matches!(
         decode(&unpaid),
         Err(StripeContractError::UnpaidInvoice)
@@ -230,15 +258,16 @@ fn unpaid_quantity_price_and_missing_allocation_are_not_coverage() {
     ));
 
     let mut wrong_price = fixture();
-    wrong_price["data"]["object"]["lines"]["data"][0]["price"]["id"] = json!("price_other");
+    wrong_price["data"]["object"]["lines"]["data"][0]["pricing"]["price_details"]["price"] =
+        json!("price_other");
     assert!(matches!(
         decode(&wrong_price),
         Err(StripeContractError::UnsupportedPrice)
     ));
 
     let mut missing_subscription_item = fixture();
-    missing_subscription_item["data"]["object"]["lines"]["data"][0]["subscription_item"] =
-        Value::Null;
+    missing_subscription_item["data"]["object"]["lines"]["data"][0]["parent"]
+        ["subscription_item_details"]["subscription_item"] = Value::Null;
     assert!(matches!(
         decode(&missing_subscription_item),
         Err(StripeContractError::InvalidField("subscription_item"))
@@ -260,39 +289,44 @@ fn unpaid_quantity_price_and_missing_allocation_are_not_coverage() {
         Err(StripeContractError::InvalidField("customer"))
     ));
 
-    let mut missing_payment_intent = fixture();
-    missing_payment_intent["data"]["object"]["payment_intent"] = Value::Null;
+    let mut missing_payment = payment_fixture();
+    missing_payment["payment"] = Value::Null;
+    let missing_payment = serde_json::to_vec(&missing_payment).unwrap();
     assert!(matches!(
-        decode(&missing_payment_intent),
+        decode_invoice_payment(&missing_payment, &config()),
+        Err(StripeContractError::MissingField("payment"))
+    ));
+
+    let mut unsupported_payment = payment_fixture();
+    unsupported_payment["payment"]["type"] = json!("out_of_band");
+    let unsupported_payment = serde_json::to_vec(&unsupported_payment).unwrap();
+    assert!(matches!(
+        decode_invoice_payment(&unsupported_payment, &config()),
         Err(StripeContractError::UnsupportedSettlement(_))
     ));
 
-    let mut unexpanded_payment_intent = fixture();
-    unexpanded_payment_intent["data"]["object"]["payment_intent"] = json!("pi_contract_payment");
+    let mut failed_payment = payment_fixture();
+    failed_payment["status"] = json!("open");
+    let failed_payment = serde_json::to_vec(&failed_payment).unwrap();
     assert!(matches!(
-        decode(&unexpanded_payment_intent),
+        decode_invoice_payment(&failed_payment, &config()),
         Err(StripeContractError::UnsupportedSettlement(_))
     ));
 
-    let mut failed_payment_intent = fixture();
-    failed_payment_intent["data"]["object"]["payment_intent"]["status"] = json!("processing");
+    let mut partial_payment = payment_fixture();
+    partial_payment["amount_paid"] = json!(100);
+    let partial_payment = serde_json::to_vec(&partial_payment).unwrap();
     assert!(matches!(
-        decode(&failed_payment_intent),
+        decode_invoice_payment(&partial_payment, &config()),
         Err(StripeContractError::UnsupportedSettlement(_))
     ));
 
-    let mut partial_payment = fixture();
-    partial_payment["data"]["object"]["amount_paid"] = json!(100);
+    let mut zero_payment = payment_fixture();
+    zero_payment["amount_paid"] = json!(0);
+    zero_payment["amount_requested"] = json!(0);
+    let zero_payment = serde_json::to_vec(&zero_payment).unwrap();
     assert!(matches!(
-        decode(&partial_payment),
-        Err(StripeContractError::UnsupportedSettlement(_))
-    ));
-
-    let mut zero_payment = fixture();
-    zero_payment["data"]["object"]["amount_paid"] = json!(0);
-    zero_payment["data"]["object"]["amount_due"] = json!(0);
-    assert!(matches!(
-        decode(&zero_payment),
+        decode_invoice_payment(&zero_payment, &config()),
         Err(StripeContractError::UnsupportedSettlement(_))
     ));
 
@@ -342,7 +376,15 @@ fn malformed_and_invalid_configuration_fail_closed() {
 
     let (raw, signature) = signed_payload(&json!({"not": "an event"}), NOW);
     assert!(matches!(
-        decode_paid_invoice(&raw, &signature, SECRET, NOW, &config(), &binding()),
+        decode_paid_invoice(
+            &raw,
+            &signature,
+            SECRET,
+            NOW,
+            &config(),
+            &binding(),
+            &settlement(),
+        ),
         Err(StripeContractError::MalformedPayload)
     ));
 }
