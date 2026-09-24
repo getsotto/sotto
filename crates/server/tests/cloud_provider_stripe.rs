@@ -128,6 +128,23 @@ fn contradictory_invoice_subscription_is_rejected() {
 }
 
 #[test]
+fn negative_invoice_adjustment_amounts_are_rejected() {
+    let mut overpaid = fixture();
+    overpaid["data"]["object"]["amount_overpaid"] = json!(-1);
+    assert!(matches!(
+        decode(&overpaid),
+        Err(StripeContractError::InvalidField("amount_overpaid"))
+    ));
+
+    let mut off_stripe = fixture();
+    off_stripe["data"]["object"]["amount_paid_off_stripe"] = json!(-1);
+    assert!(matches!(
+        decode(&off_stripe),
+        Err(StripeContractError::InvalidField("amount_paid_off_stripe"))
+    ));
+}
+
+#[test]
 fn annual_standard_price_maps_to_a_year_interval() {
     let mut annual = fixture();
     annual["data"]["object"]["lines"]["data"][0]["pricing"]["price_details"]["price"] =

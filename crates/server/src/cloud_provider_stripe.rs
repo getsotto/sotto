@@ -224,6 +224,12 @@ pub(crate) fn validate_personal_invoice_observation(
             "payment must settle the full positive invoice amount",
         ));
     }
+    if facts.amount_overpaid < 0 {
+        return Err(StripeContractError::InvalidField("amount_overpaid"));
+    }
+    if facts.amount_paid_off_stripe < 0 {
+        return Err(StripeContractError::InvalidField("amount_paid_off_stripe"));
+    }
     let interval = if facts.price_id == config.monthly_price_id {
         StripeInterval::Month
     } else if facts.price_id == config.annual_price_id {
