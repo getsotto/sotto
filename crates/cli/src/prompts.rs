@@ -1,11 +1,11 @@
 //! Interactive terminal prompt helpers for CLI subcommands.
 //!
 //! When required arguments are omitted in an interactive terminal (stdin, stdout, and stderr
-//! are all TTYs and no override disables styling/prompts), these functions provide fuzzy/selectable
-//! menus using `inquire`.
+//! are all TTYs, `TERM` is not dumb, and CI is not active), these functions provide
+//! selectable menus using `inquire`.
 //!
-//! If the session is non-interactive (e.g. piped input/output, CI, or --plain/NO_COLOR),
-//! missing arguments result in an immediate input error with standard exit code 1 or 2.
+//! If the session is non-interactive (e.g. piped input/output or CI), missing arguments
+//! result in an immediate input error with standard exit code 2 (matching clap).
 
 use std::io::{self, IsTerminal};
 
@@ -20,11 +20,10 @@ use crate::theme::Theme;
 /// Check whether interactive prompting is permissible.
 ///
 /// Prompts require an interactive terminal across stdin, stdout, and stderr,
+/// a terminal capable of raw mode and cursor movement (not `TERM=dumb`),
 /// and that CI is not active.
 pub fn can_prompt() -> bool {
     allowed(
-        std::env::args().any(|arg| arg == "--plain"),
-        std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
         crate::theme::ci_enabled(std::env::var("CI").ok().as_deref()),
         std::env::var("TERM").is_ok_and(|t| t == "dumb"),
         io::stdin().is_terminal(),
@@ -36,8 +35,13 @@ pub fn can_prompt() -> bool {
 /// Preflight check for commands requiring a secret name: if omitted and prompting is disabled,
 /// fail immediately without triggering unlock prompts.
 pub fn preflight_secret_name(name: Option<&str>) -> Result<()> {
-    if name.is_none() && !can_prompt() {
-        return Err(Error::Input(
+    preflight_secret_name_gate(name, can_prompt())
+}
+
+/// Pure testable preflight gate for missing secret name.
+pub fn preflight_secret_name_gate(name: Option<&str>, prompt_allowed: bool) -> Result<()> {
+    if name.is_none() && !prompt_allowed {
+        return Err(Error::MissingArgument(
             "missing required argument <NAME>; provide a secret name or run in an interactive terminal".into(),
         ));
     }
@@ -45,7 +49,10 @@ pub fn preflight_secret_name(name: Option<&str>) -> Result<()> {
 }
 
 /// Prompt the user to select a secret name from the active environment.
-pub fn select_secret_key(app: &App, config: &Config, theme: &Theme) -> Result<String> {
+///
+/// Returns `Ok(Some(name))` on successful selection, `Ok(None)` if the user cancelled
+/// the prompt (e.g. Escape or Ctrl-C), or an error.
+pub fn select_secret_key(app: &App, config: &Config, theme: &Theme) -> Result<Option<String>> {
     preflight_secret_name(None)?;
 
     let names = app.list(config)?;
@@ -61,15 +68,23 @@ pub fn select_secret_key(app: &App, config: &Config, theme: &Theme) -> Result<St
         theme.bold_accent(&format!("{}/{}", config.project, config.environment))
     );
 
-    Select::new(&message, names)
-        .prompt()
-        .map_err(|e| Error::Input(format!("selection cancelled or failed: {e}")))
+    match Select::new(&message, names).prompt() {
+        Ok(choice) => Ok(Some(choice)),
+        Err(inquire::InquireError::OperationCanceled) => Ok(None),
+        Err(e) => Err(Error::Input(format!("selection failed: {e}"))),
+    }
 }
 
 /// Prompt the user to select an environment from the project's environments.
-pub fn select_environment(store: &Store, project_id: &str, theme: &Theme) -> Result<String> {
+///
+/// Returns `Ok(Some(env))` on selection, `Ok(None)` if cancelled, or an error.
+pub fn select_environment(
+    store: &Store,
+    project_id: &str,
+    theme: &Theme,
+) -> Result<Option<String>> {
     if !can_prompt() {
-        return Err(Error::Input(
+        return Err(Error::MissingArgument(
             "missing required argument <NAME>; provide an environment name or run in an interactive terminal".into(),
         ));
     }
@@ -85,9 +100,11 @@ pub fn select_environment(store: &Store, project_id: &str, theme: &Theme) -> Res
         theme.accent("(active environment will be switched)")
     );
 
-    Select::new(&message, environments)
-        .prompt()
-        .map_err(|e| Error::Input(format!("selection cancelled or failed: {e}")))
+    match Select::new(&message, environments).prompt() {
+        Ok(choice) => Ok(Some(choice)),
+        Err(inquire::InquireError::OperationCanceled) => Ok(None),
+        Err(e) => Err(Error::Input(format!("selection failed: {e}"))),
+    }
 }
 
 /// Confirm removal of a secret.
@@ -102,23 +119,22 @@ pub fn confirm_removal(name: &str, theme: &Theme) -> Result<bool> {
         theme.error(name)
     );
 
-    Confirm::new(&prompt)
-        .with_default(false)
-        .prompt()
-        .map_err(|e| Error::Input(format!("prompt cancelled: {e}")))
+    match Confirm::new(&prompt).with_default(false).prompt() {
+        Ok(confirmed) => Ok(confirmed),
+        Err(inquire::InquireError::OperationCanceled) => Ok(false),
+        Err(e) => Err(Error::Input(format!("prompt failed: {e}"))),
+    }
 }
 
 /// Pure testable gate for whether interactive prompts are allowed.
 pub fn allowed(
-    plain: bool,
-    no_color: bool,
     ci: bool,
     dumb_terminal: bool,
     stdin_tty: bool,
     stdout_tty: bool,
     stderr_tty: bool,
 ) -> bool {
-    !plain && !no_color && !ci && !dumb_terminal && stdin_tty && stdout_tty && stderr_tty
+    !ci && !dumb_terminal && stdin_tty && stdout_tty && stderr_tty
 }
 
 #[cfg(test)]
@@ -127,28 +143,29 @@ mod tests {
 
     #[test]
     fn prompt_requires_interactive_terminal_on_all_streams() {
-        assert!(allowed(false, false, false, false, true, true, true));
-        assert!(!allowed(true, false, false, false, true, true, true));
-        assert!(!allowed(false, true, false, false, true, true, true));
-        assert!(!allowed(false, false, true, false, true, true, true));
-        assert!(!allowed(false, false, false, true, true, true, true));
-        assert!(!allowed(false, false, false, false, false, true, true));
-        assert!(!allowed(false, false, false, false, true, false, true));
-        assert!(!allowed(false, false, false, false, true, true, false));
+        assert!(allowed(false, false, true, true, true));
+        assert!(!allowed(true, false, true, true, true));
+        assert!(!allowed(false, true, true, true, true));
+        assert!(!allowed(false, false, false, true, true));
+        assert!(!allowed(false, false, true, false, true));
+        assert!(!allowed(false, false, true, true, false));
     }
 
     #[test]
     fn preflight_secret_name_accepts_present_name() {
-        assert!(preflight_secret_name(Some("DATABASE_URL")).is_ok());
+        assert!(preflight_secret_name_gate(Some("DATABASE_URL"), false).is_ok());
+        assert!(preflight_secret_name_gate(Some("DATABASE_URL"), true).is_ok());
     }
 
     #[test]
-    fn preflight_secret_name_rejects_missing_name_in_non_interactive_env() {
-        if !can_prompt() {
-            assert!(matches!(
-                preflight_secret_name(None),
-                Err(Error::Input(msg)) if msg.contains("missing required argument <NAME>")
-            ));
-        }
+    fn preflight_secret_name_rejects_missing_name_when_prompting_disallowed() {
+        let err = preflight_secret_name_gate(None, false).unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("missing required argument <NAME>"));
+    }
+
+    #[test]
+    fn preflight_secret_name_allows_missing_name_when_prompting_allowed() {
+        assert!(preflight_secret_name_gate(None, true).is_ok());
     }
 }

@@ -148,7 +148,7 @@ enum Command {
     /// re-grant your shared environments.
     Reset {
         /// Skip the interactive confirmation.
-        #[arg(long)]
+        #[arg(short = 'y', long)]
         yes: bool,
     },
     /// Unlock the store for this session.
@@ -498,7 +498,13 @@ fn run() -> Result<()> {
             ensure_unlocked(&store, &keychain)?;
             let name = match name {
                 Some(name) => name,
-                None => prompts::select_secret_key(&app, &config, &theme)?,
+                None => match prompts::select_secret_key(&app, &config, &theme)? {
+                    Some(name) => name,
+                    None => {
+                        eprintln!("aborted");
+                        return Ok(());
+                    }
+                },
             };
             share(
                 &app,
@@ -571,7 +577,13 @@ fn run() -> Result<()> {
             ensure_unlocked(&store, &keychain)?;
             let name = match name {
                 Some(name) => name,
-                None => prompts::select_secret_key(&app, &config, &theme)?,
+                None => match prompts::select_secret_key(&app, &config, &theme)? {
+                    Some(name) => name,
+                    None => {
+                        eprintln!("aborted");
+                        return Ok(());
+                    }
+                },
             };
             let mut value = app.get(&config, &name)?;
             let result = if copy {
@@ -606,7 +618,13 @@ fn run() -> Result<()> {
             ensure_unlocked(&store, &keychain)?;
             let name = match name {
                 Some(name) => name,
-                None => prompts::select_secret_key(&app, &config, &theme)?,
+                None => match prompts::select_secret_key(&app, &config, &theme)? {
+                    Some(name) => name,
+                    None => {
+                        eprintln!("aborted");
+                        return Ok(());
+                    }
+                },
             };
             if !yes && prompts::can_prompt() && !prompts::confirm_removal(&name, &theme)? {
                 eprintln!("aborted");
@@ -1487,7 +1505,13 @@ fn env_use(
     let (mut config, dir) = Config::discover(cwd)?;
     let name = match name {
         Some(name) => name,
-        None => prompts::select_environment(store, &config.project_id, theme)?,
+        None => match prompts::select_environment(store, &config.project_id, theme)? {
+            Some(name) => name,
+            None => {
+                eprintln!("aborted");
+                return Ok(());
+            }
+        },
     };
     if !store
         .list_environments(&config.project_id)?
@@ -2252,6 +2276,10 @@ mod tests {
         let cli =
             Cli::try_parse_from(["sotto", "get"]).expect("sotto get without args should parse");
         assert!(matches!(cli.command, Command::Get { name: None, .. }));
+
+        let cli =
+            Cli::try_parse_from(["sotto", "reset", "-y"]).expect("sotto reset -y should parse");
+        assert!(matches!(cli.command, Command::Reset { yes: true }));
 
         let cli = Cli::try_parse_from(["sotto", "rm"]).expect("sotto rm without args should parse");
         assert!(matches!(
