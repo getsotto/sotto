@@ -190,8 +190,14 @@ async fn reads_resources_with_authentication_and_complete_pagination() {
     responses.insert(
         "/v1/invoices".into(),
         vec![
-            MockResponse::json(list(vec![json!({"id":"in_1","customer":"cus_1"})], true)),
-            MockResponse::json(list(vec![json!({"id":"in_2","customer":"cus_1"})], false)),
+            MockResponse::json(list(
+                vec![json!({"id":"in_1","customer":"cus_1","livemode":false})],
+                true,
+            )),
+            MockResponse::json(list(
+                vec![json!({"id":"in_2","customer":"cus_1","livemode":false})],
+                false,
+            )),
         ],
     );
     responses.insert(
@@ -375,6 +381,60 @@ async fn rejects_wrong_account_mode_redirect_and_invalid_pagination() {
     assert!(matches!(
         client.account(&mut session).await,
         Err(StripeReadError::Permission { status: 403 })
+    ));
+}
+
+#[tokio::test]
+async fn rejects_reused_sessions_and_unverified_resource_context() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let other_client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    client.account(&mut session).await.unwrap();
+    assert!(matches!(
+        other_client.account(&mut session).await,
+        Err(StripeReadError::SessionClientMismatch)
+    ));
+
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/subscriptions/sub_1".into(),
+        vec![MockResponse::json(json!({
+            "id":"sub_1","customer":"cus_1","status":"active"
+        }))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client.subscription(&mut session, "sub_1", "cus_1").await,
+        Err(StripeReadError::MalformedResponse("livemode"))
+    ));
+
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(
+            vec![json!({"id":"in_1","customer":{}})],
+            false,
+        ))],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .subscription_invoices(&mut session, "sub_1", None)
+            .await,
+        Err(StripeReadError::MalformedResponse("invoice.customer"))
     ));
 }
 

@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::{Method, Response, Url};
@@ -90,6 +91,8 @@ pub enum StripeReadError {
     Authentication { status: u16 },
     #[error("Stripe permission was denied with status {status}")]
     Permission { status: u16 },
+    #[error("Stripe read session belongs to another client")]
+    SessionClientMismatch,
     #[error("Stripe resource was not found")]
     ResourceMissing,
     #[error("Stripe rate limit was reached")]
@@ -147,6 +150,7 @@ pub struct StripeReadClient {
     api_version: &'static str,
     origin: Url,
     limits: StripeReadLimits,
+    identity: Arc<()>,
 }
 
 impl fmt::Debug for StripeReadClient {
@@ -226,6 +230,7 @@ impl StripeReadClient {
             api_version: STRIPE_API_VERSION,
             origin,
             limits,
+            identity: Arc::new(()),
         })
     }
 
@@ -236,6 +241,7 @@ impl StripeReadClient {
             bytes: 0,
             records: 0,
             account_verified: false,
+            identity: Arc::clone(&self.identity),
         }
     }
 
@@ -250,6 +256,10 @@ impl StripeReadClient {
         &self,
         session: &mut StripeReadSession,
     ) -> Result<StripeAccountResource, StripeReadError> {
+        if !Arc::ptr_eq(&self.identity, &session.identity) {
+            return Err(StripeReadError::SessionClientMismatch);
+        }
+        session.remaining()?;
         if session.account_verified {
             return Ok(StripeAccountResource {
                 id: self.account_id.clone(),
@@ -470,7 +480,9 @@ impl StripeReadClient {
                     let backoff = error
                         .retry_after()
                         .unwrap_or_else(|| {
-                            Duration::from_millis(50 * 2u64.saturating_pow(retries as u32))
+                            Duration::from_millis(
+                                50u64.saturating_mul(2u64.saturating_pow(retries.min(63) as u32)),
+                            )
                         })
                         .min(self.limits.max_retry_after);
                     retries += 1;
@@ -562,6 +574,7 @@ pub struct StripeReadSession {
     bytes: usize,
     records: usize,
     account_verified: bool,
+    identity: Arc<()>,
 }
 
 impl fmt::Debug for StripeReadSession {
@@ -783,10 +796,11 @@ fn validate_mode(
     mode: Option<bool>,
     environment: ProviderEnvironment,
 ) -> Result<(), StripeReadError> {
-    if mode.is_some_and(|mode| mode != matches!(environment, ProviderEnvironment::Live)) {
-        return Err(StripeReadError::ContextMismatch);
+    match mode {
+        Some(mode) if mode == matches!(environment, ProviderEnvironment::Live) => Ok(()),
+        Some(_) => Err(StripeReadError::ContextMismatch),
+        None => Err(StripeReadError::MalformedResponse("livemode")),
     }
-    Ok(())
 }
 
 fn required_id(value: &Value, field: &'static str) -> Result<String, StripeReadError> {
@@ -821,11 +835,19 @@ fn optional_validated_ref(
     value: Option<&Value>,
     field: &'static str,
 ) -> Result<Option<String>, StripeReadError> {
-    let reference = optional_ref(value);
-    if let Some(reference) = reference.as_deref() {
-        validate_identifier(reference).map_err(|_| StripeReadError::MalformedResponse(field))?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
     }
-    Ok(reference)
+    let reference = value
+        .as_str()
+        .or_else(|| value.get("id").and_then(Value::as_str))
+        .filter(|reference| !reference.trim().is_empty())
+        .ok_or(StripeReadError::MalformedResponse(field))?;
+    validate_identifier(reference).map_err(|_| StripeReadError::MalformedResponse(field))?;
+    Ok(Some(reference.to_owned()))
 }
 
 fn required_string(value: &Value, field: &'static str) -> Result<String, StripeReadError> {
