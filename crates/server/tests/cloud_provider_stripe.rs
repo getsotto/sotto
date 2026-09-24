@@ -192,6 +192,18 @@ fn signature_and_timestamp_fail_before_payload_is_interpreted() {
         ),
         Err(StripeContractError::InvalidSignature)
     ));
+    assert!(matches!(
+        decode_paid_invoice(
+            &raw,
+            "v1=00",
+            SECRET,
+            NOW,
+            &config(),
+            &binding(),
+            &settlement(),
+        ),
+        Err(StripeContractError::MalformedSignature)
+    ));
 }
 
 #[test]
@@ -271,6 +283,35 @@ fn unpaid_quantity_price_and_missing_allocation_are_not_coverage() {
         Err(StripeContractError::UnsupportedQuantity)
     ));
 
+    let mut wrong_quantity = fixture();
+    wrong_quantity["data"]["object"]["lines"]["data"][0]["quantity"] = json!(2);
+    assert!(matches!(
+        decode(&wrong_quantity),
+        Err(StripeContractError::UnsupportedQuantity)
+    ));
+
+    let mut unsupported_parent = fixture();
+    unsupported_parent["data"]["object"]["lines"]["data"][0]["parent"]["type"] =
+        json!("subscription");
+    assert!(matches!(
+        decode(&unsupported_parent),
+        Err(StripeContractError::UnsupportedLine(_))
+    ));
+
+    let mut pre_basil_line = fixture();
+    let line = &mut pre_basil_line["data"]["object"]["lines"]["data"][0];
+    line["parent"] = Value::Null;
+    line["pricing"] = Value::Null;
+    line["subscription_item"] = json!("si_contract_person");
+    line["price"] = json!({
+        "id": "price_contract_month",
+        "recurring": {"interval": "month"}
+    });
+    assert!(matches!(
+        decode(&pre_basil_line),
+        Err(StripeContractError::MissingField("lines.data[0].parent"))
+    ));
+
     let mut wrong_price = fixture();
     wrong_price["data"]["object"]["lines"]["data"][0]["pricing"]["price_details"]["price"] =
         json!("price_other");
@@ -344,6 +385,14 @@ fn unpaid_quantity_price_and_missing_allocation_are_not_coverage() {
         Err(StripeContractError::UnsupportedSettlement(_))
     ));
 
+    let mut live_payment = payment_fixture();
+    live_payment["livemode"] = json!(true);
+    let live_payment = serde_json::to_vec(&live_payment).unwrap();
+    assert!(matches!(
+        decode_invoice_payment(&live_payment, &config()),
+        Err(StripeContractError::ContextMismatch)
+    ));
+
     let mut forged_metadata = fixture();
     forged_metadata["data"]["object"]["metadata"]["sotto_allocation_reference"] =
         json!("allocation_forged");
@@ -400,6 +449,18 @@ fn malformed_and_invalid_configuration_fail_closed() {
             &settlement(),
         ),
         Err(StripeContractError::MalformedPayload)
+    ));
+}
+
+#[test]
+fn invalid_normalised_event_is_reported_as_evidence_error() {
+    let mut invalid_event = fixture();
+    invalid_event["created"] = json!(-1);
+    assert!(matches!(
+        decode(&invalid_event),
+        Err(StripeContractError::ProviderEvidence(
+            sotto_server::cloud_provider::ProviderAdapterError::InvalidEvidence(_)
+        ))
     ));
 }
 
