@@ -845,11 +845,8 @@ fn parse_subscription(value: &Value) -> Result<StripeSubscriptionResource, Strip
     Ok(StripeSubscriptionResource {
         id: required_id(value, "subscription.id")?,
         customer_id: optional_validated_ref(value.get("customer"), "subscription.customer")?,
-        status: value
-            .get("status")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        livemode: value.get("livemode").and_then(Value::as_bool),
+        status: optional_string(value.get("status"), "subscription.status")?,
+        livemode: optional_bool(value.get("livemode"), "subscription.livemode")?,
     })
 }
 
@@ -858,42 +855,34 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
         id: required_id(value, "invoice.id")?,
         customer_id: optional_validated_ref(value.get("customer"), "invoice.customer")?,
         subscription_id: optional_validated_ref(value.get("subscription"), "invoice.subscription")?,
-        status: value
-            .get("status")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        currency: value
-            .get("currency")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        amount_paid: value.get("amount_paid").and_then(Value::as_i64),
-        amount_due: value.get("amount_due").and_then(Value::as_i64),
-        amount_overpaid: value.get("amount_overpaid").and_then(Value::as_i64),
-        amount_paid_off_stripe: value.get("amount_paid_off_stripe").and_then(Value::as_i64),
-        allocation_reference: value
-            .get("metadata")
-            .and_then(Value::as_object)
-            .and_then(|metadata| metadata.get(STRIPE_ALLOCATION_METADATA_KEY))
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_owned),
-        livemode: value.get("livemode").and_then(Value::as_bool),
+        status: optional_string(value.get("status"), "invoice.status")?,
+        currency: optional_string(value.get("currency"), "invoice.currency")?
+            .map(|currency| currency.to_ascii_lowercase()),
+        amount_paid: optional_i64(value.get("amount_paid"), "invoice.amount_paid")?,
+        amount_due: optional_i64(value.get("amount_due"), "invoice.amount_due")?,
+        amount_overpaid: optional_i64(value.get("amount_overpaid"), "invoice.amount_overpaid")?,
+        amount_paid_off_stripe: optional_i64(
+            value.get("amount_paid_off_stripe"),
+            "invoice.amount_paid_off_stripe",
+        )?,
+        allocation_reference: optional_allocation_reference(value.get("metadata"))?,
+        livemode: optional_bool(value.get("livemode"), "invoice.livemode")?,
     })
 }
 
 fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, StripeReadError> {
-    let parent = value.get("parent").and_then(Value::as_object);
+    let parent = optional_object(value.get("parent"), "line.parent")?;
     let details = parent
         .and_then(|parent| parent.get("subscription_item_details"))
         .and_then(Value::as_object);
-    let pricing = value.get("pricing").and_then(Value::as_object);
+    let pricing = optional_object(value.get("pricing"), "line.pricing")?;
     let price_details = pricing
         .and_then(|pricing| pricing.get("price_details"))
         .and_then(Value::as_object);
-    let period = value.get("period").and_then(Value::as_object);
+    let period = optional_object(value.get("period"), "line.period")?;
     Ok(StripeInvoiceLineResource {
         id: required_id(value, "invoice line.id")?,
-        quantity: value.get("quantity").and_then(Value::as_i64),
+        quantity: optional_i64(value.get("quantity"), "line.quantity")?,
         subscription_id: details
             .map(|details| optional_validated_ref(details.get("subscription"), "line.subscription"))
             .transpose()?
@@ -909,14 +898,22 @@ fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, Stripe
             .transpose()?
             .flatten(),
         parent_type: parent
-            .and_then(|parent| parent.get("type").and_then(Value::as_str))
-            .map(str::to_owned),
+            .map(|parent| optional_string(parent.get("type"), "line.parent.type"))
+            .transpose()?
+            .flatten(),
         pricing_type: pricing
-            .and_then(|pricing| pricing.get("type").and_then(Value::as_str))
-            .map(str::to_owned),
-        livemode: value.get("livemode").and_then(Value::as_bool),
-        period_start: period.and_then(|period| period.get("start").and_then(Value::as_i64)),
-        period_end: period.and_then(|period| period.get("end").and_then(Value::as_i64)),
+            .map(|pricing| optional_string(pricing.get("type"), "line.pricing.type"))
+            .transpose()?
+            .flatten(),
+        livemode: optional_bool(value.get("livemode"), "line.livemode")?,
+        period_start: period
+            .map(|period| optional_i64(period.get("start"), "line.period.start"))
+            .transpose()?
+            .flatten(),
+        period_end: period
+            .map(|period| optional_i64(period.get("end"), "line.period.end"))
+            .transpose()?
+            .flatten(),
     })
 }
 
@@ -930,8 +927,8 @@ fn parse_invoice_payment(value: &Value) -> Result<StripeInvoicePaymentResource, 
         status: required_string(value, "status")?,
         amount_paid: required_i64(value, "amount_paid")?,
         amount_requested: required_i64(value, "amount_requested")?,
-        currency: required_string(value, "currency")?,
-        livemode: value.get("livemode").and_then(Value::as_bool),
+        currency: required_string(value, "currency")?.to_ascii_lowercase(),
+        livemode: optional_bool(value.get("livemode"), "invoice payment.livemode")?,
         payment_type: required_string_object(payment, "type", "payment.type")?,
         payment_intent_id: optional_validated_ref(
             payment.get("payment_intent"),
@@ -966,6 +963,70 @@ fn required_ref(value: &Value, field: &'static str) -> Result<String, StripeRead
     .ok_or(StripeReadError::MalformedResponse(field))?;
     validate_identifier(&reference)?;
     Ok(reference)
+}
+
+fn optional_string(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<String>, StripeReadError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .map(Some)
+            .ok_or(StripeReadError::MalformedResponse(field)),
+    }
+}
+
+fn optional_bool(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<bool>, StripeReadError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_bool()
+            .map(Some)
+            .ok_or(StripeReadError::MalformedResponse(field)),
+    }
+}
+
+fn optional_i64(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<Option<i64>, StripeReadError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or(StripeReadError::MalformedResponse(field)),
+    }
+}
+
+fn optional_object<'a>(
+    value: Option<&'a Value>,
+    field: &'static str,
+) -> Result<Option<&'a serde_json::Map<String, Value>>, StripeReadError> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_object()
+            .map(Some)
+            .ok_or(StripeReadError::MalformedResponse(field)),
+    }
+}
+
+fn optional_allocation_reference(value: Option<&Value>) -> Result<Option<String>, StripeReadError> {
+    let Some(metadata) = optional_object(value, "invoice.metadata")? else {
+        return Ok(None);
+    };
+    optional_string(
+        metadata.get(STRIPE_ALLOCATION_METADATA_KEY),
+        "invoice.metadata.sotto_allocation_reference",
+    )
 }
 
 fn optional_ref(value: Option<&Value>) -> Option<String> {
