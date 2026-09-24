@@ -568,6 +568,7 @@ async fn receipt_update_failure_rolls_back_projection_and_retry_applies_once() {
     let suffix = Uuid::new_v4().to_string().replace('-', "_");
     let function_name = format!("provider_refresh_fail_{suffix}");
     let trigger_name = format!("provider_refresh_fail_trigger_{suffix}");
+    let event_id = fixture.event_id.replace('\'', "''");
     sqlx::query(&format!(
         "CREATE FUNCTION public.{function_name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'provider refresh test failure'; END; $$"
     ))
@@ -575,7 +576,7 @@ async fn receipt_update_failure_rolls_back_projection_and_retry_applies_once() {
     .await
     .expect("create receipt failure function");
     sqlx::query(&format!(
-        "CREATE TRIGGER {trigger_name} BEFORE UPDATE OF status ON cloud_provider_event_receipts FOR EACH ROW WHEN (NEW.status = 'applied') EXECUTE FUNCTION public.{function_name}()"
+        "CREATE TRIGGER {trigger_name} BEFORE UPDATE OF status ON cloud_provider_event_receipts FOR EACH ROW WHEN (NEW.status = 'applied' AND NEW.event_id = '{event_id}') EXECUTE FUNCTION public.{function_name}()"
     ))
     .execute(&pool)
     .await
