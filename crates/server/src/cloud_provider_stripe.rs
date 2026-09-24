@@ -288,7 +288,8 @@ pub fn decode_paid_invoice(
         return Err(StripeContractError::UnsupportedQuantity);
     }
     let line = &lines[0];
-    let provider_item_id = required_ref(line, "id")?;
+    let invoice_line_id = required_ref(line, "id")?;
+    let provider_item_id = required_ref(line, "subscription_item")?;
     if required_i64(line, "quantity")? != 1 {
         return Err(StripeContractError::UnsupportedQuantity);
     }
@@ -374,7 +375,7 @@ pub fn decode_paid_invoice(
         interval,
         period_start,
         period_end,
-        evidence_reference: format!("stripe:invoice:{invoice_id}:line:{provider_item_id}"),
+        evidence_reference: format!("stripe:invoice:{invoice_id}:line:{invoice_line_id}"),
     })
 }
 

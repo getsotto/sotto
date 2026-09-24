@@ -89,7 +89,7 @@ fn paid_personal_invoice_accepts_expanded_references_and_normalises_evidence() {
     );
     assert_eq!(
         evidence.evidence_reference,
-        "stripe:invoice:in_contract_invoice:line:si_contract_person"
+        "stripe:invoice:in_contract_invoice:line:il_contract_line"
     );
 }
 
@@ -234,6 +234,14 @@ fn unpaid_quantity_price_and_missing_allocation_are_not_coverage() {
     assert!(matches!(
         decode(&wrong_price),
         Err(StripeContractError::UnsupportedPrice)
+    ));
+
+    let mut missing_subscription_item = fixture();
+    missing_subscription_item["data"]["object"]["lines"]["data"][0]["subscription_item"] =
+        Value::Null;
+    assert!(matches!(
+        decode(&missing_subscription_item),
+        Err(StripeContractError::InvalidField("subscription_item"))
     ));
 
     let mut missing_allocation = fixture();

@@ -27,7 +27,8 @@
       "lines": {
         "data": [
           {
-            "id": "si_contract_person",
+            "id": "il_contract_line",
+            "subscription_item": "si_contract_person",
             "quantity": 1,
             "price": {
               "id": "price_contract_month",
