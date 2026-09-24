@@ -443,3 +443,73 @@ async fn cumulative_response_bytes_are_shared_across_resource_reads() {
         Err(StripeReadError::SessionBytesExceeded)
     ));
 }
+
+#[tokio::test]
+async fn enforces_page_record_and_request_bounds() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(
+            vec![json!({"id":"in_1","customer":"cus_1"})],
+            true,
+        ))],
+    );
+    let server = mock_server(responses).await;
+    let mut bounded = limits();
+    bounded.max_pages = 1;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), bounded).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .subscription_invoices(&mut session, "sub_1", None)
+            .await,
+        Err(StripeReadError::PageBoundExceeded)
+    ));
+
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![MockResponse::json(list(
+            vec![
+                json!({"id":"in_1","customer":"cus_1"}),
+                json!({"id":"in_2","customer":"cus_1"}),
+            ],
+            false,
+        ))],
+    );
+    let server = mock_server(responses).await;
+    let mut bounded = limits();
+    bounded.max_records = 1;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), bounded).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .subscription_invoices(&mut session, "sub_1", None)
+            .await,
+        Err(StripeReadError::RecordBoundExceeded)
+    ));
+
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/subscriptions/sub_1".into(),
+        vec![MockResponse::json(json!({
+            "id":"sub_1","customer":"cus_1","status":"active","livemode":false
+        }))],
+    );
+    let server = mock_server(responses).await;
+    let mut bounded = limits();
+    bounded.max_requests = 1;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), bounded).unwrap();
+    let mut session = client.session();
+    client.account(&mut session).await.unwrap();
+    assert!(matches!(
+        client.subscription(&mut session, "sub_1", "cus_1").await,
+        Err(StripeReadError::RequestBoundExceeded)
+    ));
+}
