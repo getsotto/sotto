@@ -64,6 +64,11 @@ impl MockResponse {
             body: String::new(),
         }
     }
+
+    fn with_header(mut self, name: &'static str, value: &str) -> Self {
+        self.headers.push((name, value.into()));
+        self
+    }
 }
 
 struct MockServer {
@@ -371,5 +376,70 @@ async fn rejects_a_response_body_before_it_can_exceed_the_bound() {
     assert!(matches!(
         client.account(&mut session).await,
         Err(StripeReadError::ResponseTooLarge)
+    ));
+}
+
+#[tokio::test]
+async fn retries_rate_limits_but_does_not_retry_authentication_or_leak_error_bodies() {
+    let mut responses = HashMap::new();
+    responses.insert(
+        "/v1/account".into(),
+        vec![
+            MockResponse::status(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate secret sk_test_transport",
+            )
+            .with_header("retry-after", "0"),
+            MockResponse::json(account()),
+        ],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(client.account(&mut session).await.is_ok());
+    assert_eq!(server.state.calls.lock().unwrap().len(), 2);
+
+    let mut responses = HashMap::new();
+    responses.insert(
+        "/v1/account".into(),
+        vec![MockResponse::status(
+            StatusCode::UNAUTHORIZED,
+            "authentication secret sk_test_transport",
+        )],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    let error = client.account(&mut session).await.unwrap_err();
+    assert!(matches!(
+        error,
+        StripeReadError::Authentication { status: 401 }
+    ));
+    assert!(!error.to_string().contains(API_KEY));
+    assert_eq!(server.state.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn cumulative_response_bytes_are_shared_across_resource_reads() {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/subscriptions/sub_1".into(),
+        vec![MockResponse::json(json!({
+            "id":"sub_1","customer":"cus_1","status":"active","livemode":false
+        }))],
+    );
+    let server = mock_server(responses).await;
+    let mut bounded = limits();
+    bounded.max_total_response_bytes = 100;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), bounded).unwrap();
+    let mut session = client.session();
+    assert!(client.account(&mut session).await.is_ok());
+    assert!(matches!(
+        client.subscription(&mut session, "sub_1", "cus_1").await,
+        Err(StripeReadError::SessionBytesExceeded)
     ));
 }

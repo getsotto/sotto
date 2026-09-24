@@ -526,6 +526,7 @@ impl StripeReadClient {
         }
         if !(200..300).contains(&status) {
             return Err(match status {
+                300..=399 => StripeReadError::RedirectRejected,
                 401 | 403 => StripeReadError::Authentication { status },
                 404 => StripeReadError::ResourceMissing,
                 429 => StripeReadError::RateLimited { retry_after },
