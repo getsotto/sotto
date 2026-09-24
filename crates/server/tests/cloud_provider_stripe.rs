@@ -64,7 +64,7 @@ fn paid_personal_invoice_accepts_expanded_references_and_normalises_evidence() {
     let evidence = decode(&fixture()).unwrap();
     assert_eq!(
         evidence.account_provenance,
-        StripeAccountProvenance::DeclaredAccount("acct_test_sotto_contract".into())
+        StripeAccountProvenance::OperatorAccount
     );
     assert_eq!(evidence.invoice_id, "in_contract_invoice");
     assert_eq!(evidence.customer_id, "cus_contract_person");
@@ -175,10 +175,10 @@ fn unsupported_versions_types_and_contexts_fail_closed() {
         Err(StripeContractError::UnsupportedEventType(_))
     ));
 
-    let mut wrong_account = fixture();
-    wrong_account["account"] = json!("acct_other");
+    let mut connect_account = fixture();
+    connect_account["account"] = json!("acct_test_sotto_contract");
     assert!(matches!(
-        decode(&wrong_account),
+        decode(&connect_account),
         Err(StripeContractError::ContextMismatch)
     ));
 

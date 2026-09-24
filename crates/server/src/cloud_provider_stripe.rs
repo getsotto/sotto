@@ -118,7 +118,6 @@ pub struct StripeCoverageEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StripeAccountProvenance {
     OperatorAccount,
-    DeclaredAccount(String),
 }
 
 /// Durable personal ownership resolved by the caller before evidence can authorise coverage.
@@ -391,13 +390,10 @@ fn validate_event_context(
     {
         return Err(StripeContractError::ContextMismatch);
     }
-    match event.account.as_deref() {
-        Some(account) if account == config.account_id => {
-            Ok(StripeAccountProvenance::DeclaredAccount(account.into()))
-        }
-        Some(_) => Err(StripeContractError::ContextMismatch),
-        None => Ok(StripeAccountProvenance::OperatorAccount),
+    if event.account.is_some() {
+        return Err(StripeContractError::ContextMismatch);
     }
+    Ok(StripeAccountProvenance::OperatorAccount)
 }
 
 fn required_payment_intent(

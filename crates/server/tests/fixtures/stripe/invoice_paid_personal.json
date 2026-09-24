@@ -3,7 +3,6 @@
   "created": 1700000000,
   "api_version": "2026-07-29.dahlia",
   "type": "invoice.paid",
-  "account": "acct_test_sotto_contract",
   "livemode": false,
   "data": {
     "object": {
