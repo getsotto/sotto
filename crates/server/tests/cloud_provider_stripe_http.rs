@@ -250,6 +250,28 @@ fn paid_payment() -> Value {
     })
 }
 
+fn observation_responses(
+    invoice: Value,
+    line: Value,
+    payment: Value,
+) -> HashMap<String, Vec<MockResponse>> {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/invoices/in_1".into(),
+        vec![MockResponse::json(invoice)],
+    );
+    responses.insert(
+        "/v1/invoices/in_1/lines".into(),
+        vec![MockResponse::json(list(vec![line], false))],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![MockResponse::json(list(vec![payment], false))],
+    );
+    responses
+}
+
 #[tokio::test]
 async fn assembles_a_personal_invoice_observation_from_complete_reads() {
     let mut responses = HashMap::new();
@@ -344,6 +366,65 @@ async fn reads_all_payment_pages_before_rejecting_ambiguous_settlement() {
         .unwrap()
         .iter()
         .any(|call| call.path_and_query.contains("starting_after=inpay_1")));
+}
+
+#[tokio::test]
+async fn rejects_amount_period_and_settlement_contract_violations() {
+    let mut invoice = paid_invoice();
+    invoice["amount_due"] = json!(300);
+    let server = mock_server(observation_responses(
+        invoice,
+        personal_line("il_1"),
+        paid_payment(),
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+            .await,
+        Err(StripeReadError::Observation(
+            sotto_server::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(_)
+        ))
+    ));
+
+    let mut line = personal_line("il_1");
+    line["period"]["end"] = json!(1700000000);
+    let server = mock_server(observation_responses(paid_invoice(), line, paid_payment())).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+            .await,
+        Err(StripeReadError::Observation(
+            sotto_server::cloud_provider_stripe::StripeContractError::InvalidField("period")
+        ))
+    ));
+
+    let mut payment = paid_payment();
+    payment["amount_paid"] = json!(298);
+    payment["amount_requested"] = json!(298);
+    let server = mock_server(observation_responses(
+        paid_invoice(),
+        personal_line("il_1"),
+        payment,
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .personal_invoice_observation(&mut session, "in_1", &personal_binding())
+            .await,
+        Err(StripeReadError::Observation(
+            sotto_server::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(_)
+        ))
+    ));
 }
 
 #[tokio::test]
