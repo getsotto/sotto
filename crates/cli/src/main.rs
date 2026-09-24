@@ -180,6 +180,9 @@ enum Command {
         /// Copy the secret to the clipboard instead of printing it.
         #[arg(short = 'c', long, conflicts_with = "reveal")]
         copy: bool,
+        /// Do not copy the secret to the clipboard in an interactive terminal.
+        #[arg(long, conflicts_with = "copy")]
+        no_copy: bool,
     },
     /// List secret names in the active environment.
     Ls {
@@ -370,6 +373,13 @@ fn run() -> Result<()> {
             ..
         } => {
             return Err(Error::Input("--copy conflicts with --reveal".into()));
+        }
+        Command::Get {
+            copy: true,
+            no_copy: true,
+            ..
+        } => {
+            return Err(Error::Input("--copy conflicts with --no-copy".into()));
         }
         _ => {}
     }
@@ -571,10 +581,22 @@ fn run() -> Result<()> {
             eprintln!("set {name} ({}/{})", config.project, config.environment);
             Ok(())
         }
-        Command::Get { name, reveal, copy } => {
+        Command::Get {
+            name,
+            reveal,
+            copy,
+            no_copy,
+        } => {
+            if no_copy && !reveal && io::stdout().is_terminal() {
+                return Err(Error::Input(
+                    "refusing to print a secret to a terminal; use --reveal or pipe the output"
+                        .into(),
+                ));
+            }
             prompts::preflight_secret_name(name.as_deref())?;
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
+            let is_interactive = name.is_none();
             let name = match name {
                 Some(name) => name,
                 None => match prompts::select_secret_key(&app, &config, &theme)? {
@@ -586,11 +608,27 @@ fn run() -> Result<()> {
                 },
             };
             let mut value = app.get(&config, &name)?;
-            let result = if copy {
+            let automatic_copy = is_interactive
+                && !reveal
+                && !no_copy
+                && !copy
+                && io::stdout().is_terminal()
+                && !sotto_cli::theme::ci_enabled(std::env::var("CI").ok().as_deref());
+            let result = if copy || automatic_copy {
                 match std::str::from_utf8(&value) {
-                    Ok(text) => clipboard::copy(text).map(|()| {
-                        eprintln!("Copied to clipboard; will attempt to clear after 45 seconds.");
-                    }),
+                    Ok(text) => match clipboard::copy(text) {
+                        Ok(()) => {
+                            eprintln!(
+                                "Copied to clipboard; will attempt to clear after 45 seconds."
+                            );
+                            Ok(())
+                        }
+                        Err(err) if automatic_copy => {
+                            eprintln!("warning: could not copy to clipboard: {err}");
+                            write_value(&value, reveal)
+                        }
+                        Err(err) => Err(err),
+                    },
                     Err(_) => Err(Error::Input("clipboard requires valid UTF-8 text".into())),
                 }
             } else {
@@ -2275,7 +2313,25 @@ mod tests {
     fn subcommands_parse_with_omitted_name_for_interactive_fallbacks() {
         let cli =
             Cli::try_parse_from(["sotto", "get"]).expect("sotto get without args should parse");
-        assert!(matches!(cli.command, Command::Get { name: None, .. }));
+        assert!(matches!(
+            cli.command,
+            Command::Get {
+                name: None,
+                no_copy: false,
+                ..
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "get", "--no-copy"])
+            .expect("sotto get --no-copy should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Get {
+                name: None,
+                no_copy: true,
+                ..
+            }
+        ));
 
         let cli =
             Cli::try_parse_from(["sotto", "reset", "-y"]).expect("sotto reset -y should parse");
