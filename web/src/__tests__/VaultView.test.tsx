@@ -254,4 +254,143 @@ describe("VaultView selection loading", () => {
     });
     expect(memberSelect).toBeEnabled();
   });
+
+  function mockOrgShareVault(envIds: string[] = ["env-a"]) {
+    vi.mocked(api.fetchProjects).mockResolvedValue([
+      { id: "project-a", encName: new Uint8Array([1]), orgId: "org-1" },
+    ]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue(envIds.map((id) => environment(id)));
+    vi.mocked(api.fetchMembers).mockResolvedValue([
+      { userId: "member-a", role: "member", publicKey: new Uint8Array([6]) },
+    ]);
+    vi.mocked(api.fetchMyGrant).mockResolvedValue(new Uint8Array([7]));
+    vi.mocked(api.fetchSecrets).mockResolvedValue([]);
+    vi.mocked(api.fetchOrgs).mockResolvedValue([
+      { id: "org-1", encName: new Uint8Array(), role: "owner", encOrgKey: null },
+    ]);
+    vi.mocked(vault.decryptProjectName).mockReturnValue("project-a");
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
+    vi.mocked(vault.sealGrantTo).mockReturnValue(new Uint8Array([9]));
+  }
+
+  async function openEnvAndPickMember(envName: string) {
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: envName }));
+    const memberSelect = await screen.findByRole("combobox", {
+      name: /Share this environment with/,
+    });
+    fireEvent.change(memberSelect, { target: { value: "member-a" } });
+    const shareForm = screen.getByRole("button", { name: "Share" }).closest("form");
+    expect(shareForm).not.toBeNull();
+    return shareForm;
+  }
+
+  it("shows a share notice when the environment is still selected", async () => {
+    mockOrgShareVault();
+    const shareRequest = deferred<void>();
+    vi.mocked(api.createGrant).mockReturnValue(shareRequest.promise);
+
+    renderVault();
+    const shareForm = await openEnvAndPickMember("env-a");
+    if (shareForm === null) {
+      return;
+    }
+
+    fireEvent.submit(shareForm);
+    expect(api.createGrant).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      shareRequest.resolve();
+    });
+
+    expect(await screen.findByText("shared this environment with member-a")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("does not show a share notice after switching environments", async () => {
+    mockOrgShareVault(["env-a", "env-b"]);
+    const shareRequest = deferred<void>();
+    vi.mocked(api.createGrant).mockReturnValue(shareRequest.promise);
+
+    renderVault();
+    const shareForm = await openEnvAndPickMember("env-a");
+    if (shareForm === null) {
+      return;
+    }
+
+    fireEvent.submit(shareForm);
+    expect(api.createGrant).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "env-b" }));
+    expect(await screen.findByRole("button", { name: "env-b", current: true })).toBeInTheDocument();
+
+    await act(async () => {
+      shareRequest.resolve();
+    });
+
+    expect(screen.queryByText("shared this environment with member-a")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.createGrant).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not show a share error after switching environments", async () => {
+    mockOrgShareVault(["env-a", "env-b"]);
+    const shareRequest = deferred<void>();
+    vi.mocked(api.createGrant).mockReturnValue(shareRequest.promise);
+
+    renderVault();
+    const shareForm = await openEnvAndPickMember("env-a");
+    if (shareForm === null) {
+      return;
+    }
+
+    fireEvent.submit(shareForm);
+    fireEvent.click(screen.getByRole("button", { name: "env-b" }));
+    expect(await screen.findByRole("button", { name: "env-b", current: true })).toBeInTheDocument();
+
+    await act(async () => {
+      shareRequest.reject(new Error("share failed"));
+    });
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("share failed")).not.toBeInTheDocument();
+  });
+
+  it("does not show a share notice after switching projects", async () => {
+    mockOrgShareVault(["env-a"]);
+    vi.mocked(api.fetchProjects).mockResolvedValue([
+      { id: "project-a", encName: new Uint8Array([1]), orgId: "org-1" },
+      { id: "project-b", encName: new Uint8Array([1]), orgId: null },
+    ]);
+    vi.mocked(api.fetchEnvironments).mockImplementation(async (projectId) => {
+      if (projectId === "project-a") {
+        return [environment("env-a")];
+      }
+      if (projectId === "project-b") {
+        return [environment("env-c")];
+      }
+      return [];
+    });
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
+    const shareRequest = deferred<void>();
+    vi.mocked(api.createGrant).mockReturnValue(shareRequest.promise);
+
+    renderVault();
+    const shareForm = await openEnvAndPickMember("env-a");
+    if (shareForm === null) {
+      return;
+    }
+
+    fireEvent.submit(shareForm);
+    fireEvent.click(await screen.findByRole("button", { name: /project-b/ }));
+    expect(await screen.findByRole("button", { name: "env-c" })).toBeInTheDocument();
+
+    await act(async () => {
+      shareRequest.resolve();
+    });
+
+    expect(screen.queryByText("shared this environment with member-a")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
 });

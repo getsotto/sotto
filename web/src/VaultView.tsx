@@ -239,6 +239,12 @@ export function VaultView({
       return;
     }
     const envId = openEnv.envId;
+    // Capture the selection generation so a late response cannot paint a notice or error
+    // after the user has already switched environment or project.
+    const shareEnvLoad = envLoad.current;
+    const shareProjectLoad = projectLoad.current;
+    const shareStillCurrent = () =>
+      shareEnvLoad === envLoad.current && shareProjectLoad === projectLoad.current;
     sharingEnvRef.current = envId;
     setSharingEnvId(envId);
     try {
@@ -256,8 +262,14 @@ export function VaultView({
           // Best-effort only; the member may just see the org id for names.
         }
       }
+      if (!shareStillCurrent()) {
+        return;
+      }
       setNotice(`shared this environment with ${member.userId}`);
     } catch (e) {
+      if (!shareStillCurrent()) {
+        return;
+      }
       setError(message(e));
     } finally {
       if (sharingEnvRef.current === envId) {
