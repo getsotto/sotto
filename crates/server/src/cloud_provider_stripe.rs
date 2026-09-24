@@ -520,13 +520,14 @@ pub fn decode_paid_invoice(
         .ok_or(StripeContractError::MissingField(
             "metadata.sotto_allocation_reference",
         ))?;
+    let invoice_subscription_id = optional_ref(invoice, "subscription")?;
     let observation = validate_personal_invoice_observation(
         config,
         binding,
         StripePersonalInvoiceFacts {
             invoice_id: invoice_id.clone(),
             customer_id: customer_id.clone(),
-            invoice_subscription_id: None,
+            invoice_subscription_id,
             subscription_id: subscription_id.clone(),
             provider_item_id: provider_item_id.clone(),
             invoice_line_id: invoice_line_id.clone(),
@@ -602,7 +603,7 @@ pub fn decode_invoice_payment(
     }
     let amount_paid = required_i64(&payment, "amount_paid")?;
     let amount_requested = required_i64(&payment, "amount_requested")?;
-    let currency = required_string(&payment, "currency")?.to_ascii_lowercase();
+    let currency = required_string(&payment, "currency")?;
     if amount_paid <= 0 || amount_requested <= 0 || amount_paid != amount_requested {
         return Err(StripeContractError::UnsupportedSettlement(
             "invoice payment does not settle its requested amount",
@@ -662,6 +663,29 @@ fn required_string(object: &Value, field: &'static str) -> Result<String, Stripe
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned)
         .ok_or(StripeContractError::MissingField(field))
+}
+
+fn optional_ref(
+    object: &Value,
+    field: &'static str,
+) -> Result<Option<String>, StripeContractError> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(value) = value.as_str().filter(|value| !value.trim().is_empty()) {
+        return Ok(Some(value.to_owned()));
+    }
+    if let Some(value) = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(Some(value.to_owned()));
+    }
+    Err(StripeContractError::InvalidField(field))
 }
 
 fn required_ref(object: &Value, field: &'static str) -> Result<String, StripeContractError> {

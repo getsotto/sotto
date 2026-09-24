@@ -118,6 +118,16 @@ fn paid_personal_invoice_accepts_expanded_references_and_normalises_evidence() {
 }
 
 #[test]
+fn contradictory_invoice_subscription_is_rejected() {
+    let mut payload = fixture();
+    payload["data"]["object"]["subscription"] = json!("sub_other");
+    assert!(matches!(
+        decode(&payload),
+        Err(StripeContractError::OwnershipMismatch)
+    ));
+}
+
+#[test]
 fn annual_standard_price_maps_to_a_year_interval() {
     let mut annual = fixture();
     annual["data"]["object"]["lines"]["data"][0]["pricing"]["price_details"]["price"] =
