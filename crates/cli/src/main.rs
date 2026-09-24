@@ -20,6 +20,7 @@ use sotto_cli::dotenv;
 use sotto_cli::error::{Error, Result};
 use sotto_cli::export::{self, ExportFormat};
 use sotto_cli::keychain::{Keychain, OsKeychain};
+use sotto_cli::prompts;
 use sotto_cli::remote;
 use sotto_cli::session;
 use sotto_cli::store::Store;
@@ -112,7 +113,7 @@ enum Command {
     )]
     Share {
         /// The secret name to share.
-        name: String,
+        name: Option<String>,
         /// How many times the link may be viewed before it burns (1-100).
         #[arg(
             long,
@@ -172,7 +173,7 @@ enum Command {
     },
     /// Print a secret's value. Refuses to print to a terminal without --reveal.
     Get {
-        name: String,
+        name: Option<String>,
         /// Allow printing the secret to a terminal.
         #[arg(long)]
         reveal: bool,
@@ -187,7 +188,12 @@ enum Command {
         json: bool,
     },
     /// Remove a secret.
-    Rm { name: String },
+    Rm {
+        name: Option<String>,
+        /// Skip the interactive confirmation.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Show a secret's version history (from the server; run after `login`).
     #[command(
         after_help = "Examples:\n  sotto history DATABASE_URL\n  sotto history DATABASE_URL --reveal\n\nHistory and rollback use the server and require login and an unlocked local store. History normally shows version numbers and sizes; --reveal prints plaintext values."
@@ -272,7 +278,7 @@ enum EnvCommand {
         json: bool,
     },
     /// Set the active environment for this project.
-    Use { name: String },
+    Use { name: Option<String> },
     /// Compare two environments key by key (presence + "differs" markers).
     #[command(
         after_help = "Examples:\n  sotto env diff dev staging\n  sotto env diff dev staging --reveal\n\nMarkers:\n  =  key exists in both environments with the same value\n  !  key exists in both environments with different values\n  <  key exists only in the left (first) environment\n  >  key exists only in the right (second) environment\n\nValues are hidden by default. --reveal displays plaintext values for keys that differ in both environments."
@@ -486,6 +492,10 @@ fn run() -> Result<()> {
         } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
+            let name = match name {
+                Some(name) => name,
+                None => prompts::select_secret_key(&app, &config, &theme)?,
+            };
             share(
                 &app,
                 &keychain,
@@ -554,6 +564,10 @@ fn run() -> Result<()> {
         Command::Get { name, reveal, copy } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
+            let name = match name {
+                Some(name) => name,
+                None => prompts::select_secret_key(&app, &config, &theme)?,
+            };
             let mut value = app.get(&config, &name)?;
             let result = if copy {
                 match std::str::from_utf8(&value) {
@@ -581,9 +595,17 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Rm { name } => {
+        Command::Rm { name, yes } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
+            let name = match name {
+                Some(name) => name,
+                None => prompts::select_secret_key(&app, &config, &theme)?,
+            };
+            if !yes && prompts::can_prompt() && !prompts::confirm_removal(&name, &theme)? {
+                eprintln!("aborted");
+                return Ok(());
+            }
             app.remove(&config, &name)?;
             eprintln!("removed {name}");
             Ok(())
@@ -631,7 +653,7 @@ fn run() -> Result<()> {
                 }
                 Ok(())
             }
-            EnvCommand::Use { name } => env_use(&store, &cwd, &name),
+            EnvCommand::Use { name } => env_use(&store, &cwd, name, &theme),
             EnvCommand::Diff {
                 left,
                 right,
@@ -1433,12 +1455,21 @@ fn env_copy(app: &App, config: &Config, src: &str, dst: &str, confirm: bool) -> 
     Ok(())
 }
 
-fn env_use(store: &Store, cwd: &Path, name: &str) -> Result<()> {
+fn env_use(
+    store: &Store,
+    cwd: &Path,
+    name: Option<String>,
+    theme: &sotto_cli::theme::Theme,
+) -> Result<()> {
     let (mut config, dir) = Config::discover(cwd)?;
+    let name = match name {
+        Some(name) => name,
+        None => prompts::select_environment(store, &config.project_id, theme)?,
+    };
     if !store
         .list_environments(&config.project_id)?
         .iter()
-        .any(|e| e == name)
+        .any(|e| e == &name)
     {
         return Err(Error::NotFound(format!("environment `{name}`")));
     }
@@ -2186,5 +2217,43 @@ mod tests {
             env_list_json(&environments, "staging").unwrap(),
             r#"[{"active":false,"name":"dev"},{"active":false,"name":"prod"},{"active":true,"name":"staging"}]"#
         );
+    }
+
+    #[test]
+    fn subcommands_parse_with_omitted_name_for_interactive_fallbacks() {
+        let cli =
+            Cli::try_parse_from(["sotto", "get"]).expect("sotto get without args should parse");
+        assert!(matches!(cli.command, Command::Get { name: None, .. }));
+
+        let cli = Cli::try_parse_from(["sotto", "rm"]).expect("sotto rm without args should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Rm {
+                name: None,
+                yes: false
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "rm", "-y"]).expect("sotto rm -y should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Rm {
+                name: None,
+                yes: true
+            }
+        ));
+
+        let cli =
+            Cli::try_parse_from(["sotto", "share"]).expect("sotto share without args should parse");
+        assert!(matches!(cli.command, Command::Share { name: None, .. }));
+
+        let cli = Cli::try_parse_from(["sotto", "env", "use"])
+            .expect("sotto env use without args should parse");
+        assert!(matches!(
+            cli.command,
+            Command::Env {
+                command: EnvCommand::Use { name: None }
+            }
+        ));
     }
 }
