@@ -26,6 +26,7 @@ pub mod cloud_coverage_reconciliation;
 pub mod cloud_coverage_store;
 pub mod cloud_provider;
 pub mod cloud_provider_refresh;
+pub mod cloud_provider_stripe;
 pub mod community;
 pub mod config;
 pub mod db;
