@@ -149,6 +149,43 @@ test("checkout cancelled return is handled", async ({ page }) => {
   await expect(page).not.toHaveURL(/billing=cancelled/);
 });
 
+// fetchCommunity() (web/src/api.ts) returns null for a rejected request, a non-2xx response, or a
+// body that isn't valid JSON, and the landing page treats all three the same: hide the optional
+// stats, keep everything else usable. One test per failure mode so a regression that only breaks
+// one path (e.g. a JSON.parse change) doesn't hide behind the other two passing.
+async function expectCommunityFallback(page: import("@playwright/test").Page) {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Open source" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Star on GitHub" })).toHaveAttribute(
+    "href",
+    "https://github.com/getsotto/sotto",
+  );
+  await expect(page.getByRole("link", { name: "Good first issues" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Contributing" })).toBeVisible();
+  await expect(page.locator(".community-stats")).toHaveCount(0);
+  await expect(page.getByText(/curl -fsSL/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Copy", exact: true }).first()).toBeVisible();
+}
+
+test("landing page falls back gracefully when the community request is rejected", async ({ page }) => {
+  await page.route("**/community", (route) => route.abort());
+  await expectCommunityFallback(page);
+});
+
+test("landing page falls back gracefully on a failed community response", async ({ page }) => {
+  await page.route("**/community", async (route) => {
+    await route.fulfill({ status: 503 });
+  });
+  await expectCommunityFallback(page);
+});
+
+test("landing page falls back gracefully when the community response is not JSON", async ({ page }) => {
+  await page.route("**/community", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: "not JSON" });
+  });
+  await expectCommunityFallback(page);
+});
+
 test("landing page offers a star and a contributor path", async ({ page }) => {
   await page.route("**/community", async (route) => {
     await route.fulfill({
