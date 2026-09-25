@@ -23,6 +23,10 @@ const KEY_VERSION: u8 = 1;
 /// Warn in the job log once a token has fewer than this many whole days left. Two weeks spans a
 /// holiday and a sprint, so whoever owns the pipeline sees it at least once before it breaks.
 const EXPIRY_WARNING_DAYS: i64 = 14;
+/// Longest lifetime `sotto token create --expires-in-days` accepts, in days. Mirrors the server's
+/// limit so an out-of-range value is rejected while parsing arguments, before any local setup;
+/// the server still validates the lifetime authoritatively.
+pub const MAX_LIFETIME_DAYS: u32 = 365;
 
 /// A parsed machine token: the API bearer + the machine keypair recovered from its private key.
 pub struct MachineToken {

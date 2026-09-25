@@ -311,8 +311,11 @@ enum TokenCommand {
         /// Human label for the token ("github-actions").
         #[arg(long, default_value = "ci")]
         name: String,
-        /// Days until the token stops working (the server allows 1 to 365; default 90).
-        #[arg(long)]
+        /// Days until the token stops working (1-365; the server defaults to 90).
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(u32).range(1..=sotto_cli::remote::machine::MAX_LIFETIME_DAYS as i64)
+        )]
         expires_in_days: Option<u32>,
     },
     /// List the active environment's machine tokens.
@@ -1870,7 +1873,7 @@ mod tests {
 
     use super::{
         display_secret, env_list_json, history_line, import_dotenv, login_config, set_confirmation,
-        Cli, Command, EnvCommand, ThemeCommand,
+        Cli, Command, EnvCommand, ThemeCommand, TokenCommand,
     };
 
     #[test]
@@ -2188,6 +2191,49 @@ mod tests {
                 views: 1,
                 expire: None,
                 ..
+            }
+        ));
+    }
+
+    #[test]
+    fn token_lifetime_parses_bounds_and_rejects_out_of_range_values_before_setup() {
+        let max = sotto_cli::remote::machine::MAX_LIFETIME_DAYS;
+        for days in [1, max] {
+            let value = days.to_string();
+            let cli =
+                Cli::try_parse_from(["sotto", "token", "create", "--expires-in-days", &value])
+                    .unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Token {
+                    command: TokenCommand::Create {
+                        expires_in_days: Some(parsed),
+                        ..
+                    }
+                } if parsed == days
+            ));
+        }
+
+        for value in ["0", "366", "4294967295", "-1"] {
+            let flag = format!("--expires-in-days={value}");
+            let err = match Cli::try_parse_from(["sotto", "token", "create", &flag]) {
+                Ok(_) => panic!("accepted {flag}"),
+                Err(err) => err,
+            };
+            let message = err.to_string();
+            assert!(message.contains("--expires-in-days"), "{flag}: {message}");
+            assert!(message.contains("1..=365"), "{flag}: {message}");
+        }
+
+        // Omitting the flag defers to the server's default lifetime.
+        let cli = Cli::try_parse_from(["sotto", "token", "create"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Token {
+                command: TokenCommand::Create {
+                    expires_in_days: None,
+                    ..
+                }
             }
         ));
     }
