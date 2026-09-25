@@ -14,8 +14,8 @@ use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
 use sotto_server::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
 use sotto_server::cloud_provider_stripe_http::{
     StripeCreditNoteResource, StripeCreditNoteStatus, StripeCreditNoteType, StripeDisputeResource,
-    StripeDisputeStatus, StripeReadClient, StripeReadError, StripeReadLimits, StripeRefundResource,
-    StripeRefundStatus,
+    StripeDisputeStatus, StripeReadClient, StripeReadError, StripeReadLimits, StripeReadSession,
+    StripeRefundResource, StripeRefundStatus,
 };
 use tokio::net::TcpListener;
 use url::Url;
@@ -1907,4 +1907,322 @@ async fn credit_note_reads_keep_memos_links_and_metadata_out_of_evidence() {
         "{rendered}"
     );
     assert!(!rendered.contains(API_KEY), "{rendered}");
+}
+
+/// The three correction reads, so the shared transport rules are proved once for each of them.
+#[derive(Clone, Copy, Debug)]
+enum Correction {
+    Refunds,
+    Disputes,
+    CreditNotes,
+}
+
+impl Correction {
+    const ALL: [Self; 3] = [Self::Refunds, Self::Disputes, Self::CreditNotes];
+
+    fn path(self) -> &'static str {
+        match self {
+            Self::Refunds => "/v1/refunds",
+            Self::Disputes => "/v1/disputes",
+            Self::CreditNotes => "/v1/credit_notes",
+        }
+    }
+
+    fn parent_field(self) -> &'static str {
+        match self {
+            Self::Refunds | Self::Disputes => "payment_intent",
+            Self::CreditNotes => "invoice",
+        }
+    }
+
+    fn record(self, id: &str) -> Value {
+        match self {
+            Self::Refunds => refund(id, json!("succeeded")),
+            Self::Disputes => dispute(id, "needs_response"),
+            Self::CreditNotes => credit_note(id, "issued", "post_payment"),
+        }
+    }
+
+    async fn read(
+        self,
+        client: &StripeReadClient,
+        session: &mut StripeReadSession,
+    ) -> Result<usize, StripeReadError> {
+        match self {
+            Self::Refunds => client
+                .payment_intent_refunds(session, "pi_1")
+                .await
+                .map(|records| records.len()),
+            Self::Disputes => client
+                .payment_intent_disputes(session, "pi_1")
+                .await
+                .map(|records| records.len()),
+            Self::CreditNotes => client
+                .invoice_credit_notes(session, "in_1")
+                .await
+                .map(|records| records.len()),
+        }
+    }
+}
+
+fn correction_paths_requested(server: &MockServer) -> Vec<String> {
+    server
+        .state
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|call| call.path_and_query.clone())
+        .filter(|path| {
+            Correction::ALL
+                .iter()
+                .any(|correction| path.starts_with(correction.path()))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn later_page_failures_return_no_partial_corrections() {
+    type Check = fn(&StripeReadError) -> bool;
+    for correction in Correction::ALL {
+        let first_page = || {
+            MockResponse::json(list(
+                vec![correction.record("x_1"), correction.record("x_2")],
+                true,
+            ))
+        };
+        let wrong_parent = with_fields(
+            correction.record("x_3"),
+            &[(correction.parent_field(), Some(json!("other_1")))],
+        );
+        let negative = with_fields(correction.record("x_3"), &[("amount", Some(json!(-1)))]);
+        let cases: Vec<(&str, Vec<MockResponse>, Check)> = vec![
+            (
+                "missing",
+                vec![
+                    first_page(),
+                    MockResponse::status(StatusCode::NOT_FOUND, "{}"),
+                ],
+                |error| matches!(error, StripeReadError::ResourceMissing),
+            ),
+            (
+                "forbidden",
+                vec![
+                    first_page(),
+                    MockResponse::status(StatusCode::FORBIDDEN, "{}"),
+                ],
+                |error| matches!(error, StripeReadError::Permission { status: 403 }),
+            ),
+            (
+                "server error after its retry",
+                vec![
+                    first_page(),
+                    MockResponse::status(StatusCode::INTERNAL_SERVER_ERROR, "{}"),
+                    MockResponse::status(StatusCode::INTERNAL_SERVER_ERROR, "{}"),
+                ],
+                |error| matches!(error, StripeReadError::Retryable { status: 500 }),
+            ),
+            (
+                "cursor record repeated",
+                vec![
+                    first_page(),
+                    MockResponse::json(list(vec![correction.record("x_2")], false)),
+                ],
+                |error| {
+                    matches!(
+                        error,
+                        StripeReadError::InvalidPagination("duplicate record id")
+                    )
+                },
+            ),
+            (
+                "empty page claiming more",
+                vec![first_page(), MockResponse::json(list(Vec::new(), true))],
+                |error| {
+                    matches!(
+                        error,
+                        StripeReadError::InvalidPagination("empty page reported with more results")
+                    )
+                },
+            ),
+            (
+                "malformed record",
+                vec![
+                    first_page(),
+                    MockResponse::json(list(vec![negative], false)),
+                ],
+                |error| matches!(error, StripeReadError::MalformedResponse(_)),
+            ),
+            (
+                "wrong parent",
+                vec![
+                    first_page(),
+                    MockResponse::json(list(vec![wrong_parent], false)),
+                ],
+                |error| matches!(error, StripeReadError::ParentMismatch),
+            ),
+        ];
+        for (name, pages, check) in cases {
+            let server = mock_server(correction_responses(correction.path(), pages)).await;
+            let client =
+                StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits())
+                    .unwrap();
+            let mut session = client.session();
+            let result = correction.read(&client, &mut session).await;
+            assert!(
+                result.as_ref().is_err_and(check),
+                "{correction:?} {name}: {result:?}"
+            );
+            // The failure came from the second page, after a first page that parsed cleanly.
+            assert!(
+                correction_paths_requested(&server)
+                    .iter()
+                    .any(|path| path.contains("starting_after=x_2")),
+                "{correction:?} {name}"
+            );
+        }
+
+        let server = mock_server(correction_responses(correction.path(), vec![first_page()])).await;
+        let mut bounded = limits();
+        bounded.max_pages = 1;
+        let client =
+            StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), bounded).unwrap();
+        let mut session = client.session();
+        assert!(
+            matches!(
+                correction.read(&client, &mut session).await,
+                Err(StripeReadError::PageBoundExceeded)
+            ),
+            "{correction:?}"
+        );
+        assert_eq!(correction_paths_requested(&server).len(), 1);
+    }
+}
+
+fn shared_session_responses() -> HashMap<String, Vec<MockResponse>> {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![MockResponse::json(list(vec![paid_payment()], false))],
+    );
+    for correction in Correction::ALL {
+        responses.insert(
+            correction.path().into(),
+            vec![MockResponse::json(list(
+                vec![correction.record("x_1")],
+                false,
+            ))],
+        );
+    }
+    responses
+}
+
+async fn shared_session_client(bounded: StripeReadLimits) -> (MockServer, StripeReadClient) {
+    let server = mock_server(shared_session_responses()).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), bounded).unwrap();
+    (server, client)
+}
+
+#[tokio::test]
+async fn correction_reads_spend_the_invoice_session_budget() {
+    // One record each from the invoice payments, refunds and disputes fills a budget of three.
+    let mut bounded = limits();
+    bounded.max_records = 3;
+    let (_server, client) = shared_session_client(bounded).await;
+    let mut session = client.session();
+    client.invoice_payments(&mut session, "in_1").await.unwrap();
+    assert_eq!(
+        Correction::Refunds
+            .read(&client, &mut session)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        Correction::Disputes
+            .read(&client, &mut session)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        Correction::CreditNotes.read(&client, &mut session).await,
+        Err(StripeReadError::RecordBoundExceeded)
+    ));
+
+    // The account check and three reads use four requests; the fifth is refused before sending.
+    let mut bounded = limits();
+    bounded.max_requests = 4;
+    let (server, client) = shared_session_client(bounded).await;
+    let mut session = client.session();
+    client.invoice_payments(&mut session, "in_1").await.unwrap();
+    Correction::Refunds
+        .read(&client, &mut session)
+        .await
+        .unwrap();
+    Correction::Disputes
+        .read(&client, &mut session)
+        .await
+        .unwrap();
+    assert!(matches!(
+        Correction::CreditNotes.read(&client, &mut session).await,
+        Err(StripeReadError::RequestBoundExceeded)
+    ));
+    assert!(correction_paths_requested(&server)
+        .iter()
+        .all(|path| !path.starts_with("/v1/credit_notes")));
+
+    // The byte bound is one short of the account, payment and refund bodies together, and far
+    // above any one of them, so only a cumulative count can reject the refund page.
+    let body = |value: Value| serde_json::to_string(&value).unwrap().len();
+    let mut bounded = limits();
+    bounded.max_total_response_bytes = body(account())
+        + body(list(vec![paid_payment()], false))
+        + body(list(vec![Correction::Refunds.record("x_1")], false))
+        - 1;
+    let (_server, client) = shared_session_client(bounded).await;
+    let mut session = client.session();
+    client.invoice_payments(&mut session, "in_1").await.unwrap();
+    assert!(matches!(
+        Correction::Refunds.read(&client, &mut session).await,
+        Err(StripeReadError::SessionBytesExceeded)
+    ));
+}
+
+#[tokio::test]
+async fn correction_reads_keep_the_session_deadline_and_owner() {
+    let mut bounded = limits();
+    bounded.session_timeout = std::time::Duration::from_secs(1);
+    let (server, client) = shared_session_client(bounded).await;
+    let mut session = client.session();
+    client.invoice_payments(&mut session, "in_1").await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
+    for correction in Correction::ALL {
+        assert!(
+            matches!(
+                correction.read(&client, &mut session).await,
+                Err(StripeReadError::Timeout)
+            ),
+            "{correction:?}"
+        );
+    }
+    assert!(correction_paths_requested(&server).is_empty());
+
+    let (server, client) = shared_session_client(limits()).await;
+    let other_client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    client.account(&mut session).await.unwrap();
+    for correction in Correction::ALL {
+        assert!(
+            matches!(
+                correction.read(&other_client, &mut session).await,
+                Err(StripeReadError::SessionClientMismatch)
+            ),
+            "{correction:?}"
+        );
+    }
+    assert!(correction_paths_requested(&server).is_empty());
 }
