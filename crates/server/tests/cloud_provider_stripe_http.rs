@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
 use sotto_server::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
 use sotto_server::cloud_provider_stripe_http::{
-    StripeReadClient, StripeReadError, StripeReadLimits,
+    StripeReadClient, StripeReadError, StripeReadLimits, StripeRefundResource, StripeRefundStatus,
 };
 use tokio::net::TcpListener;
 use url::Url;
@@ -1020,4 +1020,363 @@ async fn enforces_page_record_and_request_bounds() {
         client.subscription(&mut session, "sub_1", "cus_1").await,
         Err(StripeReadError::RequestBoundExceeded)
     ));
+}
+
+fn correction_responses(
+    path: &str,
+    pages: Vec<MockResponse>,
+) -> HashMap<String, Vec<MockResponse>> {
+    let mut responses = HashMap::new();
+    responses.insert("/v1/account".into(), vec![MockResponse::json(account())]);
+    responses.insert(path.into(), pages);
+    responses
+}
+
+fn query_pairs(call: &Call) -> Vec<(String, String)> {
+    Url::parse(&format!("http://loopback{}", call.path_and_query))
+        .unwrap()
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect()
+}
+
+/// Every request to `path` must carry exactly the parent filter, the page size and the expected
+/// cursor, so a filter dropped after the first page fails here rather than widening the read.
+fn assert_filtered_pages(
+    server: &MockServer,
+    path: &str,
+    filter: (&str, &str),
+    cursors: &[Option<&str>],
+) {
+    let calls = server.state.calls.lock().unwrap();
+    assert_eq!(
+        calls.first().map(|call| call.path_and_query.as_str()),
+        Some("/v1/account"),
+        "the account must be verified before any correction read"
+    );
+    let pages: Vec<&Call> = calls
+        .iter()
+        .filter(|call| call.path_and_query.split('?').next() == Some(path))
+        .collect();
+    assert_eq!(pages.len(), cursors.len(), "{pages:?}");
+    for (call, cursor) in pages.iter().zip(cursors) {
+        let mut expected = vec![
+            (filter.0.to_owned(), filter.1.to_owned()),
+            ("limit".to_owned(), "100".to_owned()),
+        ];
+        if let Some(cursor) = cursor {
+            expected.push(("starting_after".to_owned(), (*cursor).to_owned()));
+        }
+        assert_eq!(query_pairs(call), expected, "{}", call.path_and_query);
+        assert_eq!(
+            call.authorization.as_deref(),
+            Some("Bearer sk_test_transport")
+        );
+        assert_eq!(call.version.as_deref(), Some("2026-07-29.dahlia"));
+    }
+}
+
+/// Apply `(field, value)` edits to a fixture. `None` removes the field.
+fn with_fields(mut resource: Value, edits: &[(&str, Option<Value>)]) -> Value {
+    for (field, value) in edits {
+        match value {
+            Some(value) => resource[*field] = value.clone(),
+            None => {
+                resource.as_object_mut().unwrap().remove(*field);
+            }
+        }
+    }
+    resource
+}
+
+fn refund(id: &str, status: Value) -> Value {
+    json!({
+        "id":id,
+        "object":"refund",
+        "amount":299,
+        "balance_transaction":"txn_1",
+        "charge":"ch_1",
+        "created":1_700_000_100,
+        "currency":"gbp",
+        "metadata":{},
+        "payment_intent":"pi_1",
+        "reason":null,
+        "receipt_number":null,
+        "status":status
+    })
+}
+
+async fn read_refunds(
+    pages: Vec<MockResponse>,
+) -> Result<Vec<StripeRefundResource>, StripeReadError> {
+    let server = mock_server(correction_responses("/v1/refunds", pages)).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    client.payment_intent_refunds(&mut session, "pi_1").await
+}
+
+#[tokio::test]
+async fn reads_every_refund_page_with_its_payment_intent_filter() {
+    let expanded = with_fields(
+        refund("re_2", json!("requires_action")),
+        &[
+            (
+                "payment_intent",
+                Some(json!({"id":"pi_1","object":"payment_intent"})),
+            ),
+            ("charge", Some(json!({"id":"ch_1","object":"charge"}))),
+        ],
+    );
+    let unlinked = with_fields(
+        refund("re_6", Value::Null),
+        &[
+            ("payment_intent", Some(Value::Null)),
+            ("charge", Some(Value::Null)),
+        ],
+    );
+    let server = mock_server(correction_responses(
+        "/v1/refunds",
+        vec![
+            MockResponse::json(list(
+                vec![
+                    refund("re_1", json!("pending")),
+                    expanded,
+                    refund("re_3", json!("succeeded")),
+                ],
+                true,
+            )),
+            MockResponse::json(list(
+                vec![
+                    refund("re_4", json!("failed")),
+                    refund("re_5", json!("canceled")),
+                    unlinked,
+                    refund("re_7", json!("returned_by_bank")),
+                ],
+                false,
+            )),
+        ],
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    let refunds = client
+        .payment_intent_refunds(&mut session, "pi_1")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        refunds
+            .iter()
+            .map(|refund| refund.status.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            Some(StripeRefundStatus::Pending),
+            Some(StripeRefundStatus::RequiresAction),
+            Some(StripeRefundStatus::Succeeded),
+            Some(StripeRefundStatus::Failed),
+            Some(StripeRefundStatus::Canceled),
+            None,
+            Some(StripeRefundStatus::Unknown("returned_by_bank".into())),
+        ]
+    );
+    assert_eq!(
+        refunds[1],
+        StripeRefundResource {
+            id: "re_2".into(),
+            payment_intent_id: Some("pi_1".into()),
+            charge_id: Some("ch_1".into()),
+            amount: 299,
+            currency: "gbp".into(),
+            created: 1_700_000_100,
+            status: Some(StripeRefundStatus::RequiresAction),
+            livemode: None,
+        }
+    );
+    // Stripe may omit the parent; the filter must not be copied into the evidence as proof.
+    assert_eq!(refunds[5].payment_intent_id, None);
+    assert_eq!(refunds[5].charge_id, None);
+    assert_filtered_pages(
+        &server,
+        "/v1/refunds",
+        ("payment_intent", "pi_1"),
+        &[None, Some("re_3")],
+    );
+}
+
+#[tokio::test]
+async fn an_empty_refund_list_is_not_a_failed_refund_read() {
+    let server = mock_server(correction_responses(
+        "/v1/refunds",
+        vec![MockResponse::json(list(Vec::new(), false))],
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert_eq!(
+        client
+            .payment_intent_refunds(&mut session, "pi_1")
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+    assert_filtered_pages(&server, "/v1/refunds", ("payment_intent", "pi_1"), &[None]);
+
+    assert!(matches!(
+        read_refunds(vec![MockResponse::status(StatusCode::NOT_FOUND, "{}")]).await,
+        Err(StripeReadError::ResourceMissing)
+    ));
+    assert!(matches!(
+        read_refunds(vec![MockResponse::status(StatusCode::FORBIDDEN, "{}")]).await,
+        Err(StripeReadError::Permission { status: 403 })
+    ));
+    assert!(matches!(
+        read_refunds(vec![MockResponse::status(StatusCode::UNAUTHORIZED, "{}")]).await,
+        Err(StripeReadError::Authentication { status: 401 })
+    ));
+
+    // An account that cannot be verified stops the read before any refund request is made.
+    let mut responses = correction_responses(
+        "/v1/refunds",
+        vec![MockResponse::json(list(Vec::new(), false))],
+    );
+    responses.insert(
+        "/v1/account".into(),
+        vec![MockResponse::status(StatusCode::FORBIDDEN, "{}")],
+    );
+    let server = mock_server(responses).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client.payment_intent_refunds(&mut session, "pi_1").await,
+        Err(StripeReadError::Permission { status: 403 })
+    ));
+    assert!(server
+        .state
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|call| !call.path_and_query.starts_with("/v1/refunds")));
+}
+
+#[tokio::test]
+async fn rejects_refunds_that_contradict_their_parent_or_mode() {
+    for payment_intent in [json!("pi_other"), json!({"id":"pi_other"})] {
+        let contradictory = with_fields(
+            refund("re_1", json!("succeeded")),
+            &[("payment_intent", Some(payment_intent))],
+        );
+        assert!(matches!(
+            read_refunds(vec![MockResponse::json(list(vec![contradictory], false))]).await,
+            Err(StripeReadError::ParentMismatch)
+        ));
+    }
+
+    let live = with_fields(
+        refund("re_1", json!("succeeded")),
+        &[("livemode", Some(json!(true)))],
+    );
+    assert!(matches!(
+        read_refunds(vec![MockResponse::json(list(vec![live], false))]).await,
+        Err(StripeReadError::ContextMismatch)
+    ));
+
+    let test_mode = with_fields(
+        refund("re_1", json!("succeeded")),
+        &[("livemode", Some(json!(false)))],
+    );
+    let refunds = read_refunds(vec![MockResponse::json(list(vec![test_mode], false))])
+        .await
+        .unwrap();
+    assert_eq!(refunds[0].livemode, Some(false));
+}
+
+#[tokio::test]
+async fn rejects_malformed_refund_fields_by_name() {
+    let cases: Vec<(&str, Option<Value>, &str)> = vec![
+        ("id", None, "list.data.id"),
+        ("object", None, "refund.object"),
+        ("object", Some(json!("charge")), "refund.object"),
+        ("amount", None, "refund.amount"),
+        ("amount", Some(Value::Null), "refund.amount"),
+        ("amount", Some(json!("299")), "refund.amount"),
+        ("amount", Some(json!(2.5)), "refund.amount"),
+        ("amount", Some(json!(-1)), "refund.amount"),
+        ("created", None, "refund.created"),
+        ("created", Some(json!(-1)), "refund.created"),
+        ("currency", None, "refund.currency"),
+        ("currency", Some(json!("GBP")), "refund.currency"),
+        ("payment_intent", Some(json!({})), "refund.payment_intent"),
+        ("payment_intent", Some(json!("")), "refund.payment_intent"),
+        ("charge", Some(json!(7)), "refund.charge"),
+        ("status", Some(json!("")), "refund.status"),
+        ("status", Some(json!(3)), "refund.status"),
+        (
+            "status",
+            Some(json!("Refunded after a support call")),
+            "refund.status",
+        ),
+        ("livemode", Some(json!("false")), "refund.livemode"),
+    ];
+    for (field, value, expected) in cases {
+        let malformed = with_fields(refund("re_1", json!("succeeded")), &[(field, value)]);
+        let result = read_refunds(vec![MockResponse::json(list(vec![malformed], false))]).await;
+        assert!(
+            matches!(result, Err(StripeReadError::MalformedResponse(name)) if name == expected),
+            "{field}: {result:?}"
+        );
+    }
+
+    // Zero is a value Stripe sent, not a stand-in for a missing amount.
+    let zero = with_fields(
+        refund("re_1", json!("canceled")),
+        &[("amount", Some(json!(0)))],
+    );
+    let refunds = read_refunds(vec![MockResponse::json(list(vec![zero], false))])
+        .await
+        .unwrap();
+    assert_eq!(refunds[0].amount, 0);
+}
+
+#[tokio::test]
+async fn refund_reads_keep_metadata_and_free_text_out_of_evidence() {
+    let sensitive = with_fields(
+        refund("re_1", json!("succeeded")),
+        &[
+            ("metadata", Some(json!({"note":"sentinel-metadata"}))),
+            ("description", Some(json!("sentinel-description"))),
+            ("reason", Some(json!("requested_by_customer"))),
+            ("receipt_number", Some(json!("sentinel-receipt"))),
+            (
+                "instructions_email",
+                Some(json!("sentinel@example.invalid")),
+            ),
+            (
+                "destination_details",
+                Some(json!({"type":"card","card":{"reference":"sentinel-reference"}})),
+            ),
+        ],
+    );
+    let refunds = read_refunds(vec![MockResponse::json(list(
+        vec![sensitive.clone()],
+        false,
+    ))])
+    .await
+    .unwrap();
+    let rendered = format!("{refunds:?}");
+    assert!(!rendered.contains("sentinel"), "{rendered}");
+    assert!(!rendered.contains("requested_by_customer"), "{rendered}");
+
+    let contradictory = with_fields(sensitive, &[("payment_intent", Some(json!("pi_other")))]);
+    let error = read_refunds(vec![MockResponse::json(list(vec![contradictory], false))])
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:?} {error}");
+    assert!(!rendered.contains("sentinel"), "{rendered}");
+    assert!(!rendered.contains(API_KEY), "{rendered}");
 }
