@@ -118,6 +118,33 @@ fn paid_personal_invoice_accepts_expanded_references_and_normalises_evidence() {
 }
 
 #[test]
+fn contradictory_invoice_subscription_is_rejected() {
+    let mut payload = fixture();
+    payload["data"]["object"]["subscription"] = json!("sub_other");
+    assert!(matches!(
+        decode(&payload),
+        Err(StripeContractError::OwnershipMismatch)
+    ));
+}
+
+#[test]
+fn negative_invoice_adjustment_amounts_are_rejected() {
+    let mut overpaid = fixture();
+    overpaid["data"]["object"]["amount_overpaid"] = json!(-1);
+    assert!(matches!(
+        decode(&overpaid),
+        Err(StripeContractError::InvalidField("amount_overpaid"))
+    ));
+
+    let mut off_stripe = fixture();
+    off_stripe["data"]["object"]["amount_paid_off_stripe"] = json!(-1);
+    assert!(matches!(
+        decode(&off_stripe),
+        Err(StripeContractError::InvalidField("amount_paid_off_stripe"))
+    ));
+}
+
+#[test]
 fn annual_standard_price_maps_to_a_year_interval() {
     let mut annual = fixture();
     annual["data"]["object"]["lines"]["data"][0]["pricing"]["price_details"]["price"] =
