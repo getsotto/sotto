@@ -107,6 +107,12 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e.to_string())
+    }
+}
+
 impl From<sotto_core::Error> for Error {
     fn from(_: sotto_core::Error) -> Self {
         // Stay opaque - never leak why an authenticated decryption failed.
