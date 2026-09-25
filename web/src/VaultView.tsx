@@ -84,6 +84,7 @@ export function VaultView({
   const [activeProject, setActiveProject] = useState<NamedProject | null>(null);
   const [envs, setEnvs] = useState<NamedEnv[] | null>(null);
   const [openEnv, setOpenEnv] = useState<OpenEnv | null>(null);
+  const [loadingEnvId, setLoadingEnvId] = useState<string | null>(null);
   const [revealed, setRevealed] = useState<Revealed | null>(null);
   // Org members of the active project (loaded when an org env is opened), for the share picker.
   const [members, setMembers] = useState<Member[] | null>(null);
@@ -145,6 +146,7 @@ export function VaultView({
   async function selectProject(np: NamedProject) {
     const load = ++projectLoad.current;
     ++envLoad.current; // a project switch also invalidates any in-flight environment load
+    setLoadingEnvId(null);
     setError(null);
     setNotice(null);
     setActiveProject(np);
@@ -172,6 +174,7 @@ export function VaultView({
 
   async function selectEnv(ne: NamedEnv) {
     const load = ++envLoad.current;
+    setLoadingEnvId(ne.env.id);
     setError(null);
     setNotice(null);
     setOpenEnv(null);
@@ -187,6 +190,7 @@ export function VaultView({
       }
       if (grant === null) {
         setError("you have no key for this environment - ask an admin to share it with you");
+        setLoadingEnvId(null);
         return;
       }
       const vaultKey = openEnvGrant(master, encPrivateKeys, grant);
@@ -202,6 +206,7 @@ export function VaultView({
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
       setOpenEnv({ envId: ne.env.id, vaultKey, secrets });
+      setLoadingEnvId(null);
       // Org project: load the member list so the env can be shared from here.
       const orgId = activeProject?.project.orgId;
       if (orgId) {
@@ -216,6 +221,7 @@ export function VaultView({
         return;
       }
       setError(message(e));
+      setLoadingEnvId(null);
     }
   }
 
@@ -402,6 +408,7 @@ export function VaultView({
                 <button
                   onClick={() => void selectEnv(e)}
                   aria-current={openEnv?.envId === e.env.id ? "true" : undefined}
+                  aria-busy={loadingEnvId === e.env.id ? "true" : undefined}
                 >
                   {e.name}
                 </button>
@@ -409,6 +416,12 @@ export function VaultView({
             ))}
           </ul>
         </section>
+      )}
+
+      {loadingEnvId !== null && (
+        <p role="status" aria-live="polite" className="muted">
+          Opening environment…
+        </p>
       )}
 
       {openEnv !== null && (
