@@ -463,6 +463,31 @@ impl StripeReadClient {
         Ok(disputes)
     }
 
+    /// Enumerate every credit note Stripe returns for one invoice, issued or void.
+    ///
+    /// Each page repeats the `invoice` filter. An empty result means only that this filtered
+    /// enumeration returned no credit notes. It is not a consistent snapshot: notes can be issued
+    /// or voided during or after the read.
+    pub async fn invoice_credit_notes(
+        &self,
+        session: &mut StripeReadSession,
+        invoice_id: &str,
+    ) -> Result<Vec<StripeCreditNoteResource>, StripeReadError> {
+        self.ensure_account(session).await?;
+        validate_identifier(invoice_id)?;
+        let query = vec![("invoice".to_owned(), invoice_id.to_owned())];
+        let notes = self
+            .list(session, "v1/credit_notes", query, parse_credit_note)
+            .await?;
+        for note in &notes {
+            if note.invoice_id != invoice_id {
+                return Err(StripeReadError::ParentMismatch);
+            }
+            validate_mode(Some(note.livemode), self.environment)?;
+        }
+        Ok(notes)
+    }
+
     pub async fn personal_invoice_observation(
         &self,
         session: &mut StripeReadSession,
@@ -1000,6 +1025,69 @@ impl StripeDisputeStatus {
     }
 }
 
+/// One credit note returned by [`StripeReadClient::invoice_credit_notes`].
+///
+/// A credit note is not automatically a cash refund. `pre_payment_amount` reduced what the invoice
+/// asked for, while `post_payment_amount` was refunded, credited to the customer balance or
+/// credited outside Stripe. The note's embedded `lines` and `refunds` are previews rather than
+/// complete lists, so neither is retained or offered as evidence. Line enumeration, credit
+/// allocation and deduplication against refunds belong to a later boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeCreditNoteResource {
+    pub id: String,
+    pub invoice_id: String,
+    pub customer_id: String,
+    pub amount: i64,
+    pub pre_payment_amount: i64,
+    pub post_payment_amount: i64,
+    pub currency: String,
+    pub created: i64,
+    pub status: StripeCreditNoteStatus,
+    pub credit_note_type: StripeCreditNoteType,
+    pub livemode: bool,
+}
+
+/// A voided note must stay distinguishable from an issued one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeCreditNoteStatus {
+    Issued,
+    Void,
+    /// A token this contract does not know. It must not be read as void or as issued.
+    Unknown(String),
+}
+
+impl StripeCreditNoteStatus {
+    fn from_token(token: String) -> Self {
+        match token.as_str() {
+            "issued" => Self::Issued,
+            "void" => Self::Void,
+            _ => Self::Unknown(token),
+        }
+    }
+}
+
+/// Whether the note was issued before payment, after it, or across both. Stripe's prose names
+/// only the first two, but its enum also documents `mixed`, which is kept rather than rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeCreditNoteType {
+    PrePayment,
+    PostPayment,
+    Mixed,
+    /// A token this contract does not know. It must not be read as either payment phase.
+    Unknown(String),
+}
+
+impl StripeCreditNoteType {
+    fn from_token(token: String) -> Self {
+        match token.as_str() {
+            "pre_payment" => Self::PrePayment,
+            "post_payment" => Self::PostPayment,
+            "mixed" => Self::Mixed,
+            _ => Self::Unknown(token),
+        }
+    }
+}
+
 fn parse_subscription(value: &Value) -> Result<StripeSubscriptionResource, StripeReadError> {
     Ok(StripeSubscriptionResource {
         id: required_id(value, "subscription.id")?,
@@ -1130,6 +1218,34 @@ fn parse_dispute(value: &Value) -> Result<StripeDisputeResource, StripeReadError
             .ok_or(StripeReadError::MalformedResponse("dispute.status"))?,
         livemode: optional_bool(value.get("livemode"), "dispute.livemode")?
             .ok_or(StripeReadError::MalformedResponse("dispute.livemode"))?,
+    })
+}
+
+fn parse_credit_note(value: &Value) -> Result<StripeCreditNoteResource, StripeReadError> {
+    require_object(value, "credit_note", "credit note.object")?;
+    Ok(StripeCreditNoteResource {
+        id: required_id(value, "credit note.id")?,
+        invoice_id: required_validated_ref(value.get("invoice"), "credit note.invoice")?,
+        customer_id: required_validated_ref(value.get("customer"), "credit note.customer")?,
+        amount: required_non_negative_i64(value.get("amount"), "credit note.amount")?,
+        pre_payment_amount: required_non_negative_i64(
+            value.get("pre_payment_amount"),
+            "credit note.pre_payment_amount",
+        )?,
+        post_payment_amount: required_non_negative_i64(
+            value.get("post_payment_amount"),
+            "credit note.post_payment_amount",
+        )?,
+        currency: required_currency(value.get("currency"), "credit note.currency")?,
+        created: required_non_negative_i64(value.get("created"), "credit note.created")?,
+        status: optional_token(value.get("status"), "credit note.status")?
+            .map(StripeCreditNoteStatus::from_token)
+            .ok_or(StripeReadError::MalformedResponse("credit note.status"))?,
+        credit_note_type: optional_token(value.get("type"), "credit note.type")?
+            .map(StripeCreditNoteType::from_token)
+            .ok_or(StripeReadError::MalformedResponse("credit note.type"))?,
+        livemode: optional_bool(value.get("livemode"), "credit note.livemode")?
+            .ok_or(StripeReadError::MalformedResponse("credit note.livemode"))?,
     })
 }
 

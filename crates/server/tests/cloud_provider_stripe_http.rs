@@ -13,8 +13,9 @@ use serde_json::{json, Value};
 use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
 use sotto_server::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
 use sotto_server::cloud_provider_stripe_http::{
-    StripeDisputeResource, StripeDisputeStatus, StripeReadClient, StripeReadError,
-    StripeReadLimits, StripeRefundResource, StripeRefundStatus,
+    StripeCreditNoteResource, StripeCreditNoteStatus, StripeCreditNoteType, StripeDisputeResource,
+    StripeDisputeStatus, StripeReadClient, StripeReadError, StripeReadLimits, StripeRefundResource,
+    StripeRefundStatus,
 };
 use tokio::net::TcpListener;
 use url::Url;
@@ -1618,5 +1619,292 @@ async fn dispute_reads_keep_evidence_and_metadata_out_of_evidence() {
         .unwrap_err();
     let rendered = format!("{error:?} {error}");
     assert!(!rendered.contains("sentinel"), "{rendered}");
+    assert!(!rendered.contains(API_KEY), "{rendered}");
+}
+
+fn credit_note(id: &str, status: &str, note_type: &str) -> Value {
+    json!({
+        "id":id,
+        "object":"credit_note",
+        "amount":299,
+        "created":1_700_000_300,
+        "currency":"gbp",
+        "customer":"cus_1",
+        "invoice":"in_1",
+        "livemode":false,
+        "memo":null,
+        "metadata":{},
+        "out_of_band_amount":null,
+        "post_payment_amount":299,
+        "pre_payment_amount":0,
+        "reason":null,
+        "refunds":[],
+        "status":status,
+        "type":note_type,
+        "voided_at":null
+    })
+}
+
+async fn read_credit_notes(
+    pages: Vec<MockResponse>,
+) -> Result<Vec<StripeCreditNoteResource>, StripeReadError> {
+    let server = mock_server(correction_responses("/v1/credit_notes", pages)).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    client.invoice_credit_notes(&mut session, "in_1").await
+}
+
+#[tokio::test]
+async fn reads_every_credit_note_page_with_issued_and_void_notes_distinct() {
+    // A post-payment note that also links a refund. The note keeps its own amounts; nothing is
+    // netted against or deduplicated with the refund at this boundary.
+    let with_refund = with_fields(
+        credit_note("cn_1", "issued", "post_payment"),
+        &[(
+            "refunds",
+            Some(json!([{"amount_refunded":299,"refund":"re_linked","type":"refund"}])),
+        )],
+    );
+    let voided = with_fields(
+        credit_note("cn_2", "void", "pre_payment"),
+        &[
+            ("invoice", Some(json!({"id":"in_1","object":"invoice"}))),
+            ("customer", Some(json!({"id":"cus_1","object":"customer"}))),
+            ("pre_payment_amount", Some(json!(299))),
+            ("post_payment_amount", Some(json!(0))),
+            ("voided_at", Some(json!(1_700_000_400))),
+        ],
+    );
+    let mixed = with_fields(
+        credit_note("cn_3", "issued", "mixed"),
+        &[
+            ("pre_payment_amount", Some(json!(100))),
+            ("post_payment_amount", Some(json!(199))),
+        ],
+    );
+    let server = mock_server(correction_responses(
+        "/v1/credit_notes",
+        vec![
+            MockResponse::json(list(vec![with_refund, voided], true)),
+            MockResponse::json(list(
+                vec![mixed, credit_note("cn_4", "reissued", "adjustment_only")],
+                false,
+            )),
+        ],
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    let notes = client
+        .invoice_credit_notes(&mut session, "in_1")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        notes
+            .iter()
+            .map(|note| (note.status.clone(), note.credit_note_type.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                StripeCreditNoteStatus::Issued,
+                StripeCreditNoteType::PostPayment
+            ),
+            (
+                StripeCreditNoteStatus::Void,
+                StripeCreditNoteType::PrePayment
+            ),
+            (StripeCreditNoteStatus::Issued, StripeCreditNoteType::Mixed),
+            (
+                StripeCreditNoteStatus::Unknown("reissued".into()),
+                StripeCreditNoteType::Unknown("adjustment_only".into())
+            ),
+        ]
+    );
+    assert_eq!(
+        notes[0],
+        StripeCreditNoteResource {
+            id: "cn_1".into(),
+            invoice_id: "in_1".into(),
+            customer_id: "cus_1".into(),
+            amount: 299,
+            pre_payment_amount: 0,
+            post_payment_amount: 299,
+            currency: "gbp".into(),
+            created: 1_700_000_300,
+            status: StripeCreditNoteStatus::Issued,
+            credit_note_type: StripeCreditNoteType::PostPayment,
+            livemode: false,
+        }
+    );
+    assert_eq!(notes[1].invoice_id, "in_1");
+    assert_eq!(notes[1].customer_id, "cus_1");
+    assert_eq!(
+        (notes[2].pre_payment_amount, notes[2].post_payment_amount),
+        (100, 199)
+    );
+    assert!(!format!("{notes:?}").contains("re_linked"));
+    assert_filtered_pages(
+        &server,
+        "/v1/credit_notes",
+        ("invoice", "in_1"),
+        &[None, Some("cn_2")],
+    );
+}
+
+#[tokio::test]
+async fn an_empty_credit_note_list_is_not_a_failed_credit_note_read() {
+    let server = mock_server(correction_responses(
+        "/v1/credit_notes",
+        vec![MockResponse::json(list(Vec::new(), false))],
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert_eq!(
+        client
+            .invoice_credit_notes(&mut session, "in_1")
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+    assert_filtered_pages(&server, "/v1/credit_notes", ("invoice", "in_1"), &[None]);
+
+    assert!(matches!(
+        read_credit_notes(vec![MockResponse::status(StatusCode::NOT_FOUND, "{}")]).await,
+        Err(StripeReadError::ResourceMissing)
+    ));
+    assert!(matches!(
+        read_credit_notes(vec![MockResponse::status(StatusCode::FORBIDDEN, "{}")]).await,
+        Err(StripeReadError::Permission { status: 403 })
+    ));
+}
+
+#[tokio::test]
+async fn rejects_credit_notes_that_contradict_their_invoice_or_mode() {
+    for invoice in [json!("in_other"), json!({"id":"in_other"})] {
+        let contradictory = with_fields(
+            credit_note("cn_1", "issued", "post_payment"),
+            &[("invoice", Some(invoice))],
+        );
+        assert!(matches!(
+            read_credit_notes(vec![MockResponse::json(list(vec![contradictory], false))]).await,
+            Err(StripeReadError::ParentMismatch)
+        ));
+    }
+
+    let live = with_fields(
+        credit_note("cn_1", "issued", "post_payment"),
+        &[("livemode", Some(json!(true)))],
+    );
+    assert!(matches!(
+        read_credit_notes(vec![MockResponse::json(list(vec![live], false))]).await,
+        Err(StripeReadError::ContextMismatch)
+    ));
+}
+
+#[tokio::test]
+async fn rejects_malformed_credit_note_fields_by_name() {
+    let cases: Vec<(&str, Option<Value>, &str)> = vec![
+        ("object", Some(json!("invoice")), "credit note.object"),
+        ("invoice", None, "credit note.invoice"),
+        ("invoice", Some(Value::Null), "credit note.invoice"),
+        ("invoice", Some(json!({})), "credit note.invoice"),
+        ("customer", None, "credit note.customer"),
+        ("customer", Some(json!("cus 1")), "credit note.customer"),
+        ("amount", Some(json!(-1)), "credit note.amount"),
+        ("pre_payment_amount", None, "credit note.pre_payment_amount"),
+        (
+            "pre_payment_amount",
+            Some(Value::Null),
+            "credit note.pre_payment_amount",
+        ),
+        (
+            "post_payment_amount",
+            Some(json!("0")),
+            "credit note.post_payment_amount",
+        ),
+        (
+            "post_payment_amount",
+            Some(json!(-299)),
+            "credit note.post_payment_amount",
+        ),
+        ("currency", Some(json!("Gbp")), "credit note.currency"),
+        ("created", Some(Value::Null), "credit note.created"),
+        ("status", None, "credit note.status"),
+        (
+            "status",
+            Some(json!("Voided by support")),
+            "credit note.status",
+        ),
+        ("type", None, "credit note.type"),
+        ("type", Some(Value::Null), "credit note.type"),
+        ("type", Some(json!(1)), "credit note.type"),
+        ("livemode", None, "credit note.livemode"),
+    ];
+    for (field, value, expected) in cases {
+        let malformed = with_fields(
+            credit_note("cn_1", "issued", "post_payment"),
+            &[(field, value)],
+        );
+        let result =
+            read_credit_notes(vec![MockResponse::json(list(vec![malformed], false))]).await;
+        assert!(
+            matches!(result, Err(StripeReadError::MalformedResponse(name)) if name == expected),
+            "{field}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn credit_note_reads_keep_memos_links_and_metadata_out_of_evidence() {
+    let sensitive = with_fields(
+        credit_note("cn_1", "issued", "post_payment"),
+        &[
+            ("metadata", Some(json!({"note":"sentinel-metadata"}))),
+            ("memo", Some(json!("sentinel-memo"))),
+            ("number", Some(json!("SENTINEL-0001-CN-01"))),
+            (
+                "pdf",
+                Some(json!(
+                    "https://pay.stripe.invalid/credit_notes/sentinel-pdf"
+                )),
+            ),
+            (
+                "lines",
+                Some(json!({
+                    "object":"list",
+                    "data":[{"id":"cnli_1","description":"sentinel-line"}],
+                    "has_more":true
+                })),
+            ),
+        ],
+    );
+    let notes = read_credit_notes(vec![MockResponse::json(list(
+        vec![sensitive.clone()],
+        false,
+    ))])
+    .await
+    .unwrap();
+    let rendered = format!("{notes:?}");
+    assert!(
+        !rendered.to_ascii_lowercase().contains("sentinel"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("https://"), "{rendered}");
+
+    let contradictory = with_fields(sensitive, &[("invoice", Some(json!("in_other")))]);
+    let error = read_credit_notes(vec![MockResponse::json(list(vec![contradictory], false))])
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:?} {error}");
+    assert!(
+        !rendered.to_ascii_lowercase().contains("sentinel"),
+        "{rendered}"
+    );
     assert!(!rendered.contains(API_KEY), "{rendered}");
 }
