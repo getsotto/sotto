@@ -414,10 +414,8 @@ impl StripeReadClient {
         self.ensure_account(session).await?;
         validate_identifier(payment_intent_id)?;
         let query = vec![("payment_intent".to_owned(), payment_intent_id.to_owned())];
-        let refunds = self
-            .list(session, "v1/refunds", query, parse_refund)
-            .await?;
-        for refund in &refunds {
+        self.list(session, "v1/refunds", query, |value| {
+            let refund = parse_refund(value)?;
             if refund
                 .payment_intent_id
                 .as_deref()
@@ -430,8 +428,9 @@ impl StripeReadClient {
             if refund.livemode.is_some() {
                 validate_mode(refund.livemode, self.environment)?;
             }
-        }
-        Ok(refunds)
+            Ok(refund)
+        })
+        .await
     }
 
     /// Enumerate every dispute Stripe returns for one PaymentIntent, whatever its status.
@@ -447,10 +446,8 @@ impl StripeReadClient {
         self.ensure_account(session).await?;
         validate_identifier(payment_intent_id)?;
         let query = vec![("payment_intent".to_owned(), payment_intent_id.to_owned())];
-        let disputes = self
-            .list(session, "v1/disputes", query, parse_dispute)
-            .await?;
-        for dispute in &disputes {
+        self.list(session, "v1/disputes", query, |value| {
+            let dispute = parse_dispute(value)?;
             if dispute
                 .payment_intent_id
                 .as_deref()
@@ -459,8 +456,9 @@ impl StripeReadClient {
                 return Err(StripeReadError::ParentMismatch);
             }
             validate_mode(Some(dispute.livemode), self.environment)?;
-        }
-        Ok(disputes)
+            Ok(dispute)
+        })
+        .await
     }
 
     /// Enumerate every credit note Stripe returns for one invoice, issued or void.
@@ -476,16 +474,15 @@ impl StripeReadClient {
         self.ensure_account(session).await?;
         validate_identifier(invoice_id)?;
         let query = vec![("invoice".to_owned(), invoice_id.to_owned())];
-        let notes = self
-            .list(session, "v1/credit_notes", query, parse_credit_note)
-            .await?;
-        for note in &notes {
+        self.list(session, "v1/credit_notes", query, |value| {
+            let note = parse_credit_note(value)?;
             if note.invoice_id != invoice_id {
                 return Err(StripeReadError::ParentMismatch);
             }
             validate_mode(Some(note.livemode), self.environment)?;
-        }
-        Ok(notes)
+            Ok(note)
+        })
+        .await
     }
 
     pub async fn personal_invoice_observation(

@@ -1982,6 +1982,43 @@ fn correction_paths_requested(server: &MockServer) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn correction_context_errors_stop_before_the_next_page() {
+    for correction in Correction::ALL {
+        for wrong_mode in [false, true] {
+            let record = if wrong_mode {
+                with_fields(correction.record("x_1"), &[("livemode", Some(json!(true)))])
+            } else {
+                with_fields(
+                    correction.record("x_1"),
+                    &[(correction.parent_field(), Some(json!("other_1")))],
+                )
+            };
+            let server = mock_server(correction_responses(
+                correction.path(),
+                vec![
+                    MockResponse::json(list(vec![record], true)),
+                    MockResponse::status(StatusCode::FORBIDDEN, "{}"),
+                ],
+            ))
+            .await;
+            let client =
+                StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits())
+                    .unwrap();
+            let result = correction.read(&client, &mut client.session()).await;
+            assert!(
+                if wrong_mode {
+                    matches!(result, Err(StripeReadError::ContextMismatch))
+                } else {
+                    matches!(result, Err(StripeReadError::ParentMismatch))
+                },
+                "{correction:?} mode={wrong_mode}: {result:?}"
+            );
+            assert_eq!(correction_paths_requested(&server).len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
 async fn later_page_failures_return_no_partial_corrections() {
     type Check = fn(&StripeReadError) -> bool;
     for correction in Correction::ALL {
