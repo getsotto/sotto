@@ -363,3 +363,47 @@ describe("TeamPanel invitations", () => {
     },
   );
 });
+
+describe("TeamPanel billing request ownership", () => {
+  const admin = (id: string): Org => ({
+    id, encName: new Uint8Array(), role: "admin", encOrgKey: null,
+  });
+  const billablePlan: Entitlements = { ...freePlan, billingEnabled: true };
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([admin("org-a"), admin("org-b")]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchEntitlements).mockResolvedValue(billablePlan);
+  });
+
+  it.each(["success", "failure"] as const)(
+    "ignores a stale checkout %s after switching organisations",
+    async (outcome) => {
+      const pending = deferred<string>();
+      vi.mocked(api.createCheckout).mockReturnValueOnce(pending.promise).mockResolvedValueOnce("/checkout-b");
+      const assign = vi.spyOn(window.location, "assign").mockImplementation(() => {});
+      render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+      fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+      fireEvent.click(await screen.findByRole("button", { name: "Upgrade to Team" }));
+      expect(screen.getByRole("button", { name: "Opening checkout…" })).toBeDisabled();
+
+      fireEvent.click(screen.getByRole("button", { name: /org-b/ }));
+      expect(await screen.findByRole("button", { name: "Upgrade to Team" })).toBeEnabled();
+
+      await act(async () => {
+        if (outcome === "success") pending.resolve("/checkout-a");
+        else pending.reject(new Error("stale checkout failure"));
+      });
+      expect(assign).not.toHaveBeenCalled();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Upgrade to Team" }));
+      await act(async () => {});
+      expect(api.createCheckout).toHaveBeenLastCalledWith("org-b");
+      expect(assign).toHaveBeenCalledWith("/checkout-b");
+      assign.mockRestore();
+    },
+  );
+});

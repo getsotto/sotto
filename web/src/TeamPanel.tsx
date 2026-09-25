@@ -87,6 +87,7 @@ export function TeamPanel({
   const [billingOutcome] = useState(parseBillingOutcome);
   const [deletionActive, setDeletionActive] = useState(false);
   const orgLoadGeneration = useRef(0);
+  const billingGeneration = useRef(0);
   const inviteInFlight = useRef(false);
 
   useEffect(() => {
@@ -109,6 +110,8 @@ export function TeamPanel({
   async function selectOrg(no: NamedOrg) {
     const generation = ++orgLoadGeneration.current;
     const isCurrent = () => generation === orgLoadGeneration.current;
+    ++billingGeneration.current;
+    setBillingBusy(false);
     setError(null);
     setNotice(null);
     setOpenOrg(no);
@@ -182,12 +185,17 @@ export function TeamPanel({
   /// Hand the browser to a Stripe-hosted page. `busy` stays set on success: the page is about to
   /// navigate away, and re-enabling would invite a double click while it does.
   async function goToStripe(fetchUrl: (orgId: string) => Promise<string>, orgId: string) {
+    const generation = ++billingGeneration.current;
+    const isCurrent = () => generation === billingGeneration.current;
     setError(null);
     setNotice(null);
     setBillingBusy(true);
     try {
-      window.location.assign(await fetchUrl(orgId));
+      const url = await fetchUrl(orgId);
+      if (!isCurrent()) return;
+      window.location.assign(url);
     } catch (e) {
+      if (!isCurrent()) return;
       setError(message(e));
       setBillingBusy(false);
     }
