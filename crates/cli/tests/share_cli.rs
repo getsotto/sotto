@@ -41,6 +41,33 @@ fn invalid_share_limits_are_rejected_before_local_setup() {
 }
 
 #[test]
+fn invalid_token_lifetimes_are_rejected_before_local_setup() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    for value in ["0", "366", "4294967295"] {
+        let data_dir = scratch.path().join(format!("days-{value}"));
+        let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+            .current_dir(scratch.path())
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .env_remove("SOTTO_PASSWORD")
+            .args(["--plain", "token", "create", "--expires-in-days", value])
+            .output()
+            .expect("run sotto");
+
+        assert_eq!(output.status.code(), Some(2), "accepted {value}");
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+        assert!(stderr.contains("--expires-in-days"), "{value}: {stderr}");
+        assert!(stderr.contains("1..=365"), "{value}: {stderr}");
+        assert!(
+            !stderr.contains("sotto.toml"),
+            "{value} reached project lookup: {stderr}"
+        );
+        assert!(!data_dir.exists(), "{value} created {}", data_dir.display());
+    }
+}
+
+#[test]
 fn invalid_rollback_versions_are_rejected_before_local_setup() {
     let scratch = tempfile::tempdir().expect("scratch directory");
     for (label, args) in [
