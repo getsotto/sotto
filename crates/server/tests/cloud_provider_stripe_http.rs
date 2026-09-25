@@ -13,7 +13,8 @@ use serde_json::{json, Value};
 use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
 use sotto_server::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
 use sotto_server::cloud_provider_stripe_http::{
-    StripeReadClient, StripeReadError, StripeReadLimits, StripeRefundResource, StripeRefundStatus,
+    StripeDisputeResource, StripeDisputeStatus, StripeReadClient, StripeReadError,
+    StripeReadLimits, StripeRefundResource, StripeRefundStatus,
 };
 use tokio::net::TcpListener;
 use url::Url;
@@ -1374,6 +1375,245 @@ async fn refund_reads_keep_metadata_and_free_text_out_of_evidence() {
 
     let contradictory = with_fields(sensitive, &[("payment_intent", Some(json!("pi_other")))]);
     let error = read_refunds(vec![MockResponse::json(list(vec![contradictory], false))])
+        .await
+        .unwrap_err();
+    let rendered = format!("{error:?} {error}");
+    assert!(!rendered.contains("sentinel"), "{rendered}");
+    assert!(!rendered.contains(API_KEY), "{rendered}");
+}
+
+fn dispute(id: &str, status: &str) -> Value {
+    json!({
+        "id":id,
+        "object":"dispute",
+        "amount":299,
+        "balance_transactions":[],
+        "charge":"ch_1",
+        "created":1_700_000_200,
+        "currency":"gbp",
+        "is_charge_refundable":false,
+        "livemode":false,
+        "metadata":{},
+        "payment_intent":"pi_1",
+        "reason":"general",
+        "status":status
+    })
+}
+
+async fn read_disputes(
+    pages: Vec<MockResponse>,
+) -> Result<Vec<StripeDisputeResource>, StripeReadError> {
+    let server = mock_server(correction_responses("/v1/disputes", pages)).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    client.payment_intent_disputes(&mut session, "pi_1").await
+}
+
+#[tokio::test]
+async fn reads_every_dispute_page_with_open_and_terminal_states_distinct() {
+    let expanded = with_fields(
+        dispute("du_2", "warning_under_review"),
+        &[
+            (
+                "payment_intent",
+                Some(json!({"id":"pi_1","object":"payment_intent"})),
+            ),
+            ("charge", Some(json!({"id":"ch_1","object":"charge"}))),
+        ],
+    );
+    let unlinked = with_fields(
+        dispute("du_9", "lost"),
+        &[("payment_intent", Some(Value::Null))],
+    );
+    let server = mock_server(correction_responses(
+        "/v1/disputes",
+        vec![
+            MockResponse::json(list(
+                vec![
+                    dispute("du_1", "warning_needs_response"),
+                    expanded,
+                    dispute("du_3", "warning_closed"),
+                    dispute("du_4", "needs_response"),
+                ],
+                true,
+            )),
+            MockResponse::json(list(
+                vec![
+                    dispute("du_5", "under_review"),
+                    dispute("du_6", "won"),
+                    dispute("du_7", "lost"),
+                    dispute("du_8", "prevented"),
+                    unlinked,
+                    dispute("du_10", "arbitration_pending"),
+                ],
+                false,
+            )),
+        ],
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+
+    let disputes = client
+        .payment_intent_disputes(&mut session, "pi_1")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        disputes
+            .iter()
+            .map(|dispute| dispute.status.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            StripeDisputeStatus::WarningNeedsResponse,
+            StripeDisputeStatus::WarningUnderReview,
+            StripeDisputeStatus::WarningClosed,
+            StripeDisputeStatus::NeedsResponse,
+            StripeDisputeStatus::UnderReview,
+            StripeDisputeStatus::Won,
+            StripeDisputeStatus::Lost,
+            StripeDisputeStatus::Prevented,
+            StripeDisputeStatus::Lost,
+            StripeDisputeStatus::Unknown("arbitration_pending".into()),
+        ]
+    );
+    assert_eq!(
+        disputes[1],
+        StripeDisputeResource {
+            id: "du_2".into(),
+            payment_intent_id: Some("pi_1".into()),
+            charge_id: "ch_1".into(),
+            amount: 299,
+            currency: "gbp".into(),
+            created: 1_700_000_200,
+            status: StripeDisputeStatus::WarningUnderReview,
+            livemode: false,
+        }
+    );
+    assert_eq!(disputes[8].payment_intent_id, None);
+    assert_eq!(disputes[8].charge_id, "ch_1");
+    assert_filtered_pages(
+        &server,
+        "/v1/disputes",
+        ("payment_intent", "pi_1"),
+        &[None, Some("du_4")],
+    );
+}
+
+#[tokio::test]
+async fn an_empty_dispute_list_is_not_a_failed_dispute_read() {
+    let server = mock_server(correction_responses(
+        "/v1/disputes",
+        vec![MockResponse::json(list(Vec::new(), false))],
+    ))
+    .await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert_eq!(
+        client
+            .payment_intent_disputes(&mut session, "pi_1")
+            .await
+            .unwrap(),
+        Vec::new()
+    );
+    assert_filtered_pages(&server, "/v1/disputes", ("payment_intent", "pi_1"), &[None]);
+
+    assert!(matches!(
+        read_disputes(vec![MockResponse::status(StatusCode::NOT_FOUND, "{}")]).await,
+        Err(StripeReadError::ResourceMissing)
+    ));
+    assert!(matches!(
+        read_disputes(vec![MockResponse::status(StatusCode::FORBIDDEN, "{}")]).await,
+        Err(StripeReadError::Permission { status: 403 })
+    ));
+}
+
+#[tokio::test]
+async fn rejects_disputes_that_contradict_their_parent_or_mode() {
+    for payment_intent in [json!("pi_other"), json!({"id":"pi_other"})] {
+        let contradictory = with_fields(
+            dispute("du_1", "needs_response"),
+            &[("payment_intent", Some(payment_intent))],
+        );
+        assert!(matches!(
+            read_disputes(vec![MockResponse::json(list(vec![contradictory], false))]).await,
+            Err(StripeReadError::ParentMismatch)
+        ));
+    }
+
+    let live = with_fields(
+        dispute("du_1", "needs_response"),
+        &[("livemode", Some(json!(true)))],
+    );
+    assert!(matches!(
+        read_disputes(vec![MockResponse::json(list(vec![live], false))]).await,
+        Err(StripeReadError::ContextMismatch)
+    ));
+}
+
+#[tokio::test]
+async fn rejects_malformed_dispute_fields_by_name() {
+    let cases: Vec<(&str, Option<Value>, &str)> = vec![
+        ("object", Some(json!("refund")), "dispute.object"),
+        ("charge", None, "dispute.charge"),
+        ("charge", Some(Value::Null), "dispute.charge"),
+        ("charge", Some(json!({"object":"charge"})), "dispute.charge"),
+        ("payment_intent", Some(json!(12)), "dispute.payment_intent"),
+        ("amount", Some(Value::Null), "dispute.amount"),
+        ("amount", Some(json!(-299)), "dispute.amount"),
+        ("currency", Some(json!("gb")), "dispute.currency"),
+        ("created", Some(json!("1700000200")), "dispute.created"),
+        ("status", None, "dispute.status"),
+        ("status", Some(Value::Null), "dispute.status"),
+        ("status", Some(json!("Needs Response")), "dispute.status"),
+        ("livemode", None, "dispute.livemode"),
+        ("livemode", Some(Value::Null), "dispute.livemode"),
+        ("livemode", Some(json!(0)), "dispute.livemode"),
+    ];
+    for (field, value, expected) in cases {
+        let malformed = with_fields(dispute("du_1", "needs_response"), &[(field, value)]);
+        let result = read_disputes(vec![MockResponse::json(list(vec![malformed], false))]).await;
+        assert!(
+            matches!(result, Err(StripeReadError::MalformedResponse(name)) if name == expected),
+            "{field}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dispute_reads_keep_evidence_and_metadata_out_of_evidence() {
+    let sensitive = with_fields(
+        dispute("du_1", "needs_response"),
+        &[
+            ("metadata", Some(json!({"note":"sentinel-metadata"}))),
+            (
+                "evidence",
+                Some(json!({
+                    "customer_email_address":"sentinel@example.invalid",
+                    "uncategorized_text":"sentinel-evidence"
+                })),
+            ),
+            (
+                "payment_method_details",
+                Some(json!({"type":"card","card":{"network_reason_code":"sentinel-network"}})),
+            ),
+        ],
+    );
+    let disputes = read_disputes(vec![MockResponse::json(list(
+        vec![sensitive.clone()],
+        false,
+    ))])
+    .await
+    .unwrap();
+    let rendered = format!("{disputes:?}");
+    assert!(!rendered.contains("sentinel"), "{rendered}");
+    assert!(!rendered.contains("general"), "{rendered}");
+
+    let contradictory = with_fields(sensitive, &[("livemode", Some(json!(true)))]);
+    let error = read_disputes(vec![MockResponse::json(list(vec![contradictory], false))])
         .await
         .unwrap_err();
     let rendered = format!("{error:?} {error}");

@@ -434,6 +434,35 @@ impl StripeReadClient {
         Ok(refunds)
     }
 
+    /// Enumerate every dispute Stripe returns for one PaymentIntent, whatever its status.
+    ///
+    /// Each page repeats the `payment_intent` filter. An empty result means only that this
+    /// filtered enumeration returned no disputes. It is not a consistent snapshot: disputes can be
+    /// opened or change state during or after the read.
+    pub async fn payment_intent_disputes(
+        &self,
+        session: &mut StripeReadSession,
+        payment_intent_id: &str,
+    ) -> Result<Vec<StripeDisputeResource>, StripeReadError> {
+        self.ensure_account(session).await?;
+        validate_identifier(payment_intent_id)?;
+        let query = vec![("payment_intent".to_owned(), payment_intent_id.to_owned())];
+        let disputes = self
+            .list(session, "v1/disputes", query, parse_dispute)
+            .await?;
+        for dispute in &disputes {
+            if dispute
+                .payment_intent_id
+                .as_deref()
+                .is_some_and(|id| id != payment_intent_id)
+            {
+                return Err(StripeReadError::ParentMismatch);
+            }
+            validate_mode(Some(dispute.livemode), self.environment)?;
+        }
+        Ok(disputes)
+    }
+
     pub async fn personal_invoice_observation(
         &self,
         session: &mut StripeReadSession,
@@ -921,6 +950,56 @@ impl StripeRefundStatus {
     }
 }
 
+/// One dispute returned by [`StripeReadClient::payment_intent_disputes`].
+///
+/// This is evidence about a single object, not an access decision. As with refunds, an absent
+/// `payment_intent_id` stays absent and must be resolved by a later authenticated read before it
+/// can be attributed to the requested PaymentIntent. Evidence, reasons, balance transactions and
+/// payment method details are not retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeDisputeResource {
+    pub id: String,
+    pub payment_intent_id: Option<String>,
+    pub charge_id: String,
+    pub amount: i64,
+    pub currency: String,
+    pub created: i64,
+    pub status: StripeDisputeStatus,
+    pub livemode: bool,
+}
+
+/// Dispute states stay distinct. An inquiry, an open dispute and each outcome can have different
+/// consequences, so none of them collapses into a single disputed flag here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripeDisputeStatus {
+    WarningNeedsResponse,
+    WarningUnderReview,
+    WarningClosed,
+    NeedsResponse,
+    UnderReview,
+    Won,
+    Lost,
+    Prevented,
+    /// A token this contract does not know. It must not be read as no dispute or as resolved.
+    Unknown(String),
+}
+
+impl StripeDisputeStatus {
+    fn from_token(token: String) -> Self {
+        match token.as_str() {
+            "warning_needs_response" => Self::WarningNeedsResponse,
+            "warning_under_review" => Self::WarningUnderReview,
+            "warning_closed" => Self::WarningClosed,
+            "needs_response" => Self::NeedsResponse,
+            "under_review" => Self::UnderReview,
+            "won" => Self::Won,
+            "lost" => Self::Lost,
+            "prevented" => Self::Prevented,
+            _ => Self::Unknown(token),
+        }
+    }
+}
+
 fn parse_subscription(value: &Value) -> Result<StripeSubscriptionResource, StripeReadError> {
     Ok(StripeSubscriptionResource {
         id: required_id(value, "subscription.id")?,
@@ -1031,6 +1110,26 @@ fn parse_refund(value: &Value) -> Result<StripeRefundResource, StripeReadError> 
         status: optional_token(value.get("status"), "refund.status")?
             .map(StripeRefundStatus::from_token),
         livemode: optional_bool(value.get("livemode"), "refund.livemode")?,
+    })
+}
+
+fn parse_dispute(value: &Value) -> Result<StripeDisputeResource, StripeReadError> {
+    require_object(value, "dispute", "dispute.object")?;
+    Ok(StripeDisputeResource {
+        id: required_id(value, "dispute.id")?,
+        payment_intent_id: optional_validated_ref(
+            value.get("payment_intent"),
+            "dispute.payment_intent",
+        )?,
+        charge_id: required_validated_ref(value.get("charge"), "dispute.charge")?,
+        amount: required_non_negative_i64(value.get("amount"), "dispute.amount")?,
+        currency: required_currency(value.get("currency"), "dispute.currency")?,
+        created: required_non_negative_i64(value.get("created"), "dispute.created")?,
+        status: optional_token(value.get("status"), "dispute.status")?
+            .map(StripeDisputeStatus::from_token)
+            .ok_or(StripeReadError::MalformedResponse("dispute.status"))?,
+        livemode: optional_bool(value.get("livemode"), "dispute.livemode")?
+            .ok_or(StripeReadError::MalformedResponse("dispute.livemode"))?,
     })
 }
 
@@ -1154,6 +1253,13 @@ fn optional_validated_ref(
         .ok_or(StripeReadError::MalformedResponse(field))?;
     validate_identifier(reference).map_err(|_| StripeReadError::MalformedResponse(field))?;
     Ok(Some(reference.to_owned()))
+}
+
+fn required_validated_ref(
+    value: Option<&Value>,
+    field: &'static str,
+) -> Result<String, StripeReadError> {
+    optional_validated_ref(value, field)?.ok_or(StripeReadError::MalformedResponse(field))
 }
 
 fn required_string(value: &Value, field: &'static str) -> Result<String, StripeReadError> {
