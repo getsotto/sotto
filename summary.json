@@ -1,7 +1,7 @@
 {
   "components": [
     {
-      "checked_at": "2026-09-24T21:43:53Z",
+      "checked_at": "2026-09-25T00:01:00Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -87,6 +87,11 @@
           "date": "2026-09-24",
           "ok": 5,
           "total": 5
+        },
+        {
+          "date": "2026-09-25",
+          "ok": 1,
+          "total": 1
         }
       ],
       "description": "Serving requests and reaching its database",
@@ -96,7 +101,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-09-24T21:43:53Z",
+      "checked_at": "2026-09-25T00:01:00Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -182,6 +187,11 @@
           "date": "2026-09-24",
           "ok": 5,
           "total": 5
+        },
+        {
+          "date": "2026-09-25",
+          "ok": 1,
+          "total": 1
         }
       ],
       "description": "The application shell loads",
@@ -191,7 +201,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-09-24T21:43:53Z",
+      "checked_at": "2026-09-25T00:01:00Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -277,6 +287,11 @@
           "date": "2026-09-24",
           "ok": 5,
           "total": 5
+        },
+        {
+          "date": "2026-09-25",
+          "ok": 1,
+          "total": 1
         }
       ],
       "description": "The GitHub sign-in flow starts",
@@ -286,7 +301,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-09-24T21:43:53Z",
+      "checked_at": "2026-09-25T00:01:00Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -372,6 +387,11 @@
           "date": "2026-09-24",
           "ok": 5,
           "total": 5
+        },
+        {
+          "date": "2026-09-25",
+          "ok": 1,
+          "total": 1
         }
       ],
       "description": "Subscription webhooks are accepted and authenticated",
@@ -381,7 +401,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-09-24T21:43:53Z",
+      "checked_at": "2026-09-25T00:01:00Z",
       "days": [
         {
           "date": "2026-09-12",
@@ -447,6 +467,11 @@
           "date": "2026-09-24",
           "ok": 5,
           "total": 5
+        },
+        {
+          "date": "2026-09-25",
+          "ok": 1,
+          "total": 1
         }
       ],
       "description": "A canary machine token can retrieve its grant and its secrets",
@@ -456,6 +481,6 @@
       "state": "ok"
     }
   ],
-  "generated_at": "2026-09-24T21:43:53Z",
+  "generated_at": "2026-09-25T00:01:00Z",
   "schema": 1
 }
