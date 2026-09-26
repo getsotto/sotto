@@ -274,6 +274,8 @@ export function VaultView({
       return;
     }
     const envId = openEnv.envId;
+    const selectionGeneration = envLoad.current;
+    const selectionIsCurrent = () => selectionGeneration === envLoad.current;
     rotatingEnvRef.current = envId;
     setRotatingEnvId(envId);
     setError(null);
@@ -289,7 +291,9 @@ export function VaultView({
           throw new Error("this environment is not in an organisation; nothing to rotate");
         }
         roster = await fetchMembers(orgId);
-        setMembers(roster);
+        if (selectionIsCurrent()) {
+          setMembers(roster);
+        }
       }
       const newKey = crypto.getRandomValues(new Uint8Array(32));
       const snap = await fetchSnapshot(openEnv.envId);
@@ -321,14 +325,18 @@ export function VaultView({
         machineGrants,
         historyKeys,
       });
-      setNotice("environment key rotated");
-      // Reload the environment under the new key (fetches the re-sealed grant).
-      const current = envs?.find((e) => e.env.id === openEnv.envId);
-      if (current !== undefined) {
-        await selectEnv(current);
+      if (selectionIsCurrent()) {
+        setNotice("environment key rotated");
+        // Reload the environment under the new key (fetches the re-sealed grant).
+        const current = envs?.find((e) => e.env.id === envId);
+        if (current !== undefined) {
+          await selectEnv(current);
+        }
       }
     } catch (e) {
-      setError(message(e));
+      if (selectionIsCurrent()) {
+        setError(message(e));
+      }
     } finally {
       if (rotatingEnvRef.current === envId) {
         rotatingEnvRef.current = null;

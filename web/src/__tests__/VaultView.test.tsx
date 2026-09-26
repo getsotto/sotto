@@ -255,3 +255,40 @@ describe("VaultView selection loading", () => {
     expect(memberSelect).toBeEnabled();
   });
 });
+
+
+describe("VaultView rotation ownership", () => {
+  it("does not reopen a rotated environment after the selection changes", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchProjects).mockResolvedValue([
+      { id: "project-a", encName: new Uint8Array([1]), orgId: "org-1" },
+    ]);
+    vi.mocked(api.fetchOrgs).mockResolvedValue([
+      { id: "org-1", encName: new Uint8Array(), role: "owner", encOrgKey: null },
+    ]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a"), environment("env-b")]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchMyGrant).mockResolvedValue(new Uint8Array([7]));
+    vi.mocked(api.fetchSecrets).mockResolvedValue([]);
+    vi.mocked(api.fetchSnapshot).mockResolvedValue({ revision: 1, secrets: [] });
+    vi.mocked(api.fetchHistory).mockResolvedValue([]);
+    vi.mocked(api.fetchGrantHolders).mockResolvedValue([]);
+    vi.mocked(api.fetchMachineTokens).mockResolvedValue([]);
+    vi.mocked(vault.decryptProjectName).mockReturnValue("project-a");
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
+    const rotation = deferred<void>();
+    vi.mocked(api.postRotate).mockReturnValue(rotation.promise);
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Rotate environment key" }));
+    await waitFor(() => expect(api.postRotate).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "env-b" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "env-b" })).toHaveAttribute("aria-current", "true"));
+    await act(async () => rotation.resolve());
+    expect(screen.getByRole("button", { name: "env-b" })).toHaveAttribute("aria-current", "true");
+    expect(api.fetchMyGrant).toHaveBeenCalledTimes(2);
+  });
+});
