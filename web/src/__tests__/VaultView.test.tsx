@@ -255,3 +255,22 @@ describe("VaultView selection loading", () => {
     expect(memberSelect).toBeEnabled();
   });
 });
+
+
+describe("VaultView project loading recovery", () => {
+  it("retries a failed project load without re-unlocking", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects)
+      .mockRejectedValueOnce(new Error("projects unavailable"))
+      .mockResolvedValueOnce([project("project-recovered")]);
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
+
+    renderVault();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("projects unavailable");
+    fireEvent.click(screen.getByRole("button", { name: "Retry projects" }));
+    expect(await screen.findByRole("button", { name: /project-recovered/ })).toBeInTheDocument();
+    expect(api.fetchProjects).toHaveBeenCalledTimes(2);
+  });
+});

@@ -81,6 +81,8 @@ export function VaultView({
   onLogout: () => void;
 }) {
   const [projects, setProjects] = useState<NamedProject[] | null>(null);
+  const [projectsLoading, setProjectsLoading] = useState(true);
+  const [projectsError, setProjectsError] = useState<string | null>(null);
   const [activeProject, setActiveProject] = useState<NamedProject | null>(null);
   const [envs, setEnvs] = useState<NamedEnv[] | null>(null);
   const [openEnv, setOpenEnv] = useState<OpenEnv | null>(null);
@@ -107,6 +109,28 @@ export function VaultView({
     return (orgId !== null ? orgKeys.get(orgId) : undefined) ?? master;
   }
 
+  async function loadProjects(keys: Map<string, Uint8Array>) {
+    setProjectsLoading(true);
+    setProjectsError(null);
+    try {
+      const rows = await fetchProjects();
+      setProjects(
+        rows.map((project) => {
+          const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
+          return {
+            project,
+            name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
+          };
+        }),
+      );
+    } catch (e) {
+      setProjects([]);
+      setProjectsError(message(e));
+    } finally {
+      setProjectsLoading(false);
+    }
+  }
+
   useEffect(() => {
     void (async () => {
       try {
@@ -126,16 +150,7 @@ export function VaultView({
         setOrgKeys(keys);
         setOrgRoles(roles);
 
-        const rows = await fetchProjects();
-        setProjects(
-          rows.map((project) => {
-            const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
-            return {
-              project,
-              name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
-            };
-          }),
-        );
+        await loadProjects(keys);
       } catch (e) {
         setError(message(e));
       }
@@ -374,11 +389,18 @@ export function VaultView({
 
       <section>
         <h2>Projects</h2>
-        {projects === null ? (
+        {projectsLoading ? (
           <p className="muted">Loading…</p>
         ) : (
-          <ul className="items">
-            {projects.map((p) => (
+          <>
+            {projectsError !== null && (
+              <p>
+                <span role="alert">{projectsError}</span>{" "}
+                <button onClick={() => void loadProjects(orgKeys)}>Retry projects</button>
+              </p>
+            )}
+            <ul className="items">
+            {(projects ?? []).map((p) => (
               <li key={p.project.id}>
                 <button
                   onClick={() => void selectProject(p)}
@@ -389,7 +411,8 @@ export function VaultView({
                 </button>
               </li>
             ))}
-          </ul>
+            </ul>
+          </>
         )}
       </section>
 
