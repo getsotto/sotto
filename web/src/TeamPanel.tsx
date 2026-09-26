@@ -239,7 +239,9 @@ export function TeamPanel({
           </button>
         </p>
       )}
-      {notice !== null && <p className="notice">{notice}</p>}
+      <div role="status" aria-live="polite" aria-atomic="true">
+        {notice !== null && <p className="notice">{notice}</p>}
+      </div>
       {orgsLoading && orgs === null && <p className="muted">Loading…</p>}
       {orgs !== null && (
         <ul className="items">
