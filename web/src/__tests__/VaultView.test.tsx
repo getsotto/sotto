@@ -255,3 +255,31 @@ describe("VaultView selection loading", () => {
     expect(memberSelect).toBeEnabled();
   });
 });
+
+
+describe("VaultView secret copying", () => {
+  it("copies the exact revealed value only after explicit activation", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("project-a")]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchMyGrant).mockResolvedValue(new Uint8Array([7]));
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.decryptSecretName).mockImplementation((_key, _env, entry) => entry.id);
+    vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("  first line\nsecond line  ");
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "secret-a" }));
+    expect(writeText).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Secret copied.");
+    expect(writeText).toHaveBeenCalledWith("  first line\nsecond line  ");
+  });
+});
