@@ -370,7 +370,9 @@ export function VaultView({
         reveal them.
       </p>
       {error !== null && <p role="alert">{error}</p>}
-      {notice !== null && <p className="notice">{notice}</p>}
+      <div role="status" aria-live="polite" aria-atomic="true">
+        {notice !== null && <p className="notice">{notice}</p>}
+      </div>
 
       <section>
         <h2>Projects</h2>
