@@ -109,10 +109,11 @@ export function VaultView({
 
   useEffect(() => {
     void (async () => {
+      // Organisation discovery is optional for personal projects. Keep it isolated so
+      // a failure does not prevent the independent project request.
+      const keys = new Map<string, Uint8Array>();
+      const roles = new Map<string, string>();
       try {
-        // Open every org key we hold first, so org project names decrypt on first paint.
-        const keys = new Map<string, Uint8Array>();
-        const roles = new Map<string, string>();
         for (const org of await fetchOrgs()) {
           roles.set(org.id, org.role);
           if (org.encOrgKey !== null) {
@@ -123,9 +124,13 @@ export function VaultView({
             }
           }
         }
-        setOrgKeys(keys);
-        setOrgRoles(roles);
+      } catch (e) {
+        setError(`organisations unavailable: ${message(e)}`);
+      }
+      setOrgKeys(keys);
+      setOrgRoles(roles);
 
+      try {
         const rows = await fetchProjects();
         setProjects(
           rows.map((project) => {
