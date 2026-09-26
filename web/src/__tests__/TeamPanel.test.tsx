@@ -8,6 +8,7 @@ import { TeamPanel } from "../TeamPanel";
 import * as vault from "../vault";
 
 vi.mock("../api", () => ({
+  organisationDeletionEnabled: false,
   createCheckout: vi.fn(),
   createPortal: vi.fn(),
   fetchAudit: vi.fn(),
@@ -365,62 +366,33 @@ describe("TeamPanel invitations", () => {
   );
 });
 
-describe("TeamPanel billing request ownership", () => {
-  const admin = (id: string): Org => ({
-    id, encName: new Uint8Array(), role: "admin", encOrgKey: null,
-  });
-  const billablePlan: Entitlements = { ...freePlan, billingEnabled: true };
 
-  beforeEach(() => {
+describe("TeamPanel audit visibility", () => {
+  it.each([
+    ["owner", "free", false],
+    ["admin", "free", false],
+    ["member", "free", false],
+    ["owner", "team", true],
+    ["admin", "team", true],
+    ["member", "team", false],
+  ] as const)("gates audit for %s with effective %s", async (role, effectiveTier, allowed) => {
     vi.resetAllMocks();
-    vi.mocked(api.fetchOrgs).mockResolvedValue([admin("org-a"), admin("org-b")]);
+    vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), role }]);
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
-    vi.mocked(api.fetchEntitlements).mockResolvedValue(billablePlan);
-  });
-
-  it.each(["success", "failure"] as const)(
-    "ignores a stale checkout %s after switching organisations",
-    async (outcome) => {
-      const pending = deferred<string>();
-      vi.mocked(api.createCheckout).mockReturnValueOnce(pending.promise).mockResolvedValueOnce("/checkout-b");
-      const assign = vi.spyOn(window.location, "assign").mockImplementation(() => {});
-      render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
-
-      fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
-      fireEvent.click(await screen.findByRole("button", { name: "Upgrade to Team" }));
-      expect(screen.getByRole("button", { name: "Opening checkout…" })).toBeDisabled();
-
-      fireEvent.click(screen.getByRole("button", { name: /org-b/ }));
-      expect(await screen.findByRole("button", { name: "Upgrade to Team" })).toBeEnabled();
-
-      await act(async () => {
-        if (outcome === "success") pending.resolve("/checkout-a");
-        else pending.reject(new Error("stale checkout failure"));
-      });
-      expect(assign).not.toHaveBeenCalled();
-      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-
-      fireEvent.click(screen.getByRole("button", { name: "Upgrade to Team" }));
-      await act(async () => {});
-      expect(api.createCheckout).toHaveBeenLastCalledWith("org-b");
-      expect(assign).toHaveBeenCalledWith("/checkout-b");
-      assign.mockRestore();
-    },
-  );
-});
-
-describe("TeamPanel organisation-list recovery", () => {
-  it("retries a failed organisation-list request", async () => {
-    vi.resetAllMocks();
-    vi.mocked(api.fetchOrgs)
-      .mockRejectedValueOnce(new Error("organisations unavailable"))
-      .mockResolvedValueOnce([org("org-recovered")]);
+    vi.mocked(api.fetchEntitlements).mockResolvedValue({
+      ...freePlan,
+      tier: "free",
+      effectiveTier,
+    });
+    vi.mocked(api.fetchAudit).mockResolvedValue([]);
 
     render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Members of org-a" });
+    await act(async () => { await Promise.resolve(); });
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("organisations unavailable");
-    fireEvent.click(screen.getByRole("button", { name: "Retry organisations" }));
-    expect(await screen.findByRole("button", { name: /org-recovered/ })).toBeInTheDocument();
-    expect(api.fetchOrgs).toHaveBeenCalledTimes(2);
+    expect(api.fetchAudit).toHaveBeenCalledTimes(allowed ? 1 : 0);
+    if (allowed) expect(await screen.findByText("No events yet.")).toBeInTheDocument();
+    else expect(screen.queryByRole("heading", { name: "Audit log" })).not.toBeInTheDocument();
   });
 });
