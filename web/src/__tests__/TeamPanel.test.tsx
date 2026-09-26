@@ -8,6 +8,7 @@ import { TeamPanel } from "../TeamPanel";
 import * as vault from "../vault";
 
 vi.mock("../api", () => ({
+  organisationDeletionEnabled: false,
   createCheckout: vi.fn(),
   createPortal: vi.fn(),
   fetchAudit: vi.fn(),
@@ -362,4 +363,35 @@ describe("TeamPanel invitations", () => {
       expect(input).toBeEnabled();
     },
   );
+});
+
+
+describe("TeamPanel audit visibility", () => {
+  it.each([
+    ["owner", "free", false],
+    ["admin", "free", false],
+    ["member", "free", false],
+    ["owner", "team", true],
+    ["admin", "team", true],
+    ["member", "team", false],
+  ] as const)("gates audit for %s with effective %s", async (role, effectiveTier, allowed) => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), role }]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchEntitlements).mockResolvedValue({
+      ...freePlan,
+      tier: "free",
+      effectiveTier,
+    });
+    vi.mocked(api.fetchAudit).mockResolvedValue([]);
+
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Members of org-a" });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(api.fetchAudit).toHaveBeenCalledTimes(allowed ? 1 : 0);
+    if (allowed) expect(await screen.findByText("No events yet.")).toBeInTheDocument();
+    else expect(screen.queryByRole("heading", { name: "Audit log" })).not.toBeInTheDocument();
+  });
 });
