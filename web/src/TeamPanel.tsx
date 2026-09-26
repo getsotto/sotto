@@ -74,6 +74,8 @@ export function TeamPanel({
   encPrivateKeys: Uint8Array;
 }) {
   const [orgs, setOrgs] = useState<NamedOrg[] | null>(null);
+  const [orgsLoading, setOrgsLoading] = useState(true);
+  const [orgsError, setOrgsError] = useState<string | null>(null);
   const [openOrg, setOpenOrg] = useState<NamedOrg | null>(null);
   const [members, setMembers] = useState<Member[] | null>(null);
   const [membersLoading, setMembersLoading] = useState(false);
@@ -95,15 +97,21 @@ export function TeamPanel({
     }
   }, [billingOutcome]);
 
+  async function loadOrgs() {
+    setOrgsLoading(true);
+    setOrgsError(null);
+    try {
+      const rows = await fetchOrgs();
+      setOrgs(rows.map((org) => ({ org, name: orgDisplayName(master, encPrivateKeys, org) })));
+    } catch (e) {
+      setOrgsError(message(e));
+    } finally {
+      setOrgsLoading(false);
+    }
+  }
+
   useEffect(() => {
-    void (async () => {
-      try {
-        const rows = await fetchOrgs();
-        setOrgs(rows.map((org) => ({ org, name: orgDisplayName(master, encPrivateKeys, org) })));
-      } catch (e) {
-        setError(message(e));
-      }
-    })();
+    void loadOrgs();
   }, [master, encPrivateKeys]);
 
   async function selectOrg(no: NamedOrg) {
@@ -215,8 +223,16 @@ export function TeamPanel({
         <p className="muted">Checkout cancelled. Nothing was charged.</p>
       )}
       {error !== null && <p role="alert">{error}</p>}
+      {orgsError !== null && (
+        <p>
+          <span role="alert">{orgsError}</span>{" "}
+          <button disabled={orgsLoading} onClick={() => void loadOrgs()}>
+            {orgsLoading ? "Retrying…" : "Retry organisations"}
+          </button>
+        </p>
+      )}
       {notice !== null && <p className="notice">{notice}</p>}
-      {orgs === null && error === null && <p className="muted">Loading…</p>}
+      {orgsLoading && orgs === null && <p className="muted">Loading…</p>}
       {orgs !== null && (
         <ul className="items">
           {orgs.map((o) => (

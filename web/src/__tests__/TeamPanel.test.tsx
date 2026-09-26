@@ -363,3 +363,20 @@ describe("TeamPanel invitations", () => {
     },
   );
 });
+
+
+describe("TeamPanel organisation-list recovery", () => {
+  it("retries a failed organisation-list request", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs)
+      .mockRejectedValueOnce(new Error("organisations unavailable"))
+      .mockResolvedValueOnce([org("org-recovered")]);
+
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("organisations unavailable");
+    fireEvent.click(screen.getByRole("button", { name: "Retry organisations" }));
+    expect(await screen.findByRole("button", { name: /org-recovered/ })).toBeInTheDocument();
+    expect(api.fetchOrgs).toHaveBeenCalledTimes(2);
+  });
+});
