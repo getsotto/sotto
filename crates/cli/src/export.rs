@@ -138,6 +138,50 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn shell_exports_round_trip_through_child_environment() {
+        use std::process::Command;
+
+        let entries = vec![
+            ("PWF_EMPTY".into(), "".into()),
+            ("PWF_SPACES".into(), " leading and trailing ".into()),
+            (
+                "PWF_QUOTES".into(),
+                "single ' double \" backslash \\".into(),
+            ),
+            (
+                "PWF_DOLLAR".into(),
+                "$HOME $(printf expanded) \x60printf expanded\x60".into(),
+            ),
+            ("PWF_LINES".into(), "line1\nline2\rcarriage\ttab".into()),
+            ("PWF_UNICODE".into(), "café 東京".into()),
+            ("PWF_EQUALS_HASH".into(), "left=right#literal".into()),
+        ];
+        let mut script = render(ExportFormat::Shell, &entries);
+        script.push_str(
+            "sh -c 'printf \"%s\\0\" \"$PWF_EMPTY\" \"$PWF_SPACES\" \"$PWF_QUOTES\" \"$PWF_DOLLAR\" \"$PWF_LINES\" \"$PWF_UNICODE\" \"$PWF_EQUALS_HASH\"'\n",
+        );
+
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env("PWF_EMPTY", "inherited-value")
+            .output()
+            .expect("POSIX shell should run");
+        assert!(
+            output.status.success(),
+            "shell failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let expected = entries
+            .iter()
+            .flat_map(|(_, value)| value.as_bytes().iter().copied().chain(std::iter::once(0)))
+            .collect::<Vec<_>>();
+        assert_eq!(output.stdout, expected);
+    }
+
     #[test]
     fn shell_uses_posix_single_quoting() {
         let out = render(ExportFormat::Shell, &[("Q".into(), "a'b".into())]);
