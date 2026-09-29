@@ -91,6 +91,7 @@ export function VaultView({
   const [copyBusy, setCopyBusy] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
   const copyGeneration = useRef(0);
+  const [secretQuery, setSecretQuery] = useState("");
   // Org members of the active project (loaded when an org env is opened), for the share picker.
   const [members, setMembers] = useState<Member[] | null>(null);
   const [shareTo, setShareTo] = useState("");
@@ -174,6 +175,7 @@ export function VaultView({
     setEnvs(null);
     setOpenEnv(null);
     setRevealed(null);
+    setSecretQuery("");
     setMembers(null);
     setShareTo(""); // drop a stale member pick so the next env's Share button starts disabled
     try {
@@ -202,6 +204,7 @@ export function VaultView({
     setNotice(null);
     setOpenEnv(null);
     setRevealed(null);
+    setSecretQuery("");
     setMembers(null);
     setShareTo(""); // the new env reloads its own members; don't carry a stale pick across
     try {
@@ -440,6 +443,12 @@ export function VaultView({
     }
   }
 
+  const normalizedSecretQuery = secretQuery.trim().toLocaleLowerCase();
+  const filteredSecrets =
+    openEnv?.secrets.filter((secret) =>
+      secret.name.toLocaleLowerCase().includes(normalizedSecretQuery),
+    ) ?? [];
+
   return (
     <Shell onLogout={onLogout}>
       <h1>Your vault</h1>
@@ -512,8 +521,21 @@ export function VaultView({
           {openEnv.secrets.length === 0 ? (
             <p className="muted">No secrets in this environment.</p>
           ) : (
-            <ul className="items">
-              {openEnv.secrets.map((s) => (
+            <>
+              <label>
+                Search secret names
+                <input
+                  type="search"
+                  value={secretQuery}
+                  onChange={(e) => setSecretQuery(e.target.value)}
+                  autoComplete="off"
+                />
+              </label>
+              {filteredSecrets.length === 0 ? (
+                <p className="muted">No secret names match this search.</p>
+              ) : (
+                <ul className="items">
+              {filteredSecrets.map((s) => (
                 <li key={s.entry.id}>
                   <button
                     onClick={() => reveal(s)}
@@ -523,7 +545,9 @@ export function VaultView({
                   </button>
                 </li>
               ))}
-            </ul>
+                </ul>
+              )}
+            </>
           )}
           {members !== null && members.length > 0 && (
             <form

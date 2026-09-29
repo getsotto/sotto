@@ -94,6 +94,31 @@ describe("VaultView selection loading", () => {
     vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
   });
 
+  it("filters loaded secret names locally and clears the query on environment switch", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a"), environment("env-b")]);
+    vi.mocked(api.fetchSecrets).mockImplementation((envId) =>
+      Promise.resolve(envId === "env-a" ? [secret("Alpha"), secret("Beta")] : [secret("Gamma")]),
+    );
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    await screen.findByRole("button", { name: "Alpha" });
+
+    const search = screen.getByRole("searchbox", { name: "Search secret names" });
+    fireEvent.change(search, { target: { value: "ALP" } });
+    expect(screen.getByRole("button", { name: "Alpha" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Beta" })).toBeNull();
+    expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+
+    fireEvent.change(search, { target: { value: "missing" } });
+    expect(screen.getByText("No secret names match this search.")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "env-b" }));
+    await screen.findByRole("button", { name: "Gamma" });
+    expect(screen.getByRole("searchbox", { name: "Search secret names" })).toHaveValue("");
+  });
+
   it("keeps environments from the latest project when requests resolve out of order", async () => {
     const first = deferred<Environment[]>();
     const second = deferred<Environment[]>();
