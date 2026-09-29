@@ -1946,8 +1946,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        display_secret, env_list_json, history_line, import_dotenv, login_config, set_confirmation,
-        Cli, Command, EnvCommand, ThemeCommand, TokenCommand,
+        display_secret, env_list_json, history_line, import_dotenv, login_config,
+        machine_token_list_json, set_confirmation, Cli, Command, EnvCommand, ThemeCommand,
+        TokenCommand,
     };
 
     #[test]
