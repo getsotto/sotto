@@ -478,3 +478,53 @@ mod pty_tests {
         );
     }
 }
+
+#[test]
+fn env_use_omitted_name_precedes_project_discovery_non_interactively() {
+    for (label, config) in [
+        ("absent", None),
+        ("malformed", Some("this is not = [valid toml")),
+        (
+            "valid",
+            Some("project_id = \"00000000-0000-0000-0000-000000000000\"\nproject = \"test-project\"\nenvironment = \"dev\"\n"),
+        ),
+    ] {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let data_dir = scratch.path().join("sotto-data");
+        if let Some(config) = config {
+            std::fs::write(scratch.path().join("sotto.toml"), config).expect("write config");
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+            .current_dir(scratch.path())
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env_remove("SOTTO_PASSWORD")
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .args(["--plain", "env", "use"])
+            .output()
+            .expect("run sotto");
+        assert_eq!(output.status.code(), Some(2), "{label}");
+        assert!(output.stdout.is_empty(), "{label}");
+        let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+        assert!(stderr.contains("missing required argument <NAME>"), "{label}: {stderr}");
+        assert!(!stderr.contains("Master password:"), "{label}: {stderr}");
+        assert!(!data_dir.exists(), "{label} created {}", data_dir.display());
+    }
+}
+
+#[test]
+fn env_use_supplied_name_still_discovers_project() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+        .current_dir(scratch.path())
+        .env("SOTTO_DATA_DIR", scratch.path().join("sotto-data"))
+        .env_remove("SOTTO_PASSWORD")
+        .env_remove("SOTTO_TOKEN")
+        .env_remove("SOTTO_THEME")
+        .args(["--plain", "env", "use", "dev"])
+        .output()
+        .expect("run sotto");
+    assert_eq!(output.status.code(), Some(3));
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert!(stderr.contains("sotto.toml"), "{stderr}");
+}

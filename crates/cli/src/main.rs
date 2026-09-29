@@ -1564,6 +1564,12 @@ fn env_use(
     name: Option<String>,
     theme: &sotto_cli::theme::Theme,
 ) -> Result<()> {
+    if name.is_none() && !prompts::can_prompt() {
+        return Err(Error::MissingArgument(
+            "missing required argument <NAME>; provide an environment name or run in an interactive terminal".into(),
+        ));
+    }
+
     let (mut config, dir) = Config::discover(cwd)?;
     let name = match name {
         Some(name) => name,
