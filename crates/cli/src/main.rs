@@ -241,6 +241,10 @@ enum Command {
         reveal: bool,
     },
     /// Import secrets from a .env file into the active environment.
+    #[command(after_help = r#"Examples:
+  sotto import .env
+
+Values are imported literally: $OTHER and ${OTHER} are not expanded, and an inline # is part of the value; whole lines beginning with # are comments. Unquoted surrounding whitespace is trimmed, while matching quotes preserve spaces inside the value. Single-quoted values are literal. Double-quoted values decode \n, \r, \t, \\, and \". Physical multiline values are unsupported; use a double-quoted \n escape to store a newline."#)]
     Import {
         /// Path to the .env file.
         file: PathBuf,
@@ -1970,6 +1974,28 @@ mod tests {
         assert!(help.contains("sotto run --env staging -- npm test"));
         assert!(help.contains("sotto run -- python -c \"print('hello')\""));
         assert!(help.contains("Sotto options go before --"));
+    }
+
+    #[test]
+    fn import_help_explains_literal_and_quoted_values() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("import")
+            .expect("import subcommand should exist")
+            .render_long_help()
+            .to_string();
+
+        for expected in [
+            "sotto import .env",
+            "$OTHER",
+            "${OTHER}",
+            "inline # is part of the value",
+            "Single-quoted values are literal",
+            "Physical multiline values are unsupported",
+            "Double-quoted values decode",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
     }
 
     #[test]
