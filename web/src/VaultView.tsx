@@ -326,11 +326,17 @@ export function VaultView({
         historyKeys,
       });
       if (selectionIsCurrent()) {
-        setNotice("environment key rotated");
         // Reload the environment under the new key (fetches the re-sealed grant).
         const current = envs?.find((e) => e.env.id === envId);
         if (current !== undefined) {
           await selectEnv(current);
+          // selectEnv clears transient notices before reloading. Only restore the rotation
+          // success after that reload if no newer selection superseded it.
+          if (envLoad.current === selectionGeneration + 1) {
+            setNotice("environment key rotated");
+          }
+        } else {
+          setNotice("environment key rotated");
         }
       }
     } catch (e) {
