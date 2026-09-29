@@ -1,0 +1,14 @@
+{
+  "id": "inpay_contract_payment",
+  "object": "invoice_payment",
+  "amount_paid": 299,
+  "amount_requested": 299,
+  "currency": "gbp",
+  "invoice": "in_contract_invoice",
+  "livemode": false,
+  "payment": {
+    "type": "payment_intent",
+    "payment_intent": "pi_contract_payment"
+  },
+  "status": "paid"
+}
