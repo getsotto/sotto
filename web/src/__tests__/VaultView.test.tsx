@@ -1029,3 +1029,55 @@ describe("VaultView secret copying", () => {
     expect(screen.getByRole("button", { name: "Copy secret" })).toBeEnabled();
   });
 });
+
+describe("VaultView secret hiding", () => {
+  it("hides a revealed secret, returns focus, and allows revealing it again", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptSecretName).mockReturnValue("secret-a");
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("secret-value");
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    const secretButton = await screen.findByRole("button", { name: "secret-a" });
+
+    fireEvent.click(secretButton);
+    expect(screen.getByDisplayValue("secret-value")).toBeInTheDocument();
+    expect(secretButton).toHaveAttribute("aria-current", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide secret" }));
+    expect(screen.queryByDisplayValue("secret-value")).not.toBeInTheDocument();
+    expect(secretButton).not.toHaveAttribute("aria-current");
+    expect(secretButton).toHaveFocus();
+
+    fireEvent.click(secretButton);
+    expect(screen.getByDisplayValue("secret-value")).toBeInTheDocument();
+  });
+
+  it("does not restore a hidden secret when a pending share finishes", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptSecretName).mockReturnValue("secret-a");
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("secret-value");
+    vi.mocked(vault.sealForShare).mockReturnValue({
+      encBlob: new Uint8Array([1]),
+      fragmentKey: new Uint8Array([2]),
+    });
+    const shareRequest = deferred<string>();
+    vi.mocked(api.createShare).mockReturnValue(shareRequest.promise);
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "secret-a" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create one-time share link" }));
+    await waitFor(() => expect(api.createShare).toHaveBeenCalledOnce());
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide secret" }));
+    await act(async () => shareRequest.resolve("late-token"));
+
+    expect(screen.queryByDisplayValue("secret-value")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue(/late-token/)).not.toBeInTheDocument();
+  });
+});
