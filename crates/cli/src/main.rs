@@ -20,9 +20,11 @@ use sotto_cli::dotenv;
 use sotto_cli::error::{Error, Result};
 use sotto_cli::export::{self, ExportFormat};
 use sotto_cli::keychain::{Keychain, OsKeychain};
+use sotto_cli::prompts;
 use sotto_cli::remote;
 use sotto_cli::session;
 use sotto_cli::store::Store;
+use sotto_cli::tui;
 use sotto_cli::vault::Vault;
 
 /// How long an unlocked session lasts before the master password is needed again.
@@ -47,7 +49,7 @@ struct Cli {
     #[arg(long, global = true)]
     plain: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -112,7 +114,7 @@ enum Command {
     )]
     Share {
         /// The secret name to share.
-        name: String,
+        name: Option<String>,
         /// How many times the link may be viewed before it burns (1-100).
         #[arg(
             long,
@@ -147,7 +149,7 @@ enum Command {
     /// re-grant your shared environments.
     Reset {
         /// Skip the interactive confirmation.
-        #[arg(long)]
+        #[arg(short = 'y', long)]
         yes: bool,
     },
     /// Unlock the store for this session.
@@ -172,13 +174,16 @@ enum Command {
     },
     /// Print a secret's value. Refuses to print to a terminal without --reveal.
     Get {
-        name: String,
+        name: Option<String>,
         /// Allow printing the secret to a terminal.
         #[arg(long)]
         reveal: bool,
         /// Copy the secret to the clipboard instead of printing it.
         #[arg(short = 'c', long, conflicts_with = "reveal")]
         copy: bool,
+        /// Do not copy the secret to the clipboard in an interactive terminal.
+        #[arg(long, conflicts_with = "copy")]
+        no_copy: bool,
     },
     /// List secret names in the active environment.
     Ls {
@@ -187,7 +192,12 @@ enum Command {
         json: bool,
     },
     /// Remove a secret.
-    Rm { name: String },
+    Rm {
+        name: Option<String>,
+        /// Skip the interactive confirmation.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Show a secret's version history (from the server; run after `login`).
     #[command(
         after_help = "Examples:\n  sotto history DATABASE_URL\n  sotto history DATABASE_URL --reveal\n\nHistory and rollback use the server and require login and an unlocked local store. History normally shows version numbers and sizes; --reveal prints plaintext values."
@@ -272,7 +282,7 @@ enum EnvCommand {
         json: bool,
     },
     /// Set the active environment for this project.
-    Use { name: String },
+    Use { name: Option<String> },
     /// Compare two environments key by key (presence + "differs" markers).
     #[command(
         after_help = "Examples:\n  sotto env diff dev staging\n  sotto env diff dev staging --reveal\n\nMarkers:\n  =  key exists in both environments with the same value\n  !  key exists in both environments with different values\n  <  key exists only in the left (first) environment\n  >  key exists only in the right (second) environment\n\nValues are hidden by default. --reveal displays plaintext values for keys that differ in both environments."
@@ -302,8 +312,11 @@ enum TokenCommand {
         /// Human label for the token ("github-actions").
         #[arg(long, default_value = "ci")]
         name: String,
-        /// Days until the token stops working (the server allows 1 to 365; default 90).
-        #[arg(long)]
+        /// Days until the token stops working (1-365; the server defaults to 90).
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(u32).range(1..=sotto_cli::remote::machine::MAX_LIFETIME_DAYS as i64)
+        )]
         expires_in_days: Option<u32>,
     },
     /// List the active environment's machine tokens.
@@ -351,25 +364,32 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Command::Share {
+        Some(Command::Share {
             copy: true,
             no_copy: true,
             ..
-        } => {
+        }) => {
             return Err(Error::Input("--copy conflicts with --no-copy".into()));
         }
-        Command::Get {
+        Some(Command::Get {
             copy: true,
             reveal: true,
             ..
-        } => {
+        }) => {
             return Err(Error::Input("--copy conflicts with --reveal".into()));
+        }
+        Some(Command::Get {
+            copy: true,
+            no_copy: true,
+            ..
+        }) => {
+            return Err(Error::Input("--copy conflicts with --no-copy".into()));
         }
         _ => {}
     }
 
     // Completions need neither the store nor the keychain - handle before touching either.
-    if let Command::Completions { shell } = &cli.command {
+    if let Some(Command::Completions { shell }) = &cli.command {
         clap_complete::generate(*shell, &mut Cli::command(), "sotto", &mut io::stdout());
         return Ok(());
     }
@@ -379,8 +399,10 @@ fn run() -> Result<()> {
     // resolution: machine output is never styled and must not depend on the config file.
     if let Ok(token) = std::env::var("SOTTO_TOKEN") {
         match &cli.command {
-            Command::Run { args } => return machine_run(&token, args.clone()),
-            Command::Export { format, reveal } => return machine_export(&token, *format, *reveal),
+            Some(Command::Run { args }) => return machine_run(&token, args.clone()),
+            Some(Command::Export { format, reveal }) => {
+                return machine_export(&token, *format, *reveal)
+            }
             _ => {} // every other command proceeds as a normal session
         }
     }
@@ -421,10 +443,19 @@ fn run() -> Result<()> {
     }
 
     // Theme commands need neither the store nor the keychain.
-    if let Command::Theme { command } = &cli.command {
+    if let Some(Command::Theme { command }) = &cli.command {
         let config_path = sotto_cli::paths::config_path()?;
         let themes_dir = sotto_cli::paths::themes_path()?;
         return theme_command(command.as_ref(), &theme, &config_path, &themes_dir);
+    }
+
+    // Bare sotto in a non-interactive environment prints help to stderr and exits 2,
+    // without creating the data directory or opening the store.
+    if cli.command.is_none() && !prompts::can_prompt() {
+        let mut cmd = Cli::command();
+        let _ = cmd.write_help(&mut std::io::stderr());
+        eprintln!();
+        std::process::exit(2);
     }
 
     let store_path = sotto_cli::paths::store_path()?;
@@ -437,7 +468,16 @@ fn run() -> Result<()> {
     let app = App::new(&store, &keychain);
     let cwd = std::env::current_dir().map_err(|e| Error::Io(e.to_string()))?;
 
-    match cli.command {
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        None => {
+            let config = effective_config(&cwd, cli.env.as_deref())?;
+            ensure_unlocked(&store, &keychain)?;
+            return tui::run(&app, &store, &config, &theme);
+        }
+    };
+
+    match command {
         Command::Init { name, org } => init(&store, &keychain, &cwd, name, org),
         Command::Org { command } => org_command(&store, &keychain, command),
         Command::Grant { user_id } => {
@@ -487,8 +527,19 @@ fn run() -> Result<()> {
             copy,
             no_copy,
         } => {
+            prompts::preflight_secret_name(name.as_deref())?;
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
+            let name = match name {
+                Some(name) => name,
+                None => match prompts::select_secret_key(&app, &config, &theme)? {
+                    Some(name) => name,
+                    None => {
+                        eprintln!("aborted");
+                        return Ok(());
+                    }
+                },
+            };
             share(
                 &app,
                 &keychain,
@@ -554,15 +605,54 @@ fn run() -> Result<()> {
             eprintln!("set {name} ({}/{})", config.project, config.environment);
             Ok(())
         }
-        Command::Get { name, reveal, copy } => {
+        Command::Get {
+            name,
+            reveal,
+            copy,
+            no_copy,
+        } => {
+            if no_copy && !reveal && io::stdout().is_terminal() {
+                return Err(Error::Input(
+                    "refusing to print a secret to a terminal; use --reveal or pipe the output"
+                        .into(),
+                ));
+            }
+            prompts::preflight_secret_name(name.as_deref())?;
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
+            let is_interactive = name.is_none();
+            let name = match name {
+                Some(name) => name,
+                None => match prompts::select_secret_key(&app, &config, &theme)? {
+                    Some(name) => name,
+                    None => {
+                        eprintln!("aborted");
+                        return Ok(());
+                    }
+                },
+            };
             let mut value = app.get(&config, &name)?;
-            let result = if copy {
+            let automatic_copy = is_interactive
+                && !reveal
+                && !no_copy
+                && !copy
+                && io::stdout().is_terminal()
+                && !sotto_cli::theme::ci_enabled(std::env::var("CI").ok().as_deref());
+            let result = if copy || automatic_copy {
                 match std::str::from_utf8(&value) {
-                    Ok(text) => clipboard::copy(text).map(|()| {
-                        eprintln!("Copied to clipboard; will attempt to clear after 45 seconds.");
-                    }),
+                    Ok(text) => match clipboard::copy(text) {
+                        Ok(()) => {
+                            eprintln!(
+                                "Copied to clipboard; will attempt to clear after 45 seconds."
+                            );
+                            Ok(())
+                        }
+                        Err(err) if automatic_copy => {
+                            eprintln!("warning: could not copy to clipboard: {err}");
+                            write_value(&value, reveal)
+                        }
+                        Err(err) => Err(err),
+                    },
                     Err(_) => Err(Error::Input("clipboard requires valid UTF-8 text".into())),
                 }
             } else {
@@ -584,9 +674,24 @@ fn run() -> Result<()> {
             }
             Ok(())
         }
-        Command::Rm { name } => {
+        Command::Rm { name, yes } => {
+            prompts::preflight_secret_name(name.as_deref())?;
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
+            let name = match name {
+                Some(name) => name,
+                None => match prompts::select_secret_key(&app, &config, &theme)? {
+                    Some(name) => name,
+                    None => {
+                        eprintln!("aborted");
+                        return Ok(());
+                    }
+                },
+            };
+            if !yes && prompts::can_prompt() && !prompts::confirm_removal(&name, &theme)? {
+                eprintln!("aborted");
+                return Ok(());
+            }
             app.remove(&config, &name)?;
             eprintln!("removed {name}");
             Ok(())
@@ -634,7 +739,7 @@ fn run() -> Result<()> {
                 }
                 Ok(())
             }
-            EnvCommand::Use { name } => env_use(&store, &cwd, &name),
+            EnvCommand::Use { name } => env_use(&store, &cwd, name, &theme),
             EnvCommand::Diff {
                 left,
                 right,
@@ -1453,12 +1558,27 @@ fn env_copy(app: &App, config: &Config, src: &str, dst: &str, confirm: bool) -> 
     Ok(())
 }
 
-fn env_use(store: &Store, cwd: &Path, name: &str) -> Result<()> {
+fn env_use(
+    store: &Store,
+    cwd: &Path,
+    name: Option<String>,
+    theme: &sotto_cli::theme::Theme,
+) -> Result<()> {
     let (mut config, dir) = Config::discover(cwd)?;
+    let name = match name {
+        Some(name) => name,
+        None => match prompts::select_environment(store, &config.project_id, theme)? {
+            Some(name) => name,
+            None => {
+                eprintln!("aborted");
+                return Ok(());
+            }
+        },
+    };
     if !store
         .list_environments(&config.project_id)?
         .iter()
-        .any(|e| e == name)
+        .any(|e| e == &name)
     {
         return Err(Error::NotFound(format!("environment `{name}`")));
     }
@@ -1504,11 +1624,11 @@ fn env_list_json(environments: &[String], active: &str) -> Result<String> {
 }
 
 fn ensure_unlocked(store: &Store, keychain: &dyn Keychain) -> Result<()> {
-    if session::current_master_key(keychain)?.is_some() {
-        return Ok(());
-    }
     if store.get_identity()?.is_none() {
         return Err(Error::NoIdentity);
+    }
+    if session::current_master_key(keychain)?.is_some() {
+        return Ok(());
     }
     let mut password = read_password("Master password: ")?;
     let _spinner = sotto_cli::feedback::spinner("Deriving key...");
@@ -1774,7 +1894,7 @@ mod tests {
 
     use super::{
         display_secret, env_list_json, history_line, import_dotenv, login_config, set_confirmation,
-        Cli, Command, EnvCommand, ThemeCommand,
+        Cli, Command, EnvCommand, ThemeCommand, TokenCommand,
     };
 
     #[test]
@@ -1853,10 +1973,10 @@ mod tests {
                 .unwrap_or_else(|err| panic!("version {version} should parse: {err}"));
             assert!(matches!(
                 cli.command,
-                Command::Rollback {
+                Some(Command::Rollback {
                     version: parsed,
                     ..
-                } if parsed == version
+                }) if parsed == version
             ));
         }
 
@@ -1885,7 +2005,7 @@ mod tests {
         let cli = Cli::try_parse_from(["sotto", "run", "--", "npm", "start"])
             .expect("npm example should parse");
         assert!(cli.env.is_none());
-        let Command::Run { args } = cli.command else {
+        let Some(Command::Run { args }) = cli.command else {
             panic!("expected run command");
         };
         assert_eq!(args, vec!["npm".to_owned(), "start".to_owned()]);
@@ -1893,14 +2013,14 @@ mod tests {
         let cli = Cli::try_parse_from(["sotto", "run", "--env", "staging", "--", "npm", "test"])
             .expect("environment example should parse");
         assert_eq!(cli.env.as_deref(), Some("staging"));
-        let Command::Run { args } = cli.command else {
+        let Some(Command::Run { args }) = cli.command else {
             panic!("expected run command");
         };
         assert_eq!(args, vec!["npm".to_owned(), "test".to_owned()]);
 
         let cli = Cli::try_parse_from(["sotto", "run", "--", "python", "-c", "print('hello')"])
             .expect("python example should parse");
-        let Command::Run { args } = cli.command else {
+        let Some(Command::Run { args }) = cli.command else {
             panic!("expected run command");
         };
         assert_eq!(
@@ -1951,14 +2071,14 @@ mod tests {
         let cli = Cli::try_parse_from(["sotto", "theme", "ls"]).expect("theme ls should parse");
         assert!(matches!(
             cli.command,
-            Command::Theme {
+            Some(Command::Theme {
                 command: Some(ThemeCommand::Ls)
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["sotto", "theme", "set", "sordino"])
             .expect("theme set should parse");
-        let Command::Theme { command } = cli.command else {
+        let Some(Command::Theme { command }) = cli.command else {
             panic!("expected theme command");
         };
         assert!(matches!(command, Some(ThemeCommand::Set { name }) if name == "sordino"));
@@ -1967,14 +2087,17 @@ mod tests {
             Cli::try_parse_from(["sotto", "theme", "current"]).expect("theme current should parse");
         assert!(matches!(
             cli.command,
-            Command::Theme {
+            Some(Command::Theme {
                 command: Some(ThemeCommand::Current)
-            }
+            })
         ));
 
         // Bare `sotto theme` defaults to listing.
         let cli = Cli::try_parse_from(["sotto", "theme"]).expect("bare theme should parse");
-        assert!(matches!(cli.command, Command::Theme { command: None }));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Theme { command: None })
+        ));
     }
 
     #[test]
@@ -2032,30 +2155,30 @@ mod tests {
         let cli = Cli::try_parse_from(["sotto", "get", "KEY", "-c"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Get {
+            Some(Command::Get {
                 copy: true,
                 reveal: false,
                 ..
-            }
+            })
         ));
 
         let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--copy"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Share {
+            Some(Command::Share {
                 copy: true,
                 no_copy: false,
                 ..
-            }
+            })
         ));
         let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--no-copy"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Share {
+            Some(Command::Share {
                 copy: false,
                 no_copy: true,
                 ..
-            }
+            })
         ));
     }
 
@@ -2064,13 +2187,15 @@ mod tests {
         for views in [1, sotto_cli::remote::share::MAX_VIEWS] {
             let value = views.to_string();
             let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--views", &value]).unwrap();
-            assert!(matches!(cli.command, Command::Share { views: parsed, .. } if parsed == views));
+            assert!(
+                matches!(cli.command, Some(Command::Share { views: parsed, .. }) if parsed == views)
+            );
         }
         for expire in [1, sotto_cli::remote::share::MAX_TTL_SECONDS] {
             let value = expire.to_string();
             let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--expire", &value]).unwrap();
             assert!(
-                matches!(cli.command, Command::Share { expire: Some(parsed), .. } if parsed == expire)
+                matches!(cli.command, Some(Command::Share { expire: Some(parsed), .. }) if parsed == expire)
             );
         }
 
@@ -2088,11 +2213,54 @@ mod tests {
         let cli = Cli::try_parse_from(["sotto", "share", "KEY"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Share {
+            Some(Command::Share {
                 views: 1,
                 expire: None,
                 ..
-            }
+            })
+        ));
+    }
+
+    #[test]
+    fn token_lifetime_parses_bounds_and_rejects_out_of_range_values_before_setup() {
+        let max = sotto_cli::remote::machine::MAX_LIFETIME_DAYS;
+        for days in [1, max] {
+            let value = days.to_string();
+            let cli =
+                Cli::try_parse_from(["sotto", "token", "create", "--expires-in-days", &value])
+                    .unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Token {
+                    command: TokenCommand::Create {
+                        expires_in_days: Some(parsed),
+                        ..
+                    }
+                }) if parsed == days
+            ));
+        }
+
+        for value in ["0", "366", "4294967295", "-1"] {
+            let flag = format!("--expires-in-days={value}");
+            let err = match Cli::try_parse_from(["sotto", "token", "create", &flag]) {
+                Ok(_) => panic!("accepted {flag}"),
+                Err(err) => err,
+            };
+            let message = err.to_string();
+            assert!(message.contains("--expires-in-days"), "{flag}: {message}");
+            assert!(message.contains("1..=365"), "{flag}: {message}");
+        }
+
+        // Omitting the flag defers to the server's default lifetime.
+        let cli = Cli::try_parse_from(["sotto", "token", "create"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Token {
+                command: TokenCommand::Create {
+                    expires_in_days: None,
+                    ..
+                }
+            })
         ));
     }
 
@@ -2181,18 +2349,18 @@ mod tests {
     fn env_ls_json_parser_parses_flag() {
         let cli = Cli::try_parse_from(["sotto", "env", "ls", "--json"])
             .expect("sotto env ls --json should parse");
-        let Command::Env {
+        let Some(Command::Env {
             command: EnvCommand::Ls { json },
-        } = cli.command
+        }) = cli.command
         else {
             panic!("expected EnvCommand::Ls");
         };
         assert!(json);
 
         let cli = Cli::try_parse_from(["sotto", "env", "ls"]).expect("sotto env ls should parse");
-        let Command::Env {
+        let Some(Command::Env {
             command: EnvCommand::Ls { json },
-        } = cli.command
+        }) = cli.command
         else {
             panic!("expected EnvCommand::Ls");
         };
@@ -2211,5 +2379,74 @@ mod tests {
             env_list_json(&environments, "staging").unwrap(),
             r#"[{"active":false,"name":"dev"},{"active":false,"name":"prod"},{"active":true,"name":"staging"}]"#
         );
+    }
+
+    #[test]
+    fn bare_sotto_parses_as_none_command() {
+        let cli = Cli::try_parse_from(["sotto"]).expect("bare sotto should parse");
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn subcommands_parse_with_omitted_name_for_interactive_fallbacks() {
+        let cli =
+            Cli::try_parse_from(["sotto", "get"]).expect("sotto get without args should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Get {
+                name: None,
+                no_copy: false,
+                ..
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "get", "--no-copy"])
+            .expect("sotto get --no-copy should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Get {
+                name: None,
+                no_copy: true,
+                ..
+            })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["sotto", "reset", "-y"]).expect("sotto reset -y should parse");
+        assert!(matches!(cli.command, Some(Command::Reset { yes: true })));
+
+        let cli = Cli::try_parse_from(["sotto", "rm"]).expect("sotto rm without args should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Rm {
+                name: None,
+                yes: false
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "rm", "-y"]).expect("sotto rm -y should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Rm {
+                name: None,
+                yes: true
+            })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["sotto", "share"]).expect("sotto share without args should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Share { name: None, .. })
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "env", "use"])
+            .expect("sotto env use without args should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Env {
+                command: EnvCommand::Use { name: None }
+            })
+        ));
     }
 }

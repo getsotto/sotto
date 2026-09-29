@@ -58,11 +58,12 @@ pub const STRIPE_API_VERSION: &str = "2026-07-29.dahlia";
 /// `checkout.session.completed` was dropped for twelve days, and only an unrelated test failure
 /// surfaced it.
 ///
-/// Widening this is safe because of how little of a payload is actually read. The handlers touch
-/// `client_reference_id`, `customer`, `subscription`, `status`, `metadata.org_id` and `id`, and
-/// [`Event`] says as much: everything else is ignored. Those fields are not what changes between
-/// API versions. Add a version here when Stripe moves and the fields above still mean what they
-/// meant; remove one when it stops being served.
+/// The legacy handlers touch `client_reference_id`, `customer`, `subscription`, `status`,
+/// `metadata.org_id` and `id`, and [`Event`] says as much: everything else is ignored. Provider
+/// coverage adapters consume their own version-sensitive resource shapes and must carry separate
+/// fixture or sandbox evidence before treating an allowlisted version as compatible. Add a version
+/// here when Stripe moves and the legacy fields above still mean what they meant; do not infer
+/// coverage compatibility from this allowlist.
 pub const ACCEPTED_WEBHOOK_API_VERSIONS: &[&str] = &[
     "2026-06-24.dahlia",
     "2026-07-29.dahlia",
@@ -1322,11 +1323,23 @@ async fn org_for_subscription(
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SignatureVerificationError {
+    Malformed,
+    Stale,
+    Invalid,
+}
+
 /// Verify a `Stripe-Signature` header: `t=<unix>,v1=<hex hmac>[,v1=…]`, where the MAC is
 /// HMAC-SHA256 over `"{t}.{payload}"`. Any valid `v1` within the timestamp tolerance passes
 /// (Stripe sends multiples during secret rotation); comparison is constant-time via the `hmac`
 /// crate's `verify_slice`.
-fn verify_signature(secret: &str, header: &str, payload: &str, now: i64) -> bool {
+pub(crate) fn verify_signature_detailed(
+    secret: &str,
+    header: &str,
+    payload: &str,
+    now: i64,
+) -> std::result::Result<(), SignatureVerificationError> {
     let mut timestamp: Option<i64> = None;
     let mut candidates: Vec<Vec<u8>> = Vec::new();
     for part in header.split(',') {
@@ -1340,18 +1353,33 @@ fn verify_signature(secret: &str, header: &str, payload: &str, now: i64) -> bool
             _ => {}
         }
     }
-    let Some(t) = timestamp else { return false };
+    let Some(t) = timestamp else {
+        return Err(SignatureVerificationError::Malformed);
+    };
     if (now - t).abs() > SIGNATURE_TOLERANCE_SECS || candidates.is_empty() {
-        return false;
+        return Err(if candidates.is_empty() {
+            SignatureVerificationError::Malformed
+        } else {
+            SignatureVerificationError::Stale
+        });
     }
     let mut mac =
         Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
     mac.update(t.to_string().as_bytes());
     mac.update(b".");
     mac.update(payload.as_bytes());
-    candidates
+    if candidates
         .into_iter()
         .any(|candidate| mac.clone().verify_slice(&candidate).is_ok())
+    {
+        Ok(())
+    } else {
+        Err(SignatureVerificationError::Invalid)
+    }
+}
+
+pub(crate) fn verify_signature(secret: &str, header: &str, payload: &str, now: i64) -> bool {
+    verify_signature_detailed(secret, header, payload, now).is_ok()
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {

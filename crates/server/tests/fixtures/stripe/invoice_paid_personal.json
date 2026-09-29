@@ -1,0 +1,46 @@
+{
+  "id": "evt_contract_invoice_paid",
+  "created": 1700000000,
+  "api_version": "2026-07-29.dahlia",
+  "type": "invoice.paid",
+  "livemode": false,
+  "data": {
+    "object": {
+      "id": "in_contract_invoice",
+      "customer": { "id": "cus_contract_person" },
+      "status": "paid",
+      "currency": "gbp",
+      "amount_paid": 299,
+      "amount_due": 299,
+      "amount_overpaid": 0,
+      "amount_paid_off_stripe": 0,
+      "metadata": {
+        "sotto_allocation_reference": "allocation_contract_person",
+        "irrelevant_customer_note": "fixture only"
+      },
+      "lines": {
+        "data": [
+          {
+            "id": "il_contract_line",
+            "parent": {
+              "type": "subscription_item_details",
+              "subscription_item_details": {
+                "subscription": "sub_contract_person",
+                "subscription_item": "si_contract_person",
+                "proration": false
+              }
+            },
+            "quantity": 1,
+            "pricing": {
+              "type": "price_details",
+              "price_details": {
+                "price": "price_contract_month"
+              }
+            },
+            "period": { "start": 1700000000, "end": 1702592000 }
+          }
+        ]
+      }
+    }
+  }
+}

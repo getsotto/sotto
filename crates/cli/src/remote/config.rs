@@ -96,7 +96,7 @@ pub fn explicit_server_url(
 pub fn web_base(config_path: &Path) -> Result<String> {
     let web = GlobalConfig::load_from(config_path)?.and_then(|c| c.web_url);
     match web
-        .map(|w| w.trim_end_matches('/').to_string())
+        .map(|w| w.trim().trim_end_matches('/').to_string())
         .filter(|w| !w.is_empty())
     {
         Some(web) => Ok(web),
@@ -189,6 +189,34 @@ mod tests {
             resolve(Some(""), None, Some("https://c".into())),
             Some("https://c".into())
         );
+    }
+
+    #[test]
+    fn web_base_normalizes_configured_url_and_falls_back_when_blank() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let save = |web_url: Option<&str>| {
+            GlobalConfig {
+                server_url: Some("https://api.example.test".into()),
+                web_url: web_url.map(str::to_owned),
+                theme: None,
+                last_user_id: None,
+            }
+            .save_to(&path)
+            .unwrap();
+        };
+
+        save(Some("  https://web.example.test///  "));
+        assert_eq!(web_base(&path).unwrap(), "https://web.example.test");
+
+        save(Some("   "));
+        assert_eq!(web_base(&path).unwrap(), "https://api.example.test");
+
+        save(Some(""));
+        assert_eq!(web_base(&path).unwrap(), "https://api.example.test");
+
+        save(Some("https://web.example.test"));
+        assert_eq!(web_base(&path).unwrap(), "https://web.example.test");
     }
 
     #[test]

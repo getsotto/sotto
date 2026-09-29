@@ -151,6 +151,83 @@ describe("TeamPanel organisation loading", () => {
   });
 });
 
+describe("TeamPanel organisation names", () => {
+  const master = new Uint8Array([1]);
+  const encPrivateKeys = new Uint8Array([2]);
+  const encOrgKey = new Uint8Array([3]);
+  const orgKey = new Uint8Array([4]);
+  const encName = new Uint8Array([5]);
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchEntitlements).mockResolvedValue(freePlan);
+  });
+
+  it("uses the id without a key while keeping a decryptable organisation", async () => {
+    vi.mocked(api.fetchOrgs).mockResolvedValue([
+      org("org-without-key"),
+      { ...org("org-with-key"), encOrgKey, encName },
+    ]);
+    vi.mocked(vault.openOrgKey).mockReturnValue(orgKey);
+    vi.mocked(vault.decryptOrgName).mockReturnValue("Friendly name");
+
+    render(<TeamPanel master={master} encPrivateKeys={encPrivateKeys} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-without-key/ }));
+    expect(screen.getByRole("heading", { name: "Members of org-without-key" })).toBeInTheDocument();
+    expect(api.fetchMembers).toHaveBeenCalledWith("org-without-key");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Friendly name/ }));
+    expect(screen.getByRole("heading", { name: "Members of Friendly name" })).toBeInTheDocument();
+    expect(api.fetchMembers).toHaveBeenLastCalledWith("org-with-key");
+    expect(vault.openOrgKey).toHaveBeenCalledExactlyOnceWith(master, encPrivateKeys, encOrgKey);
+    expect(vault.decryptOrgName).toHaveBeenCalledExactlyOnceWith(orgKey, "org-with-key", encName);
+  });
+
+  it("keeps an organisation selectable when its key cannot be opened", async () => {
+    vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), encOrgKey }]);
+    vi.mocked(vault.openOrgKey).mockImplementation(() => {
+      throw new Error("key unavailable");
+    });
+
+    render(<TeamPanel master={master} encPrivateKeys={encPrivateKeys} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    expect(screen.getByRole("heading", { name: "Members of org-a" })).toBeInTheDocument();
+    expect(api.fetchMembers).toHaveBeenCalledExactlyOnceWith("org-a");
+    expect(vault.decryptOrgName).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps an organisation selectable when its name cannot be decrypted", async () => {
+    vi.mocked(api.fetchOrgs).mockResolvedValue([
+      { ...org("org-a"), encOrgKey, encName },
+      { ...org("org-b"), encOrgKey, encName },
+    ]);
+    vi.mocked(vault.openOrgKey).mockReturnValue(orgKey);
+    vi.mocked(vault.decryptOrgName).mockImplementation((_key, orgId) => {
+      if (orgId === "org-a") throw new Error("name unavailable");
+      return "Healthy org";
+    });
+
+    render(<TeamPanel master={master} encPrivateKeys={encPrivateKeys} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    expect(screen.getByRole("heading", { name: "Members of org-a" })).toBeInTheDocument();
+    expect(api.fetchMembers).toHaveBeenCalledWith("org-a");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Healthy org/ }));
+    expect(screen.getByRole("heading", { name: "Members of Healthy org" })).toBeInTheDocument();
+    expect(api.fetchMembers).toHaveBeenLastCalledWith("org-b");
+    expect(vault.decryptOrgName).toHaveBeenNthCalledWith(1, orgKey, "org-a", encName);
+    expect(vault.decryptOrgName).toHaveBeenNthCalledWith(2, orgKey, "org-b", encName);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+});
+
 describe("TeamPanel invitations", () => {
   const adminOrg: Org = {
     id: "org-a",
