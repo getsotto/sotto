@@ -86,6 +86,7 @@ export function VaultView({
   const [activeProject, setActiveProject] = useState<NamedProject | null>(null);
   const [envs, setEnvs] = useState<NamedEnv[] | null>(null);
   const [openEnv, setOpenEnv] = useState<OpenEnv | null>(null);
+  const [loadingEnvId, setLoadingEnvId] = useState<string | null>(null);
   const [revealed, setRevealed] = useState<Revealed | null>(null);
   // Org members of the active project (loaded when an org env is opened), for the share picker.
   const [members, setMembers] = useState<Member[] | null>(null);
@@ -160,6 +161,7 @@ export function VaultView({
   async function selectProject(np: NamedProject) {
     const load = ++projectLoad.current;
     ++envLoad.current; // a project switch also invalidates any in-flight environment load
+    setLoadingEnvId(null);
     setError(null);
     setNotice(null);
     setActiveProject(np);
@@ -187,6 +189,7 @@ export function VaultView({
 
   async function selectEnv(ne: NamedEnv) {
     const load = ++envLoad.current;
+    setLoadingEnvId(ne.env.id);
     setError(null);
     setNotice(null);
     setOpenEnv(null);
@@ -202,6 +205,7 @@ export function VaultView({
       }
       if (grant === null) {
         setError("you have no key for this environment - ask an admin to share it with you");
+        setLoadingEnvId(null);
         return;
       }
       const vaultKey = openEnvGrant(master, encPrivateKeys, grant);
@@ -217,6 +221,7 @@ export function VaultView({
         }))
         .sort((a, b) => a.name.localeCompare(b.name));
       setOpenEnv({ envId: ne.env.id, vaultKey, secrets });
+      setLoadingEnvId(null);
       // Org project: load the member list so the env can be shared from here.
       const orgId = activeProject?.project.orgId;
       if (orgId) {
@@ -231,6 +236,7 @@ export function VaultView({
         return;
       }
       setError(message(e));
+      setLoadingEnvId(null);
     }
   }
 
@@ -254,6 +260,12 @@ export function VaultView({
       return;
     }
     const envId = openEnv.envId;
+    // Capture the selection generation so a late response cannot paint a notice or error
+    // after the user has already switched environment or project.
+    const shareEnvLoad = envLoad.current;
+    const shareProjectLoad = projectLoad.current;
+    const shareStillCurrent = () =>
+      shareEnvLoad === envLoad.current && shareProjectLoad === projectLoad.current;
     sharingEnvRef.current = envId;
     setSharingEnvId(envId);
     try {
@@ -271,8 +283,14 @@ export function VaultView({
           // Best-effort only; the member may just see the org id for names.
         }
       }
+      if (!shareStillCurrent()) {
+        return;
+      }
       setNotice(`shared this environment with ${member.userId}`);
     } catch (e) {
+      if (!shareStillCurrent()) {
+        return;
+      }
       setError(message(e));
     } finally {
       if (sharingEnvRef.current === envId) {
@@ -289,6 +307,8 @@ export function VaultView({
       return;
     }
     const envId = openEnv.envId;
+    const selectionGeneration = envLoad.current;
+    const selectionIsCurrent = () => selectionGeneration === envLoad.current;
     rotatingEnvRef.current = envId;
     setRotatingEnvId(envId);
     setError(null);
@@ -304,7 +324,9 @@ export function VaultView({
           throw new Error("this environment is not in an organisation; nothing to rotate");
         }
         roster = await fetchMembers(orgId);
-        setMembers(roster);
+        if (selectionIsCurrent()) {
+          setMembers(roster);
+        }
       }
       const newKey = crypto.getRandomValues(new Uint8Array(32));
       const snap = await fetchSnapshot(openEnv.envId);
@@ -336,14 +358,24 @@ export function VaultView({
         machineGrants,
         historyKeys,
       });
-      setNotice("environment key rotated");
-      // Reload the environment under the new key (fetches the re-sealed grant).
-      const current = envs?.find((e) => e.env.id === openEnv.envId);
-      if (current !== undefined) {
-        await selectEnv(current);
+      if (selectionIsCurrent()) {
+        // Reload the environment under the new key (fetches the re-sealed grant).
+        const current = envs?.find((e) => e.env.id === envId);
+        if (current !== undefined) {
+          await selectEnv(current);
+          // selectEnv clears transient notices before reloading. Only restore the rotation
+          // success after that reload if no newer selection superseded it.
+          if (envLoad.current === selectionGeneration + 1) {
+            setNotice("environment key rotated");
+          }
+        } else {
+          setNotice("environment key rotated");
+        }
       }
     } catch (e) {
-      setError(message(e));
+      if (selectionIsCurrent()) {
+        setError(message(e));
+      }
     } finally {
       if (rotatingEnvRef.current === envId) {
         rotatingEnvRef.current = null;
@@ -425,6 +457,7 @@ export function VaultView({
                 <button
                   onClick={() => void selectEnv(e)}
                   aria-current={openEnv?.envId === e.env.id ? "true" : undefined}
+                  aria-busy={loadingEnvId === e.env.id ? "true" : undefined}
                 >
                   {e.name}
                 </button>
@@ -432,6 +465,12 @@ export function VaultView({
             ))}
           </ul>
         </section>
+      )}
+
+      {loadingEnvId !== null && (
+        <p role="status" aria-live="polite" className="muted">
+          Opening environment…
+        </p>
       )}
 
       {openEnv !== null && (
