@@ -100,6 +100,76 @@ mod tests {
     }
 
     #[test]
+    fn discover_prefers_nearest_nested_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let nested = parent.join("nested project");
+        let start = nested.join("src/subdir");
+        std::fs::create_dir_all(&start).unwrap();
+
+        let parent_config = Config {
+            project_id: "11111111-1111-1111-1111-111111111111".into(),
+            project: "parent-api".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let nested_config = Config {
+            project_id: "22222222-2222-2222-2222-222222222222".into(),
+            project: "nested-api".into(),
+            environment: "staging".into(),
+            org_id: Some("33333333-3333-3333-3333-333333333333".into()),
+        };
+        parent_config.save_to(&parent).unwrap();
+        nested_config.save_to(&nested).unwrap();
+
+        let (found_config, found_dir) = Config::discover(&start).unwrap();
+        assert_eq!(found_config, nested_config);
+        assert_eq!(found_dir, nested);
+    }
+
+    #[test]
+    fn discover_reports_malformed_nearest_config_instead_of_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let nested = parent.join("nested");
+        let start = nested.join("src");
+        std::fs::create_dir_all(&start).unwrap();
+        sample().save_to(&parent).unwrap();
+        std::fs::write(nested.join(CONFIG_FILE), "project = [\n").unwrap();
+
+        assert!(matches!(Config::discover(&start), Err(Error::Config(_))));
+    }
+
+    #[test]
+    fn discover_reports_invalid_utf8_in_nearest_config_instead_of_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let nested = parent.join("nested");
+        let start = nested.join("src");
+        std::fs::create_dir_all(&start).unwrap();
+        sample().save_to(&parent).unwrap();
+        std::fs::write(nested.join(CONFIG_FILE), b"\xff\xfe").unwrap();
+
+        assert!(matches!(Config::discover(&start), Err(Error::Io(_))));
+    }
+
+    #[test]
+    fn discover_uses_parent_config_when_nearest_config_is_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        let nested = parent.join("nested");
+        let start = nested.join("src");
+        std::fs::create_dir_all(&start).unwrap();
+        sample().save_to(&parent).unwrap();
+        sample().save_to(&nested).unwrap();
+        std::fs::remove_file(nested.join(CONFIG_FILE)).unwrap();
+
+        let (found_config, found_dir) = Config::discover(&start).unwrap();
+        assert_eq!(found_config, sample());
+        assert_eq!(found_dir, parent);
+    }
+
+    #[test]
     fn parse_error_names_parent_discovered_file() {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("my project");
