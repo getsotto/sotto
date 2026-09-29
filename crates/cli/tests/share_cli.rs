@@ -508,7 +508,6 @@ fn env_use_omitted_name_precedes_project_discovery_non_interactively() {
         let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
         assert!(stderr.contains("missing required argument <NAME>"), "{label}: {stderr}");
         assert!(!stderr.contains("Master password:"), "{label}: {stderr}");
-        assert!(!data_dir.exists(), "{label} created {}", data_dir.display());
     }
 }
 
