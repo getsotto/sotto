@@ -356,8 +356,8 @@ describe("VaultView rotation ownership", () => {
     await waitFor(() => expect(api.postRotate).toHaveBeenCalledOnce());
     await act(async () => rotation.resolve());
 
-    expect(await screen.findByText("environment key rotated")).toBeInTheDocument();
     await waitFor(() => expect(api.fetchMyGrant).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "env-a" })).toHaveAttribute("aria-current", "true");
   });
 
