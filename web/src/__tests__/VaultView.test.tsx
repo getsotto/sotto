@@ -162,6 +162,47 @@ describe("VaultView selection loading", () => {
     expect(screen.queryByRole("button", { name: "secret-a" })).not.toBeInTheDocument();
   });
 
+
+  it("shows progress while opening an environment and clears it after success", async () => {
+    const secrets = deferred<SecretEntry[]>();
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockReturnValue(secrets.promise);
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    const envButton = await screen.findByRole("button", { name: "env-a" });
+    fireEvent.click(envButton);
+    expect(await screen.findByRole("status")).toHaveTextContent("Opening environment…");
+    expect(envButton).toHaveAttribute("aria-busy", "true");
+    expect(screen.queryByText("No secrets in this environment.")).not.toBeInTheDocument();
+
+    await act(async () => secrets.resolve([]));
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByText("No secrets in this environment.")).toBeInTheDocument();
+  });
+
+  it("keeps progress owned by the latest environment request", async () => {
+    const first = deferred<SecretEntry[]>();
+    const second = deferred<SecretEntry[]>();
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a"), environment("env-b")]);
+    vi.mocked(api.fetchSecrets).mockImplementation((id) => id === "env-a" ? first.promise : second.promise);
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    await waitFor(() => expect(api.fetchSecrets).toHaveBeenCalledWith("env-a"));
+    fireEvent.click(screen.getByRole("button", { name: "env-b" }));
+    await waitFor(() => expect(api.fetchSecrets).toHaveBeenCalledWith("env-b"));
+
+    await act(async () => first.reject(new Error("stale failure")));
+    expect(screen.getByRole("status")).toHaveTextContent("Opening environment…");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await act(async () => second.resolve([]));
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByText("No secrets in this environment.")).toBeInTheDocument();
+  });
+
   it("sends only one rotation request when rotate is clicked twice", async () => {
     vi.mocked(api.fetchProjects).mockResolvedValue([
       { id: "project-a", encName: new Uint8Array([1]), orgId: "org-1" },
@@ -393,4 +434,112 @@ describe("VaultView selection loading", () => {
     expect(screen.queryByText("shared this environment with member-a")).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
+});
+
+
+describe("VaultView rotation ownership", () => {
+  it("does not reopen a rotated environment after the selection changes", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchProjects).mockResolvedValue([
+      { id: "project-a", encName: new Uint8Array([1]), orgId: "org-1" },
+    ]);
+    vi.mocked(api.fetchOrgs).mockResolvedValue([
+      { id: "org-1", encName: new Uint8Array(), role: "owner", encOrgKey: null },
+    ]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a"), environment("env-b")]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchMyGrant).mockResolvedValue(new Uint8Array([7]));
+    vi.mocked(api.fetchSecrets).mockResolvedValue([]);
+    vi.mocked(api.fetchSnapshot).mockResolvedValue({ revision: 1, secrets: [] });
+    vi.mocked(api.fetchHistory).mockResolvedValue([]);
+    vi.mocked(api.fetchGrantHolders).mockResolvedValue([]);
+    vi.mocked(api.fetchMachineTokens).mockResolvedValue([]);
+    vi.mocked(vault.decryptProjectName).mockReturnValue("project-a");
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
+    const rotation = deferred<void>();
+    vi.mocked(api.postRotate).mockReturnValue(rotation.promise);
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Rotate environment key" }));
+    await waitFor(() => expect(api.postRotate).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "env-b" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "env-b" })).toHaveAttribute("aria-current", "true"));
+    await act(async () => rotation.resolve());
+    expect(screen.getByRole("button", { name: "env-b" })).toHaveAttribute("aria-current", "true");
+    expect(api.fetchMyGrant).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores a late rotation error after the selection changes", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchProjects).mockResolvedValue([
+      { id: "project-a", encName: new Uint8Array([1]), orgId: "org-1" },
+    ]);
+    vi.mocked(api.fetchOrgs).mockResolvedValue([
+      { id: "org-1", encName: new Uint8Array(), role: "owner", encOrgKey: null },
+    ]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a"), environment("env-b")]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchMyGrant).mockResolvedValue(new Uint8Array([7]));
+    vi.mocked(api.fetchSecrets).mockResolvedValue([]);
+    vi.mocked(api.fetchSnapshot).mockResolvedValue({ revision: 1, secrets: [] });
+    vi.mocked(api.fetchHistory).mockResolvedValue([]);
+    vi.mocked(api.fetchGrantHolders).mockResolvedValue([]);
+    vi.mocked(api.fetchMachineTokens).mockResolvedValue([]);
+    vi.mocked(vault.decryptProjectName).mockReturnValue("project-a");
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
+    const rotation = deferred<void>();
+    vi.mocked(api.postRotate).mockReturnValue(rotation.promise);
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Rotate environment key" }));
+    await waitFor(() => expect(api.postRotate).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "env-b" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "env-b" })).toHaveAttribute("aria-current", "true"));
+    await act(async () => rotation.reject(new Error("stale rotation failure")));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "env-b" })).toHaveAttribute("aria-current", "true");
+  });
+
+  it("reloads and reports success when the rotated environment stays selected", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchProjects).mockResolvedValue([
+      { id: "project-a", encName: new Uint8Array([1]), orgId: "org-1" },
+    ]);
+    vi.mocked(api.fetchOrgs).mockResolvedValue([
+      { id: "org-1", encName: new Uint8Array(), role: "owner", encOrgKey: null },
+    ]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchMyGrant).mockResolvedValue(new Uint8Array([7]));
+    vi.mocked(api.fetchSecrets).mockResolvedValue([]);
+    vi.mocked(api.fetchSnapshot).mockResolvedValue({ revision: 1, secrets: [] });
+    vi.mocked(api.fetchHistory).mockResolvedValue([]);
+    vi.mocked(api.fetchGrantHolders).mockResolvedValue([]);
+    vi.mocked(api.fetchMachineTokens).mockResolvedValue([]);
+    vi.mocked(vault.decryptProjectName).mockReturnValue("project-a");
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
+    const rotation = deferred<void>();
+    vi.mocked(api.postRotate).mockReturnValue(rotation.promise);
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    await waitFor(() => expect(api.fetchMyGrant).toHaveBeenCalledTimes(1));
+    fireEvent.click(await screen.findByRole("button", { name: "Rotate environment key" }));
+    await waitFor(() => expect(api.postRotate).toHaveBeenCalledOnce());
+    await act(async () => rotation.resolve());
+
+    await waitFor(() => expect(api.fetchMyGrant).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("environment key rotated")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "env-a" })).toHaveAttribute("aria-current", "true");
+  });
+
 });
