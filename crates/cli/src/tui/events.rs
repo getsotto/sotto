@@ -369,7 +369,9 @@ mod tests {
         handle_key_event(&mut tui_app, key(KeyCode::Esc)).unwrap();
         assert!(!tui_app.show_theme_modal);
 
-        // Re-open and commit via Enter
+        // Re-open and commit via Enter with isolated config path
+        let temp_dir = tempfile::tempdir().unwrap();
+        tui_app.config_path = Some(temp_dir.path().join("config.toml"));
         handle_key_event(&mut tui_app, key(KeyCode::Char('t'))).unwrap();
         assert!(tui_app.show_theme_modal);
         handle_key_event(&mut tui_app, key(KeyCode::Enter)).unwrap();

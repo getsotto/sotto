@@ -417,15 +417,39 @@ fn draw_theme_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     f.render_widget(Clear, popup_area);
 
+    let total_themes = app.available_themes.len();
+    let max_visible = (popup_height.saturating_sub(5) as usize)
+        .max(1)
+        .min(total_themes);
+
+    // Compute the scrolling window so selected_theme_index is always visible
+    let start_idx = if app.selected_theme_index >= max_visible {
+        (app.selected_theme_index + 1).saturating_sub(max_visible)
+    } else {
+        0
+    };
+    let end_idx = (start_idx + max_visible).min(total_themes);
+
+    let title_text = if start_idx > 0 && end_idx < total_themes {
+        " Theme Switcher (↑/↓ more) "
+    } else if start_idx > 0 {
+        " Theme Switcher (↑ more) "
+    } else if end_idx < total_themes {
+        " Theme Switcher (↓ more) "
+    } else {
+        " Theme Switcher "
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(styles.bold_accent())
-        .title(Span::styled(" Theme Switcher ", styles.bold_accent()));
+        .title(Span::styled(title_text, styles.bold_accent()));
 
     let mut lines = Vec::new();
     lines.push(Line::from(""));
 
-    for (idx, theme) in app.available_themes.iter().enumerate() {
+    for idx in start_idx..end_idx {
+        let theme = &app.available_themes[idx];
         let is_selected = idx == app.selected_theme_index;
         let is_original = theme.name.eq_ignore_ascii_case(&app.original_theme.name);
 
@@ -762,5 +786,43 @@ mod tests {
         assert!(content.contains("Search (typing... Esc to clear)"));
         assert!(content.contains("DATABASE_URL"));
         assert!(!content.contains("API_TOKEN"));
+    }
+
+    #[test]
+    fn render_theme_modal_scrolls_viewport_when_overflowing() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        // Construct 15 dummy themes to trigger overflow
+        tui_app.available_themes = (0..15)
+            .map(|i| {
+                let mut t = Theme::nord();
+                t.name = format!("custom-{i:02}");
+                t
+            })
+            .collect();
+        tui_app.show_theme_modal = true;
+
+        // Terminal with limited height (height 12 -> max visible ~ 5)
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // When selection is at 0, custom-00 is visible, scroll down indicator shown
+        tui_app.selected_theme_index = 0;
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains("custom-00"));
+        assert!(content.contains("↓ more"));
+        assert!(content.contains("Apply"));
+
+        // When selection jumps to end, custom-14 is visible, scroll up indicator shown
+        tui_app.selected_theme_index = 14;
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains("custom-14"));
+        assert!(content.contains("↑ more"));
+        assert!(content.contains("Apply"));
     }
 }

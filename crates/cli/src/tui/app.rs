@@ -1,5 +1,6 @@
 //! TUI application state management for the interactive Sotto dashboard.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -17,6 +18,7 @@ pub struct TuiApp<'a> {
     pub app: &'a App<'a>,
     pub store: &'a Store,
     pub config: Config,
+    pub config_path: Option<PathBuf>,
     pub styles: TuiStyles,
     pub current_theme: Theme,
     pub original_theme: Theme,
@@ -62,6 +64,7 @@ impl<'a> TuiApp<'a> {
             app,
             store,
             config,
+            config_path: crate::paths::config_path().ok(),
             styles,
             current_theme: theme.clone(),
             original_theme: theme.clone(),
@@ -339,17 +342,26 @@ impl<'a> TuiApp<'a> {
     pub fn commit_theme(&mut self) -> Result<()> {
         if let Some(selected) = self.available_themes.get(self.selected_theme_index) {
             let theme_name = selected.name.clone();
-            if let Ok(config_path) = crate::paths::config_path() {
-                if let Some(parent) = config_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+            let target_path = self
+                .config_path
+                .clone()
+                .or_else(|| crate::paths::config_path().ok());
+
+            match target_path {
+                Some(config_path) => {
+                    if let Some(parent) = config_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(err) = crate::theme::save_theme_preference(&theme_name, &config_path)
+                    {
+                        self.set_status(format!("Failed to persist theme preference: {err}"));
+                    } else {
+                        self.set_status(format!("Theme set to `{theme_name}`"));
+                    }
                 }
-                if let Err(err) = crate::theme::save_theme_preference(&theme_name, &config_path) {
-                    self.set_status(format!("Failed to persist theme preference: {err}"));
-                } else {
-                    self.set_status(format!("Theme set to `{theme_name}`"));
+                None => {
+                    self.set_status("Failed to locate configuration file".into());
                 }
-            } else {
-                self.set_status(format!("Theme set to `{theme_name}`"));
             }
         }
         self.show_theme_modal = false;
@@ -679,13 +691,23 @@ mod tests {
         assert_eq!(tui_app.current_theme.name, "nord");
         assert_eq!(tui_app.styles.accent, initial_accent);
 
-        // Committing theme keeps preview and closes modal
+        // Committing theme keeps preview and closes modal with isolated config path
+        let temp_dir = tempfile::tempdir().unwrap();
+        let isolated_config = temp_dir.path().join("config.toml");
+        tui_app.config_path = Some(isolated_config.clone());
+
         tui_app.open_theme_modal();
         tui_app.next_theme();
         let committed_name = tui_app.current_theme.name.clone();
         tui_app.commit_theme().unwrap();
         assert!(!tui_app.show_theme_modal);
         assert_eq!(tui_app.current_theme.name, committed_name);
+
+        // Verify written config matches committed choice
+        let loaded = crate::remote::config::GlobalConfig::load_from(&isolated_config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.theme.as_deref(), Some(committed_name.as_str()));
     }
 
     #[test]
