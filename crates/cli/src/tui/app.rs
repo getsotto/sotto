@@ -18,6 +18,11 @@ pub struct TuiApp<'a> {
     pub store: &'a Store,
     pub config: Config,
     pub styles: TuiStyles,
+    pub current_theme: Theme,
+    pub original_theme: Theme,
+    pub available_themes: Vec<Theme>,
+    pub selected_theme_index: usize,
+    pub show_theme_modal: bool,
     pub environments: Vec<String>,
     pub active_env_index: usize,
     pub secrets: Vec<SecretItem>,
@@ -27,6 +32,7 @@ pub struct TuiApp<'a> {
     pub search_mode: bool,
     pub revealed: bool,
     pub decrypted_cache: Option<Zeroizing<Vec<u8>>>,
+    pub reveal_animation_start: Option<Instant>,
     pub show_help: bool,
     pub status_message: Option<(String, Instant)>,
     pub running: bool,
@@ -57,6 +63,11 @@ impl<'a> TuiApp<'a> {
             store,
             config,
             styles,
+            current_theme: theme.clone(),
+            original_theme: theme.clone(),
+            available_themes: Vec::new(),
+            selected_theme_index: 0,
+            show_theme_modal: false,
             environments,
             active_env_index,
             secrets: Vec::new(),
@@ -66,6 +77,7 @@ impl<'a> TuiApp<'a> {
             search_mode: false,
             revealed: false,
             decrypted_cache: None,
+            reveal_animation_start: None,
             show_help: false,
             status_message: None,
             running: true,
@@ -109,10 +121,11 @@ impl<'a> TuiApp<'a> {
         self.reset_secret_view();
     }
 
-    /// Reset any revealed or cached secret cleartext.
+    /// Reset any revealed or cached secret cleartext and ongoing reveal animations.
     pub fn reset_secret_view(&mut self) {
         self.revealed = false;
         self.decrypted_cache = None;
+        self.reveal_animation_start = None;
     }
 
     /// Get the currently highlighted secret item, if one exists.
@@ -186,6 +199,7 @@ impl<'a> TuiApp<'a> {
             let value = self.app.get(&self.config, &item.name)?;
             self.decrypted_cache = Some(Zeroizing::new(value));
             self.revealed = true;
+            self.reveal_animation_start = Some(Instant::now());
         }
         Ok(())
     }
@@ -252,6 +266,101 @@ impl<'a> TuiApp<'a> {
             }
         }
         None
+    }
+
+    /// Open the theme switcher modal, discovering available themes and capturing the original theme.
+    pub fn open_theme_modal(&mut self) {
+        let themes_dir = crate::paths::themes_path().ok();
+        let mut themes = crate::theme::available_themes(themes_dir.as_deref());
+        if themes.is_empty() {
+            themes = Theme::presets();
+        }
+
+        let selected_idx = themes
+            .iter()
+            .position(|t| t.name.eq_ignore_ascii_case(&self.current_theme.name))
+            .unwrap_or(0);
+
+        self.original_theme = self.current_theme.clone();
+        self.available_themes = themes;
+        self.selected_theme_index = selected_idx;
+        self.show_theme_modal = true;
+        self.preview_selected_theme();
+    }
+
+    /// Update the active styles and current theme to preview the currently selected theme item.
+    pub fn preview_selected_theme(&mut self) {
+        if let Some(selected) = self.available_themes.get(self.selected_theme_index) {
+            let active = self.original_theme.active;
+            let preview = selected.clone().with_active(active);
+            self.styles = TuiStyles::from_theme(&preview);
+            self.current_theme = preview;
+        }
+    }
+
+    /// Select the next theme in the modal list with real-time preview.
+    pub fn next_theme(&mut self) {
+        if !self.available_themes.is_empty() {
+            self.selected_theme_index =
+                (self.selected_theme_index + 1) % self.available_themes.len();
+            self.preview_selected_theme();
+        }
+    }
+
+    /// Select the previous theme in the modal list with real-time preview.
+    pub fn previous_theme(&mut self) {
+        if !self.available_themes.is_empty() {
+            if self.selected_theme_index == 0 {
+                self.selected_theme_index = self.available_themes.len() - 1;
+            } else {
+                self.selected_theme_index -= 1;
+            }
+            self.preview_selected_theme();
+        }
+    }
+
+    /// Jump to the first theme in the modal list.
+    pub fn theme_home(&mut self) {
+        if !self.available_themes.is_empty() {
+            self.selected_theme_index = 0;
+            self.preview_selected_theme();
+        }
+    }
+
+    /// Jump to the last theme in the modal list.
+    pub fn theme_end(&mut self) {
+        if !self.available_themes.is_empty() {
+            self.selected_theme_index = self.available_themes.len() - 1;
+            self.preview_selected_theme();
+        }
+    }
+
+    /// Commit the selected theme and persist the choice into the user configuration.
+    pub fn commit_theme(&mut self) -> Result<()> {
+        if let Some(selected) = self.available_themes.get(self.selected_theme_index) {
+            let theme_name = selected.name.clone();
+            if let Ok(config_path) = crate::paths::config_path() {
+                if let Some(parent) = config_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(err) = crate::theme::save_theme_preference(&theme_name, &config_path) {
+                    self.set_status(format!("Failed to persist theme preference: {err}"));
+                } else {
+                    self.set_status(format!("Theme set to `{theme_name}`"));
+                }
+            } else {
+                self.set_status(format!("Theme set to `{theme_name}`"));
+            }
+        }
+        self.show_theme_modal = false;
+        Ok(())
+    }
+
+    /// Revert any live preview back to the original theme and close the modal.
+    pub fn revert_theme(&mut self) {
+        self.current_theme = self.original_theme.clone();
+        self.styles = TuiStyles::from_theme(&self.current_theme);
+        self.show_theme_modal = false;
     }
 }
 
@@ -527,5 +636,77 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn theme_modal_lifecycle_and_live_preview() {
+        let (store, keychain, config) = unlocked();
+        let initial_theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        let mut tui_app = TuiApp::new(&app, &store, config, &initial_theme).unwrap();
+
+        assert!(!tui_app.show_theme_modal);
+        assert_eq!(tui_app.current_theme.name, "nord");
+
+        // Open modal
+        tui_app.open_theme_modal();
+        assert!(tui_app.show_theme_modal);
+        assert!(!tui_app.available_themes.is_empty());
+        assert_eq!(tui_app.original_theme.name, "nord");
+
+        // Cycle through themes and observe live style updates
+        let initial_accent = tui_app.styles.accent;
+        tui_app.next_theme();
+        let next_theme_name = tui_app.current_theme.name.clone();
+        assert_ne!(next_theme_name, "nord");
+        let next_accent = tui_app.styles.accent;
+        assert_ne!(initial_accent, next_accent);
+
+        // Test theme home and end
+        tui_app.theme_end();
+        assert_eq!(
+            tui_app.selected_theme_index,
+            tui_app.available_themes.len() - 1
+        );
+        tui_app.theme_home();
+        assert_eq!(tui_app.selected_theme_index, 0);
+
+        // Reverting restores original theme and styles
+        tui_app.next_theme();
+        assert_ne!(tui_app.current_theme.name, "nord");
+        tui_app.revert_theme();
+        assert!(!tui_app.show_theme_modal);
+        assert_eq!(tui_app.current_theme.name, "nord");
+        assert_eq!(tui_app.styles.accent, initial_accent);
+
+        // Committing theme keeps preview and closes modal
+        tui_app.open_theme_modal();
+        tui_app.next_theme();
+        let committed_name = tui_app.current_theme.name.clone();
+        tui_app.commit_theme().unwrap();
+        assert!(!tui_app.show_theme_modal);
+        assert_eq!(tui_app.current_theme.name, committed_name);
+    }
+
+    #[test]
+    fn reveal_animation_trigger_and_teardown() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "SECRET_KEY", b"super-secret-value")
+            .unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert!(tui_app.reveal_animation_start.is_none());
+
+        // Reveal arms the animation start timestamp
+        tui_app.toggle_reveal().unwrap();
+        assert!(tui_app.revealed);
+        assert!(tui_app.reveal_animation_start.is_some());
+
+        // Reset clears reveal and animation start timestamp
+        tui_app.reset_secret_view();
+        assert!(!tui_app.revealed);
+        assert!(tui_app.reveal_animation_start.is_none());
     }
 }

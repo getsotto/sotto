@@ -1,11 +1,15 @@
 //! Rendering functions and widgets for the interactive Sotto dashboard.
 
+use std::time::Duration;
+
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::tui::app::TuiApp;
+use crate::tui::theme::{to_ratatui_color, TuiStyles};
 
 /// Render the complete TUI dashboard frame.
 pub fn draw(f: &mut Frame, app: &TuiApp) {
@@ -26,6 +30,8 @@ pub fn draw(f: &mut Frame, app: &TuiApp) {
 
     if app.show_help {
         draw_help_modal(f, app, size);
+    } else if app.show_theme_modal {
+        draw_theme_modal(f, app, size);
     }
 }
 
@@ -204,9 +210,30 @@ fn draw_right_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
             if let Some(cache) = &app.decrypted_cache {
                 match std::str::from_utf8(cache) {
                     Ok(text) => {
-                        for line in text.lines() {
-                            lines
-                                .push(Line::from(Span::styled(format!("  {line}"), styles.text())));
+                        let is_animating = app
+                            .reveal_animation_start
+                            .map(|start| start.elapsed() < Duration::from_millis(150))
+                            .unwrap_or(false);
+
+                        if is_animating {
+                            let elapsed = app
+                                .reveal_animation_start
+                                .map(|s| s.elapsed())
+                                .unwrap_or_default();
+                            let progress = (elapsed.as_secs_f32() / 0.150).clamp(0.0, 1.0);
+
+                            for line in text.lines() {
+                                lines.push(render_cipher_unscramble_line(
+                                    line, progress, elapsed, styles,
+                                ));
+                            }
+                        } else {
+                            for line in text.lines() {
+                                lines.push(Line::from(Span::styled(
+                                    format!("  {line}"),
+                                    styles.text(),
+                                )));
+                            }
                         }
                     }
                     Err(_) => {
@@ -284,11 +311,13 @@ fn draw_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled("[/] ", styles.bold_accent()),
             Span::styled("Search  ", styles.muted()),
             Span::styled("[Tab] ", styles.bold_accent()),
-            Span::styled("Switch Env  ", styles.muted()),
+            Span::styled("Env  ", styles.muted()),
             Span::styled("[c] ", styles.bold_accent()),
             Span::styled("Copy  ", styles.muted()),
             Span::styled("[r] ", styles.bold_accent()),
             Span::styled("Reveal  ", styles.muted()),
+            Span::styled("[t] ", styles.bold_accent()),
+            Span::styled("Theme  ", styles.muted()),
             Span::styled("[q] ", styles.bold_accent()),
             Span::styled("Quit", styles.muted()),
         ])
@@ -302,7 +331,7 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     let styles = &app.styles;
 
     let popup_width = 54.min(area.width.saturating_sub(4));
-    let popup_height = 18.min(area.height.saturating_sub(2));
+    let popup_height = 20.min(area.height.saturating_sub(2));
 
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -353,6 +382,10 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled("Toggle secret reveal / mask", styles.text()),
         ]),
         Line::from(vec![
+            Span::styled("  t           ", styles.bold_accent()),
+            Span::styled("Open live theme switcher modal", styles.text()),
+        ]),
+        Line::from(vec![
             Span::styled("  ?           ", styles.bold_accent()),
             Span::styled("Toggle this help screen", styles.text()),
         ]),
@@ -369,6 +402,121 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
         .alignment(Alignment::Left);
 
     f.render_widget(paragraph, popup_area);
+}
+
+fn draw_theme_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let styles = &app.styles;
+
+    let theme_count = app.available_themes.len() as u16;
+    let popup_width = 54.min(area.width.saturating_sub(4));
+    let popup_height = (theme_count + 6).min(area.height.saturating_sub(2));
+
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(styles.bold_accent())
+        .title(Span::styled(" Theme Switcher ", styles.bold_accent()));
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+
+    for (idx, theme) in app.available_themes.iter().enumerate() {
+        let is_selected = idx == app.selected_theme_index;
+        let is_original = theme.name.eq_ignore_ascii_case(&app.original_theme.name);
+
+        let mut spans = Vec::new();
+        if is_selected {
+            spans.push(Span::styled(" ▸ ", styles.bold_accent()));
+            spans.push(Span::styled(
+                format!("{:<13}", theme.name),
+                styles.bold_accent(),
+            ));
+        } else {
+            spans.push(Span::raw("   "));
+            spans.push(Span::styled(format!("{:<13}", theme.name), styles.text()));
+        }
+
+        // Swatch previews
+        spans.push(Span::styled(
+            " ■",
+            Style::default().fg(to_ratatui_color(&theme.accent, styles.active)),
+        ));
+        spans.push(Span::styled(
+            "■",
+            Style::default().fg(to_ratatui_color(&theme.success, styles.active)),
+        ));
+        spans.push(Span::styled(
+            "■",
+            Style::default().fg(to_ratatui_color(&theme.warning, styles.active)),
+        ));
+        spans.push(Span::styled(
+            "■ ",
+            Style::default().fg(to_ratatui_color(&theme.error, styles.active)),
+        ));
+
+        if is_selected {
+            if is_original {
+                spans.push(Span::styled(" (current)", styles.success()));
+            } else {
+                spans.push(Span::styled(" (preview)", styles.accent()));
+            }
+        } else if is_original {
+            spans.push(Span::styled(" (current)", styles.muted()));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  [Enter] ", styles.bold_accent()),
+        Span::styled("Apply   ", styles.text()),
+        Span::styled("[Esc] ", styles.bold_accent()),
+        Span::styled("Cancel   ", styles.text()),
+        Span::styled("[↑/↓] ", styles.bold_accent()),
+        Span::styled("Preview", styles.text()),
+    ]));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .alignment(Alignment::Left);
+
+    f.render_widget(paragraph, popup_area);
+}
+
+const CIPHER_GLYPHS: &[char] = &['%', '#', '*', '@', '&', '?', '0', '1', '$', '!'];
+
+fn render_cipher_unscramble_line<'a>(
+    line: &str,
+    progress: f32,
+    elapsed: Duration,
+    styles: &'a TuiStyles,
+) -> Line<'a> {
+    let char_count = line.chars().count();
+    if char_count == 0 {
+        return Line::from(Span::raw("  "));
+    }
+
+    let mut spans = vec![Span::raw("  ")];
+    let revealed_count = ((char_count as f32) * progress).floor() as usize;
+    let tick = (elapsed.as_millis() / 25) as usize;
+
+    for (idx, ch) in line.chars().enumerate() {
+        if idx < revealed_count {
+            spans.push(Span::styled(ch.to_string(), styles.text()));
+        } else {
+            let glyph_idx = (idx + tick + (ch as usize)) % CIPHER_GLYPHS.len();
+            let cipher_char = CIPHER_GLYPHS[glyph_idx];
+            spans.push(Span::styled(cipher_char.to_string(), styles.bold_accent()));
+        }
+    }
+
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -448,21 +596,25 @@ mod tests {
 
         for (width, height) in sizes {
             for show_help in [false, true] {
-                for revealed in [false, true] {
-                    let mut tui_app = TuiApp::new(&app, &store, config.clone(), &theme).unwrap();
-                    tui_app.show_help = show_help;
-                    if revealed {
-                        tui_app.toggle_reveal().unwrap();
-                    }
-                    let backend = TestBackend::new(width, height);
-                    let mut terminal = Terminal::new(backend).unwrap();
-                    terminal
-                        .draw(|f| draw(f, &tui_app))
-                        .unwrap_or_else(|e| {
+                for show_theme_modal in [false, true] {
+                    for revealed in [false, true] {
+                        let mut tui_app =
+                            TuiApp::new(&app, &store, config.clone(), &theme).unwrap();
+                        tui_app.show_help = show_help;
+                        if show_theme_modal {
+                            tui_app.open_theme_modal();
+                        }
+                        if revealed {
+                            tui_app.toggle_reveal().unwrap();
+                        }
+                        let backend = TestBackend::new(width, height);
+                        let mut terminal = Terminal::new(backend).unwrap();
+                        terminal.draw(|f| draw(f, &tui_app)).unwrap_or_else(|e| {
                             panic!(
-                                "failed rendering at size {width}x{height} (help={show_help}, revealed={revealed}): {e}"
+                                "failed rendering at size {width}x{height} (help={show_help}, theme={show_theme_modal}, revealed={revealed}): {e}"
                             );
                         });
+                    }
                 }
             }
         }
@@ -488,13 +640,79 @@ mod tests {
         assert!(content.contains("press `r` to reveal plaintext"));
         assert!(!content.contains("super-secret-cleartext"));
 
-        // Revealed state
+        // Revealed state (completed animation)
         tui_app.toggle_reveal().unwrap();
+        tui_app.reveal_animation_start =
+            Some(std::time::Instant::now() - Duration::from_millis(250));
         terminal.draw(|f| draw(f, &tui_app)).unwrap();
         let buffer = terminal.backend().buffer();
         let content = format!("{buffer:?}");
         assert!(content.contains("super-secret-cleartext"));
         assert!(content.contains("plaintext unmasked"));
+    }
+
+    #[test]
+    fn render_cipher_unscramble_animation() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "SECRET_TOKEN", b"super-secret-cleartext")
+            .unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Trigger reveal with animation starting now (0ms elapsed)
+        tui_app.toggle_reveal().unwrap();
+        tui_app.reveal_animation_start = Some(std::time::Instant::now());
+
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = format!("{buffer:?}");
+
+        // In mid-animation at 0ms, cipher glyphs appear and full cleartext has not fully resolved
+        let has_cipher_glyph = CIPHER_GLYPHS.iter().any(|&g| content.contains(g));
+        assert!(
+            has_cipher_glyph,
+            "mid-animation render must contain cipher glyphs"
+        );
+        assert!(!content.contains("super-secret-cleartext"));
+
+        // Fast-forward animation past 150ms
+        tui_app.reveal_animation_start =
+            Some(std::time::Instant::now() - Duration::from_millis(200));
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = format!("{buffer:?}");
+        assert!(content.contains("super-secret-cleartext"));
+    }
+
+    #[test]
+    fn render_theme_modal_and_swatches() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_theme_modal();
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let content = format!("{buffer:?}");
+
+        assert!(content.contains("Theme Switcher"));
+        assert!(content.contains("nord"));
+        assert!(content.contains("sordino"));
+        assert!(content.contains("terminal"));
+        assert!(content.contains("monochrome"));
+        assert!(content.contains("tokyo-night"));
+        assert!(content.contains("(current)"));
+        assert!(content.contains("Apply"));
+        assert!(content.contains("Cancel"));
     }
 
     #[test]
@@ -516,6 +734,7 @@ mod tests {
         assert!(content.contains("Keyboard Shortcuts"));
         assert!(content.contains("Toggle this help screen"));
         assert!(content.contains("Copy secret to clipboard"));
+        assert!(content.contains("Open live theme switcher modal"));
         assert!(content.contains("Cycle active environment"));
     }
 
