@@ -59,14 +59,14 @@ function environment(id: string): Environment {
   return { id, encName: new Uint8Array([2]), encVaultKey: null };
 }
 
-function secret(id: string): SecretEntry {
+function secret(id: string, deleted = false): SecretEntry {
   return {
     id,
     encName: new Uint8Array([3]),
     encValue: new Uint8Array([4]),
     encDataKey: new Uint8Array([5]),
     version: 1,
-    deleted: false,
+    deleted,
   };
 }
 
@@ -434,6 +434,89 @@ describe("VaultView selection loading", () => {
     expect(screen.queryByText("shared this environment with member-a")).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
+
+  it("renders only live secrets and never decrypts deleted entries", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([
+      secret("secret-deleted", true),
+      secret("secret-live"),
+    ]);
+
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+
+    expect(await screen.findByRole("button", { name: "secret-live" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "secret-deleted" })).not.toBeInTheDocument();
+
+    // Check the call arguments too: nameOr() falls back to the id, so visible output alone
+    // could hide an unwanted decrypt attempt.
+    expect(vault.decryptSecretName).toHaveBeenCalledTimes(1);
+    expect(vault.decryptSecretName).toHaveBeenCalledWith(
+      new Uint8Array([8]),
+      "env-a",
+      expect.objectContaining({ id: "secret-live" }),
+    );
+    expect(vault.decryptSecretName).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ id: "secret-deleted" }),
+    );
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
+  });
+
+  it("shows the empty state when the server returns only deleted entries", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([
+      secret("secret-deleted-a", true),
+      secret("secret-deleted-b", true),
+    ]);
+
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+
+    expect(await screen.findByText("No secrets in this environment.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "secret-deleted-a" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "secret-deleted-b" })).not.toBeInTheDocument();
+
+    expect(vault.decryptSecretName).not.toHaveBeenCalled();
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
+  });
+
+  it("decrypts a live secret value only when its button is selected", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([
+      secret("secret-deleted", true),
+      secret("secret-live"),
+    ]);
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("synthetic-value");
+
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+
+    const liveButton = await screen.findByRole("button", { name: "secret-live" });
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
+
+    fireEvent.click(liveButton);
+
+    expect(await screen.findByDisplayValue("synthetic-value")).toBeInTheDocument();
+    expect(vault.decryptSecretValue).toHaveBeenCalledTimes(1);
+    expect(vault.decryptSecretValue).toHaveBeenCalledWith(
+      new Uint8Array([8]),
+      "env-a",
+      expect.objectContaining({ id: "secret-live" }),
+    );
+    expect(vault.decryptSecretValue).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ id: "secret-deleted" }),
+    );
+  });
 });
 
 
@@ -541,5 +624,4 @@ describe("VaultView rotation ownership", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "env-a" })).toHaveAttribute("aria-current", "true");
   });
-
 });
