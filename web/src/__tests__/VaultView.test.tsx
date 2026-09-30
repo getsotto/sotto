@@ -59,14 +59,14 @@ function environment(id: string): Environment {
   return { id, encName: new Uint8Array([2]), encVaultKey: null };
 }
 
-function secret(id: string): SecretEntry {
+function secret(id: string, deleted = false): SecretEntry {
   return {
     id,
     encName: new Uint8Array([3]),
     encValue: new Uint8Array([4]),
     encDataKey: new Uint8Array([5]),
     version: 1,
-    deleted: false,
+    deleted,
   };
 }
 
@@ -434,6 +434,89 @@ describe("VaultView selection loading", () => {
     expect(screen.queryByText("shared this environment with member-a")).not.toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
+
+  it("renders only live secrets and never decrypts deleted entries", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([
+      secret("secret-deleted", true),
+      secret("secret-live"),
+    ]);
+
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+
+    expect(await screen.findByRole("button", { name: "secret-live" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "secret-deleted" })).not.toBeInTheDocument();
+
+    // Check the call arguments too: nameOr() falls back to the id, so visible output alone
+    // could hide an unwanted decrypt attempt.
+    expect(vault.decryptSecretName).toHaveBeenCalledTimes(1);
+    expect(vault.decryptSecretName).toHaveBeenCalledWith(
+      new Uint8Array([8]),
+      "env-a",
+      expect.objectContaining({ id: "secret-live" }),
+    );
+    expect(vault.decryptSecretName).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ id: "secret-deleted" }),
+    );
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
+  });
+
+  it("shows the empty state when the server returns only deleted entries", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([
+      secret("secret-deleted-a", true),
+      secret("secret-deleted-b", true),
+    ]);
+
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+
+    expect(await screen.findByText("No secrets in this environment.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "secret-deleted-a" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "secret-deleted-b" })).not.toBeInTheDocument();
+
+    expect(vault.decryptSecretName).not.toHaveBeenCalled();
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
+  });
+
+  it("decrypts a live secret value only when its button is selected", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([
+      secret("secret-deleted", true),
+      secret("secret-live"),
+    ]);
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("synthetic-value");
+
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+
+    const liveButton = await screen.findByRole("button", { name: "secret-live" });
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
+
+    fireEvent.click(liveButton);
+
+    expect(await screen.findByDisplayValue("synthetic-value")).toBeInTheDocument();
+    expect(vault.decryptSecretValue).toHaveBeenCalledTimes(1);
+    expect(vault.decryptSecretValue).toHaveBeenCalledWith(
+      new Uint8Array([8]),
+      "env-a",
+      expect.objectContaining({ id: "secret-live" }),
+    );
+    expect(vault.decryptSecretValue).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.objectContaining({ id: "secret-deleted" }),
+    );
+  });
 });
 
 
@@ -541,7 +624,6 @@ describe("VaultView rotation ownership", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "env-a" })).toHaveAttribute("aria-current", "true");
   });
-
 });
 
 
@@ -576,5 +658,57 @@ describe("VaultView independent initial loads", () => {
     expect(await screen.findByRole("button", { name: /personal-a/ })).toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("organisations unavailable: offline");
     expect(api.fetchProjects).toHaveBeenCalledOnce();
+  });
+});
+
+
+describe("VaultView navigation ordering", () => {
+  it("sorts projects and environments by decrypted display name", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("project-b"), project("project-a")]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-b"), environment("env-a")]);
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
+
+    renderVault();
+
+    const projects = screen.getByRole("heading", { name: "Projects" }).parentElement!;
+    await screen.findByRole("button", { name: /project-a/ });
+    expect([...projects.querySelectorAll("button")].map((button) => button.textContent)).toEqual([
+      "project-apersonal",
+      "project-bpersonal",
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: /project-a/ }));
+    const environments = await screen.findByRole("heading", { name: "Environments" });
+    expect([...environments.parentElement!.querySelectorAll("button")].map((button) => button.textContent))
+      .toEqual(["env-a", "env-b"]);
+  });
+});
+
+describe("VaultView secret copying", () => {
+  it("copies the exact revealed value only after explicit activation", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("project-a")]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchMyGrant).mockResolvedValue(new Uint8Array([7]));
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.decryptSecretName).mockImplementation((_key, _env, entry) => entry.id);
+    vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("  first line\nsecond line  ");
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "secret-a" }));
+    expect(writeText).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Secret copied.");
+    expect(writeText).toHaveBeenCalledWith("  first line\nsecond line  ");
   });
 });

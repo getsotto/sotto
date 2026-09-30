@@ -5,13 +5,42 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
-use crate::commands::App;
+use crate::commands::{App, SecretHistoryItem};
 use crate::config::Config;
 use crate::error::Result;
 use crate::store::Store;
 use crate::theme::Theme;
 use crate::tui::theme::TuiStyles;
 use crate::vault::SecretItem;
+
+/// Editing mode for the secret modal dialogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretModalMode {
+    New,
+    Edit,
+}
+
+/// Active focus field inside the secret modal dialogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretModalField {
+    Name,
+    Value,
+}
+
+/// Generate a cryptographically secure random secret string using the core CSPRNG.
+pub fn generate_random_secret(length: usize) -> String {
+    const CHARSET: &[u8] =
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*(-_=+)";
+    let mut buf = vec![0u8; length];
+    for chunk in buf.chunks_mut(32) {
+        let raw = sotto_core::random::bytes::<32>();
+        let to_copy = chunk.len().min(32);
+        chunk[..to_copy].copy_from_slice(&raw[..to_copy]);
+    }
+    buf.iter()
+        .map(|&byte| CHARSET[(byte as usize) % CHARSET.len()] as char)
+        .collect()
+}
 
 /// Application state for the interactive split-pane dashboard.
 pub struct TuiApp<'a> {
@@ -25,6 +54,19 @@ pub struct TuiApp<'a> {
     pub available_themes: Vec<Theme>,
     pub selected_theme_index: usize,
     pub show_theme_modal: bool,
+    pub show_secret_modal: bool,
+    pub secret_modal_mode: SecretModalMode,
+    pub secret_modal_name: String,
+    pub secret_modal_value: Zeroizing<String>,
+    pub secret_modal_field: SecretModalField,
+    pub secret_modal_masked: bool,
+    pub show_delete_modal: bool,
+    pub delete_modal_secret_name: String,
+    pub show_history_modal: bool,
+    pub history_modal_secret_name: String,
+    pub history_modal_items: Vec<SecretHistoryItem>,
+    pub history_modal_selected_index: usize,
+    pub history_modal_revealed: bool,
     pub environments: Vec<String>,
     pub active_env_index: usize,
     pub secrets: Vec<SecretItem>,
@@ -71,6 +113,19 @@ impl<'a> TuiApp<'a> {
             available_themes: Vec::new(),
             selected_theme_index: 0,
             show_theme_modal: false,
+            show_secret_modal: false,
+            secret_modal_mode: SecretModalMode::New,
+            secret_modal_name: String::new(),
+            secret_modal_value: Zeroizing::new(String::new()),
+            secret_modal_field: SecretModalField::Name,
+            secret_modal_masked: true,
+            show_delete_modal: false,
+            delete_modal_secret_name: String::new(),
+            show_history_modal: false,
+            history_modal_secret_name: String::new(),
+            history_modal_items: Vec::new(),
+            history_modal_selected_index: 0,
+            history_modal_revealed: false,
             environments,
             active_env_index,
             secrets: Vec::new(),
@@ -288,6 +343,10 @@ impl<'a> TuiApp<'a> {
         self.available_themes = themes;
         self.selected_theme_index = selected_idx;
         self.show_theme_modal = true;
+        self.show_help = false;
+        self.show_secret_modal = false;
+        self.show_delete_modal = false;
+        self.show_history_modal = false;
         self.preview_selected_theme();
     }
 
@@ -373,6 +432,322 @@ impl<'a> TuiApp<'a> {
         self.current_theme = self.original_theme.clone();
         self.styles = TuiStyles::from_theme(&self.current_theme);
         self.show_theme_modal = false;
+    }
+
+    /// Open the dialogue to create a new secret in the active environment.
+    pub fn open_new_secret_modal(&mut self) {
+        self.show_secret_modal = true;
+        self.secret_modal_mode = SecretModalMode::New;
+        self.secret_modal_name.clear();
+        self.secret_modal_value = Zeroizing::new(String::new());
+        self.secret_modal_field = SecretModalField::Name;
+        self.secret_modal_masked = true;
+        self.show_help = false;
+        self.show_theme_modal = false;
+        self.show_delete_modal = false;
+        self.show_history_modal = false;
+    }
+
+    /// Open the dialogue to edit the selected secret's value.
+    pub fn open_edit_secret_modal(&mut self) -> Result<()> {
+        let selected_name = self.selected_secret().map(|s| s.name.clone());
+        if let Some(secret_name) = selected_name {
+            let value = self.app.get(&self.config, &secret_name)?;
+            let zeroized = Zeroizing::new(value);
+            match std::str::from_utf8(&zeroized) {
+                Ok(text) => {
+                    self.show_secret_modal = true;
+                    self.secret_modal_mode = SecretModalMode::Edit;
+                    self.secret_modal_name = secret_name;
+                    self.secret_modal_value = Zeroizing::new(text.to_string());
+                    self.secret_modal_field = SecretModalField::Value;
+                    self.secret_modal_masked = true;
+                    self.show_help = false;
+                    self.show_theme_modal = false;
+                    self.show_delete_modal = false;
+                    self.show_history_modal = false;
+                }
+                Err(_) => {
+                    self.set_status("Cannot edit: secret contains non-UTF-8 bytes".into());
+                }
+            }
+        } else {
+            self.set_status("No secret selected to edit".into());
+        }
+        Ok(())
+    }
+
+    /// Close the secret creation or edit modal without saving.
+    pub fn close_secret_modal(&mut self) {
+        self.show_secret_modal = false;
+        self.secret_modal_name.clear();
+        self.secret_modal_value = Zeroizing::new(String::new());
+    }
+
+    /// Switch to the next field in the secret modal dialogue.
+    pub fn secret_modal_next_field(&mut self) {
+        if self.secret_modal_mode == SecretModalMode::New {
+            self.secret_modal_field = match self.secret_modal_field {
+                SecretModalField::Name => SecretModalField::Value,
+                SecretModalField::Value => SecretModalField::Name,
+            };
+        }
+    }
+
+    /// Switch to the previous field in the secret modal dialogue.
+    pub fn secret_modal_prev_field(&mut self) {
+        self.secret_modal_next_field();
+    }
+
+    /// Insert a character into the currently focused secret modal field.
+    pub fn secret_modal_insert_char(&mut self, c: char) {
+        match self.secret_modal_field {
+            SecretModalField::Name if self.secret_modal_mode == SecretModalMode::New => {
+                self.secret_modal_name.push(c);
+            }
+            SecretModalField::Value => {
+                self.secret_modal_value.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    /// Delete the preceding character from the currently focused secret modal field.
+    pub fn secret_modal_backspace(&mut self) {
+        match self.secret_modal_field {
+            SecretModalField::Name if self.secret_modal_mode == SecretModalMode::New => {
+                self.secret_modal_name.pop();
+            }
+            SecretModalField::Value => {
+                self.secret_modal_value.pop();
+            }
+            _ => {}
+        }
+    }
+
+    /// Toggle masking of the secret value field inside the modal dialogue.
+    pub fn toggle_secret_modal_mask(&mut self) {
+        self.secret_modal_masked = !self.secret_modal_masked;
+    }
+
+    /// Populate the secret modal value field with a cryptographically secure random string.
+    pub fn generate_secret_modal_value(&mut self) {
+        let generated = generate_random_secret(32);
+        self.secret_modal_value = Zeroizing::new(generated);
+        self.set_status("Generated 32-character random secret".into());
+    }
+
+    /// Commit and save the secret modal contents to the active vault.
+    pub fn commit_secret_modal(&mut self) -> Result<()> {
+        let name = self.secret_modal_name.trim().to_string();
+        if name.is_empty() {
+            self.set_status("Secret name cannot be empty".into());
+            return Ok(());
+        }
+        if name.contains(|c: char| c.is_whitespace()) {
+            self.set_status("Secret name cannot contain whitespace".into());
+            return Ok(());
+        }
+
+        let is_new = self.secret_modal_mode == SecretModalMode::New;
+        self.app
+            .set(&self.config, &name, self.secret_modal_value.as_bytes())?;
+        self.refresh_secrets()?;
+
+        if let Some(pos) = self.filtered_indices.iter().position(|&idx| {
+            self.secrets
+                .get(idx)
+                .map(|s| s.name == name)
+                .unwrap_or(false)
+        }) {
+            self.selected_filtered_index = pos;
+        }
+
+        if is_new {
+            self.set_status(format!(
+                "Created secret `{name}` in `{}`",
+                self.config.environment
+            ));
+        } else {
+            self.set_status(format!(
+                "Updated secret `{name}` in `{}`",
+                self.config.environment
+            ));
+        }
+
+        self.close_secret_modal();
+        Ok(())
+    }
+
+    /// Open the confirmation dialogue to delete the selected secret.
+    pub fn open_delete_modal(&mut self) {
+        let selected_name = self.selected_secret().map(|s| s.name.clone());
+        if let Some(name) = selected_name {
+            self.show_delete_modal = true;
+            self.delete_modal_secret_name = name;
+            self.show_help = false;
+            self.show_theme_modal = false;
+            self.show_secret_modal = false;
+            self.show_history_modal = false;
+        } else {
+            self.set_status("No secret selected to delete".into());
+        }
+    }
+
+    /// Close the delete confirmation dialogue without deleting.
+    pub fn close_delete_modal(&mut self) {
+        self.show_delete_modal = false;
+        self.delete_modal_secret_name.clear();
+    }
+
+    /// Confirm and execute the deletion of the selected secret.
+    pub fn commit_delete_modal(&mut self) -> Result<()> {
+        let name = self.delete_modal_secret_name.clone();
+        if name.is_empty() {
+            self.close_delete_modal();
+            return Ok(());
+        }
+
+        self.app.remove(&self.config, &name)?;
+        self.refresh_secrets()?;
+        self.set_status(format!(
+            "Deleted secret `{name}` from `{}`",
+            self.config.environment
+        ));
+        self.close_delete_modal();
+        Ok(())
+    }
+
+    /// Open the version history dialogue for the selected secret.
+    pub fn open_history_modal(&mut self) -> Result<()> {
+        let selected_name = self.selected_secret().map(|s| s.name.clone());
+        if let Some(secret_name) = selected_name {
+            match self.app.secret_history(&self.config, &secret_name) {
+                Ok(history) => {
+                    self.show_history_modal = true;
+                    self.history_modal_secret_name = secret_name;
+                    self.history_modal_items = history;
+                    self.history_modal_selected_index = 0;
+                    self.history_modal_revealed = false;
+                    self.show_help = false;
+                    self.show_theme_modal = false;
+                    self.show_secret_modal = false;
+                    self.show_delete_modal = false;
+                }
+                Err(err) => {
+                    self.set_status(format!("Failed to load version history: {err}"));
+                }
+            }
+        } else {
+            self.set_status("No secret selected to view history".into());
+        }
+        Ok(())
+    }
+
+    /// Close the version history dialogue.
+    pub fn close_history_modal(&mut self) {
+        self.show_history_modal = false;
+        self.history_modal_revealed = false;
+        self.history_modal_items.clear();
+        self.history_modal_secret_name.clear();
+        self.history_modal_selected_index = 0;
+    }
+
+    /// Move selection up in the version history list.
+    pub fn history_modal_up(&mut self) {
+        if self.history_modal_selected_index > 0 {
+            self.history_modal_selected_index -= 1;
+        }
+    }
+
+    /// Move selection down in the version history list.
+    pub fn history_modal_down(&mut self) {
+        if !self.history_modal_items.is_empty()
+            && self.history_modal_selected_index + 1 < self.history_modal_items.len()
+        {
+            self.history_modal_selected_index += 1;
+        }
+    }
+
+    /// Jump to the latest version in the version history list.
+    pub fn history_modal_home(&mut self) {
+        self.history_modal_selected_index = 0;
+    }
+
+    /// Jump to the earliest version in the version history list.
+    pub fn history_modal_end(&mut self) {
+        if !self.history_modal_items.is_empty() {
+            self.history_modal_selected_index = self.history_modal_items.len() - 1;
+        }
+    }
+
+    /// Toggle masking of secret values in the version history dialogue.
+    pub fn toggle_history_reveal(&mut self) {
+        self.history_modal_revealed = !self.history_modal_revealed;
+    }
+
+    /// Copy the currently selected historical version value to the clipboard.
+    pub fn copy_history_selected(&mut self) -> Result<()> {
+        if let Some(item) = self
+            .history_modal_items
+            .get(self.history_modal_selected_index)
+        {
+            if let Some(val) = &item.value {
+                match std::str::from_utf8(val) {
+                    Ok(text) => match crate::clipboard::copy(text) {
+                        Ok(()) => {
+                            let name = &self.history_modal_secret_name;
+                            let ver = item.version;
+                            self.set_status(format!(
+                                "Copied `{name}` (v{ver}) to clipboard (clears in 45s)"
+                            ));
+                        }
+                        Err(err) => {
+                            self.set_status(format!("Clipboard copy failed: {err}"));
+                        }
+                    },
+                    Err(_) => {
+                        self.set_status("Cannot copy: version contains non-UTF-8 bytes".into());
+                    }
+                }
+            } else {
+                self.set_status("Cannot copy: version value is unreadable".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore the selected historical version as a new current version (rollback).
+    pub fn rollback_history_selected(&mut self) -> Result<()> {
+        if let Some(item) = self
+            .history_modal_items
+            .get(self.history_modal_selected_index)
+        {
+            let target_version = item.version;
+            let secret_name = self.history_modal_secret_name.clone();
+            match self
+                .app
+                .rollback(&self.config, &secret_name, target_version)
+            {
+                Ok(()) => {
+                    self.refresh_secrets()?;
+                    let new_version = self
+                        .secrets
+                        .iter()
+                        .find(|s| s.name == secret_name)
+                        .map(|s| s.version)
+                        .unwrap_or(target_version + 1);
+                    self.close_history_modal();
+                    self.set_status(format!(
+                        "Restored `{secret_name}` to v{target_version} (saved as v{new_version})"
+                    ));
+                }
+                Err(err) => {
+                    self.set_status(format!("Rollback failed: {err}"));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -730,5 +1105,216 @@ mod tests {
         tui_app.reset_secret_view();
         assert!(!tui_app.revealed);
         assert!(tui_app.reveal_animation_start.is_none());
+    }
+
+    #[test]
+    fn secret_modal_new_lifecycle_and_validation() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert!(!tui_app.show_secret_modal);
+
+        // Open new secret modal
+        tui_app.open_new_secret_modal();
+        assert!(tui_app.show_secret_modal);
+        assert_eq!(tui_app.secret_modal_mode, SecretModalMode::New);
+        assert_eq!(tui_app.secret_modal_field, SecretModalField::Name);
+        assert!(tui_app.secret_modal_masked);
+
+        // Reject empty secret name
+        tui_app.commit_secret_modal().unwrap();
+        assert!(tui_app.show_secret_modal);
+        assert_eq!(
+            tui_app.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Secret name cannot be empty")
+        );
+
+        // Reject whitespace in secret name
+        tui_app.secret_modal_insert_char('A');
+        tui_app.secret_modal_insert_char(' ');
+        tui_app.secret_modal_insert_char('B');
+        tui_app.commit_secret_modal().unwrap();
+        assert!(tui_app.show_secret_modal);
+        assert_eq!(
+            tui_app.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Secret name cannot contain whitespace")
+        );
+
+        // Backspace and fix name
+        tui_app.secret_modal_backspace();
+        tui_app.secret_modal_backspace();
+        tui_app.secret_modal_insert_char('P');
+        tui_app.secret_modal_insert_char('I');
+        assert_eq!(tui_app.secret_modal_name, "API");
+
+        // Switch to value field and type
+        tui_app.secret_modal_next_field();
+        assert_eq!(tui_app.secret_modal_field, SecretModalField::Value);
+        tui_app.secret_modal_insert_char('k');
+        tui_app.secret_modal_insert_char('e');
+        tui_app.secret_modal_insert_char('y');
+        tui_app.secret_modal_insert_char('1');
+        assert_eq!(tui_app.secret_modal_value.as_str(), "key1");
+
+        // Toggle mask
+        assert!(tui_app.secret_modal_masked);
+        tui_app.toggle_secret_modal_mask();
+        assert!(!tui_app.secret_modal_masked);
+
+        // Commit secret creation
+        tui_app.commit_secret_modal().unwrap();
+        assert!(!tui_app.show_secret_modal);
+        assert_eq!(tui_app.secrets.len(), 1);
+        assert_eq!(tui_app.secrets[0].name, "API");
+        assert_eq!(
+            tui_app.selected_secret().map(|s| s.name.as_str()),
+            Some("API")
+        );
+
+        // Verify stored value
+        let fetched = app.get(&tui_app.config, "API").unwrap();
+        assert_eq!(fetched, b"key1");
+    }
+
+    #[test]
+    fn secret_modal_edit_lifecycle() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "EXISTING_KEY", b"initial-secret").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert_eq!(
+            tui_app.selected_secret().map(|s| s.name.as_str()),
+            Some("EXISTING_KEY")
+        );
+
+        // Open edit modal
+        tui_app.open_edit_secret_modal().unwrap();
+        assert!(tui_app.show_secret_modal);
+        assert_eq!(tui_app.secret_modal_mode, SecretModalMode::Edit);
+        assert_eq!(tui_app.secret_modal_name, "EXISTING_KEY");
+        assert_eq!(tui_app.secret_modal_value.as_str(), "initial-secret");
+        assert_eq!(tui_app.secret_modal_field, SecretModalField::Value);
+
+        // Edit value
+        tui_app.secret_modal_value = Zeroizing::new("updated-secret".into());
+        tui_app.commit_secret_modal().unwrap();
+        assert!(!tui_app.show_secret_modal);
+
+        // Verify updated value in vault
+        let fetched = app.get(&tui_app.config, "EXISTING_KEY").unwrap();
+        assert_eq!(fetched, b"updated-secret");
+    }
+
+    #[test]
+    fn secret_modal_random_generator() {
+        let secret1 = generate_random_secret(32);
+        let secret2 = generate_random_secret(32);
+        assert_eq!(secret1.len(), 32);
+        assert_eq!(secret2.len(), 32);
+        assert_ne!(secret1, secret2);
+
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+
+        tui_app.open_new_secret_modal();
+        tui_app.generate_secret_modal_value();
+        assert_eq!(tui_app.secret_modal_value.len(), 32);
+        assert!(tui_app.status_message.is_some());
+    }
+
+    #[test]
+    fn delete_modal_lifecycle_and_execution() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "TARGET", b"val").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert_eq!(tui_app.secrets.len(), 1);
+
+        // Open delete modal
+        tui_app.open_delete_modal();
+        assert!(tui_app.show_delete_modal);
+        assert_eq!(tui_app.delete_modal_secret_name, "TARGET");
+
+        // Cancel delete
+        tui_app.close_delete_modal();
+        assert!(!tui_app.show_delete_modal);
+        assert_eq!(tui_app.secrets.len(), 1);
+
+        // Re-open and commit delete
+        tui_app.open_delete_modal();
+        tui_app.commit_delete_modal().unwrap();
+        assert!(!tui_app.show_delete_modal);
+        assert_eq!(tui_app.secrets.len(), 0);
+        assert_eq!(
+            tui_app.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some("Deleted secret `TARGET` from `dev`")
+        );
+    }
+
+    #[test]
+    fn version_history_modal_lifecycle_and_rollback() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+
+        // Populate a secret with 3 versions
+        app.set(&config, "HOST_KEY", b"v1-initial").unwrap();
+        app.set(&config, "HOST_KEY", b"v2-staging").unwrap();
+        app.set(&config, "HOST_KEY", b"v3-production").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert_eq!(tui_app.secrets.len(), 1);
+        assert_eq!(tui_app.secrets[0].version, 3);
+
+        // Open history modal
+        tui_app.open_history_modal().unwrap();
+        assert!(tui_app.show_history_modal);
+        assert_eq!(tui_app.history_modal_secret_name, "HOST_KEY");
+        assert_eq!(tui_app.history_modal_items.len(), 3);
+        assert_eq!(tui_app.history_modal_selected_index, 0);
+        assert_eq!(tui_app.history_modal_items[0].version, 3);
+        assert_eq!(tui_app.history_modal_items[1].version, 2);
+        assert_eq!(tui_app.history_modal_items[2].version, 1);
+
+        // Test reveal toggle
+        assert!(!tui_app.history_modal_revealed);
+        tui_app.toggle_history_reveal();
+        assert!(tui_app.history_modal_revealed);
+
+        // Test navigation
+        tui_app.history_modal_down();
+        assert_eq!(tui_app.history_modal_selected_index, 1); // pointing to v2
+        tui_app.history_modal_down();
+        assert_eq!(tui_app.history_modal_selected_index, 2); // pointing to v1
+        tui_app.history_modal_down();
+        assert_eq!(tui_app.history_modal_selected_index, 2); // clamped at bottom
+        tui_app.history_modal_up();
+        assert_eq!(tui_app.history_modal_selected_index, 1); // back to v2
+        tui_app.history_modal_home();
+        assert_eq!(tui_app.history_modal_selected_index, 0); // v3
+        tui_app.history_modal_end();
+        assert_eq!(tui_app.history_modal_selected_index, 2); // v1
+
+        // Move to v2 and roll back
+        tui_app.history_modal_selected_index = 1;
+        tui_app.rollback_history_selected().unwrap();
+
+        // Verify modal closed, secret restored to v2 value and recorded as v4
+        assert!(!tui_app.show_history_modal);
+        assert_eq!(tui_app.secrets[0].version, 4);
+        let restored_val = app.get(&tui_app.config, "HOST_KEY").unwrap();
+        assert_eq!(restored_val, b"v2-staging");
+        assert_eq!(
+            tui_app.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some("Restored `HOST_KEY` to v2 (saved as v4)")
+        );
     }
 }

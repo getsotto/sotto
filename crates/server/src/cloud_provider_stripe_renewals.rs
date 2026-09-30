@@ -39,6 +39,7 @@ pub struct StripeRenewalFailureEvidence {
     renewal_period_start: i64,
     renewal_period_end: i64,
     event_created_at: i64,
+    interval: StripeInterval,
 }
 
 impl StripeRenewalFailureEvidence {
@@ -104,6 +105,10 @@ impl StripeRenewalFailureEvidence {
 
     pub const fn renewal_period_end(&self) -> i64 {
         self.renewal_period_end
+    }
+
+    pub const fn interval(&self) -> StripeInterval {
+        self.interval
     }
 
     pub const fn event_created_at(&self) -> i64 {
@@ -501,6 +506,7 @@ pub fn decode_personal_renewal_failure(
             renewal_period_start,
             renewal_period_end,
             event_created_at,
+            interval: expected_interval,
         },
     )))
 }

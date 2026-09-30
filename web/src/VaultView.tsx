@@ -88,6 +88,9 @@ export function VaultView({
   const [openEnv, setOpenEnv] = useState<OpenEnv | null>(null);
   const [loadingEnvId, setLoadingEnvId] = useState<string | null>(null);
   const [revealed, setRevealed] = useState<Revealed | null>(null);
+  const [copyBusy, setCopyBusy] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+  const copyGeneration = useRef(0);
   // Org members of the active project (loaded when an org env is opened), for the share picker.
   const [members, setMembers] = useState<Member[] | null>(null);
   const [shareTo, setShareTo] = useState("");
@@ -116,13 +119,15 @@ export function VaultView({
     try {
       const rows = await fetchProjects();
       setProjects(
-        rows.map((project) => {
-          const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
-          return {
-            project,
-            name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
-          };
-        }),
+        rows
+          .map((project) => {
+            const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
+            return {
+              project,
+              name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
+            };
+          })
+          .sort((a, b) => a.name.localeCompare(b.name)),
       );
     } catch (e) {
       setProjects([]);
@@ -178,7 +183,9 @@ export function VaultView({
         return;
       }
       setEnvs(
-        rows.map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(key, env.id, env.encName)) })),
+        rows
+          .map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(key, env.id, env.encName)) }))
+          .sort((a, b) => a.name.localeCompare(b.name)),
       );
     } catch (e) {
       if (load !== projectLoad.current) {
@@ -390,12 +397,35 @@ export function VaultView({
     if (openEnv === null) {
       return;
     }
+    ++copyGeneration.current;
+    setCopyBusy(false);
+    setCopyFeedback(null);
     setError(null);
     try {
       const value = decryptSecretValue(openEnv.vaultKey, openEnv.envId, ns.entry);
       setRevealed({ name: ns.name, value, link: null });
     } catch (e) {
       setError(message(e));
+    }
+  }
+
+  async function copySecret(current: Revealed) {
+    if (copyBusy) return;
+    const generation = ++copyGeneration.current;
+    setCopyBusy(true);
+    setCopyFeedback(null);
+    try {
+      if (navigator.clipboard?.writeText === undefined) {
+        throw new Error("clipboard unavailable");
+      }
+      await navigator.clipboard.writeText(current.value);
+      if (generation === copyGeneration.current) setCopyFeedback("Secret copied.");
+    } catch {
+      if (generation === copyGeneration.current) {
+        setCopyFeedback("Copy failed. Select the value above and copy it manually.");
+      }
+    } finally {
+      if (generation === copyGeneration.current) setCopyBusy(false);
     }
   }
 
@@ -553,6 +583,10 @@ export function VaultView({
             rows={3}
             spellCheck={false}
           />
+          <button disabled={copyBusy} onClick={() => void copySecret(revealed)}>
+            {copyBusy ? "Copying…" : "Copy secret"}
+          </button>
+          {copyFeedback !== null && <p role="status">{copyFeedback}</p>}
           {revealed.link === null ? (
             <button className="ghost" onClick={() => void share(revealed)}>
               Create one-time share link
