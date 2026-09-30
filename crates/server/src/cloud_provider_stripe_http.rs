@@ -596,6 +596,38 @@ impl StripeReadClient {
         .map_err(StripeReadError::Observation)
     }
 
+    /// Assemble one invoice and its bounded correction reads without deciding access eligibility.
+    #[doc(hidden)]
+    pub async fn personal_invoice_correction_evidence(
+        &self,
+        session: &mut StripeReadSession,
+        invoice_id: &str,
+        binding: &StripeAllocationBinding,
+    ) -> Result<
+        crate::cloud_provider_stripe_corrections::StripePersonalInvoiceCorrectionEvidence,
+        StripeReadError,
+    > {
+        let observation = self
+            .personal_invoice_observation(session, invoice_id, binding)
+            .await?;
+        let refunds = self
+            .payment_intent_refunds(session, observation.payment_intent_id())
+            .await?;
+        let disputes = self
+            .payment_intent_disputes(session, observation.payment_intent_id())
+            .await?;
+        let credit_notes = self
+            .invoice_credit_notes(session, observation.invoice_id())
+            .await?;
+        crate::cloud_provider_stripe_corrections::assemble(
+            observation,
+            refunds,
+            disputes,
+            credit_notes,
+            self.environment,
+        )
+    }
+
     async fn list<T, F>(
         &self,
         session: &mut StripeReadSession,
