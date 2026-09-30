@@ -32,6 +32,10 @@ pub fn draw(f: &mut Frame, app: &TuiApp) {
         draw_help_modal(f, app, size);
     } else if app.show_theme_modal {
         draw_theme_modal(f, app, size);
+    } else if app.show_secret_modal {
+        draw_secret_modal(f, app, size);
+    } else if app.show_delete_modal {
+        draw_delete_modal(f, app, size);
     }
 }
 
@@ -276,6 +280,14 @@ fn draw_right_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
             ),
         ]));
         lines.push(Line::from(vec![
+            Span::styled("  [e] ", styles.bold_accent()),
+            Span::styled("Edit secret value", styles.text()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  [d] ", styles.bold_accent()),
+            Span::styled("Delete secret", styles.text()),
+        ]));
+        lines.push(Line::from(vec![
             Span::styled("  [Tab] ", styles.bold_accent()),
             Span::styled("Cycle active environment", styles.text()),
         ]));
@@ -312,6 +324,12 @@ fn draw_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled("Search  ", styles.muted()),
             Span::styled("[Tab] ", styles.bold_accent()),
             Span::styled("Env  ", styles.muted()),
+            Span::styled("[n] ", styles.bold_accent()),
+            Span::styled("New  ", styles.muted()),
+            Span::styled("[e] ", styles.bold_accent()),
+            Span::styled("Edit  ", styles.muted()),
+            Span::styled("[d] ", styles.bold_accent()),
+            Span::styled("Delete  ", styles.muted()),
             Span::styled("[c] ", styles.bold_accent()),
             Span::styled("Copy  ", styles.muted()),
             Span::styled("[r] ", styles.bold_accent()),
@@ -331,7 +349,7 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     let styles = &app.styles;
 
     let popup_width = 54.min(area.width.saturating_sub(4));
-    let popup_height = 20.min(area.height.saturating_sub(2));
+    let popup_height = 23.min(area.height.saturating_sub(2));
 
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -372,6 +390,18 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
         Line::from(vec![
             Span::styled("  Tab         ", styles.bold_accent()),
             Span::styled("Cycle active environment", styles.text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  n           ", styles.bold_accent()),
+            Span::styled("Create new secret in environment", styles.text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  e           ", styles.bold_accent()),
+            Span::styled("Edit selected secret value", styles.text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  d           ", styles.bold_accent()),
+            Span::styled("Delete selected secret", styles.text()),
         ]),
         Line::from(vec![
             Span::styled("  c           ", styles.bold_accent()),
@@ -513,6 +543,174 @@ fn draw_theme_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     f.render_widget(paragraph, popup_area);
 }
 
+fn draw_secret_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let styles = &app.styles;
+
+    let popup_width = 62.min(area.width.saturating_sub(4));
+    let popup_height = 14.min(area.height.saturating_sub(2));
+
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+
+    let title = match app.secret_modal_mode {
+        crate::tui::app::SecretModalMode::New => " New Secret ",
+        crate::tui::app::SecretModalMode::Edit => " Edit Secret ",
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(styles.bold_accent())
+        .title(Span::styled(title, styles.bold_accent()));
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Environment: ", styles.muted()),
+        Span::styled(&app.config.environment, styles.bold_accent()),
+    ]));
+    lines.push(Line::from(""));
+
+    match app.secret_modal_mode {
+        crate::tui::app::SecretModalMode::New => {
+            let is_name_focused = app.secret_modal_field == crate::tui::app::SecretModalField::Name;
+            let cursor = if is_name_focused { "▏" } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "  Name:  ",
+                    if is_name_focused {
+                        styles.bold_accent()
+                    } else {
+                        styles.muted()
+                    },
+                ),
+                Span::styled(
+                    format!("[{}{}]", app.secret_modal_name, cursor),
+                    if is_name_focused {
+                        styles.text()
+                    } else {
+                        styles.muted()
+                    },
+                ),
+            ]));
+        }
+        crate::tui::app::SecretModalMode::Edit => {
+            lines.push(Line::from(vec![
+                Span::styled("  Name:  ", styles.muted()),
+                Span::styled(
+                    format!("{} (read-only)", app.secret_modal_name),
+                    styles.text(),
+                ),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+
+    let is_value_focused = app.secret_modal_field == crate::tui::app::SecretModalField::Value;
+    let cursor = if is_value_focused { "▏" } else { "" };
+    let mask_hint = if app.secret_modal_masked {
+        " (masked)"
+    } else {
+        " (revealed)"
+    };
+    let displayed_value = if app.secret_modal_masked {
+        "•".repeat(app.secret_modal_value.len())
+    } else {
+        app.secret_modal_value.to_string()
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            "  Value: ",
+            if is_value_focused {
+                styles.bold_accent()
+            } else {
+                styles.muted()
+            },
+        ),
+        Span::styled(
+            format!("[{}{}]", displayed_value, cursor),
+            if is_value_focused {
+                styles.text()
+            } else {
+                styles.muted()
+            },
+        ),
+        Span::styled(mask_hint, styles.muted()),
+    ]));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  [Tab] ", styles.bold_accent()),
+        Span::styled("Switch Field   ", styles.muted()),
+        Span::styled("[Ctrl+G] ", styles.bold_accent()),
+        Span::styled("Generate   ", styles.muted()),
+        Span::styled("[Ctrl+R] ", styles.bold_accent()),
+        Span::styled("Mask/Reveal", styles.muted()),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  [Enter] ", styles.bold_accent()),
+        Span::styled("Save   ", styles.success()),
+        Span::styled("[Esc] ", styles.bold_accent()),
+        Span::styled("Cancel", styles.muted()),
+    ]));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(paragraph, popup_area);
+}
+
+fn draw_delete_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let styles = &app.styles;
+
+    let popup_width = 54.min(area.width.saturating_sub(4));
+    let popup_height = 9.min(area.height.saturating_sub(2));
+
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(styles.error())
+        .title(Span::styled(" Delete Secret ", styles.error()));
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Delete `", styles.text()),
+            Span::styled(&app.delete_modal_secret_name, styles.bold_accent()),
+            Span::styled(
+                format!("` from `{}`?", app.config.environment),
+                styles.text(),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "  This action cannot be undone.",
+            styles.warning(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [y/Enter] ", styles.error()),
+            Span::styled("Delete Secret    ", styles.error()),
+            Span::styled("[n/Esc] ", styles.bold_accent()),
+            Span::styled("Cancel", styles.muted()),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(paragraph, popup_area);
+}
+
 const CIPHER_GLYPHS: &[char] = &['%', '#', '*', '@', '&', '?', '0', '1', '$', '!'];
 
 fn render_cipher_unscramble_line<'a>(
@@ -619,27 +817,24 @@ mod tests {
         ];
 
         for (width, height) in sizes {
-            for show_help in [false, true] {
-                for show_theme_modal in [false, true] {
-                    for revealed in [false, true] {
-                        let mut tui_app =
-                            TuiApp::new(&app, &store, config.clone(), &theme).unwrap();
-                        tui_app.show_help = show_help;
-                        if show_theme_modal {
-                            tui_app.open_theme_modal();
-                        }
-                        if revealed {
-                            tui_app.toggle_reveal().unwrap();
-                        }
-                        let backend = TestBackend::new(width, height);
-                        let mut terminal = Terminal::new(backend).unwrap();
-                        terminal.draw(|f| draw(f, &tui_app)).unwrap_or_else(|e| {
-                            panic!(
-                                "failed rendering at size {width}x{height} (help={show_help}, theme={show_theme_modal}, revealed={revealed}): {e}"
-                            );
-                        });
-                    }
+            for modal_state in 0..6 {
+                let mut tui_app = TuiApp::new(&app, &store, config.clone(), &theme).unwrap();
+                match modal_state {
+                    0 => {} // Normal view
+                    1 => tui_app.show_help = true,
+                    2 => tui_app.open_theme_modal(),
+                    3 => tui_app.open_new_secret_modal(),
+                    4 => tui_app.open_edit_secret_modal().unwrap(),
+                    5 => tui_app.open_delete_modal(),
+                    _ => {}
                 }
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|f| draw(f, &tui_app)).unwrap_or_else(|e| {
+                    panic!(
+                        "failed rendering at size {width}x{height} (modal_state={modal_state}): {e}"
+                    );
+                });
             }
         }
     }
@@ -824,5 +1019,77 @@ mod tests {
         assert!(content.contains("custom-14"));
         assert!(content.contains("↑ more"));
         assert!(content.contains("Apply"));
+    }
+
+    #[test]
+    fn render_secret_modal_new() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_new_secret_modal();
+        tui_app.secret_modal_name = "STRIPE_KEY".into();
+        tui_app.secret_modal_value = zeroize::Zeroizing::new("sk_test_123".into());
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+
+        assert!(content.contains("New Secret"));
+        assert!(content.contains("STRIPE_KEY"));
+        assert!(content.contains("(masked)"));
+        assert!(content.contains("Save"));
+        assert!(content.contains("Cancel"));
+        assert!(content.contains("Generate"));
+    }
+
+    #[test]
+    fn render_secret_modal_edit() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "EXISTING_VAR", b"secret-pass").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_edit_secret_modal().unwrap();
+        tui_app.secret_modal_masked = false;
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+
+        assert!(content.contains("Edit Secret"));
+        assert!(content.contains("EXISTING_VAR"));
+        assert!(content.contains("(read-only)"));
+        assert!(content.contains("secret-pass"));
+        assert!(content.contains("(revealed)"));
+    }
+
+    #[test]
+    fn render_delete_modal() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "TO_REMOVE", b"val").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_delete_modal();
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+
+        assert!(content.contains("Delete Secret"));
+        assert!(content.contains("TO_REMOVE"));
+        assert!(content.contains("This action cannot be undone."));
+        assert!(content.contains("Delete Secret"));
+        assert!(content.contains("Cancel"));
     }
 }
