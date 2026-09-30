@@ -75,7 +75,7 @@ impl StripeCoverageConfig {
             .map_err(StripeContractError::ProviderContext)
     }
 
-    fn validate(&self) -> Result<(), StripeContractError> {
+    pub(crate) fn validate(&self) -> Result<(), StripeContractError> {
         for (value, name) in [
             (&self.account_id, "Stripe account"),
             (&self.monthly_price_id, "monthly Stripe price"),
@@ -348,6 +348,22 @@ impl StripeAllocationBinding {
     pub const fn payer_kind(&self) -> PayerKind {
         self.payer_kind
     }
+
+    pub fn allocation_reference(&self) -> &str {
+        &self.allocation_reference
+    }
+
+    pub fn customer_id(&self) -> &str {
+        &self.customer_id
+    }
+
+    pub fn subscription_id(&self) -> &str {
+        &self.subscription_id
+    }
+
+    pub fn provider_item_id(&self) -> &str {
+        &self.provider_item_id
+    }
 }
 
 /// Errors are intentionally typed so the caller can reject permanent evidence failures and retry
@@ -394,6 +410,26 @@ pub enum StripeContractError {
     OwnershipMismatch,
     #[error("Stripe coverage currently supports personal allocations only")]
     UnsupportedPayerKind,
+    #[error("Stripe renewal failure evidence is unsupported: {0}")]
+    UnsupportedRenewal(&'static str),
+}
+
+pub(crate) fn verify_webhook_signature(
+    webhook_secret: &str,
+    signature_header: &str,
+    payload: &str,
+    now: i64,
+) -> Result<(), StripeContractError> {
+    if webhook_secret.trim().is_empty() {
+        return Err(StripeContractError::InvalidConfig("Stripe webhook secret"));
+    }
+    verify_signature_detailed(webhook_secret, signature_header, payload, now).map_err(|error| {
+        match error {
+            SignatureVerificationError::Malformed => StripeContractError::MalformedSignature,
+            SignatureVerificationError::Stale => StripeContractError::StaleSignature,
+            SignatureVerificationError::Invalid => StripeContractError::InvalidSignature,
+        }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,13 +465,7 @@ pub fn decode_paid_invoice(
 ) -> Result<StripeCoverageEvidence, StripeContractError> {
     let payload =
         std::str::from_utf8(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;
-    verify_signature_detailed(webhook_secret, signature_header, payload, now).map_err(|error| {
-        match error {
-            SignatureVerificationError::Malformed => StripeContractError::MalformedSignature,
-            SignatureVerificationError::Stale => StripeContractError::StaleSignature,
-            SignatureVerificationError::Invalid => StripeContractError::InvalidSignature,
-        }
-    })?;
+    verify_webhook_signature(webhook_secret, signature_header, payload, now)?;
 
     let event: RawStripeEvent =
         serde_json::from_slice(raw_payload).map_err(|_| StripeContractError::MalformedPayload)?;

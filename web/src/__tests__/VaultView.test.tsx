@@ -625,3 +625,63 @@ describe("VaultView rotation ownership", () => {
     expect(screen.getByRole("button", { name: "env-a" })).toHaveAttribute("aria-current", "true");
   });
 });
+
+
+describe("VaultView project loading recovery", () => {
+  it("retries a failed project load without re-unlocking", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects)
+      .mockRejectedValueOnce(new Error("projects unavailable"))
+      .mockResolvedValueOnce([project("project-recovered")]);
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
+
+    renderVault();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("projects unavailable");
+    fireEvent.click(screen.getByRole("button", { name: "Retry projects" }));
+    expect(await screen.findByRole("button", { name: /project-recovered/ })).toBeInTheDocument();
+    expect(api.fetchProjects).toHaveBeenCalledTimes(2);
+  });
+});
+
+
+describe("VaultView independent initial loads", () => {
+  it("loads personal projects when organisation discovery fails", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockRejectedValue(new Error("offline"));
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("personal-a")]);
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
+
+    renderVault();
+
+    expect(await screen.findByRole("button", { name: /personal-a/ })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("organisations unavailable: offline");
+    expect(api.fetchProjects).toHaveBeenCalledOnce();
+  });
+});
+
+
+describe("VaultView navigation ordering", () => {
+  it("sorts projects and environments by decrypted display name", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("project-b"), project("project-a")]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-b"), environment("env-a")]);
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
+
+    renderVault();
+
+    const projects = screen.getByRole("heading", { name: "Projects" }).parentElement!;
+    await screen.findByRole("button", { name: /project-a/ });
+    expect([...projects.querySelectorAll("button")].map((button) => button.textContent)).toEqual([
+      "project-apersonal",
+      "project-bpersonal",
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: /project-a/ }));
+    const environments = await screen.findByRole("heading", { name: "Environments" });
+    expect([...environments.parentElement!.querySelectorAll("button")].map((button) => button.textContent))
+      .toEqual(["env-a", "env-b"]);
+  });
+});

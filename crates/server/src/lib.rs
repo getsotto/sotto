@@ -32,6 +32,8 @@ pub mod cloud_provider_stripe_corrections;
 // Dormant Stripe history transport; it remains unwired until the complete-history contract lands.
 #[doc(hidden)]
 pub mod cloud_provider_stripe_http;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_renewals;
 pub mod community;
 pub mod config;
 pub mod db;

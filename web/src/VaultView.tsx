@@ -81,6 +81,8 @@ export function VaultView({
   onLogout: () => void;
 }) {
   const [projects, setProjects] = useState<NamedProject[] | null>(null);
+  const [projectsLoading, setProjectsLoading] = useState(true);
+  const [projectsError, setProjectsError] = useState<string | null>(null);
   const [activeProject, setActiveProject] = useState<NamedProject | null>(null);
   const [envs, setEnvs] = useState<NamedEnv[] | null>(null);
   const [openEnv, setOpenEnv] = useState<OpenEnv | null>(null);
@@ -108,12 +110,37 @@ export function VaultView({
     return (orgId !== null ? orgKeys.get(orgId) : undefined) ?? master;
   }
 
+  async function loadProjects(keys: Map<string, Uint8Array>) {
+    setProjectsLoading(true);
+    setProjectsError(null);
+    try {
+      const rows = await fetchProjects();
+      setProjects(
+        rows
+          .map((project) => {
+            const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
+            return {
+              project,
+              name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
+            };
+          })
+          .sort((a, b) => a.name.localeCompare(b.name)),
+      );
+    } catch (e) {
+      setProjects([]);
+      setProjectsError(message(e));
+    } finally {
+      setProjectsLoading(false);
+    }
+  }
+
   useEffect(() => {
     void (async () => {
+      // Organisation discovery is optional for personal projects. Keep it isolated so
+      // a failure does not prevent the independent project request.
+      const keys = new Map<string, Uint8Array>();
+      const roles = new Map<string, string>();
       try {
-        // Open every org key we hold first, so org project names decrypt on first paint.
-        const keys = new Map<string, Uint8Array>();
-        const roles = new Map<string, string>();
         for (const org of await fetchOrgs()) {
           roles.set(org.id, org.role);
           if (org.encOrgKey !== null) {
@@ -124,22 +151,13 @@ export function VaultView({
             }
           }
         }
-        setOrgKeys(keys);
-        setOrgRoles(roles);
-
-        const rows = await fetchProjects();
-        setProjects(
-          rows.map((project) => {
-            const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
-            return {
-              project,
-              name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
-            };
-          }),
-        );
       } catch (e) {
-        setError(message(e));
+        setError(`organisations unavailable: ${message(e)}`);
       }
+      setOrgKeys(keys);
+      setOrgRoles(roles);
+
+      await loadProjects(keys);
     })();
   }, [master, encPrivateKeys]);
 
@@ -162,7 +180,9 @@ export function VaultView({
         return;
       }
       setEnvs(
-        rows.map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(key, env.id, env.encName)) })),
+        rows
+          .map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(key, env.id, env.encName)) }))
+          .sort((a, b) => a.name.localeCompare(b.name)),
       );
     } catch (e) {
       if (load !== projectLoad.current) {
@@ -406,11 +426,18 @@ export function VaultView({
 
       <section>
         <h2>Projects</h2>
-        {projects === null ? (
+        {projectsLoading ? (
           <p className="muted">Loading…</p>
         ) : (
-          <ul className="items">
-            {projects.map((p) => (
+          <>
+            {projectsError !== null && (
+              <p>
+                <span role="alert">{projectsError}</span>{" "}
+                <button onClick={() => void loadProjects(orgKeys)}>Retry projects</button>
+              </p>
+            )}
+            <ul className="items">
+            {(projects ?? []).map((p) => (
               <li key={p.project.id}>
                 <button
                   onClick={() => void selectProject(p)}
@@ -421,7 +448,8 @@ export function VaultView({
                 </button>
               </li>
             ))}
-          </ul>
+            </ul>
+          </>
         )}
       </section>
 

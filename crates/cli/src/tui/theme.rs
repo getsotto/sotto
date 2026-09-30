@@ -100,6 +100,14 @@ impl TuiStyles {
         }
     }
 
+    pub fn error(&self) -> Style {
+        if !self.active {
+            Style::default()
+        } else {
+            Style::default().fg(self.error)
+        }
+    }
+
     pub fn border(&self) -> Style {
         if !self.active {
             Style::default()
