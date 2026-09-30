@@ -53,6 +53,32 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+## Frontend development
+
+The web client uses Node.js 22 and wasm-pack 0.15.0, alongside the Rust and
+`wasm32-unknown-unknown` prerequisites above. Install wasm-pack using the
+[official project instructions](https://github.com/wasm-tool/wasm-pack#installation), then run
+the following from the repository root:
+
+```sh
+cd web
+npm ci
+npm run build:wasm
+npm run typecheck
+```
+
+`npm run build:wasm` generates the WebAssembly bindings required before
+typechecking. `npm run dev` generates those bindings and starts the Vite
+development server. `npm run build` generates bindings and creates a production
+bundle. `npm run smoke` generates Node bindings and checks that the crypto core
+loads.
+
+To run the development server against the local API, first follow the
+[server setup](README.md#running-the-server) in the README. Browser regression
+tests also need Postgres, Playwright and the e2e fixture described in
+[web/e2e/README.md](web/e2e/README.md); viewing the landing page does not
+exercise authenticated vault flows.
+
 ## Branches and pull requests
 
 - Keep branches focused on a single change or issue.
