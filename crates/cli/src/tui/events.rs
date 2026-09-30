@@ -60,6 +60,37 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
+    if app.show_history_modal {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.close_history_modal();
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.history_modal_up();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.history_modal_down();
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                app.history_modal_home();
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                app.history_modal_end();
+            }
+            KeyCode::Char('r') | KeyCode::Char(' ') => {
+                app.toggle_history_reveal();
+            }
+            KeyCode::Char('c') => {
+                app.copy_history_selected()?;
+            }
+            KeyCode::Enter | KeyCode::Char('b') => {
+                app.rollback_history_selected()?;
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     if app.show_secret_modal {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('g')) => {
@@ -178,6 +209,9 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
         KeyCode::Char('d') => {
             app.open_delete_modal();
         }
+        KeyCode::Char('h') => {
+            app.open_history_modal()?;
+        }
         KeyCode::Char('c') => {
             app.copy_selected()?;
         }
@@ -216,7 +250,20 @@ pub fn handle_mouse_event(app: &mut TuiApp, mouse: MouseEvent) -> Result<()> {
         return Ok(());
     }
 
-    if app.show_help || app.show_secret_modal || app.show_delete_modal {
+    if app.show_history_modal {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                app.history_modal_down();
+            }
+            MouseEventKind::ScrollUp => {
+                app.history_modal_up();
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    if app.show_help || app.show_secret_modal || app.show_delete_modal || app.show_history_modal {
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
             if app.show_help {
                 app.show_help = false;
@@ -615,5 +662,63 @@ mod tests {
         handle_key_event(&mut tui_app, key(KeyCode::Char('y'))).unwrap();
         assert!(!tui_app.show_delete_modal);
         assert_eq!(tui_app.secrets.len(), 0);
+    }
+
+    #[test]
+    fn history_modal_key_events() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let keychain = crate::keychain::MemoryKeychain::default();
+        crate::session::init(
+            &store,
+            &keychain,
+            b"pw",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master = crate::session::current_master_key(&keychain)
+            .unwrap()
+            .unwrap();
+        let keypair = crate::session::account_keypair(&store, &master).unwrap();
+        let project = crate::vault::Vault::create_project(&store, &keypair, "acme").unwrap();
+        let config = crate::config::Config {
+            project_id: project.id,
+            project: "acme".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let theme = crate::theme::Theme::default();
+        let app = crate::commands::App::new(&store, &keychain);
+        app.set(&config, "HIST_SECRET", b"val-v1").unwrap();
+        app.set(&config, "HIST_SECRET", b"val-v2").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert_eq!(tui_app.secrets.len(), 1);
+
+        // 'h' opens history modal
+        handle_key_event(&mut tui_app, key(KeyCode::Char('h'))).unwrap();
+        assert!(tui_app.show_history_modal);
+        assert_eq!(tui_app.history_modal_items.len(), 2);
+        assert_eq!(tui_app.history_modal_selected_index, 0);
+
+        // 'j' moves down to v1
+        handle_key_event(&mut tui_app, key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(tui_app.history_modal_selected_index, 1);
+
+        // 'r' toggles reveal
+        assert!(!tui_app.history_modal_revealed);
+        handle_key_event(&mut tui_app, key(KeyCode::Char('r'))).unwrap();
+        assert!(tui_app.history_modal_revealed);
+
+        // Enter rolls back to v1 (creates v3)
+        handle_key_event(&mut tui_app, key(KeyCode::Enter)).unwrap();
+        assert!(!tui_app.show_history_modal);
+        assert_eq!(tui_app.secrets[0].version, 3);
+        assert_eq!(app.get(&tui_app.config, "HIST_SECRET").unwrap(), b"val-v1");
+
+        // Re-open and Esc closes
+        handle_key_event(&mut tui_app, key(KeyCode::Char('h'))).unwrap();
+        assert!(tui_app.show_history_modal);
+        handle_key_event(&mut tui_app, key(KeyCode::Esc)).unwrap();
+        assert!(!tui_app.show_history_modal);
     }
 }

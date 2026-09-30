@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
-use crate::commands::App;
+use crate::commands::{App, SecretHistoryItem};
 use crate::config::Config;
 use crate::error::Result;
 use crate::store::Store;
@@ -62,6 +62,11 @@ pub struct TuiApp<'a> {
     pub secret_modal_masked: bool,
     pub show_delete_modal: bool,
     pub delete_modal_secret_name: String,
+    pub show_history_modal: bool,
+    pub history_modal_secret_name: String,
+    pub history_modal_items: Vec<SecretHistoryItem>,
+    pub history_modal_selected_index: usize,
+    pub history_modal_revealed: bool,
     pub environments: Vec<String>,
     pub active_env_index: usize,
     pub secrets: Vec<SecretItem>,
@@ -116,6 +121,11 @@ impl<'a> TuiApp<'a> {
             secret_modal_masked: true,
             show_delete_modal: false,
             delete_modal_secret_name: String::new(),
+            show_history_modal: false,
+            history_modal_secret_name: String::new(),
+            history_modal_items: Vec::new(),
+            history_modal_selected_index: 0,
+            history_modal_revealed: false,
             environments,
             active_env_index,
             secrets: Vec::new(),
@@ -333,6 +343,10 @@ impl<'a> TuiApp<'a> {
         self.available_themes = themes;
         self.selected_theme_index = selected_idx;
         self.show_theme_modal = true;
+        self.show_help = false;
+        self.show_secret_modal = false;
+        self.show_delete_modal = false;
+        self.show_history_modal = false;
         self.preview_selected_theme();
     }
 
@@ -431,6 +445,7 @@ impl<'a> TuiApp<'a> {
         self.show_help = false;
         self.show_theme_modal = false;
         self.show_delete_modal = false;
+        self.show_history_modal = false;
     }
 
     /// Open the dialogue to edit the selected secret's value.
@@ -450,6 +465,7 @@ impl<'a> TuiApp<'a> {
                     self.show_help = false;
                     self.show_theme_modal = false;
                     self.show_delete_modal = false;
+                    self.show_history_modal = false;
                 }
                 Err(_) => {
                     self.set_status("Cannot edit: secret contains non-UTF-8 bytes".into());
@@ -572,6 +588,7 @@ impl<'a> TuiApp<'a> {
             self.show_help = false;
             self.show_theme_modal = false;
             self.show_secret_modal = false;
+            self.show_history_modal = false;
         } else {
             self.set_status("No secret selected to delete".into());
         }
@@ -598,6 +615,138 @@ impl<'a> TuiApp<'a> {
             self.config.environment
         ));
         self.close_delete_modal();
+        Ok(())
+    }
+
+    /// Open the version history dialogue for the selected secret.
+    pub fn open_history_modal(&mut self) -> Result<()> {
+        let selected_name = self.selected_secret().map(|s| s.name.clone());
+        if let Some(secret_name) = selected_name {
+            match self.app.secret_history(&self.config, &secret_name) {
+                Ok(history) => {
+                    self.show_history_modal = true;
+                    self.history_modal_secret_name = secret_name;
+                    self.history_modal_items = history;
+                    self.history_modal_selected_index = 0;
+                    self.history_modal_revealed = false;
+                    self.show_help = false;
+                    self.show_theme_modal = false;
+                    self.show_secret_modal = false;
+                    self.show_delete_modal = false;
+                }
+                Err(err) => {
+                    self.set_status(format!("Failed to load version history: {err}"));
+                }
+            }
+        } else {
+            self.set_status("No secret selected to view history".into());
+        }
+        Ok(())
+    }
+
+    /// Close the version history dialogue.
+    pub fn close_history_modal(&mut self) {
+        self.show_history_modal = false;
+        self.history_modal_revealed = false;
+        self.history_modal_items.clear();
+        self.history_modal_secret_name.clear();
+        self.history_modal_selected_index = 0;
+    }
+
+    /// Move selection up in the version history list.
+    pub fn history_modal_up(&mut self) {
+        if self.history_modal_selected_index > 0 {
+            self.history_modal_selected_index -= 1;
+        }
+    }
+
+    /// Move selection down in the version history list.
+    pub fn history_modal_down(&mut self) {
+        if !self.history_modal_items.is_empty()
+            && self.history_modal_selected_index + 1 < self.history_modal_items.len()
+        {
+            self.history_modal_selected_index += 1;
+        }
+    }
+
+    /// Jump to the latest version in the version history list.
+    pub fn history_modal_home(&mut self) {
+        self.history_modal_selected_index = 0;
+    }
+
+    /// Jump to the earliest version in the version history list.
+    pub fn history_modal_end(&mut self) {
+        if !self.history_modal_items.is_empty() {
+            self.history_modal_selected_index = self.history_modal_items.len() - 1;
+        }
+    }
+
+    /// Toggle masking of secret values in the version history dialogue.
+    pub fn toggle_history_reveal(&mut self) {
+        self.history_modal_revealed = !self.history_modal_revealed;
+    }
+
+    /// Copy the currently selected historical version value to the clipboard.
+    pub fn copy_history_selected(&mut self) -> Result<()> {
+        if let Some(item) = self
+            .history_modal_items
+            .get(self.history_modal_selected_index)
+        {
+            if let Some(val) = &item.value {
+                match std::str::from_utf8(val) {
+                    Ok(text) => match crate::clipboard::copy(text) {
+                        Ok(()) => {
+                            let name = &self.history_modal_secret_name;
+                            let ver = item.version;
+                            self.set_status(format!(
+                                "Copied `{name}` (v{ver}) to clipboard (clears in 45s)"
+                            ));
+                        }
+                        Err(err) => {
+                            self.set_status(format!("Clipboard copy failed: {err}"));
+                        }
+                    },
+                    Err(_) => {
+                        self.set_status("Cannot copy: version contains non-UTF-8 bytes".into());
+                    }
+                }
+            } else {
+                self.set_status("Cannot copy: version value is unreadable".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Restore the selected historical version as a new current version (rollback).
+    pub fn rollback_history_selected(&mut self) -> Result<()> {
+        if let Some(item) = self
+            .history_modal_items
+            .get(self.history_modal_selected_index)
+        {
+            let target_version = item.version;
+            let secret_name = self.history_modal_secret_name.clone();
+            match self
+                .app
+                .rollback(&self.config, &secret_name, target_version)
+            {
+                Ok(()) => {
+                    self.refresh_secrets()?;
+                    let new_version = self
+                        .secrets
+                        .iter()
+                        .find(|s| s.name == secret_name)
+                        .map(|s| s.version)
+                        .unwrap_or(target_version + 1);
+                    self.close_history_modal();
+                    self.set_status(format!(
+                        "Restored `{secret_name}` to v{target_version} (saved as v{new_version})"
+                    ));
+                }
+                Err(err) => {
+                    self.set_status(format!("Rollback failed: {err}"));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -1107,6 +1256,65 @@ mod tests {
         assert_eq!(
             tui_app.status_message.as_ref().map(|(m, _)| m.as_str()),
             Some("Deleted secret `TARGET` from `dev`")
+        );
+    }
+
+    #[test]
+    fn version_history_modal_lifecycle_and_rollback() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+
+        // Populate a secret with 3 versions
+        app.set(&config, "HOST_KEY", b"v1-initial").unwrap();
+        app.set(&config, "HOST_KEY", b"v2-staging").unwrap();
+        app.set(&config, "HOST_KEY", b"v3-production").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert_eq!(tui_app.secrets.len(), 1);
+        assert_eq!(tui_app.secrets[0].version, 3);
+
+        // Open history modal
+        tui_app.open_history_modal().unwrap();
+        assert!(tui_app.show_history_modal);
+        assert_eq!(tui_app.history_modal_secret_name, "HOST_KEY");
+        assert_eq!(tui_app.history_modal_items.len(), 3);
+        assert_eq!(tui_app.history_modal_selected_index, 0);
+        assert_eq!(tui_app.history_modal_items[0].version, 3);
+        assert_eq!(tui_app.history_modal_items[1].version, 2);
+        assert_eq!(tui_app.history_modal_items[2].version, 1);
+
+        // Test reveal toggle
+        assert!(!tui_app.history_modal_revealed);
+        tui_app.toggle_history_reveal();
+        assert!(tui_app.history_modal_revealed);
+
+        // Test navigation
+        tui_app.history_modal_down();
+        assert_eq!(tui_app.history_modal_selected_index, 1); // pointing to v2
+        tui_app.history_modal_down();
+        assert_eq!(tui_app.history_modal_selected_index, 2); // pointing to v1
+        tui_app.history_modal_down();
+        assert_eq!(tui_app.history_modal_selected_index, 2); // clamped at bottom
+        tui_app.history_modal_up();
+        assert_eq!(tui_app.history_modal_selected_index, 1); // back to v2
+        tui_app.history_modal_home();
+        assert_eq!(tui_app.history_modal_selected_index, 0); // v3
+        tui_app.history_modal_end();
+        assert_eq!(tui_app.history_modal_selected_index, 2); // v1
+
+        // Move to v2 and roll back
+        tui_app.history_modal_selected_index = 1;
+        tui_app.rollback_history_selected().unwrap();
+
+        // Verify modal closed, secret restored to v2 value and recorded as v4
+        assert!(!tui_app.show_history_modal);
+        assert_eq!(tui_app.secrets[0].version, 4);
+        let restored_val = app.get(&tui_app.config, "HOST_KEY").unwrap();
+        assert_eq!(restored_val, b"v2-staging");
+        assert_eq!(
+            tui_app.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some("Restored `HOST_KEY` to v2 (saved as v4)")
         );
     }
 }

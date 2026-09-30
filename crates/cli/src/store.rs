@@ -112,6 +112,7 @@ pub struct SecretVersion {
     pub enc_name: Vec<u8>,
     pub enc_value: Vec<u8>,
     pub enc_data_key: Vec<u8>,
+    pub created_at: i64,
 }
 
 /// A secret as the sync engine sees it: opaque ciphertext + version + tombstone flag.
@@ -491,7 +492,7 @@ impl Store {
     /// Return the retained version history of a secret, oldest first.
     pub fn secret_versions(&self, secret_id: &str) -> Result<Vec<SecretVersion>> {
         let mut stmt = self.conn.prepare(
-            "SELECT version, enc_name, enc_value, enc_data_key
+            "SELECT version, enc_name, enc_value, enc_data_key, created_at
              FROM secret_versions WHERE secret_id = ?1 ORDER BY version",
         )?;
         let rows = stmt.query_map(params![secret_id], |r| {
@@ -500,6 +501,7 @@ impl Store {
                 enc_name: r.get(1)?,
                 enc_value: r.get(2)?,
                 enc_data_key: r.get(3)?,
+                created_at: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -704,6 +706,8 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].enc_value, b"v1");
         assert_eq!(history[1].enc_value, b"v2");
+        assert!(history[0].created_at > 0);
+        assert!(history[1].created_at >= history[0].created_at);
 
         // soft delete hides it from listing but retains history
         s.delete_secret(&row.id).unwrap();

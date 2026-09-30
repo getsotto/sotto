@@ -36,6 +36,8 @@ pub fn draw(f: &mut Frame, app: &TuiApp) {
         draw_secret_modal(f, app, size);
     } else if app.show_delete_modal {
         draw_delete_modal(f, app, size);
+    } else if app.show_history_modal {
+        draw_history_modal(f, app, size);
     }
 }
 
@@ -288,6 +290,10 @@ fn draw_right_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled("Delete secret", styles.text()),
         ]));
         lines.push(Line::from(vec![
+            Span::styled("  [h] ", styles.bold_accent()),
+            Span::styled("View version history", styles.text()),
+        ]));
+        lines.push(Line::from(vec![
             Span::styled("  [Tab] ", styles.bold_accent()),
             Span::styled("Cycle active environment", styles.text()),
         ]));
@@ -349,7 +355,7 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     let styles = &app.styles;
 
     let popup_width = 54.min(area.width.saturating_sub(4));
-    let popup_height = 23.min(area.height.saturating_sub(2));
+    let popup_height = 24.min(area.height.saturating_sub(2));
 
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
@@ -402,6 +408,10 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
         Line::from(vec![
             Span::styled("  d           ", styles.bold_accent()),
             Span::styled("Delete selected secret", styles.text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  h           ", styles.bold_accent()),
+            Span::styled("View secret version history", styles.text()),
         ]),
         Line::from(vec![
             Span::styled("  c           ", styles.bold_accent()),
@@ -711,6 +721,175 @@ fn draw_delete_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     f.render_widget(paragraph, popup_area);
 }
 
+fn format_relative_time(created_at_ms: i64) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let diff_ms = (now_ms - created_at_ms).max(0);
+    let diff_secs = diff_ms / 1000;
+    if diff_secs < 60 {
+        "just now".to_string()
+    } else if diff_secs < 3600 {
+        let mins = diff_secs / 60;
+        format!("{mins}m ago")
+    } else if diff_secs < 86400 {
+        let hours = diff_secs / 3600;
+        format!("{hours}h ago")
+    } else {
+        let days = diff_secs / 86400;
+        format!("{days}d ago")
+    }
+}
+
+fn draw_history_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let styles = &app.styles;
+
+    let popup_width = 72.min(area.width.saturating_sub(4));
+    let popup_height = 18.min(area.height.saturating_sub(2));
+
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let y = (area.height.saturating_sub(popup_height)) / 2;
+    let popup_area = Rect::new(x, y, popup_width, popup_height);
+
+    f.render_widget(Clear, popup_area);
+
+    let title = format!(" Version History: {} ", app.history_modal_secret_name);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(styles.bold_accent())
+        .title(Span::styled(title, styles.bold_accent()));
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Environment: ", styles.muted()),
+        Span::styled(&app.config.environment, styles.bold_accent()),
+        Span::styled("  |  Total: ", styles.muted()),
+        Span::styled(
+            format!("{} version(s)", app.history_modal_items.len()),
+            styles.text(),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    if app.history_modal_items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No versions recorded for this secret.",
+            styles.muted(),
+        )));
+    } else {
+        let available_slots = popup_height.saturating_sub(8) as usize;
+        let max_visible = available_slots.max(1);
+        let total_items = app.history_modal_items.len();
+        let selected = app.history_modal_selected_index;
+
+        let start = if total_items <= max_visible || selected < max_visible / 2 {
+            0
+        } else if selected + max_visible / 2 >= total_items {
+            total_items.saturating_sub(max_visible)
+        } else {
+            selected.saturating_sub(max_visible / 2)
+        };
+        let end = (start + max_visible).min(total_items);
+
+        if start > 0 {
+            lines.push(Line::from(Span::styled(
+                "  (↑ more versions above)",
+                styles.muted(),
+            )));
+        }
+
+        for (idx, item) in app
+            .history_modal_items
+            .iter()
+            .enumerate()
+            .take(end)
+            .skip(start)
+        {
+            let is_selected = idx == selected;
+            let cursor = if is_selected { "▸ " } else { "  " };
+            let latest_tag = if idx == 0 { " (latest)" } else { "" };
+            let time_str = format_relative_time(item.created_at);
+
+            let value_repr = if app.history_modal_revealed {
+                if let Some(val) = &item.value {
+                    match std::str::from_utf8(val) {
+                        Ok(text) => text.lines().next().unwrap_or("").to_string(),
+                        Err(_) => "[binary data]".to_string(),
+                    }
+                } else {
+                    "[unreadable]".to_string()
+                }
+            } else if let Some(val) = &item.value {
+                format!("•••••••••••••••••••• ({}B)", val.len())
+            } else {
+                "[unreadable]".to_string()
+            };
+
+            let row_spans = vec![
+                Span::styled(
+                    cursor,
+                    if is_selected {
+                        styles.bold_accent()
+                    } else {
+                        styles.muted()
+                    },
+                ),
+                Span::styled(
+                    format!("v{}{latest_tag:<9}", item.version),
+                    if is_selected {
+                        styles.bold_accent()
+                    } else {
+                        styles.text()
+                    },
+                ),
+                Span::styled(format!("{time_str:<10}"), styles.muted()),
+                Span::styled(
+                    format!(" {value_repr}"),
+                    if is_selected {
+                        styles.selected()
+                    } else {
+                        styles.text()
+                    },
+                ),
+            ];
+            lines.push(Line::from(row_spans));
+        }
+
+        if end < total_items {
+            lines.push(Line::from(Span::styled(
+                "  (↓ more versions below)",
+                styles.muted(),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  [r] ", styles.bold_accent()),
+        Span::styled(
+            if app.history_modal_revealed {
+                "Conceal   "
+            } else {
+                "Reveal   "
+            },
+            styles.muted(),
+        ),
+        Span::styled("[c] ", styles.bold_accent()),
+        Span::styled("Copy   ", styles.muted()),
+        Span::styled("[Enter] ", styles.bold_accent()),
+        Span::styled("Restore   ", styles.success()),
+        Span::styled("[Esc] ", styles.bold_accent()),
+        Span::styled("Close", styles.muted()),
+    ]));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(paragraph, popup_area);
+}
+
 const CIPHER_GLYPHS: &[char] = &['%', '#', '*', '@', '&', '?', '0', '1', '$', '!'];
 
 fn render_cipher_unscramble_line<'a>(
@@ -817,7 +996,7 @@ mod tests {
         ];
 
         for (width, height) in sizes {
-            for modal_state in 0..6 {
+            for modal_state in 0..7 {
                 let mut tui_app = TuiApp::new(&app, &store, config.clone(), &theme).unwrap();
                 match modal_state {
                     0 => {} // Normal view
@@ -826,6 +1005,7 @@ mod tests {
                     3 => tui_app.open_new_secret_modal(),
                     4 => tui_app.open_edit_secret_modal().unwrap(),
                     5 => tui_app.open_delete_modal(),
+                    6 => tui_app.open_history_modal().unwrap(),
                     _ => {}
                 }
                 let backend = TestBackend::new(width, height);
@@ -1091,5 +1271,73 @@ mod tests {
         assert!(content.contains("This action cannot be undone."));
         assert!(content.contains("Delete Secret"));
         assert!(content.contains("Cancel"));
+    }
+
+    #[test]
+    fn render_history_modal_masked_and_revealed() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "PAYMENT_KEY", b"v1-secret").unwrap();
+        app.set(&config, "PAYMENT_KEY", b"v2-secret").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_history_modal().unwrap();
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Masked render
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains("Version History: PAYMENT_KEY"));
+        assert!(content.contains("v2"));
+        assert!(content.contains("(latest)"));
+        assert!(content.contains("v1"));
+        assert!(content.contains("••••••••••••••••••••"));
+        assert!(!content.contains("v1-secret"));
+        assert!(content.contains("Reveal"));
+        assert!(content.contains("Restore"));
+
+        // Revealed render
+        tui_app.toggle_history_reveal();
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let revealed_content = format!("{:?}", terminal.backend().buffer());
+        assert!(revealed_content.contains("v2-secret"));
+        assert!(revealed_content.contains("v1-secret"));
+        assert!(revealed_content.contains("Conceal"));
+    }
+
+    #[test]
+    fn render_history_modal_scrolling() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        for i in 1..=15 {
+            app.set(&config, "MANY_VERSIONS", format!("val-{i}").as_bytes())
+                .unwrap();
+        }
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_history_modal().unwrap();
+        assert_eq!(tui_app.history_modal_items.len(), 15);
+
+        // Terminal with constrained height (height 14)
+        let backend = TestBackend::new(90, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Selected at top: v15 visible, scroll down indicator shown
+        tui_app.history_modal_selected_index = 0;
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains("v15"));
+        assert!(content.contains("more versions below"));
+
+        // Jump to end: v1 visible, scroll up indicator shown
+        tui_app.history_modal_end();
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let end_content = format!("{:?}", terminal.backend().buffer());
+        assert!(end_content.contains("v1"));
+        assert!(end_content.contains("more versions above"));
     }
 }
