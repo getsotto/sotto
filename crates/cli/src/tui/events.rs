@@ -192,20 +192,134 @@ mod tests {
         }
     }
 
-    #[test]
-    fn search_mode_appends_and_backspaces() {
-        let mut query = String::new();
-        let k = key(KeyCode::Char('a'));
-        if let KeyCode::Char(c) = k.code {
-            query.push(c);
+    fn with_search_app(check: impl FnOnce(&mut TuiApp<'_>)) {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let keychain = crate::keychain::MemoryKeychain::default();
+        crate::session::init(
+            &store,
+            &keychain,
+            b"pw",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master = crate::session::current_master_key(&keychain)
+            .unwrap()
+            .unwrap();
+        let keypair = crate::session::account_keypair(&store, &master).unwrap();
+        let project = crate::vault::Vault::create_project(&store, &keypair, "search-test").unwrap();
+        let config = crate::config::Config {
+            project_id: project.id,
+            project: "search-test".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let theme = crate::theme::Theme::default();
+        let app = crate::commands::App::new(&store, &keychain);
+        for name in ["API_KEY", "DATABASE_URL", "DATA_DIR"] {
+            // Non-UTF-8 dummy values reject an accidental copy before reaching the host clipboard.
+            app.set(&config, name, &[0xff]).unwrap();
         }
-        assert_eq!(query, "a");
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        check(&mut tui_app);
+    }
 
-        let b = key(KeyCode::Backspace);
-        if b.code == KeyCode::Backspace {
-            query.pop();
+    fn search_for(app: &mut TuiApp, query: &str) {
+        handle_key_event(app, key(KeyCode::Char('/'))).unwrap();
+        assert!(app.search_mode);
+        for character in query.chars() {
+            handle_key_event(app, key(KeyCode::Char(character))).unwrap();
         }
-        assert_eq!(query, "");
+    }
+
+    fn filtered_names<'a>(app: &'a TuiApp) -> Vec<&'a str> {
+        app.filtered_indices
+            .iter()
+            .map(|&index| app.secrets[index].name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn search_keys_filter_and_backspace_through_no_match() {
+        with_search_app(|app| {
+            search_for(app, "aPi");
+            assert_eq!(app.search_query, "aPi");
+            assert_eq!(filtered_names(app), ["API_KEY"]);
+            assert_eq!(app.selected_secret().unwrap().name, "API_KEY");
+
+            handle_key_event(app, key(KeyCode::Char('x'))).unwrap();
+            assert_eq!(app.search_query, "aPix");
+            assert!(filtered_names(app).is_empty());
+            assert!(app.selected_secret().is_none());
+
+            handle_key_event(app, key(KeyCode::Backspace)).unwrap();
+            assert_eq!(app.search_query, "aPi");
+            assert_eq!(filtered_names(app), ["API_KEY"]);
+            assert_eq!(app.selected_secret().unwrap().name, "API_KEY");
+            assert!(app.search_mode);
+        });
+    }
+
+    #[test]
+    fn search_enter_keeps_filter_then_escape_clears_without_quitting() {
+        with_search_app(|app| {
+            search_for(app, "api");
+            handle_key_event(app, key(KeyCode::Enter)).unwrap();
+            assert!(!app.search_mode);
+            assert_eq!(app.search_query, "api");
+            assert_eq!(filtered_names(app), ["API_KEY"]);
+
+            handle_key_event(app, key(KeyCode::Esc)).unwrap();
+            assert!(app.running);
+            assert!(!app.search_mode);
+            assert_eq!(app.search_query, "");
+            assert_eq!(filtered_names(app), ["API_KEY", "DATABASE_URL", "DATA_DIR"]);
+        });
+    }
+
+    #[test]
+    fn search_escape_clears_query_and_restores_list() {
+        with_search_app(|app| {
+            search_for(app, "api");
+            handle_key_event(app, key(KeyCode::Esc)).unwrap();
+            assert!(app.running);
+            assert!(!app.search_mode);
+            assert_eq!(app.search_query, "");
+            assert_eq!(filtered_names(app), ["API_KEY", "DATABASE_URL", "DATA_DIR"]);
+            assert!(app.selected_secret().is_some());
+        });
+    }
+
+    #[test]
+    fn search_shortcuts_are_query_text() {
+        for character in ['q', 'c', 'r', 't', '?'] {
+            with_search_app(|app| {
+                search_for(app, &character.to_string());
+                assert_eq!(app.search_query, character.to_string());
+                assert!(app.search_mode);
+                assert!(app.running);
+                assert!(!app.revealed);
+                assert!(app.decrypted_cache.is_none());
+                assert!(!app.show_help);
+                assert!(!app.show_theme_modal);
+                assert!(app.status_message.is_none());
+            });
+        }
+    }
+
+    #[test]
+    fn search_navigation_keeps_filter_and_selects_a_result() {
+        with_search_app(|app| {
+            search_for(app, "data");
+            assert_eq!(filtered_names(app), ["DATABASE_URL", "DATA_DIR"]);
+            assert_eq!(app.selected_secret().unwrap().name, "DATABASE_URL");
+
+            handle_key_event(app, key(KeyCode::Down)).unwrap();
+            assert!(!app.search_mode);
+            assert_eq!(app.search_query, "data");
+            assert_eq!(filtered_names(app), ["DATABASE_URL", "DATA_DIR"]);
+            assert_eq!(app.selected_secret().unwrap().name, "DATA_DIR");
+            assert!(app.running);
+        });
     }
 
     #[test]
