@@ -1,5 +1,6 @@
 //! TUI application state management for the interactive Sotto dashboard.
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -12,12 +13,55 @@ use crate::theme::Theme;
 use crate::tui::theme::TuiStyles;
 use crate::vault::SecretItem;
 
+/// Editing mode for the secret modal dialogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretModalMode {
+    New,
+    Edit,
+}
+
+/// Active focus field inside the secret modal dialogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretModalField {
+    Name,
+    Value,
+}
+
+/// Generate a cryptographically secure random secret string using the core CSPRNG.
+pub fn generate_random_secret(length: usize) -> String {
+    const CHARSET: &[u8] =
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*(-_=+)";
+    let mut buf = vec![0u8; length];
+    for chunk in buf.chunks_mut(32) {
+        let raw = sotto_core::random::bytes::<32>();
+        let to_copy = chunk.len().min(32);
+        chunk[..to_copy].copy_from_slice(&raw[..to_copy]);
+    }
+    buf.iter()
+        .map(|&byte| CHARSET[(byte as usize) % CHARSET.len()] as char)
+        .collect()
+}
+
 /// Application state for the interactive split-pane dashboard.
 pub struct TuiApp<'a> {
     pub app: &'a App<'a>,
     pub store: &'a Store,
     pub config: Config,
+    pub config_path: Option<PathBuf>,
     pub styles: TuiStyles,
+    pub current_theme: Theme,
+    pub original_theme: Theme,
+    pub available_themes: Vec<Theme>,
+    pub selected_theme_index: usize,
+    pub show_theme_modal: bool,
+    pub show_secret_modal: bool,
+    pub secret_modal_mode: SecretModalMode,
+    pub secret_modal_name: String,
+    pub secret_modal_value: Zeroizing<String>,
+    pub secret_modal_field: SecretModalField,
+    pub secret_modal_masked: bool,
+    pub show_delete_modal: bool,
+    pub delete_modal_secret_name: String,
     pub environments: Vec<String>,
     pub active_env_index: usize,
     pub secrets: Vec<SecretItem>,
@@ -27,6 +71,7 @@ pub struct TuiApp<'a> {
     pub search_mode: bool,
     pub revealed: bool,
     pub decrypted_cache: Option<Zeroizing<Vec<u8>>>,
+    pub reveal_animation_start: Option<Instant>,
     pub show_help: bool,
     pub status_message: Option<(String, Instant)>,
     pub running: bool,
@@ -56,7 +101,21 @@ impl<'a> TuiApp<'a> {
             app,
             store,
             config,
+            config_path: crate::paths::config_path().ok(),
             styles,
+            current_theme: theme.clone(),
+            original_theme: theme.clone(),
+            available_themes: Vec::new(),
+            selected_theme_index: 0,
+            show_theme_modal: false,
+            show_secret_modal: false,
+            secret_modal_mode: SecretModalMode::New,
+            secret_modal_name: String::new(),
+            secret_modal_value: Zeroizing::new(String::new()),
+            secret_modal_field: SecretModalField::Name,
+            secret_modal_masked: true,
+            show_delete_modal: false,
+            delete_modal_secret_name: String::new(),
             environments,
             active_env_index,
             secrets: Vec::new(),
@@ -66,6 +125,7 @@ impl<'a> TuiApp<'a> {
             search_mode: false,
             revealed: false,
             decrypted_cache: None,
+            reveal_animation_start: None,
             show_help: false,
             status_message: None,
             running: true,
@@ -109,10 +169,11 @@ impl<'a> TuiApp<'a> {
         self.reset_secret_view();
     }
 
-    /// Reset any revealed or cached secret cleartext.
+    /// Reset any revealed or cached secret cleartext and ongoing reveal animations.
     pub fn reset_secret_view(&mut self) {
         self.revealed = false;
         self.decrypted_cache = None;
+        self.reveal_animation_start = None;
     }
 
     /// Get the currently highlighted secret item, if one exists.
@@ -186,6 +247,7 @@ impl<'a> TuiApp<'a> {
             let value = self.app.get(&self.config, &item.name)?;
             self.decrypted_cache = Some(Zeroizing::new(value));
             self.revealed = true;
+            self.reveal_animation_start = Some(Instant::now());
         }
         Ok(())
     }
@@ -252,6 +314,291 @@ impl<'a> TuiApp<'a> {
             }
         }
         None
+    }
+
+    /// Open the theme switcher modal, discovering available themes and capturing the original theme.
+    pub fn open_theme_modal(&mut self) {
+        let themes_dir = crate::paths::themes_path().ok();
+        let mut themes = crate::theme::available_themes(themes_dir.as_deref());
+        if themes.is_empty() {
+            themes = Theme::presets();
+        }
+
+        let selected_idx = themes
+            .iter()
+            .position(|t| t.name.eq_ignore_ascii_case(&self.current_theme.name))
+            .unwrap_or(0);
+
+        self.original_theme = self.current_theme.clone();
+        self.available_themes = themes;
+        self.selected_theme_index = selected_idx;
+        self.show_theme_modal = true;
+        self.preview_selected_theme();
+    }
+
+    /// Update the active styles and current theme to preview the currently selected theme item.
+    pub fn preview_selected_theme(&mut self) {
+        if let Some(selected) = self.available_themes.get(self.selected_theme_index) {
+            let active = self.original_theme.active;
+            let preview = selected.clone().with_active(active);
+            self.styles = TuiStyles::from_theme(&preview);
+            self.current_theme = preview;
+        }
+    }
+
+    /// Select the next theme in the modal list with real-time preview.
+    pub fn next_theme(&mut self) {
+        if !self.available_themes.is_empty() {
+            self.selected_theme_index =
+                (self.selected_theme_index + 1) % self.available_themes.len();
+            self.preview_selected_theme();
+        }
+    }
+
+    /// Select the previous theme in the modal list with real-time preview.
+    pub fn previous_theme(&mut self) {
+        if !self.available_themes.is_empty() {
+            if self.selected_theme_index == 0 {
+                self.selected_theme_index = self.available_themes.len() - 1;
+            } else {
+                self.selected_theme_index -= 1;
+            }
+            self.preview_selected_theme();
+        }
+    }
+
+    /// Jump to the first theme in the modal list.
+    pub fn theme_home(&mut self) {
+        if !self.available_themes.is_empty() {
+            self.selected_theme_index = 0;
+            self.preview_selected_theme();
+        }
+    }
+
+    /// Jump to the last theme in the modal list.
+    pub fn theme_end(&mut self) {
+        if !self.available_themes.is_empty() {
+            self.selected_theme_index = self.available_themes.len() - 1;
+            self.preview_selected_theme();
+        }
+    }
+
+    /// Commit the selected theme and persist the choice into the user configuration.
+    pub fn commit_theme(&mut self) -> Result<()> {
+        if let Some(selected) = self.available_themes.get(self.selected_theme_index) {
+            let theme_name = selected.name.clone();
+            let target_path = self
+                .config_path
+                .clone()
+                .or_else(|| crate::paths::config_path().ok());
+
+            match target_path {
+                Some(config_path) => {
+                    if let Some(parent) = config_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(err) = crate::theme::save_theme_preference(&theme_name, &config_path)
+                    {
+                        self.set_status(format!("Failed to persist theme preference: {err}"));
+                    } else {
+                        self.set_status(format!("Theme set to `{theme_name}`"));
+                    }
+                }
+                None => {
+                    self.set_status("Failed to locate configuration file".into());
+                }
+            }
+        }
+        self.show_theme_modal = false;
+        Ok(())
+    }
+
+    /// Revert any live preview back to the original theme and close the modal.
+    pub fn revert_theme(&mut self) {
+        self.current_theme = self.original_theme.clone();
+        self.styles = TuiStyles::from_theme(&self.current_theme);
+        self.show_theme_modal = false;
+    }
+
+    /// Open the dialogue to create a new secret in the active environment.
+    pub fn open_new_secret_modal(&mut self) {
+        self.show_secret_modal = true;
+        self.secret_modal_mode = SecretModalMode::New;
+        self.secret_modal_name.clear();
+        self.secret_modal_value = Zeroizing::new(String::new());
+        self.secret_modal_field = SecretModalField::Name;
+        self.secret_modal_masked = true;
+        self.show_help = false;
+        self.show_theme_modal = false;
+        self.show_delete_modal = false;
+    }
+
+    /// Open the dialogue to edit the selected secret's value.
+    pub fn open_edit_secret_modal(&mut self) -> Result<()> {
+        let selected_name = self.selected_secret().map(|s| s.name.clone());
+        if let Some(secret_name) = selected_name {
+            let value = self.app.get(&self.config, &secret_name)?;
+            let zeroized = Zeroizing::new(value);
+            match std::str::from_utf8(&zeroized) {
+                Ok(text) => {
+                    self.show_secret_modal = true;
+                    self.secret_modal_mode = SecretModalMode::Edit;
+                    self.secret_modal_name = secret_name;
+                    self.secret_modal_value = Zeroizing::new(text.to_string());
+                    self.secret_modal_field = SecretModalField::Value;
+                    self.secret_modal_masked = true;
+                    self.show_help = false;
+                    self.show_theme_modal = false;
+                    self.show_delete_modal = false;
+                }
+                Err(_) => {
+                    self.set_status("Cannot edit: secret contains non-UTF-8 bytes".into());
+                }
+            }
+        } else {
+            self.set_status("No secret selected to edit".into());
+        }
+        Ok(())
+    }
+
+    /// Close the secret creation or edit modal without saving.
+    pub fn close_secret_modal(&mut self) {
+        self.show_secret_modal = false;
+        self.secret_modal_name.clear();
+        self.secret_modal_value = Zeroizing::new(String::new());
+    }
+
+    /// Switch to the next field in the secret modal dialogue.
+    pub fn secret_modal_next_field(&mut self) {
+        if self.secret_modal_mode == SecretModalMode::New {
+            self.secret_modal_field = match self.secret_modal_field {
+                SecretModalField::Name => SecretModalField::Value,
+                SecretModalField::Value => SecretModalField::Name,
+            };
+        }
+    }
+
+    /// Switch to the previous field in the secret modal dialogue.
+    pub fn secret_modal_prev_field(&mut self) {
+        self.secret_modal_next_field();
+    }
+
+    /// Insert a character into the currently focused secret modal field.
+    pub fn secret_modal_insert_char(&mut self, c: char) {
+        match self.secret_modal_field {
+            SecretModalField::Name if self.secret_modal_mode == SecretModalMode::New => {
+                self.secret_modal_name.push(c);
+            }
+            SecretModalField::Value => {
+                self.secret_modal_value.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    /// Delete the preceding character from the currently focused secret modal field.
+    pub fn secret_modal_backspace(&mut self) {
+        match self.secret_modal_field {
+            SecretModalField::Name if self.secret_modal_mode == SecretModalMode::New => {
+                self.secret_modal_name.pop();
+            }
+            SecretModalField::Value => {
+                self.secret_modal_value.pop();
+            }
+            _ => {}
+        }
+    }
+
+    /// Toggle masking of the secret value field inside the modal dialogue.
+    pub fn toggle_secret_modal_mask(&mut self) {
+        self.secret_modal_masked = !self.secret_modal_masked;
+    }
+
+    /// Populate the secret modal value field with a cryptographically secure random string.
+    pub fn generate_secret_modal_value(&mut self) {
+        let generated = generate_random_secret(32);
+        self.secret_modal_value = Zeroizing::new(generated);
+        self.set_status("Generated 32-character random secret".into());
+    }
+
+    /// Commit and save the secret modal contents to the active vault.
+    pub fn commit_secret_modal(&mut self) -> Result<()> {
+        let name = self.secret_modal_name.trim().to_string();
+        if name.is_empty() {
+            self.set_status("Secret name cannot be empty".into());
+            return Ok(());
+        }
+        if name.contains(|c: char| c.is_whitespace()) {
+            self.set_status("Secret name cannot contain whitespace".into());
+            return Ok(());
+        }
+
+        let is_new = self.secret_modal_mode == SecretModalMode::New;
+        self.app
+            .set(&self.config, &name, self.secret_modal_value.as_bytes())?;
+        self.refresh_secrets()?;
+
+        if let Some(pos) = self.filtered_indices.iter().position(|&idx| {
+            self.secrets
+                .get(idx)
+                .map(|s| s.name == name)
+                .unwrap_or(false)
+        }) {
+            self.selected_filtered_index = pos;
+        }
+
+        if is_new {
+            self.set_status(format!(
+                "Created secret `{name}` in `{}`",
+                self.config.environment
+            ));
+        } else {
+            self.set_status(format!(
+                "Updated secret `{name}` in `{}`",
+                self.config.environment
+            ));
+        }
+
+        self.close_secret_modal();
+        Ok(())
+    }
+
+    /// Open the confirmation dialogue to delete the selected secret.
+    pub fn open_delete_modal(&mut self) {
+        let selected_name = self.selected_secret().map(|s| s.name.clone());
+        if let Some(name) = selected_name {
+            self.show_delete_modal = true;
+            self.delete_modal_secret_name = name;
+            self.show_help = false;
+            self.show_theme_modal = false;
+            self.show_secret_modal = false;
+        } else {
+            self.set_status("No secret selected to delete".into());
+        }
+    }
+
+    /// Close the delete confirmation dialogue without deleting.
+    pub fn close_delete_modal(&mut self) {
+        self.show_delete_modal = false;
+        self.delete_modal_secret_name.clear();
+    }
+
+    /// Confirm and execute the deletion of the selected secret.
+    pub fn commit_delete_modal(&mut self) -> Result<()> {
+        let name = self.delete_modal_secret_name.clone();
+        if name.is_empty() {
+            self.close_delete_modal();
+            return Ok(());
+        }
+
+        self.app.remove(&self.config, &name)?;
+        self.refresh_secrets()?;
+        self.set_status(format!(
+            "Deleted secret `{name}` from `{}`",
+            self.config.environment
+        ));
+        self.close_delete_modal();
+        Ok(())
     }
 }
 
@@ -527,5 +874,239 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn theme_modal_lifecycle_and_live_preview() {
+        let (store, keychain, config) = unlocked();
+        let initial_theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        let mut tui_app = TuiApp::new(&app, &store, config, &initial_theme).unwrap();
+
+        assert!(!tui_app.show_theme_modal);
+        assert_eq!(tui_app.current_theme.name, "nord");
+
+        // Open modal
+        tui_app.open_theme_modal();
+        assert!(tui_app.show_theme_modal);
+        assert!(!tui_app.available_themes.is_empty());
+        assert_eq!(tui_app.original_theme.name, "nord");
+
+        // Cycle through themes and observe live style updates
+        let initial_accent = tui_app.styles.accent;
+        tui_app.next_theme();
+        let next_theme_name = tui_app.current_theme.name.clone();
+        assert_ne!(next_theme_name, "nord");
+        let next_accent = tui_app.styles.accent;
+        assert_ne!(initial_accent, next_accent);
+
+        // Test theme home and end
+        tui_app.theme_end();
+        assert_eq!(
+            tui_app.selected_theme_index,
+            tui_app.available_themes.len() - 1
+        );
+        tui_app.theme_home();
+        assert_eq!(tui_app.selected_theme_index, 0);
+
+        // Reverting restores original theme and styles
+        tui_app.next_theme();
+        assert_ne!(tui_app.current_theme.name, "nord");
+        tui_app.revert_theme();
+        assert!(!tui_app.show_theme_modal);
+        assert_eq!(tui_app.current_theme.name, "nord");
+        assert_eq!(tui_app.styles.accent, initial_accent);
+
+        // Committing theme keeps preview and closes modal with isolated config path
+        let temp_dir = tempfile::tempdir().unwrap();
+        let isolated_config = temp_dir.path().join("config.toml");
+        tui_app.config_path = Some(isolated_config.clone());
+
+        tui_app.open_theme_modal();
+        tui_app.next_theme();
+        let committed_name = tui_app.current_theme.name.clone();
+        tui_app.commit_theme().unwrap();
+        assert!(!tui_app.show_theme_modal);
+        assert_eq!(tui_app.current_theme.name, committed_name);
+
+        // Verify written config matches committed choice
+        let loaded = crate::remote::config::GlobalConfig::load_from(&isolated_config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.theme.as_deref(), Some(committed_name.as_str()));
+    }
+
+    #[test]
+    fn reveal_animation_trigger_and_teardown() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "SECRET_KEY", b"super-secret-value")
+            .unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert!(tui_app.reveal_animation_start.is_none());
+
+        // Reveal arms the animation start timestamp
+        tui_app.toggle_reveal().unwrap();
+        assert!(tui_app.revealed);
+        assert!(tui_app.reveal_animation_start.is_some());
+
+        // Reset clears reveal and animation start timestamp
+        tui_app.reset_secret_view();
+        assert!(!tui_app.revealed);
+        assert!(tui_app.reveal_animation_start.is_none());
+    }
+
+    #[test]
+    fn secret_modal_new_lifecycle_and_validation() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert!(!tui_app.show_secret_modal);
+
+        // Open new secret modal
+        tui_app.open_new_secret_modal();
+        assert!(tui_app.show_secret_modal);
+        assert_eq!(tui_app.secret_modal_mode, SecretModalMode::New);
+        assert_eq!(tui_app.secret_modal_field, SecretModalField::Name);
+        assert!(tui_app.secret_modal_masked);
+
+        // Reject empty secret name
+        tui_app.commit_secret_modal().unwrap();
+        assert!(tui_app.show_secret_modal);
+        assert_eq!(
+            tui_app.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Secret name cannot be empty")
+        );
+
+        // Reject whitespace in secret name
+        tui_app.secret_modal_insert_char('A');
+        tui_app.secret_modal_insert_char(' ');
+        tui_app.secret_modal_insert_char('B');
+        tui_app.commit_secret_modal().unwrap();
+        assert!(tui_app.show_secret_modal);
+        assert_eq!(
+            tui_app.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+            Some("Secret name cannot contain whitespace")
+        );
+
+        // Backspace and fix name
+        tui_app.secret_modal_backspace();
+        tui_app.secret_modal_backspace();
+        tui_app.secret_modal_insert_char('P');
+        tui_app.secret_modal_insert_char('I');
+        assert_eq!(tui_app.secret_modal_name, "API");
+
+        // Switch to value field and type
+        tui_app.secret_modal_next_field();
+        assert_eq!(tui_app.secret_modal_field, SecretModalField::Value);
+        tui_app.secret_modal_insert_char('k');
+        tui_app.secret_modal_insert_char('e');
+        tui_app.secret_modal_insert_char('y');
+        tui_app.secret_modal_insert_char('1');
+        assert_eq!(tui_app.secret_modal_value.as_str(), "key1");
+
+        // Toggle mask
+        assert!(tui_app.secret_modal_masked);
+        tui_app.toggle_secret_modal_mask();
+        assert!(!tui_app.secret_modal_masked);
+
+        // Commit secret creation
+        tui_app.commit_secret_modal().unwrap();
+        assert!(!tui_app.show_secret_modal);
+        assert_eq!(tui_app.secrets.len(), 1);
+        assert_eq!(tui_app.secrets[0].name, "API");
+        assert_eq!(
+            tui_app.selected_secret().map(|s| s.name.as_str()),
+            Some("API")
+        );
+
+        // Verify stored value
+        let fetched = app.get(&tui_app.config, "API").unwrap();
+        assert_eq!(fetched, b"key1");
+    }
+
+    #[test]
+    fn secret_modal_edit_lifecycle() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "EXISTING_KEY", b"initial-secret").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert_eq!(
+            tui_app.selected_secret().map(|s| s.name.as_str()),
+            Some("EXISTING_KEY")
+        );
+
+        // Open edit modal
+        tui_app.open_edit_secret_modal().unwrap();
+        assert!(tui_app.show_secret_modal);
+        assert_eq!(tui_app.secret_modal_mode, SecretModalMode::Edit);
+        assert_eq!(tui_app.secret_modal_name, "EXISTING_KEY");
+        assert_eq!(tui_app.secret_modal_value.as_str(), "initial-secret");
+        assert_eq!(tui_app.secret_modal_field, SecretModalField::Value);
+
+        // Edit value
+        tui_app.secret_modal_value = Zeroizing::new("updated-secret".into());
+        tui_app.commit_secret_modal().unwrap();
+        assert!(!tui_app.show_secret_modal);
+
+        // Verify updated value in vault
+        let fetched = app.get(&tui_app.config, "EXISTING_KEY").unwrap();
+        assert_eq!(fetched, b"updated-secret");
+    }
+
+    #[test]
+    fn secret_modal_random_generator() {
+        let secret1 = generate_random_secret(32);
+        let secret2 = generate_random_secret(32);
+        assert_eq!(secret1.len(), 32);
+        assert_eq!(secret2.len(), 32);
+        assert_ne!(secret1, secret2);
+
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+
+        tui_app.open_new_secret_modal();
+        tui_app.generate_secret_modal_value();
+        assert_eq!(tui_app.secret_modal_value.len(), 32);
+        assert!(tui_app.status_message.is_some());
+    }
+
+    #[test]
+    fn delete_modal_lifecycle_and_execution() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "TARGET", b"val").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert_eq!(tui_app.secrets.len(), 1);
+
+        // Open delete modal
+        tui_app.open_delete_modal();
+        assert!(tui_app.show_delete_modal);
+        assert_eq!(tui_app.delete_modal_secret_name, "TARGET");
+
+        // Cancel delete
+        tui_app.close_delete_modal();
+        assert!(!tui_app.show_delete_modal);
+        assert_eq!(tui_app.secrets.len(), 1);
+
+        // Re-open and commit delete
+        tui_app.open_delete_modal();
+        tui_app.commit_delete_modal().unwrap();
+        assert!(!tui_app.show_delete_modal);
+        assert_eq!(tui_app.secrets.len(), 0);
+        assert_eq!(
+            tui_app.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some("Deleted secret `TARGET` from `dev`")
+        );
     }
 }

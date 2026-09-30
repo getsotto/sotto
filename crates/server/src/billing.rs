@@ -1356,7 +1356,11 @@ pub(crate) fn verify_signature_detailed(
     let Some(t) = timestamp else {
         return Err(SignatureVerificationError::Malformed);
     };
-    if (now - t).abs() > SIGNATURE_TOLERANCE_SECS || candidates.is_empty() {
+    let stale = now
+        .checked_sub(t)
+        .and_then(|delta| delta.checked_abs())
+        .is_none_or(|age| age > SIGNATURE_TOLERANCE_SECS);
+    if stale || candidates.is_empty() {
         return Err(if candidates.is_empty() {
             SignatureVerificationError::Malformed
         } else {
@@ -1511,6 +1515,13 @@ mod tests {
         assert!(!verify_signature("whsec_x", &header, "{}", 1000 - 301));
         // ...but anything inside the tolerance passes.
         assert!(verify_signature("whsec_x", &header, "{}", 1000 + 300));
+    }
+
+    #[test]
+    fn extreme_timestamp_difference_fails_without_overflow() {
+        let timestamp = i64::MIN;
+        let header = format!("t={timestamp},v1={}", sign("whsec_x", timestamp, "{}"));
+        assert!(!verify_signature("whsec_x", &header, "{}", 0));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Pure association of a personal invoice with its Stripe correction evidence.
 //!
-//! This module deliberately does not decide whether a correction changes Cloud access. It turns
-//! transport resources into either explicitly associated evidence or an unresolved result.
+//! This module turns transport resources into explicitly associated evidence or an unresolved
+//! result, then applies the personal invoice access policy to that sealed result.
 
 use std::collections::HashSet;
 
@@ -59,6 +59,147 @@ impl StripeCorrectionUnresolved {
 pub enum StripePersonalInvoiceCorrectionEvidence {
     Associated(Box<StripeAssociatedCorrectionEvidence>),
     Unresolved(StripeUnresolvedCorrections),
+}
+
+/// The access-policy result for one validated personal invoice observation.
+///
+/// Known refunds, disputes and credit notes preserve the original paid term. They do not get
+/// converted into a net amount or an entitlement end date. Unresolved association evidence stays
+/// unresolved until a later boundary can establish it; it cannot produce a partial policy result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StripePersonalInvoiceAccessDecision {
+    RetainPaidTerm(StripeRetainedPaidTerm),
+    NeedsEvidence(StripeUnresolvedCorrections),
+}
+
+/// The original paid interval retained by the personal correction policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripeRetainedPaidTerm {
+    observation: StripePersonalInvoiceObservation,
+}
+
+impl StripeRetainedPaidTerm {
+    pub fn invoice_id(&self) -> &str {
+        self.observation.invoice_id()
+    }
+
+    pub fn allocation_reference(&self) -> &str {
+        self.observation.allocation_reference()
+    }
+
+    pub fn customer_id(&self) -> &str {
+        self.observation.customer_id()
+    }
+
+    pub fn subscription_id(&self) -> &str {
+        self.observation.subscription_id()
+    }
+
+    pub fn provider_item_id(&self) -> &str {
+        self.observation.provider_item_id()
+    }
+
+    pub const fn interval(&self) -> crate::cloud_provider_stripe::StripeInterval {
+        self.observation.interval()
+    }
+
+    pub fn evidence_reference(&self) -> &str {
+        self.observation.evidence_reference()
+    }
+
+    pub const fn period_start(&self) -> i64 {
+        self.observation.period_start()
+    }
+
+    pub const fn period_end(&self) -> i64 {
+        self.observation.period_end()
+    }
+}
+
+/// Apply the agreed personal correction policy to sealed invoice evidence.
+///
+/// A partial or full refund, dispute, or credit note does not shorten the paid term by itself.
+/// Early termination requires a separate confirmed cancellation workflow, which is deliberately
+/// absent from this operation. This function is pure and does not establish current account
+/// eligibility or publish a coverage projection.
+pub fn evaluate_personal_invoice_access(
+    evidence: &StripePersonalInvoiceCorrectionEvidence,
+) -> StripePersonalInvoiceAccessDecision {
+    match evidence {
+        StripePersonalInvoiceCorrectionEvidence::Associated(associated) => {
+            let mut unresolved = Vec::new();
+            for refund in associated.refunds() {
+                match refund.status() {
+                    StripeRefundStatus::Pending
+                    | StripeRefundStatus::RequiresAction
+                    | StripeRefundStatus::Succeeded
+                    | StripeRefundStatus::Failed
+                    | StripeRefundStatus::Canceled => {}
+                    StripeRefundStatus::Unknown(status) => {
+                        unresolved.push(StripeCorrectionUnresolved::RefundUnknownStatus {
+                            refund_id: refund.id().to_owned(),
+                            status: status.clone(),
+                        });
+                    }
+                }
+            }
+            for dispute in associated.disputes() {
+                match dispute.status() {
+                    StripeDisputeStatus::WarningNeedsResponse
+                    | StripeDisputeStatus::WarningUnderReview
+                    | StripeDisputeStatus::WarningClosed
+                    | StripeDisputeStatus::NeedsResponse
+                    | StripeDisputeStatus::UnderReview
+                    | StripeDisputeStatus::Won
+                    | StripeDisputeStatus::Lost
+                    | StripeDisputeStatus::Prevented => {}
+                    StripeDisputeStatus::Unknown(status) => {
+                        unresolved.push(StripeCorrectionUnresolved::DisputeUnknownStatus {
+                            dispute_id: dispute.id().to_owned(),
+                            status: status.clone(),
+                        });
+                    }
+                }
+            }
+            for credit_note in associated.credit_notes() {
+                match credit_note.status() {
+                    StripeCreditNoteStatus::Issued | StripeCreditNoteStatus::Void => {}
+                    StripeCreditNoteStatus::Unknown(status) => {
+                        unresolved.push(StripeCorrectionUnresolved::CreditNoteUnknownStatus {
+                            credit_note_id: credit_note.id().to_owned(),
+                            status: status.clone(),
+                        });
+                    }
+                }
+                match credit_note.note_type() {
+                    StripeCreditNoteType::PrePayment
+                    | StripeCreditNoteType::PostPayment
+                    | StripeCreditNoteType::Mixed => {}
+                    StripeCreditNoteType::Unknown(note_type) => {
+                        unresolved.push(StripeCorrectionUnresolved::CreditNoteUnknownType {
+                            credit_note_id: credit_note.id().to_owned(),
+                            note_type: note_type.clone(),
+                        });
+                    }
+                }
+            }
+            if !unresolved.is_empty() {
+                unresolved.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+                return StripePersonalInvoiceAccessDecision::NeedsEvidence(
+                    StripeUnresolvedCorrections {
+                        invoice_id: associated.observation().invoice_id().to_owned(),
+                        reasons: unresolved,
+                    },
+                );
+            }
+            StripePersonalInvoiceAccessDecision::RetainPaidTerm(StripeRetainedPaidTerm {
+                observation: associated.observation.clone(),
+            })
+        }
+        StripePersonalInvoiceCorrectionEvidence::Unresolved(unresolved) => {
+            StripePersonalInvoiceAccessDecision::NeedsEvidence(unresolved.clone())
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,4 +571,47 @@ pub(crate) fn assemble(
 
 fn is_live(environment: ProviderEnvironment) -> bool {
     matches!(environment, ProviderEnvironment::Live)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_table_preserves_unresolved_reasons_without_promoting_them() {
+        let cases = vec![
+            (
+                "missing refund status",
+                vec![StripeCorrectionUnresolved::RefundMissingStatus {
+                    refund_id: "re_missing".into(),
+                }],
+            ),
+            (
+                "multiple reasons",
+                vec![
+                    StripeCorrectionUnresolved::CreditNoteUnknownStatus {
+                        credit_note_id: "cn_unknown".into(),
+                        status: "future_status".into(),
+                    },
+                    StripeCorrectionUnresolved::CreditNoteUnknownType {
+                        credit_note_id: "cn_unknown".into(),
+                        note_type: "future_type".into(),
+                    },
+                ],
+            ),
+        ];
+
+        for (name, reasons) in cases {
+            let evidence =
+                StripePersonalInvoiceCorrectionEvidence::Unresolved(StripeUnresolvedCorrections {
+                    invoice_id: "in_test".into(),
+                    reasons: reasons.clone(),
+                });
+            let decision = evaluate_personal_invoice_access(&evidence);
+            let StripePersonalInvoiceAccessDecision::NeedsEvidence(unresolved) = decision else {
+                panic!("{name} was promoted to an access decision");
+            };
+            assert_eq!(unresolved.reasons(), reasons.as_slice(), "{name}");
+        }
+    }
 }
