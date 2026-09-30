@@ -348,6 +348,22 @@ impl StripeAllocationBinding {
     pub const fn payer_kind(&self) -> PayerKind {
         self.payer_kind
     }
+
+    pub fn allocation_reference(&self) -> &str {
+        &self.allocation_reference
+    }
+
+    pub fn customer_id(&self) -> &str {
+        &self.customer_id
+    }
+
+    pub fn subscription_id(&self) -> &str {
+        &self.subscription_id
+    }
+
+    pub fn provider_item_id(&self) -> &str {
+        &self.provider_item_id
+    }
 }
 
 /// Errors are intentionally typed so the caller can reject permanent evidence failures and retry

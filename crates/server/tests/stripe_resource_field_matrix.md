@@ -15,7 +15,7 @@ invoice payments](https://docs.stripe.com/api/invoice-payment/list).
 | Resource | Required fields used | Provenance and rejection rule |
 | --- | --- | --- |
 | `GET /v1/account` | `id`, `livemode` | Must equal the configured operator account and environment before resource reads continue. |
-| `GET /v1/invoices/:id` | `id`, `customer`, `status`, `currency`, `amount_paid`, `amount_due`, `amount_overpaid`, `amount_paid_off_stripe`, `livemode`, `metadata.sotto_allocation_reference` | The path ID, paid status, mode, currency, full positive amount and trusted allocation claim are checked. Missing financial or metadata fields fail closed. |
+| `GET /v1/invoices/:id` | `id`, `customer`, `parent.type`, `parent.subscription_details.subscription`, `status`, `currency`, `amount_paid`, `amount_due`, `amount_overpaid`, `amount_paid_off_stripe`, `livemode`, `metadata.sotto_allocation_reference` | The path ID, nested subscription parent, paid status, mode, currency, full positive amount and trusted allocation claim are checked. Missing financial, parent or metadata fields fail closed. The deprecated top-level `subscription` field cannot establish association. |
 | `GET /v1/invoices/:id/lines` | `id`, `quantity`, `livemode`, `parent.type`, `parent.subscription_item_details.subscription`, `parent.subscription_item_details.subscription_item`, `pricing.type`, `pricing.price_details.price`, `period.start`, `period.end` | The complete paginated list must contain exactly one subscription-item line with quantity one and a configured standard price. Invoice-item and other line types are unsupported. |
 | `GET /v1/invoice_payments?invoice=:id` | `id`, `invoice`, `status`, `amount_paid`, `amount_requested`, `currency`, `livemode`, `payment.type`, `payment.payment_intent` | The complete list must contain exactly one paid PaymentIntent settlement. Open, canceled, multiple or mismatched records are ambiguous or unsupported. |
 
@@ -78,3 +78,17 @@ later boundary.
 The operations do not retain metadata, descriptions, reasons, receipt numbers, destination or
 payment method details, dispute evidence, credit note memos, numbers or PDF links, or any other
 free text.
+
+## Personal invoice history
+
+The bounded history operation lists `/v1/invoices` with both `subscription` and `customer` filters
+on every page, then accounts for every returned invoice under the same request, page, record, byte
+and deadline budgets. A paid invoice is reread before its correction evidence is assembled; the
+listed and assembled headers must match. Draft, open, void and uncollectible invoices are retained
+as non-entitlement observations. No invoice status establishes a failed renewal in this slice.
+
+Stripe introduced `invoice.parent` in the Basil API family and deprecated the top-level subscription
+fields. The operation requires `parent.type=subscription_details` and the nested subscription ID,
+accepting an expanded object ID. Missing or unknown parent shapes become unresolved evidence, and
+contradictory present IDs fail closed. Synthetic loopback fixtures exercise this contract; no
+sandbox response has been observed at the repository's pinned API version.
