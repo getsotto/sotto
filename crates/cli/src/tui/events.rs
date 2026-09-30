@@ -22,6 +22,31 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
+    if app.show_theme_modal {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.revert_theme();
+            }
+            KeyCode::Enter => {
+                app.commit_theme()?;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.previous_theme();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.next_theme();
+            }
+            KeyCode::Home => {
+                app.theme_home();
+            }
+            KeyCode::End => {
+                app.theme_end();
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     if app.search_mode {
         match key.code {
             KeyCode::Esc => {
@@ -106,6 +131,9 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
         KeyCode::Char('r') => {
             app.toggle_reveal()?;
         }
+        KeyCode::Char('t') => {
+            app.open_theme_modal();
+        }
         KeyCode::Esc => {
             if !app.search_query.is_empty() {
                 app.search_query.clear();
@@ -122,6 +150,19 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
 
 /// Handle incoming mouse events (scroll and click selection).
 pub fn handle_mouse_event(app: &mut TuiApp, mouse: MouseEvent) -> Result<()> {
+    if app.show_theme_modal {
+        match mouse.kind {
+            MouseEventKind::ScrollDown => {
+                app.next_theme();
+            }
+            MouseEventKind::ScrollUp => {
+                app.previous_theme();
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match mouse.kind {
         MouseEventKind::ScrollDown => {
             app.move_selection_down();
@@ -211,6 +252,12 @@ mod tests {
         handle_key_event(&mut tui_app, ctrl_c).unwrap();
         assert!(!tui_app.running);
 
+        // Theme modal mode
+        let mut tui_app = TuiApp::new(&app, &store, config.clone(), &theme).unwrap();
+        tui_app.show_theme_modal = true;
+        handle_key_event(&mut tui_app, ctrl_c).unwrap();
+        assert!(!tui_app.running);
+
         // Search mode
         let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
         tui_app.search_mode = true;
@@ -264,5 +311,119 @@ mod tests {
         // PageUp key
         handle_key_event(&mut tui_app, key(KeyCode::PageUp)).unwrap();
         assert_eq!(tui_app.selected_filtered_index, 0);
+    }
+
+    #[test]
+    fn theme_modal_key_events() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let keychain = crate::keychain::MemoryKeychain::default();
+        crate::session::init(
+            &store,
+            &keychain,
+            b"pw",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master = crate::session::current_master_key(&keychain)
+            .unwrap()
+            .unwrap();
+        let keypair = crate::session::account_keypair(&store, &master).unwrap();
+        let project = crate::vault::Vault::create_project(&store, &keypair, "acme").unwrap();
+        let config = crate::config::Config {
+            project_id: project.id,
+            project: "acme".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let theme = crate::theme::Theme::default();
+        let app = crate::commands::App::new(&store, &keychain);
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        assert!(!tui_app.show_theme_modal);
+
+        // Open modal via 't'
+        handle_key_event(&mut tui_app, key(KeyCode::Char('t'))).unwrap();
+        assert!(tui_app.show_theme_modal);
+        assert_eq!(tui_app.selected_theme_index, 0);
+
+        // Navigate down
+        handle_key_event(&mut tui_app, key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(tui_app.selected_theme_index, 1);
+
+        // Navigate up
+        handle_key_event(&mut tui_app, key(KeyCode::Char('k'))).unwrap();
+        assert_eq!(tui_app.selected_theme_index, 0);
+
+        // End key
+        handle_key_event(&mut tui_app, key(KeyCode::End)).unwrap();
+        assert_eq!(
+            tui_app.selected_theme_index,
+            tui_app.available_themes.len() - 1
+        );
+
+        // Home key
+        handle_key_event(&mut tui_app, key(KeyCode::Home)).unwrap();
+        assert_eq!(tui_app.selected_theme_index, 0);
+
+        // Esc reverts and closes
+        handle_key_event(&mut tui_app, key(KeyCode::Esc)).unwrap();
+        assert!(!tui_app.show_theme_modal);
+
+        // Re-open and commit via Enter with isolated config path
+        let temp_dir = tempfile::tempdir().unwrap();
+        tui_app.config_path = Some(temp_dir.path().join("config.toml"));
+        handle_key_event(&mut tui_app, key(KeyCode::Char('t'))).unwrap();
+        assert!(tui_app.show_theme_modal);
+        handle_key_event(&mut tui_app, key(KeyCode::Enter)).unwrap();
+        assert!(!tui_app.show_theme_modal);
+    }
+
+    #[test]
+    fn theme_modal_mouse_scroll_events() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let keychain = crate::keychain::MemoryKeychain::default();
+        crate::session::init(
+            &store,
+            &keychain,
+            b"pw",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master = crate::session::current_master_key(&keychain)
+            .unwrap()
+            .unwrap();
+        let keypair = crate::session::account_keypair(&store, &master).unwrap();
+        let project = crate::vault::Vault::create_project(&store, &keypair, "acme").unwrap();
+        let config = crate::config::Config {
+            project_id: project.id,
+            project: "acme".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let theme = crate::theme::Theme::default();
+        let app = crate::commands::App::new(&store, &keychain);
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_theme_modal();
+        assert_eq!(tui_app.selected_theme_index, 0);
+
+        let scroll_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        let scroll_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        handle_mouse_event(&mut tui_app, scroll_down).unwrap();
+        assert_eq!(tui_app.selected_theme_index, 1);
+
+        handle_mouse_event(&mut tui_app, scroll_up).unwrap();
+        assert_eq!(tui_app.selected_theme_index, 0);
     }
 }
