@@ -25,6 +25,13 @@ const KEY_LEN: usize = core_vault::KEY_LEN;
 /// Environments created for a new project.
 pub const DEFAULT_ENVIRONMENTS: &[&str] = &["dev", "staging", "prod"];
 
+/// A secret item with name and current version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretItem {
+    pub name: String,
+    pub version: i64,
+}
+
 /// An unlocked view of one environment's secrets.
 ///
 /// Holds the environment's decrypted vault key, zeroized on drop. The account keypair opens the
@@ -144,6 +151,21 @@ impl<'a> Vault<'a> {
             .collect::<Result<Vec<_>>>()?;
         names.sort();
         Ok(names)
+    }
+
+    /// List secret items (name and current version) of all non-deleted secrets, sorted by name.
+    pub fn list_items(&self) -> Result<Vec<SecretItem>> {
+        let rows = self.store.list_secrets(&self.env_id)?;
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let name = self.decrypt_name(&row)?;
+            items.push(SecretItem {
+                name,
+                version: row.version,
+            });
+        }
+        items.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(items)
     }
 
     /// Delete a secret by name (tombstone; version history retained).

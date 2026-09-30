@@ -35,6 +35,8 @@ uuid = { version = "1", features = ["v4"] }
 indicatif = "0.18"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 inquire = "0.9"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
 
 # Server
 axum = "0.8"

@@ -81,6 +81,11 @@ impl<'a> App<'a> {
         self.vault(config)?.list_names()
     }
 
+    /// List secret items (name and version) in the configured environment, sorted by name.
+    pub fn list_items(&self, config: &Config) -> Result<Vec<crate::vault::SecretItem>> {
+        self.vault(config)?.list_items()
+    }
+
     /// Remove a secret from the configured environment.
     pub fn remove(&self, config: &Config, name: &str) -> Result<()> {
         self.vault(config)?.delete(name)

@@ -15,7 +15,7 @@ invoice payments](https://docs.stripe.com/api/invoice-payment/list).
 | Resource | Required fields used | Provenance and rejection rule |
 | --- | --- | --- |
 | `GET /v1/account` | `id`, `livemode` | Must equal the configured operator account and environment before resource reads continue. |
-| `GET /v1/invoices/:id` | `id`, `customer`, `status`, `currency`, `amount_paid`, `amount_due`, `amount_overpaid`, `amount_paid_off_stripe`, `livemode`, `metadata.sotto_allocation_reference` | The path ID, paid status, mode, currency, full positive amount and trusted allocation claim are checked. Missing financial or metadata fields fail closed. |
+| `GET /v1/invoices/:id` | `id`, `customer`, `parent.type`, `parent.subscription_details.subscription`, `status`, `currency`, `amount_paid`, `amount_due`, `amount_overpaid`, `amount_paid_off_stripe`, `livemode`, `metadata.sotto_allocation_reference` | The path ID, nested subscription parent, paid status, mode, currency, full positive amount and trusted allocation claim are checked. Missing financial, parent or metadata fields fail closed. The deprecated top-level `subscription` field cannot establish association. |
 | `GET /v1/invoices/:id/lines` | `id`, `quantity`, `livemode`, `parent.type`, `parent.subscription_item_details.subscription`, `parent.subscription_item_details.subscription_item`, `pricing.type`, `pricing.price_details.price`, `period.start`, `period.end` | The complete paginated list must contain exactly one subscription-item line with quantity one and a configured standard price. Invoice-item and other line types are unsupported. |
 | `GET /v1/invoice_payments?invoice=:id` | `id`, `invoice`, `status`, `amount_paid`, `amount_requested`, `currency`, `livemode`, `payment.type`, `payment.payment_intent` | The complete list must contain exactly one paid PaymentIntent settlement. Open, canceled, multiple or mismatched records are ambiguous or unsupported. |
 
@@ -78,3 +78,37 @@ later boundary.
 The operations do not retain metadata, descriptions, reasons, receipt numbers, destination or
 payment method details, dispute evidence, credit note memos, numbers or PDF links, or any other
 free text.
+
+## Personal invoice history
+
+The bounded history operation lists `/v1/invoices` with both `subscription` and `customer` filters
+on every page, then accounts for every returned invoice under the same request, page, record, byte
+and deadline budgets. A paid invoice is reread before its correction evidence is assembled; the
+listed and assembled headers must match. Draft, open, void and uncollectible invoices are retained
+as non-entitlement observations. No invoice status establishes a failed renewal in this slice.
+
+Stripe introduced `invoice.parent` in the Basil API family and deprecated the top-level subscription
+fields. The operation requires `parent.type=subscription_details` and the nested subscription ID,
+accepting an expanded object ID. Missing or unknown parent shapes become unresolved evidence, and
+contradictory present IDs fail closed. Synthetic loopback fixtures exercise this contract; no
+sandbox response has been observed at the repository's pinned API version.
+
+## Personal renewal failure snapshot
+
+The pure renewal decoder consumes the original signed `invoice.payment_failed` bytes and the
+sealed history returned by the bounded reader. It makes no additional Stripe requests. The
+snapshot fixture is synthetic and the inbound API-version allowlist is not evidence that every
+shape is supported.
+
+| Snapshot path | Required fields used | Provenance and rejection rule |
+| --- | --- | --- |
+| `event` | `id`, `created`, `api_version`, `type`, `livemode`, `data.object` | Signature is verified before JSON interpretation. The event must be `invoice.payment_failed`, have a nonnegative creation time, an allowlisted inbound version, direct operator context, and the configured mode. Account or Connect context is rejected. |
+| `data.object` (invoice) | `object`, `id`, `customer`, `parent.type`, `parent.subscription_details.subscription`, `billing_reason`, `collection_method`, `status`, `currency`, `amount_due`, `amount_remaining`, `amount_paid`, `amount_overpaid`, `amount_paid_off_stripe`, `livemode`, `metadata.sotto_allocation_reference` | Requires an open, automatically collected `subscription_cycle` invoice in GBP with a positive amount due and remaining amount, no settlement or off-Stripe amount, and remaining equal to due. Nested parent, customer and metadata must match the trusted binding; legacy top-level subscription cannot fill a missing nested parent. |
+| `data.object.lines` | `object`, `has_more`, `data[0]` | The embedded list must be complete (`has_more=false`) and contain exactly one line. A truncated list returns NeedsEvidence rather than selecting a partial result. |
+| `data.object.lines.data[0]` | `id`, `invoice`, `livemode`, `quantity`, `parent.type`, `parent.subscription_item_details.subscription`, `parent.subscription_item_details.subscription_item`, `parent.subscription_item_details.proration`, `pricing.type`, `pricing.price_details.price`, `period.start`, `period.end` | The line must be a non-prorated subscription-item line with quantity one, a configured monthly or annual price, positive service duration, matching invoice and mode, and exact binding ownership. Missing proration proof is NeedsEvidence; true proration is unsupported. The line period, not invoice header timing, establishes the renewal boundary. |
+
+The linked result preserves the failed invoice and line, the exact paid predecessor and its original
+interval, provider account and mode, and a stable renewal identity. Event IDs remain separate so
+duplicate retry deliveries can be recognised without changing renewal identity. A missing or
+ambiguous exact predecessor returns NeedsEvidence; the decoder never claims current payment state
+or converts the failure into coverage.
