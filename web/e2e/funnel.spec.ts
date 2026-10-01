@@ -16,7 +16,11 @@ for (const javaScriptEnabled of [true, false]) {
       const page = await context.newPage();
       await page.goto("/");
       // The static copy button is disabled. Wait for React when scripting is on.
-      if (javaScriptEnabled) await expect(page.getByRole("button", { name: "Copy", exact: true })).toBeEnabled();
+      if (javaScriptEnabled) {
+        await expect(
+          page.locator(".install").first().getByRole("button", { name: "Copy", exact: true }),
+        ).toBeEnabled();
+      }
       const nav = page.getByRole("navigation", { name: "Guides", exact: true });
       const expected = guidePages.map((guide) => ({ href: `/${guide.slug}`, label: guide.navLabel }));
       const readLinks = () => nav.locator("a").evaluateAll((anchors) => anchors.map((anchor) => ({
