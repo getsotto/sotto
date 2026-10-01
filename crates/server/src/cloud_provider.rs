@@ -3,6 +3,8 @@
 //! Provider HTTP and signature verification happen outside this module. This module accepts only
 //! normalized, verified evidence, records an idempotent receipt, and applies the evidence through
 //! the existing caller-owned reconciliation transaction. It never stores raw provider payloads.
+//! Provider invalidation acceptance is a dormant, local-only boundary: it adds no webhook,
+//! scheduler or remote discovery path and does not make a collection authoritative.
 
 use std::{collections::BTreeSet, fmt, time::Duration};
 
@@ -372,6 +374,13 @@ pub enum ApplyDisposition {
     AlreadyApplied,
 }
 
+/// Whether a verified provider change advanced the beneficiary invalidation fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidationDisposition {
+    Accepted { generation: i64 },
+    AlreadyAccepted { generation: i64 },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApplyReceipt {
     pub event_id: String,
@@ -403,6 +412,12 @@ pub enum ProviderAdapterError {
     ProviderContextMismatch,
     #[error("provider event is missing")]
     EventMissing,
+    #[error("provider event was already rejected")]
+    EventRejected,
+    #[error("provider invalidation conflicts with an existing association")]
+    InvalidationConflict,
+    #[error("provider invalidation generation is exhausted")]
+    InvalidationGenerationOverflow,
 }
 
 /// Record verified event identity before provider history collection begins.
@@ -473,6 +488,191 @@ pub async fn record_verified_event(
     } else {
         Err(ProviderAdapterError::EventNotPending)
     }
+}
+
+/// Accept one verified provider change and advance the beneficiary fence exactly once.
+///
+/// The event receipt is locked before the coordinator, matching preparation and completion's
+/// lock order. The event must already have been recorded, and the allocation/source binding must
+/// already belong to the beneficiary. This records no coverage projection.
+pub async fn accept_provider_invalidation(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+) -> Result<InvalidationDisposition, ProviderAdapterError> {
+    context.validate()?;
+    event.validate()?;
+    allocation.validate()?;
+    validate_event_allocation(event, allocation)?;
+
+    let receipt = sqlx::query(
+        "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
+                normalized_payload_hash, status, allocation_id, coverage_source_id \
+         FROM cloud_provider_event_receipts \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 FOR UPDATE",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ProviderAdapterError::EventMissing)?;
+    verify_stored_event(&receipt, event)?;
+    let status: String = receipt.try_get("status")?;
+    if status == "rejected" {
+        return Err(ProviderAdapterError::EventRejected);
+    }
+    if status == "applied"
+        && (receipt
+            .try_get::<Option<String>, _>("allocation_id")?
+            .as_deref()
+            != Some(allocation.allocation_id.as_str())
+            || receipt
+                .try_get::<Option<String>, _>("coverage_source_id")?
+                .as_deref()
+                != Some(allocation.source_id.as_str()))
+    {
+        return Err(ProviderAdapterError::AllocationConflict);
+    }
+
+    let source = sqlx::query(
+        "SELECT beneficiary_id, provider_namespace, external_allocation_reference, \
+                ownership_evidence_reference \
+         FROM cloud_coverage_sources WHERE source_id = $1",
+    )
+    .bind(&allocation.source_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ProviderAdapterError::ProviderContextMismatch)?;
+    let source_matches = source.try_get::<String, _>("beneficiary_id")?
+        == allocation.beneficiary_id
+        && source.try_get::<String, _>("provider_namespace")? == context.namespace
+        && source.try_get::<String, _>("external_allocation_reference")?
+            == allocation.external_allocation_reference
+        && source.try_get::<String, _>("ownership_evidence_reference")?
+            == allocation.ownership_evidence_reference;
+    if !source_matches {
+        return Err(ProviderAdapterError::ProviderContextMismatch);
+    }
+    validate_registered_allocation(tx, context, allocation).await?;
+    validate_provider_bindings(tx, context, &[source_binding(context, allocation)]).await?;
+
+    let coordinator = sqlx::query(
+        "SELECT provider_invalidation_generation \
+         FROM cloud_coverage_coordinators WHERE beneficiary_id = $1 FOR UPDATE",
+    )
+    .bind(&allocation.beneficiary_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ProviderAdapterError::ProviderContextMismatch)?;
+    let generation: i64 = coordinator.try_get("provider_invalidation_generation")?;
+
+    let existing = sqlx::query(
+        "SELECT event_type, provider_created_at, normalized_payload_hash, allocation_id, \
+                coverage_source_id, accepted_generation \
+         FROM cloud_provider_invalidation_associations \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(existing) = existing {
+        let same = existing.try_get::<String, _>("event_type")? == event.event_type
+            && existing.try_get::<i64, _>("provider_created_at")? == event.provider_created_at
+            && existing.try_get::<String, _>("normalized_payload_hash")?
+                == event.normalized_payload_hash
+            && existing.try_get::<String, _>("allocation_id")? == allocation.allocation_id
+            && existing.try_get::<String, _>("coverage_source_id")? == allocation.source_id;
+        if !same {
+            return Err(ProviderAdapterError::InvalidationConflict);
+        }
+        return Ok(InvalidationDisposition::AlreadyAccepted {
+            generation: existing.try_get("accepted_generation")?,
+        });
+    }
+
+    let next_generation = generation
+        .checked_add(1)
+        .filter(|value| *value > 0)
+        .ok_or(ProviderAdapterError::InvalidationGenerationOverflow)?;
+    let inserted = sqlx::query(
+        "INSERT INTO cloud_provider_invalidation_associations \
+         (provider_namespace, provider_account_id, provider_environment, event_id, event_type, \
+          provider_created_at, normalized_payload_hash, beneficiary_id, allocation_id, \
+          coverage_source_id, accepted_generation) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+         ON CONFLICT (provider_namespace, provider_account_id, provider_environment, event_id) \
+         DO NOTHING",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .bind(&event.event_type)
+    .bind(event.provider_created_at)
+    .bind(&event.normalized_payload_hash)
+    .bind(&allocation.beneficiary_id)
+    .bind(&allocation.allocation_id)
+    .bind(&allocation.source_id)
+    .bind(next_generation)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| match error {
+        sqlx::Error::Database(database) if database.code().as_deref() == Some("23505") => {
+            ProviderAdapterError::InvalidationConflict
+        }
+        error => ProviderAdapterError::Database(error),
+    })?;
+    if inserted.rows_affected() == 0 {
+        let existing = sqlx::query(
+            "SELECT event_type, provider_created_at, normalized_payload_hash, allocation_id, \
+                    coverage_source_id, accepted_generation \
+             FROM cloud_provider_invalidation_associations \
+             WHERE provider_namespace = $1 AND provider_account_id = $2 \
+               AND provider_environment = $3 AND event_id = $4",
+        )
+        .bind(&context.namespace)
+        .bind(&context.account_id)
+        .bind(context.environment.as_str())
+        .bind(&event.event_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(ProviderAdapterError::InvalidationConflict)?;
+        let same = existing.try_get::<String, _>("event_type")? == event.event_type
+            && existing.try_get::<i64, _>("provider_created_at")? == event.provider_created_at
+            && existing.try_get::<String, _>("normalized_payload_hash")?
+                == event.normalized_payload_hash
+            && existing.try_get::<String, _>("allocation_id")? == allocation.allocation_id
+            && existing.try_get::<String, _>("coverage_source_id")? == allocation.source_id;
+        if !same {
+            return Err(ProviderAdapterError::InvalidationConflict);
+        }
+        return Ok(InvalidationDisposition::AlreadyAccepted {
+            generation: existing.try_get("accepted_generation")?,
+        });
+    }
+    let updated = sqlx::query(
+        "UPDATE cloud_coverage_coordinators SET provider_invalidation_generation = $2 \
+         WHERE beneficiary_id = $1 AND provider_invalidation_generation = $3",
+    )
+    .bind(&allocation.beneficiary_id)
+    .bind(next_generation)
+    .bind(generation)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ProviderAdapterError::InvalidationConflict);
+    }
+    Ok(InvalidationDisposition::Accepted {
+        generation: next_generation,
+    })
 }
 
 /// Permanently reject a recorded event after verified processing determines it cannot be applied.
@@ -975,6 +1175,51 @@ pub async fn replay_verified_event(
         revision,
         outcome: ApplyDisposition::AlreadyApplied,
     })
+}
+
+async fn validate_registered_allocation(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+) -> Result<(), ProviderAdapterError> {
+    let row = sqlx::query(
+        "SELECT allocation.payer_id, allocation.beneficiary_id, allocation.provider_namespace, \
+                allocation.provider_account_id, allocation.provider_environment, \
+                allocation.provider_subscription_id, allocation.provider_item_id, \
+                allocation.external_allocation_reference, allocation.coverage_source_id, \
+                allocation.effective_from, allocation.effective_until, allocation.state, \
+                allocation.ownership_evidence_reference, payer.provider_customer_id, \
+                payer.payer_kind \
+         FROM cloud_provider_allocations AS allocation \
+         JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
+         WHERE allocation.allocation_id = $1",
+    )
+    .bind(&allocation.allocation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ProviderAdapterError::ProviderContextMismatch)?;
+    let same = row.try_get::<String, _>("payer_id")? == allocation.payer_id
+        && row.try_get::<String, _>("beneficiary_id")? == allocation.beneficiary_id
+        && row.try_get::<String, _>("provider_namespace")? == context.namespace
+        && row.try_get::<String, _>("provider_account_id")? == context.account_id
+        && row.try_get::<String, _>("provider_environment")? == context.environment.as_str()
+        && row.try_get::<String, _>("provider_customer_id")? == allocation.provider_customer_id
+        && row.try_get::<String, _>("payer_kind")? == allocation.payer_kind.as_str()
+        && row.try_get::<String, _>("provider_subscription_id")? == allocation.subscription_id
+        && row.try_get::<String, _>("provider_item_id")? == allocation.provider_item_id
+        && row.try_get::<String, _>("external_allocation_reference")?
+            == allocation.external_allocation_reference
+        && row.try_get::<String, _>("coverage_source_id")? == allocation.source_id
+        && row.try_get::<i64, _>("effective_from")? == allocation.effective_from
+        && row.try_get::<Option<i64>, _>("effective_until")? == allocation.effective_until
+        && row.try_get::<String, _>("state")? == allocation.state.as_str()
+        && row.try_get::<String, _>("ownership_evidence_reference")?
+            == allocation.ownership_evidence_reference;
+    if same {
+        Ok(())
+    } else {
+        Err(ProviderAdapterError::ProviderContextMismatch)
+    }
 }
 
 async fn ensure_payer(

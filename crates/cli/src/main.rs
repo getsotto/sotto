@@ -115,13 +115,12 @@ enum Command {
     Share {
         /// The secret name to share.
         name: Option<String>,
-        /// How many times the link may be viewed before it burns (1-100).
+        /// How many times the link may be viewed before it burns (1-100; default: 1).
         #[arg(
             long,
-            default_value_t = 1,
             value_parser = clap::value_parser!(i32).range(1..=sotto_cli::remote::share::MAX_VIEWS as i64)
         )]
-        views: i32,
+        views: Option<i32>,
         /// Link lifetime in seconds (1-2592000; default: no expiry).
         #[arg(
             long,
@@ -539,6 +538,29 @@ fn run() -> Result<()> {
                         return Ok(());
                     }
                 },
+            };
+            let can_prompt = prompts::can_prompt();
+            let views = match views {
+                Some(views) => views,
+                None if can_prompt => match prompts::prompt_share_views(&theme)? {
+                    Some(views) => views,
+                    None => {
+                        eprintln!("aborted");
+                        return Ok(());
+                    }
+                },
+                None => 1,
+            };
+            let expire = match expire {
+                Some(expire) => Some(expire),
+                None if can_prompt => match prompts::prompt_share_lifetime(&theme)? {
+                    Some(expire) => expire,
+                    None => {
+                        eprintln!("aborted");
+                        return Ok(());
+                    }
+                },
+                None => None,
             };
             share(
                 &app,
@@ -2194,7 +2216,7 @@ mod tests {
             let value = views.to_string();
             let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--views", &value]).unwrap();
             assert!(
-                matches!(cli.command, Some(Command::Share { views: parsed, .. }) if parsed == views)
+                matches!(cli.command, Some(Command::Share { views: Some(parsed), .. }) if parsed == views)
             );
         }
         for expire in [1, sotto_cli::remote::share::MAX_TTL_SECONDS] {
@@ -2220,7 +2242,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Share {
-                views: 1,
+                views: None,
                 expire: None,
                 ..
             })

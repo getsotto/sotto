@@ -17,6 +17,8 @@
 //! - [`state`] - shared application state ([`state::AppState`])
 //! - [`error`] - server error type
 
+#![allow(clippy::double_must_use)]
+
 pub mod account;
 pub mod audit;
 pub mod auth;

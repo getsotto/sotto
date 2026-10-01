@@ -20,9 +20,9 @@ use uuid::Uuid;
 use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::SourceBinding;
 use sotto_server::cloud_provider::{
-    AllocationState, CollectionLimits, ProviderCollectionError, ProviderContext,
-    ProviderEnvironment, ProviderHistoryClient, ProviderHistoryPage, VerifiedAllocation,
-    VerifiedProviderEvent,
+    accept_provider_invalidation, AllocationState, CollectionLimits, InvalidationDisposition,
+    ProviderCollectionError, ProviderContext, ProviderEnvironment, ProviderHistoryClient,
+    ProviderHistoryPage, VerifiedAllocation, VerifiedProviderEvent,
 };
 use sotto_server::cloud_provider_refresh::{refresh_verified_event, ProviderRefreshError};
 use sotto_server::db;
@@ -323,11 +323,80 @@ async fn cleanup_event_and_allocation(pool: &PgPool, event_id: &str, allocation_
 }
 
 async fn cleanup_event(pool: &PgPool, event_id: &str) {
+    sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
+        .bind(event_id)
+        .execute(pool)
+        .await
+        .expect("delete fixture invalidation");
     sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
         .bind(event_id)
         .execute(pool)
         .await
         .expect("delete fixture receipt");
+}
+
+#[tokio::test]
+async fn accepted_invalidation_during_fetch_rejects_refresh_completion() {
+    let Some(pool) = pool_or_skip(8).await else {
+        return;
+    };
+    let (fixture, event, allocation) = fixture(&pool).await;
+    record_event(&pool, &event).await;
+    let context = context();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let mut client = ScriptedClient::new(ClientAction::Block {
+        entered: entered.clone(),
+        release: release.clone(),
+        page: page(&context, &fixture.source_id),
+    });
+    let refresh_pool = pool.clone();
+    let refresh_context = context.clone();
+    let refresh_event = event.clone();
+    let refresh_allocation = allocation.clone();
+    let task = tokio::spawn(async move {
+        refresh_verified_event(
+            &refresh_pool,
+            &mut client,
+            &refresh_context,
+            &refresh_event,
+            &refresh_allocation,
+            CollectionLimits::default(),
+        )
+        .await
+    });
+    timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("provider request entered");
+
+    let mut invalidate = pool.begin().await.expect("begin invalidation");
+    assert_eq!(
+        accept_provider_invalidation(&mut invalidate, &context, &event, &allocation)
+            .await
+            .expect("accept invalidation"),
+        InvalidationDisposition::Accepted { generation: 1 }
+    );
+    invalidate.commit().await.expect("commit invalidation");
+    release.notify_one();
+
+    let result = timeout(Duration::from_secs(5), task)
+        .await
+        .expect("refresh task completes")
+        .expect("refresh task joins");
+    assert!(matches!(
+        result,
+        Err(ProviderRefreshError::Completion(
+            sotto_server::cloud_provider::ProviderAdapterError::CollectionSuperseded
+        ))
+    ));
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM cloud_provider_event_receipts WHERE event_id = $1")
+            .bind(&fixture.event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read pending receipt");
+    assert_eq!(status, "pending");
+    cleanup(&pool, &fixture).await;
 }
 
 async fn projection_snapshot(

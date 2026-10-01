@@ -59,6 +59,9 @@ pub struct CollectionTicket {
     pub attempt_id: String,
     pub collection_epoch: i64,
     pub source_set_generation: i64,
+    /// The accepted provider-event generation captured for this attempt, if fenced.
+    /// Legacy attempts remain readable with no fence and cannot be completed as new reads.
+    pub provider_invalidation_generation: Option<i64>,
     pub expected_projection_revision: Option<i64>,
     pub source_bindings: Vec<SourceBinding>,
     pub status: CollectionStatus,
@@ -380,7 +383,8 @@ pub async fn begin_collection(
     validate_attempt_id(attempt_id)?;
 
     let coordinator = sqlx::query(
-        "SELECT source_set_generation, collection_epoch, current_attempt_id \
+        "SELECT source_set_generation, collection_epoch, current_attempt_id, \
+                provider_invalidation_generation \
          FROM cloud_coverage_coordinators WHERE beneficiary_id = $1 FOR UPDATE",
     )
     .bind(beneficiary_id)
@@ -392,10 +396,12 @@ pub async fn begin_collection(
     let generation: i64 = coordinator.try_get("source_set_generation")?;
     let epoch: i64 = coordinator.try_get("collection_epoch")?;
     let current_attempt_id: Option<String> = coordinator.try_get("current_attempt_id")?;
+    let invalidation_generation: i64 = coordinator.try_get("provider_invalidation_generation")?;
 
     if let Some(existing) = sqlx::query(
         "SELECT attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
-                expected_projection_revision, source_bindings::text AS source_bindings, status, \
+                provider_invalidation_generation, expected_projection_revision, \
+                source_bindings::text AS source_bindings, status, \
                 aggregate_evidence_reference, canonical_result::text AS canonical_result, \
                 projection_revision \
          FROM cloud_coverage_collection_attempts \
@@ -408,6 +414,11 @@ pub async fn begin_collection(
     {
         let ticket = collection_ticket_from_row(&existing)?;
         validate_stored_attempt(tx, &ticket, &existing).await?;
+        if ticket.status == CollectionStatus::Pending
+            && ticket.provider_invalidation_generation.is_none()
+        {
+            return Err(ReconciliationError::CollectionConflict);
+        }
         return Ok(ticket);
     }
 
@@ -446,13 +457,14 @@ pub async fn begin_collection(
     sqlx::query(
         "INSERT INTO cloud_coverage_collection_attempts \
          (attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
-          expected_projection_revision, source_bindings, status) \
-         VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'pending')",
+          provider_invalidation_generation, expected_projection_revision, source_bindings, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, 'pending')",
     )
     .bind(attempt_id)
     .bind(beneficiary_id)
     .bind(next_epoch)
     .bind(generation)
+    .bind(invalidation_generation)
     .bind(expected_projection_revision)
     .bind(source_bindings_json)
     .execute(&mut **tx)
@@ -472,6 +484,7 @@ pub async fn begin_collection(
         attempt_id: attempt_id.into(),
         collection_epoch: next_epoch,
         source_set_generation: generation,
+        provider_invalidation_generation: Some(invalidation_generation),
         expected_projection_revision,
         source_bindings,
         status: CollectionStatus::Pending,
@@ -493,7 +506,8 @@ pub async fn finish_collection(
     validate_attempt_id(&ticket.attempt_id)?;
 
     let coordinator = sqlx::query(
-        "SELECT source_set_generation, collection_epoch, current_attempt_id \
+        "SELECT source_set_generation, collection_epoch, current_attempt_id, \
+                provider_invalidation_generation \
          FROM cloud_coverage_coordinators WHERE beneficiary_id = $1 FOR UPDATE",
     )
     .bind(&ticket.beneficiary_id)
@@ -502,11 +516,14 @@ pub async fn finish_collection(
     .ok_or(ReconciliationError::NoSources)?;
     let current_generation: i64 = coordinator.try_get("source_set_generation")?;
     let current_epoch: i64 = coordinator.try_get("collection_epoch")?;
+    let current_invalidation_generation: i64 =
+        coordinator.try_get("provider_invalidation_generation")?;
     let current_attempt: Option<String> = coordinator.try_get("current_attempt_id")?;
 
     let attempt = sqlx::query(
         "SELECT attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
-                expected_projection_revision, source_bindings::text AS source_bindings, status, \
+                provider_invalidation_generation, expected_projection_revision, \
+                source_bindings::text AS source_bindings, status, \
                 aggregate_evidence_reference, canonical_result::text AS canonical_result, \
                 projection_revision \
          FROM cloud_coverage_collection_attempts \
@@ -523,6 +540,7 @@ pub async fn finish_collection(
         || stored_ticket.collection_epoch != ticket.collection_epoch
         || stored_ticket.source_set_generation != ticket.source_set_generation
         || stored_ticket.expected_projection_revision != ticket.expected_projection_revision
+        || stored_ticket.provider_invalidation_generation != ticket.provider_invalidation_generation
         || stored_ticket.source_bindings != ticket.source_bindings
     {
         return Err(ReconciliationError::CollectionConflict);
@@ -565,6 +583,7 @@ pub async fn finish_collection(
     if current_attempt.as_deref() != Some(ticket.attempt_id.as_str())
         || current_generation != ticket.source_set_generation
         || current_epoch != ticket.collection_epoch
+        || ticket.provider_invalidation_generation != Some(current_invalidation_generation)
     {
         return Err(ReconciliationError::CollectionConflict);
     }
@@ -784,6 +803,7 @@ fn collection_ticket_from_row(
         attempt_id: row.try_get("attempt_id")?,
         collection_epoch: row.try_get("collection_epoch")?,
         source_set_generation: row.try_get("source_set_generation")?,
+        provider_invalidation_generation: row.try_get("provider_invalidation_generation")?,
         expected_projection_revision: row.try_get("expected_projection_revision")?,
         source_bindings,
         status,
@@ -1238,6 +1258,7 @@ mod tests {
             attempt_id: "attempt".into(),
             collection_epoch: 1,
             source_set_generation: 1,
+            provider_invalidation_generation: None,
             expected_projection_revision: None,
             source_bindings: Vec::new(),
             status: CollectionStatus::Completed,

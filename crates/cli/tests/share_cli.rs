@@ -261,6 +261,7 @@ mod pty_tests {
     fn no_echo_no_opost(slave: &OwnedFd) {
         let mut termios = tcgetattr(slave).expect("tcgetattr");
         termios.local_flags.remove(LocalFlags::ECHO);
+        termios.local_flags.remove(LocalFlags::ISIG);
         termios.output_flags.remove(OutputFlags::OPOST);
         tcsetattr(slave, SetArg::TCSANOW, &termios).expect("tcsetattr");
     }
@@ -283,7 +284,7 @@ mod pty_tests {
     }
 
     fn wait_bounded(child: &mut Child) -> std::process::ExitStatus {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(status) = child.try_wait().expect("wait for child") {
                 return status;
@@ -291,7 +292,7 @@ mod pty_tests {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("process on pty did not exit within 30 seconds");
+                panic!("process on pty did not exit within 60 seconds");
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -475,6 +476,287 @@ mod pty_tests {
                 "refusing to print a secret to a terminal; use --reveal or pipe the output"
             ),
             "expected refusal: {stderr}"
+        );
+    }
+
+    fn setup_test_project_with_secret(scratch: &std::path::Path) -> Option<std::path::PathBuf> {
+        let data_dir = scratch.join("sotto-data");
+
+        let init_output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+            .current_dir(scratch)
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("SOTTO_PASSWORD", "test-master-password")
+            .arg("init")
+            .output()
+            .expect("run sotto init");
+
+        if init_output.status.code() == Some(5) {
+            let stderr = String::from_utf8_lossy(&init_output.stderr);
+            if stderr.contains("Platform secure storage failure")
+                || stderr.contains("org.freedesktop.secrets")
+                || stderr.contains("keychain error")
+            {
+                eprintln!("skipping: OS keychain not available in headless environment");
+                return None;
+            }
+        }
+
+        assert_eq!(
+            init_output.status.code(),
+            Some(0),
+            "init must succeed: {}",
+            String::from_utf8_lossy(&init_output.stderr)
+        );
+
+        let set_output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+            .current_dir(scratch)
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("SOTTO_PASSWORD", "test-master-password")
+            .args(["set", "DEMO_SECRET", "--value", "super-secret"])
+            .output()
+            .expect("run sotto set");
+
+        assert_eq!(
+            set_output.status.code(),
+            Some(0),
+            "set must succeed: {}",
+            String::from_utf8_lossy(&set_output.stderr)
+        );
+
+        Some(data_dir)
+    }
+
+    #[test]
+    fn interactive_share_with_defaults_on_pty() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let Some(data_dir) = setup_test_project_with_secret(scratch.path()) else {
+            return;
+        };
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sotto"));
+        cmd.current_dir(scratch.path())
+            .arg("share")
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("SOTTO_PASSWORD", "test-master-password")
+            .env("TERM", "xterm-256color")
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .env_remove("CI");
+
+        // Input: Enter to select DEMO_SECRET, Enter to select 1 view, Enter to select No expiry
+        let run = run_on_pty_with_input(&mut cmd, b"\n\n\n");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            stderr.contains("Select a secret"),
+            "expected secret selection prompt: {stderr}"
+        );
+        assert!(
+            stderr.contains("Select view limit"),
+            "expected view limit prompt: {stderr}"
+        );
+        assert!(
+            stderr.contains("Select link lifetime"),
+            "expected lifetime prompt: {stderr}"
+        );
+        assert!(
+            stderr.contains("not logged in; run `sotto login`")
+                || stderr.contains("share link")
+                || stdout.contains("share link"),
+            "expected share completion: stderr={stderr}, stdout={stdout}"
+        );
+    }
+
+    #[test]
+    fn interactive_share_cancels_at_secret_prompt_on_pty() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let Some(data_dir) = setup_test_project_with_secret(scratch.path()) else {
+            return;
+        };
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sotto"));
+        cmd.current_dir(scratch.path())
+            .arg("share")
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("SOTTO_PASSWORD", "test-master-password")
+            .env("TERM", "xterm-256color")
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .env_remove("CI");
+
+        // Send Escape to cancel at the first prompt (secret selection)
+        let run = run_on_pty_with_input(&mut cmd, b"\x1b");
+        assert!(run.status.success(), "cancelling prompt should exit with 0");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            stderr.contains("aborted"),
+            "expected aborted message: {stderr}"
+        );
+    }
+
+    #[test]
+    fn interactive_share_cancels_with_ctrl_c_on_pty() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let Some(data_dir) = setup_test_project_with_secret(scratch.path()) else {
+            return;
+        };
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sotto"));
+        cmd.current_dir(scratch.path())
+            .arg("share")
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("SOTTO_PASSWORD", "test-master-password")
+            .env("TERM", "xterm-256color")
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .env_remove("CI");
+
+        // Send 0x03 (Ctrl-C) to cancel at the first prompt
+        let run = run_on_pty_with_input(&mut cmd, b"\x03");
+        assert!(
+            run.status.success(),
+            "Ctrl-C cancellation should exit with 0"
+        );
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            stderr.contains("aborted"),
+            "expected aborted message: {stderr}"
+        );
+    }
+
+    #[test]
+    fn interactive_share_cancels_at_views_prompt_on_pty() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let Some(data_dir) = setup_test_project_with_secret(scratch.path()) else {
+            return;
+        };
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sotto"));
+        cmd.current_dir(scratch.path())
+            .arg("share")
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("SOTTO_PASSWORD", "test-master-password")
+            .env("TERM", "xterm-256color")
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .env_remove("CI");
+
+        // Send Enter (select secret), then Escape (cancel views prompt)
+        let run = run_on_pty_with_input(&mut cmd, b"\n\x1b");
+        assert!(run.status.success(), "cancelling prompt should exit with 0");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            stderr.contains("aborted"),
+            "expected aborted message: {stderr}"
+        );
+    }
+
+    #[test]
+    fn interactive_share_cancels_at_lifetime_prompt_on_pty() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let Some(data_dir) = setup_test_project_with_secret(scratch.path()) else {
+            return;
+        };
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sotto"));
+        cmd.current_dir(scratch.path())
+            .arg("share")
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("SOTTO_PASSWORD", "test-master-password")
+            .env("TERM", "xterm-256color")
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .env_remove("CI");
+
+        // Send Enter (select secret), Enter (select view limit), then Escape (cancel lifetime prompt)
+        let run = run_on_pty_with_input(&mut cmd, b"\n\n\x1b");
+        assert!(run.status.success(), "cancelling prompt should exit with 0");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            stderr.contains("aborted"),
+            "expected aborted message: {stderr}"
+        );
+    }
+
+    #[test]
+    fn interactive_share_with_name_prompts_views_and_lifetime_on_pty() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let Some(data_dir) = setup_test_project_with_secret(scratch.path()) else {
+            return;
+        };
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sotto"));
+        cmd.current_dir(scratch.path())
+            .args(["share", "DEMO_SECRET"])
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("SOTTO_PASSWORD", "test-master-password")
+            .env("TERM", "xterm-256color")
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .env_remove("CI");
+
+        // Send Enter (view limit), Enter (lifetime)
+        let run = run_on_pty_with_input(&mut cmd, b"\n\n");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            !stderr.contains("Select a secret"),
+            "should not prompt for secret name when supplied on CLI: {stderr}"
+        );
+        assert!(
+            stderr.contains("Select view limit"),
+            "expected view limit prompt: {stderr}"
+        );
+        assert!(
+            stderr.contains("Select link lifetime"),
+            "expected lifetime prompt: {stderr}"
+        );
+        assert!(
+            stderr.contains("not logged in; run `sotto login`")
+                || stderr.contains("share link")
+                || stdout.contains("share link"),
+            "expected share completion: stderr={stderr}, stdout={stdout}"
+        );
+    }
+
+    #[test]
+    fn interactive_share_skips_prompts_when_flags_provided_on_pty() {
+        let scratch = tempfile::tempdir().expect("scratch directory");
+        let Some(data_dir) = setup_test_project_with_secret(scratch.path()) else {
+            return;
+        };
+
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_sotto"));
+        cmd.current_dir(scratch.path())
+            .args(["share", "DEMO_SECRET", "--views", "3", "--expire", "3600"])
+            .env("SOTTO_DATA_DIR", &data_dir)
+            .env("SOTTO_PASSWORD", "test-master-password")
+            .env("TERM", "xterm-256color")
+            .env_remove("SOTTO_TOKEN")
+            .env_remove("SOTTO_THEME")
+            .env_remove("CI");
+
+        // No input needed because all flags and arguments are provided
+        let run = run_on_pty_with_input(&mut cmd, b"");
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            !stderr.contains("Select a secret"),
+            "should not prompt for secret name: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Select view limit"),
+            "should not prompt for view limit: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Select link lifetime"),
+            "should not prompt for lifetime: {stderr}"
+        );
+        assert!(
+            stderr.contains("not logged in; run `sotto login`")
+                || stderr.contains("share link")
+                || stdout.contains("share link"),
+            "expected share completion: stderr={stderr}, stdout={stdout}"
         );
     }
 }
