@@ -539,17 +539,21 @@ impl<'a> TuiApp<'a> {
 
     /// Commit and save the secret modal contents to the active vault.
     pub fn commit_secret_modal(&mut self) -> Result<()> {
-        let name = self.secret_modal_name.trim().to_string();
-        if name.is_empty() {
+        let is_new = self.secret_modal_mode == SecretModalMode::New;
+        let name = if is_new {
+            self.secret_modal_name.trim().to_string()
+        } else {
+            self.secret_modal_name.clone()
+        };
+        if is_new && name.is_empty() {
             self.set_status("Secret name cannot be empty".into());
             return Ok(());
         }
-        if name.contains(|c: char| c.is_whitespace()) {
+        if is_new && name.contains(|c: char| c.is_whitespace()) {
             self.set_status("Secret name cannot contain whitespace".into());
             return Ok(());
         }
 
-        let is_new = self.secret_modal_mode == SecretModalMode::New;
         self.app
             .set(&self.config, &name, self.secret_modal_value.as_bytes())?;
         self.refresh_secrets()?;
@@ -1207,6 +1211,35 @@ mod tests {
         // Verify updated value in vault
         let fetched = app.get(&tui_app.config, "EXISTING_KEY").unwrap();
         assert_eq!(fetched, b"updated-secret");
+    }
+
+    #[test]
+    fn secret_modal_edit_preserves_whitespace_padded_name() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, " KEY ", b"spaced-original").unwrap();
+        app.set(&config, "KEY", b"other-original").unwrap();
+        let other_history_before = app.secret_history(&config, "KEY").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.selected_filtered_index = tui_app
+            .secrets
+            .iter()
+            .position(|item| item.name == " KEY ")
+            .unwrap();
+
+        tui_app.open_edit_secret_modal().unwrap();
+        assert_eq!(tui_app.secret_modal_name, " KEY ");
+        tui_app.secret_modal_value = Zeroizing::new("edited-dummy".into());
+        tui_app.commit_secret_modal().unwrap();
+
+        assert_eq!(app.get(&tui_app.config, " KEY ").unwrap(), b"edited-dummy");
+        assert_eq!(app.get(&tui_app.config, "KEY").unwrap(), b"other-original");
+        assert_eq!(
+            app.secret_history(&tui_app.config, "KEY").unwrap(),
+            other_history_before
+        );
     }
 
     #[test]
