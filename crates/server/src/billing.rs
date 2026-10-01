@@ -232,6 +232,7 @@ impl SubscriptionObservation {
 }
 
 /// The small interface between billing handlers and an external payment provider.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait SubscriptionProvider: Send + Sync {
     async fn create_checkout(

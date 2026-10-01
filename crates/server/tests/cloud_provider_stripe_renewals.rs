@@ -16,6 +16,9 @@ use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
 use sotto_server::cloud_provider_stripe::{
     StripeAllocationBinding, StripeContractError, StripeCoverageConfig,
 };
+use sotto_server::cloud_provider_stripe_coverage::{
+    compose_personal_coverage, StripeCoverageCompositionResult, StripeCoverageRenewalState,
+};
 use sotto_server::cloud_provider_stripe_http::{
     StripePersonalInvoiceHistory, StripePersonalInvoiceHistoryEntry,
     StripePersonalInvoiceHistoryResult, StripeReadClient, StripeReadError, StripeReadLimits,
@@ -275,6 +278,94 @@ async fn history_with_line(line: Value) -> StripePersonalInvoiceHistory {
     );
     responses.insert("/v1/invoices/in_paid".into(), vec![paid_invoice()]);
     responses.insert(
+        "/v1/invoices/in_failed".into(),
+        vec![current_invoice("open")],
+    );
+    responses.insert(
+        "/v1/invoices/in_failed/lines".into(),
+        vec![list(vec![current_line()], false)],
+    );
+    responses.insert(
+        "/v1/invoices/in_paid/lines".into(),
+        vec![list(vec![line], false)],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![list(
+            vec![json!({
+                "id":"inpay_paid","invoice":"in_paid","status":"paid","amount_paid":299,
+                "amount_requested":299,"currency":"gbp","livemode":false,
+                "payment":{"type":"payment_intent","payment_intent":"pi_paid"}
+            })],
+            false,
+        )],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![list(
+            vec![json!({
+                "id":"inpay_paid","invoice":"in_paid","status":"paid","amount_paid":299,
+                "amount_requested":299,"currency":"gbp","livemode":false,
+                "payment":{"type":"payment_intent","payment_intent":"pi_paid"}
+            })],
+            false,
+        )],
+    );
+    for path in ["/v1/refunds", "/v1/disputes", "/v1/credit_notes"] {
+        responses.insert(path.into(), vec![list(Vec::new(), false)]);
+    }
+    let server = mock_server(responses).await;
+    let client = StripeReadClient::for_test(
+        "sk_test_renewal",
+        &config(),
+        server.origin.clone(),
+        limits(),
+    )
+    .unwrap();
+    let mut session = client.session();
+    let result = client
+        .personal_invoice_history(&mut session, &binding())
+        .await
+        .unwrap();
+    let StripePersonalInvoiceHistoryResult::Observed(history) = result else {
+        panic!("expected observed history");
+    };
+    history
+}
+
+async fn history_with_current_invoice(line: Value) -> StripePersonalInvoiceHistory {
+    let mut responses = HashMap::new();
+    responses.insert(
+        "/v1/account".into(),
+        vec![json!({"id":"acct_test_renewal","object":"account","livemode":false})],
+    );
+    responses.insert(
+        "/v1/subscriptions/sub_renewal".into(),
+        vec![
+            json!({"id":"sub_renewal","customer":"cus_renewal","status":"active","livemode":false}),
+        ],
+    );
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![list(
+            vec![
+                paid_invoice(),
+                current_invoice("open"),
+                generic_open_invoice(),
+            ],
+            false,
+        )],
+    );
+    responses.insert("/v1/invoices/in_paid".into(), vec![paid_invoice()]);
+    responses.insert(
+        "/v1/invoices/in_failed".into(),
+        vec![current_invoice("open")],
+    );
+    responses.insert(
+        "/v1/invoices/in_failed/lines".into(),
+        vec![list(vec![current_line()], false)],
+    );
+    responses.insert(
         "/v1/invoices/in_paid/lines".into(),
         vec![list(vec![line], false)],
     );
@@ -324,6 +415,177 @@ async fn generic_history_keeps_non_cycle_invoices_without_current_billing_fields
         StripePersonalInvoiceHistoryEntry::Paid(term)
             if term.invoice_id() == "in_paid"
     )));
+}
+
+#[tokio::test]
+async fn loopback_history_signed_failure_current_open_composes_personal_candidate() {
+    let history = history_with_current_invoice(paid_line()).await;
+    let (raw, signature) = signed(&signed_failure(), NOW);
+    let StripeRenewalFailureResult::Linked(failure) = decode_personal_renewal_failure(
+        &raw,
+        &signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected linked failure");
+    };
+    let (client, mut session, _server) = current_client("open", None).await;
+    let StripeRenewalObservationResult::Observed(observation) = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap()
+    else {
+        panic!("expected current observation");
+    };
+    let result =
+        compose_personal_coverage(&config(), &binding(), &history, &[(*failure, *observation)])
+            .unwrap();
+    let StripeCoverageCompositionResult::Candidate(candidate) = result else {
+        panic!("expected coverage candidate");
+    };
+    assert_eq!(candidate.paid_terms().len(), 1);
+    assert_eq!(candidate.paid_terms()[0].invoice_id(), "in_paid");
+    assert!(candidate
+        .non_paid_invoices()
+        .iter()
+        .any(|invoice| invoice.invoice_id() == "in_open_generic"));
+    assert_eq!(candidate.renewals().len(), 1);
+    let renewal = &candidate.renewals()[0];
+    assert!(matches!(renewal.state(), StripeCoverageRenewalState::Open));
+    assert_eq!(renewal.predecessor_invoice_id(), "in_paid");
+    assert_eq!(
+        renewal.predecessor_evidence_reference(),
+        "stripe:invoice:in_paid:line:il_paid"
+    );
+    assert_eq!(renewal.interval().to_string(), "month");
+    assert!(candidate
+        .semantic_reference()
+        .starts_with("stripe-personal-coverage-v1:"));
+}
+
+#[tokio::test]
+async fn verified_retry_events_merge_without_changing_candidate_identity() {
+    let history = history_with_current_invoice(paid_line()).await;
+    let first_payload = signed_failure();
+    let (first_raw, first_signature) = signed(&first_payload, NOW);
+    let StripeRenewalFailureResult::Linked(first_failure) = decode_personal_renewal_failure(
+        &first_raw,
+        &first_signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected first linked failure");
+    };
+    let mut retry_payload = first_payload;
+    retry_payload["id"] = json!("evt_failure_retry");
+    let (retry_raw, retry_signature) = signed(&retry_payload, NOW);
+    let StripeRenewalFailureResult::Linked(retry_failure) = decode_personal_renewal_failure(
+        &retry_raw,
+        &retry_signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected retry linked failure");
+    };
+    let (first_client, mut first_session, _first_server) = current_client("open", None).await;
+    let (retry_client, mut retry_session, _retry_server) = current_client("open", None).await;
+    let StripeRenewalObservationResult::Observed(first_observation) = first_client
+        .personal_renewal_observation(&mut first_session, &binding(), &first_failure)
+        .await
+        .unwrap()
+    else {
+        panic!("expected first observation");
+    };
+    let StripeRenewalObservationResult::Observed(retry_observation) = retry_client
+        .personal_renewal_observation(&mut retry_session, &binding(), &retry_failure)
+        .await
+        .unwrap()
+    else {
+        panic!("expected retry observation");
+    };
+    let merged = compose_personal_coverage(
+        &config(),
+        &binding(),
+        &history,
+        &[
+            ((*first_failure).clone(), (*first_observation).clone()),
+            ((*retry_failure).clone(), (*retry_observation).clone()),
+        ],
+    )
+    .unwrap();
+    let single = compose_personal_coverage(
+        &config(),
+        &binding(),
+        &history,
+        &[((*first_failure).clone(), (*first_observation).clone())],
+    )
+    .unwrap();
+    let (
+        StripeCoverageCompositionResult::Candidate(merged),
+        StripeCoverageCompositionResult::Candidate(single),
+    ) = (merged, single)
+    else {
+        panic!("expected candidates");
+    };
+    assert_eq!(merged.semantic_reference(), single.semantic_reference());
+    assert_eq!(
+        merged.renewals()[0].event_ids(),
+        &["evt_failure_1", "evt_failure_retry"]
+    );
+    assert_eq!(merged.renewals()[0].predecessor_invoice_id(), "in_paid");
+}
+
+#[tokio::test]
+async fn verified_paid_transition_replaces_the_historical_non_paid_invoice() {
+    let history = history_with_current_invoice(paid_line()).await;
+    let (raw, signature) = signed(&signed_failure(), NOW);
+    let StripeRenewalFailureResult::Linked(failure) = decode_personal_renewal_failure(
+        &raw,
+        &signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected linked failure");
+    };
+    let (client, mut session, _server) = current_client("paid", None).await;
+    let StripeRenewalObservationResult::Observed(observation) = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap()
+    else {
+        panic!("expected paid observation");
+    };
+    let result =
+        compose_personal_coverage(&config(), &binding(), &history, &[(*failure, *observation)])
+            .unwrap();
+    let StripeCoverageCompositionResult::Candidate(candidate) = result else {
+        panic!("expected candidate");
+    };
+    assert_eq!(candidate.paid_terms().len(), 2);
+    assert!(!candidate
+        .non_paid_invoices()
+        .iter()
+        .any(|invoice| invoice.invoice_id() == "in_failed"));
+    assert!(matches!(
+        candidate.renewals()[0].state(),
+        StripeCoverageRenewalState::Paid
+    ));
 }
 
 #[tokio::test]
