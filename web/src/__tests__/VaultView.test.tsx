@@ -101,7 +101,7 @@ describe("VaultView selection loading", () => {
     renderVault();
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Could not load organisations: organisations unavailable",
+      "organisations unavailable: organisations unavailable",
     );
     expect(await screen.findByRole("button", { name: /personal-project/ })).toBeInTheDocument();
     expect(api.fetchProjects).toHaveBeenCalledTimes(1);
