@@ -355,3 +355,68 @@ test("guide routes render their page client-side", async ({ page }) => {
     page.getByRole("heading", { name: "Share .env files without the screenshot dance." }),
   ).toBeVisible();
 });
+
+test("a revealed secret can be hidden and revealed again", async ({ page }) => {
+  await loginAndUnlock(page);
+  const project = page
+    .getByRole("button", { name: new RegExp(fixture.project_name) })
+    .first();
+  await project.click();
+  const envButton = page
+    .getByRole("heading", { name: "Environments" })
+    .locator("xpath=following-sibling::ul[1]")
+    .getByRole("button")
+    .first();
+  await envButton.click();
+  const secretButton = page.getByRole("button", { name: fixture.secret_name });
+  await secretButton.click();
+  await expect(page.getByDisplayValue(fixture.secret_value)).toBeVisible();
+
+  await page.getByRole("button", { name: "Hide secret" }).click();
+  await expect(page.getByDisplayValue(fixture.secret_value)).toHaveCount(0);
+  await expect(
+    page.getByLabel("Share link (burns after one view):"),
+  ).toHaveCount(0);
+  await expect(secretButton).not.toHaveAttribute("aria-current");
+  await expect(secretButton).toBeFocused();
+
+  await secretButton.press("Enter");
+  await expect(page.getByDisplayValue(fixture.secret_value)).toBeVisible();
+});
+
+
+test("a pending share cannot restore a hidden secret", async ({ page }) => {
+  let releaseShare!: () => void;
+  const shareReleased = new Promise<void>((resolve) => { releaseShare = resolve; });
+  await page.route("**/shares", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    await shareReleased;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ token: "delayed-e2e-token" }),
+    });
+  });
+
+  await loginAndUnlock(page);
+  await page
+    .getByRole("button", { name: new RegExp(fixture.project_name) })
+    .first()
+    .click();
+  await page
+    .getByRole("heading", { name: "Environments" })
+    .locator("xpath=following-sibling::ul[1]")
+    .getByRole("button")
+    .first()
+    .click();
+  await page.getByRole("button", { name: fixture.secret_name }).click();
+  await page.getByRole("button", { name: "Create one-time share link" }).click();
+  await page.getByRole("button", { name: "Hide secret" }).click();
+  releaseShare();
+
+  await expect(page.getByDisplayValue(fixture.secret_value)).toHaveCount(0);
+  await expect(page.getByDisplayValue(/delayed-e2e-token/)).toHaveCount(0);
+});
