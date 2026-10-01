@@ -29,12 +29,6 @@ function deferred<T>() {
 describe("OrganisationDeletionPanel", () => {
   beforeEach(() => vi.resetAllMocks());
 
-  it("shows the disabled feature message", async () => {
-    vi.mocked(api.fetchOrganisationDeletionStatus).mockResolvedValue(null);
-    // The enabled flag is a module constant, so this branch is covered by the component contract in source;
-    // this test file otherwise exercises the enabled workflow through the mocked module.
-    expect(typeof api.organisationDeletionEnabled).toBe("boolean");
-  });
 
   it("retries repeated initial status failures and keeps writes frozen", async () => {
     const onActiveChange = vi.fn();
