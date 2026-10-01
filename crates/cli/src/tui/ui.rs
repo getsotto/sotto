@@ -553,6 +553,40 @@ fn draw_theme_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     f.render_widget(paragraph, popup_area);
 }
 
+fn secret_input_tail(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let span = Span::raw(text);
+    if span.width() <= max_width {
+        return text.to_string();
+    }
+
+    let ellipsis = "\u{2026}";
+    let ellipsis_width = Span::raw(ellipsis).width();
+    if max_width <= ellipsis_width {
+        return ellipsis.to_string();
+    }
+
+    let graphemes: Vec<&str> = span
+        .styled_graphemes(Style::default())
+        .map(|grapheme| grapheme.symbol)
+        .collect();
+    let mut used = ellipsis_width;
+    let mut tail = Vec::new();
+    for grapheme in graphemes.into_iter().rev() {
+        let width = Span::raw(grapheme).width();
+        if used + width > max_width {
+            break;
+        }
+        used += width;
+        tail.push(grapheme);
+    }
+    tail.reverse();
+    format!("{ellipsis}{}", tail.concat())
+}
+
 fn draw_secret_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     let styles = &app.styles;
 
@@ -562,6 +596,7 @@ fn draw_secret_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
+    let inner_width = popup_width.saturating_sub(2) as usize;
 
     f.render_widget(Clear, popup_area);
 
@@ -583,13 +618,19 @@ fn draw_secret_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     ]));
     lines.push(Line::from(""));
 
+    let name_label = "  Name:  ";
     match app.secret_modal_mode {
         crate::tui::app::SecretModalMode::New => {
             let is_name_focused = app.secret_modal_field == crate::tui::app::SecretModalField::Name;
-            let cursor = if is_name_focused { "▏" } else { "" };
+            let cursor = if is_name_focused { "\u{258f}" } else { "" };
+            let available = inner_width
+                .saturating_sub(Span::raw(name_label).width())
+                .saturating_sub(2)
+                .saturating_sub(Span::raw(cursor).width());
+            let displayed_name = secret_input_tail(&app.secret_modal_name, available);
             lines.push(Line::from(vec![
                 Span::styled(
-                    "  Name:  ",
+                    name_label,
                     if is_name_focused {
                         styles.bold_accent()
                     } else {
@@ -597,7 +638,7 @@ fn draw_secret_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
                     },
                 ),
                 Span::styled(
-                    format!("[{}{}]", app.secret_modal_name, cursor),
+                    format!("[{displayed_name}{cursor}]"),
                     if is_name_focused {
                         styles.text()
                     } else {
@@ -607,12 +648,15 @@ fn draw_secret_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
             ]));
         }
         crate::tui::app::SecretModalMode::Edit => {
+            let read_only = " (read-only)";
+            let available = inner_width
+                .saturating_sub(Span::raw(name_label).width())
+                .saturating_sub(Span::raw(read_only).width());
+            let displayed_name = secret_input_tail(&app.secret_modal_name, available);
             lines.push(Line::from(vec![
-                Span::styled("  Name:  ", styles.muted()),
-                Span::styled(
-                    format!("{} (read-only)", app.secret_modal_name),
-                    styles.text(),
-                ),
+                Span::styled(name_label, styles.muted()),
+                Span::styled(displayed_name, styles.text()),
+                Span::styled(read_only, styles.text()),
             ]));
         }
     }
@@ -620,21 +664,28 @@ fn draw_secret_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     lines.push(Line::from(""));
 
     let is_value_focused = app.secret_modal_field == crate::tui::app::SecretModalField::Value;
-    let cursor = if is_value_focused { "▏" } else { "" };
+    let cursor = if is_value_focused { "\u{258f}" } else { "" };
     let mask_hint = if app.secret_modal_masked {
         " (masked)"
     } else {
         " (revealed)"
     };
-    let displayed_value = if app.secret_modal_masked {
-        "•".repeat(app.secret_modal_value.len())
+    let raw_value = if app.secret_modal_masked {
+        "\u{2022}".repeat(app.secret_modal_value.len())
     } else {
         app.secret_modal_value.to_string()
     };
+    let value_label = "  Value: ";
+    let available = inner_width
+        .saturating_sub(Span::raw(value_label).width())
+        .saturating_sub(2)
+        .saturating_sub(Span::raw(cursor).width())
+        .saturating_sub(Span::raw(mask_hint).width());
+    let displayed_value = secret_input_tail(&raw_value, available);
 
     lines.push(Line::from(vec![
         Span::styled(
-            "  Value: ",
+            value_label,
             if is_value_focused {
                 styles.bold_accent()
             } else {
@@ -642,7 +693,7 @@ fn draw_secret_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
             },
         ),
         Span::styled(
-            format!("[{}{}]", displayed_value, cursor),
+            format!("[{displayed_value}{cursor}]"),
             if is_value_focused {
                 styles.text()
             } else {
@@ -1248,6 +1299,147 @@ mod tests {
         assert!(content.contains("(read-only)"));
         assert!(content.contains("secret-pass"));
         assert!(content.contains("(revealed)"));
+    }
+
+    #[test]
+    fn render_secret_modal_long_revealed_value_keeps_cursor_and_actions_visible() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_new_secret_modal();
+        tui_app.secret_modal_name = "LONG_VALUE".into();
+        tui_app.secret_modal_field = crate::tui::app::SecretModalField::Value;
+        tui_app.secret_modal_masked = false;
+        tui_app.secret_modal_value = zeroize::Zeroizing::new("x".repeat(500));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+
+        assert!(
+            content.contains("\u{258f}"),
+            "active value cursor must remain visible"
+        );
+        assert!(content.contains("Save"), "Save hint must remain visible");
+        assert!(
+            content.contains("Cancel"),
+            "Cancel hint must remain visible"
+        );
+    }
+
+    #[test]
+    fn secret_input_tail_is_unicode_width_bounded_and_keeps_the_end() {
+        let text = "prefix-\u{79d8}\u{5bc6}\u{1f510}-suffix";
+        let viewport = secret_input_tail(text, 10);
+        assert!(Span::raw(viewport.as_str()).width() <= 10);
+        assert!(viewport.starts_with("\u{2026}"));
+        assert!(viewport.ends_with("suffix"));
+    }
+
+    #[test]
+    fn render_secret_modal_long_masked_value_keeps_cursor_and_actions_visible() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_new_secret_modal();
+        tui_app.secret_modal_name = "MASKED_VALUE".into();
+        tui_app.secret_modal_field = crate::tui::app::SecretModalField::Value;
+        tui_app.secret_modal_value = zeroize::Zeroizing::new("x".repeat(500));
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+
+        assert!(content.contains("\u{258f}"));
+        assert!(content.contains("(masked)"));
+        assert!(content.contains("Save"));
+        assert!(content.contains("Cancel"));
+        assert!(!content.contains("xxxxxxxx"));
+        assert_eq!(tui_app.secret_modal_value.len(), 500);
+    }
+
+    #[test]
+    fn render_secret_modal_long_edit_value_keeps_cursor_and_actions_visible() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        let value = "e".repeat(500);
+        app.set(&config, "LONG_EDIT_VALUE", value.as_bytes())
+            .unwrap();
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_edit_secret_modal().unwrap();
+        tui_app.secret_modal_masked = false;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+
+        assert!(content.contains("Edit Secret"));
+        assert!(content.contains("\u{258f}"));
+        assert!(content.contains("Save"));
+        assert!(content.contains("Cancel"));
+        assert_eq!(tui_app.secret_modal_value.as_str(), value);
+    }
+
+    #[test]
+    fn render_secret_modal_unicode_and_backspace_preserve_underlying_text() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_new_secret_modal();
+        tui_app.secret_modal_name = "\u{79d8}\u{5bc6}\u{1f510}".repeat(40);
+        tui_app.secret_modal_field = crate::tui::app::SecretModalField::Value;
+        tui_app.secret_modal_masked = false;
+        tui_app.secret_modal_value = zeroize::Zeroizing::new("\u{754c}\u{1f512}".repeat(80));
+        let original_name = tui_app.secret_modal_name.clone();
+        let original_value = tui_app.secret_modal_value.to_string();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains("\u{258f}"));
+        assert!(content.contains("Save"));
+        assert!(content.contains("Cancel"));
+        assert_eq!(tui_app.secret_modal_name, original_name);
+        assert_eq!(tui_app.secret_modal_value.as_str(), original_value);
+
+        tui_app.secret_modal_backspace();
+        assert_eq!(
+            tui_app.secret_modal_value.chars().count(),
+            original_value.chars().count() - 1
+        );
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let after = format!("{:?}", terminal.backend().buffer());
+        assert!(after.contains("\u{258f}"));
+        assert!(after.contains("Save"));
+    }
+
+    #[test]
+    fn render_secret_modal_long_inputs_resize_without_panicking() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_new_secret_modal();
+        tui_app.secret_modal_name = "N".repeat(300);
+        tui_app.secret_modal_value = zeroize::Zeroizing::new("v".repeat(500));
+        tui_app.secret_modal_field = crate::tui::app::SecretModalField::Value;
+
+        for (width, height) in [(80, 24), (50, 18), (40, 12), (20, 10), (10, 6), (5, 4)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, &tui_app)).unwrap_or_else(|e| {
+                panic!("long-input secret modal failed at {width}x{height}: {e}");
+            });
+        }
     }
 
     #[test]

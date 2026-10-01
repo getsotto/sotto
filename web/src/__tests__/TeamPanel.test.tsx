@@ -257,6 +257,7 @@ describe("TeamPanel invitations", () => {
     fireEvent.submit(input.closest("form")!);
 
     expect(input).toBeDisabled();
+    expect(screen.getByRole("status")).toBeEmptyDOMElement();
     expect(screen.getByRole("button", { name: "Inviting…" })).toBeDisabled();
     fireEvent.submit(input.closest("form")!);
     expect(api.inviteMember).toHaveBeenCalledOnce();
@@ -265,7 +266,7 @@ describe("TeamPanel invitations", () => {
     await act(async () => {
       pending.resolve({ userId: "user-b", publicKey: null });
     });
-    expect(screen.getByText("invited teammate@example.com (user-b)")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("invited teammate@example.com (user-b)");
     expect(input).toHaveValue("");
     expect(input).not.toBeDisabled();
     expect(api.fetchMembers).toHaveBeenCalledTimes(2);

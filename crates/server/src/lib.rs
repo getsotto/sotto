@@ -29,6 +29,8 @@ pub mod cloud_provider_refresh;
 pub mod cloud_provider_stripe;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_corrections;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_coverage;
 // Dormant Stripe history transport; it remains unwired until the complete-history contract lands.
 #[doc(hidden)]
 pub mod cloud_provider_stripe_http;
