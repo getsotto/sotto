@@ -137,3 +137,25 @@ interval, provider account and mode, and a stable renewal identity. Event IDs re
 duplicate retry deliveries can be recognised without changing renewal identity. A missing or
 ambiguous exact predecessor returns NeedsEvidence; the decoder never claims current payment state
 or converts the failure into coverage.
+
+## Current personal renewal observation acceptance
+
+The current observation operation is covered by the loopback acceptance suite in
+`cloud_provider_stripe_renewals.rs`. The suite keeps the historical signed failure and bounded
+history as inputs, then records every current read so a rejection cannot hide an extra request.
+
+| Acceptance boundary | Test evidence |
+| --- | --- |
+| Generic history remains tolerant of non-cycle non-paid invoices while paid history remains linked | `generic_history_keeps_non_cycle_invoices_without_current_billing_fields` |
+| Monthly and annual interval provenance, retained paid term identity and single-line enumeration | `annual_history_and_signed_failure_keep_annual_price_provenance`, `paid_observation_retains_the_validated_term_and_does_not_read_the_second_line`, `current_paid_invoice_supersedes_historical_failure_and_preserves_cancellation_facts` |
+| Billing-field tokens, missing fields and exact current line shape | `current_invoice_requires_an_automatic_subscription_cycle`, `current_invoice_requires_named_billing_fields`, `current_line_contract_rejects_list_shape_and_missing_period_evidence`, `current_line_contract_rejects_proration_quantity_period_and_price_changes` |
+| Paid, open, void, uncollectible and unknown settlement boundaries | `paid_observation_rejects_missing_null_and_negative_remaining`, `current_invoice_status_and_settlement_boundaries_are_explicit`, `settlement_requires_complete_nonnegative_amounts_and_no_off_stripe_value`, `closed_invoice_rejects_remaining_balance_above_due` |
+| Subscription status and nullable cancellation facts, including reread diagnostics | `subscription_cancellation_facts_round_trip_for_active_scheduled_and_ended_states`, `cancellation_fields_require_presence_and_valid_values`, `every_nullable_cancellation_timestamp_rejects_missing_wrong_type_and_negative_values`, `billing_and_cancellation_changes_name_the_provider_fields` |
+| Independent binding, invoice context, payer and legacy ownership rejection before settlement reads | `each_binding_component_is_checked_before_any_resource_read`, `each_current_invoice_context_component_is_checked_before_settlement_reads`, `client_account_and_environment_mismatches_stop_before_subscription_reads`, `contradictory_legacy_line_ownership_is_rejected`, `matching_legacy_line_ownership_remains_supported`, `foreign_binding_and_session_are_rejected_before_resource_reads` |
+| Open-to-paid race, stable retry identity and complete request trace | `open_to_paid_header_transition_returns_changed_fields_without_retrying`, `stable_paid_observation_matches_across_sessions`, `retries_keep_one_renewal_identity_but_preserve_event_ids`, `current_paid_invoice_supersedes_historical_failure_and_preserves_cancellation_facts` |
+| Shared request/page budgets and final-read refusal | `current_observation_consumes_one_shared_request_budget`, `history_and_renewal_share_page_budget_and_stop_before_a_new_correction_read` |
+| Bounded late response and correction policy | `late_pending_response_hits_the_shared_deadline_without_partial_observation`, `associated_refund_preserves_the_paid_term_and_unknown_correction_stays_unresolved` (including an associated open dispute) |
+
+These are acceptance fixtures, not live Stripe verification. They prove the operation's current
+field and request contract against controlled loopback responses; they do not establish an atomic
+remote snapshot, coverage eligibility, recovery, persistence or publication.
