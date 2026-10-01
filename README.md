@@ -114,6 +114,8 @@ sotto share DATABASE_URL --expire 3600   # lifetime in seconds
 
 By default, a share allows one view and has no expiry; the link burns after the last view.
 
+To browse secrets interactively, see the [dashboard guide](#interactive-dashboard).
+
 Use `--env` to select an environment for one command without changing the project's default:
 
 ```sh
@@ -147,6 +149,30 @@ Machine tokens expire. A new token lasts 90 days unless you pass `--expires-in-d
 from 1 to 365, and `sotto token ls` shows when each one ends. Two weeks before that, `sotto run` and
 `sotto export` print a warning in the CI log. To replace a token, create a new one, update the CI
 secret, then revoke the old one with `sotto token revoke`.
+
+### Interactive dashboard
+
+From an initialised project, run `sotto` without a subcommand to browse its local secrets:
+
+```sh
+sotto
+```
+
+A local identity must exist and be unlocked before the dashboard opens. Sotto prompts for the
+master password when needed. The dashboard requires terminals on stdin, stdout, and stderr.
+If one is missing, CI is active, or `TERM=dumb`, a bare invocation writes help to stderr and exits
+with code 2.
+Use `sotto --help` to request help explicitly.
+
+Use the arrow keys or `j` and `k` to navigate. Press `/` to search, `?` for help, and Tab to switch
+environments. This switch lasts only for the dashboard session; `sotto env use` changes the
+project's default. Press `r` to reveal or conceal the selected value, `c` to copy it to the
+clipboard, and `q` to quit. `Esc` closes the current search or dialog; from the main view, it
+clears an active search or quits.
+
+Press `t` to browse themes with a live preview. Use the arrow keys to preview each theme, then
+press `Enter` to save your choice or `Esc` to cancel. The [theme precedence rules](#output-themes)
+explain how command and environment overrides affect the saved preference.
 
 ### Output themes
 

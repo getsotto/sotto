@@ -117,6 +117,8 @@ sotto share DATABASE_URL --expire 3600   # lifetime in seconds
 
 Standardmäßig erlaubt eine Freigabe einen Aufruf und hat kein Ablaufdatum; der Link verfällt nach dem letzten Aufruf.
 
+Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
+
 Mit `--env` wählst du eine Umgebung für einen einzelnen Befehl aus, ohne die Standardumgebung des Projekts zu ändern:
 
 ```sh
@@ -150,6 +152,34 @@ Maschinen-Tokens laufen ab. Ein neues Token gilt 90 Tage, sofern du nicht `--exp
 einem Wert von 1 bis 365 angibst, und `sotto token ls` zeigt, wann jedes endet. Zwei Wochen vorher
 geben `sotto run` und `sotto export` eine Warnung im CI-Log aus. Um ein Token zu ersetzen, erstelle
 ein neues, aktualisiere das CI-Secret und widerrufe dann das alte mit `sotto token revoke`.
+
+### Interaktives Dashboard
+
+Führe `sotto` ohne Unterbefehl in einem initialisierten Projekt aus, um dessen lokale Secrets zu
+durchsuchen:
+
+```sh
+sotto
+```
+
+Eine lokale Identität muss vorhanden und entsperrt sein, bevor sich das Dashboard öffnet. Falls
+nötig, fragt Sotto nach dem Master-Passwort. Standardeingabe, Standardausgabe und
+Standardfehlerausgabe müssen mit Terminals verbunden sein. Fehlt eines davon, ist die CI aktiv
+oder gilt `TERM=dumb`,
+schreibt ein Aufruf ohne Unterbefehl die Hilfe auf die Standardfehlerausgabe und endet mit Code 2.
+Mit `sotto --help` rufst du die Hilfe ausdrücklich auf.
+
+Navigiere mit den Pfeiltasten oder `j` und `k`. Drücke `/` zum Suchen, `?` für die Hilfe und Tab
+zum Wechseln der Umgebung. Der Wechsel gilt nur für die Dashboard-Sitzung; `sotto env use` ändert
+die Standardumgebung des Projekts. Mit `r` zeigst du den ausgewählten Wert an oder verbirgst ihn,
+mit `c` kopierst du ihn in die Zwischenablage und mit `q` beendest du das Dashboard. `Esc`
+schließt die aktuelle Suche oder ein Dialogfenster; in der Hauptansicht löscht es eine aktive
+Suche oder beendet das Dashboard.
+
+Drücke `t`, um Themes mit einer Live-Vorschau durchzugehen. Mit den Pfeiltasten siehst du jedes
+Theme. Drücke `Enter`, um deine Wahl zu speichern, oder `Esc`, um abzubrechen. Die
+[Vorrangregeln für Themes](#ausgabe-themes) erklären, wie Befehlsoptionen und Umgebungsvariablen
+die gespeicherte Einstellung beeinflussen.
 
 ### Ausgabe-Themes
 

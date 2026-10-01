@@ -117,6 +117,8 @@ sotto share DATABASE_URL --expire 3600   # lifetime in seconds
 
 Par défaut, un partage autorise une vue et n’expire pas ; le lien cesse de fonctionner après la dernière vue.
 
+Pour parcourir les secrets de façon interactive, consultez le [guide du tableau de bord](#tableau-de-bord-interactif).
+
 Utilisez `--env` pour sélectionner un environnement pour une seule commande sans modifier celui par défaut du projet :
 
 ```sh
@@ -151,6 +153,32 @@ avec une valeur de 1 à 365, et `sotto token ls` indique quand chacun prend fin.
 `sotto run` et `sotto export` affichent un avertissement dans le journal de la CI. Pour remplacer un
 token, créez-en un nouveau, mettez à jour le secret de la CI, puis révoquez l'ancien avec
 `sotto token revoke`.
+
+### Tableau de bord interactif
+
+Depuis un projet initialisé, lancez `sotto` sans sous-commande pour parcourir ses secrets locaux :
+
+```sh
+sotto
+```
+
+Vous devez disposer d'une identité locale déverrouillée avant d'ouvrir le tableau de bord. Si
+nécessaire, Sotto demande le mot de passe principal. L'entrée, la sortie et la sortie d'erreur standard
+doivent toutes être reliées à des terminaux. Si l'une manque, si la CI est active ou si
+`TERM=dumb`, l'appel sans sous-commande écrit l'aide sur la sortie d'erreur standard et se termine
+avec le code 2. Utilisez `sotto --help` pour demander l'aide explicitement.
+
+Utilisez les flèches ou `j` et `k` pour naviguer. Appuyez sur `/` pour rechercher, `?` pour afficher
+l'aide et Tab pour changer d'environnement. Ce changement ne dure que pendant la session du
+tableau de bord ; `sotto env use` modifie l'environnement par défaut du projet. Appuyez sur `r`
+pour afficher ou masquer la valeur sélectionnée, `c` pour la copier dans le presse-papiers et `q`
+pour quitter. `Esc` ferme la recherche ou la boîte de dialogue en cours ; dans la vue principale,
+il efface une recherche active ou quitte.
+
+Appuyez sur `t` pour parcourir les thèmes avec un aperçu en direct. Utilisez les flèches pour
+prévisualiser chaque thème, puis appuyez sur `Enter` pour enregistrer votre choix ou sur `Esc` pour
+annuler. Les [règles de priorité des thèmes](#thèmes-de-sortie) expliquent comment les options de
+commande et les variables d'environnement influent sur la préférence enregistrée.
 
 ### Thèmes de sortie
 

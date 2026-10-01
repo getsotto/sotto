@@ -117,6 +117,8 @@ sotto share DATABASE_URL --expire 3600   # lifetime in seconds
 
 Por padrão, um compartilhamento permite uma visualização e não expira; o link deixa de funcionar após a última visualização.
 
+Para explorar os segredos interativamente, consulte o [guia do painel](#painel-interativo).
+
 Use `--env` para selecionar um ambiente para um único comando sem alterar o padrão do projeto:
 
 ```sh
@@ -150,6 +152,31 @@ Tokens de máquina expiram. Um token novo dura 90 dias, a menos que você passe 
 com um valor de 1 a 365, e `sotto token ls` mostra quando cada um termina. Duas semanas antes,
 `sotto run` e `sotto export` exibem um aviso no log da CI. Para substituir um token, crie um novo,
 atualize o segredo da CI e depois revogue o antigo com `sotto token revoke`.
+
+### Painel interativo
+
+Em um projeto inicializado, execute `sotto` sem subcomando para explorar os segredos locais:
+
+```sh
+sotto
+```
+
+Você precisa ter uma identidade local desbloqueada antes de abrir o painel. Se necessário, Sotto
+pede a senha mestra. A entrada, a saída e a saída de erro padrão precisam estar conectadas a
+terminais. Se faltar algum, a CI estiver ativa ou `TERM=dumb`, a execução sem subcomando escreve
+a ajuda na saída de erro padrão e termina com código 2. Use `sotto --help` para pedir a ajuda
+explicitamente.
+
+Use as setas ou `j` e `k` para navegar. Pressione `/` para buscar, `?` para ver a ajuda e Tab para
+trocar de ambiente. A troca vale apenas durante a sessão do painel; `sotto env use` altera o
+ambiente padrão do projeto. Pressione `r` para mostrar ou ocultar o valor selecionado, `c` para
+copiá-lo para a área de transferência e `q` para sair. `Esc` fecha a busca ou a caixa de diálogo
+atual; na tela principal, limpa uma busca ativa ou sai.
+
+Pressione `t` para percorrer os temas com visualização ao vivo. Use as setas para ver cada tema
+e pressione `Enter` para salvar sua escolha ou `Esc` para cancelar. As
+[regras de precedência dos temas](#temas-de-saída) explicam como as opções do comando e as
+variáveis de ambiente afetam a preferência salva.
 
 ### Temas de saída
 

@@ -117,6 +117,8 @@ sotto share DATABASE_URL --expire 3600   # lifetime in seconds
 
 De forma predeterminada, un enlace compartido permite una vista y no caduca; el enlace deja de funcionar después de la última vista.
 
+Para explorar los secretos de forma interactiva, consulta la [guía del panel](#panel-interactivo).
+
 Usa `--env` para elegir un entorno para un solo comando sin cambiar el entorno predeterminado del proyecto:
 
 ```sh
@@ -150,6 +152,32 @@ Los tokens de máquina caducan. Un token nuevo dura 90 días salvo que pases `--
 un valor de 1 a 365, y `sotto token ls` muestra cuándo termina cada uno. Dos semanas antes,
 `sotto run` y `sotto export` muestran un aviso en el registro de la CI. Para sustituir un token,
 crea uno nuevo, actualiza el secreto de la CI y después revoca el antiguo con `sotto token revoke`.
+
+### Panel interactivo
+
+Desde un proyecto inicializado, ejecuta `sotto` sin subcomandos para explorar sus secretos locales:
+
+```sh
+sotto
+```
+
+Debes tener una identidad local desbloqueada antes de abrir el panel. Si hace falta, Sotto pide la
+contraseña maestra. La entrada, la salida y la salida de error estándar deben estar conectadas a
+terminales.
+Si falta alguna, la CI está activa o `TERM=dumb`, la invocación sin subcomandos escribe la ayuda
+en la salida de error estándar y termina con el código 2. Usa `sotto --help` para solicitar la
+ayuda expresamente.
+
+Usa las flechas o `j` y `k` para desplazarte. Pulsa `/` para buscar, `?` para abrir la ayuda y Tab
+para cambiar de entorno. Este cambio solo dura mientras el panel está abierto; `sotto env use`
+cambia el entorno predeterminado del proyecto. Pulsa `r` para mostrar u ocultar el valor
+seleccionado, `c` para copiarlo al portapapeles y `q` para salir. `Esc` cierra la búsqueda o el
+diálogo actual; en la vista principal, borra una búsqueda activa o sale.
+
+Pulsa `t` para recorrer los temas con vista previa en directo. Usa las flechas para ver cada tema
+y pulsa `Enter` para guardar tu elección o `Esc` para cancelar. Las
+[reglas de precedencia de los temas](#temas-de-salida) explican cómo los ajustes del comando y del
+entorno afectan a la preferencia guardada.
 
 ### Temas de salida
 
