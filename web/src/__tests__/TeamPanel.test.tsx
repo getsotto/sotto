@@ -396,3 +396,42 @@ describe("TeamPanel audit visibility", () => {
     else expect(screen.queryByRole("heading", { name: "Audit log" })).not.toBeInTheDocument();
   });
 });
+
+it("renders a populated audit response for an allowed organisation", async () => {
+  vi.resetAllMocks();
+  vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), role: "owner" }]);
+  vi.mocked(api.fetchMembers).mockResolvedValue([]);
+  vi.mocked(api.fetchEntitlements).mockResolvedValue({ ...freePlan, effectiveTier: "team" });
+  vi.mocked(api.fetchAudit).mockResolvedValue([{ id: 1, actor: "user-a", action: "secret.read", target: "secret-a", envId: "env-a", detail: "ok", at: "2026-09-30T00:00:00Z" }]);
+
+  render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+  fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+
+  expect(await screen.findByText(/secret\.read/)).toBeInTheDocument();
+  expect(api.fetchAudit).toHaveBeenCalledWith("org-a");
+});
+
+it("clears an old audit log when switching to a gated organisation", async () => {
+  vi.resetAllMocks();
+  vi.mocked(api.fetchOrgs).mockResolvedValue([
+    { ...org("org-a"), role: "owner" },
+    { ...org("org-b"), role: "member" },
+  ]);
+  vi.mocked(api.fetchMembers).mockResolvedValue([]);
+  vi.mocked(api.fetchEntitlements).mockImplementation(async (orgId) => ({
+    ...freePlan,
+    effectiveTier: orgId === "org-a" ? "team" : "free",
+  }));
+  vi.mocked(api.fetchAudit).mockResolvedValue([{ id: 1, actor: "user-a", action: "secret.read", target: null, envId: null, detail: null, at: "2026-09-30T00:00:00Z" }]);
+
+  render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+  fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+  expect(await screen.findByText(/secret\.read/)).toBeInTheDocument();
+  expect(api.fetchAudit).toHaveBeenCalledWith("org-a");
+
+  fireEvent.click(screen.getByRole("button", { name: /org-b/ }));
+  expect(await screen.findByRole("heading", { name: "Members of org-b" })).toBeInTheDocument();
+  await act(async () => { await Promise.resolve(); });
+  expect(screen.queryByRole("heading", { name: "Audit log" })).not.toBeInTheDocument();
+  expect(api.fetchAudit).toHaveBeenCalledTimes(1);
+});
