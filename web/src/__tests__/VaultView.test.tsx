@@ -172,12 +172,12 @@ describe("VaultView selection loading", () => {
     fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
     const envButton = await screen.findByRole("button", { name: "env-a" });
     fireEvent.click(envButton);
-    expect(await screen.findByRole("status")).toHaveTextContent("Opening environment…");
+    expect(await screen.findByText("Opening environment…", { selector: '[role="status"]' })).toHaveTextContent("Opening environment…");
     expect(envButton).toHaveAttribute("aria-busy", "true");
     expect(screen.queryByText("No secrets in this environment.")).not.toBeInTheDocument();
 
     await act(async () => secrets.resolve([]));
-    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByText("Opening environment…", { selector: '[role="status"]' })).not.toBeInTheDocument();
     expect(screen.getByText("No secrets in this environment.")).toBeInTheDocument();
   });
 
@@ -195,11 +195,11 @@ describe("VaultView selection loading", () => {
     await waitFor(() => expect(api.fetchSecrets).toHaveBeenCalledWith("env-b"));
 
     await act(async () => first.reject(new Error("stale failure")));
-    expect(screen.getByRole("status")).toHaveTextContent("Opening environment…");
+    expect(screen.getByText("Opening environment…", { selector: '[role="status"]' })).toHaveTextContent("Opening environment…");
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 
     await act(async () => second.resolve([]));
-    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByText("Opening environment…", { selector: '[role="status"]' })).not.toBeInTheDocument();
     expect(screen.getByText("No secrets in this environment.")).toBeInTheDocument();
   });
 
@@ -345,7 +345,7 @@ describe("VaultView selection loading", () => {
       shareRequest.resolve();
     });
 
-    expect(await screen.findByText("shared this environment with member-a")).toBeInTheDocument();
+    expect(await screen.findByText("shared this environment with member-a", { selector: '[role="status"] *' })).toHaveTextContent("shared this environment with member-a");
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
@@ -620,7 +620,7 @@ describe("VaultView rotation ownership", () => {
     await act(async () => rotation.resolve());
 
     await waitFor(() => expect(api.fetchMyGrant).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText("environment key rotated")).toBeInTheDocument();
+    expect(await screen.findByText("environment key rotated", { selector: '[role="status"] *' })).toHaveTextContent("environment key rotated");
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "env-a" })).toHaveAttribute("aria-current", "true");
   });
@@ -708,7 +708,7 @@ describe("VaultView secret copying", () => {
     fireEvent.click(await screen.findByRole("button", { name: "secret-a" }));
     expect(writeText).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
-    expect(await screen.findByRole("status")).toHaveTextContent("Secret copied.");
+    expect(await screen.findByText("Secret copied.", { selector: '[role="status"]' })).toHaveTextContent("Secret copied.");
     expect(writeText).toHaveBeenCalledWith("  first line\nsecond line  ");
   });
 });
