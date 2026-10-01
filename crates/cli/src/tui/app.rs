@@ -550,6 +550,23 @@ impl<'a> TuiApp<'a> {
         }
 
         let is_new = self.secret_modal_mode == SecretModalMode::New;
+        if is_new {
+            // New must not replace a live secret. Check every name in the
+            // environment, not just the ones the search filter shows, and
+            // leave the dialogue open with its fields intact.
+            let exists = self
+                .app
+                .list_items(&self.config)?
+                .iter()
+                .any(|item| item.name == name);
+            if exists {
+                self.set_status(format!(
+                    "Secret `{name}` already exists in `{}`. Pick another name or use Edit",
+                    self.config.environment
+                ));
+                return Ok(());
+            }
+        }
         self.app
             .set(&self.config, &name, self.secret_modal_value.as_bytes())?;
         self.refresh_secrets()?;
@@ -1176,6 +1193,62 @@ mod tests {
         // Verify stored value
         let fetched = app.get(&tui_app.config, "API").unwrap();
         assert_eq!(fetched, b"key1");
+    }
+
+    #[test]
+    fn secret_modal_new_rejects_an_existing_name_and_keeps_the_dialogue_open() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "EXISTING", b"original-dummy").unwrap();
+        app.set(&config, "OTHER", b"other-dummy").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        // Hide EXISTING behind the search filter: the check must still see it.
+        tui_app.search_query = "OTHER".into();
+        tui_app.apply_filter();
+        assert_eq!(tui_app.filtered_indices.len(), 1);
+
+        tui_app.open_new_secret_modal();
+        tui_app.secret_modal_name = "EXISTING".into();
+        tui_app.secret_modal_value = Zeroizing::new("replacement-dummy".into());
+        tui_app.commit_secret_modal().unwrap();
+
+        // The dialogue stays open, with its fields retained and a clear message.
+        assert!(tui_app.show_secret_modal);
+        assert_eq!(tui_app.secret_modal_name, "EXISTING");
+        assert_eq!(tui_app.secret_modal_value.as_str(), "replacement-dummy");
+        let status = tui_app
+            .status_message
+            .as_ref()
+            .map(|(msg, _)| msg.clone())
+            .unwrap_or_default();
+        assert!(status.contains("already exists"), "{status}");
+
+        // The stored value and its history are untouched.
+        assert_eq!(
+            app.get(&tui_app.config, "EXISTING").unwrap(),
+            b"original-dummy"
+        );
+        assert_eq!(
+            app.secret_history(&tui_app.config, "EXISTING")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A different name still works from the same dialogue.
+        tui_app.secret_modal_name = "FRESH".into();
+        tui_app.commit_secret_modal().unwrap();
+        assert!(!tui_app.show_secret_modal);
+        assert_eq!(
+            app.get(&tui_app.config, "FRESH").unwrap(),
+            b"replacement-dummy"
+        );
+        assert_eq!(
+            app.get(&tui_app.config, "EXISTING").unwrap(),
+            b"original-dummy"
+        );
     }
 
     #[test]
