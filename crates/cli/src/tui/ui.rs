@@ -5,7 +5,7 @@ use std::time::Duration;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::tui::app::TuiApp;
@@ -179,7 +179,9 @@ fn draw_left_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
     };
 
     let list = List::new(items).block(list_block);
-    f.render_widget(list, left_chunks[1]);
+    let mut list_state = ListState::default()
+        .with_selected((!app.filtered_indices.is_empty()).then_some(app.selected_filtered_index));
+    f.render_stateful_widget(list, left_chunks[1], &mut list_state);
 }
 
 fn draw_right_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
