@@ -30,6 +30,8 @@ pub mod cloud_provider;
 pub mod cloud_provider_refresh;
 pub mod cloud_provider_stripe;
 #[doc(hidden)]
+pub mod cloud_provider_stripe_authority;
+#[doc(hidden)]
 pub mod cloud_provider_stripe_corrections;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_coverage;
