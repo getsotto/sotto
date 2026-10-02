@@ -882,3 +882,33 @@ describe("VaultView secret copying", () => {
     expect(writeText).toHaveBeenCalledWith("  first line\nsecond line  ");
   });
 });
+
+describe("VaultView empty states", () => {
+  it("explains a successfully loaded empty project list", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockResolvedValue([]);
+    renderVault();
+
+    expect(
+      await screen.findByText(/No synced projects are available for this account/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("sotto login")).toBeInTheDocument();
+    expect(screen.getByText("sotto push")).toBeInTheDocument();
+    expect(screen.queryByText("Loading…")).not.toBeInTheDocument();
+  });
+
+  it("explains a successfully loaded empty environment list", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("project-a")]);
+    vi.mocked(vault.decryptProjectName).mockReturnValue("project-a");
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([]);
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    expect(
+      await screen.findByText("No environments are available in this project."),
+    ).toBeInTheDocument();
+  });
+});

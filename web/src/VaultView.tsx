@@ -456,6 +456,12 @@ export function VaultView({
         <h2>Projects</h2>
         {projectsLoading ? (
           <p className="muted">Loading…</p>
+        ) : (projects ?? []).length === 0 && projectsError === null ? (
+          <p className="muted">
+            No synced projects are available for this account. If you already have a local Sotto
+            project, run <code>sotto login</code> for this account and <code>sotto push</code> from
+            that project.
+          </p>
         ) : (
           <>
             {projectsError !== null && (
@@ -484,19 +490,23 @@ export function VaultView({
       {envs !== null && (
         <section>
           <h2>Environments</h2>
-          <ul className="items">
-            {envs.map((e) => (
-              <li key={e.env.id}>
-                <button
-                  onClick={() => void selectEnv(e)}
-                  aria-current={openEnv?.envId === e.env.id ? "true" : undefined}
-                  aria-busy={loadingEnvId === e.env.id ? "true" : undefined}
-                >
-                  {e.name}
-                </button>
-              </li>
-            ))}
-          </ul>
+          {envs.length === 0 ? (
+            <p className="muted">No environments are available in this project.</p>
+          ) : (
+            <ul className="items">
+              {envs.map((e) => (
+                <li key={e.env.id}>
+                  <button
+                    onClick={() => void selectEnv(e)}
+                    aria-current={openEnv?.envId === e.env.id ? "true" : undefined}
+                    aria-busy={loadingEnvId === e.env.id ? "true" : undefined}
+                  >
+                    {e.name}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </section>
       )}
 
