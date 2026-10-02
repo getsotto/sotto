@@ -181,6 +181,75 @@ describe("VaultView selection loading", () => {
     expect(screen.getByText("No secrets in this environment.")).toBeInTheDocument();
   });
 
+  it("stops when the account has no environment grant", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchMyGrant).mockResolvedValue(null);
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    const envButton = await screen.findByRole("button", { name: "env-a" });
+    fireEvent.click(envButton);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "you have no key for this environment - ask an admin to share it with you",
+    );
+    expect(envButton).not.toHaveAttribute("aria-busy");
+    expect(vault.openEnvGrant).not.toHaveBeenCalled();
+    expect(api.fetchSecrets).not.toHaveBeenCalled();
+  });
+
+  it("clears progress when loading the environment grant fails", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchMyGrant).mockRejectedValue(new Error("grant unavailable"));
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    const envButton = await screen.findByRole("button", { name: "env-a" });
+    fireEvent.click(envButton);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("grant unavailable");
+    expect(envButton).not.toHaveAttribute("aria-busy");
+    expect(vault.openEnvGrant).not.toHaveBeenCalled();
+    expect(api.fetchSecrets).not.toHaveBeenCalled();
+  });
+
+  it("stops before fetching secrets when opening the grant fails", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(vault.openEnvGrant).mockImplementation(() => {
+      throw new Error("cannot open grant");
+    });
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    const envButton = await screen.findByRole("button", { name: "env-a" });
+    fireEvent.click(envButton);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("cannot open grant");
+    expect(envButton).not.toHaveAttribute("aria-busy");
+    expect(api.fetchSecrets).not.toHaveBeenCalled();
+  });
+
+  it("retries an environment after its grant request fails", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchMyGrant)
+      .mockRejectedValueOnce(new Error("grant unavailable"))
+      .mockResolvedValue(new Uint8Array([7]));
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    const envButton = await screen.findByRole("button", { name: "env-a" });
+    fireEvent.click(envButton);
+    expect(await screen.findByRole("alert")).toHaveTextContent("grant unavailable");
+
+    fireEvent.click(envButton);
+    expect(await screen.findByText("No secrets in this environment.")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(envButton).not.toHaveAttribute("aria-busy");
+    expect(api.fetchMyGrant).toHaveBeenCalledTimes(2);
+    expect(vault.openEnvGrant).toHaveBeenCalledTimes(1);
+    expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps progress owned by the latest environment request", async () => {
     const first = deferred<SecretEntry[]>();
     const second = deferred<SecretEntry[]>();
