@@ -114,9 +114,26 @@ describe("VaultView selection loading", () => {
     fireEvent.change(search, { target: { value: "missing" } });
     expect(screen.getByText("No secret names match this search.")).toBeTruthy();
 
+    fireEvent.change(search, { target: { value: "" } });
+    expect(screen.getByRole("button", { name: "Alpha" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Beta" })).toBeInTheDocument();
+    expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+
     fireEvent.click(screen.getByRole("button", { name: "env-b" }));
     await screen.findByRole("button", { name: "Gamma" });
     expect(screen.getByRole("searchbox", { name: "Search secret names" })).toHaveValue("");
+  });
+
+  it("shows the empty environment state without a search control", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-empty")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([]);
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-empty" }));
+
+    expect(await screen.findByText("No secrets in this environment.")).toBeInTheDocument();
+    expect(screen.queryByRole("searchbox", { name: "Search secret names" })).not.toBeInTheDocument();
   });
 
   it("keeps environments from the latest project when requests resolve out of order", async () => {
