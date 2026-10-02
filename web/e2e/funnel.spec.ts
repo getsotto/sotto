@@ -38,6 +38,53 @@ for (const javaScriptEnabled of [true, false]) {
   });
 }
 
+async function routeAuthenticatedMissingAccount(page: import("@playwright/test").Page) {
+  await page.route("**/auth/me", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ user_id: "setup-user" }) }),
+  );
+  await page.route("**/account", (route) => route.fulfill({ status: 404, body: "" }));
+}
+
+test("missing account setup retry failure stays actionable", async ({ page }) => {
+  await routeAuthenticatedMissingAccount(page);
+  await page.goto("/app");
+  await expect(page.getByRole("heading", { name: "Finish setting up Sotto" })).toBeVisible();
+
+  await page.unroute("**/account");
+  await page.route("**/account", (route) => route.fulfill({ status: 503, body: "" }));
+  await page.getByRole("button", { name: "Check setup again" }).click();
+
+  await expect(page.getByRole("heading", { name: "Finish setting up Sotto" })).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText("server error (503)");
+});
+
+test("missing account setup can log out", async ({ page }) => {
+  await routeAuthenticatedMissingAccount(page);
+  await page.route("**/auth/logout", (route) => route.fulfill({ status: 200, body: "" }));
+  await page.goto("/app");
+  await page.getByRole("button", { name: "Log out" }).click();
+  await expect(page.getByRole("button", { name: "Log in with GitHub" })).toBeVisible();
+});
+
+test("missing account setup retry is keyboard accessible", async ({ page }) => {
+  await routeAuthenticatedMissingAccount(page);
+  await page.goto("/app");
+  const retry = page.getByRole("button", { name: "Check setup again" });
+  await retry.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("alert")).toContainText("Account setup is not published yet.");
+});
+
+test("missing account setup fits a narrow mobile viewport", async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 640 });
+  await routeAuthenticatedMissingAccount(page);
+  await page.goto("/app");
+  await expect(page.getByRole("heading", { name: "Finish setting up Sotto" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Check setup again" })).toBeVisible();
+  const overflows = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
+  expect(overflows).toBe(false);
+});
+
 // The funnel regression suite (Launch gate 4): login → unlock → TeamPanel invite → Upgrade →
 // checkout handoff → return. See docs/OUTREACH.md and
 // docs/adr/0001-continuous-deploy-during-launch-waves.md for why this suite exists, and
