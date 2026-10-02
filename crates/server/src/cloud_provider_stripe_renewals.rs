@@ -18,6 +18,7 @@ use crate::cloud_provider_stripe::{
 use crate::cloud_provider_stripe_http::{
     StripePersonalInvoiceHistory, StripePersonalInvoiceHistoryEntry,
 };
+use crate::cloud_provider_stripe_repair::StripeRepairCandidate;
 
 /// A complete historical failure linked to the paid term immediately before it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -664,6 +665,91 @@ pub fn decode_personal_renewal_failure(
     Ok(StripeRenewalFailureResult::Linked(Box::new(evidence)))
 }
 
+/// Link an authenticated repair candidate to exactly one previously paid predecessor.
+///
+/// The API event proves the failed renewal shape and its transport identity; only this bounded
+/// history join may supply predecessor provenance. A missing or ambiguous predecessor remains
+/// `NeedsEvidence` and never creates a partial renewal record.
+#[allow(dead_code)]
+pub(crate) fn link_repaired_candidate(
+    candidate: &StripeRepairCandidate,
+    config: &StripeCoverageConfig,
+    binding: &StripeAllocationBinding,
+    history: &StripePersonalInvoiceHistory,
+) -> Result<StripeRenewalFailureResult, StripeContractError> {
+    config.validate()?;
+    let provenance = candidate.provenance();
+    if provenance.account_id() != config.account_id
+        || provenance.environment() != config.environment
+        || history.account_id() != config.account_id
+        || history.environment() != config.environment
+        || history.subscription_id() != binding.subscription_id()
+        || history.customer_id() != binding.customer_id()
+        || candidate.customer_id() != binding.customer_id()
+        || candidate.subscription_id() != binding.subscription_id()
+        || candidate.provider_item_id() != binding.provider_item_id()
+        || candidate.allocation_reference() != binding.allocation_reference()
+    {
+        return Err(StripeContractError::ContextMismatch);
+    }
+    let mut candidates = history
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            StripePersonalInvoiceHistoryEntry::Paid(term)
+                if term.invoice_id() != candidate.invoice_id()
+                    && term.allocation_reference() == binding.allocation_reference()
+                    && term.customer_id() == binding.customer_id()
+                    && term.subscription_id() == binding.subscription_id()
+                    && term.provider_item_id() == binding.provider_item_id()
+                    && term.interval() == candidate.interval()
+                    && term.period_end() == candidate.period_start() =>
+            {
+                Some(term)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.invoice_id().cmp(right.invoice_id()));
+    candidates.dedup_by(|left, right| left.invoice_id() == right.invoice_id());
+    let term = match candidates.as_slice() {
+        [] => {
+            return Ok(StripeRenewalFailureResult::NeedsEvidence(
+                StripeRenewalFailureNeedsEvidence::NoMatchingPaidPredecessor,
+            ));
+        }
+        [term] => *term,
+        _ => {
+            return Ok(StripeRenewalFailureResult::NeedsEvidence(
+                StripeRenewalFailureNeedsEvidence::AmbiguousPaidPredecessor,
+            ));
+        }
+    };
+    let mut evidence = StripeRenewalFailureEvidence {
+        evidence_reference: String::new(),
+        renewal_id: renewal_identity(config, binding, candidate.invoice_id()),
+        event_id: provenance.event_id().to_owned(),
+        invoice_id: candidate.invoice_id().to_owned(),
+        invoice_line_id: candidate.invoice_line_id().to_owned(),
+        predecessor_invoice_id: term.invoice_id().to_owned(),
+        predecessor_evidence_reference: term.evidence_reference().to_owned(),
+        provider_account_id: config.account_id.clone(),
+        environment: config.environment,
+        allocation_reference: binding.allocation_reference().to_owned(),
+        customer_id: candidate.customer_id().to_owned(),
+        subscription_id: candidate.subscription_id().to_owned(),
+        provider_item_id: candidate.provider_item_id().to_owned(),
+        predecessor_period_start: term.period_start(),
+        predecessor_period_end: term.period_end(),
+        renewal_period_start: candidate.period_start(),
+        renewal_period_end: candidate.period_end(),
+        event_created_at: provenance.event_created_at(),
+        interval: candidate.interval(),
+    };
+    evidence.evidence_reference = evidence_reference(&evidence);
+    Ok(StripeRenewalFailureResult::Linked(Box::new(evidence)))
+}
+
 fn renewal_identity(
     config: &StripeCoverageConfig,
     binding: &StripeAllocationBinding,
@@ -942,5 +1028,141 @@ mod identity_tests {
         );
         stored.evidence_reference.push('x');
         assert!(StripeRenewalFailureEvidence::from_stored(stored).is_err());
+    }
+}
+
+#[cfg(test)]
+mod repair_link_tests {
+    use super::*;
+    use crate::cloud_provider::PayerKind;
+    use crate::cloud_provider_stripe_corrections::StripeRetainedPaidTerm;
+    use crate::cloud_provider_stripe_http::{
+        StripePersonalInvoiceHistory, StripePersonalInvoiceHistoryEntry,
+    };
+    use crate::cloud_provider_stripe_repair::StripeRepairCandidate;
+
+    fn config() -> StripeCoverageConfig {
+        StripeCoverageConfig::new(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "price_month",
+            "price_year",
+        )
+        .unwrap()
+    }
+
+    fn binding() -> StripeAllocationBinding {
+        StripeAllocationBinding::new("alloc_1", "cus_1", "sub_1", "si_1", PayerKind::Personal)
+            .unwrap()
+    }
+
+    fn candidate() -> StripeRepairCandidate {
+        StripeRepairCandidate::for_test(
+            "evt_repaired",
+            210,
+            "acct_test",
+            ProviderEnvironment::Test,
+            "cus_1",
+            "sub_1",
+            "si_1",
+            "alloc_1",
+            "in_failed",
+            "il_failed",
+            200,
+            300,
+            StripeInterval::Month,
+        )
+    }
+
+    fn history_with(invoice_id: &str) -> StripePersonalInvoiceHistory {
+        let term = StripeRetainedPaidTerm::for_test(
+            crate::cloud_provider_stripe::StripePersonalInvoiceObservation::for_test(
+                invoice_id,
+                "cus_1",
+                "sub_1",
+                "si_1",
+                "alloc_1",
+                StripeInterval::Month,
+                100,
+                200,
+                &format!("stripe:invoice:{invoice_id}"),
+            ),
+        );
+        StripePersonalInvoiceHistory::for_test(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "sub_1",
+            "cus_1",
+            vec![StripePersonalInvoiceHistoryEntry::Paid(term)],
+        )
+    }
+
+    #[test]
+    fn repair_link_requires_matching_history_context() {
+        let mut history = history_with("in_paid");
+        history = StripePersonalInvoiceHistory::for_test(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "sub_other",
+            "cus_1",
+            history.entries().to_vec(),
+        );
+        assert!(matches!(
+            link_repaired_candidate(&candidate(), &config(), &binding(), &history),
+            Err(StripeContractError::ContextMismatch)
+        ));
+    }
+
+    #[test]
+    fn repair_link_distinguishes_missing_ambiguous_and_unique_predecessors() {
+        let empty = StripePersonalInvoiceHistory::for_test(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "sub_1",
+            "cus_1",
+            Vec::new(),
+        );
+        assert!(matches!(
+            link_repaired_candidate(&candidate(), &config(), &binding(), &empty),
+            Ok(StripeRenewalFailureResult::NeedsEvidence(
+                StripeRenewalFailureNeedsEvidence::NoMatchingPaidPredecessor
+            ))
+        ));
+
+        let first = history_with("in_paid");
+        let second_term = StripeRetainedPaidTerm::for_test(
+            crate::cloud_provider_stripe::StripePersonalInvoiceObservation::for_test(
+                "in_paid_two",
+                "cus_1",
+                "sub_1",
+                "si_1",
+                "alloc_1",
+                StripeInterval::Month,
+                100,
+                200,
+                "stripe:invoice:in_paid_two",
+            ),
+        );
+        let ambiguous = StripePersonalInvoiceHistory::for_test(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "sub_1",
+            "cus_1",
+            vec![
+                first.entries()[0].clone(),
+                StripePersonalInvoiceHistoryEntry::Paid(second_term),
+            ],
+        );
+        assert!(matches!(
+            link_repaired_candidate(&candidate(), &config(), &binding(), &ambiguous),
+            Ok(StripeRenewalFailureResult::NeedsEvidence(
+                StripeRenewalFailureNeedsEvidence::AmbiguousPaidPredecessor
+            ))
+        ));
+
+        assert!(matches!(
+            link_repaired_candidate(&candidate(), &config(), &binding(), &first),
+            Ok(StripeRenewalFailureResult::Linked(_))
+        ));
     }
 }

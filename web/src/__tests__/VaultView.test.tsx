@@ -181,6 +181,75 @@ describe("VaultView selection loading", () => {
     expect(screen.getByText("No secrets in this environment.")).toBeInTheDocument();
   });
 
+  it("stops when the account has no environment grant", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchMyGrant).mockResolvedValue(null);
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    const envButton = await screen.findByRole("button", { name: "env-a" });
+    fireEvent.click(envButton);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "you have no key for this environment - ask an admin to share it with you",
+    );
+    expect(envButton).not.toHaveAttribute("aria-busy");
+    expect(vault.openEnvGrant).not.toHaveBeenCalled();
+    expect(api.fetchSecrets).not.toHaveBeenCalled();
+  });
+
+  it("clears progress when loading the environment grant fails", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchMyGrant).mockRejectedValue(new Error("grant unavailable"));
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    const envButton = await screen.findByRole("button", { name: "env-a" });
+    fireEvent.click(envButton);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("grant unavailable");
+    expect(envButton).not.toHaveAttribute("aria-busy");
+    expect(vault.openEnvGrant).not.toHaveBeenCalled();
+    expect(api.fetchSecrets).not.toHaveBeenCalled();
+  });
+
+  it("stops before fetching secrets when opening the grant fails", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(vault.openEnvGrant).mockImplementation(() => {
+      throw new Error("cannot open grant");
+    });
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    const envButton = await screen.findByRole("button", { name: "env-a" });
+    fireEvent.click(envButton);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("cannot open grant");
+    expect(envButton).not.toHaveAttribute("aria-busy");
+    expect(api.fetchSecrets).not.toHaveBeenCalled();
+  });
+
+  it("retries an environment after its grant request fails", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchMyGrant)
+      .mockRejectedValueOnce(new Error("grant unavailable"))
+      .mockResolvedValue(new Uint8Array([7]));
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    const envButton = await screen.findByRole("button", { name: "env-a" });
+    fireEvent.click(envButton);
+    expect(await screen.findByRole("alert")).toHaveTextContent("grant unavailable");
+
+    fireEvent.click(envButton);
+    expect(await screen.findByText("No secrets in this environment.")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(envButton).not.toHaveAttribute("aria-busy");
+    expect(api.fetchMyGrant).toHaveBeenCalledTimes(2);
+    expect(vault.openEnvGrant).toHaveBeenCalledTimes(1);
+    expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps progress owned by the latest environment request", async () => {
     const first = deferred<SecretEntry[]>();
     const second = deferred<SecretEntry[]>();
@@ -515,6 +584,107 @@ describe("VaultView selection loading", () => {
       expect.anything(),
       expect.anything(),
       expect.objectContaining({ id: "secret-deleted" }),
+    );
+  });
+});
+
+describe("VaultView name-decryption fallbacks", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchMyGrant).mockResolvedValue(new Uint8Array([7]));
+    vi.mocked(api.fetchSecrets).mockResolvedValue([]);
+    vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
+  });
+
+  it("falls back to a project id without hiding healthy projects", async () => {
+    vi.mocked(api.fetchProjects).mockResolvedValue([
+      project("project-fallback"),
+      project("project-healthy"),
+    ]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-next")]);
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => {
+      if (id === "project-fallback") {
+        throw new Error("cannot decrypt project name");
+      }
+      return "Healthy project";
+    });
+    vi.mocked(vault.decryptEnvName).mockReturnValue("Next environment");
+
+    renderVault();
+
+    const fallback = await screen.findByRole("button", { name: /project-fallback/ });
+    expect(screen.getByRole("button", { name: /Healthy project/ })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.click(fallback);
+
+    await waitFor(() => expect(api.fetchEnvironments).toHaveBeenCalledWith("project-fallback"));
+    expect(await screen.findByRole("button", { name: "Next environment" })).toBeInTheDocument();
+  });
+
+  it("falls back to an environment id and opens it by that id", async () => {
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("project-a")]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([
+      environment("env-fallback"),
+      environment("env-healthy"),
+    ]);
+    vi.mocked(vault.decryptProjectName).mockReturnValue("Project A");
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => {
+      if (id === "env-fallback") {
+        throw new Error("cannot decrypt environment name");
+      }
+      return "Healthy environment";
+    });
+
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /Project A/ }));
+    const fallback = await screen.findByRole("button", { name: "env-fallback" });
+    expect(screen.getByRole("button", { name: "Healthy environment" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.click(fallback);
+
+    await waitFor(() => expect(api.fetchMyGrant).toHaveBeenCalledWith("env-fallback"));
+    expect(api.fetchSecrets).toHaveBeenCalledWith("env-fallback");
+    expect(await screen.findByText("No secrets in this environment.")).toBeInTheDocument();
+  });
+
+  it("falls back to a secret id and defers value decryption until selection", async () => {
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("project-a")]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([
+      secret("secret-fallback"),
+      secret("secret-healthy"),
+    ]);
+    vi.mocked(vault.decryptProjectName).mockReturnValue("Project A");
+    vi.mocked(vault.decryptEnvName).mockReturnValue("Environment A");
+    vi.mocked(vault.decryptSecretName).mockImplementation((_key, _envId, entry) => {
+      if (entry.id === "secret-fallback") {
+        throw new Error("cannot decrypt secret name");
+      }
+      return "Healthy secret";
+    });
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("dummy-value");
+
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /Project A/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Environment A" }));
+    const fallback = await screen.findByRole("button", { name: "secret-fallback" });
+    expect(screen.getByRole("button", { name: "Healthy secret" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
+
+    fireEvent.click(fallback);
+
+    expect(await screen.findByDisplayValue("dummy-value")).toBeInTheDocument();
+    expect(vault.decryptSecretValue).toHaveBeenCalledWith(
+      new Uint8Array([8]),
+      "env-a",
+      expect.objectContaining({ id: "secret-fallback" }),
     );
   });
 });

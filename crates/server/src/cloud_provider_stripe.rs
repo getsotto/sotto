@@ -127,6 +127,35 @@ pub struct StripePersonalInvoiceObservation {
 }
 
 impl StripePersonalInvoiceObservation {
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_test(
+        invoice_id: &str,
+        customer_id: &str,
+        subscription_id: &str,
+        provider_item_id: &str,
+        allocation_reference: &str,
+        interval: StripeInterval,
+        period_start: i64,
+        period_end: i64,
+        evidence_reference: &str,
+    ) -> Self {
+        Self {
+            invoice_id: invoice_id.into(),
+            customer_id: customer_id.into(),
+            subscription_id: subscription_id.into(),
+            provider_item_id: provider_item_id.into(),
+            allocation_reference: allocation_reference.into(),
+            payment_intent_id: "pi_test".into(),
+            currency: "gbp".into(),
+            amount_paid: 100,
+            interval,
+            period_start,
+            period_end,
+            evidence_reference: evidence_reference.into(),
+        }
+    }
+
     pub fn invoice_id(&self) -> &str {
         &self.invoice_id
     }

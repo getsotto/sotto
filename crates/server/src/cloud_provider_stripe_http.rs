@@ -334,6 +334,28 @@ impl StripeReadClient {
         Ok(resource)
     }
 
+    /// Retrieve one immutable event through the authenticated, bounded API session.
+    ///
+    /// The repair decoder owns event-shape validation. This method only binds the response to the
+    /// requested event identifier and preserves the session's request, byte and deadline bounds.
+    #[doc(hidden)]
+    pub async fn event_payload(
+        &self,
+        session: &mut StripeReadSession,
+        event_id: &str,
+    ) -> Result<Value, StripeReadError> {
+        self.ensure_account(session).await?;
+        validate_identifier(event_id)?;
+        let path = format!("v1/events/{event_id}");
+        let value = self.request_json(session, Method::GET, &path, &[]).await?;
+        if value.get("object").and_then(Value::as_str) != Some("event")
+            || value.get("id").and_then(Value::as_str) != Some(event_id)
+        {
+            return Err(StripeReadError::ContextMismatch);
+        }
+        Ok(value)
+    }
+
     pub async fn subscription_invoices(
         &self,
         session: &mut StripeReadSession,
@@ -1350,6 +1372,23 @@ impl StripePersonalInvoiceHistory {
 
     pub fn entries(&self) -> &[StripePersonalInvoiceHistoryEntry] {
         &self.entries
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        account_id: &str,
+        environment: ProviderEnvironment,
+        subscription_id: &str,
+        customer_id: &str,
+        entries: Vec<StripePersonalInvoiceHistoryEntry>,
+    ) -> Self {
+        Self {
+            account_id: account_id.into(),
+            environment,
+            subscription_id: subscription_id.into(),
+            customer_id: customer_id.into(),
+            entries,
+        }
     }
 }
 
