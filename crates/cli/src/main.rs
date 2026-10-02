@@ -2425,9 +2425,9 @@ mod tests {
     fn token_ls_json_parser_parses_flag() {
         let cli = Cli::try_parse_from(["sotto", "token", "ls", "--json"])
             .expect("sotto token ls --json should parse");
-        let Command::Token {
+        let Some(Command::Token {
             command: TokenCommand::Ls { json },
-        } = cli.command
+        }) = cli.command
         else {
             panic!("expected TokenCommand::Ls");
         };
