@@ -29,6 +29,8 @@ pub mod cloud_coverage_store;
 pub mod cloud_provider;
 pub mod cloud_provider_refresh;
 #[doc(hidden)]
+pub mod cloud_provider_refresh_inputs;
+#[doc(hidden)]
 pub mod cloud_provider_refresh_jobs;
 #[doc(hidden)]
 pub mod cloud_provider_refresh_worker;

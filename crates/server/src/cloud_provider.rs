@@ -116,6 +116,30 @@ impl VerifiedProviderEvent {
         Ok(event)
     }
 
+    /// Reconstruct a verified event from the durable receipt identity.
+    ///
+    /// The payload is intentionally absent; the stored hash is already the result of the
+    /// provider verification boundary and is validated again before it can drive a refresh.
+    pub(crate) fn from_stored(
+        event_id: String,
+        event_type: String,
+        provider_created_at: i64,
+        subscription_id: Option<String>,
+        allocation_reference: Option<String>,
+        normalized_payload_hash: String,
+    ) -> Result<Self, ProviderAdapterError> {
+        let event = Self {
+            event_id,
+            event_type,
+            provider_created_at,
+            subscription_id,
+            allocation_reference,
+            normalized_payload_hash,
+        };
+        event.validate()?;
+        Ok(event)
+    }
+
     fn validate(&self) -> Result<(), ProviderAdapterError> {
         validate_identifier(&self.event_id, "provider event")?;
         validate_identifier(&self.event_type, "provider event type")?;
