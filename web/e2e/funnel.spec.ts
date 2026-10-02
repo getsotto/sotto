@@ -421,10 +421,10 @@ test("a revealed secret can be hidden and revealed again", async ({ page }) => {
   await envButton.click();
   const secretButton = page.getByRole("button", { name: fixture.secret_name });
   await secretButton.click();
-  await expect(page.getByDisplayValue(fixture.secret_value)).toBeVisible();
+  await expect(page.locator("textarea.secret-value")).toHaveValue(fixture.secret_value);
 
   await page.getByRole("button", { name: "Hide secret" }).click();
-  await expect(page.getByDisplayValue(fixture.secret_value)).toHaveCount(0);
+  await expect(page.locator("textarea.secret-value")).toHaveCount(0);
   await expect(
     page.getByLabel("Share link (burns after one view):"),
   ).toHaveCount(0);
@@ -432,7 +432,7 @@ test("a revealed secret can be hidden and revealed again", async ({ page }) => {
   await expect(secretButton).toBeFocused();
 
   await secretButton.press("Enter");
-  await expect(page.getByDisplayValue(fixture.secret_value)).toBeVisible();
+  await expect(page.locator("textarea.secret-value")).toHaveValue(fixture.secret_value);
 });
 
 
@@ -468,6 +468,6 @@ test("a pending share cannot restore a hidden secret", async ({ page }) => {
   await page.getByRole("button", { name: "Hide secret" }).click();
   releaseShare();
 
-  await expect(page.getByDisplayValue(fixture.secret_value)).toHaveCount(0);
-  await expect(page.getByDisplayValue(/delayed-e2e-token/)).toHaveCount(0);
+  await expect(page.locator("textarea.secret-value")).toHaveCount(0);
+  await expect(page.locator("textarea.share-link")).toHaveCount(0);
 });
