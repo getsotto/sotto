@@ -830,9 +830,18 @@ fn draw_history_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
             styles.muted(),
         )));
     } else {
-        let available_slots = popup_height.saturating_sub(8) as usize;
-        let max_visible = available_slots.max(1);
         let total_items = app.history_modal_items.len();
+        // Inside the border: three header lines, then the version rows, then a
+        // blank line and the action hints. Keep room for the action hints, and
+        // for both overflow indicators whenever the list does not fit, so the
+        // indicators never push the hints out of the popup.
+        let inner_height = popup_height.saturating_sub(2) as usize;
+        let fixed_lines = 3 + 2;
+        let mut max_visible = inner_height.saturating_sub(fixed_lines);
+        if total_items > max_visible {
+            max_visible = max_visible.saturating_sub(2);
+        }
+        let max_visible = max_visible.max(1);
         let selected = app.history_modal_selected_index;
 
         let start = if total_items <= max_visible || selected < max_visible / 2 {
@@ -1438,6 +1447,85 @@ mod tests {
             let mut terminal = Terminal::new(backend).unwrap();
             terminal.draw(|f| draw(f, &tui_app)).unwrap_or_else(|e| {
                 panic!("long-input secret modal failed at {width}x{height}: {e}");
+            });
+        }
+    }
+
+    fn buffer_lines(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn render_history_modal_keeps_selection_and_actions_visible_while_scrolling() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        for i in 0..22 {
+            app.set(&config, "HISTORY_KEY", format!("value-{i}").as_bytes())
+                .unwrap();
+        }
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_history_modal().unwrap();
+        assert_eq!(tui_app.history_modal_items.len(), 22);
+
+        for selected in [0, 5, 10, 15, 21] {
+            tui_app.history_modal_selected_index = selected;
+            let backend = TestBackend::new(80, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, &tui_app)).unwrap();
+            let lines = buffer_lines(&terminal);
+
+            let version = tui_app.history_modal_items[selected].version;
+            let marker = format!("\u{25b8} v{version}");
+            assert!(
+                lines.iter().any(|line| line.contains(&marker)),
+                "selected row `{marker}` must stay visible at index {selected}:\n{}",
+                lines.join("\n")
+            );
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("Restore") && l.contains("Close")),
+                "action hints must stay visible at index {selected}:\n{}",
+                lines.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn render_history_modal_short_history_and_small_terminals_do_not_panic() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        for i in 0..3 {
+            app.set(&config, "SHORT_KEY", format!("value-{i}").as_bytes())
+                .unwrap();
+        }
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_history_modal().unwrap();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let lines = buffer_lines(&terminal);
+        assert!(lines.iter().any(|l| l.contains("Restore")));
+        assert!(!lines.iter().any(|l| l.contains("more versions")));
+
+        for (width, height) in [(50, 18), (40, 12), (20, 10), (10, 6), (5, 4)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, &tui_app)).unwrap_or_else(|e| {
+                panic!("history modal failed at {width}x{height}: {e}");
             });
         }
     }

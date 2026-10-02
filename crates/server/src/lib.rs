@@ -37,6 +37,8 @@ pub mod cloud_provider_stripe_coverage;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_http;
 #[doc(hidden)]
+pub mod cloud_provider_stripe_renewal_store;
+#[doc(hidden)]
 pub mod cloud_provider_stripe_renewals;
 pub mod community;
 pub mod config;
