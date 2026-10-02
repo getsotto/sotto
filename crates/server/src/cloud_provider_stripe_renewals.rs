@@ -10,7 +10,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::billing::webhook_version_accepted;
-use crate::cloud_provider::ProviderEnvironment;
+use crate::cloud_provider::{ProviderAdapterError, ProviderEnvironment, VerifiedProviderEvent};
 use crate::cloud_provider_stripe::{
     verify_webhook_signature, StripeAllocationBinding, StripeContractError, StripeCoverageConfig,
     StripeInterval, STRIPE_ALLOCATION_METADATA_KEY,
@@ -22,6 +22,7 @@ use crate::cloud_provider_stripe_http::{
 /// A complete historical failure linked to the paid term immediately before it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeRenewalFailureEvidence {
+    evidence_reference: String,
     renewal_id: String,
     event_id: String,
     invoice_id: String,
@@ -43,6 +44,15 @@ pub struct StripeRenewalFailureEvidence {
 }
 
 impl StripeRenewalFailureEvidence {
+    /// The versioned semantic reference for this complete historical observation.
+    ///
+    /// This is separate from the generic provider event fingerprint: it includes the linked
+    /// predecessor and its evidence reference, while the event fingerprint describes only the
+    /// verified delivery identity.
+    pub fn evidence_reference(&self) -> &str {
+        &self.evidence_reference
+    }
+
     pub fn renewal_id(&self) -> &str {
         &self.renewal_id
     }
@@ -114,6 +124,148 @@ impl StripeRenewalFailureEvidence {
     pub const fn event_created_at(&self) -> i64 {
         self.event_created_at
     }
+
+    /// Derive the generic provider event identity without retaining the signed payload.
+    pub(crate) fn verified_event(&self) -> Result<VerifiedProviderEvent, ProviderAdapterError> {
+        let canonical = canonical_event_encoding(self);
+        VerifiedProviderEvent::from_payload(
+            self.event_id.clone(),
+            "invoice.payment_failed",
+            self.event_created_at,
+            Some(self.subscription_id.clone()),
+            Some(self.allocation_reference.clone()),
+            &canonical,
+        )
+    }
+
+    /// Reconstruct sealed evidence from validated persistence columns.
+    ///
+    /// Database rows are attestations of a prior signed acceptance, not a new signature
+    /// verification. This narrow crate-private path still validates every identity and the
+    /// versioned reference before exposing the value to the rest of the adapter.
+    pub(crate) fn from_stored(
+        stored: StoredStripeRenewalFailure,
+    ) -> Result<Self, ProviderAdapterError> {
+        if stored.version != RENEWAL_EVIDENCE_VERSION {
+            return Err(ProviderAdapterError::InvalidEvidence(
+                "unsupported Stripe renewal evidence version".into(),
+            ));
+        }
+        for (value, name) in [
+            (&stored.renewal_id, "renewal id"),
+            (&stored.event_id, "provider event"),
+            (&stored.invoice_id, "invoice"),
+            (&stored.invoice_line_id, "invoice line"),
+            (&stored.predecessor_invoice_id, "predecessor invoice"),
+            (
+                &stored.predecessor_evidence_reference,
+                "predecessor evidence reference",
+            ),
+            (&stored.provider_account_id, "provider account"),
+            (&stored.allocation_reference, "allocation"),
+            (&stored.customer_id, "customer"),
+            (&stored.subscription_id, "subscription"),
+            (&stored.provider_item_id, "provider item"),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ProviderAdapterError::InvalidEvidence(format!(
+                    "stored {name} must not be empty"
+                )));
+            }
+        }
+        if stored.event_created_at < 0 {
+            return Err(ProviderAdapterError::InvalidEvidence(
+                "stored provider event timestamp must not be negative".into(),
+            ));
+        }
+        if stored.predecessor_period_start < 0
+            || stored.predecessor_period_end <= stored.predecessor_period_start
+            || stored.renewal_period_start < 0
+            || stored.renewal_period_end <= stored.renewal_period_start
+            || stored.predecessor_period_end != stored.renewal_period_start
+        {
+            return Err(ProviderAdapterError::InvalidEvidence(
+                "stored Stripe renewal periods are not adjacent".into(),
+            ));
+        }
+        let interval = match stored.interval.as_str() {
+            "month" => StripeInterval::Month,
+            "year" => StripeInterval::Year,
+            _ => {
+                return Err(ProviderAdapterError::InvalidEvidence(
+                    "stored Stripe renewal interval is unsupported".into(),
+                ));
+            }
+        };
+        let evidence = Self {
+            evidence_reference: stored.evidence_reference,
+            renewal_id: stored.renewal_id,
+            event_id: stored.event_id,
+            invoice_id: stored.invoice_id,
+            invoice_line_id: stored.invoice_line_id,
+            predecessor_invoice_id: stored.predecessor_invoice_id,
+            predecessor_evidence_reference: stored.predecessor_evidence_reference,
+            provider_account_id: stored.provider_account_id,
+            environment: stored.environment,
+            allocation_reference: stored.allocation_reference,
+            customer_id: stored.customer_id,
+            subscription_id: stored.subscription_id,
+            provider_item_id: stored.provider_item_id,
+            predecessor_period_start: stored.predecessor_period_start,
+            predecessor_period_end: stored.predecessor_period_end,
+            renewal_period_start: stored.renewal_period_start,
+            renewal_period_end: stored.renewal_period_end,
+            event_created_at: stored.event_created_at,
+            interval,
+        };
+        if evidence.renewal_id
+            != renewal_identity_from_parts(
+                &evidence.provider_account_id,
+                evidence.environment,
+                &evidence.allocation_reference,
+                &evidence.subscription_id,
+                &evidence.provider_item_id,
+                &evidence.invoice_id,
+            )
+        {
+            return Err(ProviderAdapterError::InvalidEvidence(
+                "stored Stripe renewal identity does not match its fields".into(),
+            ));
+        }
+        if evidence.evidence_reference != evidence_reference(&evidence) {
+            return Err(ProviderAdapterError::InvalidEvidence(
+                "stored Stripe renewal evidence reference does not match its fields".into(),
+            ));
+        }
+        Ok(evidence)
+    }
+}
+
+pub(crate) const RENEWAL_EVIDENCE_VERSION: i16 = 1;
+
+/// Persistence-shaped data accepted only by the validated reconstruction path above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredStripeRenewalFailure {
+    pub version: i16,
+    pub evidence_reference: String,
+    pub renewal_id: String,
+    pub event_id: String,
+    pub invoice_id: String,
+    pub invoice_line_id: String,
+    pub predecessor_invoice_id: String,
+    pub predecessor_evidence_reference: String,
+    pub provider_account_id: String,
+    pub environment: ProviderEnvironment,
+    pub allocation_reference: String,
+    pub customer_id: String,
+    pub subscription_id: String,
+    pub provider_item_id: String,
+    pub predecessor_period_start: i64,
+    pub predecessor_period_end: i64,
+    pub renewal_period_start: i64,
+    pub renewal_period_end: i64,
+    pub event_created_at: i64,
+    pub interval: String,
 }
 
 /// A well-formed failure that cannot be linked without inventing historical evidence.
@@ -487,28 +639,29 @@ pub fn decode_personal_renewal_failure(
         }
     };
 
-    Ok(StripeRenewalFailureResult::Linked(Box::new(
-        StripeRenewalFailureEvidence {
-            renewal_id: renewal_identity(config, binding, &invoice_id),
-            event_id,
-            invoice_id,
-            invoice_line_id,
-            predecessor_invoice_id: term.invoice_id().to_owned(),
-            predecessor_evidence_reference: term.evidence_reference().to_owned(),
-            provider_account_id: config.account_id.clone(),
-            environment: config.environment,
-            allocation_reference,
-            customer_id,
-            subscription_id,
-            provider_item_id,
-            predecessor_period_start: term.period_start(),
-            predecessor_period_end: term.period_end(),
-            renewal_period_start,
-            renewal_period_end,
-            event_created_at,
-            interval: expected_interval,
-        },
-    )))
+    let mut evidence = StripeRenewalFailureEvidence {
+        evidence_reference: String::new(),
+        renewal_id: renewal_identity(config, binding, &invoice_id),
+        event_id,
+        invoice_id,
+        invoice_line_id,
+        predecessor_invoice_id: term.invoice_id().to_owned(),
+        predecessor_evidence_reference: term.evidence_reference().to_owned(),
+        provider_account_id: config.account_id.clone(),
+        environment: config.environment,
+        allocation_reference,
+        customer_id,
+        subscription_id,
+        provider_item_id,
+        predecessor_period_start: term.period_start(),
+        predecessor_period_end: term.period_end(),
+        renewal_period_start,
+        renewal_period_end,
+        event_created_at,
+        interval: expected_interval,
+    };
+    evidence.evidence_reference = evidence_reference(&evidence);
+    Ok(StripeRenewalFailureResult::Linked(Box::new(evidence)))
 }
 
 fn renewal_identity(
@@ -516,15 +669,33 @@ fn renewal_identity(
     binding: &StripeAllocationBinding,
     invoice_id: &str,
 ) -> String {
+    renewal_identity_from_parts(
+        &config.account_id,
+        config.environment,
+        binding.allocation_reference(),
+        binding.subscription_id(),
+        binding.provider_item_id(),
+        invoice_id,
+    )
+}
+
+fn renewal_identity_from_parts(
+    provider_account_id: &str,
+    environment: ProviderEnvironment,
+    allocation_reference: &str,
+    subscription_id: &str,
+    provider_item_id: &str,
+    invoice_id: &str,
+) -> String {
     let parts = [
         "stripe",
         "renewal",
         "v1",
-        &config.account_id,
-        config.environment.as_str(),
-        binding.allocation_reference(),
-        binding.subscription_id(),
-        binding.provider_item_id(),
+        provider_account_id,
+        environment.as_str(),
+        allocation_reference,
+        subscription_id,
+        provider_item_id,
         invoice_id,
     ];
     let mut canonical = String::new();
@@ -533,9 +704,89 @@ fn renewal_identity(
         canonical.push(':');
         canonical.push_str(part);
     }
-    let mut digest = Sha256::new();
-    digest.update(canonical.as_bytes());
-    format!("stripe:renewal:{}", hex_lower(&digest.finalize()))
+    format!(
+        "stripe:renewal:{}",
+        hex_lower(&Sha256::digest(canonical.as_bytes()))
+    )
+}
+
+fn canonical_event_encoding(evidence: &StripeRenewalFailureEvidence) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new("stripe renewal failure event", 1);
+    encoder.string("event_type", "invoice.payment_failed");
+    encoder.string("event_id", &evidence.event_id);
+    encoder.integer("event_created_at", evidence.event_created_at);
+    encoder.string("provider_account", &evidence.provider_account_id);
+    encoder.string("environment", evidence.environment.as_str());
+    encoder.string("allocation", &evidence.allocation_reference);
+    encoder.string("customer", &evidence.customer_id);
+    encoder.string("subscription", &evidence.subscription_id);
+    encoder.string("provider_item", &evidence.provider_item_id);
+    encoder.string("invoice", &evidence.invoice_id);
+    encoder.string("invoice_line", &evidence.invoice_line_id);
+    encoder.integer("renewal_period_start", evidence.renewal_period_start);
+    encoder.integer("renewal_period_end", evidence.renewal_period_end);
+    encoder.string("interval", evidence.interval.to_string().as_str());
+    encoder.finish()
+}
+
+fn evidence_reference(evidence: &StripeRenewalFailureEvidence) -> String {
+    let mut encoder = CanonicalEncoder::new(
+        "stripe renewal failure evidence",
+        RENEWAL_EVIDENCE_VERSION as u16,
+    );
+    encoder.string("renewal_id", &evidence.renewal_id);
+    encoder.field_bytes("event", &canonical_event_encoding(evidence));
+    encoder.string("predecessor_invoice", &evidence.predecessor_invoice_id);
+    encoder.string(
+        "predecessor_evidence_reference",
+        &evidence.predecessor_evidence_reference,
+    );
+    encoder.integer(
+        "predecessor_period_start",
+        evidence.predecessor_period_start,
+    );
+    encoder.integer("predecessor_period_end", evidence.predecessor_period_end);
+    format!(
+        "stripe:renewal-failure:v{}:{}",
+        RENEWAL_EVIDENCE_VERSION,
+        hex_lower(&Sha256::digest(encoder.finish()))
+    )
+}
+
+struct CanonicalEncoder {
+    bytes: Vec<u8>,
+}
+
+impl CanonicalEncoder {
+    fn new(domain: &str, version: u16) -> Self {
+        let mut encoder = Self { bytes: Vec::new() };
+        encoder.string("domain", domain);
+        encoder.integer("version", i64::from(version));
+        encoder
+    }
+
+    fn string(&mut self, name: &str, value: &str) {
+        self.field_bytes(name, value.as_bytes());
+    }
+
+    fn integer(&mut self, name: &str, value: i64) {
+        self.field_bytes(name, &value.to_be_bytes());
+    }
+
+    fn field_bytes(&mut self, name: &str, value: &[u8]) {
+        self.bytes(name.as_bytes());
+        self.bytes(value);
+    }
+
+    fn bytes(&mut self, value: &[u8]) {
+        self.bytes
+            .extend_from_slice(&(value.len() as u64).to_be_bytes());
+        self.bytes.extend_from_slice(value);
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -607,4 +858,89 @@ fn required_bool(object: &Value, field: &'static str) -> Result<bool, StripeCont
         .get(field)
         .and_then(Value::as_bool)
         .ok_or(StripeContractError::MissingField(field))
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn evidence() -> StripeRenewalFailureEvidence {
+        let mut evidence = StripeRenewalFailureEvidence {
+            evidence_reference: String::new(),
+            renewal_id: renewal_identity_from_parts(
+                "acct_test",
+                ProviderEnvironment::Test,
+                "alloc_1",
+                "sub_1",
+                "si_1",
+                "in_failed",
+            ),
+            event_id: "evt_failed".into(),
+            invoice_id: "in_failed".into(),
+            invoice_line_id: "il_failed".into(),
+            predecessor_invoice_id: "in_paid".into(),
+            predecessor_evidence_reference: "stripe:invoice:v1:paid".into(),
+            provider_account_id: "acct_test".into(),
+            environment: ProviderEnvironment::Test,
+            allocation_reference: "alloc_1".into(),
+            customer_id: "cus_1".into(),
+            subscription_id: "sub_1".into(),
+            provider_item_id: "si_1".into(),
+            predecessor_period_start: 100,
+            predecessor_period_end: 200,
+            renewal_period_start: 200,
+            renewal_period_end: 300,
+            event_created_at: 210,
+            interval: StripeInterval::Month,
+        };
+        evidence.evidence_reference = evidence_reference(&evidence);
+        evidence
+    }
+
+    #[test]
+    fn generic_event_identity_excludes_predecessor_provenance() {
+        let original = evidence();
+        let mut changed = original.clone();
+        changed.predecessor_evidence_reference = "stripe:invoice:v1:corrected".into();
+        changed.evidence_reference = evidence_reference(&changed);
+
+        assert_eq!(
+            original.verified_event().unwrap().normalized_payload_hash,
+            changed.verified_event().unwrap().normalized_payload_hash
+        );
+        assert_ne!(original.evidence_reference, changed.evidence_reference);
+    }
+
+    #[test]
+    fn stored_reconstruction_rejects_reference_tampering() {
+        let original = evidence();
+        let mut stored = StoredStripeRenewalFailure {
+            version: RENEWAL_EVIDENCE_VERSION,
+            evidence_reference: original.evidence_reference.clone(),
+            renewal_id: original.renewal_id.clone(),
+            event_id: original.event_id.clone(),
+            invoice_id: original.invoice_id.clone(),
+            invoice_line_id: original.invoice_line_id.clone(),
+            predecessor_invoice_id: original.predecessor_invoice_id.clone(),
+            predecessor_evidence_reference: original.predecessor_evidence_reference.clone(),
+            provider_account_id: original.provider_account_id.clone(),
+            environment: original.environment,
+            allocation_reference: original.allocation_reference.clone(),
+            customer_id: original.customer_id.clone(),
+            subscription_id: original.subscription_id.clone(),
+            provider_item_id: original.provider_item_id.clone(),
+            predecessor_period_start: original.predecessor_period_start,
+            predecessor_period_end: original.predecessor_period_end,
+            renewal_period_start: original.renewal_period_start,
+            renewal_period_end: original.renewal_period_end,
+            event_created_at: original.event_created_at,
+            interval: original.interval.to_string(),
+        };
+        assert_eq!(
+            StripeRenewalFailureEvidence::from_stored(stored.clone()).unwrap(),
+            original
+        );
+        stored.evidence_reference.push('x');
+        assert!(StripeRenewalFailureEvidence::from_stored(stored).is_err());
+    }
 }
