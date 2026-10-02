@@ -1,6 +1,7 @@
 //! Loopback-backed tests for signed personal renewal failure evidence.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -12,7 +13,9 @@ use axum::Router;
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
+use sotto_server::cloud_provider::{
+    AllocationState, PayerKind, ProviderEnvironment, VerifiedAllocation,
+};
 use sotto_server::cloud_provider_stripe::{
     StripeAllocationBinding, StripeContractError, StripeCoverageConfig,
 };
@@ -24,15 +27,40 @@ use sotto_server::cloud_provider_stripe_http::{
     StripePersonalInvoiceHistoryResult, StripeReadClient, StripeReadError, StripeReadLimits,
     StripeRenewalCurrentState, StripeRenewalNeedsEvidence, StripeRenewalObservationResult,
 };
+use sotto_server::cloud_provider_stripe_renewal_store::{
+    accept_personal_renewal_failure, load_personal_renewal_failures,
+    StripeRenewalFailureDisposition, StripeRenewalFailureLoadError, StripeRenewalFailureLoadLimits,
+};
 use sotto_server::cloud_provider_stripe_renewals::{
     decode_personal_renewal_failure, StripeRenewalFailureNeedsEvidence, StripeRenewalFailureResult,
 };
+use sotto_server::db;
+use sqlx::postgres::PgConnectOptions;
+use sqlx::PgPool;
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 use url::Url;
 
 const SECRET: &str = "whsec_renewal_test";
 const NOW: i64 = 3_100;
+
+async fn store_pool_or_skip() -> Option<PgPool> {
+    if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping Stripe renewal store test: set SOTTO_RUN_DB_TESTS=1");
+        return None;
+    }
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL is required when DB tests are enabled");
+    let options = PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
+    assert!(
+        matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+        "refusing Stripe renewal store test against non-local host: {}",
+        options.get_host()
+    );
+    let pool = db::connect(&database_url).await.expect("connect");
+    db::migrate(&pool).await.expect("migrate");
+    Some(pool)
+}
 
 #[derive(Clone)]
 struct MockState {
@@ -832,6 +860,28 @@ async fn linked_failure(
     *evidence
 }
 
+async fn linked_failure_for_event(
+    event_id: &str,
+) -> sotto_server::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence {
+    let history = history().await;
+    let mut payload = signed_failure();
+    payload["id"] = json!(event_id);
+    let (raw, signature) = signed(&payload, NOW);
+    let StripeRenewalFailureResult::Linked(evidence) = decode_personal_renewal_failure(
+        &raw,
+        &signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected linked failure");
+    };
+    *evidence
+}
+
 fn current_invoice(status: &str) -> Value {
     json!({
         "id":"in_failed", "customer":"cus_renewal",
@@ -854,6 +904,335 @@ fn current_line() -> Value {
         "pricing":{"type":"price_details","price_details":{"price":"price_month"}},
         "period":{"start":2000,"end":3000}
     })
+}
+
+#[tokio::test]
+async fn signed_failure_round_trips_through_the_durable_store_and_bounds_history() {
+    let Some(pool) = store_pool_or_skip().await else {
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4().to_string();
+    let beneficiary_id = format!("renewal-store-beneficiary-{suffix}");
+    let payer_id = format!("renewal-store-payer-{suffix}");
+    let allocation_id = format!("renewal-store-allocation-{suffix}");
+    let source_id = format!("renewal-store-source-{suffix}");
+    let external_reference = "alloc_renewal".to_owned();
+    let ownership_reference = format!("renewal-store-ownership-{suffix}");
+    let context = config().provider_context().unwrap();
+    let allocation = VerifiedAllocation::new(
+        &allocation_id,
+        &payer_id,
+        "cus_renewal",
+        PayerKind::Personal,
+        &beneficiary_id,
+        "sub_renewal",
+        "si_renewal",
+        &external_reference,
+        &source_id,
+        0,
+        None,
+        AllocationState::Active,
+        &ownership_reference,
+    )
+    .unwrap();
+    let mut first_payload = signed_failure();
+    first_payload["id"] = json!(format!("evt-renewal-store-first-{suffix}"));
+    let first_id = first_payload["id"].as_str().unwrap().to_owned();
+    let mut second_payload = signed_failure();
+    second_payload["id"] = json!(format!("evt-renewal-store-second-{suffix}"));
+    let second_id = second_payload["id"].as_str().unwrap().to_owned();
+
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'renewal-store', $1)",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cloud_coverage_coordinators \
+         (beneficiary_id, source_set_generation, collection_epoch) VALUES ($1, 1, 1)",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cloud_coverage_sources \
+         (source_id, beneficiary_id, provider_namespace, external_allocation_reference, \
+          ownership_evidence_reference, registration_operation_id, registration_source_set_generation) \
+         VALUES ($1, $2, 'stripe', $3, $4, $5, 1)",
+    )
+    .bind(&source_id)
+    .bind(&beneficiary_id)
+    .bind(&external_reference)
+    .bind(&ownership_reference)
+    .bind(format!("renewal-store-registration-{suffix}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cloud_provider_payers \
+         (payer_id, provider_namespace, provider_account_id, provider_environment, \
+          provider_customer_id, payer_kind) VALUES ($1, 'stripe', $2, 'test', $3, 'personal')",
+    )
+    .bind(&payer_id)
+    .bind(&context.account_id)
+    .bind("cus_renewal")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cloud_provider_allocations \
+         (allocation_id, payer_id, beneficiary_id, provider_namespace, provider_account_id, \
+          provider_environment, provider_subscription_id, provider_item_id, \
+          external_allocation_reference, coverage_source_id, effective_from, state, \
+          ownership_evidence_reference) \
+         VALUES ($1, $2, $3, 'stripe', $4, 'test', 'sub_renewal', 'si_renewal', $5, $6, 0, 'active', $7)",
+    )
+    .bind(&allocation_id)
+    .bind(&payer_id)
+    .bind(&beneficiary_id)
+    .bind(&context.account_id)
+    .bind(&external_reference)
+    .bind(&source_id)
+    .bind(&ownership_reference)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let first = linked_failure_for_event(&first_id).await;
+    let mut wrong_owner = allocation.clone();
+    wrong_owner.provider_item_id = "forged-item".into();
+    let mut reject_forged = pool.begin().await.unwrap();
+    assert!(matches!(
+        accept_personal_renewal_failure(&mut reject_forged, &context, &wrong_owner, &first).await,
+        Err(
+            sotto_server::cloud_provider_stripe_renewal_store::StripeRenewalFailureStoreError::Provider(
+                sotto_server::cloud_provider::ProviderAdapterError::ProviderContextMismatch
+            )
+        )
+    ));
+    reject_forged.rollback().await.unwrap();
+    let forged_receipt_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1",
+    )
+    .bind(&first_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(forged_receipt_count, 0);
+
+    let mut accept = pool.begin().await.unwrap();
+    let accepted = accept_personal_renewal_failure(&mut accept, &context, &allocation, &first)
+        .await
+        .unwrap();
+    assert_eq!(
+        accepted.disposition,
+        StripeRenewalFailureDisposition::Accepted
+    );
+    assert_eq!(accepted.accepted_generation, 1);
+    accept.commit().await.unwrap();
+
+    let loaded = load_personal_renewal_failures(
+        &pool,
+        &context,
+        &allocation,
+        StripeRenewalFailureLoadLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(loaded, vec![first.clone()]);
+
+    let mut replay = pool.begin().await.unwrap();
+    let replayed = accept_personal_renewal_failure(&mut replay, &context, &allocation, &first)
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.disposition,
+        StripeRenewalFailureDisposition::AlreadyAccepted
+    );
+    assert_eq!(replayed.accepted_generation, accepted.accepted_generation);
+    replay.commit().await.unwrap();
+
+    let second = linked_failure_for_event(&second_id).await;
+    let barrier = Arc::new(Barrier::new(2));
+    let first_pool = pool.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first_context = context.clone();
+    let first_allocation = allocation.clone();
+    let first_evidence = second.clone();
+    let first_task = tokio::spawn(async move {
+        first_barrier.wait().await;
+        let mut tx = first_pool.begin().await.unwrap();
+        let result = accept_personal_renewal_failure(
+            &mut tx,
+            &first_context,
+            &first_allocation,
+            &first_evidence,
+        )
+        .await;
+        if result.is_ok() {
+            tx.commit().await.unwrap();
+        } else {
+            tx.rollback().await.unwrap();
+        }
+        result
+    });
+    let second_pool = pool.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second_context = context.clone();
+    let second_allocation = allocation.clone();
+    let second_evidence = second.clone();
+    let second_task = tokio::spawn(async move {
+        second_barrier.wait().await;
+        let mut tx = second_pool.begin().await.unwrap();
+        let result = accept_personal_renewal_failure(
+            &mut tx,
+            &second_context,
+            &second_allocation,
+            &second_evidence,
+        )
+        .await;
+        if result.is_ok() {
+            tx.commit().await.unwrap();
+        } else {
+            tx.rollback().await.unwrap();
+        }
+        result
+    });
+    let first_result = first_task.await.unwrap().unwrap();
+    let second_result = second_task.await.unwrap().unwrap();
+    assert_eq!(first_result.accepted_generation, 2);
+    assert_eq!(second_result.accepted_generation, 2);
+    assert!(matches!(
+        [first_result.disposition, second_result.disposition],
+        [
+            StripeRenewalFailureDisposition::Accepted,
+            StripeRenewalFailureDisposition::AlreadyAccepted
+        ] | [
+            StripeRenewalFailureDisposition::AlreadyAccepted,
+            StripeRenewalFailureDisposition::Accepted
+        ]
+    ));
+
+    assert!(matches!(
+        load_personal_renewal_failures(
+            &pool,
+            &context,
+            &allocation,
+            StripeRenewalFailureLoadLimits {
+                max_rows: 1,
+                max_evidence_bytes: 256 * 1024,
+            },
+        )
+        .await,
+        Err(StripeRenewalFailureLoadError::TooManyRows { limit: 1 })
+    ));
+    assert!(matches!(
+        load_personal_renewal_failures(
+            &pool,
+            &context,
+            &allocation,
+            StripeRenewalFailureLoadLimits {
+                max_rows: 64,
+                max_evidence_bytes: 1,
+            },
+        )
+        .await,
+        Err(StripeRenewalFailureLoadError::BoundExceeded { limit: 1 })
+    ));
+    let current_history = history_with_current_invoice(paid_line()).await;
+    let (current_client, mut current_session, _current_server) = current_client("open", None).await;
+    let StripeRenewalObservationResult::Observed(current_observation) = current_client
+        .personal_renewal_observation(&mut current_session, &binding(), &loaded[0])
+        .await
+        .unwrap()
+    else {
+        panic!("expected reloaded evidence to produce a current observation");
+    };
+    let composed = compose_personal_coverage(
+        &config(),
+        &binding(),
+        &current_history,
+        &[(loaded[0].clone(), (*current_observation).clone())],
+    )
+    .unwrap();
+    let StripeCoverageCompositionResult::Candidate(candidate) = composed else {
+        panic!("expected reloaded evidence to compose a candidate");
+    };
+    assert!(matches!(
+        candidate.renewals()[0].state(),
+        StripeCoverageRenewalState::Open
+    ));
+    sqlx::query(
+        "UPDATE cloud_provider_stripe_renewal_failures \
+         SET evidence_reference = 'tampered-renewal-reference' WHERE event_id = $1",
+    )
+    .bind(&first_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut conflict = pool.begin().await.unwrap();
+    assert!(matches!(
+        accept_personal_renewal_failure(&mut conflict, &context, &allocation, &first).await,
+        Err(
+            sotto_server::cloud_provider_stripe_renewal_store::StripeRenewalFailureStoreError::EvidenceConflict
+        )
+    ));
+    conflict.rollback().await.unwrap();
+    assert!(matches!(
+        load_personal_renewal_failures(
+            &pool,
+            &context,
+            &allocation,
+            StripeRenewalFailureLoadLimits::default(),
+        )
+        .await,
+        Err(StripeRenewalFailureLoadError::Corrupt(_))
+    ));
+
+    sqlx::query("DELETE FROM cloud_provider_stripe_renewal_failures WHERE beneficiary_id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE beneficiary_id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id IN ($1, $2)")
+        .bind(&first_id)
+        .bind(&second_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
+        .bind(&allocation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_sources WHERE source_id = $1")
+        .bind(&source_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_id = $1")
+        .bind(&payer_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 fn current_subscription(cancel_at_period_end: bool) -> Value {
