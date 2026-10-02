@@ -456,7 +456,7 @@ export function VaultView({
         <h2>Projects</h2>
         {projectsLoading ? (
           <p className="muted">Loading…</p>
-        ) : projects.length === 0 && projectsError === null ? (
+        ) : (projects ?? []).length === 0 && projectsError === null ? (
           <p className="muted">
             No synced projects are available for this account. If you already have a local Sotto
             project, run <code>sotto login</code> for this account and <code>sotto push</code> from
