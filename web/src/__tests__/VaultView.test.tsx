@@ -94,6 +94,48 @@ describe("VaultView selection loading", () => {
     vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
   });
 
+  it("filters loaded secret names locally and clears the query on environment switch", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a"), environment("env-b")]);
+    vi.mocked(api.fetchSecrets).mockImplementation((envId) =>
+      Promise.resolve(envId === "env-a" ? [secret("Alpha"), secret("Beta")] : [secret("Gamma")]),
+    );
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    await screen.findByRole("button", { name: "Alpha" });
+
+    const search = screen.getByRole("searchbox", { name: "Search secret names" });
+    fireEvent.change(search, { target: { value: "ALP" } });
+    expect(screen.getByRole("button", { name: "Alpha" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Beta" })).toBeNull();
+    expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+
+    fireEvent.change(search, { target: { value: "missing" } });
+    expect(screen.getByText("No secret names match this search.")).toBeTruthy();
+
+    fireEvent.change(search, { target: { value: "" } });
+    expect(screen.getByRole("button", { name: "Alpha" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Beta" })).toBeInTheDocument();
+    expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "env-b" }));
+    await screen.findByRole("button", { name: "Gamma" });
+    expect(screen.getByRole("searchbox", { name: "Search secret names" })).toHaveValue("");
+  });
+
+  it("shows the empty environment state without a search control", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-empty")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([]);
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-empty" }));
+
+    expect(await screen.findByText("No secrets in this environment.")).toBeInTheDocument();
+    expect(screen.queryByRole("searchbox", { name: "Search secret names" })).not.toBeInTheDocument();
+  });
+
   it("keeps environments from the latest project when requests resolve out of order", async () => {
     const first = deferred<Environment[]>();
     const second = deferred<Environment[]>();

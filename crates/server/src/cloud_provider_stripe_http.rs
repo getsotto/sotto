@@ -14,6 +14,7 @@ use thiserror::Error;
 use tokio::time::{sleep, timeout};
 
 use crate::billing::STRIPE_API_VERSION;
+use crate::billing_catalogue::{BillingInterval, StripePriceObservation};
 use crate::cloud_provider::ProviderEnvironment;
 use crate::cloud_provider_stripe::{
     decode_invoice_payment, validate_personal_invoice_observation, StripeAllocationBinding,
@@ -332,6 +333,36 @@ impl StripeReadClient {
         }
         validate_mode(resource.livemode, self.environment)?;
         Ok(resource)
+    }
+
+    /// Read one configured Price through the authenticated, bounded API session.
+    #[doc(hidden)]
+    pub async fn price(
+        &self,
+        session: &mut StripeReadSession,
+        price_id: &str,
+    ) -> Result<StripePriceResource, StripeReadError> {
+        self.ensure_account(session).await?;
+        validate_identifier(price_id)?;
+        let path = format!("v1/prices/{price_id}");
+        let value = self.request_json(session, Method::GET, &path, &[]).await?;
+        let resource = parse_price(&value)?;
+        if resource.id != price_id {
+            return Err(StripeReadError::ContextMismatch);
+        }
+        validate_mode(Some(resource.livemode), self.environment)?;
+        Ok(resource)
+    }
+
+    /// Read a configured Price and bind its observation to this authenticated account and mode.
+    #[doc(hidden)]
+    pub async fn price_observation(
+        &self,
+        session: &mut StripeReadSession,
+        price_id: &str,
+    ) -> Result<StripePriceObservation, StripeReadError> {
+        let resource = self.price(session, price_id).await?;
+        Ok(resource.observation(self.account_id.clone(), self.environment))
     }
 
     /// Retrieve one immutable event through the authenticated, bounded API session.
@@ -1319,6 +1350,40 @@ pub struct StripeInvoiceResource {
     collection_method_present: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StripePriceResource {
+    pub id: String,
+    pub active: bool,
+    pub livemode: bool,
+    pub currency: String,
+    pub unit_amount: Option<i64>,
+    pub interval: Option<BillingInterval>,
+    pub interval_count: Option<i64>,
+    pub usage_type: Option<String>,
+}
+
+impl StripePriceResource {
+    /// Convert the authenticated transport result into the catalogue's provider observation.
+    fn observation(
+        &self,
+        account_id: impl Into<String>,
+        environment: ProviderEnvironment,
+    ) -> StripePriceObservation {
+        StripePriceObservation::new(
+            self.id.clone(),
+            account_id,
+            environment,
+            self.active,
+            self.livemode,
+            self.currency.clone(),
+            self.unit_amount,
+            self.interval,
+            self.interval_count,
+            self.usage_type.clone(),
+        )
+    }
+}
+
 /// A non-paid invoice retained by personal history collection without becoming coverage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeNonPaidInvoice {
@@ -2190,6 +2255,56 @@ fn parse_invoice(value: &Value) -> Result<StripeInvoiceResource, StripeReadError
         livemode: optional_bool(value.get("livemode"), "invoice.livemode")?,
         billing_reason_present: value.get("billing_reason").is_some(),
         collection_method_present: value.get("collection_method").is_some(),
+    })
+}
+
+fn parse_price(value: &Value) -> Result<StripePriceResource, StripeReadError> {
+    let recurring = optional_object(value.get("recurring"), "price.recurring")?;
+    let interval = recurring
+        .and_then(|recurring| recurring.get("interval"))
+        .map(|value| match value.as_str() {
+            Some("month") => Ok(BillingInterval::Month),
+            Some("year") => Ok(BillingInterval::Year),
+            _ => Err(StripeReadError::MalformedResponse(
+                "price.recurring.interval",
+            )),
+        })
+        .transpose()?;
+    let interval_count = recurring
+        .and_then(|recurring| recurring.get("interval_count"))
+        .map(|value| {
+            value.as_i64().ok_or(StripeReadError::MalformedResponse(
+                "price.recurring.interval_count",
+            ))
+        })
+        .transpose()?;
+    let usage_type = recurring
+        .and_then(|recurring| recurring.get("usage_type"))
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or(StripeReadError::MalformedResponse(
+                    "price.recurring.usage_type",
+                ))
+        })
+        .transpose()?;
+    Ok(StripePriceResource {
+        id: required_id(value, "price.id")?,
+        active: value
+            .get("active")
+            .and_then(Value::as_bool)
+            .ok_or(StripeReadError::MalformedResponse("price.active"))?,
+        livemode: value
+            .get("livemode")
+            .and_then(Value::as_bool)
+            .ok_or(StripeReadError::MalformedResponse("price.livemode"))?,
+        currency: required_string(value, "currency")?,
+        unit_amount: optional_i64(value.get("unit_amount"), "price.unit_amount")?,
+        interval,
+        interval_count,
+        usage_type,
     })
 }
 

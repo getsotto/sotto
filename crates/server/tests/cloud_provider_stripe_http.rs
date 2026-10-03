@@ -186,6 +186,17 @@ fn account() -> Value {
     json!({"id":"acct_test_transport","object":"account","livemode":false})
 }
 
+fn monthly_price() -> Value {
+    json!({
+        "id":"price_month",
+        "active":true,
+        "currency":"gbp",
+        "livemode":false,
+        "unit_amount":299,
+        "recurring":{"interval":"month","interval_count":1,"usage_type":"licensed"}
+    })
+}
+
 fn list(data: Vec<Value>, has_more: bool) -> Value {
     json!({"object":"list","data":data,"has_more":has_more})
 }
@@ -1245,6 +1256,10 @@ async fn reads_resources_with_authentication_and_complete_pagination() {
         }))],
     );
     responses.insert(
+        "/v1/prices/price_month".into(),
+        vec![MockResponse::json(monthly_price())],
+    );
+    responses.insert(
         "/v1/invoices".into(),
         vec![
             MockResponse::json(list(
@@ -1297,6 +1312,13 @@ async fn reads_resources_with_authentication_and_complete_pagination() {
             .id,
         "sub_1"
     );
+    let observation = client
+        .price_observation(&mut session, "price_month")
+        .await
+        .unwrap();
+    assert_eq!(observation.id, "price_month");
+    assert_eq!(observation.unit_amount, Some(299));
+    assert_eq!(observation.interval_count, Some(1));
     assert_eq!(
         client
             .subscription_invoices(&mut session, "sub_1", Some("cus_1"))

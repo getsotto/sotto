@@ -23,11 +23,15 @@ pub mod account;
 pub mod audit;
 pub mod auth;
 pub mod billing;
+pub mod billing_catalogue;
+pub mod billing_operations;
 pub mod cloud_coverage;
 pub mod cloud_coverage_reconciliation;
 pub mod cloud_coverage_store;
 pub mod cloud_provider;
 pub mod cloud_provider_refresh;
+#[doc(hidden)]
+pub mod cloud_provider_refresh_inputs;
 #[doc(hidden)]
 pub mod cloud_provider_refresh_jobs;
 #[doc(hidden)]
