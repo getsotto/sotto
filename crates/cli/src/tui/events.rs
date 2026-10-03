@@ -237,14 +237,17 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
 
 /// Handle incoming mouse events (scroll and click selection).
 pub fn handle_mouse_event(app: &mut TuiApp, mouse: MouseEvent) -> Result<()> {
+    if app.show_help {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            app.show_help = false;
+        }
+        return Ok(());
+    }
+
     if app.show_theme_modal {
         match mouse.kind {
-            MouseEventKind::ScrollDown => {
-                app.next_theme();
-            }
-            MouseEventKind::ScrollUp => {
-                app.previous_theme();
-            }
+            MouseEventKind::ScrollDown => app.next_theme(),
+            MouseEventKind::ScrollUp => app.previous_theme(),
             _ => {}
         }
         return Ok(());
@@ -252,23 +255,14 @@ pub fn handle_mouse_event(app: &mut TuiApp, mouse: MouseEvent) -> Result<()> {
 
     if app.show_history_modal {
         match mouse.kind {
-            MouseEventKind::ScrollDown => {
-                app.history_modal_down();
-            }
-            MouseEventKind::ScrollUp => {
-                app.history_modal_up();
-            }
+            MouseEventKind::ScrollDown => app.history_modal_down(),
+            MouseEventKind::ScrollUp => app.history_modal_up(),
             _ => {}
         }
         return Ok(());
     }
 
-    if app.show_help || app.show_secret_modal || app.show_delete_modal || app.show_history_modal {
-        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            if app.show_help {
-                app.show_help = false;
-            }
-        }
+    if app.show_secret_modal || app.show_delete_modal {
         return Ok(());
     }
 
@@ -278,9 +272,6 @@ pub fn handle_mouse_event(app: &mut TuiApp, mouse: MouseEvent) -> Result<()> {
         }
         MouseEventKind::ScrollUp => {
             app.move_selection_up();
-        }
-        MouseEventKind::Down(MouseButton::Left) if app.show_help => {
-            app.show_help = false;
         }
         _ => {}
     }
