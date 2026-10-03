@@ -1482,4 +1482,66 @@ mod tests {
             Some("Restored `HOST_KEY` to v2 (saved as v4)")
         );
     }
+
+    #[test]
+    fn history_copy_rejects_unreadable_and_binary_values_without_closing_dialogue() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.show_history_modal = true;
+        tui_app.history_modal_secret_name = "DUMMY_KEY".into();
+        tui_app.history_modal_items = vec![
+            SecretHistoryItem {
+                version: 3,
+                created_at: 0,
+                value: None,
+            },
+            SecretHistoryItem {
+                version: 2,
+                created_at: 0,
+                value: Some(vec![0xff]),
+            },
+        ];
+
+        tui_app.copy_history_selected().unwrap();
+        assert_eq!(
+            tui_app
+                .status_message
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Cannot copy: version value is unreadable")
+        );
+        assert!(tui_app.show_history_modal);
+        assert_eq!(tui_app.history_modal_selected_index, 0);
+
+        tui_app.history_modal_selected_index = 1;
+        tui_app.copy_history_selected().unwrap();
+        assert_eq!(
+            tui_app
+                .status_message
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Cannot copy: version contains non-UTF-8 bytes")
+        );
+        assert!(tui_app.show_history_modal);
+        assert_eq!(tui_app.history_modal_selected_index, 1);
+
+        tui_app.history_modal_items.clear();
+        tui_app.history_modal_selected_index = 0;
+        let status_before = tui_app
+            .status_message
+            .as_ref()
+            .map(|notice| notice.message.clone());
+        tui_app.copy_history_selected().unwrap();
+        assert_eq!(
+            tui_app
+                .status_message
+                .as_ref()
+                .map(|notice| notice.message.clone()),
+            status_before
+        );
+        assert!(tui_app.show_history_modal);
+        assert_eq!(tui_app.history_modal_selected_index, 0);
+    }
 }
