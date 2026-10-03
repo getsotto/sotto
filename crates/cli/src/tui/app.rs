@@ -1085,6 +1085,113 @@ mod tests {
         assert_eq!(loaded.theme.as_deref(), Some(committed_name.as_str()));
     }
 
+    fn open_theme_picker_and_pick_next(tui_app: &mut TuiApp<'_>) -> String {
+        tui_app.open_theme_modal();
+        tui_app.next_theme();
+        tui_app.current_theme.name.clone()
+    }
+
+    #[test]
+    fn commit_theme_reports_malformed_config_and_recovers_on_retry() {
+        let (store, keychain, config) = unlocked();
+        let initial_theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        let mut tui_app = TuiApp::new(&app, &store, config, &initial_theme).unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        let malformed = b"theme = [";
+        std::fs::write(&config_path, malformed).unwrap();
+        tui_app.config_path = Some(config_path.clone());
+
+        // A malformed config is reported, the dashboard keeps running and the
+        // original bytes are left untouched.
+        let chosen = open_theme_picker_and_pick_next(&mut tui_app);
+        tui_app.commit_theme().unwrap();
+        assert!(!tui_app.show_theme_modal);
+        let status = tui_app
+            .status_message
+            .as_ref()
+            .map(|(msg, _)| msg.clone())
+            .expect("a failed save must set a status message");
+        assert!(
+            status.starts_with("Failed to persist theme preference"),
+            "unexpected status: {status}"
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), malformed);
+
+        // Once the config is valid again, committing in the same session
+        // persists the selection and replaces the error status.
+        std::fs::write(&config_path, b"").unwrap();
+        let chosen_again = open_theme_picker_and_pick_next(&mut tui_app);
+        tui_app.commit_theme().unwrap();
+        let status = tui_app
+            .status_message
+            .as_ref()
+            .map(|(msg, _)| msg.clone())
+            .expect("a successful save must set a status message");
+        assert!(
+            !status.starts_with("Failed to persist theme preference"),
+            "error status must be replaced after a successful retry: {status}"
+        );
+        let loaded = crate::remote::config::GlobalConfig::load_from(&config_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.theme.as_deref(), Some(chosen_again.as_str()));
+        assert_ne!(chosen, "nord");
+    }
+
+    #[test]
+    fn commit_theme_reports_unwritable_config_location_and_recovers() {
+        let (store, keychain, config) = unlocked();
+        let initial_theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        let mut tui_app = TuiApp::new(&app, &store, config, &initial_theme).unwrap();
+
+        // A regular file where the config directory should be makes both
+        // directory creation and the save fail on every platform and for
+        // every user, without relying on permission bits.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let blocker = temp_dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"plain file").unwrap();
+        let blocked_config = blocker.join("config.toml");
+        tui_app.config_path = Some(blocked_config.clone());
+
+        open_theme_picker_and_pick_next(&mut tui_app);
+        tui_app.commit_theme().unwrap();
+        assert!(!tui_app.show_theme_modal);
+        let status = tui_app
+            .status_message
+            .as_ref()
+            .map(|(msg, _)| msg.clone())
+            .expect("a failed save must set a status message");
+        assert!(
+            status.starts_with("Failed to persist theme preference"),
+            "unexpected status: {status}"
+        );
+        assert!(!blocked_config.exists());
+        assert_eq!(std::fs::read(&blocker).unwrap(), b"plain file");
+
+        // Pointing at a usable location lets the next commit succeed.
+        let good_config = temp_dir.path().join("config.toml");
+        tui_app.config_path = Some(good_config.clone());
+        let chosen = open_theme_picker_and_pick_next(&mut tui_app);
+        tui_app.commit_theme().unwrap();
+        let status = tui_app
+            .status_message
+            .as_ref()
+            .map(|(msg, _)| msg.clone())
+            .expect("a successful save must set a status message");
+        assert!(
+            !status.starts_with("Failed to persist theme preference"),
+            "error status must be replaced after a successful retry: {status}"
+        );
+        let loaded = crate::remote::config::GlobalConfig::load_from(&good_config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.theme.as_deref(), Some(chosen.as_str()));
+    }
+
     #[test]
     fn reveal_animation_trigger_and_teardown() {
         let (store, keychain, config) = unlocked();
