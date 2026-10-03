@@ -1,7 +1,11 @@
 # Stripe resource field matrix
 
 This matrix records the current resource shapes used by the dormant Stripe read operations.
-The examples are synthetic loopback fixtures; they are not claims about a connected Sotto account.
+The examples remain synthetic loopback fixtures; they are not claims about a connected Sotto
+account. An opt-in read-only probe in `cloud_provider_stripe_sandbox.rs` uses these same transport
+and decoder paths against a configured Stripe test account. Its required variables and sanitized
+report are documented in `stripe_sandbox_contract.md`; no sandbox result is recorded here until a
+credentialed run is performed.
 
 ## Personal invoice observation
 

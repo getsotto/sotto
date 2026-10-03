@@ -42,6 +42,7 @@ fn app(pool: PgPool, configured: bool) -> Router {
                 api_key: "rk_test_never_called".into(),
                 webhook_secret: WEBHOOK_SECRET.into(),
                 price_id: "price_test".into(),
+                price_catalogue: None,
                 return_url: "https://app.sotto.test".into(),
             })
         }),

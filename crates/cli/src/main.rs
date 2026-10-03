@@ -172,6 +172,9 @@ enum Command {
         stdin: bool,
     },
     /// Print a secret's value. Refuses to print to a terminal without --reveal.
+    #[command(
+        after_help = "Interactive selection:\n  Omitting NAME opens a picker when stdin, stdout, and stderr are terminals, TERM is not dumb, and CI is not active. Scripts must supply NAME. A picker selection is copied to the clipboard automatically unless --no-copy is used. --no-copy does not allow plaintext terminal output; use --reveal to print it. Supplying NAME alone does not copy.\n\nExamples:\n  sotto get\n  sotto get DATABASE_URL --copy\n  sotto get DATABASE_URL --reveal"
+    )]
     Get {
         name: Option<String>,
         /// Allow printing the secret to a terminal.
@@ -2202,6 +2205,29 @@ mod tests {
         assert_eq!(fresh.theme, None);
         assert_eq!(fresh.web_url, None);
         assert_eq!(fresh.last_user_id.as_deref(), Some("user-1"));
+    }
+
+    #[test]
+    fn get_help_explains_interactive_selection_and_copying() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let get = command
+            .find_subcommand_mut("get")
+            .expect("get subcommand should exist");
+        let help = get.render_long_help().to_string();
+
+        for expected in [
+            "Omitting NAME opens a picker",
+            "Scripts must supply NAME",
+            "copied to the clipboard automatically unless --no-copy is used",
+            "--no-copy does not allow plaintext terminal output",
+            "Supplying NAME alone does not copy",
+            "sotto get DATABASE_URL --copy",
+            "sotto get DATABASE_URL --reveal",
+        ] {
+            assert!(help.contains(expected), "missing get help text: {expected}");
+        }
     }
 
     #[test]
