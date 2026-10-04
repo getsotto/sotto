@@ -107,6 +107,24 @@ describe("VaultApp startup transitions", () => {
     expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
   });
 
+  it("shows setup guidance for a missing account and advances after a successful re-check", async () => {
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    vi.mocked(api.fetchAccount)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(account());
+
+    render(<VaultApp />);
+
+    expect(await screen.findByText("Finish setting up Sotto")).toBeInTheDocument();
+    expect(screen.getByText(/sotto push/)).toBeInTheDocument();
+    expect(screen.queryByText("Unlock your vault")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Check setup again" }));
+
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+    expect(api.fetchAccount).toHaveBeenCalledTimes(2);
+  });
+
   it("shows an alert and Reload on an account-request rejection, and Reload triggers one reload", async () => {
     vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
     vi.mocked(api.fetchAccount).mockRejectedValue(new Error("server error (500)"));

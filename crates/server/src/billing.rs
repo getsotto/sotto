@@ -11,30 +11,30 @@
 
 use std::fmt;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-#[cfg(feature = "e2e-mock-billing")]
-use axum::extract::Query;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 #[cfg(feature = "e2e-mock-billing")]
 use axum::response::Html;
-#[cfg(feature = "e2e-mock-billing")]
-use axum::routing::get;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use sqlx::{Postgres, Transaction};
+use sqlx::{Postgres, Row, Transaction};
 
 #[cfg(feature = "e2e-mock-billing")]
 use url::Url;
 
 use crate::auth::AuthUser;
+use crate::billing_catalogue::{BillingOffer, BillingPriceIds};
+use crate::billing_operations::{self, BeginOperation, BillingOperationState};
 use crate::config::BillingConfig;
 use crate::error::{Error, Result};
+use crate::founding_allocator::{self, FoundingOffer};
+use crate::personal_billing;
 use crate::state::AppState;
 use crate::{audit, org};
 
@@ -129,7 +129,6 @@ impl ProviderError {
         }
     }
 
-    #[cfg(feature = "e2e-mock-billing")]
     fn unsupported(operation: &str) -> Self {
         Self {
             status: None,
@@ -243,6 +242,36 @@ pub trait SubscriptionProvider: Send + Sync {
         cancel_url: &str,
     ) -> ProviderResult<String>;
 
+    /// Create a personal checkout using a server-selected catalogue price. The default keeps
+    /// existing provider adapters source-compatible; hosted Stripe overrides it with the personal
+    /// metadata and selected price.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_personal_checkout(
+        &self,
+        user_id: &str,
+        customer: Option<&str>,
+        price_id: &str,
+        operation_id: &str,
+        idempotency_key: &str,
+        expires_at_epoch: i64,
+        success_url: &str,
+        cancel_url: &str,
+    ) -> ProviderResult<String> {
+        let _ = (price_id, operation_id, idempotency_key, expires_at_epoch);
+        self.create_checkout(user_id, customer, success_url, cancel_url)
+            .await
+    }
+
+    /// Validate the configured Stripe price before quoting or creating a personal checkout.
+    /// Providers that cannot authenticate their price catalogue keep this route disabled.
+    async fn validate_personal_price(
+        &self,
+        _price_id: &str,
+        _offer: BillingOffer,
+    ) -> ProviderResult<()> {
+        Err(ProviderError::unsupported("personal_price_validation"))
+    }
+
     async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String>;
 
     async fn get_subscription(
@@ -250,12 +279,32 @@ pub trait SubscriptionProvider: Send + Sync {
         subscription_id: &str,
     ) -> ProviderResult<SubscriptionObservation>;
 
+    /// Read the provider's current period end for a newly paid personal subscription.
+    async fn personal_subscription_period_end(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<Option<i64>> {
+        Ok(None)
+    }
+
     async fn cancel_subscription(
         &self,
         subscription_id: &str,
         idempotency_key: &str,
         org_id: &str,
     ) -> ProviderResult<SubscriptionObservation>;
+
+    /// Request cancellation at the end of the paid term. Existing test adapters inherit the
+    /// legacy method until they opt into the personal lifecycle explicitly.
+    async fn cancel_personal_subscription(
+        &self,
+        subscription_id: &str,
+        idempotency_key: &str,
+        user_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        self.cancel_subscription(subscription_id, idempotency_key, user_id)
+            .await
+    }
 }
 
 /// Compatibility name for callers that still refer to the pre-provider billing trait.
@@ -268,12 +317,17 @@ pub struct BillingState {
     provider: Arc<dyn SubscriptionProvider>,
     webhook_secret: String,
     return_url: String,
+    price_catalogue: Option<BillingPriceIds>,
 }
 
 impl BillingState {
     /// Share the provider with the deletion worker without exposing billing credentials.
     pub fn provider(&self) -> Arc<dyn SubscriptionProvider> {
         Arc::clone(&self.provider)
+    }
+
+    pub fn price_catalogue(&self) -> Option<&BillingPriceIds> {
+        self.price_catalogue.as_ref()
     }
 
     pub fn from_config(config: BillingConfig) -> Self {
@@ -285,6 +339,7 @@ impl BillingState {
             provider: Arc::new(provider),
             webhook_secret: config.webhook_secret,
             return_url: config.return_url,
+            price_catalogue: config.price_catalogue,
         }
     }
 
@@ -297,6 +352,7 @@ impl BillingState {
             provider,
             webhook_secret,
             return_url,
+            price_catalogue: None,
         }
     }
 
@@ -306,6 +362,7 @@ impl BillingState {
             provider: Arc::new(E2eBilling { provider_origin }),
             webhook_secret: config.webhook_secret,
             return_url: config.return_url,
+            price_catalogue: config.price_catalogue,
         }
     }
 }
@@ -349,6 +406,71 @@ impl SubscriptionProvider for StripeBilling {
             .ok_or_else(ProviderError::malformed_response)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn create_personal_checkout(
+        &self,
+        user_id: &str,
+        customer: Option<&str>,
+        price_id: &str,
+        operation_id: &str,
+        idempotency_key: &str,
+        expires_at_epoch: i64,
+        success_url: &str,
+        cancel_url: &str,
+    ) -> ProviderResult<String> {
+        if price_id.is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        let mut form = vec![
+            ("mode".to_string(), "subscription".to_string()),
+            ("line_items[0][price]".to_string(), price_id.to_string()),
+            ("line_items[0][quantity]".to_string(), "1".to_string()),
+            (
+                "client_reference_id".to_string(),
+                format!("personal:{operation_id}"),
+            ),
+            (
+                "subscription_data[metadata][personal_user_id]".to_string(),
+                user_id.to_string(),
+            ),
+            (
+                "subscription_data[metadata][operation_id]".to_string(),
+                operation_id.to_string(),
+            ),
+            ("success_url".to_string(), success_url.to_string()),
+            ("cancel_url".to_string(), cancel_url.to_string()),
+            ("expires_at".to_string(), expires_at_epoch.to_string()),
+        ];
+        if let Some(customer) = customer {
+            form.push(("customer".to_string(), customer.to_string()));
+        }
+        let session = stripe_post_with_idempotency(
+            &self.api_key,
+            "checkout/sessions",
+            &form,
+            idempotency_key,
+        )
+        .await?;
+        session["url"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(ProviderError::malformed_response)
+    }
+
+    async fn validate_personal_price(
+        &self,
+        price_id: &str,
+        offer: BillingOffer,
+    ) -> ProviderResult<()> {
+        let value = stripe_get(&self.api_key, &format!("prices/{price_id}")).await?;
+        validate_stripe_personal_price(
+            &value,
+            price_id,
+            offer,
+            self.api_key.starts_with("sk_live_") || self.api_key.starts_with("rk_live_"),
+        )
+    }
+
     async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String> {
         let form = vec![
             ("customer".to_string(), customer.to_string()),
@@ -376,6 +498,17 @@ impl SubscriptionProvider for StripeBilling {
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn personal_subscription_period_end(
+        &self,
+        subscription_id: &str,
+    ) -> ProviderResult<Option<i64>> {
+        let object = stripe_get(&self.api_key, &format!("subscriptions/{subscription_id}")).await?;
+        if object["id"].as_str() != Some(subscription_id) {
+            return Err(ProviderError::malformed_response());
+        }
+        Ok(subscription_period_end(&object))
     }
 
     async fn cancel_subscription(
@@ -407,6 +540,26 @@ impl SubscriptionProvider for StripeBilling {
         let fresh = self.get_subscription(subscription_id).await;
         cancellation_outcome(cancellation.map(|_| ()), fresh)
     }
+
+    async fn cancel_personal_subscription(
+        &self,
+        subscription_id: &str,
+        idempotency_key: &str,
+        _user_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        let form = vec![("cancel_at_period_end".to_string(), "true".to_string())];
+        let response = stripe_post_with_idempotency(
+            &self.api_key,
+            &format!("subscriptions/{subscription_id}"),
+            &form,
+            idempotency_key,
+        )
+        .await?;
+        Ok(SubscriptionObservation::Current(subscription_snapshot(
+            &response,
+            subscription_id,
+        )?))
+    }
 }
 
 #[cfg(feature = "e2e-mock-billing")]
@@ -432,6 +585,14 @@ impl SubscriptionProvider for E2eBilling {
 
     async fn create_portal(&self, _customer: &str, return_url: &str) -> ProviderResult<String> {
         self.page_url("portal", &[("return_url", return_url)])
+    }
+
+    async fn validate_personal_price(
+        &self,
+        _price_id: &str,
+        _offer: BillingOffer,
+    ) -> ProviderResult<()> {
+        Ok(())
     }
 
     async fn get_subscription(
@@ -468,6 +629,14 @@ pub fn router() -> Router<AppState> {
     let router = Router::new()
         .route("/orgs/{org_id}/billing/checkout", post(create_checkout))
         .route("/orgs/{org_id}/billing/portal", post(create_portal))
+        .route("/billing/personal/quote", get(personal_quote))
+        .route("/billing/personal/checkout", post(personal_checkout))
+        .route(
+            "/billing/personal/operations/{operation_id}",
+            get(personal_operation),
+        )
+        .route("/billing/personal/portal", post(personal_portal))
+        .route("/billing/personal/cancel", post(personal_cancel))
         .route("/billing/webhook", post(webhook));
 
     #[cfg(feature = "e2e-mock-billing")]
@@ -499,6 +668,430 @@ async fn require_billing_admin(
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonalQuoteQuery {
+    offer: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonalQuoteView {
+    offer: String,
+    amount_pence: i64,
+    currency: &'static str,
+    interval: &'static str,
+    tax_treatment: &'static str,
+    quote_version: i64,
+    quote_expires_at_epoch: i64,
+    founding: bool,
+    founding_remaining_places: Option<i64>,
+    founding_term: Option<&'static str>,
+    next_renewal_amount_pence: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonalCheckoutRequest {
+    offer: String,
+    idempotency_key: String,
+    quote_version: i64,
+    quote_expires_at_epoch: i64,
+    return_url: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonalCheckoutView {
+    operation_id: String,
+    state: String,
+    checkout_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonalOperationView {
+    operation_id: String,
+    offer: String,
+    state: String,
+    provider_operation_id: Option<String>,
+    checkout_url: Option<String>,
+}
+
+fn billing_offer(value: &str) -> Result<BillingOffer> {
+    BillingOffer::ALL
+        .into_iter()
+        .find(|offer| offer.as_str() == value)
+        .ok_or_else(|| Error::BadRequest("unsupported billing offer".into()))
+}
+
+async fn validate_personal_catalogue(
+    billing: &BillingState,
+    catalogue: &BillingPriceIds,
+) -> Result<()> {
+    for offer in BillingOffer::ALL {
+        billing
+            .provider
+            .validate_personal_price(catalogue.id_for(offer), offer)
+            .await
+            .map_err(ProviderError::into_error)?;
+    }
+    Ok(())
+}
+
+fn billing_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs() as i64
+}
+
+fn personal_billing_error(error: personal_billing::PersonalBillingError) -> Error {
+    match error {
+        personal_billing::PersonalBillingError::AccountExists => {
+            Error::Conflict("a personal billing account already exists".into())
+        }
+        personal_billing::PersonalBillingError::CorruptState => {
+            Error::Internal("personal billing state is corrupt".into())
+        }
+        personal_billing::PersonalBillingError::SettlementConflict => {
+            Error::Conflict("personal settlement conflicts with stored evidence".into())
+        }
+        personal_billing::PersonalBillingError::Database(error) => Error::Db(error),
+    }
+}
+
+/// `GET /billing/personal/quote` - return a server-selected, short-lived person quote.
+async fn personal_quote(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<PersonalQuoteQuery>,
+) -> Result<Json<PersonalQuoteView>> {
+    let billing = billing_config(&state)?;
+    let catalogue = billing
+        .price_catalogue()
+        .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
+    let offer = billing_offer(&query.offer)?;
+    validate_personal_catalogue(billing, catalogue).await?;
+    let now = billing_epoch();
+    let expires = now
+        .checked_add(founding_allocator::RESERVATION_SECONDS)
+        .ok_or_else(|| Error::Internal("billing clock overflow".into()))?;
+    let mut tx = state.pool.begin().await?;
+    if let Some(account) = personal_billing::load_account(&mut tx, &user.user_id)
+        .await
+        .map_err(personal_billing_error)?
+    {
+        let reusable = matches!(
+            account.state,
+            personal_billing::PersonalBillingState::Canceled
+        ) || (matches!(
+            account.state,
+            personal_billing::PersonalBillingState::Pending
+        ) && account.pending_expires_at_epoch <= now);
+        if !reusable {
+            return Err(Error::Conflict(
+                "personal billing is already active or pending".into(),
+            ));
+        }
+    }
+    let sponsored: Option<String> = sqlx::query_scalar(
+        "SELECT allocation_id FROM cloud_provider_allocations \
+         WHERE beneficiary_id = $1 AND state IN ('pending', 'active') LIMIT 1",
+    )
+    .bind(&user.user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if sponsored.is_some() {
+        return Err(Error::Conflict(
+            "this person already has sponsored hosted coverage".into(),
+        ));
+    }
+    let amount_pence = offer.expected_amount_pence();
+    let interval = offer.expected_interval();
+    let founding = FoundingOffer::from_billing_offer(offer);
+    let (remaining, founding_term, next_renewal) = if let Some(founding_offer) = founding {
+        let status = founding_allocator::quote_status(&mut tx, founding_offer, now)
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?;
+        (
+            Some(status.remaining_places),
+            Some(match founding_offer {
+                FoundingOffer::Monthly => "through the founding monthly term",
+                FoundingOffer::Annual => "through the founding annual term",
+            }),
+            status.standard_amount_pence,
+        )
+    } else {
+        (None, None, amount_pence)
+    };
+    tx.rollback().await?;
+    Ok(Json(PersonalQuoteView {
+        offer: offer.as_str().into(),
+        amount_pence,
+        currency: "gbp",
+        interval: interval.as_str(),
+        tax_treatment: "shown_at_checkout",
+        quote_version: 1,
+        quote_expires_at_epoch: expires,
+        founding: founding.is_some(),
+        founding_remaining_places: remaining,
+        founding_term,
+        next_renewal_amount_pence: next_renewal,
+    }))
+}
+
+/// `POST /billing/personal/checkout` - persist the operation before asking Stripe for a hosted
+/// page. The provider result is the creation of the checkout session; coverage waits for the
+/// verified paid webhook handled below.
+async fn personal_checkout(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(request): Json<PersonalCheckoutRequest>,
+) -> Result<Json<PersonalCheckoutView>> {
+    let billing = billing_config(&state)?;
+    let catalogue = billing
+        .price_catalogue()
+        .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
+    let offer = billing_offer(&request.offer)?;
+    validate_personal_catalogue(billing, catalogue).await?;
+    let price_id = catalogue.id_for(offer).to_string();
+    billing_operations::validate_return_url(&billing.return_url, &request.return_url)
+        .map_err(Error::from)?;
+    let mut tx = state.pool.begin().await?;
+    let operation = billing_operations::begin_personal_operation(
+        &mut tx,
+        &user.user_id,
+        &request.idempotency_key,
+        offer,
+        request.quote_version,
+        request.quote_expires_at_epoch,
+        &billing.return_url,
+        &request.return_url,
+    )
+    .await
+    .map_err(Error::from)?;
+    let mut checkout_expires_at_epoch = None;
+    let operation = match operation {
+        BeginOperation::Created(operation) => {
+            let expiry = personal_checkout_expiry(request.quote_expires_at_epoch, billing_epoch())?;
+            checkout_expires_at_epoch = Some(expiry);
+            personal_billing::begin_account(
+                &mut tx,
+                &user.user_id,
+                &operation.operation_id,
+                offer,
+                expiry,
+                billing_epoch(),
+            )
+            .await
+            .map_err(personal_billing_error)?;
+            if let Some(founding_offer) = FoundingOffer::from_billing_offer(offer) {
+                let reservation = founding_allocator::reserve(
+                    &mut tx,
+                    &format!("founding:{}", operation.operation_id),
+                    &operation.operation_id,
+                    &user.user_id,
+                    &user.user_id,
+                    founding_offer,
+                    request.quote_version,
+                    expiry,
+                    billing_epoch(),
+                )
+                .await
+                .map_err(|error| Error::Conflict(error.to_string()))?;
+                if matches!(reservation, founding_allocator::ReservationOutcome::Full) {
+                    return Err(Error::Conflict(
+                        "founding hosted places are no longer available".into(),
+                    ));
+                }
+            }
+            tx.commit().await?;
+            operation
+        }
+        BeginOperation::AlreadyExists(operation)
+            if !matches!(operation.state, BillingOperationState::Pending)
+                || operation.provider_checkout_url.is_some() =>
+        {
+            tx.rollback().await?;
+            return Ok(Json(PersonalCheckoutView {
+                operation_id: operation.operation_id,
+                state: operation.state.as_str().into(),
+                checkout_url: operation.provider_checkout_url,
+            }));
+        }
+        BeginOperation::AlreadyExists(operation) => {
+            // The original provider request may have timed out after Stripe accepted it. Reuse
+            // the stored provider idempotency key and ask again only while the operation is still
+            // pending and has no recorded checkout URL.
+            tx.rollback().await?;
+            operation
+        }
+    };
+    let checkout_expires_at_epoch = match checkout_expires_at_epoch {
+        Some(expiry) => expiry,
+        None => personal_checkout_expiry(operation.quote_expires_at_epoch, billing_epoch())?,
+    };
+    let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
+    let checkout_url = billing
+        .provider
+        .create_personal_checkout(
+            &user.user_id,
+            None,
+            &price_id,
+            &operation.operation_id,
+            &operation.provider_idempotency_key,
+            checkout_expires_at_epoch,
+            &success_url,
+            &cancel_url,
+        )
+        .await
+        .map_err(ProviderError::into_error)?;
+    let mut result_tx = state.pool.begin().await?;
+    personal_billing::record_checkout_url(&mut result_tx, &operation.operation_id, &checkout_url)
+        .await
+        .map_err(personal_billing_error)?;
+    let result = billing_operations::record_provider_result(
+        &mut result_tx,
+        &operation.operation_id,
+        BillingOperationState::Succeeded,
+        None,
+        Some("checkout_created"),
+    )
+    .await
+    .map_err(Error::from)?;
+    result_tx.commit().await?;
+    Ok(Json(PersonalCheckoutView {
+        operation_id: result.operation_id,
+        state: result.state.as_str().into(),
+        checkout_url: Some(checkout_url),
+    }))
+}
+
+fn personal_checkout_expiry(quote_expires_at_epoch: i64, now_epoch: i64) -> Result<i64> {
+    let latest_quote_expiry = now_epoch
+        .checked_add(founding_allocator::RESERVATION_SECONDS)
+        .ok_or_else(|| Error::Internal("billing clock overflow".into()))?;
+    if quote_expires_at_epoch <= now_epoch {
+        return Err(Error::Conflict("billing quote expired".into()));
+    }
+    if quote_expires_at_epoch > latest_quote_expiry {
+        return Err(Error::BadRequest("billing quote expiry is invalid".into()));
+    }
+    quote_expires_at_epoch
+        .checked_add(founding_allocator::RESERVATION_SECONDS)
+        .ok_or_else(|| Error::Internal("billing clock overflow".into()))
+}
+
+async fn personal_operation(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(operation_id): Path<String>,
+) -> Result<Json<PersonalOperationView>> {
+    let operation =
+        billing_operations::load_operation_for_actor(&state.pool, &operation_id, &user.user_id)
+            .await
+            .map_err(Error::from)?
+            .ok_or_else(|| Error::NotFound("billing operation not found".into()))?;
+    Ok(Json(PersonalOperationView {
+        operation_id: operation.operation_id,
+        offer: operation.offer,
+        state: operation.state.as_str().into(),
+        provider_operation_id: operation.provider_operation_id,
+        checkout_url: operation.provider_checkout_url,
+    }))
+}
+
+#[derive(Debug, Serialize)]
+struct PersonalLifecycleView {
+    state: String,
+    stripe_subscription_id: Option<String>,
+    paid_through_date: Option<String>,
+    cancel_at_period_end: bool,
+    portal_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonalCancelRequest {
+    idempotency_key: String,
+}
+
+async fn personal_portal(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Json<PersonalLifecycleView>> {
+    let billing = billing_config(&state)?;
+    let mut tx = state.pool.begin().await?;
+    let account = personal_billing::load_account(&mut tx, &user.user_id)
+        .await
+        .map_err(personal_billing_error)?
+        .ok_or_else(|| Error::NotFound("personal billing account not found".into()))?;
+    let customer = account.stripe_customer_id.clone().ok_or_else(|| {
+        Error::Conflict("personal billing has not received a paid customer yet".into())
+    })?;
+    tx.rollback().await?;
+    let portal_url = billing
+        .provider
+        .create_portal(&customer, &app_url(&billing.return_url))
+        .await
+        .map_err(ProviderError::into_error)?;
+    Ok(Json(PersonalLifecycleView {
+        state: account.state.as_str().into(),
+        stripe_subscription_id: account.stripe_subscription_id,
+        paid_through_date: account.paid_through_date,
+        cancel_at_period_end: account.cancel_at_period_end,
+        portal_url: Some(portal_url),
+    }))
+}
+
+async fn personal_cancel(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(request): Json<PersonalCancelRequest>,
+) -> Result<Json<PersonalLifecycleView>> {
+    if request.idempotency_key.trim().is_empty() {
+        return Err(Error::BadRequest(
+            "idempotency_key must not be empty".into(),
+        ));
+    }
+    let billing = billing_config(&state)?;
+    let mut tx = state.pool.begin().await?;
+    let account = personal_billing::load_account(&mut tx, &user.user_id)
+        .await
+        .map_err(personal_billing_error)?
+        .ok_or_else(|| Error::NotFound("personal billing account not found".into()))?;
+    if account.cancel_at_period_end {
+        tx.rollback().await?;
+        return Ok(Json(PersonalLifecycleView {
+            state: account.state.as_str().into(),
+            stripe_subscription_id: account.stripe_subscription_id,
+            paid_through_date: account.paid_through_date,
+            cancel_at_period_end: true,
+            portal_url: None,
+        }));
+    }
+    let subscription_id = account.stripe_subscription_id.clone().ok_or_else(|| {
+        Error::Conflict("personal billing has not received a paid subscription yet".into())
+    })?;
+    tx.rollback().await?;
+    billing
+        .provider
+        .cancel_personal_subscription(&subscription_id, &request.idempotency_key, &user.user_id)
+        .await
+        .map_err(ProviderError::into_error)?;
+    let mut update_tx = state.pool.begin().await?;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET cancel_at_period_end = TRUE, \
+         cancellation_requested_at = now(), updated_at = now() WHERE user_id = $1",
+    )
+    .bind(&user.user_id)
+    .execute(&mut *update_tx)
+    .await?;
+    update_tx.commit().await?;
+    Ok(Json(PersonalLifecycleView {
+        state: account.state.as_str().into(),
+        stripe_subscription_id: Some(subscription_id),
+        paid_through_date: account.paid_through_date,
+        cancel_at_period_end: true,
+        portal_url: None,
+    }))
 }
 
 /// A provider-hosted page for the browser to navigate to.
@@ -711,6 +1304,23 @@ async fn stripe_post(
     stripe_response(response).await
 }
 
+async fn stripe_post_with_idempotency(
+    api_key: &str,
+    path: &str,
+    form: &[(String, String)],
+    idempotency_key: &str,
+) -> ProviderResult<serde_json::Value> {
+    let response = stripe_client()
+        .post(format!("https://api.stripe.com/v1/{path}"))
+        .bearer_auth(api_key)
+        .headers(stripe_headers(Some(idempotency_key))?)
+        .form(form)
+        .send()
+        .await
+        .map_err(|_| ProviderError::transport())?;
+    stripe_response(response).await
+}
+
 /// Fetch one Stripe resource with the pinned API version and structured error classification.
 async fn stripe_get(api_key: &str, path: &str) -> ProviderResult<serde_json::Value> {
     let response = stripe_client()
@@ -721,6 +1331,41 @@ async fn stripe_get(api_key: &str, path: &str) -> ProviderResult<serde_json::Val
         .await
         .map_err(|_| ProviderError::transport())?;
     stripe_response(response).await
+}
+
+fn validate_stripe_personal_price(
+    value: &serde_json::Value,
+    price_id: &str,
+    offer: BillingOffer,
+    expected_livemode: bool,
+) -> ProviderResult<()> {
+    if value["id"].as_str() != Some(price_id)
+        || value["active"].as_bool() != Some(true)
+        || value["livemode"].as_bool() != Some(expected_livemode)
+        || value["currency"].as_str() != Some("gbp")
+        || value["unit_amount"].as_i64() != Some(offer.expected_amount_pence())
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    let recurring = value["recurring"]
+        .as_object()
+        .ok_or_else(ProviderError::malformed_response)?;
+    if recurring
+        .get("interval")
+        .and_then(serde_json::Value::as_str)
+        != Some(offer.expected_interval().as_str())
+        || recurring
+            .get("interval_count")
+            .and_then(serde_json::Value::as_i64)
+            != Some(1)
+        || recurring
+            .get("usage_type")
+            .and_then(serde_json::Value::as_str)
+            != Some("licensed")
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    Ok(())
 }
 
 /// Delete one Stripe resource with an idempotency key and the explicit cancellation form.
@@ -894,7 +1539,39 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
 
     let object = &event.data.object;
     let subscription_id = event_subscription_id(&event);
+    let personal_period_end = if is_personal_checkout_event(&event) {
+        if let Some(subscription_id) = subscription_id.as_deref() {
+            billing
+                .provider
+                .personal_subscription_period_end(subscription_id)
+                .await
+                .map_err(ProviderError::into_error)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if disposition == EventDisposition::Reconcile {
+        if is_personal_checkout_event(&event) {
+            // A personal checkout has no organisation tier to reconcile. Re-apply the verified
+            // settlement instead; the personal account store makes this equal-timestamp replay
+            // idempotent while still requiring the paid webhook evidence.
+            checkout_completed(
+                &mut tx,
+                object,
+                event.created,
+                event.kind == "checkout.session.async_payment_succeeded",
+                personal_period_end,
+            )
+            .await?;
+            if let Some(subscription_id) = subscription_id {
+                update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+            }
+            mark_webhook_event_processed(&mut tx, &event.id).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
         let subscription_id = subscription_id.ok_or_else(|| {
             Error::Config("stripe reconciliation event has no subscription id".into())
         })?;
@@ -922,9 +1599,19 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
 
     match disposition {
         EventDisposition::Apply => match event.kind.as_str() {
-            "checkout.session.completed" => checkout_completed(&mut tx, object).await?,
+            "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
+                checkout_completed(
+                    &mut tx,
+                    object,
+                    event.created,
+                    event.kind == "checkout.session.async_payment_succeeded",
+                    personal_period_end,
+                )
+                .await?
+            }
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
+            "invoice.paid" => invoice_paid(&mut tx, object).await?,
             _ => {}
         },
         EventDisposition::Reconcile | EventDisposition::Ignore => {
@@ -968,6 +1655,13 @@ async fn record_webhook_event(
         if processed {
             return Ok(EventDisposition::Ignore);
         }
+    }
+
+    if is_personal_checkout_event(event) {
+        return Ok(EventDisposition::Apply);
+    }
+    if event.kind == "invoice.paid" {
+        return Ok(EventDisposition::Apply);
     }
 
     let Some(subscription_id) = subscription_id else {
@@ -1089,9 +1783,12 @@ async fn update_subscription_watermark(
 
 fn event_subscription_id(event: &Event) -> Option<String> {
     match event.kind.as_str() {
-        "checkout.session.completed" => event.data.object["subscription"]
-            .as_str()
-            .map(str::to_string),
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
+            event.data.object["subscription"]
+                .as_str()
+                .map(str::to_string)
+        }
+        "invoice.paid" => invoice_subscription_id(&event.data.object).map(str::to_string),
         "customer.subscription.updated" | "customer.subscription.deleted" => {
             event.data.object["id"].as_str().map(str::to_string)
         }
@@ -1101,7 +1798,9 @@ fn event_subscription_id(event: &Event) -> Option<String> {
 
 fn event_org_hint(event: &Event) -> Option<&str> {
     match event.kind.as_str() {
-        "checkout.session.completed" => event.data.object["client_reference_id"].as_str(),
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
+            event.data.object["client_reference_id"].as_str()
+        }
         "customer.subscription.updated" | "customer.subscription.deleted" => {
             event.data.object["metadata"]["org_id"].as_str()
         }
@@ -1109,11 +1808,23 @@ fn event_org_hint(event: &Event) -> Option<&str> {
     }
 }
 
+fn is_personal_checkout_event(event: &Event) -> bool {
+    matches!(
+        event.kind.as_str(),
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded"
+    ) && event.data.object["client_reference_id"]
+        .as_str()
+        .is_some_and(|reference| reference.starts_with("personal:"))
+}
+
 /// A paid checkout: record the Stripe ids and grant the Team tier. Idempotent - a redelivered
 /// event changes no rows and writes no duplicate audit entry.
 async fn checkout_completed(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
+    event_created: i64,
+    async_payment_succeeded: bool,
+    personal_period_end: Option<i64>,
 ) -> Result<()> {
     // Sessions this server creates always carry the org id; anything else isn't ours to act on.
     // Said out loud, because ignoring an event and acting on one are indistinguishable from
@@ -1126,6 +1837,17 @@ async fn checkout_completed(
         );
         return Ok(());
     };
+    if let Some(operation_id) = org_id.strip_prefix("personal:") {
+        return personal_checkout_completed(
+            tx,
+            object,
+            event_created,
+            operation_id,
+            async_payment_succeeded,
+            personal_period_end,
+        )
+        .await;
+    }
     let customer = object["customer"].as_str();
     let subscription = object["subscription"].as_str();
 
@@ -1168,19 +1890,155 @@ async fn checkout_completed(
     Ok(())
 }
 
+async fn personal_checkout_completed(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+    event_created: i64,
+    operation_id: &str,
+    async_payment_succeeded: bool,
+    personal_period_end: Option<i64>,
+) -> Result<()> {
+    if !async_payment_succeeded && object["payment_status"].as_str() != Some("paid") {
+        // A completed Checkout session is not itself authority. The account remains pending until
+        // Stripe says the session is paid, so SCA failures and asynchronous payment methods never
+        // become a free hosted term.
+        return Ok(());
+    }
+    let customer = object["customer"]
+        .as_str()
+        .ok_or_else(|| Error::Config("paid personal checkout has no customer".into()))?;
+    let subscription = object["subscription"]
+        .as_str()
+        .ok_or_else(|| Error::Config("paid personal checkout has no subscription".into()))?;
+    let payment_reference = object["payment_intent"]
+        .as_str()
+        .or_else(|| object["id"].as_str())
+        .ok_or_else(|| Error::Config("paid personal checkout has no payment reference".into()))?;
+    let account = sqlx::query(
+        "SELECT user_id, offer FROM billing_personal_accounts WHERE operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| Error::Config("personal checkout operation is not registered".into()))?;
+    let user_id: String = account.try_get("user_id")?;
+    let offer = billing_offer(&account.try_get::<String, _>("offer")?)?;
+    let paid_on = founding_allocator::FoundingDate::from_unix_seconds(event_created)
+        .map_err(|_| Error::Config("personal checkout timestamp is invalid".into()))?;
+    let interval_offer = match offer {
+        BillingOffer::StandardMonthly | BillingOffer::FoundingMonthly => FoundingOffer::Monthly,
+        BillingOffer::StandardAnnual | BillingOffer::FoundingAnnual => FoundingOffer::Annual,
+    };
+    let paid_through = if let Some(period_end) = personal_period_end {
+        founding_allocator::FoundingDate::from_unix_seconds(period_end)
+            .map_err(|_| Error::Config("personal subscription period end is invalid".into()))?
+    } else {
+        paid_on.add_term(interval_offer)
+    };
+    if FoundingOffer::from_billing_offer(offer).is_some() {
+        let reservation_id = format!("founding:{operation_id}");
+        match founding_allocator::confirm_payment(
+            tx,
+            &reservation_id,
+            payment_reference,
+            paid_on,
+            event_created,
+        )
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?
+        {
+            founding_allocator::ConfirmationOutcome::Awarded(_)
+            | founding_allocator::ConfirmationOutcome::AlreadyAwarded(_) => {}
+            founding_allocator::ConfirmationOutcome::RefundRequired => {
+                let refund = personal_billing::record_refund_required(
+                    tx,
+                    operation_id,
+                    customer,
+                    subscription,
+                    payment_reference,
+                )
+                .await
+                .map_err(personal_billing_error)?;
+                if matches!(refund, personal_billing::SettlementDisposition::Applied) {
+                    personal_billing::record_event(
+                        tx,
+                        &user_id,
+                        operation_id,
+                        "billing.personal_refund_required",
+                        Some("founding capacity was consumed after payment"),
+                    )
+                    .await
+                    .map_err(personal_billing_error)?;
+                }
+                return Ok(());
+            }
+        }
+    }
+    let settlement = personal_billing::record_paid_settlement(
+        tx,
+        operation_id,
+        customer,
+        subscription,
+        payment_reference,
+        paid_through.to_unix_seconds(),
+        &paid_through.to_string(),
+    )
+    .await
+    .map_err(personal_billing_error)?;
+    if matches!(settlement, personal_billing::SettlementDisposition::Applied) {
+        personal_billing::record_event(
+            tx,
+            &user_id,
+            operation_id,
+            "billing.personal_paid",
+            Some("personal checkout paid and coverage recorded"),
+        )
+        .await
+        .map_err(personal_billing_error)?;
+    }
+    Ok(())
+}
+
 /// A subscription lifecycle change: the status decides the tier. Handles late/failed payments
 /// (`unpaid` → free) and recoveries (`active` again → team).
 async fn subscription_updated(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
 ) -> Result<()> {
-    let Some(org_id) = org_for_subscription(tx, object).await? else {
+    let Some(status) = object["status"].as_str() else {
+        eprintln!("warning: ignored Stripe subscription event without a status");
         return Ok(());
     };
-    let Some(status) = object["status"].as_str() else {
-        eprintln!(
-            "warning: ignored Stripe subscription event without a status for organisation {org_id}"
-        );
+    if let Some(user_id) = personal_user_for_subscription(tx, object).await? {
+        let subscription_id = object["id"].as_str().ok_or_else(|| {
+            Error::Config("personal subscription event has no subscription id".into())
+        })?;
+        let cancel_at_period_end = object["cancel_at_period_end"].as_bool().ok_or_else(|| {
+            Error::Config("personal subscription event has no cancellation state".into())
+        })?;
+        let state = match SubscriptionStatus::parse(status) {
+            SubscriptionStatus::Active | SubscriptionStatus::Trialing => "active",
+            SubscriptionStatus::PastDue | SubscriptionStatus::Paused => "past_due",
+            SubscriptionStatus::Unpaid => "unpaid",
+            SubscriptionStatus::Canceled | SubscriptionStatus::IncompleteExpired => "canceled",
+            SubscriptionStatus::Incomplete => "pending",
+            SubscriptionStatus::Unknown(_) => return Ok(()),
+        };
+        sqlx::query(
+            "UPDATE billing_personal_accounts SET state = CASE \
+                 WHEN state = 'pending' AND $2 <> 'canceled' THEN state ELSE $2 END, \
+                 cancel_at_period_end = $3, stripe_subscription_id = COALESCE(stripe_subscription_id, $4), \
+                 updated_at = now() WHERE user_id = $1",
+        )
+        .bind(&user_id)
+        .bind(state)
+        .bind(cancel_at_period_end)
+        .bind(subscription_id)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(());
+    }
+    let Some(org_id) = org_for_subscription(tx, object).await? else {
         return Ok(());
     };
     let parsed_status = SubscriptionStatus::parse(status);
@@ -1217,12 +2075,106 @@ async fn subscription_updated(
     Ok(())
 }
 
+/// Since Stripe API 2025-03-31.basil, subscription billing periods live on the subscription
+/// items rather than on the subscription object. Personal checkout creates one item, but taking
+/// the furthest item end keeps the stored term safe if that shape ever gains another item.
+fn subscription_period_end(object: &serde_json::Value) -> Option<i64> {
+    object["items"]["data"]
+        .as_array()?
+        .iter()
+        .filter_map(|item| item["current_period_end"].as_i64())
+        .filter(|end| *end > 0)
+        .max()
+}
+
+/// Invoice.period_end describes the usage period that produced the invoice and therefore looks
+/// backwards for subscription invoices. The subscription line's period.end is the service term
+/// the paid invoice covers; the top-level field remains a compatibility fallback for old payloads.
+fn invoice_period_end(object: &serde_json::Value) -> Option<i64> {
+    let lines = object["lines"]["data"].as_array();
+    let subscription_line_end = lines.and_then(|lines| {
+        lines
+            .iter()
+            .filter(|line| {
+                line["parent"]["type"].as_str() == Some("subscription_item_details")
+                    || line["type"].as_str() == Some("subscription")
+            })
+            .filter_map(|line| line["period"]["end"].as_i64())
+            .filter(|end| *end > 0)
+            .max()
+            .or_else(|| {
+                lines
+                    .iter()
+                    .filter_map(|line| line["period"]["end"].as_i64())
+                    .filter(|end| *end > 0)
+                    .max()
+            })
+    });
+    subscription_line_end.or_else(|| object["period_end"].as_i64().filter(|end| *end > 0))
+}
+
+fn invoice_subscription_id(object: &serde_json::Value) -> Option<&str> {
+    object["parent"]["subscription_details"]["subscription"].as_str()
+}
+
+async fn invoice_paid(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<()> {
+    let Some(subscription_id) = invoice_subscription_id(object) else {
+        return Ok(());
+    };
+    let personal: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM billing_personal_accounts \
+         WHERE stripe_subscription_id = $1)",
+    )
+    .bind(subscription_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !personal {
+        return Ok(());
+    }
+    let period_end = invoice_period_end(object)
+        .ok_or_else(|| Error::Config("paid personal invoice has no period end".into()))?;
+    let paid_through = founding_allocator::FoundingDate::from_unix_seconds(period_end)
+        .map_err(|_| Error::Config("paid personal invoice has invalid period end".into()))?;
+    let payment_reference = object["payment_intent"]
+        .as_str()
+        .or_else(|| object["id"].as_str())
+        .ok_or_else(|| Error::Config("paid personal invoice has no payment reference".into()))?;
+    personal_billing::record_invoice_paid(
+        tx,
+        subscription_id,
+        payment_reference,
+        period_end,
+        &paid_through.to_string(),
+    )
+    .await
+    .map_err(personal_billing_error)?;
+    Ok(())
+}
+
 /// The subscription ended for good: back to the free tier (existing data stays readable - the
 /// entitlement gates are creation-time only).
 async fn subscription_deleted(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
 ) -> Result<()> {
+    if let Some(user_id) = personal_user_for_subscription(tx, object).await? {
+        let subscription_id = object["id"].as_str().ok_or_else(|| {
+            Error::Config("personal subscription event has no subscription id".into())
+        })?;
+        sqlx::query(
+            "UPDATE billing_personal_accounts SET state = 'canceled', \
+             stripe_subscription_id = COALESCE(stripe_subscription_id, $2), updated_at = now() \
+             WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .bind(subscription_id)
+        .execute(&mut **tx)
+        .await?;
+        return Ok(());
+    }
     let Some(org_id) = org_for_subscription(tx, object).await? else {
         return Ok(());
     };
@@ -1322,6 +2274,24 @@ async fn org_for_subscription(
             .fetch_optional(&mut **tx)
             .await?,
     )
+}
+
+async fn personal_user_for_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    object: &serde_json::Value,
+) -> Result<Option<String>> {
+    if let Some(user_id) = object["metadata"]["personal_user_id"].as_str() {
+        return Ok(Some(user_id.to_string()));
+    }
+    let Some(subscription_id) = object["id"].as_str() else {
+        return Ok(None);
+    };
+    Ok(sqlx::query_scalar(
+        "SELECT user_id FROM billing_personal_accounts WHERE stripe_subscription_id = $1",
+    )
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1606,6 +2576,34 @@ mod tests {
     }
 
     #[test]
+    fn personal_price_validation_rejects_shape_drift_and_accepts_restricted_live_keys() {
+        let price = serde_json::json!({
+            "id": "price_founder",
+            "active": true,
+            "livemode": true,
+            "currency": "gbp",
+            "unit_amount": 199,
+            "recurring": {"interval": "month", "interval_count": 1, "usage_type": "licensed"}
+        });
+        assert!(validate_stripe_personal_price(
+            &price,
+            "price_founder",
+            BillingOffer::FoundingMonthly,
+            true
+        )
+        .is_ok());
+        let mut wrong_amount = price.clone();
+        wrong_amount["unit_amount"] = serde_json::json!(299);
+        assert!(validate_stripe_personal_price(
+            &wrong_amount,
+            "price_founder",
+            BillingOffer::FoundingMonthly,
+            true
+        )
+        .is_err());
+    }
+
+    #[test]
     fn cancellation_form_is_explicit_and_traceable() {
         let form = cancellation_form("org-123");
         assert!(form.contains(&("invoice_now".into(), "false".into())));
@@ -1651,5 +2649,41 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind, ProviderErrorKind::Retryable);
+    }
+
+    #[test]
+    fn personal_checkout_expiry_leaves_stripe_a_full_window() {
+        let now = 1_700_000_000;
+        let quote_expiry = now + founding_allocator::RESERVATION_SECONDS;
+        assert_eq!(
+            personal_checkout_expiry(quote_expiry, now).unwrap(),
+            now + founding_allocator::RESERVATION_SECONDS * 2
+        );
+        assert!(personal_checkout_expiry(now, now).is_err());
+        assert!(personal_checkout_expiry(quote_expiry + 1, now).is_err());
+    }
+
+    #[test]
+    fn stripe_period_helpers_use_item_and_line_service_periods() {
+        let subscription = serde_json::json!({
+            "current_period_end": 1_700_000_001,
+            "items": {"data": [
+                {"current_period_end": 1_800_000_000},
+                {"current_period_end": 1_900_000_000}
+            ]}
+        });
+        assert_eq!(subscription_period_end(&subscription), Some(1_900_000_000));
+
+        let invoice = serde_json::json!({
+            "period_end": 1_800_000_000,
+            "lines": {"data": [
+                {"type": "invoiceitem", "period": {"end": 1_850_000_000}},
+                {"parent": {"type": "subscription_item_details"},
+                 "period": {"end": 1_950_000_000}}
+            ]},
+            "parent": {"subscription_details": {"subscription": "sub-1"}}
+        });
+        assert_eq!(invoice_period_end(&invoice), Some(1_950_000_000));
+        assert_eq!(invoice_subscription_id(&invoice), Some("sub-1"));
     }
 }
