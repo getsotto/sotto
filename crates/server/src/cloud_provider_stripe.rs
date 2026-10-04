@@ -647,12 +647,13 @@ pub fn decode_paid_invoice(
     });
     let normalized_bytes = serde_json::to_vec(&normalized)
         .map_err(|_| StripeContractError::NormalizationSerialization)?;
-    let verified_event = VerifiedProviderEvent::from_payload(
+    let verified_event = VerifiedProviderEvent::from_payload_with_object_id(
         event.id.clone(),
         event.event_type,
         event.created,
         Some(subscription_id.clone()),
         Some(allocation_reference.clone()),
+        invoice_id.clone(),
         &normalized_bytes,
     )
     .map_err(StripeContractError::ProviderEvidence)?;

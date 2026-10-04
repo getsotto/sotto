@@ -54,12 +54,13 @@ fn live_context() -> ProviderContext {
 }
 
 fn event(id: &str) -> VerifiedProviderEvent {
-    VerifiedProviderEvent::from_payload(
+    VerifiedProviderEvent::from_payload_with_object_id(
         id,
         "invoice.paid",
         1_700_000_000,
         Some("sub_test_1".into()),
         Some("allocation_ref_1".into()),
+        format!("invoice:{id}"),
         br#"{"amount":299,"status":"paid"}"#,
     )
     .unwrap()

@@ -92,6 +92,12 @@ pub struct VerifiedProviderEvent {
     pub provider_created_at: i64,
     pub subscription_id: Option<String>,
     pub allocation_reference: Option<String>,
+    /// Provider object identity needed by restart-safe refresh workers.
+    ///
+    /// This is optional for provider-neutral events and legacy receipts. Concrete adapters should
+    /// persist it when their downstream read requires the original object id (for example, a
+    /// Stripe invoice).
+    pub provider_object_id: Option<String>,
     pub normalized_payload_hash: String,
 }
 
@@ -110,9 +116,38 @@ impl VerifiedProviderEvent {
             provider_created_at,
             subscription_id,
             allocation_reference,
+            provider_object_id: None,
             normalized_payload_hash: hex_sha256(normalized_payload),
         };
         event.validate()?;
+        Ok(event)
+    }
+
+    /// Construct a verified event while retaining the provider object's stable identity.
+    pub fn from_payload_with_object_id(
+        event_id: impl Into<String>,
+        event_type: impl Into<String>,
+        provider_created_at: i64,
+        subscription_id: Option<String>,
+        allocation_reference: Option<String>,
+        provider_object_id: impl Into<String>,
+        normalized_payload: &[u8],
+    ) -> Result<Self, ProviderAdapterError> {
+        let provider_object_id = provider_object_id.into();
+        let mut event = Self::from_payload(
+            event_id,
+            event_type,
+            provider_created_at,
+            subscription_id,
+            allocation_reference,
+            normalized_payload,
+        )?;
+        if provider_object_id.trim().is_empty() {
+            return Err(ProviderAdapterError::InvalidEvidence(
+                "provider object id must not be empty".into(),
+            ));
+        }
+        event.provider_object_id = Some(provider_object_id);
         Ok(event)
     }
 
@@ -126,6 +161,7 @@ impl VerifiedProviderEvent {
         provider_created_at: i64,
         subscription_id: Option<String>,
         allocation_reference: Option<String>,
+        provider_object_id: Option<String>,
         normalized_payload_hash: String,
     ) -> Result<Self, ProviderAdapterError> {
         let event = Self {
@@ -134,6 +170,7 @@ impl VerifiedProviderEvent {
             provider_created_at,
             subscription_id,
             allocation_reference,
+            provider_object_id,
             normalized_payload_hash,
         };
         event.validate()?;
@@ -150,6 +187,7 @@ impl VerifiedProviderEvent {
         }
         validate_optional_identifier(self.subscription_id.as_deref(), "subscription")?;
         validate_optional_identifier(self.allocation_reference.as_deref(), "allocation")?;
+        validate_optional_identifier(self.provider_object_id.as_deref(), "provider object")?;
         if self.normalized_payload_hash.len() != 64
             || !self
                 .normalized_payload_hash
@@ -456,8 +494,9 @@ pub async fn record_verified_event(
     let inserted = sqlx::query(
         "INSERT INTO cloud_provider_event_receipts \
          (provider_namespace, provider_account_id, provider_environment, event_id, event_type, \
-          provider_created_at, subscription_id, allocation_reference, normalized_payload_hash, status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending') \
+          provider_created_at, subscription_id, allocation_reference, provider_object_id, \
+          normalized_payload_hash, status) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending') \
          ON CONFLICT (provider_namespace, provider_account_id, provider_environment, event_id) \
          DO NOTHING",
     )
@@ -469,6 +508,7 @@ pub async fn record_verified_event(
     .bind(event.provider_created_at)
     .bind(event.subscription_id.as_deref())
     .bind(event.allocation_reference.as_deref())
+    .bind(event.provider_object_id.as_deref())
     .bind(&event.normalized_payload_hash)
     .execute(&mut **tx)
     .await?
@@ -480,7 +520,7 @@ pub async fn record_verified_event(
 
     let row = sqlx::query(
         "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
-                normalized_payload_hash, status \
+                provider_object_id, normalized_payload_hash, status \
          FROM cloud_provider_event_receipts \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
            AND provider_environment = $3 AND event_id = $4",
@@ -497,11 +537,13 @@ pub async fn record_verified_event(
     let stored_created: i64 = row.try_get("provider_created_at")?;
     let stored_subscription: Option<String> = row.try_get("subscription_id")?;
     let stored_allocation: Option<String> = row.try_get("allocation_reference")?;
+    let stored_object: Option<String> = row.try_get("provider_object_id")?;
     if stored_hash != event.normalized_payload_hash
         || stored_type != event.event_type
         || stored_created != event.provider_created_at
         || stored_subscription != event.subscription_id
         || stored_allocation != event.allocation_reference
+        || stored_object != event.provider_object_id
     {
         return Err(ProviderAdapterError::EventConflict);
     }
@@ -534,7 +576,7 @@ pub async fn accept_provider_invalidation(
 
     let receipt = sqlx::query(
         "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
-                normalized_payload_hash, status, allocation_id, coverage_source_id \
+                provider_object_id, normalized_payload_hash, status, allocation_id, coverage_source_id \
          FROM cloud_provider_event_receipts \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
            AND provider_environment = $3 AND event_id = $4 FOR UPDATE",
@@ -745,7 +787,7 @@ pub async fn reject_verified_event(
     validate_identifier(rejection_code, "rejection code")?;
     let receipt = sqlx::query(
         "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
-                normalized_payload_hash, status, rejection_code \
+                provider_object_id, normalized_payload_hash, status, rejection_code \
          FROM cloud_provider_event_receipts \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
            AND provider_environment = $3 AND event_id = $4 FOR UPDATE",
@@ -972,7 +1014,7 @@ pub async fn prepare_verified_event(
     validate_event_allocation(event, allocation)?;
     let receipt = sqlx::query(
         "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
-                normalized_payload_hash, status, collection_beneficiary_id, \
+                provider_object_id, normalized_payload_hash, status, collection_beneficiary_id, \
                 collection_attempt_id, collection_run_id \
          FROM cloud_provider_event_receipts \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
@@ -1067,7 +1109,7 @@ pub async fn complete_verified_event(
     }
     let receipt = sqlx::query(
         "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
-                normalized_payload_hash, status, collection_beneficiary_id, \
+                provider_object_id, normalized_payload_hash, status, collection_beneficiary_id, \
                 collection_attempt_id, collection_run_id \
          FROM cloud_provider_event_receipts \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
@@ -1158,7 +1200,7 @@ pub async fn replay_verified_event(
 
     let receipt = sqlx::query(
         "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
-                normalized_payload_hash, status, allocation_id, coverage_source_id, \
+                provider_object_id, normalized_payload_hash, status, allocation_id, coverage_source_id, \
                 projection_revision, collection_beneficiary_id, collection_attempt_id \
          FROM cloud_provider_event_receipts \
          WHERE provider_namespace = $1 AND provider_account_id = $2 \
@@ -1503,11 +1545,13 @@ fn verify_stored_event(
     let stored_created: i64 = row.try_get("provider_created_at")?;
     let stored_subscription: Option<String> = row.try_get("subscription_id")?;
     let stored_allocation: Option<String> = row.try_get("allocation_reference")?;
+    let stored_object: Option<String> = row.try_get("provider_object_id")?;
     if stored_hash != event.normalized_payload_hash
         || stored_type != event.event_type
         || stored_created != event.provider_created_at
         || stored_subscription != event.subscription_id
         || stored_allocation != event.allocation_reference
+        || stored_object != event.provider_object_id
     {
         return Err(ProviderAdapterError::EventConflict);
     }
@@ -1676,6 +1720,32 @@ mod tests {
         .unwrap();
         assert_eq!(event.normalized_payload_hash.len(), 64);
         assert_eq!(event.event_id, "evt_1");
+        assert_eq!(event.provider_object_id, None);
+    }
+
+    #[test]
+    fn provider_object_identity_is_optional_but_cannot_be_blank() {
+        let event = VerifiedProviderEvent::from_payload_with_object_id(
+            "evt_1",
+            "invoice.paid",
+            10,
+            None,
+            None,
+            "in_1",
+            b"{}",
+        )
+        .unwrap();
+        assert_eq!(event.provider_object_id.as_deref(), Some("in_1"));
+        assert!(VerifiedProviderEvent::from_payload_with_object_id(
+            "evt_2",
+            "invoice.paid",
+            10,
+            None,
+            None,
+            "  ",
+            b"{}",
+        )
+        .is_err());
     }
 
     #[test]

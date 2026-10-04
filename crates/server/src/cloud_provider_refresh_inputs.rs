@@ -37,7 +37,8 @@ pub async fn load(
 ) -> Result<RefreshJobInputs, RefreshInputError> {
     let row = sqlx::query(
         "SELECT receipt.event_type, receipt.provider_created_at, receipt.subscription_id, \
-                receipt.allocation_reference, receipt.normalized_payload_hash, receipt.status, \
+                receipt.allocation_reference, receipt.provider_object_id, \
+                receipt.normalized_payload_hash, receipt.status, \
                 allocation.payer_id, payer.provider_customer_id, payer.payer_kind, \
                 allocation.provider_subscription_id, allocation.provider_item_id, \
                 allocation.external_allocation_reference, allocation.effective_from, \
@@ -79,6 +80,7 @@ pub async fn load(
         row.try_get("provider_created_at")?,
         row.try_get("subscription_id")?,
         row.try_get("allocation_reference")?,
+        row.try_get("provider_object_id")?,
         row.try_get("normalized_payload_hash")?,
     )
     .map_err(|error| RefreshInputError::Corrupt(error.to_string()))?;
