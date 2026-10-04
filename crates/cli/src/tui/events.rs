@@ -602,6 +602,67 @@ mod tests {
     }
 
     #[test]
+    fn help_modal_mouse_events_do_not_move_underlying_selection() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let keychain = crate::keychain::MemoryKeychain::default();
+        crate::session::init(
+            &store,
+            &keychain,
+            b"pw",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master = crate::session::current_master_key(&keychain)
+            .unwrap()
+            .unwrap();
+        let keypair = crate::session::account_keypair(&store, &master).unwrap();
+        let project = crate::vault::Vault::create_project(&store, &keypair, "acme").unwrap();
+        let config = crate::config::Config {
+            project_id: project.id,
+            project: "acme".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let theme = crate::theme::Theme::default();
+        let app = crate::commands::App::new(&store, &keychain);
+        app.set(&config, "KEY_00", b"a").unwrap();
+        app.set(&config, "KEY_01", b"b").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        let scroll_down = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 40,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        };
+        let scroll_up = MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 40,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        };
+        let left_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 40,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        tui_app.show_help = true;
+        handle_mouse_event(&mut tui_app, scroll_down).unwrap();
+        handle_mouse_event(&mut tui_app, scroll_up).unwrap();
+        assert_eq!(tui_app.selected_filtered_index, 0);
+        assert!(tui_app.show_help);
+
+        handle_mouse_event(&mut tui_app, left_click).unwrap();
+        assert!(!tui_app.show_help);
+        assert_eq!(tui_app.selected_filtered_index, 0);
+
+        handle_mouse_event(&mut tui_app, scroll_down).unwrap();
+        assert_eq!(tui_app.selected_filtered_index, 1);
+    }
+
+    #[test]
     fn theme_modal_mouse_scroll_events() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let keychain = crate::keychain::MemoryKeychain::default();

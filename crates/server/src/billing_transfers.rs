@@ -287,6 +287,16 @@ pub async fn begin_transfer(
 ) -> Result<BeginTransfer, TransferError> {
     request.validate_shape()?;
     authorise_transfer_parties(tx, request).await?;
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET state = 'failed', result_code = 'consent_expired', \
+         updated_at = now() \
+         WHERE beneficiary_id = $1 AND state = 'awaiting_consent' \
+           AND quote_expires_at_epoch <= $2",
+    )
+    .bind(&request.beneficiary_id)
+    .bind(now_epoch)
+    .execute(&mut **tx)
+    .await?;
     if let Some(existing) =
         load_by_idempotency(tx, &request.actor_user_id, &request.idempotency_key).await?
     {
@@ -428,6 +438,33 @@ pub async fn accept_transfer(
     if updated.is_none() {
         return Err(TransferError::InvalidTransition);
     }
+    load_transfer(tx, transfer_id).await
+}
+
+/// Withdraw or decline an invitation before provider work starts. Either participant can clear
+/// the consent slot; later provider states are deliberately irreversible here.
+pub async fn withdraw_transfer(
+    tx: &mut Transaction<'_, Postgres>,
+    transfer_id: &str,
+    user_id: &str,
+) -> Result<TransferIntent, TransferError> {
+    if user_id.trim().is_empty() {
+        return Err(TransferError::InvalidField("user_id"));
+    }
+    let current = load_transfer(tx, transfer_id).await?;
+    if current.actor_user_id != user_id && current.counterparty_user_id != user_id {
+        return Err(TransferError::Unauthorised);
+    }
+    if current.state != TransferState::AwaitingConsent {
+        return Err(TransferError::InvalidTransition);
+    }
+    sqlx::query(
+        "UPDATE billing_transfer_intents SET state = 'failed', result_code = 'consent_withdrawn', \
+         updated_at = now() WHERE transfer_id = $1 AND state = 'awaiting_consent'",
+    )
+    .bind(transfer_id)
+    .execute(&mut **tx)
+    .await?;
     load_transfer(tx, transfer_id).await
 }
 

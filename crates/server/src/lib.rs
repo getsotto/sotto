@@ -26,6 +26,8 @@ pub mod billing;
 pub mod billing_catalogue;
 pub mod billing_operations;
 #[doc(hidden)]
+pub mod billing_refunds;
+#[doc(hidden)]
 pub mod billing_transfers;
 pub mod cloud_coverage;
 pub mod cloud_coverage_reconciliation;

@@ -31,6 +31,7 @@ use url::Url;
 use crate::auth::AuthUser;
 use crate::billing_catalogue::{BillingOffer, BillingPriceIds};
 use crate::billing_operations::{self, BeginOperation, BillingOperationState};
+use crate::billing_refunds::{self, CorrectionReason, PayerKind};
 use crate::config::BillingConfig;
 use crate::error::{Error, Result};
 use crate::founding_allocator::{self, FoundingOffer};
@@ -265,6 +266,14 @@ pub struct SponsoredCheckoutSession {
     pub subscription_id: Option<String>,
 }
 
+/// Provider evidence for a refund request. A refund response is not an access decision; the
+/// durable correction state decides whether the paid term remains or ends early.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefundReceipt {
+    pub refund_id: String,
+    pub status: String,
+}
+
 impl SubscriptionObservation {
     pub fn purge_gate(&self) -> PurgeGate {
         match self {
@@ -366,6 +375,24 @@ pub trait SubscriptionProvider: Send + Sync {
 
     async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String>;
 
+    /// Create a refund against a verified payment reference. The caller owns the durable
+    /// correction transaction and must record the receipt before changing any entitlement.
+    async fn create_refund(
+        &self,
+        payment_reference: &str,
+        amount_pence: Option<i64>,
+        idempotency_key: &str,
+    ) -> ProviderResult<RefundReceipt> {
+        let _ = (payment_reference, amount_pence, idempotency_key);
+        Err(ProviderError::unsupported("refund"))
+    }
+
+    /// Read a previously created refund. A stored provider refund ID must be reconciled with a
+    /// read before another create call is attempted.
+    async fn get_refund(&self, _provider_refund_id: &str) -> ProviderResult<RefundReceipt> {
+        Err(ProviderError::unsupported("refund_lookup"))
+    }
+
     async fn get_subscription(
         &self,
         subscription_id: &str,
@@ -396,6 +423,20 @@ pub trait SubscriptionProvider: Send + Sync {
     ) -> ProviderResult<SubscriptionObservation> {
         self.cancel_subscription(subscription_id, idempotency_key, user_id)
             .await
+    }
+
+    /// Immediately terminate a personal subscription after an approved full refund. The
+    /// correction workflow keeps its request in `provider_pending` until this step and the
+    /// refund both succeed, so a retry can safely repeat the same provider idempotency key.
+    async fn terminate_personal_subscription(
+        &self,
+        _subscription_id: &str,
+        _idempotency_key: &str,
+        _user_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Err(ProviderError::unsupported(
+            "personal_subscription_termination",
+        ))
     }
 }
 
@@ -829,6 +870,57 @@ impl SubscriptionProvider for StripeBilling {
             .ok_or_else(ProviderError::malformed_response)
     }
 
+    async fn create_refund(
+        &self,
+        payment_reference: &str,
+        amount_pence: Option<i64>,
+        idempotency_key: &str,
+    ) -> ProviderResult<RefundReceipt> {
+        if !payment_reference.starts_with("pi_") || idempotency_key.trim().is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        if amount_pence.is_some_and(|amount| amount <= 0) {
+            return Err(ProviderError::malformed_response());
+        }
+        let mut form = vec![("payment_intent".to_string(), payment_reference.to_string())];
+        if let Some(amount) = amount_pence {
+            form.push(("amount".to_string(), amount.to_string()));
+        }
+        let value =
+            stripe_post_with_idempotency(&self.api_key, "refunds", &form, idempotency_key).await?;
+        let refund_id = value["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let status = value["status"]
+            .as_str()
+            .filter(|status| !status.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        Ok(RefundReceipt {
+            refund_id: refund_id.to_string(),
+            status: status.to_string(),
+        })
+    }
+
+    async fn get_refund(&self, provider_refund_id: &str) -> ProviderResult<RefundReceipt> {
+        if !provider_refund_id.starts_with("re_") {
+            return Err(ProviderError::malformed_response());
+        }
+        let value = stripe_get(&self.api_key, &format!("refunds/{provider_refund_id}")).await?;
+        let refund_id = value["id"]
+            .as_str()
+            .filter(|id| *id == provider_refund_id)
+            .ok_or_else(ProviderError::malformed_response)?;
+        let status = value["status"]
+            .as_str()
+            .filter(|status| !status.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        Ok(RefundReceipt {
+            refund_id: refund_id.to_string(),
+            status: status.to_string(),
+        })
+    }
+
     async fn get_subscription(
         &self,
         subscription_id: &str,
@@ -905,6 +997,38 @@ impl SubscriptionProvider for StripeBilling {
             &response,
             subscription_id,
         )?))
+    }
+
+    async fn terminate_personal_subscription(
+        &self,
+        subscription_id: &str,
+        idempotency_key: &str,
+        user_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        let current = self.get_subscription(subscription_id).await?;
+        let SubscriptionObservation::Current(snapshot) = current else {
+            return Ok(current);
+        };
+        if !matches!(snapshot.status.purge_gate(), PurgeGate::Blocking) {
+            return Ok(SubscriptionObservation::Current(snapshot));
+        }
+        let form = vec![
+            ("invoice_now".into(), "false".into()),
+            ("prorate".into(), "false".into()),
+            (
+                "cancellation_details[comment]".into(),
+                format!("Sotto personal billing correction {user_id}"),
+            ),
+        ];
+        let cancellation = stripe_delete(
+            &self.api_key,
+            &format!("subscriptions/{subscription_id}"),
+            idempotency_key,
+            &form,
+        )
+        .await;
+        let fresh = self.get_subscription(subscription_id).await;
+        cancellation_outcome(cancellation.map(|_| ()), fresh)
     }
 }
 
@@ -999,6 +1123,23 @@ pub fn router() -> Router<AppState> {
         )
         .route("/billing/personal/portal", post(personal_portal))
         .route("/billing/personal/cancel", post(personal_cancel))
+        .route("/billing/personal/refunds", post(personal_refund_request))
+        .route(
+            "/billing/personal/refunds/{request_id}",
+            get(personal_refund_status),
+        )
+        .route(
+            "/billing/personal/refunds/{request_id}/confirm-early",
+            post(personal_refund_confirm_early),
+        )
+        .route(
+            "/billing/refunds/{request_id}/review",
+            post(operator_review_refund),
+        )
+        .route(
+            "/billing/refunds/{request_id}/process",
+            post(operator_process_refund),
+        )
         .route("/billing/webhook", post(webhook));
 
     #[cfg(feature = "e2e-mock-billing")]
@@ -1017,9 +1158,16 @@ fn billing_config(state: &AppState) -> Result<&BillingState> {
 }
 
 const SPONSORED_BILLING_ENABLED_ENV: &str = "SOTTO_SPONSORED_BILLING_ENABLED";
+const BILLING_CORRECTIONS_ENABLED_ENV: &str = "SOTTO_BILLING_CORRECTIONS_ENABLED";
+const BILLING_OPERATOR_TOKEN_ENV: &str = "SOTTO_BILLING_OPERATOR_TOKEN";
+const BILLING_CORRECTION_POLICY_VERSION: &str = "2026-10-04";
 
 fn sponsored_billing_enabled() -> bool {
     std::env::var(SPONSORED_BILLING_ENABLED_ENV).as_deref() == Ok("1")
+}
+
+fn billing_corrections_enabled() -> bool {
+    std::env::var(BILLING_CORRECTIONS_ENABLED_ENV).as_deref() == Ok("1")
 }
 
 fn sponsored_billing_config(state: &AppState) -> Result<&BillingState> {
@@ -1801,6 +1949,303 @@ struct PersonalLifecycleView {
 #[derive(Debug, Deserialize)]
 struct PersonalCancelRequest {
     idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonalRefundRequest {
+    reason: String,
+    amount_pence: Option<i64>,
+    full_refund: bool,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersonalRefundEarlyConfirmation {
+    effective_at_epoch: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct BillingRefundReviewRequest {
+    approve: bool,
+    result_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PersonalRefundView {
+    request_id: String,
+    state: String,
+    reason: String,
+    amount_pence: Option<i64>,
+    full_refund_requested: bool,
+    preserve_paid_term: bool,
+    early_termination_confirmed_at_epoch: Option<i64>,
+    effective_at_epoch: Option<i64>,
+    result_code: Option<String>,
+}
+
+fn correction_reason(value: &str) -> Result<CorrectionReason> {
+    match value {
+        "duplicate_charge" => Ok(CorrectionReason::DuplicateCharge),
+        "billing_error" => Ok(CorrectionReason::BillingError),
+        "accidental_renewal" => Ok(CorrectionReason::AccidentalRenewal),
+        "legal_requirement" => Ok(CorrectionReason::LegalRequirement),
+        _ => Err(Error::BadRequest(
+            "unsupported billing correction reason".into(),
+        )),
+    }
+}
+
+fn personal_refund_view(request: billing_refunds::BillingRefundRequest) -> PersonalRefundView {
+    PersonalRefundView {
+        request_id: request.request_id,
+        state: request.state.as_str().into(),
+        reason: request.reason,
+        amount_pence: request.amount_pence,
+        full_refund_requested: request.full_refund_requested,
+        preserve_paid_term: request.preserve_paid_term,
+        early_termination_confirmed_at_epoch: request.early_termination_confirmed_at_epoch,
+        effective_at_epoch: request.effective_at_epoch,
+        result_code: request.result_code,
+    }
+}
+
+fn require_billing_corrections() -> Result<()> {
+    if billing_corrections_enabled() {
+        Ok(())
+    } else {
+        Err(Error::NotConfigured(
+            "billing corrections are not enabled".into(),
+        ))
+    }
+}
+
+fn require_billing_operator(headers: &HeaderMap) -> Result<()> {
+    let configured = std::env::var(BILLING_OPERATOR_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| {
+            Error::NotConfigured("billing operator controls are not configured".into())
+        })?;
+    let provided = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if provided != Some(configured.as_str()) {
+        return Err(Error::Forbidden(
+            "billing operator authorisation failed".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn personal_refund_request(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(request): Json<PersonalRefundRequest>,
+) -> Result<Json<PersonalRefundView>> {
+    require_billing_corrections()?;
+    billing_config(&state)?;
+    if request.idempotency_key.trim().is_empty() {
+        return Err(Error::BadRequest(
+            "idempotency_key must not be empty".into(),
+        ));
+    }
+    let reason = correction_reason(&request.reason)?;
+    let mut tx = state.pool.begin().await?;
+    let account = personal_billing::load_account(&mut tx, &user.user_id)
+        .await
+        .map_err(personal_billing_error)?
+        .ok_or_else(|| Error::NotFound("personal billing account not found".into()))?;
+    let payment_reference = account.payment_reference.ok_or_else(|| {
+        Error::Conflict("personal billing has no settled payment to correct".into())
+    })?;
+    let subscription_id = account.stripe_subscription_id.ok_or_else(|| {
+        Error::Conflict("personal billing has no settled subscription to correct".into())
+    })?;
+    let (_, correction) = billing_refunds::create_request(
+        &mut tx,
+        &billing_refunds::CorrectionRequest {
+            requester_user_id: user.user_id.clone(),
+            beneficiary_id: user.user_id,
+            organization_id: None,
+            payer_kind: PayerKind::Personal,
+            payment_reference,
+            subscription_id,
+            amount_pence: request.amount_pence,
+            reason,
+            policy_version: BILLING_CORRECTION_POLICY_VERSION.into(),
+            idempotency_key: request.idempotency_key,
+            full_refund_requested: request.full_refund,
+        },
+    )
+    .await
+    .map_err(Error::from)?;
+    tx.commit().await?;
+    Ok(Json(personal_refund_view(correction)))
+}
+
+async fn personal_refund_status(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(request_id): Path<String>,
+) -> Result<Json<PersonalRefundView>> {
+    require_billing_corrections()?;
+    let mut tx = state.pool.begin().await?;
+    let request = billing_refunds::load_for_requester(&mut tx, &request_id, &user.user_id)
+        .await
+        .map_err(Error::from)?
+        .ok_or_else(|| Error::NotFound("billing correction request not found".into()))?;
+    tx.rollback().await?;
+    Ok(Json(personal_refund_view(request)))
+}
+
+async fn personal_refund_confirm_early(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(request_id): Path<String>,
+    Json(request): Json<PersonalRefundEarlyConfirmation>,
+) -> Result<Json<PersonalRefundView>> {
+    require_billing_corrections()?;
+    let mut tx = state.pool.begin().await?;
+    let request = billing_refunds::confirm_early_termination(
+        &mut tx,
+        &request_id,
+        &user.user_id,
+        request.effective_at_epoch,
+    )
+    .await
+    .map_err(Error::from)?;
+    tx.commit().await?;
+    Ok(Json(personal_refund_view(request)))
+}
+
+async fn operator_review_refund(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+    Json(review): Json<BillingRefundReviewRequest>,
+) -> Result<Json<PersonalRefundView>> {
+    require_billing_corrections()?;
+    require_billing_operator(&headers)?;
+    let mut tx = state.pool.begin().await?;
+    let request = billing_refunds::review_request(
+        &mut tx,
+        &request_id,
+        review.approve,
+        review.result_code.as_deref(),
+    )
+    .await
+    .map_err(Error::from)?;
+    tx.commit().await?;
+    Ok(Json(personal_refund_view(request)))
+}
+
+async fn operator_process_refund(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Result<Json<PersonalRefundView>> {
+    require_billing_corrections()?;
+    require_billing_operator(&headers)?;
+    let billing = billing_config(&state)?;
+    let mut tx = state.pool.begin().await?;
+    let current = billing_refunds::load_for_operator(&mut tx, &request_id)
+        .await
+        .map_err(Error::from)?;
+    let current = if current.state == billing_refunds::CorrectionState::Approved {
+        let next = billing_refunds::begin_provider_refund(&mut tx, &request_id)
+            .await
+            .map_err(Error::from)?;
+        tx.commit().await?;
+        next
+    } else {
+        tx.rollback().await?;
+        current
+    };
+    if current.state == billing_refunds::CorrectionState::TerminationPending {
+        let provider_key = format!("sotto-refund:{request_id}:terminate");
+        billing
+            .provider
+            .terminate_personal_subscription(
+                &current.subscription_id,
+                &provider_key,
+                &current.beneficiary_id,
+            )
+            .await
+            .map_err(ProviderError::into_error)?;
+        let mut tx = state.pool.begin().await?;
+        let request = billing_refunds::record_provider_termination(&mut tx, &request_id)
+            .await
+            .map_err(Error::from)?;
+        tx.commit().await?;
+        return Ok(Json(personal_refund_view(request)));
+    }
+    if current.state != billing_refunds::CorrectionState::ProviderPending {
+        return Ok(Json(personal_refund_view(current)));
+    }
+    let provider_key = format!("sotto-refund:{request_id}");
+    let receipt = if let Some(provider_refund_id) = current.provider_refund_id.as_deref() {
+        billing
+            .provider
+            .get_refund(provider_refund_id)
+            .await
+            .map_err(ProviderError::into_error)?
+    } else {
+        billing
+            .provider
+            .create_refund(
+                &current.payment_reference,
+                current.amount_pence,
+                &provider_key,
+            )
+            .await
+            .map_err(ProviderError::into_error)?
+    };
+    let mut tx = state.pool.begin().await?;
+    let request = match receipt.status.as_str() {
+        "succeeded" => billing_refunds::record_provider_refund(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            true,
+            None,
+        )
+        .await
+        .map_err(Error::from)?,
+        "pending" | "requires_action" => {
+            billing_refunds::record_provider_pending(&mut tx, &request_id, &receipt.refund_id)
+                .await
+                .map_err(Error::from)?
+        }
+        status => billing_refunds::record_provider_refund(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            false,
+            Some(status),
+        )
+        .await
+        .map_err(Error::from)?,
+    };
+    tx.commit().await?;
+    if request.state == billing_refunds::CorrectionState::TerminationPending {
+        billing
+            .provider
+            .terminate_personal_subscription(
+                &request.subscription_id,
+                &format!("{provider_key}:terminate"),
+                &request.beneficiary_id,
+            )
+            .await
+            .map_err(ProviderError::into_error)?;
+        let mut tx = state.pool.begin().await?;
+        let request = billing_refunds::record_provider_termination(&mut tx, &request_id)
+            .await
+            .map_err(Error::from)?;
+        tx.commit().await?;
+        return Ok(Json(personal_refund_view(request)));
+    }
+    Ok(Json(personal_refund_view(request)))
 }
 
 async fn personal_portal(

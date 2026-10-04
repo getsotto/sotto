@@ -8,8 +8,8 @@ use uuid::Uuid;
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_transfers::{
     accept_transfer, begin_source_adjustment, begin_transfer, complete_source_adjustment,
-    mark_failed, record_destination_paid, record_destination_prepared, BeginTransfer,
-    TransferError, TransferPayer, TransferRequest, TransferState,
+    mark_failed, record_destination_paid, record_destination_prepared, withdraw_transfer,
+    BeginTransfer, TransferError, TransferPayer, TransferRequest, TransferState,
 };
 use sotto_server::db;
 
@@ -484,5 +484,47 @@ async fn sponsored_admin_and_beneficiary_can_authorise_leaving_a_sponsorship() {
         .await
         .expect("abort uncommitted provider step");
     tx.commit().await.expect("commit sponsored transfer");
+
+    let mut expired = request.clone();
+    expired.idempotency_key = "expired-invitation".into();
+    let mut tx = pool.begin().await.expect("begin expired invitation");
+    let expired_id = match begin_transfer(&mut tx, &expired, 1_800_000_000)
+        .await
+        .expect("create expired invitation")
+    {
+        BeginTransfer::Created(intent) => intent.transfer_id,
+        BeginTransfer::AlreadyExists(_) => panic!("expired invitation unexpectedly existed"),
+    };
+    tx.commit().await.expect("commit expired invitation");
+
+    let mut fresh = request;
+    fresh.idempotency_key = "fresh-invitation".into();
+    fresh.quote_expires_at_epoch = 1_800_002_000;
+    fresh.effective_from = 1_800_001_001;
+    let mut tx = pool.begin().await.expect("begin fresh invitation");
+    let fresh_id = match begin_transfer(&mut tx, &fresh, 1_800_001_001)
+        .await
+        .expect("expired invitation should release the slot")
+    {
+        BeginTransfer::Created(intent) => {
+            assert_eq!(intent.state, TransferState::AwaitingConsent);
+            intent.transfer_id
+        }
+        BeginTransfer::AlreadyExists(_) => panic!("fresh invitation unexpectedly existed"),
+    };
+    let expired_state: (String, String) = sqlx::query_as(
+        "SELECT state, result_code FROM billing_transfer_intents WHERE transfer_id = $1",
+    )
+    .bind(&expired_id)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("read expired invitation");
+    assert_eq!(expired_state, ("failed".into(), "consent_expired".into()));
+    let withdrawn = withdraw_transfer(&mut tx, &fresh_id, &admin)
+        .await
+        .expect("actor can withdraw invitation");
+    assert_eq!(withdrawn.state, TransferState::Failed);
+    assert_eq!(withdrawn.result_code.as_deref(), Some("consent_withdrawn"));
+    tx.commit().await.expect("commit withdrawn invitation");
     cleanup(&pool, &fixture).await;
 }
