@@ -92,6 +92,12 @@ async fn run() -> Result<()> {
     };
 
     println!("deployment mode: {}", config.deployment_mode.as_str());
+    println!(
+        "provider refresh: ingest={}, worker={}, reconciliation={}",
+        config.provider_refresh_ingest_enabled,
+        config.provider_refresh_worker_enabled,
+        config.provider_refresh_reconciliation_enabled
+    );
 
     // Default-on telemetry must never be a surprise: say so at boot, with the off switch.
     if config.telemetry.ping_enabled && !config.telemetry.ingest_enabled {

@@ -371,7 +371,7 @@ async fn accepted_invalidation_during_fetch_rejects_refresh_completion() {
 
     let mut invalidate = pool.begin().await.expect("begin invalidation");
     assert_eq!(
-        accept_provider_invalidation(&mut invalidate, &context, &event, &allocation)
+        accept_provider_invalidation(&mut invalidate, &context, &event, &allocation, true)
             .await
             .expect("accept invalidation"),
         InvalidationDisposition::Accepted { generation: 1 }

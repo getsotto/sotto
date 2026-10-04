@@ -1,5 +1,6 @@
 //! Server configuration, read from the environment.
 
+pub use crate::billing_catalogue::BillingPriceIds;
 use crate::error::{Error, Result};
 
 /// Identifies who operates this server. This is deployment metadata, not an entitlement.
@@ -57,6 +58,9 @@ const ORGANISATION_DELETION_RETENTION_ENV: &str = "SOTTO_ORGANISATION_DELETION_R
 const ORGANISATION_DELETION_WORKER_ENV: &str = "SOTTO_ORGANISATION_DELETION_WORKER_ENABLED";
 const ORGANISATION_DELETION_METRICS_TOKEN_ENV: &str = "SOTTO_ORGANISATION_DELETION_METRICS_TOKEN";
 const ORGANISATION_DELETION_OPERATOR_TOKEN_ENV: &str = "SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN";
+const PROVIDER_REFRESH_INGEST_ENV: &str = "SOTTO_PROVIDER_REFRESH_INGEST_ENABLED";
+const PROVIDER_REFRESH_WORKER_ENV: &str = "SOTTO_PROVIDER_REFRESH_WORKER_ENABLED";
+const PROVIDER_REFRESH_RECONCILIATION_ENV: &str = "SOTTO_PROVIDER_REFRESH_RECONCILIATION_ENABLED";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -80,6 +84,12 @@ pub struct Config {
     pub organisation_deletion_metrics_token: Option<String>,
     /// Bearer token for the protected operator-observation endpoint.
     pub organisation_deletion_operator_token: Option<String>,
+    /// Whether verified provider changes may enqueue durable refresh work.
+    pub provider_refresh_ingest_enabled: bool,
+    /// Whether a runtime worker may claim and process durable refresh work.
+    pub provider_refresh_worker_enabled: bool,
+    /// Whether the periodic registered-source repair scan is enabled.
+    pub provider_refresh_reconciliation_enabled: bool,
 }
 
 /// Anonymous version-ping telemetry settings (see [`crate::telemetry`]).
@@ -95,19 +105,22 @@ pub struct TelemetryConfig {
     pub ingest_enabled: bool,
 }
 
-/// Stripe billing credentials and the single subscription price.
+/// Stripe billing credentials, the legacy organisation price, and the optional hosted catalogue.
 ///
-/// All three come from the Stripe dashboard; the price id (not a number) lives here so pricing is
-/// an operational decision, never a code change. Billing endpoints return 503 when this is absent
-/// - the integration ships dark and is enabled by setting the environment variables.
+/// The ids come from the Stripe dashboard; amounts and recurrence are validated separately so
+/// pricing remains an operational decision without allowing arbitrary client-selected prices.
+/// Legacy billing endpoints return 503 when this configuration is absent.
 #[derive(Debug, Clone)]
 pub struct BillingConfig {
     /// Restricted API key (`rk_test_…` / `rk_live_…`).
     pub api_key: String,
     /// Webhook signing secret (`whsec_…`) for `POST /billing/webhook`.
     pub webhook_secret: String,
-    /// The Price id (`price_…`) of the flat per-org monthly Team subscription.
+    /// The legacy Price id (`price_…`) of the flat per-org monthly Team subscription.
     pub price_id: String,
+    /// The optional server-owned four-offer catalogue. Legacy organisation billing remains
+    /// available when these are absent; a partial catalogue is rejected at boot.
+    pub price_catalogue: Option<BillingPriceIds>,
     /// Where Stripe-hosted pages send the browser back to (the web app origin).
     pub return_url: String,
 }
@@ -148,9 +161,10 @@ impl Config {
     /// Load configuration from the environment.
     ///
     /// `DATABASE_URL` is required. OAuth is enabled only when both `GITHUB_CLIENT_ID` and
-    /// `GITHUB_CLIENT_SECRET` are set, and billing only when all three `STRIPE_*` variables are,
-    /// so the server still boots (health, migrations) without them. Empty values count as unset -
-    /// docker compose interpolation (`${VAR:-}`) exports empties for every blank `.env` line.
+    /// `GITHUB_CLIENT_SECRET` are set, and legacy billing only when all three legacy `STRIPE_*`
+    /// variables are present, so the server still boots (health, migrations) without them. Empty
+    /// values count as unset - docker compose interpolation (`${VAR:-}`) exports empties for every
+    /// blank `.env` line.
     pub fn from_env() -> Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| Error::Config("DATABASE_URL is not set".into()))?;
@@ -173,6 +187,8 @@ impl Config {
             _ => None,
         };
 
+        let billing_price_catalogue = billing_price_catalogue_from_env()?;
+        let hosted_catalogue_configured = billing_price_catalogue.is_some();
         let billing = match (
             env_nonempty("STRIPE_API_KEY"),
             env_nonempty("STRIPE_WEBHOOK_SECRET"),
@@ -182,10 +198,20 @@ impl Config {
                 api_key,
                 webhook_secret,
                 price_id,
+                price_catalogue: billing_price_catalogue,
                 return_url: billing_return_url(&public_base_url, web_origin.as_deref()),
             }),
             _ => None,
         };
+        if hosted_catalogue_configured && billing.is_none() {
+            // The hosted catalogue is dormant until the hosted billing route lands. Keep one
+            // complete Stripe configuration boundary for now so legacy billing cannot silently
+            // disappear while the new ids are present.
+            return Err(Error::Config(
+                "hosted Stripe price ids require STRIPE_API_KEY, STRIPE_WEBHOOK_SECRET, and STRIPE_PRICE_ID"
+                    .into(),
+            ));
+        }
 
         let telemetry = TelemetryConfig {
             ping_enabled: telemetry_ping_enabled(
@@ -204,6 +230,15 @@ impl Config {
             env_nonempty(ORGANISATION_DELETION_METRICS_TOKEN_ENV);
         let organisation_deletion_operator_token =
             env_nonempty(ORGANISATION_DELETION_OPERATOR_TOKEN_ENV);
+        let provider_refresh_ingest_enabled =
+            feature_flag_is_enabled(std::env::var(PROVIDER_REFRESH_INGEST_ENV).ok().as_deref());
+        let provider_refresh_worker_enabled =
+            feature_flag_is_enabled(std::env::var(PROVIDER_REFRESH_WORKER_ENV).ok().as_deref());
+        let provider_refresh_reconciliation_enabled = feature_flag_is_enabled(
+            std::env::var(PROVIDER_REFRESH_RECONCILIATION_ENV)
+                .ok()
+                .as_deref(),
+        );
 
         Ok(Self {
             database_url,
@@ -216,13 +251,59 @@ impl Config {
             organisation_deletion_worker_enabled,
             organisation_deletion_metrics_token,
             organisation_deletion_operator_token,
+            provider_refresh_ingest_enabled,
+            provider_refresh_worker_enabled,
+            provider_refresh_reconciliation_enabled,
         })
     }
+}
+
+const BILLING_CATALOGUE_ENV: [&str; 4] = [
+    "STRIPE_STANDARD_MONTHLY_PRICE_ID",
+    "STRIPE_STANDARD_ANNUAL_PRICE_ID",
+    "STRIPE_FOUNDING_MONTHLY_PRICE_ID",
+    "STRIPE_FOUNDING_ANNUAL_PRICE_ID",
+];
+
+fn billing_price_catalogue_from_env() -> Result<Option<BillingPriceIds>> {
+    let values = BILLING_CATALOGUE_ENV
+        .iter()
+        .map(|name| env_nonempty(name))
+        .collect::<Vec<_>>()
+        .try_into()
+        .expect("billing catalogue has four environment variables");
+    billing_price_catalogue_from_values(values)
+}
+
+fn billing_price_catalogue_from_values(
+    values: [Option<String>; 4],
+) -> Result<Option<BillingPriceIds>> {
+    if values.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if values.iter().any(Option::is_none) {
+        return Err(Error::Config(
+            "all four hosted Stripe price ids must be configured together".into(),
+        ));
+    }
+    let [standard_monthly, standard_annual, founding_monthly, founding_annual] = values;
+    Ok(Some(BillingPriceIds {
+        standard_monthly: standard_monthly.expect("checked above"),
+        standard_annual: standard_annual.expect("checked above"),
+        founding_monthly: founding_monthly.expect("checked above"),
+        founding_annual: founding_annual.expect("checked above"),
+    }))
 }
 
 /// Enable the destructive worker only for the exact opt-in value, so empty or unexpected values
 /// keep the staged lifecycle disabled until an operator has completed the enablement checklist.
 fn organisation_deletion_worker_is_enabled(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Provider refresh switches are deliberately exact and independently opt-in. Empty, malformed,
+/// or whitespace-padded values leave the corresponding path disabled during rollout.
+fn feature_flag_is_enabled(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
@@ -304,10 +385,10 @@ fn env_nonempty(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        billing_return_url, organisation_deletion_retention_from_env_result,
-        organisation_deletion_worker_is_enabled, parse_organisation_deletion_retention_days,
-        telemetry_ping_enabled, DeploymentMode, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
-        MAX_ORGANISATION_DELETION_RETENTION_DAYS,
+        billing_price_catalogue_from_values, billing_return_url, feature_flag_is_enabled,
+        organisation_deletion_retention_from_env_result, organisation_deletion_worker_is_enabled,
+        parse_organisation_deletion_retention_days, telemetry_ping_enabled, DeploymentMode,
+        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
     #[test]
@@ -350,6 +431,33 @@ mod tests {
         assert_eq!(
             billing_return_url("https://sotto.test", None),
             "https://sotto.test"
+        );
+    }
+
+    #[test]
+    fn billing_price_catalogue_requires_all_four_ids() {
+        assert_eq!(
+            billing_price_catalogue_from_values([None, None, None, None]).unwrap(),
+            None
+        );
+        assert!(billing_price_catalogue_from_values([
+            Some("price_month".into()),
+            None,
+            None,
+            None,
+        ])
+        .is_err());
+        assert_eq!(
+            billing_price_catalogue_from_values([
+                Some("price_month".into()),
+                Some("price_year".into()),
+                Some("price_founder_month".into()),
+                Some("price_founder_year".into()),
+            ])
+            .unwrap()
+            .unwrap()
+            .standard_monthly,
+            "price_month"
         );
     }
 
@@ -426,5 +534,14 @@ mod tests {
         assert!(!organisation_deletion_worker_is_enabled(Some("true")));
         assert!(!organisation_deletion_worker_is_enabled(Some(" 1 ")));
         assert!(organisation_deletion_worker_is_enabled(Some("1")));
+    }
+
+    #[test]
+    fn provider_refresh_switches_require_independent_exact_opt_in() {
+        assert!(!feature_flag_is_enabled(None));
+        assert!(!feature_flag_is_enabled(Some("")));
+        assert!(!feature_flag_is_enabled(Some("true")));
+        assert!(!feature_flag_is_enabled(Some(" 1 ")));
+        assert!(feature_flag_is_enabled(Some("1")));
     }
 }

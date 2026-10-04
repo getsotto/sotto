@@ -23,21 +23,46 @@ pub mod account;
 pub mod audit;
 pub mod auth;
 pub mod billing;
+pub mod billing_catalogue;
+pub mod billing_operations;
 pub mod cloud_coverage;
 pub mod cloud_coverage_reconciliation;
 pub mod cloud_coverage_store;
 pub mod cloud_provider;
 pub mod cloud_provider_refresh;
+#[doc(hidden)]
+pub mod cloud_provider_refresh_inputs;
+#[doc(hidden)]
+pub mod cloud_provider_refresh_jobs;
+#[doc(hidden)]
+pub mod cloud_provider_refresh_worker;
 pub mod cloud_provider_stripe;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_authority;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_corrections;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_coverage;
+pub mod founding_allocator;
 // Dormant Stripe history transport; it remains unwired until the complete-history contract lands.
+#[doc(hidden)]
+pub mod cloud_provider_stripe_adapter;
 #[doc(hidden)]
 pub mod cloud_provider_stripe_http;
 #[doc(hidden)]
+pub mod cloud_provider_stripe_renewal_store;
+#[doc(hidden)]
 pub mod cloud_provider_stripe_renewals;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_repair;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_sponsored;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_sponsored_adapter;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_sponsored_refresh;
+#[doc(hidden)]
+pub mod cloud_provider_stripe_sponsored_store;
 pub mod community;
 pub mod config;
 pub mod db;
@@ -47,6 +72,7 @@ pub mod error;
 pub mod health;
 pub mod machine;
 pub mod org;
+pub mod personal_billing;
 // The lifecycle seam, HTTP adapter, and worker remain doc-hidden: deletion is enabled per
 // deployment rather than presented as a stable public API surface, and the internal seam is not
 // something an embedder should call directly.

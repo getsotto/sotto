@@ -79,6 +79,11 @@ pub struct StripeRetainedPaidTerm {
 }
 
 impl StripeRetainedPaidTerm {
+    #[cfg(test)]
+    pub(crate) fn for_test(observation: StripePersonalInvoiceObservation) -> Self {
+        Self { observation }
+    }
+
     pub fn invoice_id(&self) -> &str {
         self.observation.invoice_id()
     }

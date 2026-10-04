@@ -10,6 +10,7 @@ type Phase =
   | { kind: "checking" }
   | { kind: "error"; message: string }
   | { kind: "loggedOut" }
+  | { kind: "setupRequired"; checking: boolean; error: string | null }
   | { kind: "locked"; salt: Uint8Array; encPrivateKeys: Uint8Array }
   | { kind: "unlocked"; master: Uint8Array; encPrivateKeys: Uint8Array };
 
@@ -26,10 +27,7 @@ export function VaultApp() {
         }
         const account = await fetchAccount();
         if (account === null) {
-          setPhase({
-            kind: "error",
-            message: "No account found - set up Sotto with the CLI first.",
-          });
+          setPhase({ kind: "setupRequired", checking: false, error: null });
           return;
         }
         setPhase({ kind: "locked", salt: account.salt, encPrivateKeys: account.encPrivateKeys });
@@ -38,6 +36,26 @@ export function VaultApp() {
       }
     })();
   }, []);
+
+  function checkSetupAgain() {
+    setPhase({ kind: "setupRequired", checking: true, error: null });
+    void (async () => {
+      try {
+        const account = await fetchAccount();
+        if (account === null) {
+          setPhase({ kind: "setupRequired", checking: false, error: "Account setup is not published yet." });
+          return;
+        }
+        setPhase({ kind: "locked", salt: account.salt, encPrivateKeys: account.encPrivateKeys });
+      } catch (e) {
+        setPhase({
+          kind: "setupRequired",
+          checking: false,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    })();
+  }
 
   function doLogout() {
     void (async () => {
@@ -65,6 +83,22 @@ export function VaultApp() {
           <button className="primary" type="button" onClick={() => window.location.reload()}>
             Reload
           </button>
+        </Shell>
+      );
+    case "setupRequired":
+      return (
+        <Shell onLogout={doLogout}>
+          <h1>Finish setting up Sotto</h1>
+          <p className="muted">
+            Your GitHub session is active, but this account has not published its encrypted account bundle yet.
+          </p>
+          <p>On the device where you keep your Emergency Kit, run:</p>
+          <pre><code>sotto init{"\n"}sotto login{"\n"}sotto push</code></pre>
+          <p className="muted">If you already initialized Sotto, do not create another identity; log in and push the existing account.</p>
+          <button className="primary" type="button" onClick={checkSetupAgain} disabled={phase.checking}>
+            {phase.checking ? "Checking…" : "Check setup again"}
+          </button>
+          {phase.error !== null && <p role="alert">{phase.error}</p>}
         </Shell>
       );
     case "loggedOut":

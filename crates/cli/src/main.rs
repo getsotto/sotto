@@ -172,6 +172,9 @@ enum Command {
         stdin: bool,
     },
     /// Print a secret's value. Refuses to print to a terminal without --reveal.
+    #[command(
+        after_help = "Interactive selection:\n  Omitting NAME opens a picker when stdin, stdout, and stderr are terminals, TERM is not dumb, and CI is not active. Scripts must supply NAME. A picker selection is copied to the clipboard automatically unless --no-copy is used. --no-copy does not allow plaintext terminal output; use --reveal to print it. Supplying NAME alone does not copy.\n\nExamples:\n  sotto get\n  sotto get DATABASE_URL --copy\n  sotto get DATABASE_URL --reveal"
+    )]
     Get {
         name: Option<String>,
         /// Allow printing the secret to a terminal.
@@ -323,7 +326,11 @@ enum TokenCommand {
         expires_in_days: Option<u32>,
     },
     /// List the active environment's machine tokens.
-    Ls,
+    Ls {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Revoke a machine token (its access dies immediately; also run `sotto rotate` to re-key).
     Revoke { token_id: String },
 }
@@ -991,8 +998,13 @@ fn token_command(
             println!("{}", issued.token);
             Ok(())
         }
-        TokenCommand::Ls => {
-            for t in remote::SyncApi::list_machine_tokens(&client, &env.id)? {
+        TokenCommand::Ls { json } => {
+            let tokens = remote::SyncApi::list_machine_tokens(&client, &env.id)?;
+            if json {
+                println!("{}", machine_token_list_json(&tokens)?);
+                return Ok(());
+            }
+            for t in tokens {
                 let expiry = t
                     .expiry_label()
                     .map(|label| format!("  {label}"))
@@ -1655,6 +1667,21 @@ fn env_list_json(environments: &[String], active: &str) -> Result<String> {
     to_json(&value)
 }
 
+/// Stable machine-readable shape for token list JSON output.
+fn machine_token_list_json(tokens: &[remote::api::MachineTokenInfo]) -> Result<String> {
+    let value: Vec<_> = tokens
+        .iter()
+        .map(|token| {
+            serde_json::json!({
+                "token_id": token.token_id,
+                "name": token.name,
+                "created_by": token.created_by,
+            })
+        })
+        .collect();
+    to_json(&value)
+}
+
 fn ensure_unlocked(store: &Store, keychain: &dyn Keychain) -> Result<()> {
     if store.get_identity()?.is_none() {
         return Err(Error::NoIdentity);
@@ -1919,14 +1946,16 @@ mod tests {
     use sotto_cli::commands::App;
     use sotto_cli::config::Config;
     use sotto_cli::keychain::MemoryKeychain;
+    use sotto_cli::remote::api::MachineTokenInfo;
     use sotto_cli::session;
     use sotto_cli::store::Store;
     use sotto_cli::vault::Vault;
     use std::time::Duration;
 
     use super::{
-        display_secret, env_list_json, history_line, import_dotenv, login_config, set_confirmation,
-        Cli, Command, EnvCommand, ThemeCommand, TokenCommand,
+        display_secret, env_list_json, history_line, import_dotenv, login_config,
+        machine_token_list_json, set_confirmation, Cli, Command, EnvCommand, ThemeCommand,
+        TokenCommand,
     };
 
     #[test]
@@ -2205,6 +2234,29 @@ mod tests {
     }
 
     #[test]
+    fn get_help_explains_interactive_selection_and_copying() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let get = command
+            .find_subcommand_mut("get")
+            .expect("get subcommand should exist");
+        let help = get.render_long_help().to_string();
+
+        for expected in [
+            "Omitting NAME opens a picker",
+            "Scripts must supply NAME",
+            "copied to the clipboard automatically unless --no-copy is used",
+            "--no-copy does not allow plaintext terminal output",
+            "Supplying NAME alone does not copy",
+            "sotto get DATABASE_URL --copy",
+            "sotto get DATABASE_URL --reveal",
+        ] {
+            assert!(help.contains(expected), "missing get help text: {expected}");
+        }
+    }
+
+    #[test]
     fn copy_flags_parse_for_get_and_share() {
         let cli = Cli::try_parse_from(["sotto", "get", "KEY", "-c"]).unwrap();
         assert!(matches!(
@@ -2419,6 +2471,47 @@ mod tests {
             panic!("expected EnvCommand::Ls");
         };
         assert!(!json);
+    }
+
+    #[test]
+    fn token_ls_json_parser_parses_flag() {
+        let cli = Cli::try_parse_from(["sotto", "token", "ls", "--json"])
+            .expect("sotto token ls --json should parse");
+        let Some(Command::Token {
+            command: TokenCommand::Ls { json },
+        }) = cli.command
+        else {
+            panic!("expected TokenCommand::Ls");
+        };
+        assert!(json);
+    }
+
+    #[test]
+    fn token_ls_json_preserves_metadata_and_null_creator() {
+        let tokens = vec![
+            MachineTokenInfo {
+                token_id: "token-1".into(),
+                name: "nightly \"build\" 🚀".into(),
+                public_key: "unused".into(),
+                created_by: Some("user-1".into()),
+                expires_at: None,
+                expires_in_days: None,
+            },
+            MachineTokenInfo {
+                token_id: "token-2".into(),
+                name: "backup".into(),
+                public_key: "unused".into(),
+                created_by: None,
+                expires_at: None,
+                expires_in_days: None,
+            },
+        ];
+        let value: serde_json::Value =
+            serde_json::from_str(&machine_token_list_json(&tokens).unwrap()).unwrap();
+        assert_eq!(value[0]["name"], "nightly \"build\" 🚀");
+        assert_eq!(value[0]["created_by"], "user-1");
+        assert!(value[1]["created_by"].is_null());
+        assert_eq!(machine_token_list_json(&[]).unwrap(), "[]");
     }
 
     #[test]
