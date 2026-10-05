@@ -59,17 +59,12 @@ struct CreateShare {
     idempotency_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum TtlRequest {
+    #[default]
     Omitted,
     ExplicitNoExpiry,
     Value(i64),
-}
-
-impl Default for TtlRequest {
-    fn default() -> Self {
-        Self::Omitted
-    }
 }
 
 impl<'de> Deserialize<'de> for TtlRequest {
