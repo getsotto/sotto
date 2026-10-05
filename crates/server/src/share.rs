@@ -274,8 +274,7 @@ impl TtlRequest {
 
 fn validate_idempotency_key(key: Option<&str>) -> Result<Option<String>> {
     let Some(key) = key else { return Ok(None) };
-    let key = key.trim();
-    if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY {
+    if key.trim().is_empty() || key.len() > MAX_IDEMPOTENCY_KEY {
         return Err(Error::BadRequest(format!(
             "idempotency_key must be between 1 and {MAX_IDEMPOTENCY_KEY} characters"
         )));
@@ -509,6 +508,15 @@ mod tests {
             normalize_options(ShareClass::Paid, None, TtlRequest::Value(3600)).unwrap(),
             (1, Some(3600))
         );
+    }
+
+    #[test]
+    fn idempotency_keys_are_opaque_but_not_blank() {
+        assert_eq!(
+            super::validate_idempotency_key(Some(" key ")).unwrap(),
+            Some(" key ".to_string())
+        );
+        assert!(super::validate_idempotency_key(Some(" \t ")).is_err());
     }
 
     #[test]
