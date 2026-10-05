@@ -8,7 +8,9 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use sqlx::postgres::PgConnectOptions;
 use sqlx::PgPool;
+use std::str::FromStr;
 use tower::ServiceExt;
 
 use sotto_server::auth::session;
@@ -17,7 +19,17 @@ use sotto_server::db;
 use sotto_server::state::AppState;
 
 async fn pool_or_skip() -> Option<PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
+    if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping share tests: set SOTTO_RUN_DB_TESTS=1");
+        return None;
+    }
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL for opted-in database tests");
+    let options = PgConnectOptions::from_str(&url).expect("parse DATABASE_URL");
+    assert!(
+        matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+        "refusing share tests against non-local host: {}",
+        options.get_host()
+    );
     let pool = db::connect(&url).await.expect("connect");
     db::migrate(&pool).await.expect("migrate");
     Some(pool)
