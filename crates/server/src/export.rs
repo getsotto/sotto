@@ -126,7 +126,11 @@ async fn start_export(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<(StatusCode, Json<ExportManifestView>)> {
-    let account: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+    sqlx::query("DELETE FROM export_sessions WHERE expires_at <= now()")
+        .execute(&state.pool)
+        .await?;
+    type AccountRow = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+    let account: Option<AccountRow> = sqlx::query_as(
         "SELECT public_key, enc_private_keys, kdf_params, recovery_blob \
          FROM users WHERE id = $1 AND public_key IS NOT NULL",
     )
@@ -261,7 +265,7 @@ async fn export_chunk(
         row.ok_or_else(|| Error::NotFound("export is missing or expired".into()))?;
     let document: ExportManifest = serde_json::from_slice(&manifest)
         .map_err(|_| Error::Internal("stored export manifest is corrupt".into()))?;
-    if index >= 1 + document.environments.len() {
+    if index > document.environments.len() {
         return Err(Error::BadRequest("export chunk is out of range".into()));
     }
     let hash_text = encoding::encode(&hash);
