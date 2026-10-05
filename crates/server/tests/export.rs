@@ -68,8 +68,11 @@ async fn json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("json response")
 }
 
-async fn seed(pool: &PgPool) -> (&'static str, String) {
-    let user_id = "test-export-user";
+async fn seed(pool: &PgPool, user_id: &'static str) -> String {
+    let project_id = format!("{user_id}-project");
+    let environment_id = format!("{user_id}-environment");
+    let secret_id = format!("{user_id}-secret");
+    let history_id = format!("{user_id}-history");
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user_id)
         .execute(pool)
@@ -89,7 +92,8 @@ async fn seed(pool: &PgPool) -> (&'static str, String) {
     .execute(pool)
     .await
     .expect("insert user");
-    sqlx::query("INSERT INTO projects (id, owner_id, enc_name) VALUES ('export-project', $1, $2)")
+    sqlx::query("INSERT INTO projects (id, owner_id, enc_name) VALUES ($1, $2, $3)")
+        .bind(&project_id)
         .bind(user_id)
         .bind(b"project-name".as_slice())
         .execute(pool)
@@ -97,16 +101,19 @@ async fn seed(pool: &PgPool) -> (&'static str, String) {
         .expect("insert project");
     sqlx::query(
         "INSERT INTO environments (id, project_id, enc_name, revision)
-         VALUES ('export-environment', 'export-project', $1, 7)",
+         VALUES ($1, $2, $3, 7)",
     )
+    .bind(&environment_id)
+    .bind(&project_id)
     .bind(b"environment-name".as_slice())
     .execute(pool)
     .await
     .expect("insert environment");
     sqlx::query(
         "INSERT INTO environment_grants (env_id, user_id, enc_vault_key, granted_by)
-         VALUES ('export-environment', $1, $2, $1)",
+         VALUES ($1, $2, $3, $2)",
     )
+    .bind(&environment_id)
     .bind(user_id)
     .bind(b"vault-grant".as_slice())
     .execute(pool)
@@ -114,8 +121,10 @@ async fn seed(pool: &PgPool) -> (&'static str, String) {
     .expect("insert grant");
     sqlx::query(
         "INSERT INTO secrets (id, env_id, enc_name, enc_value, enc_data_key, version)
-         VALUES ('export-secret', 'export-environment', $1, $2, $3, 2)",
+         VALUES ($1, $2, $3, $4, $5, 2)",
     )
+    .bind(&secret_id)
+    .bind(&environment_id)
     .bind(b"secret-name".as_slice())
     .bind(b"secret-value".as_slice())
     .bind(b"secret-key".as_slice())
@@ -125,8 +134,10 @@ async fn seed(pool: &PgPool) -> (&'static str, String) {
     sqlx::query(
         "INSERT INTO secret_versions
             (id, secret_id, version, enc_name, enc_value, enc_data_key)
-         VALUES ('export-history', 'export-secret', 1, $1, $2, $3)",
+         VALUES ($1, $2, 1, $3, $4, $5)",
     )
+    .bind(&history_id)
+    .bind(&secret_id)
     .bind(b"old-name".as_slice())
     .bind(b"old-value".as_slice())
     .bind(b"old-key".as_slice())
@@ -134,7 +145,7 @@ async fn seed(pool: &PgPool) -> (&'static str, String) {
     .await
     .expect("insert history");
     let token = session::issue(pool, user_id).await.expect("issue session");
-    (user_id, token)
+    token
 }
 
 async fn cleanup(pool: &PgPool, user_id: &str) {
@@ -150,7 +161,8 @@ async fn export_manifest_and_chunks_preserve_opaque_history() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let (user_id, token) = seed(&pool).await;
+    let user_id = "test-export-manifest-user";
+    let token = seed(&pool, user_id).await;
 
     let response = app(pool.clone())
         .oneshot(request("POST", "/account/export", &token))
@@ -191,7 +203,7 @@ async fn export_manifest_and_chunks_preserve_opaque_history() {
     assert_eq!(environment["environment"]["revision"], 7);
     assert_eq!(
         environment["environment"]["secrets"][0]["id"],
-        "export-secret"
+        format!("{user_id}-secret")
     );
     assert_eq!(environment["environment"]["history"][0]["version"], 1);
     assert_eq!(
@@ -207,14 +219,16 @@ async fn export_rejects_revision_drift_after_manifest_creation() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
-    let (user_id, token) = seed(&pool).await;
+    let user_id = "test-export-drift-user";
+    let token = seed(&pool, user_id).await;
     let response = app(pool.clone())
         .oneshot(request("POST", "/account/export", &token))
         .await
         .expect("start export");
     let manifest = json(response).await;
     let export_id = manifest["export_id"].as_str().expect("export id");
-    sqlx::query("UPDATE environments SET revision = 8 WHERE id = 'export-environment'")
+    sqlx::query("UPDATE environments SET revision = 8 WHERE id = $1")
+        .bind(format!("{user_id}-environment"))
         .execute(&pool)
         .await
         .expect("advance revision");
