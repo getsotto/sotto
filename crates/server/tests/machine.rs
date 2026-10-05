@@ -290,6 +290,21 @@ async fn hosted_machine_policy_rejects_an_ineligible_beneficiary() {
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
     assert!(body.contains("machine access requires an eligible Cloud account"));
 
+    let (status, body) = request_with_router(
+        app_with_policy(
+            pool.clone(),
+            sotto_server::config::DeploymentMode::Cloud,
+            true,
+        ),
+        "POST",
+        &format!("/environments/{e}/tokens"),
+        &owner,
+        Some(token_body("blocked", b"machine-grant")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+    assert!(body.contains("machine access requires an eligible Cloud account"));
+
     let (status, _) = get(&pool, &api_token, "/machine/grant").await;
     assert_eq!(
         status,

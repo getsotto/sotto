@@ -222,5 +222,31 @@ async fn migration_0045_backfills_verified_beneficiaries_and_marks_orphans_ambig
             ("beneficiary-orphan".into(), None, "ambiguous".into()),
         ]
     );
+
+    // A deleted beneficiary is deliberately no longer presented as verified. Use a separate
+    // user so deleting the beneficiary cannot cascade through the environment fixture.
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ('beneficiary-deleted', 'github', 'beneficiary-deleted')",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("insert beneficiary");
+    sqlx::query(
+        "UPDATE machine_tokens SET beneficiary_id = 'beneficiary-deleted' WHERE id = 'beneficiary-known'",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("assign beneficiary");
+    sqlx::query("DELETE FROM users WHERE id = 'beneficiary-deleted'")
+        .execute(&database.pool)
+        .await
+        .expect("delete beneficiary");
+    let after_delete: (Option<String>, String) = sqlx::query_as(
+        "SELECT beneficiary_id, beneficiary_status FROM machine_tokens WHERE id = 'beneficiary-known'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .expect("read deleted beneficiary");
+    assert_eq!(after_delete, (None, "ambiguous".into()));
     database.cleanup().await;
 }

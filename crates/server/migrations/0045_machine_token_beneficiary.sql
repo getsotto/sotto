@@ -31,3 +31,23 @@ WHERE created_by IS NOT NULL
   AND beneficiary_id IS NULL;
 
 CREATE INDEX IF NOT EXISTS machine_tokens_beneficiary_idx ON machine_tokens (beneficiary_id);
+
+-- The foreign key clears beneficiary_id when its user is deleted. Keep the status honest so an
+-- operator never sees a token as verified after its accountable person has disappeared.
+CREATE OR REPLACE FUNCTION mark_machine_token_beneficiary_ambiguous()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF OLD.beneficiary_id IS NOT NULL AND NEW.beneficiary_id IS NULL THEN
+        NEW.beneficiary_status := 'ambiguous';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS machine_tokens_beneficiary_status_on_clear ON machine_tokens;
+CREATE TRIGGER machine_tokens_beneficiary_status_on_clear
+BEFORE UPDATE OF beneficiary_id ON machine_tokens
+FOR EACH ROW
+EXECUTE FUNCTION mark_machine_token_beneficiary_ambiguous();

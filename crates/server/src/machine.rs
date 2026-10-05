@@ -152,6 +152,8 @@ async fn create_token(
     Path(env_id): Path<String>,
     Json(body): Json<CreateToken>,
 ) -> Result<(StatusCode, Json<CreatedToken>)> {
+    let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
+    access.require_manage_structure("must be an admin or owner to create a machine token")?;
     enforce_creator_eligibility(&state, &user.user_id).await?;
     if body.name.is_empty() || body.name.len() > MAX_NAME {
         return Err(Error::BadRequest(format!(
@@ -172,8 +174,6 @@ async fn create_token(
         )));
     }
 
-    let (_project_id, access) = env_access(&state, &env_id, &user.user_id).await?;
-    access.require_manage_structure("must be an admin or owner to create a machine token")?;
     let audit_org = access.org_id().map(str::to_string);
 
     let token_id = uuid::Uuid::new_v4().to_string();
