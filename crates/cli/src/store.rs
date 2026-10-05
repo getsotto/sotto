@@ -591,6 +591,32 @@ impl Store {
         Ok(())
     }
 
+    /// Add one server-retained history version without changing the environment's current row.
+    pub fn put_remote_history(
+        &self,
+        secret_id: &str,
+        version: i64,
+        enc_name: &[u8],
+        enc_value: &[u8],
+        enc_data_key: &[u8],
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO secret_versions
+                (id, secret_id, version, enc_name, enc_value, enc_data_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                new_id(),
+                secret_id,
+                version,
+                enc_name,
+                enc_value,
+                enc_data_key,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
     /// The last server revision this environment was reconciled with (0 if never synced).
     pub fn synced_revision(&self, env_id: &str) -> Result<i64> {
         self.conn

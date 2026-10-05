@@ -15,8 +15,9 @@ use crate::error::{Error, Result};
 
 use super::api::{
     AccountBundle, BatchRequest, BatchResponse, CreatedMachineToken, CreatedShare, EnvironmentInfo,
-    GrantView, Invited, MachineTokenInfo, Me, MemberInfo, NewEnvironment, NewOrg, NewProject,
-    NewShare, OrgInfo, RemovalReceipt, RotateRequest, RotateResponse, Snapshot, SyncApi,
+    ExportChunk, ExportManifest, GrantView, Invited, MachineTokenInfo, Me, MemberInfo,
+    NewEnvironment, NewOrg, NewProject, NewShare, OrgInfo, RemovalReceipt, RotateRequest,
+    RotateResponse, Snapshot, SyncApi,
 };
 
 /// Row shapes for the two "list of ids" endpoints (each returns `[{ "user_id"|"env_id": ... }]`).
@@ -136,6 +137,26 @@ impl SyncApi for HttpClient {
             return Ok(None);
         }
         parse(resp).map(Some)
+    }
+
+    fn start_export(&self) -> Result<ExportManifest> {
+        let resp = self
+            .http
+            .post(self.url("/account/export"))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
+    fn export_chunk(&self, export_id: &str, index: usize) -> Result<ExportChunk> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/account/export/{export_id}/chunks/{index}")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
     }
 
     fn create_project(&self, project: &NewProject) -> Result<()> {
