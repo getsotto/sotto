@@ -106,8 +106,17 @@ struct ExportEnvironment {
     enc_name: String,
     enc_vault_key: String,
     revision: i64,
+    content_hash: String,
     secrets: Vec<ExportSecret>,
     history: Vec<ExportHistory>,
+}
+
+fn environment_content_hash(environment: &ExportEnvironment) -> Result<String> {
+    let mut payload = environment.clone();
+    payload.content_hash.clear();
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|e| Error::Internal(format!("serialising export chunk: {e}")))?;
+    Ok(encoding::encode(&Sha256::digest(bytes)))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,6 +149,41 @@ async fn start_export(
     let (public_key, enc_private_keys, kdf_params, recovery_blob) =
         account.ok_or_else(|| Error::NotFound("account is not initialised".into()))?;
 
+    let project_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM projects p \
+         WHERE (p.org_id IS NULL AND p.owner_id = $1) \
+            OR (p.org_id IS NOT NULL AND EXISTS ( \
+                   SELECT 1 FROM organization_memberships m \
+                   JOIN organizations o ON o.id = m.org_id \
+                   WHERE m.org_id = p.org_id AND m.user_id = $1 \
+                     AND o.lifecycle_state <> 'deleted'))",
+    )
+    .bind(&user.user_id)
+    .fetch_one(&state.pool)
+    .await?;
+    if project_count > MAX_PROJECTS as i64 {
+        return Err(Error::Conflict(
+            "export exceeds the project bound; narrow the scope".into(),
+        ));
+    }
+    let environment_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM environments e JOIN projects p ON p.id = e.project_id \
+         WHERE (p.org_id IS NULL AND p.owner_id = $1) \
+            OR (p.org_id IS NOT NULL AND EXISTS ( \
+                   SELECT 1 FROM organization_memberships m \
+                   JOIN organizations o ON o.id = m.org_id \
+                   WHERE m.org_id = p.org_id AND m.user_id = $1 \
+                     AND o.lifecycle_state <> 'deleted'))",
+    )
+    .bind(&user.user_id)
+    .fetch_one(&state.pool)
+    .await?;
+    if environment_count > MAX_ENVIRONMENTS as i64 {
+        return Err(Error::Conflict(
+            "export exceeds the environment bound; narrow the scope".into(),
+        ));
+    }
+
     type ResourceRow = (
         String,
         Vec<u8>,
@@ -160,22 +204,23 @@ async fn start_export(
                    JOIN organizations o ON o.id = m.org_id \
                    WHERE m.org_id = p.org_id AND m.user_id = $1 \
                      AND o.lifecycle_state <> 'deleted')) \
-         ORDER BY p.id, e.id",
+         ORDER BY p.id, e.id LIMIT $2",
     )
     .bind(&user.user_id)
+    .bind((MAX_PROJECTS + MAX_ENVIRONMENTS + 1) as i64)
     .fetch_all(&state.pool)
     .await?;
+    if rows.len() > MAX_PROJECTS + MAX_ENVIRONMENTS {
+        return Err(Error::Conflict(
+            "export exceeds the project or environment bound; narrow the scope".into(),
+        ));
+    }
 
     let mut projects = Vec::new();
     let mut environments = Vec::new();
     let mut omitted_environment_count = 0;
     for (project_id, enc_name, org_id, env_id, env_name, grant, revision) in rows {
         if projects.last().map(|p: &ExportProject| p.id.as_str()) != Some(project_id.as_str()) {
-            if projects.len() == MAX_PROJECTS {
-                return Err(Error::Conflict(
-                    "export exceeds the project bound; narrow the scope".into(),
-                ));
-            }
             projects.push(ExportProject {
                 id: project_id.clone(),
                 enc_name: encoding::encode(&enc_name),
@@ -187,11 +232,6 @@ async fn start_export(
             omitted_environment_count += 1;
             continue;
         };
-        if environments.len() == MAX_ENVIRONMENTS {
-            return Err(Error::Conflict(
-                "export exceeds the environment bound; narrow the scope".into(),
-            ));
-        }
         environments.push(ExportEnvironmentRef {
             id: env_id,
             project_id,
@@ -293,7 +333,7 @@ async fn export_chunk(
     let current: Option<(i64, Vec<u8>)> = sqlx::query_as(
         "SELECT e.revision, eg.enc_vault_key FROM environments e \
          JOIN environment_grants eg ON eg.env_id = e.id AND eg.user_id = $2 \
-         WHERE e.id = $1",
+         WHERE e.id = $1 FOR UPDATE",
     )
     .bind(&expected.id)
     .bind(&user.user_id)
@@ -306,6 +346,15 @@ async fn export_chunk(
             "export changed while it was being read; restart the export".into(),
         ));
     }
+    let secret_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM secrets WHERE env_id = $1")
+        .bind(&expected.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if secret_count > MAX_SECRETS_PER_ENVIRONMENT as i64 {
+        return Err(Error::Conflict(
+            "export environment exceeds the secret bound; export in smaller scopes".into(),
+        ));
+    }
     type SecretRow = (String, Vec<u8>, Vec<u8>, Vec<u8>, i64, bool);
     let secrets: Vec<SecretRow> = sqlx::query_as(
         "SELECT id, enc_name, enc_value, enc_data_key, version, (deleted_at IS NOT NULL) \
@@ -314,9 +363,16 @@ async fn export_chunk(
     .bind(&expected.id)
     .fetch_all(&mut *tx)
     .await?;
-    if secrets.len() > MAX_SECRETS_PER_ENVIRONMENT {
+    let history_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM secret_versions sv \
+         JOIN secrets s ON sv.secret_id = s.id WHERE s.env_id = $1",
+    )
+    .bind(&expected.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if history_count > MAX_HISTORY_PER_ENVIRONMENT as i64 {
         return Err(Error::Conflict(
-            "export environment exceeds the secret bound; export in smaller scopes".into(),
+            "export history exceeds the row bound; export in smaller scopes".into(),
         ));
     }
     type HistoryRow = (String, i64, Vec<u8>, Vec<u8>, Vec<u8>);
@@ -328,19 +384,15 @@ async fn export_chunk(
     .bind(&expected.id)
     .fetch_all(&mut *tx)
     .await?;
-    if history.len() > MAX_HISTORY_PER_ENVIRONMENT {
-        return Err(Error::Conflict(
-            "export history exceeds the row bound; export in smaller scopes".into(),
-        ));
-    }
     tx.commit().await?;
 
-    let environment = ExportEnvironment {
+    let mut environment = ExportEnvironment {
         id: expected.id.clone(),
         project_id: expected.project_id.clone(),
         enc_name: expected.enc_name.clone(),
         enc_vault_key: encoding::encode(&grant),
         revision,
+        content_hash: String::new(),
         secrets: secrets
             .into_iter()
             .map(
@@ -367,6 +419,7 @@ async fn export_chunk(
             )
             .collect(),
     };
+    environment.content_hash = environment_content_hash(&environment)?;
     Ok(Json(ExportChunk {
         version: document.version,
         export_id,

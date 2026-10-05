@@ -234,6 +234,26 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Run a group of local restore writes atomically.
+    pub fn transaction<T>(
+        &self,
+        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let value = operation(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    /// Remove the identity and account keys after a failed restore rollback.
+    pub fn clear_identity(&self) -> Result<()> {
+        self.transaction(|tx| {
+            tx.execute("DELETE FROM identity WHERE id = 1", [])?;
+            tx.execute("DELETE FROM account_keys WHERE id = 1", [])?;
+            Ok(())
+        })
+    }
+
     // --- projects ---
 
     pub fn create_project(&self, name: &str) -> Result<Project> {
@@ -588,32 +608,6 @@ impl Store {
             ],
         )?;
         tx.commit()?;
-        Ok(())
-    }
-
-    /// Add one server-retained history version without changing the environment's current row.
-    pub fn put_remote_history(
-        &self,
-        secret_id: &str,
-        version: i64,
-        enc_name: &[u8],
-        enc_value: &[u8],
-        enc_data_key: &[u8],
-    ) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR IGNORE INTO secret_versions
-                (id, secret_id, version, enc_name, enc_value, enc_data_key, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                new_id(),
-                secret_id,
-                version,
-                enc_name,
-                enc_value,
-                enc_data_key,
-                now_ms()
-            ],
-        )?;
         Ok(())
     }
 

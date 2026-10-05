@@ -6,8 +6,9 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -87,6 +88,11 @@ pub fn download(api: &dyn SyncApi) -> Result<ExportBundle> {
                     "export chunk does not match its manifest environment".into(),
                 ));
             }
+            if environment_content_hash(&environment)? != environment.content_hash {
+                return Err(Error::Server(
+                    "export chunk content hash does not match its contents".into(),
+                ));
+            }
             environments.insert(environment.id.clone(), environment);
         } else {
             return Err(Error::Server("export chunk omitted its environment".into()));
@@ -149,7 +155,31 @@ fn bundle_hash(bundle: &ExportBundle) -> Result<String> {
     Ok(super::api::b64encode(&Sha256::digest(encoded)))
 }
 
+fn environment_content_hash(environment: &super::api::ExportEnvironment) -> Result<String> {
+    let mut payload = environment.clone();
+    payload.content_hash.clear();
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|e| Error::Server(format!("serialising export chunk: {e}")))?;
+    Ok(super::api::b64encode(&Sha256::digest(bytes)))
+}
+
 fn verify_bundle_hash(bundle: &ExportBundle, input: bool) -> Result<()> {
+    for environment in &bundle.environments {
+        let computed = environment_content_hash(environment).map_err(|error| {
+            if input {
+                Error::Input(error.to_string())
+            } else {
+                error
+            }
+        })?;
+        if computed != environment.content_hash {
+            return Err(if input {
+                Error::Input("export chunk content hash does not match its contents".into())
+            } else {
+                Error::Server("export chunk content hash does not match its contents".into())
+            });
+        }
+    }
     let computed = bundle_hash(bundle).map_err(|error| {
         if input {
             Error::Input(error.to_string())
@@ -264,26 +294,70 @@ pub fn restore(
         ttl,
     )?;
 
-    for project in &bundle.projects {
-        if store.get_project(&project.id)?.is_none() {
-            store.create_project_with_id(&project.id, &project.id)?;
-        }
-    }
-    for (environment, secrets, history) in decoded {
-        if store.find_environment(&environment.id)?.is_none() {
-            store.create_environment(
-                &environment.id,
-                &environment.project_id,
-                &environment.id,
-                &super::api::b64decode(&environment.enc_vault_key)?,
+    let restore_result = store.transaction(|tx| {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        for project in &bundle.projects {
+            tx.execute(
+                "INSERT INTO projects (id, name, created_at) VALUES (?1, ?2, ?3)",
+                params![project.id, project.id, timestamp],
             )?;
         }
-        for secret in &secrets {
-            store.put_remote_secret(&environment.id, secret)?;
+        for (environment, secrets, history) in decoded {
+            tx.execute(
+                "INSERT INTO environments (id, project_id, name, enc_vault_key, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    environment.id,
+                    environment.project_id,
+                    environment.id,
+                    super::api::b64decode(&environment.enc_vault_key)?,
+                    timestamp
+                ],
+            )?;
+            for secret in &secrets {
+                let deleted_at = secret.deleted.then_some(timestamp);
+                tx.execute(
+                    "INSERT INTO secrets
+                        (id, env_id, enc_name, enc_value, enc_data_key, version, deleted_at,
+                         created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                    params![
+                        secret.id,
+                        environment.id,
+                        secret.enc_name,
+                        secret.enc_value,
+                        secret.enc_data_key,
+                        secret.version,
+                        deleted_at,
+                        timestamp
+                    ],
+                )?;
+            }
+            for (secret_id, version, enc_name, enc_value, enc_data_key) in history {
+                tx.execute(
+                    "INSERT INTO secret_versions
+                        (id, secret_id, version, enc_name, enc_value, enc_data_key, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        secret_id,
+                        version,
+                        enc_name,
+                        enc_value,
+                        enc_data_key,
+                        timestamp
+                    ],
+                )?;
+            }
         }
-        for (secret_id, version, enc_name, enc_value, enc_data_key) in history {
-            store.put_remote_history(&secret_id, version, &enc_name, &enc_value, &enc_data_key)?;
-        }
+        Ok(())
+    });
+    if let Err(error) = restore_result {
+        let _ = session::rollback_restore(store, keychain);
+        return Err(error);
     }
     Ok(())
 }
@@ -291,7 +365,12 @@ pub fn restore(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account;
+    use crate::keychain::MemoryKeychain;
     use crate::remote::api::{ExportEnvironmentRef, ExportHistory, ExportSecret};
+    use crate::session;
+    use crate::store::Store;
+    use std::time::Duration;
 
     fn manifest() -> ExportManifest {
         ExportManifest {
@@ -351,6 +430,7 @@ mod tests {
                 enc_name: "name".into(),
                 enc_vault_key: "grant".into(),
                 revision: 2,
+                content_hash: String::new(),
                 secrets: vec![ExportSecret {
                     id: "s".into(),
                     enc_name: "n".into(),
@@ -368,11 +448,70 @@ mod tests {
                 }],
             }],
         };
+        bundle.environments[0].content_hash =
+            environment_content_hash(&bundle.environments[0]).unwrap();
         bundle.manifest_hash = bundle_hash(&bundle).unwrap();
         let bytes = serde_json::to_vec(&bundle).unwrap();
         let decoded: ExportBundle = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, bundle);
         verify_bundle_hash(&decoded, true).unwrap();
         assert!(!String::from_utf8(bytes).unwrap().contains("plaintext"));
+    }
+
+    #[test]
+    fn failed_restore_rolls_back_identity_and_resources() {
+        let source = Store::open_in_memory().unwrap();
+        let source_keychain = MemoryKeychain::default();
+        let kit = session::init(&source, &source_keychain, b"pw", Duration::from_secs(60)).unwrap();
+        let material = account::material(&source).unwrap();
+        let secret_key = sotto_core::format::decode_key("SK", 1, &kit.secret_key).unwrap();
+        let mut bundle = ExportBundle {
+            version: EXPORT_VERSION,
+            manifest_hash: String::new(),
+            account: AccountBundle {
+                public_key: super::super::api::b64encode(&material.public_key),
+                enc_private_keys: super::super::api::b64encode(&material.enc_private_keys),
+                kdf_params: super::super::api::b64encode(&material.kdf_params),
+                recovery_blob: super::super::api::b64encode(&material.recovery_blob),
+            },
+            projects: vec![ExportProject {
+                id: "project".into(),
+                enc_name: "opaque".into(),
+                org_id: None,
+            }],
+            environments: vec![ExportEnvironment {
+                id: "environment".into(),
+                project_id: "project".into(),
+                enc_name: "opaque".into(),
+                enc_vault_key: "opaque".into(),
+                revision: 1,
+                content_hash: String::new(),
+                secrets: Vec::new(),
+                history: vec![ExportHistory {
+                    secret_id: "missing-secret".into(),
+                    version: 1,
+                    enc_name: "opaque".into(),
+                    enc_value: "opaque".into(),
+                    enc_data_key: "opaque".into(),
+                }],
+            }],
+        };
+        bundle.environments[0].content_hash =
+            environment_content_hash(&bundle.environments[0]).unwrap();
+        bundle.manifest_hash = bundle_hash(&bundle).unwrap();
+
+        let restored = Store::open_in_memory().unwrap();
+        let restored_keychain = MemoryKeychain::default();
+        assert!(restore(
+            &restored,
+            &restored_keychain,
+            &bundle,
+            &secret_key,
+            b"pw",
+            Duration::from_secs(60),
+        )
+        .is_err());
+        assert!(restored.get_identity().unwrap().is_none());
+        assert!(restored.get_project("project").unwrap().is_none());
     }
 }

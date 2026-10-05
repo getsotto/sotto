@@ -385,6 +385,7 @@ pub struct ExportEnvironment {
     pub enc_name: String,
     pub enc_vault_key: String,
     pub revision: i64,
+    pub content_hash: String,
     pub secrets: Vec<ExportSecret>,
     pub history: Vec<ExportHistory>,
 }
