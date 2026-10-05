@@ -48,15 +48,40 @@ struct CreateShare {
     /// How many times the link may be fetched before it burns.
     #[serde(default)]
     max_views: Option<i32>,
-    /// `None` means omitted, `Some(None)` means an explicit no-expiry request.
+    /// Omitted, explicit no-expiry, and a concrete lifetime remain distinct until policy checks.
     #[serde(default)]
-    ttl_seconds: Option<Option<i64>>,
+    ttl_seconds: TtlRequest,
     /// Optional Argon2 salt (base64) for a passphrase-protected link.
     #[serde(default)]
     passphrase_salt: Option<String>,
     /// A caller-owned retry identity. It is scoped to the authenticated creator.
     #[serde(default)]
     idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TtlRequest {
+    Omitted,
+    ExplicitNoExpiry,
+    Value(i64),
+}
+
+impl Default for TtlRequest {
+    fn default() -> Self {
+        Self::Omitted
+    }
+}
+
+impl<'de> Deserialize<'de> for TtlRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match Option::<i64>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::ExplicitNoExpiry,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -207,13 +232,14 @@ async fn share_class(state: &AppState, user_id: &str) -> Result<ShareClass> {
 fn normalize_options(
     class: ShareClass,
     max_views: Option<i32>,
-    ttl_seconds: Option<Option<i64>>,
+    ttl_seconds: TtlRequest,
 ) -> Result<(i32, Option<i64>)> {
     match class {
         ShareClass::Paid => {
             let max_views = max_views.unwrap_or(1);
-            validate(max_views, ttl_seconds.flatten())?;
-            Ok((max_views, ttl_seconds.flatten()))
+            let ttl_seconds = ttl_seconds.value();
+            validate(max_views, ttl_seconds)?;
+            Ok((max_views, ttl_seconds))
         }
         ShareClass::Free => {
             if let Some(views) = max_views {
@@ -224,15 +250,24 @@ fn normalize_options(
                 }
             }
             let ttl_seconds = match ttl_seconds {
-                None => FREE_TTL_SECONDS,
-                Some(Some(ttl)) if ttl == FREE_TTL_SECONDS => FREE_TTL_SECONDS,
-                Some(Some(_)) | Some(None) => {
+                TtlRequest::Omitted => FREE_TTL_SECONDS,
+                TtlRequest::Value(ttl) if ttl == FREE_TTL_SECONDS => FREE_TTL_SECONDS,
+                TtlRequest::Value(_) | TtlRequest::ExplicitNoExpiry => {
                     return Err(Error::BadRequest(
                         "free share links expire after exactly 7 days".into(),
                     ))
                 }
             };
             Ok((FREE_MAX_VIEWS, Some(ttl_seconds)))
+        }
+    }
+}
+
+impl TtlRequest {
+    fn value(self) -> Option<i64> {
+        match self {
+            Self::Omitted | Self::ExplicitNoExpiry => None,
+            Self::Value(value) => Some(value),
         }
     }
 }
@@ -440,19 +475,26 @@ fn random_token() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_options, ShareClass, FREE_TTL_SECONDS};
+    use super::{normalize_options, CreateShare, ShareClass, TtlRequest, FREE_TTL_SECONDS};
 
     #[test]
     fn free_options_are_bounded_and_default_to_seven_days() {
         assert_eq!(
-            normalize_options(ShareClass::Free, None, None).unwrap(),
+            normalize_options(ShareClass::Free, None, TtlRequest::Omitted).unwrap(),
             (1, Some(FREE_TTL_SECONDS))
         );
-        assert!(normalize_options(ShareClass::Free, Some(2), None).is_err());
-        assert!(normalize_options(ShareClass::Free, Some(1), Some(None)).is_err());
-        assert!(normalize_options(ShareClass::Free, Some(1), Some(Some(3600))).is_err());
+        assert!(normalize_options(ShareClass::Free, Some(2), TtlRequest::Omitted).is_err());
+        assert!(
+            normalize_options(ShareClass::Free, Some(1), TtlRequest::ExplicitNoExpiry).is_err()
+        );
+        assert!(normalize_options(ShareClass::Free, Some(1), TtlRequest::Value(3600)).is_err());
         assert_eq!(
-            normalize_options(ShareClass::Free, Some(1), Some(Some(FREE_TTL_SECONDS))).unwrap(),
+            normalize_options(
+                ShareClass::Free,
+                Some(1),
+                TtlRequest::Value(FREE_TTL_SECONDS)
+            )
+            .unwrap(),
             (1, Some(FREE_TTL_SECONDS))
         );
     }
@@ -460,12 +502,24 @@ mod tests {
     #[test]
     fn paid_options_keep_the_existing_flexibility() {
         assert_eq!(
-            normalize_options(ShareClass::Paid, Some(5), Some(None)).unwrap(),
+            normalize_options(ShareClass::Paid, Some(5), TtlRequest::ExplicitNoExpiry).unwrap(),
             (5, None)
         );
         assert_eq!(
-            normalize_options(ShareClass::Paid, None, Some(Some(3600))).unwrap(),
+            normalize_options(ShareClass::Paid, None, TtlRequest::Value(3600)).unwrap(),
             (1, Some(3600))
         );
+    }
+
+    #[test]
+    fn ttl_request_distinguishes_omitted_null_and_value() {
+        let omitted: CreateShare = serde_json::from_str(r#"{"enc_blob":"x"}"#).unwrap();
+        let explicit_null: CreateShare =
+            serde_json::from_str(r#"{"enc_blob":"x","ttl_seconds":null}"#).unwrap();
+        let value: CreateShare =
+            serde_json::from_str(r#"{"enc_blob":"x","ttl_seconds":3600}"#).unwrap();
+        assert_eq!(omitted.ttl_seconds, TtlRequest::Omitted);
+        assert_eq!(explicit_null.ttl_seconds, TtlRequest::ExplicitNoExpiry);
+        assert_eq!(value.ttl_seconds, TtlRequest::Value(3600));
     }
 }
