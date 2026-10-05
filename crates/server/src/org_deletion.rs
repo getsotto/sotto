@@ -127,6 +127,7 @@ pub struct DeletionLease {
     pub org_id: String,
     pub state: DeletionState,
     pub subscription_id: Option<String>,
+    pub sponsored_subscription_id: Option<String>,
     pub worker_id: String,
     pub state_version: i64,
     pub attempt_count: i32,
@@ -210,14 +211,16 @@ pub async fn request_with_retention(
     }
 
     let mut tx = pool.begin().await?;
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
-        "SELECT lifecycle_state, stripe_subscription_id FROM organizations \
+    let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT lifecycle_state, organizations.stripe_subscription_id, \
+             (SELECT provider_subscription_id FROM billing_sponsored_subscriptions \
+              WHERE organization_id = organizations.id) FROM organizations \
          WHERE id = $1 FOR UPDATE",
     )
     .bind(org_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((lifecycle, subscription_id)) = row else {
+    let Some((lifecycle, subscription_id, sponsored_subscription_id)) = row else {
         return Err(Error::NotFound("organisation not found".into()));
     };
     let lifecycle = LifecycleState::from_db(&lifecycle)?;
@@ -303,15 +306,16 @@ pub async fn request_with_retention(
     let id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO organization_deletions \
-         (id, org_id, state, requested_by, requested_at, purge_after, subscription_id) \
+         (id, org_id, state, requested_by, requested_at, purge_after, subscription_id, sponsored_subscription_id) \
          VALUES ($1::uuid, $2, 'requested', $3, now(), \
-                 now() + ($4::bigint * interval '1 day'), $5)",
+                 now() + ($4::bigint * interval '1 day'), $5, $6)",
     )
     .bind(&id)
     .bind(org_id)
     .bind(actor)
     .bind(retention_days)
     .bind(subscription_id)
+    .bind(sponsored_subscription_id)
     .execute(&mut *tx)
     .await?;
     sqlx::query("UPDATE organizations SET lifecycle_state = 'deleting' WHERE id = $1")
@@ -566,16 +570,16 @@ pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<Deletion
         tx.commit().await?;
         return Ok(None);
     };
-    let row: (String, String, Option<String>, i64, i32) = sqlx::query_as(
+    let row: (String, String, Option<String>, Option<String>, i64, i32) = sqlx::query_as(
         "UPDATE organization_deletions \
              SET lease_owner = $1, lease_expires_at = now() + interval '5 minutes', \
              state_version = state_version + 1, \
              attempt_count = attempt_count + CASE \
                  WHEN state IN ('cancelling_billing', 'recovering') \
-                      OR (state = 'retention' AND subscription_id IS NOT NULL) \
+                      OR (state = 'retention' AND (subscription_id IS NOT NULL OR sponsored_subscription_id IS NOT NULL)) \
                  THEN 1 ELSE 0 END \
          WHERE id = $2::uuid \
-         RETURNING org_id, state, subscription_id, state_version, attempt_count",
+         RETURNING org_id, state, subscription_id, sponsored_subscription_id, state_version, attempt_count",
     )
     .bind(worker_id)
     .bind(&id)
@@ -590,9 +594,10 @@ pub async fn claim_due(pool: &PgPool, worker_id: &str) -> Result<Option<Deletion
         org_id: row.0,
         state: DeletionState::from_db(&row.1)?,
         subscription_id: row.2,
+        sponsored_subscription_id: row.3,
         worker_id: worker_id.into(),
-        state_version: row.3,
-        attempt_count: row.4,
+        state_version: row.4,
+        attempt_count: row.5,
     }))
 }
 
@@ -646,31 +651,39 @@ async fn advance_billing(
     provider: Option<&dyn SubscriptionProvider>,
     recovering: bool,
 ) -> Result<Option<DeletionView>> {
-    let Some(subscription_id) = lease.subscription_id.as_deref() else {
+    let subscription_ids = deletion_subscription_ids(lease);
+    if subscription_ids.is_empty() {
         return if recovering {
-            finish_recovery(pool, lease, SubscriptionObservation::Missing).await
+            finish_recovery(pool, lease, &[SubscriptionObservation::Missing]).await
         } else {
-            finish_billing(pool, lease, SubscriptionObservation::Missing).await
+            finish_billing(pool, lease, &[SubscriptionObservation::Missing]).await
         };
-    };
+    }
     let Some(provider) = provider else {
         return fail_attempt(pool, lease, "billing_unavailable", None, None).await;
     };
-    let observation = if recovering {
-        provider.get_subscription(subscription_id).await
+    let mut observations = Vec::with_capacity(subscription_ids.len());
+    for (index, subscription_id) in subscription_ids.into_iter().enumerate() {
+        let observation = if recovering {
+            provider.get_subscription(subscription_id).await
+        } else {
+            provider
+                .cancel_subscription(
+                    subscription_id,
+                    &format!("org-deletion-{}-{index}", lease.id),
+                    &lease.org_id,
+                )
+                .await
+        };
+        match observation {
+            Ok(observation) => observations.push(observation),
+            Err(error) => return handle_provider_error(pool, lease, error.kind, error.code).await,
+        }
+    }
+    if recovering {
+        finish_recovery(pool, lease, &observations).await
     } else {
-        provider
-            .cancel_subscription(
-                subscription_id,
-                &format!("org-deletion-{}", lease.id),
-                &lease.org_id,
-            )
-            .await
-    };
-    match observation {
-        Ok(observation) if recovering => finish_recovery(pool, lease, observation).await,
-        Ok(observation) => finish_billing(pool, lease, observation).await,
-        Err(error) => handle_provider_error(pool, lease, error.kind, error.code).await,
+        finish_billing(pool, lease, &observations).await
     }
 }
 
@@ -679,19 +692,37 @@ async fn advance_retention(
     lease: &DeletionLease,
     provider: Option<&dyn SubscriptionProvider>,
 ) -> Result<Option<DeletionView>> {
-    let Some(subscription_id) = lease.subscription_id.as_deref() else {
+    let subscription_ids = deletion_subscription_ids(lease);
+    if subscription_ids.is_empty() {
         return enter_purging(pool, lease).await;
-    };
+    }
     let Some(provider) = provider else {
         if operator_observation_is_fresh(pool, lease).await? {
             return enter_purging(pool, lease).await;
         }
         return fail_attempt(pool, lease, "billing_unavailable", None, None).await;
     };
-    match provider.get_subscription(subscription_id).await {
-        Ok(observation) => finish_retention_reconciliation(pool, lease, observation).await,
-        Err(error) => handle_provider_error(pool, lease, error.kind, error.code).await,
+    let mut observations = Vec::with_capacity(subscription_ids.len());
+    for subscription_id in subscription_ids {
+        match provider.get_subscription(subscription_id).await {
+            Ok(observation) => observations.push(observation),
+            Err(error) => return handle_provider_error(pool, lease, error.kind, error.code).await,
+        }
     }
+    finish_retention_reconciliation(pool, lease, &observations).await
+}
+
+fn deletion_subscription_ids(lease: &DeletionLease) -> Vec<&str> {
+    let mut ids = Vec::with_capacity(2);
+    if let Some(subscription_id) = lease.subscription_id.as_deref() {
+        ids.push(subscription_id);
+    }
+    if let Some(subscription_id) = lease.sponsored_subscription_id.as_deref() {
+        if !ids.contains(&subscription_id) {
+            ids.push(subscription_id);
+        }
+    }
+    ids
 }
 
 async fn operator_observation_is_fresh(pool: &PgPool, lease: &DeletionLease) -> Result<bool> {
@@ -725,6 +756,14 @@ pub struct OperatorObservation<'a> {
     pub managed_backup_expiry_by: Option<&'a str>,
 }
 
+type OperatorDeletionRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 pub async fn record_operator_observation(
     pool: &PgPool,
     org_id: &str,
@@ -754,8 +793,8 @@ pub async fn record_operator_observation(
     }
 
     let mut tx = pool.begin().await?;
-    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT d.id::text, d.state, d.subscription_id, d.resume_state \
+    let row: Option<OperatorDeletionRow> = sqlx::query_as(
+        "SELECT d.id::text, d.state, d.subscription_id, d.sponsored_subscription_id, d.resume_state \
          FROM organization_deletions d JOIN organizations o ON o.id = d.org_id \
          WHERE d.org_id = $1 AND o.lifecycle_state = 'deleting' \
            AND d.state NOT IN ('cancelled', 'completed') FOR UPDATE OF d, o",
@@ -763,7 +802,8 @@ pub async fn record_operator_observation(
     .bind(org_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((id, state, operation_subscription, resume_state)) = row else {
+    let Some((id, state, operation_subscription, sponsored_subscription, resume_state)) = row
+    else {
         return Err(Error::NotFound("deletion not found".into()));
     };
     let observed_at = normalise_rfc3339_timestamp(
@@ -818,7 +858,14 @@ pub async fn record_operator_observation(
             "organisation recovery is in progress".into(),
         ));
     }
-    if operation_subscription.as_deref() != Some(observation.subscription_id) {
+    if sponsored_subscription.is_some() && operation_subscription.is_some() {
+        return Err(Error::Conflict(
+            "manual observation cannot settle multiple billing subscriptions".into(),
+        ));
+    }
+    if operation_subscription.as_deref() != Some(observation.subscription_id)
+        && sponsored_subscription.as_deref() != Some(observation.subscription_id)
+    {
         return Err(Error::Conflict(
             "manual observation does not match the deletion subscription".into(),
         ));
@@ -944,9 +991,9 @@ fn looks_like_rfc3339(value: &str) -> bool {
 async fn finish_retention_reconciliation(
     pool: &PgPool,
     lease: &DeletionLease,
-    observation: SubscriptionObservation,
+    observations: &[SubscriptionObservation],
 ) -> Result<Option<DeletionView>> {
-    let gate = observation.purge_gate();
+    let gate = combined_purge_gate(observations);
     let (state, retry_now) = match gate {
         PurgeGate::Terminal | PurgeGate::Missing => (DeletionState::Purging, false),
         PurgeGate::Blocking => (DeletionState::CancellingBilling, true),
@@ -1019,7 +1066,8 @@ async fn enter_purging(pool: &PgPool, lease: &DeletionLease) -> Result<Option<De
     let row: Option<(String, String)> = sqlx::query_as(
         "UPDATE organization_deletions SET state = 'purging', attempt_count = 0, \
          purge_started_at = COALESCE(purge_started_at, now()), \
-         billing_checked_at = CASE WHEN subscription_id IS NULL THEN now() ELSE billing_checked_at END, \
+         billing_checked_at = CASE WHEN subscription_id IS NULL AND sponsored_subscription_id IS NULL \
+                                  THEN now() ELSE billing_checked_at END, \
          next_attempt_at = NULL, \
          lease_owner = NULL, lease_expires_at = NULL, state_version = state_version + 1 \
          WHERE id = $1::uuid AND state = 'retention' AND purge_after <= now() \
@@ -1053,9 +1101,9 @@ async fn enter_purging(pool: &PgPool, lease: &DeletionLease) -> Result<Option<De
 async fn finish_billing(
     pool: &PgPool,
     lease: &DeletionLease,
-    observation: SubscriptionObservation,
+    observations: &[SubscriptionObservation],
 ) -> Result<Option<DeletionView>> {
-    let gate = observation.purge_gate();
+    let gate = combined_purge_gate(observations);
     if let Some(next) = billing_transition(gate) {
         let state = next.as_str();
         let billing_state = billing_state_name(gate);
@@ -1076,7 +1124,7 @@ async fn finish_billing(
         .fetch_optional(&mut *tx)
         .await?;
         // Free deletions bypass provider cancellation, so only linked subscriptions count here.
-        if lease.subscription_id.is_some() {
+        if !deletion_subscription_ids(lease).is_empty() {
             metrics::increment_tx(
                 &mut tx,
                 metrics::PROVIDER_CANCELLATION_ATTEMPTS,
@@ -1122,23 +1170,28 @@ async fn finish_billing(
 async fn finish_recovery(
     pool: &PgPool,
     lease: &DeletionLease,
-    observation: SubscriptionObservation,
+    observations: &[SubscriptionObservation],
 ) -> Result<Option<DeletionView>> {
-    let gate = observation.purge_gate();
-    let tier = match &observation {
-        SubscriptionObservation::Current(snapshot) if !matches!(gate, PurgeGate::Unknown) => {
-            snapshot.status.entitlement_tier()
-        }
-        SubscriptionObservation::Missing => "free",
-        SubscriptionObservation::Current(_) => {
-            return handle_provider_error(
-                pool,
-                lease,
-                ProviderErrorKind::Unknown,
-                Some("billing_status_unknown".into()),
-            )
-            .await;
-        }
+    let gate = combined_purge_gate(observations);
+    if gate == PurgeGate::Unknown {
+        return handle_provider_error(
+            pool,
+            lease,
+            ProviderErrorKind::Unknown,
+            Some("billing_status_unknown".into()),
+        )
+        .await;
+    }
+    let tier = if observations.iter().any(|observation| {
+        matches!(
+            observation,
+            SubscriptionObservation::Current(snapshot)
+                if snapshot.status.entitlement_tier() == "team"
+        )
+    }) {
+        "team"
+    } else {
+        "free"
     };
     let mut tx = pool.begin().await?;
     let row: Option<(String, String)> = sqlx::query_as(
@@ -1156,7 +1209,7 @@ async fn finish_recovery(
     .fetch_optional(&mut *tx)
     .await?;
     // Recovery without a subscription uses a local missing observation, not a provider call.
-    if lease.subscription_id.is_some() {
+    if !deletion_subscription_ids(lease).is_empty() {
         metrics::increment_tx(
             &mut tx,
             metrics::PROVIDER_RECONCILIATION_ATTEMPTS,
@@ -1328,6 +1381,32 @@ fn billing_state_name(gate: PurgeGate) -> &'static str {
     }
 }
 
+fn combined_purge_gate(observations: &[SubscriptionObservation]) -> PurgeGate {
+    if observations.is_empty() {
+        return PurgeGate::Missing;
+    }
+    if observations
+        .iter()
+        .any(|observation| observation.purge_gate() == PurgeGate::Unknown)
+    {
+        return PurgeGate::Unknown;
+    }
+    if observations
+        .iter()
+        .any(|observation| observation.purge_gate() == PurgeGate::Blocking)
+    {
+        return PurgeGate::Blocking;
+    }
+    if observations
+        .iter()
+        .all(|observation| observation.purge_gate() == PurgeGate::Missing)
+    {
+        PurgeGate::Missing
+    } else {
+        PurgeGate::Terminal
+    }
+}
+
 fn view_from_row(id: &str, (org_id, state): (String, String)) -> Result<DeletionView> {
     Ok(DeletionView {
         id: id.into(),
@@ -1342,10 +1421,12 @@ type PurgeRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
     bool,
     bool,
     bool,
     String,
+    Option<String>,
     Option<String>,
 );
 
@@ -1355,12 +1436,14 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
     // Provider and operator observations share the fifteen-minute freshness bound after a lost
     // lease, so a stale result cannot satisfy the destructive purge gate.
     let row: Option<PurgeRow> = sqlx::query_as(
-        "SELECT d.org_id, d.state, d.subscription_id, d.last_billing_state, \
+        "SELECT d.org_id, d.state, d.subscription_id, d.sponsored_subscription_id, d.last_billing_state, \
                 d.billing_observation_source, d.billing_checked_at IS NOT NULL, \
                 (d.billing_checked_at >= now() - ($1 * interval '1 second') \
                  AND d.billing_observation_source IN ('provider', 'operator')), \
                 d.purge_after <= now(), \
-                o.lifecycle_state, o.stripe_subscription_id \
+                o.lifecycle_state, o.stripe_subscription_id, \
+                    (SELECT provider_subscription_id FROM billing_sponsored_subscriptions \
+                     WHERE organization_id = o.id) \
          FROM organization_deletions d JOIN organizations o ON o.id = d.org_id \
          WHERE d.id = $2::uuid AND d.state_version = $3 AND d.lease_owner = $4 \
          FOR UPDATE OF d, o",
@@ -1375,6 +1458,7 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
         org_id,
         state,
         operation_subscription,
+        operation_sponsored_subscription,
         billing_state,
         _observation_source,
         checked,
@@ -1382,6 +1466,7 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
         due,
         lifecycle,
         current_subscription,
+        current_sponsored_subscription,
     )) = row
     else {
         metrics::increment_tx(&mut tx, metrics::STALE_COMPARE_AND_SET, "rejected").await?;
@@ -1398,6 +1483,10 @@ async fn purge(pool: &PgPool, lease: &DeletionLease) -> Result<Option<DeletionVi
         || (operation_subscription.is_some()
             && current_subscription.is_some()
             && current_subscription != operation_subscription)
+        || (operation_sponsored_subscription.is_none() && current_sponsored_subscription.is_some())
+        || (operation_sponsored_subscription.is_some()
+            && current_sponsored_subscription.is_some()
+            && current_sponsored_subscription != operation_sponsored_subscription)
     {
         let failed: Option<String> = sqlx::query_scalar(
             "UPDATE organization_deletions SET state = 'failed', resume_state = 'purging', \

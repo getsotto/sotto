@@ -1124,6 +1124,8 @@ mod tests {
                     name: t.name.clone(),
                     public_key: b64encode(&t.public_key),
                     created_by: Some(t.created_by.clone()),
+                    beneficiary_id: Some(t.created_by.clone()),
+                    beneficiary_status: Some("verified".into()),
                     expires_at: None,
                     expires_in_days: None,
                 })

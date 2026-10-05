@@ -76,7 +76,13 @@ async fn create_project(
                 "must be an admin or owner to create a project in this organisation".into(),
             ));
         }
-        crate::entitlements::check_can_create_org_project(&mut tx, org_id, &body.id).await?;
+        crate::entitlements::check_can_create_org_project(
+            &mut tx,
+            state.deployment_mode,
+            org_id,
+            &body.id,
+        )
+        .await?;
     }
     let created: Option<String> = sqlx::query_scalar(
         "INSERT INTO projects (id, owner_id, org_id, enc_name) VALUES ($1, $2, $3, $4) \

@@ -166,6 +166,12 @@ pub struct MachineTokenInfo {
     pub public_key: String,
     /// The user who created the token, if still known.
     pub created_by: Option<String>,
+    /// The human account whose hosted eligibility is accountable for this token, if known.
+    #[serde(default)]
+    pub beneficiary_id: Option<String>,
+    /// `verified` or `ambiguous`; absent from servers predating machine accountability.
+    #[serde(default)]
+    pub beneficiary_status: Option<String>,
     /// When the token stops authenticating (UTC, RFC 3339). Absent from servers that predate
     /// token expiry, whose tokens never expire.
     #[serde(default)]
