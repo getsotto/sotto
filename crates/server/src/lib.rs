@@ -75,6 +75,8 @@ pub mod db;
 pub mod encoding;
 pub mod entitlements;
 pub mod error;
+#[doc(hidden)]
+pub mod export;
 pub mod health;
 pub mod machine;
 pub mod org;
@@ -129,6 +131,7 @@ pub fn app(state: AppState) -> Router {
         .merge(audit::router())
         .merge(entitlements::router())
         .merge(account::router())
+        .merge(export::router())
         .merge(person_eligibility::router())
         .merge(org::router())
         .merge(billing::router())
