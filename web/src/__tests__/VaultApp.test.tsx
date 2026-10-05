@@ -125,6 +125,73 @@ describe("VaultApp startup transitions", () => {
     expect(api.fetchAccount).toHaveBeenCalledTimes(2);
   });
 
+  it("allows another setup check after the account is still missing", async () => {
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    const recheck = deferred<api.Account | null>();
+    vi.mocked(api.fetchAccount)
+      .mockResolvedValueOnce(null)
+      .mockReturnValueOnce(recheck.promise)
+      .mockResolvedValueOnce(account());
+
+    render(<VaultApp />);
+
+    expect(await screen.findByText("Finish setting up Sotto")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Check setup again" }));
+
+    expect(screen.getByRole("button", { name: "Checking…" })).toBeDisabled();
+    expect(screen.queryByText("Unlock your vault")).not.toBeInTheDocument();
+    expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+
+    await act(async () => {
+      recheck.resolve(null);
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Account setup is not published yet.",
+    );
+    const retry = screen.getByRole("button", { name: "Check setup again" });
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.fetchAccount).toHaveBeenCalledTimes(3);
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+  });
+
+  it("allows another setup check after a request failure", async () => {
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    const recheck = deferred<api.Account | null>();
+    vi.mocked(api.fetchAccount)
+      .mockResolvedValueOnce(null)
+      .mockReturnValueOnce(recheck.promise)
+      .mockResolvedValueOnce(account());
+
+    render(<VaultApp />);
+
+    expect(await screen.findByText("Finish setting up Sotto")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Check setup again" }));
+
+    expect(screen.getByRole("button", { name: "Checking…" })).toBeDisabled();
+    expect(screen.queryByText("Unlock your vault")).not.toBeInTheDocument();
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+
+    await act(async () => {
+      recheck.reject(new Error("temporary request failure"));
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent("temporary request failure");
+    const retry = screen.getByRole("button", { name: "Check setup again" });
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.fetchAccount).toHaveBeenCalledTimes(3);
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+  });
+
   it("shows an alert and Reload on an account-request rejection, and Reload triggers one reload", async () => {
     vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
     vi.mocked(api.fetchAccount).mockRejectedValue(new Error("server error (500)"));
