@@ -107,6 +107,12 @@ impl IntoResponse for Error {
         }
         let code = self.code();
         let mut response = (status, message).into_response();
+        if matches!(self, Error::RateLimited(_)) {
+            response.headers_mut().insert(
+                HeaderName::from_static("retry-after"),
+                HeaderValue::from_static("60"),
+            );
+        }
         response.headers_mut().insert(
             HeaderName::from_static("x-sotto-error-code"),
             HeaderValue::from_static(code),
@@ -141,6 +147,7 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::Error;
+    use axum::response::IntoResponse;
 
     #[test]
     fn error_codes_are_stable_and_old_clients_keep_plain_messages() {
@@ -152,5 +159,11 @@ mod tests {
         );
         assert_eq!(Error::RateLimited("retry".into()).code(), "rate_limited");
         assert_eq!(Error::NotConfigured("offline".into()).code(), "unavailable");
+    }
+
+    #[test]
+    fn rate_limits_include_a_retry_hint() {
+        let response = Error::RateLimited("try later".into()).into_response();
+        assert_eq!(response.headers()["retry-after"], "60");
     }
 }
