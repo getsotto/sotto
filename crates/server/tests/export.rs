@@ -96,11 +96,10 @@ async fn seed(pool: &PgPool) -> (&'static str, String) {
         .await
         .expect("insert project");
     sqlx::query(
-        "INSERT INTO environments (id, project_id, enc_name, enc_vault_key, revision)
-         VALUES ('export-environment', 'export-project', $1, $2, 7)",
+        "INSERT INTO environments (id, project_id, enc_name, revision)
+         VALUES ('export-environment', 'export-project', $1, 7)",
     )
     .bind(b"environment-name".as_slice())
-    .bind(b"vault-grant".as_slice())
     .execute(pool)
     .await
     .expect("insert environment");
