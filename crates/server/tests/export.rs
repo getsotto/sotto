@@ -84,7 +84,7 @@ async fn seed(pool: &PgPool, user_id: &'static str) -> String {
          VALUES ($1, 'github', $2, $3, $4, $5, $6)",
     )
     .bind(user_id)
-    .bind("test-export-subject")
+    .bind(format!("{user_id}-subject"))
     .bind([1u8; 32].as_slice())
     .bind(b"private".as_slice())
     .bind(b"kdf".as_slice())
