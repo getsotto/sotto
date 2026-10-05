@@ -303,6 +303,16 @@ struct ShareSummary {
     created_at: String,
 }
 
+type ShareSummaryRow = (
+    String,
+    String,
+    i32,
+    i32,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
 #[derive(Serialize)]
 struct ShareList {
     active_free_count: i64,
@@ -319,15 +329,7 @@ async fn list_shares(State(state): State<AppState>, user: AuthUser) -> Result<Js
     .bind(&user.user_id)
     .fetch_one(&state.pool)
     .await?;
-    let rows: Vec<(
-        String,
-        String,
-        i32,
-        i32,
-        Option<String>,
-        Option<String>,
-        String,
-    )> = sqlx::query_as(
+    let rows: Vec<ShareSummaryRow> = sqlx::query_as(
         "SELECT token, share_class, max_views, view_count, expires_at::text, \
                     revoked_at::text, created_at::text \
              FROM share_links WHERE created_by = $1 ORDER BY created_at DESC LIMIT 100",
