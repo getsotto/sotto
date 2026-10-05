@@ -24,8 +24,12 @@ async fn pool_or_skip() -> Option<PgPool> {
 }
 
 fn app(pool: PgPool) -> Router {
+    app_with_mode(pool, sotto_server::config::DeploymentMode::SelfHosted)
+}
+
+fn app_with_mode(pool: PgPool, deployment_mode: sotto_server::config::DeploymentMode) -> Router {
     let state = AppState {
-        deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
+        deployment_mode,
         telemetry_ingest: false,
         cloud_action_enforcement_enabled: false,
         machine_eligibility_enforcement_enabled: false,
@@ -71,12 +75,37 @@ async fn body_text(resp: axum::response::Response) -> String {
 
 /// POST /shares with a bearer token; returns (status, body).
 async fn create(pool: &PgPool, token: &str, body: String) -> (StatusCode, String) {
+    create_with_app(app(pool.clone()), token, body).await
+}
+
+async fn create_cloud(pool: &PgPool, token: &str, body: String) -> (StatusCode, String) {
+    create_with_app(
+        app_with_mode(pool.clone(), sotto_server::config::DeploymentMode::Cloud),
+        token,
+        body,
+    )
+    .await
+}
+
+async fn create_with_app(router: Router, token: &str, body: String) -> (StatusCode, String) {
     let req = Request::builder()
         .method("POST")
         .uri("/shares")
         .header("authorization", format!("Bearer {token}"))
         .header("content-type", "application/json")
         .body(Body::from(body))
+        .expect("req");
+    let resp = router.oneshot(req).await.expect("oneshot");
+    let status = resp.status();
+    (status, body_text(resp).await)
+}
+
+async fn list(pool: &PgPool, token: &str) -> (StatusCode, String) {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/shares")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
         .expect("req");
     let resp = app(pool.clone()).oneshot(req).await.expect("oneshot");
     let status = resp.status();
@@ -110,6 +139,13 @@ fn create_body(blob: &[u8], max_views: i32, ttl: Option<i64>) -> String {
     };
     format!(
         r#"{{"enc_blob":"{}","max_views":{max_views},"ttl_seconds":{ttl}}}"#,
+        b64(blob)
+    )
+}
+
+fn create_body_with_key(blob: &[u8], key: &str) -> String {
+    format!(
+        r#"{{"enc_blob":"{}","idempotency_key":"{key}"}}"#,
         b64(blob)
     )
 }
@@ -255,6 +291,180 @@ async fn passphrase_salt_round_trips_and_create_requires_auth() {
     );
 
     sqlx::query("DELETE FROM users WHERE id = 'share-salt-u'")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn free_cloud_links_default_to_one_view_and_seven_days() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let session = fresh_session(&pool, "share-free-defaults-u", "share-free-defaults-s").await;
+
+    let (status, first) = create_cloud(
+        &pool,
+        &session,
+        create_body_with_key(b"free-ciphertext", "free-defaults"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let token = token_of(&first);
+    let (expires_at, max_views, share_class): (String, i32, String) = sqlx::query_as(
+        "SELECT expires_at::text, max_views, share_class FROM share_links WHERE token = $1",
+    )
+    .bind(&token)
+    .fetch_one(&pool)
+    .await
+    .expect("free link row");
+    assert_eq!(max_views, 1);
+    assert_eq!(share_class, "free");
+    let within_window: bool = sqlx::query_scalar(
+        "SELECT $1::timestamptz BETWEEN now() + interval '6 days 23 hours' \
+         AND now() + interval '7 days 1 minute'",
+    )
+    .bind(expires_at)
+    .fetch_one(&pool)
+    .await
+    .expect("free expiry window");
+    assert!(within_window);
+
+    let (status, _) = create_cloud(
+        &pool,
+        &session,
+        create_body(b"incompatible", 2, Some(604_800)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = create_cloud(
+        &pool,
+        &session,
+        r#"{"enc_blob":"aW5jb21wYXRpYmxl","max_views":1,"ttl_seconds":null}"#.into(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A same-key retry is an exact replay and does not consume another slot.
+    let (status, replay) = create_cloud(
+        &pool,
+        &session,
+        create_body_with_key(b"free-ciphertext", "free-defaults"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(token_of(&replay), token);
+    assert_eq!(fetch(&pool, &token).await.0, StatusCode::OK);
+    assert_eq!(fetch(&pool, &token).await.0, StatusCode::NOT_FOUND);
+
+    let other = fresh_session(&pool, "share-free-other-u", "share-free-other-s").await;
+    let (status, body) = list(&pool, &other).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains(&token));
+
+    sqlx::query("DELETE FROM users WHERE id = 'share-free-defaults-u'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = 'share-free-other-u'")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn free_cloud_allowance_serializes_parallel_creation_and_releases_slots() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let session = fresh_session(&pool, "share-free-race-u", "share-free-race-s").await;
+    for (blob, key) in [
+        (b"one".as_slice(), "race-one"),
+        (b"two".as_slice(), "race-two"),
+    ] {
+        assert_eq!(
+            create_cloud(&pool, &session, create_body_with_key(blob, key))
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+    }
+    let (left, right) = tokio::join!(
+        create_cloud(
+            &pool,
+            &session,
+            create_body_with_key(b"three", "race-three")
+        ),
+        create_cloud(&pool, &session, create_body_with_key(b"four", "race-four"))
+    );
+    let statuses = [left.0, right.0];
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::CREATED)
+            .count(),
+        1
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|status| **status == StatusCode::PAYMENT_REQUIRED)
+            .count(),
+        1
+    );
+
+    let (status, body) = list(&pool, &session).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("active_free_count"));
+    assert!(!body.contains(&b64(b"one")));
+
+    // Consuming a one-view link frees one allowance slot.
+    let token = sqlx::query_scalar::<_, String>(
+        "SELECT token FROM share_links WHERE created_by = 'share-free-race-u' \
+         AND view_count = 0 ORDER BY token LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("unconsumed free link");
+    assert_eq!(fetch(&pool, &token).await.0, StatusCode::OK);
+    assert_eq!(
+        create_cloud(
+            &pool,
+            &session,
+            create_body_with_key(b"after-consume", "race-after-consume")
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+
+    sqlx::query("DELETE FROM users WHERE id = 'share-free-race-u'")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn share_creation_rate_limit_returns_retry_information() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let session = fresh_session(&pool, "share-rate-u", "share-rate-s").await;
+    for n in 0..10 {
+        let (status, body) =
+            create(&pool, &session, create_body(&[n as u8], 100, Some(3600))).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    assert_eq!(
+        create(&pool, &session, create_body(b"too-many", 100, Some(3600)))
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    sqlx::query("DELETE FROM users WHERE id = 'share-rate-u'")
         .execute(&pool)
         .await
         .unwrap();
