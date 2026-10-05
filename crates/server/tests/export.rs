@@ -68,11 +68,7 @@ async fn json(response: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).expect("json response")
 }
 
-async fn seed(pool: &PgPool, user_id: &'static str) -> String {
-    let project_id = format!("{user_id}-project");
-    let environment_id = format!("{user_id}-environment");
-    let secret_id = format!("{user_id}-secret");
-    let history_id = format!("{user_id}-history");
+async fn seed_user(pool: &PgPool, user_id: &str) -> String {
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user_id)
         .execute(pool)
@@ -92,6 +88,15 @@ async fn seed(pool: &PgPool, user_id: &'static str) -> String {
     .execute(pool)
     .await
     .expect("insert user");
+    session::issue(pool, user_id).await.expect("issue session")
+}
+
+async fn seed(pool: &PgPool, user_id: &str) -> String {
+    let project_id = format!("{user_id}-project");
+    let environment_id = format!("{user_id}-environment");
+    let secret_id = format!("{user_id}-secret");
+    let history_id = format!("{user_id}-history");
+    let token = seed_user(pool, user_id).await;
     sqlx::query("INSERT INTO projects (id, owner_id, enc_name) VALUES ($1, $2, $3)")
         .bind(&project_id)
         .bind(user_id)
@@ -144,7 +149,6 @@ async fn seed(pool: &PgPool, user_id: &'static str) -> String {
     .execute(pool)
     .await
     .expect("insert history");
-    let token = session::issue(pool, user_id).await.expect("issue session");
     token
 }
 
@@ -212,6 +216,91 @@ async fn export_manifest_and_chunks_preserve_opaque_history() {
     );
 
     cleanup(&pool, user_id).await;
+}
+
+#[tokio::test]
+async fn export_excludes_unshared_organisation_environments_without_blocking_exit() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let owner_id = "test-export-org-owner";
+    let member_id = "test-export-org-member";
+    let org_id = "test-export-org";
+    let project_id = "test-export-org-project";
+    let shared_environment_id = "test-export-shared-environment";
+    let unshared_environment_id = "test-export-unshared-environment";
+    let token = seed_user(&pool, member_id).await;
+    seed_user(&pool, owner_id).await;
+
+    sqlx::query("INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, $2, $3)")
+        .bind(org_id)
+        .bind(b"organisation-name".as_slice())
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .expect("insert organisation");
+    sqlx::query(
+        "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, 'owner'), ($1, $3, 'member')",
+    )
+    .bind(org_id)
+    .bind(owner_id)
+    .bind(member_id)
+    .execute(&pool)
+    .await
+    .expect("insert memberships");
+    sqlx::query("INSERT INTO projects (id, owner_id, org_id, enc_name) VALUES ($1, $2, $3, $4)")
+        .bind(project_id)
+        .bind(owner_id)
+        .bind(org_id)
+        .bind(b"project-name".as_slice())
+        .execute(&pool)
+        .await
+        .expect("insert organisation project");
+    sqlx::query(
+        "INSERT INTO environments (id, project_id, enc_name, revision) VALUES ($1, $3, $2, 1), ($4, $3, $5, 1)",
+    )
+    .bind(shared_environment_id)
+    .bind(b"shared-environment".as_slice())
+    .bind(project_id)
+    .bind(unshared_environment_id)
+    .bind(b"unshared-environment".as_slice())
+    .execute(&pool)
+    .await
+    .expect("insert organisation environments");
+    sqlx::query(
+        "INSERT INTO environment_grants (env_id, user_id, enc_vault_key, granted_by)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(shared_environment_id)
+    .bind(member_id)
+    .bind(b"vault-grant".as_slice())
+    .bind(owner_id)
+    .execute(&pool)
+    .await
+    .expect("grant shared environment");
+
+    let response = app(pool.clone())
+        .oneshot(request("POST", "/account/export", &token))
+        .await
+        .expect("start organisation export");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let manifest = json(response).await;
+    assert_eq!(manifest["complete"], true);
+    assert_eq!(manifest["omitted_environment_count"], 1);
+    assert_eq!(
+        manifest["not_shared_environment_ids"],
+        serde_json::json!([unshared_environment_id])
+    );
+    assert_eq!(manifest["environments"].as_array().unwrap().len(), 1);
+    assert_eq!(manifest["environments"][0]["id"], shared_environment_id);
+
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .expect("clean organisation");
+    cleanup(&pool, owner_id).await;
+    cleanup(&pool, member_id).await;
 }
 
 #[tokio::test]

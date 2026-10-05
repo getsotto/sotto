@@ -30,6 +30,8 @@ pub struct ExportBundle {
     pub account: AccountBundle,
     pub projects: Vec<ExportProject>,
     pub environments: Vec<ExportEnvironment>,
+    #[serde(default)]
+    pub not_shared_environment_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -38,6 +40,8 @@ struct ExportManifestForHash {
     account: AccountBundle,
     projects: Vec<ExportProject>,
     environments: Vec<super::api::ExportEnvironmentRef>,
+    #[serde(default)]
+    not_shared_environment_ids: Vec<String>,
     omitted_environment_count: usize,
 }
 
@@ -50,7 +54,7 @@ pub fn download(api: &dyn SyncApi) -> Result<ExportBundle> {
             manifest.version
         )));
     }
-    if !manifest.complete || manifest.omitted_environment_count != 0 {
+    if !manifest.complete {
         return Err(Error::Server(
             "export scope is incomplete; restore is refused until every authorised environment is included"
                 .into(),
@@ -126,6 +130,7 @@ pub fn download(api: &dyn SyncApi) -> Result<ExportBundle> {
         account,
         projects: manifest.projects,
         environments,
+        not_shared_environment_ids: manifest.not_shared_environment_ids,
     };
     verify_bundle_hash(&bundle, false)?;
     Ok(bundle)
@@ -148,7 +153,8 @@ fn bundle_hash(bundle: &ExportBundle) -> Result<String> {
         account: bundle.account.clone(),
         projects: bundle.projects.clone(),
         environments,
-        omitted_environment_count: 0,
+        not_shared_environment_ids: bundle.not_shared_environment_ids.clone(),
+        omitted_environment_count: bundle.not_shared_environment_ids.len(),
     };
     let encoded = serde_json::to_vec(&manifest)
         .map_err(|e| Error::Server(format!("serialising export manifest: {e}")))?;
@@ -392,6 +398,7 @@ mod tests {
                 enc_vault_key: "grant".into(),
                 revision: 2,
             }],
+            not_shared_environment_ids: Vec::new(),
             omitted_environment_count: 0,
         }
     }
@@ -447,6 +454,7 @@ mod tests {
                     enc_data_key: "k".into(),
                 }],
             }],
+            not_shared_environment_ids: Vec::new(),
         };
         bundle.environments[0].content_hash =
             environment_content_hash(&bundle.environments[0]).unwrap();
@@ -495,6 +503,7 @@ mod tests {
                     enc_data_key: "opaque".into(),
                 }],
             }],
+            not_shared_environment_ids: Vec::new(),
         };
         bundle.environments[0].content_hash =
             environment_content_hash(&bundle.environments[0]).unwrap();

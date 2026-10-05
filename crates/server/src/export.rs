@@ -64,6 +64,9 @@ struct ExportManifest {
     account: ExportAccount,
     projects: Vec<ExportProject>,
     environments: Vec<ExportEnvironmentRef>,
+    /// Organisation environments the caller can see but has never been granted.
+    #[serde(default)]
+    not_shared_environment_ids: Vec<String>,
     omitted_environment_count: usize,
 }
 
@@ -77,6 +80,8 @@ struct ExportManifestView {
     complete: bool,
     projects: Vec<ExportProject>,
     environments: Vec<ExportEnvironmentRef>,
+    /// Organisation environments intentionally outside this caller's exportable scope.
+    not_shared_environment_ids: Vec<String>,
     omitted_environment_count: usize,
 }
 
@@ -218,7 +223,7 @@ async fn start_export(
 
     let mut projects = Vec::new();
     let mut environments = Vec::new();
-    let mut omitted_environment_count = 0;
+    let mut not_shared_environment_ids = Vec::new();
     for (project_id, enc_name, org_id, env_id, env_name, grant, revision) in rows {
         if projects.last().map(|p: &ExportProject| p.id.as_str()) != Some(project_id.as_str()) {
             projects.push(ExportProject {
@@ -229,7 +234,7 @@ async fn start_export(
         }
         let Some(env_id) = env_id else { continue };
         let Some(grant) = grant else {
-            omitted_environment_count += 1;
+            not_shared_environment_ids.push(env_id);
             continue;
         };
         environments.push(ExportEnvironmentRef {
@@ -251,7 +256,8 @@ async fn start_export(
         },
         projects: projects.clone(),
         environments: environments.clone(),
-        omitted_environment_count,
+        omitted_environment_count: not_shared_environment_ids.len(),
+        not_shared_environment_ids: not_shared_environment_ids.clone(),
     };
     let manifest = serde_json::to_vec(&document)
         .map_err(|e| Error::Internal(format!("serialising export manifest: {e}")))?;
@@ -280,10 +286,11 @@ async fn start_export(
             manifest_hash: hash_text,
             expires_at,
             total_chunks,
-            complete: omitted_environment_count == 0,
+            complete: true,
             projects,
             environments,
-            omitted_environment_count,
+            not_shared_environment_ids,
+            omitted_environment_count: document.omitted_environment_count,
         }),
     ))
 }
@@ -316,7 +323,7 @@ async fn export_chunk(
             manifest_hash: hash_text,
             index,
             total_chunks: 1 + document.environments.len(),
-            complete: document.environments.is_empty() && document.omitted_environment_count == 0,
+            complete: document.environments.is_empty(),
             account: Some(document.account),
             environment: None,
         }));
@@ -426,8 +433,7 @@ async fn export_chunk(
         manifest_hash: hash_text,
         index,
         total_chunks: 1 + document.environments.len(),
-        complete: index + 1 == 1 + document.environments.len()
-            && document.omitted_environment_count == 0,
+        complete: index + 1 == 1 + document.environments.len(),
         account: None,
         environment: Some(environment),
     }))
@@ -449,6 +455,7 @@ mod tests {
             },
             projects: Vec::new(),
             environments: Vec::new(),
+            not_shared_environment_ids: Vec::new(),
             omitted_environment_count: 0,
         };
         let encoded = serde_json::to_vec(&manifest).unwrap();

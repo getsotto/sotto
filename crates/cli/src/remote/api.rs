@@ -347,6 +347,8 @@ pub struct ExportManifest {
     pub complete: bool,
     pub projects: Vec<ExportProject>,
     pub environments: Vec<ExportEnvironmentRef>,
+    #[serde(default)]
+    pub not_shared_environment_ids: Vec<String>,
     pub omitted_environment_count: usize,
 }
 
