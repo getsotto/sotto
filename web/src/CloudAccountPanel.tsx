@@ -34,7 +34,6 @@ export function CloudAccountPanel() {
     try {
       const next = await fetchEligibility();
       setEligibility(next);
-      if (next.actions.billing) setQuote(await fetchPersonalQuote(offer));
     } catch (e) { setError(message(e)); }
   }
   useEffect(() => { void load(); }, []);
