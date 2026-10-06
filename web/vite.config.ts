@@ -135,6 +135,7 @@ Disallow: /app
 Disallow: /cloud
 Disallow: /s/
 Disallow: /auth
+# /account is the authenticated API; the browser Cloud surface lives at /cloud.
 Disallow: /account
 Disallow: /projects
 Disallow: /environments

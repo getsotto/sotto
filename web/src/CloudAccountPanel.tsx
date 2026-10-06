@@ -6,11 +6,13 @@ import {
   createPersonalPortal,
   fetchCloudExportChunk,
   fetchEligibility,
+  fetchPersonalOperation,
   fetchPersonalQuote,
   requestPersonalRefund,
   startCloudExport,
   type EligibilityView,
   type PersonalLifecycle,
+  type PersonalOperation,
   type PersonalQuote,
   type RefundRequest,
 } from "./api";
@@ -25,6 +27,7 @@ export function CloudAccountPanel() {
   const [quote, setQuote] = useState<PersonalQuote | null>(null);
   const [lifecycle, setLifecycle] = useState<PersonalLifecycle | null>(null);
   const [refund, setRefund] = useState<RefundRequest | null>(null);
+  const [operation, setOperation] = useState<PersonalOperation | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -47,6 +50,24 @@ export function CloudAccountPanel() {
     return () => { current = false; };
   }, [offer, eligibility?.actions.billing]);
 
+  async function refreshOperation() {
+    const operationId = sessionStorage.getItem("sotto_personal_operation_id");
+    if (operationId === null) return;
+    try {
+      const next = await fetchPersonalOperation(operationId);
+      setOperation(next);
+      if (next.state !== "pending") sessionStorage.removeItem("sotto_personal_operation_id");
+    } catch {
+      // A stale browser session must not turn into a billing error. Eligibility remains the
+      // source of truth when the operation has already been reconciled or expired.
+      sessionStorage.removeItem("sotto_personal_operation_id");
+    }
+  }
+
+  useEffect(() => {
+    if (eligibility?.state === "pending_initial_payment") void refreshOperation();
+  }, [eligibility?.state]);
+
   async function checkout() {
     if (quote === null) return;
     setBusy(true); setError(null); setNotice(null);
@@ -55,14 +76,18 @@ export function CloudAccountPanel() {
       // actual success/cancel paths are derived server-side, so query strings must not be added
       // here.
       const result = await createPersonalCheckout({ offer: quote.offer, idempotencyKey: crypto.randomUUID(), quoteVersion: quote.quoteVersion, quoteExpiresAtEpoch: quote.quoteExpiresAtEpoch, returnUrl: window.location.origin });
+      sessionStorage.setItem("sotto_personal_operation_id", result.operationId);
+      setOperation({ operationId: result.operationId, offer: quote.offer, state: result.state, checkoutUrl: result.checkoutUrl });
       if (result.checkoutUrl !== null) window.location.assign(result.checkoutUrl);
       else setNotice("Checkout is pending provider confirmation. Reload this page shortly.");
-    } catch (e) { setError(message(e)); setBusy(false); }
+    } catch (e) { setError(message(e)); }
+    finally { setBusy(false); }
   }
   async function portal() {
     setBusy(true); setError(null);
     try { const next = await createPersonalPortal(); if (next.portalUrl !== null) window.location.assign(next.portalUrl); else setNotice("The billing portal is not available yet."); }
-    catch (e) { setError(message(e)); setBusy(false); }
+    catch (e) { setError(message(e)); }
+    finally { setBusy(false); }
   }
   async function cancel() {
     setBusy(true); setError(null);
@@ -97,6 +122,7 @@ export function CloudAccountPanel() {
     {error !== null && <p role="alert">{error}</p>}{notice !== null && <p className="notice" role="status">{notice}</p>}
     <section aria-labelledby="status-heading"><h2 id="status-heading">Hosted access</h2><p><strong>{eligibility.state.replaceAll("_", " ")}</strong>{paidThrough !== null ? ` · paid through ${paidThrough}` : ""}</p>{recoveryUntil !== null && <p className="muted">Recovery is available until {recoveryUntil}.</p>}{eligibility.payer === null && eligibility.state === "paid" && <p className="muted">Your hosted access is sponsored or provided by another billing record. There is no personal upgrade to buy.</p>}{eligibility.state === "unavailable" && <p>Billing evidence is temporarily unavailable. Checkout is hidden until the account can be checked safely.</p>}</section>
     {eligibility.actions.billing && quote !== null && <section aria-labelledby="billing-heading"><h2 id="billing-heading">Choose hosted billing</h2><label>Term <select value={offer} onChange={(e) => setOffer(e.target.value as PersonalQuote["offer"])}><option value="monthly">Monthly</option><option value="annual">Annual</option></select></label><p>{pounds(quote.amountPence)} per {quote.interval}. Tax is shown at checkout.</p>{quote.founding && <p className="muted">Founding price: {quote.foundingRemainingPlaces ?? 0} places remain; {quote.foundingTerm}. Renews at {pounds(quote.nextRenewalAmountPence)}.</p>}<button className="primary" disabled={busy} onClick={() => void checkout()}>{busy ? "Opening checkout…" : "Continue to secure checkout"}</button></section>}
+    {eligibility.state === "pending_initial_payment" && <section aria-labelledby="pending-heading"><h2 id="pending-heading">Payment confirmation pending</h2><p>Your checkout is waiting for the verified payment webhook. Hosted access stays unchanged until it arrives.</p>{operation?.checkoutUrl !== null && operation?.checkoutUrl !== undefined && <p><a href={operation.checkoutUrl}>Return to checkout</a></p>}<button disabled={busy} onClick={() => void refreshOperation()}>Refresh payment status</button></section>}
     {(eligibility.state === "paid" || eligibility.state === "renewal_recovery") && <section aria-labelledby="manage-heading"><h2 id="manage-heading">Manage billing</h2><button disabled={busy} onClick={() => void portal()}>Open billing portal</button>{" "}{eligibility.actions.revoke && <button disabled={busy} onClick={() => void cancel()}>Cancel at the end of the paid period</button>}<button disabled={busy} onClick={() => void askRefund()}>Request a refund</button>{lifecycle?.cancelAtPeriodEnd && <p className="muted">Cancellation is scheduled; access remains available until {lifecycle.paidThroughDate ?? "the paid period ends"}.</p>}{refund !== null && <p className="muted">Refund request: {refund.state}. The paid term is preserved by default.</p>}</section>}
     {eligibility.actions.export && <section aria-labelledby="export-heading"><h2 id="export-heading">Recover your encrypted account</h2><p>{exportUntil === null ? "Your export window is open." : `Export before ${exportUntil}.`}</p>{eligibility.accountInitialized ? <button disabled={busy} onClick={() => void exportAccount()}>Download encrypted export</button> : <p>Set up your account before exporting.</p>}</section>}
     <p><a href="/app">Back to vault</a></p>

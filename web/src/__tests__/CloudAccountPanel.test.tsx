@@ -12,11 +12,15 @@ vi.mock("../api", () => ({
   fetchCloudExportChunk: vi.fn(),
   fetchEligibility: vi.fn(),
   fetchPersonalQuote: vi.fn(),
+  fetchPersonalOperation: vi.fn(),
   requestPersonalRefund: vi.fn(),
   startCloudExport: vi.fn(),
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  sessionStorage.clear();
+});
 
 const base = {
   accountInitialized: true,
@@ -55,5 +59,18 @@ describe("CloudAccountPanel", () => {
     expect(await screen.findByText(/£2\.99 per month/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /secure checkout/i })).toBeInTheDocument();
     expect(screen.getByText(/12 places remain/)).toBeInTheDocument();
+  });
+
+  it("keeps a pending checkout recoverable", async () => {
+    vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "pending_initial_payment" });
+    vi.mocked(api.fetchPersonalOperation).mockResolvedValue({
+      operationId: "operation-1", offer: "monthly", state: "pending", checkoutUrl: null,
+    });
+    sessionStorage.setItem("sotto_personal_operation_id", "operation-1");
+
+    render(<CloudAccountPanel />);
+
+    expect(await screen.findByRole("heading", { name: "Payment confirmation pending" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh payment status" })).toBeInTheDocument();
   });
 });
