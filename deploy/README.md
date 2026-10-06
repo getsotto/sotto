@@ -102,6 +102,14 @@ wrong. See [Uptime monitoring](#uptime-monitoring).
 Then open `https://<your-domain>` in a browser and sign in with GitHub. Point the CLI at your
 instance with `sotto login --server https://<your-domain>`.
 
+## Legacy billing transition
+
+Before changing an existing hosted account, run the read-only inventory and rehearsal in
+[`LEGACY-BILLING-CUTOVER-RUNBOOK.md`](./LEGACY-BILLING-CUTOVER-RUNBOOK.md). It reports aggregate
+legacy paid, trial, manual and contradictory cohorts plus token and link provenance without
+printing customer or provider identifiers. The inventory does not charge, backfill, revoke or
+change entitlements; an approved cohort and notice decision is required before a later cutover.
+
 ## Upgrading
 
 ```sh
