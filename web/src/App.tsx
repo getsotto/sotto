@@ -9,6 +9,7 @@ import { VaultApp } from "./VaultApp";
 
 // Minimal path routing (no router dependency):
 //   /app            → the vault app (login → unlock → view secrets)
+//   /cloud          → Cloud billing, recovery and export controls (no vault unlock)
 //   /s/:token       → the share recipient page (no account)
 //   /auth/callback  → the post-OAuth landing (SPA; the API endpoints are proxied elsewhere)
 //   /<guide-slug>   → an indexable guide page (see web/src/seo/pages.ts)
@@ -25,7 +26,7 @@ function route():
   if (path === "/app" || path === "/app/") {
     return { name: "vault" };
   }
-  if (path === "/account" || path === "/account/") {
+  if (path === "/cloud" || path === "/cloud/") {
     return { name: "account" };
   }
   const share = /^\/s\/([^/]+)$/.exec(path);

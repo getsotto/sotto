@@ -370,7 +370,11 @@ export async function fetchSponsoredQuote(orgId: string, input: { action: string
   const body = await postJson<{
     action: string; seat_count: number; amount_pence: number; currency: string; interval: string;
     quote_version: number; quote_expires_at_epoch: number;
-  }>(`/orgs/${encodeURIComponent(orgId)}/billing/sponsored/quote`, input);
+  }>(`/orgs/${encodeURIComponent(orgId)}/billing/sponsored/quote`, {
+    action: input.action,
+    offer: input.offer,
+    beneficiary_ids: input.beneficiaryIds,
+  });
   return { action: body.action, seatCount: body.seat_count, amountPence: body.amount_pence, currency: body.currency, interval: body.interval, quoteVersion: body.quote_version, quoteExpiresAtEpoch: body.quote_expires_at_epoch };
 }
 

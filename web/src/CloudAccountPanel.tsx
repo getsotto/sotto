@@ -39,7 +39,12 @@ export function CloudAccountPanel() {
   useEffect(() => { void load(); }, []);
   useEffect(() => {
     if (eligibility?.actions.billing !== true) return;
-    void fetchPersonalQuote(offer).then(setQuote).catch((e) => setError(message(e)));
+    let current = true;
+    setQuote(null);
+    void fetchPersonalQuote(offer)
+      .then((next) => { if (current) setQuote(next); })
+      .catch((e) => { if (current) setError(message(e)); });
+    return () => { current = false; };
   }, [offer, eligibility?.actions.billing]);
 
   async function checkout() {

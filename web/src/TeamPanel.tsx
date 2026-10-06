@@ -92,6 +92,7 @@ export function TeamPanel({
   const [billingOutcome] = useState(parseBillingOutcome);
   const [deletionActive, setDeletionActive] = useState(false);
   const [sponsoredSeats, setSponsoredSeats] = useState<import("./api").SponsoredSeat[]>([]);
+  const [sponsoredAvailable, setSponsoredAvailable] = useState<boolean | null>(null);
   const [sponsoredBeneficiary, setSponsoredBeneficiary] = useState("");
   const [sponsoredAction, setSponsoredAction] = useState<"add" | "remove" | "replace">("add");
   const [sponsoredReplacement, setSponsoredReplacement] = useState("");
@@ -138,6 +139,7 @@ export function TeamPanel({
     setPlan(null);
     setDeletionActive(false);
     setSponsoredSeats([]);
+    setSponsoredAvailable(null);
     try {
       const nextMembers = await fetchMembers(no.org.id);
       if (!isCurrent()) return;
@@ -150,9 +152,14 @@ export function TeamPanel({
         // Sponsored billing is opt-in and may be absent on older servers. It must not hide the
         // established membership surface when that capability is unavailable.
         try {
-          setSponsoredSeats(await fetchSponsoredSeats(no.org.id));
+          const nextSeats = await fetchSponsoredSeats(no.org.id);
+          if (!isCurrent()) return;
+          setSponsoredSeats(nextSeats);
+          setSponsoredAvailable(true);
         } catch {
+          if (!isCurrent()) return;
           setSponsoredSeats([]);
+          setSponsoredAvailable(false);
         }
       }
       // The audit log is admin/owner-only AND a Team feature; skip the fetch when gated.
@@ -183,6 +190,10 @@ export function TeamPanel({
         offer: "monthly",
         beneficiaryIds: [beneficiaryId],
       });
+      const effectiveFrom = Math.min(
+        Math.floor(Date.now() / 1000) + 30,
+        quote.quoteExpiresAtEpoch - 1,
+      );
       const result = await createSponsoredCheckout(openOrg.org.id, {
         action: sponsoredAction,
         offer: "monthly",
@@ -190,7 +201,7 @@ export function TeamPanel({
         replacementBeneficiaryId: sponsoredAction === "replace" ? sponsoredReplacement.trim() : undefined,
         quoteVersion: quote.quoteVersion,
         quoteExpiresAtEpoch: quote.quoteExpiresAtEpoch,
-        effectiveFrom: Math.floor(Date.now() / 1000),
+        effectiveFrom,
         effectiveUntil: sponsoredUntil === "" ? undefined : Math.floor(new Date(`${sponsoredUntil}T23:59:59Z`).getTime() / 1000),
         idempotencyKey: crypto.randomUUID(),
         returnUrl: window.location.origin,
@@ -369,7 +380,7 @@ export function TeamPanel({
               ))}
             </ul>
           )}
-          {canManage && (
+          {canManage && sponsoredAvailable === true && (
             <section aria-labelledby="sponsored-heading">
               <h3 id="sponsored-heading">Sponsored Cloud seats</h3>
               <p className="muted">Seat changes are quoted before checkout and take effect only after the provider confirms payment.</p>

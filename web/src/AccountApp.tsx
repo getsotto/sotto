@@ -36,7 +36,7 @@ export function AccountApp() {
     return <Shell><p role="alert">{error}</p><button className="primary" onClick={() => window.location.reload()}>Reload</button></Shell>;
   }
   if (phase === "loggedOut") {
-    return <Shell><h1>Manage your Sotto Cloud account</h1><p className="muted">Sign in to view billing, recovery and export controls. Unlocking your vault is not required.</p><button className="primary" onClick={startLogin}>Log in with GitHub</button></Shell>;
+    return <Shell><h1>Manage your Sotto Cloud account</h1><p className="muted">Sign in to view billing, recovery and export controls. Unlocking your vault is not required.</p><button className="primary" onClick={() => startLogin("/cloud")}>Log in with GitHub</button></Shell>;
   }
   return <Shell onLogout={() => void doLogout()}><CloudAccountPanel /></Shell>;
 }

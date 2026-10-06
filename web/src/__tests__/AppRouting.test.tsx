@@ -23,7 +23,7 @@ function visit(path: string) {
 
 describe("App share-link routing", () => {
   it("routes the account surface separately from the vault", () => {
-    visit("/account");
+    visit("/cloud");
 
     render(<App />);
 
