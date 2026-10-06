@@ -108,6 +108,11 @@ enum Command {
     },
     /// Log out of the sync server (clear the stored session token).
     Logout,
+    /// Show the Cloud server, eligibility and safe next actions without unlocking the vault.
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommand,
+    },
     /// Create a one-time / expiring share link for a secret and print it.
     #[command(
         after_help = "Examples:\n  sotto share DATABASE_URL\n  sotto share DATABASE_URL --views 3\n  sotto share DATABASE_URL --expire 3600"
@@ -258,6 +263,11 @@ Values are imported literally: $OTHER and ${OTHER} are not expanded, and an inli
         #[arg(long)]
         cloud: bool,
     },
+    /// Manage the metadata of links created by `sotto share` (ciphertext and fragment keys are never listed).
+    Shares {
+        #[command(subcommand)]
+        command: SharesCommand,
+    },
     /// Manage environments.
     Env {
         #[command(subcommand)]
@@ -339,6 +349,26 @@ enum TokenCommand {
     },
     /// Revoke a machine token (its access dies immediately; also run `sotto rotate` to re-key).
     Revoke { token_id: String },
+}
+
+#[derive(Subcommand)]
+enum CloudCommand {
+    /// Show server capability and account eligibility. `--json` is stable for CI diagnostics.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SharesCommand {
+    /// List link metadata without ciphertext or fragment material.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke one of your links by its public token.
+    Revoke { token: String },
 }
 
 #[derive(Subcommand)]
@@ -537,6 +567,9 @@ fn run() -> Result<()> {
             eprintln!("logged out");
             Ok(())
         }
+        Command::Cloud { command } => match command {
+            CloudCommand::Status { json } => cloud_status(&keychain, json),
+        },
         Command::Share {
             name,
             views,
@@ -595,6 +628,10 @@ fn run() -> Result<()> {
                 },
             )
         }
+        Command::Shares { command } => match command {
+            SharesCommand::Ls { json } => list_shares(&keychain, json),
+            SharesCommand::Revoke { token } => revoke_share(&keychain, &token),
+        },
         Command::Push => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
@@ -1288,6 +1325,104 @@ fn sync_client(keychain: &dyn Keychain) -> Result<remote::HttpClient> {
     let token = remote::auth::current_session(keychain)?
         .ok_or_else(|| Error::Input("not logged in; run `sotto login`".into()))?;
     Ok(remote::HttpClient::new(server, token))
+}
+
+/// Show Cloud capability and eligibility information without unlocking local state or opening a
+/// browser. Missing endpoints are deliberately rendered as an older-server message so the
+/// command remains useful while a self-hosted instance is upgraded.
+fn cloud_status(keychain: &dyn Keychain, json: bool) -> Result<()> {
+    let config_path = sotto_cli::paths::config_path()?;
+    let server = remote::config::server_url(None, &config_path)?;
+    let client = sync_client(keychain)?;
+    let server_info = client.server_info()?;
+    let eligibility = client.eligibility()?;
+
+    if json {
+        let value = serde_json::json!({
+            "server": server,
+            "server_info": server_info,
+            "eligibility": eligibility,
+        });
+        println!("{}", to_json(&value)?);
+        return Ok(());
+    }
+
+    println!("server: {server}");
+    match server_info {
+        Some(info) => {
+            println!("deployment: {}", info.deployment_mode);
+            println!("entitlement model: {}", info.entitlement_model);
+        }
+        None => println!("server capability discovery unavailable (older server)"),
+    }
+    match eligibility {
+        Some(view) => {
+            println!("eligibility model: {}", view.model);
+            println!("eligibility: {}", view.state);
+            println!("billing available: {}", view.billing_available);
+            println!(
+                "actions: setup={} billing={} export={} revoke={}",
+                view.actions.setup, view.actions.billing, view.actions.export, view.actions.revoke
+            );
+            if !view.next_actions.is_empty() {
+                println!("next actions: {}", view.next_actions.join(", "));
+            }
+            if let Some(epoch) = view.paid_through_epoch {
+                println!("paid through: {epoch}");
+            }
+            if let Some(epoch) = view.recovery_until_epoch {
+                println!("recovery until: {epoch}");
+            }
+            if let Some(epoch) = view.export_until_epoch {
+                println!("export until: {epoch}");
+            }
+        }
+        None => println!("account eligibility unavailable (older server)"),
+    }
+    Ok(())
+}
+
+fn list_shares(keychain: &dyn Keychain, json: bool) -> Result<()> {
+    let client = sync_client(keychain)?;
+    let list = remote::SyncApi::list_shares(&client)?;
+    if json {
+        println!("{}", to_json(&list)?);
+        return Ok(());
+    }
+
+    println!("active free links: {}", list.active_free_count);
+    if list.links.is_empty() {
+        println!("no share links");
+        return Ok(());
+    }
+    for link in list.links {
+        let expiry = link
+            .expires_at
+            .as_deref()
+            .map(|value| format!("expires {value}"))
+            .unwrap_or_else(|| "no expiry".into());
+        let revoked = link
+            .revoked_at
+            .as_deref()
+            .map(|value| format!(", revoked {value}"))
+            .unwrap_or_default();
+        println!(
+            "{}  class={}  views={}/{}  {expiry}{revoked}",
+            link.token, link.share_class, link.view_count, link.max_views
+        );
+    }
+    Ok(())
+}
+
+fn revoke_share(keychain: &dyn Keychain, token: &str) -> Result<()> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(Error::Input("share token must not be empty".into()));
+    }
+    let client = sync_client(keychain)?;
+    remote::SyncApi::revoke_share(&client, token)?;
+    eprintln!("revoked share {token}");
+    Ok(())
 }
 
 /// Log in to the sync server via the loopback OAuth flow, then persist the session + server URL.
@@ -2015,8 +2150,8 @@ mod tests {
 
     use super::{
         display_secret, env_list_json, history_line, import_dotenv, login_config,
-        machine_token_list_json, set_confirmation, Cli, Command, EnvCommand, ThemeCommand,
-        TokenCommand,
+        machine_token_list_json, set_confirmation, Cli, CloudCommand, Command, EnvCommand,
+        SharesCommand, ThemeCommand, TokenCommand,
     };
 
     #[test]
@@ -2545,6 +2680,36 @@ mod tests {
             panic!("expected TokenCommand::Ls");
         };
         assert!(json);
+    }
+
+    #[test]
+    fn cloud_and_share_management_commands_parse_without_local_setup() {
+        let cli = Cli::try_parse_from(["sotto", "cloud", "status", "--json"])
+            .expect("sotto cloud status --json should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Cloud {
+                command: CloudCommand::Status { json: true }
+            })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["sotto", "shares", "ls"]).expect("sotto shares ls should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Shares {
+                command: SharesCommand::Ls { json: false }
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "shares", "revoke", "share-token"])
+            .expect("sotto shares revoke should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Shares {
+                command: SharesCommand::Revoke { token }
+            }) if token == "share-token"
+        ));
     }
 
     #[test]
