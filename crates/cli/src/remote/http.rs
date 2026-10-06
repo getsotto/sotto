@@ -318,6 +318,9 @@ impl SyncApi for HttpClient {
             .bearer_auth(&self.token)
             .send()
             .map_err(net)?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Err(Error::NotFound(format!("share `{token}`")));
+        }
         ok(resp)
     }
 
@@ -609,5 +612,14 @@ mod tests {
             .server_info()
             .expect("SPA fallback should not be an error")
             .is_none());
+    }
+
+    #[test]
+    fn revoking_an_unknown_share_is_not_found() {
+        let base = serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nmissing",
+        );
+        let result = HttpClient::new(base, "session".into()).revoke_share("typo");
+        assert!(matches!(result, Err(Error::NotFound(message)) if message == "share `typo`"));
     }
 }
