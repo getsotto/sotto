@@ -46,7 +46,10 @@ export function CloudAccountPanel() {
     if (quote === null) return;
     setBusy(true); setError(null); setNotice(null);
     try {
-      const result = await createPersonalCheckout({ offer: quote.offer, idempotencyKey: crypto.randomUUID(), quoteVersion: quote.quoteVersion, quoteExpiresAtEpoch: quote.quoteExpiresAtEpoch, returnUrl: `${window.location.origin}/account?billing=complete` });
+      // The server accepts only its configured web origin as the return-url identity. Stripe's
+      // actual success/cancel paths are derived server-side, so query strings must not be added
+      // here.
+      const result = await createPersonalCheckout({ offer: quote.offer, idempotencyKey: crypto.randomUUID(), quoteVersion: quote.quoteVersion, quoteExpiresAtEpoch: quote.quoteExpiresAtEpoch, returnUrl: window.location.origin });
       if (result.checkoutUrl !== null) window.location.assign(result.checkoutUrl);
       else setNotice("Checkout is pending provider confirmation. Reload this page shortly.");
     } catch (e) { setError(message(e)); setBusy(false); }

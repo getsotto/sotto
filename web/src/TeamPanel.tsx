@@ -193,7 +193,7 @@ export function TeamPanel({
         effectiveFrom: Math.floor(Date.now() / 1000),
         effectiveUntil: sponsoredUntil === "" ? undefined : Math.floor(new Date(`${sponsoredUntil}T23:59:59Z`).getTime() / 1000),
         idempotencyKey: crypto.randomUUID(),
-        returnUrl: `${window.location.origin}/app?billing=complete`,
+        returnUrl: window.location.origin,
       });
       if (result.checkoutUrl !== null) window.location.assign(result.checkoutUrl);
       else setNotice("Seat checkout is pending provider confirmation. Reload shortly.");
