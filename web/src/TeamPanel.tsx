@@ -93,6 +93,9 @@ export function TeamPanel({
   const [deletionActive, setDeletionActive] = useState(false);
   const [sponsoredSeats, setSponsoredSeats] = useState<import("./api").SponsoredSeat[]>([]);
   const [sponsoredBeneficiary, setSponsoredBeneficiary] = useState("");
+  const [sponsoredAction, setSponsoredAction] = useState<"add" | "remove" | "replace">("add");
+  const [sponsoredReplacement, setSponsoredReplacement] = useState("");
+  const [sponsoredUntil, setSponsoredUntil] = useState("");
   const [sponsoredBusy, setSponsoredBusy] = useState(false);
   const orgLoadGeneration = useRef(0);
   const billingGeneration = useRef(0);
@@ -176,17 +179,19 @@ export function TeamPanel({
     try {
       const beneficiaryId = sponsoredBeneficiary.trim();
       const quote = await fetchSponsoredQuote(openOrg.org.id, {
-        action: "add",
+        action: sponsoredAction,
         offer: "monthly",
         beneficiaryIds: [beneficiaryId],
       });
       const result = await createSponsoredCheckout(openOrg.org.id, {
-        action: "add",
+        action: sponsoredAction,
         offer: "monthly",
         beneficiaryId,
+        replacementBeneficiaryId: sponsoredAction === "replace" ? sponsoredReplacement.trim() : undefined,
         quoteVersion: quote.quoteVersion,
         quoteExpiresAtEpoch: quote.quoteExpiresAtEpoch,
         effectiveFrom: Math.floor(Date.now() / 1000),
+        effectiveUntil: sponsoredUntil === "" ? undefined : Math.floor(new Date(`${sponsoredUntil}T23:59:59Z`).getTime() / 1000),
         idempotencyKey: crypto.randomUUID(),
         returnUrl: `${window.location.origin}/app?billing=complete`,
       });
@@ -374,8 +379,11 @@ export function TeamPanel({
                 </ul>
               )}
               <form className="row" onSubmit={(e) => { e.preventDefault(); void addSponsoredSeat(); }}>
+                <label>Change <select value={sponsoredAction} onChange={(e) => setSponsoredAction(e.target.value as "add" | "remove" | "replace")} disabled={sponsoredBusy}><option value="add">Add seat</option><option value="remove">Remove seat</option><option value="replace">Replace seat</option></select></label>
                 <label>Beneficiary user id<input value={sponsoredBeneficiary} onChange={(e) => setSponsoredBeneficiary(e.target.value)} disabled={sponsoredBusy} /></label>
-                <button type="submit" disabled={sponsoredBusy || sponsoredBeneficiary.trim() === ""}>{sponsoredBusy ? "Preparing…" : "Add seat"}</button>
+                {sponsoredAction === "replace" && <label>Replacement user id<input value={sponsoredReplacement} onChange={(e) => setSponsoredReplacement(e.target.value)} disabled={sponsoredBusy} /></label>}
+                {sponsoredAction !== "add" && <label>Effective until<input type="date" value={sponsoredUntil} onChange={(e) => setSponsoredUntil(e.target.value)} disabled={sponsoredBusy} required /></label>}
+                <button type="submit" disabled={sponsoredBusy || sponsoredBeneficiary.trim() === "" || (sponsoredAction === "replace" && sponsoredReplacement.trim() === "")}>{sponsoredBusy ? "Preparing…" : sponsoredAction === "add" ? "Add seat" : sponsoredAction === "remove" ? "Schedule removal" : "Schedule replacement"}</button>
               </form>
             </section>
           )}
