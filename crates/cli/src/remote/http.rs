@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use reqwest::blocking::{Client, Response};
-use reqwest::header::IF_NONE_MATCH;
+use reqwest::header::{CONTENT_TYPE, IF_NONE_MATCH};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 
@@ -61,10 +61,7 @@ impl HttpClient {
             .get(self.url("/server/info"))
             .send()
             .map_err(net)?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        parse(resp).map(Some)
+        parse_optional_json(resp)
     }
 
     /// Read the account's Cloud state. A 404 is the supported fallback for older servers.
@@ -75,10 +72,7 @@ impl HttpClient {
             .bearer_auth(&self.token)
             .send()
             .map_err(net)?;
-        if resp.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        parse(resp).map(Some)
+        parse_optional_json(resp)
     }
 }
 
@@ -132,6 +126,35 @@ fn parse<T: DeserializeOwned>(resp: Response) -> Result<T> {
     } else {
         Err(server_error(resp))
     }
+}
+
+/// Parse an optional discovery response. Older reverse proxies can serve the SPA document with a
+/// successful status for an unknown API route; that is the same compatibility case as a 404.
+fn parse_optional_json<T: DeserializeOwned>(resp: Response) -> Result<Option<T>> {
+    if !resp.status().is_success() {
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        return Err(server_error(resp));
+    }
+
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().map_err(|e| Error::Server(e.to_string()))?;
+    let trimmed = body.trim_start();
+    if content_type
+        .as_deref()
+        .is_some_and(|value| !value.to_ascii_lowercase().contains("json"))
+        || trimmed.starts_with('<')
+    {
+        return Ok(None);
+    }
+    serde_json::from_str(trimmed)
+        .map(Some)
+        .map_err(|e| Error::Server(e.to_string()))
 }
 
 /// Expect a 2xx with no body of interest.
@@ -575,5 +598,16 @@ mod tests {
             classify_status(StatusCode::SERVICE_UNAVAILABLE, None, String::new()),
             Error::Unavailable(message) if message == "server unavailable"
         ));
+    }
+
+    #[test]
+    fn discovery_treats_an_older_spa_fallback_as_missing() {
+        let base = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<html>old app</html>",
+        );
+        assert!(HttpClient::new(base, "session".into())
+            .server_info()
+            .expect("SPA fallback should not be an error")
+            .is_none());
     }
 }

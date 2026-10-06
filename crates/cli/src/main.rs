@@ -1337,10 +1337,7 @@ fn cloud_status(keychain: &dyn Keychain, json: bool) -> Result<()> {
     let client = sync_client(keychain)?;
     let server_info = client.server_info()?;
     let eligibility = client.eligibility()?;
-    let billing_url = eligibility
-        .as_ref()
-        .filter(|view| view.actions.billing)
-        .map(|_| format!("{web_base}/cloud"));
+    let billing_url = billing_handoff_url(eligibility.as_ref(), &web_base);
 
     if json {
         let value = serde_json::json!({
@@ -1389,6 +1386,26 @@ fn cloud_status(keychain: &dyn Keychain, json: bool) -> Result<()> {
         None => println!("account eligibility unavailable (older server)"),
     }
     Ok(())
+}
+
+fn billing_handoff_url(
+    eligibility: Option<&remote::api::EligibilityView>,
+    web_base: &str,
+) -> Option<String> {
+    if !eligibility.is_some_and(|view| view.billing_available) {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(web_base).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    Some(format!("{}/cloud", web_base.trim_end_matches('/')))
 }
 
 fn list_shares(keychain: &dyn Keychain, json: bool) -> Result<()> {
@@ -2719,6 +2736,43 @@ mod tests {
                 command: SharesCommand::Revoke { token }
             }) if token == "share-token"
         ));
+    }
+
+    #[test]
+    fn billing_handoff_is_available_for_existing_cloud_billing_accounts() {
+        let view = sotto_cli::remote::api::EligibilityView {
+            model: "person_eligibility_v1".into(),
+            state: "paid".into(),
+            deployment_mode: "cloud".into(),
+            account_initialized: true,
+            billing_available: true,
+            paid_through_epoch: Some(1),
+            recovery_until_epoch: None,
+            export_until_epoch: None,
+            actions: sotto_cli::remote::api::EligibilityActions {
+                setup: false,
+                billing: false,
+                export: false,
+                revoke: true,
+            },
+            next_actions: vec!["revoke".into()],
+            payer: Some("personal".into()),
+        };
+        assert_eq!(
+            super::billing_handoff_url(Some(&view), "https://app.example"),
+            Some("https://app.example/cloud".into())
+        );
+        assert_eq!(
+            super::billing_handoff_url(Some(&view), "javascript:alert(1)"),
+            None
+        );
+        assert_eq!(
+            super::billing_handoff_url(
+                Some(&view),
+                "https://app.example/?redirect=https%3A%2F%2Fevil.example"
+            ),
+            None
+        );
     }
 
     #[test]
