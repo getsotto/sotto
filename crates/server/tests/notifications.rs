@@ -220,3 +220,61 @@ async fn verified_contact_cannot_be_reassigned_to_another_user() {
     cleanup(&pool, OWNER).await;
     cleanup(&pool, OTHER).await;
 }
+
+#[tokio::test]
+async fn deleted_contact_fails_queued_email_without_breaking_the_outbox_row() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "notification-test-deleted-contact";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    notifications::record_verified_email(
+        &pool,
+        "contact-deleted",
+        USER_ID,
+        "person@example.test",
+        1_800_000_000,
+    )
+    .await
+    .expect("record verified contact");
+    let intent = NoticeIntent {
+        recipient_user_id: USER_ID.into(),
+        event_key: "event-deleted-contact".into(),
+        policy_key: "recovery-v1".into(),
+        kind: NoticeKind::RecoveryEnd,
+        channel: NoticeChannel::Email,
+        contact_id: Some("contact-deleted".into()),
+        due_at_epoch: 1,
+        content: content(),
+    };
+    notifications::enqueue(&pool, &intent)
+        .await
+        .expect("enqueue email notice");
+    sqlx::query("DELETE FROM cloud_verified_contacts WHERE contact_id='contact-deleted'")
+        .execute(&pool)
+        .await
+        .expect("delete verified contact");
+
+    let mut sender = RetrySender;
+    assert!(
+        notifications::run_once(&pool, "worker-deleted-contact", &mut sender)
+            .await
+            .expect("mark deleted contact unavailable")
+    );
+    let row = sqlx::query(
+        "SELECT status, last_error_code, contact_id FROM cloud_notice_outbox \
+         WHERE recipient_user_id=$1 AND event_key='event-deleted-contact'",
+    )
+    .bind(USER_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load deleted-contact notice");
+    assert_eq!(row.get::<String, _>("status"), "failed");
+    assert_eq!(
+        row.get::<String, _>("last_error_code"),
+        "contact_unavailable"
+    );
+    assert_eq!(row.get::<Option<String>, _>("contact_id"), None);
+    cleanup(&pool, USER_ID).await;
+}

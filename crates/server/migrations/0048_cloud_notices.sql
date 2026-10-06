@@ -40,7 +40,9 @@ CREATE TABLE IF NOT EXISTS cloud_notice_outbox (
     CHECK (channel IN ('in_app', 'email')),
     CHECK (status IN ('pending', 'leased', 'delivered', 'cancelled', 'failed')),
     CHECK (attempt_count >= 0),
-    CHECK ((channel = 'in_app' AND contact_id IS NULL) OR (channel = 'email' AND contact_id IS NOT NULL))
+    -- A deleted contact is nulled by the foreign key. The worker revalidates before sending and
+    -- records contact_missing, while enqueue still requires an active verified contact.
+    CHECK ((channel = 'in_app' AND contact_id IS NULL) OR channel = 'email')
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS cloud_notice_outbox_identity_idx
