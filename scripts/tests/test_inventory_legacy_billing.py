@@ -61,6 +61,9 @@ class Database(unittest.TestCase):
     def test_inventory_query_is_read_only(self):
         self.assertNotRegex(inventory.INVENTORY_SQL, r"(?i)\b(insert|update|delete|alter|drop)\b")
 
+    def test_deleted_organisation_tombstones_are_not_live_cohorts(self):
+        self.assertEqual(inventory.INVENTORY_SQL.count("WHERE lifecycle_state <> 'deleted'"), 2)
+
     def test_database_password_is_not_an_argument(self):
         completed = mock.Mock(stdout="organisation_cohort\tlegacy_free\t1\n")
         provenance = mock.Mock(stdout="50|160000\n")

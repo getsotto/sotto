@@ -56,7 +56,9 @@ SELECT 'organisation_cohort' AS category, CASE
         THEN 'quarantine_trial_tier_mismatch'
     ELSE 'legacy_free'
 END AS label, count(*)::text
-FROM organizations GROUP BY 1, 2
+FROM organizations
+WHERE lifecycle_state <> 'deleted'
+GROUP BY 1, 2
 UNION ALL
 SELECT 'personal_billing_state', state, count(*)::text
 FROM billing_personal_accounts GROUP BY 1, 2
@@ -90,7 +92,9 @@ SELECT 'legacy_subscription_link', CASE
     WHEN stripe_subscription_id IS NOT NULL THEN 'organisation_subscription'
     ELSE 'no_organisation_subscription'
 END, count(*)::text
-FROM organizations GROUP BY 1, 2
+FROM organizations
+WHERE lifecycle_state <> 'deleted'
+GROUP BY 1, 2
 UNION ALL
 SELECT 'personal_provider_link', CASE
     WHEN stripe_subscription_id IS NOT NULL AND stripe_customer_id IS NOT NULL THEN 'complete'
