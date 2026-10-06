@@ -1333,13 +1333,19 @@ fn sync_client(keychain: &dyn Keychain) -> Result<remote::HttpClient> {
 fn cloud_status(keychain: &dyn Keychain, json: bool) -> Result<()> {
     let config_path = sotto_cli::paths::config_path()?;
     let server = remote::config::server_url(None, &config_path)?;
+    let web_base = remote::config::web_base(&config_path)?;
     let client = sync_client(keychain)?;
     let server_info = client.server_info()?;
     let eligibility = client.eligibility()?;
+    let billing_url = eligibility
+        .as_ref()
+        .filter(|view| view.actions.billing)
+        .map(|_| format!("{web_base}/cloud"));
 
     if json {
         let value = serde_json::json!({
             "server": server,
+            "billing_url": billing_url,
             "server_info": server_info,
             "eligibility": eligibility,
         });
@@ -1366,6 +1372,9 @@ fn cloud_status(keychain: &dyn Keychain, json: bool) -> Result<()> {
             );
             if !view.next_actions.is_empty() {
                 println!("next actions: {}", view.next_actions.join(", "));
+            }
+            if let Some(url) = billing_url {
+                println!("billing url: {url}");
             }
             if let Some(epoch) = view.paid_through_epoch {
                 println!("paid through: {epoch}");
