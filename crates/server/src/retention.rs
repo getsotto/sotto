@@ -143,6 +143,7 @@ pub struct ScopeItem {
     pub resource_kind: String,
     pub resource_id: String,
     pub ownership_kind: String,
+    pub expected_created_at_epoch: i64,
     pub expected_revision: Option<i64>,
 }
 
@@ -153,6 +154,9 @@ impl ScopeItem {
         bounded(&self.resource_id, MAX_KEY, "resource_id")?;
         if !matches!(self.ownership_kind.as_str(), "personal" | "shared") {
             return Err(RetentionError::InvalidInput("ownership_kind"));
+        }
+        if self.expected_created_at_epoch <= 0 {
+            return Err(RetentionError::InvalidInput("expected_created_at_epoch"));
         }
         if !matches!(
             self.resource_kind.as_str(),
@@ -253,19 +257,33 @@ pub async fn enqueue_in_tx(
 
 pub async fn add_scope_item(pool: &PgPool, item: &ScopeItem) -> RetentionResult<bool> {
     item.validate()?;
+    let mut tx = pool.begin().await?;
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM cloud_retention_jobs WHERE job_id=$1 FOR UPDATE")
+            .bind(&item.job_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(state) = state else {
+        return Err(RetentionError::NotFound);
+    };
+    if state != RetentionState::Planned.as_str() {
+        return Err(RetentionError::Held("retention scope is immutable"));
+    }
     let inserted = sqlx::query(
         "INSERT INTO cloud_retention_scope_items \
-         (job_id, resource_kind, resource_id, ownership_kind, expected_revision) \
-         VALUES ($1,$2,$3,$4,$5) ON CONFLICT (job_id, resource_kind, resource_id) DO NOTHING",
+         (job_id, resource_kind, resource_id, ownership_kind, expected_created_at, expected_revision) \
+         VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (job_id, resource_kind, resource_id) DO NOTHING",
     )
     .bind(&item.job_id)
     .bind(&item.resource_kind)
     .bind(&item.resource_id)
     .bind(&item.ownership_kind)
+    .bind(item.expected_created_at_epoch)
     .bind(item.expected_revision)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
+    tx.commit().await?;
     Ok(inserted == 1)
 }
 
@@ -314,8 +332,9 @@ pub async fn cancel(pool: &PgPool, job_id: &str, reason: &str) -> RetentionResul
     bounded(job_id, MAX_KEY, "job_id")?;
     bounded(reason, 160, "reason")?;
     let affected = sqlx::query(
-        "UPDATE cloud_retention_jobs SET state='cancelled', hold_code=$2, updated_at=now() \
-         WHERE job_id=$1 AND state IN ('planned','dry_run','ready','held')",
+        "UPDATE cloud_retention_jobs SET state='cancelled', hold_code=$2, lease_owner=NULL, \
+             lease_expires_at=NULL, updated_at=now() \
+         WHERE job_id=$1 AND state IN ('planned','dry_run','ready','held','leased')",
     )
     .bind(job_id)
     .bind(reason)
@@ -345,7 +364,7 @@ pub async fn enable_purge(pool: &PgPool, job_id: &str) -> RetentionResult<()> {
 pub async fn list_scope(pool: &PgPool, job_id: &str) -> RetentionResult<Vec<ScopeItem>> {
     bounded(job_id, MAX_KEY, "job_id")?;
     let rows = sqlx::query(
-        "SELECT job_id, resource_kind, resource_id, ownership_kind, expected_revision \
+        "SELECT job_id, resource_kind, resource_id, ownership_kind, expected_created_at, expected_revision \
          FROM cloud_retention_scope_items WHERE job_id=$1 ORDER BY resource_kind, resource_id \
          LIMIT $2",
     )
@@ -365,6 +384,7 @@ pub async fn list_scope(pool: &PgPool, job_id: &str) -> RetentionResult<Vec<Scop
                 resource_kind: row.try_get("resource_kind")?,
                 resource_id: row.try_get("resource_id")?,
                 ownership_kind: row.try_get("ownership_kind")?,
+                expected_created_at_epoch: row.try_get("expected_created_at")?,
                 expected_revision: row.try_get("expected_revision")?,
             })
         })
@@ -443,6 +463,30 @@ pub async fn run_once(
     }
 
     let mut tx = pool.begin().await?;
+    let lease_state = sqlx::query(
+        "SELECT state, lease_owner FROM cloud_retention_jobs WHERE job_id=$1 FOR UPDATE",
+    )
+    .bind(&lease.job_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(lease_state) = lease_state else {
+        return Err(RetentionError::LeaseLost);
+    };
+    let state: String = lease_state.try_get("state")?;
+    let owner: Option<String> = lease_state.try_get("lease_owner")?;
+    if state == RetentionState::Cancelled.as_str() {
+        tx.commit().await?;
+        return Ok(Some(RetentionRun {
+            job_id: lease.job_id,
+            state: RetentionState::Cancelled,
+            dry_run: lease.dry_run,
+            processed_items: 0,
+            held_items: 0,
+        }));
+    }
+    if state != RetentionState::Leased.as_str() || owner.as_deref() != Some(&lease.worker_id) {
+        return Err(RetentionError::LeaseLost);
+    }
     if let Some(expected) = lease.expected_coverage_revision {
         let current: Option<i64> = sqlx::query_scalar(
             "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id=$1",
@@ -464,7 +508,7 @@ pub async fn run_once(
     }
 
     let items = sqlx::query(
-        "SELECT resource_kind, resource_id, ownership_kind, expected_revision \
+        "SELECT resource_kind, resource_id, ownership_kind, expected_created_at, expected_revision \
          FROM cloud_retention_scope_items WHERE job_id=$1 AND state='planned' \
          ORDER BY resource_kind, resource_id LIMIT $2 FOR UPDATE",
     )
@@ -473,19 +517,13 @@ pub async fn run_once(
     .fetch_all(&mut *tx)
     .await?;
     if mode == RetentionMode::DryRun {
-        let remaining: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM cloud_retention_scope_items WHERE job_id=$1 AND state='planned'",
-        )
-        .bind(&lease.job_id)
-        .fetch_one(&mut *tx)
-        .await?;
         clear_lease(&mut tx, &lease, RetentionState::DryRun).await?;
         tx.commit().await?;
         return Ok(Some(RetentionRun {
             job_id: lease.job_id,
             state: RetentionState::DryRun,
             dry_run: true,
-            processed_items: remaining as usize,
+            processed_items: items.len(),
             held_items: items
                 .iter()
                 .filter(|item| {
@@ -503,10 +541,12 @@ pub async fn run_once(
         .ok_or(RetentionError::Held("shared scope is not deletable"))?;
     let mut processed = 0;
     let mut held = 0;
+    let mut hold_reason = None;
     for item in &items {
         let resource_kind: String = item.try_get("resource_kind")?;
         let resource_id: String = item.try_get("resource_id")?;
         let ownership_kind: String = item.try_get("ownership_kind")?;
+        let expected_created_at_epoch: i64 = item.try_get("expected_created_at")?;
         let expected_revision: Option<i64> = item.try_get("expected_revision")?;
         if lease.scope_kind != ScopeKind::Personal.as_str() || ownership_kind != "personal" {
             sqlx::query(
@@ -519,34 +559,127 @@ pub async fn run_once(
             .execute(&mut *tx)
             .await?;
             held += 1;
+            hold_reason = Some("shared_resource");
             continue;
         }
         let deleted = match resource_kind.as_str() {
             "project" => {
-                sqlx::query("DELETE FROM projects WHERE id=$1 AND owner_id=$2 AND org_id IS NULL")
+                let current = sqlx::query(
+                    "SELECT owner_id, org_id, (extract(epoch from created_at) * 1000000)::bigint AS created_epoch \
+                     FROM projects WHERE id=$1 FOR UPDATE",
+                )
                     .bind(&resource_id)
-                    .bind(subject)
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected()
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                match current {
+                    None => 0,
+                    Some(current) => {
+                        let owner_id: String = current.try_get("owner_id")?;
+                        let org_id: Option<String> = current.try_get("org_id")?;
+                        let created_epoch: i64 = current.try_get("created_epoch")?;
+                        if owner_id != subject
+                            || org_id.is_some()
+                            || created_epoch != expected_created_at_epoch
+                        {
+                            sqlx::query(
+                            "UPDATE cloud_retention_scope_items SET state='held', hold_code='resource_identity_changed', updated_at=now() \
+                             WHERE job_id=$1 AND resource_kind=$2 AND resource_id=$3",
+                        )
+                        .bind(&lease.job_id)
+                        .bind(&resource_kind)
+                        .bind(&resource_id)
+                        .execute(&mut *tx)
+                        .await?;
+                            held += 1;
+                            hold_reason = Some("resource_identity_changed");
+                            continue;
+                        }
+                        sqlx::query("DELETE FROM projects WHERE id=$1")
+                            .bind(&resource_id)
+                            .execute(&mut *tx)
+                            .await?
+                            .rows_affected()
+                    }
+                }
             }
-            "environment" => sqlx::query(
-                "DELETE FROM environments e USING projects p \
-                 WHERE e.id=$1 AND e.project_id=p.id AND p.owner_id=$2 AND p.org_id IS NULL \
-                   AND ($3::bigint IS NULL OR e.revision=$3)",
-            )
-            .bind(&resource_id)
-            .bind(subject)
-            .bind(expected_revision)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected(),
-            "share" => sqlx::query("DELETE FROM share_links WHERE id=$1 AND created_by=$2")
+            "environment" => {
+                let current = sqlx::query(
+                    "SELECT e.revision, p.owner_id, p.org_id, \
+                            (extract(epoch from e.created_at) * 1000000)::bigint AS created_epoch \
+                     FROM environments e JOIN projects p ON p.id=e.project_id \
+                     WHERE e.id=$1 FOR UPDATE",
+                )
                 .bind(&resource_id)
-                .bind(subject)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected(),
+                .fetch_optional(&mut *tx)
+                .await?;
+                match current {
+                    None => 0,
+                    Some(current) => {
+                        let revision: i64 = current.try_get("revision")?;
+                        let owner_id: String = current.try_get("owner_id")?;
+                        let org_id: Option<String> = current.try_get("org_id")?;
+                        let created_epoch: i64 = current.try_get("created_epoch")?;
+                        if owner_id != subject
+                            || org_id.is_some()
+                            || expected_revision.is_some_and(|expected| expected != revision)
+                            || created_epoch != expected_created_at_epoch
+                        {
+                            sqlx::query(
+                            "UPDATE cloud_retention_scope_items SET state='held', hold_code='resource_identity_changed', updated_at=now() \
+                             WHERE job_id=$1 AND resource_kind=$2 AND resource_id=$3",
+                        )
+                        .bind(&lease.job_id)
+                        .bind(&resource_kind)
+                        .bind(&resource_id)
+                        .execute(&mut *tx)
+                            .await?;
+                            held += 1;
+                            hold_reason = Some("resource_identity_changed");
+                            continue;
+                        }
+                        sqlx::query("DELETE FROM environments WHERE id=$1")
+                            .bind(&resource_id)
+                            .execute(&mut *tx)
+                            .await?
+                            .rows_affected()
+                    }
+                }
+            }
+            "share" => {
+                let current = sqlx::query(
+                    "SELECT created_by, (extract(epoch from created_at) * 1000000)::bigint AS created_epoch \
+                     FROM share_links WHERE id=$1 FOR UPDATE",
+                )
+                .bind(&resource_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                match current {
+                    None => 0,
+                    Some(current) => {
+                        let created_by: String = current.try_get("created_by")?;
+                        let created_epoch: i64 = current.try_get("created_epoch")?;
+                        if created_by != subject || created_epoch != expected_created_at_epoch {
+                            sqlx::query(
+                            "UPDATE cloud_retention_scope_items SET state='held', hold_code='resource_identity_changed', updated_at=now() \
+                             WHERE job_id=$1 AND resource_kind=$2 AND resource_id=$3",
+                        )
+                        .bind(&lease.job_id)
+                        .bind(&resource_kind)
+                        .bind(&resource_id)
+                        .execute(&mut *tx)
+                        .await?;
+                            held += 1;
+                            hold_reason = Some("resource_identity_changed");
+                            continue;
+                        }
+                        sqlx::query("DELETE FROM share_links WHERE id=$1")
+                            .bind(&resource_id)
+                            .execute(&mut *tx)
+                            .await?
+                            .rows_affected()
+                    }
+                }
+            }
             _ => return Err(RetentionError::InvalidInput("resource_kind")),
         };
         let tombstone = serde_json::json!({
@@ -593,7 +726,12 @@ pub async fn run_once(
         }
     };
     if held > 0 {
-        set_job_hold(&mut tx, &lease, "shared_resource").await?;
+        set_job_hold(
+            &mut tx,
+            &lease,
+            hold_reason.unwrap_or("retention_scope_held"),
+        )
+        .await?;
     } else {
         clear_lease(&mut tx, &lease, next_state).await?;
     }

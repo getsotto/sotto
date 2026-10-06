@@ -50,6 +50,9 @@ CREATE TABLE IF NOT EXISTS cloud_retention_scope_items (
     resource_kind       TEXT NOT NULL,
     resource_id         TEXT NOT NULL,
     ownership_kind      TEXT NOT NULL,
+    -- Microseconds since epoch make the creation identity exact instead of truncating the
+    -- database timestamp to seconds before comparing it during purge.
+    expected_created_at BIGINT NOT NULL CHECK (expected_created_at > 0),
     expected_revision   BIGINT,
     state               TEXT NOT NULL DEFAULT 'planned',
     hold_code           TEXT,
