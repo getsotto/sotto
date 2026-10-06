@@ -3,11 +3,18 @@
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{PgPool, Row};
 use std::str::FromStr;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
 
 use sotto_server::db;
 use sotto_server::retention::{
     self, EnqueueOutcome, RetentionIntent, RetentionMode, RetentionState, ScopeItem, ScopeKind,
 };
+
+fn retention_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 async fn pool_or_skip() -> Option<PgPool> {
     if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
@@ -93,6 +100,7 @@ fn intent(job_id: &str, user_id: &str) -> RetentionIntent {
 
 #[tokio::test]
 async fn dry_run_is_idempotent_and_purge_deletes_only_the_explicit_personal_scope() {
+    let _guard = retention_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -191,6 +199,7 @@ async fn dry_run_is_idempotent_and_purge_deletes_only_the_explicit_personal_scop
 
 #[tokio::test]
 async fn shared_scope_holds_and_cancellation_stops_due_work() {
+    let _guard = retention_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -272,6 +281,7 @@ async fn shared_scope_holds_and_cancellation_stops_due_work() {
 
 #[tokio::test]
 async fn recreated_project_is_held_instead_of_being_purged() {
+    let _guard = retention_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
