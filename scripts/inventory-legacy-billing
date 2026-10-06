@@ -26,6 +26,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 INVENTORY_VERSION = 1
+LIBPQ_QUERY_OPTIONS = {
+    "sslmode": "PGSSLMODE",
+    "sslrootcert": "PGSSLROOTCERT",
+    "sslcert": "PGSSLCERT",
+    "sslkey": "PGSSLKEY",
+    "sslcrl": "PGSSLCRL",
+    "sslcrldir": "PGSSLCRLDIR",
+    "gssencmode": "PGGSSENCMODE",
+    "channel_binding": "PGCHANNELBINDING",
+    "connect_timeout": "PGCONNECT_TIMEOUT",
+    "application_name": "PGAPPNAME",
+}
 
 # Every SELECT below returns only a label and a count. Keep the query explicit so a future column
 # containing an identifier or customer data cannot leak into an operator report by accident.
@@ -102,6 +114,12 @@ def connection_env(url: str) -> dict[str, str]:
         env["PGUSER"] = urllib.parse.unquote(parts.username)
     if parts.password:
         env["PGPASSWORD"] = urllib.parse.unquote(parts.password)
+    for option, variable in LIBPQ_QUERY_OPTIONS.items():
+        values = urllib.parse.parse_qs(parts.query, keep_blank_values=True).get(option, [])
+        if len(values) > 1:
+            raise ValueError(f"database URL has repeated {option}")
+        if values:
+            env[variable] = urllib.parse.unquote(values[0])
     return env
 
 

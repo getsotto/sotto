@@ -78,6 +78,17 @@ class Database(unittest.TestCase):
                 self.assertEqual(inventory.main([]), 0)
         read.assert_called_once_with("postgres://db/sotto")
 
+    def test_database_url_preserves_libpq_tls_options(self):
+        env = inventory.connection_env(
+            "postgres://u:p@db/sotto?sslmode=verify-full&sslrootcert=%2Fetc%2Fca.pem"
+        )
+        self.assertEqual(env["PGSSLMODE"], "verify-full")
+        self.assertEqual(env["PGSSLROOTCERT"], "/etc/ca.pem")
+
+    def test_repeated_tls_options_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "repeated sslmode"):
+            inventory.connection_env("postgres://db/sotto?sslmode=require&sslmode=verify-full")
+
 
 if __name__ == "__main__":
     unittest.main()
