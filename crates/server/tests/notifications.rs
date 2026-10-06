@@ -271,10 +271,7 @@ async fn deleted_contact_fails_queued_email_without_breaking_the_outbox_row() {
     .await
     .expect("load deleted-contact notice");
     assert_eq!(row.get::<String, _>("status"), "failed");
-    assert_eq!(
-        row.get::<String, _>("last_error_code"),
-        "contact_unavailable"
-    );
+    assert_eq!(row.get::<String, _>("last_error_code"), "contact_missing");
     assert_eq!(row.get::<Option<String>, _>("contact_id"), None);
     cleanup(&pool, USER_ID).await;
 }
