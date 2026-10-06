@@ -25,6 +25,7 @@ const MAX_EVENT_KEY: usize = 160;
 const MAX_TEXT: usize = 240;
 const MAX_DETAIL: usize = 2_000;
 const MAX_NOTICES: i64 = 100;
+pub const STANDARD_MONTHLY_PRICE_NOTICE_LEAD_SECONDS: i64 = 60 * 24 * 60 * 60;
 type NoticeResult<T> = std::result::Result<T, NoticeError>;
 
 const RETRY_DELAYS: [Duration; 5] = [
@@ -192,6 +193,22 @@ fn payload_json(content: &NoticeContent) -> NoticeResult<String> {
     serde_json::to_string(content).map_err(|_| NoticeError::InvalidContent("payload"))
 }
 
+/// Calculate the due time for a standard monthly price-change notice from its confirmed effective
+/// date. Retries and restarts therefore cannot move a customer's notice window.
+pub fn price_change_due_at(effective_at_epoch: i64) -> NoticeResult<i64> {
+    let due_at = effective_at_epoch
+        .checked_sub(STANDARD_MONTHLY_PRICE_NOTICE_LEAD_SECONDS)
+        .ok_or(NoticeError::InvalidContent(
+            "price change date is out of range",
+        ))?;
+    if due_at <= 0 {
+        return Err(NoticeError::InvalidContent(
+            "price change notice would be due before the epoch",
+        ));
+    }
+    Ok(due_at)
+}
+
 /// Queue a notice idempotently. A conflict returns `AlreadyQueued` without changing due dates or
 /// the existing delivery state.
 pub async fn enqueue(pool: &PgPool, intent: &NoticeIntent) -> NoticeResult<EnqueueOutcome> {
@@ -206,6 +223,23 @@ pub async fn enqueue_in_tx(
     intent: &NoticeIntent,
 ) -> NoticeResult<EnqueueOutcome> {
     intent.validate()?;
+    if intent.channel == NoticeChannel::Email {
+        let contact_id = intent
+            .contact_id
+            .as_deref()
+            .ok_or(NoticeError::ContactUnavailable)?;
+        let contact_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM cloud_verified_contacts \
+             WHERE contact_id=$1 AND user_id=$2 AND channel='email' AND revoked_at IS NULL)",
+        )
+        .bind(contact_id)
+        .bind(&intent.recipient_user_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !contact_exists {
+            return Err(NoticeError::ContactUnavailable);
+        }
+    }
     let payload = payload_json(&intent.content)?;
     let notice_id = format!("notice:{}", Uuid::new_v4());
     let inserted = sqlx::query(
@@ -589,5 +623,20 @@ mod tests {
         assert_eq!(NoticeKind::PriceChange.as_str(), "price_change");
         assert_eq!(NoticeChannel::InApp.as_str(), "in_app");
         assert_eq!(NoticeChannel::Email.as_str(), "email");
+    }
+
+    #[test]
+    fn monthly_price_notice_uses_the_confirmed_sixty_day_boundary() {
+        let effective_at = 2_000_000_000;
+        assert_eq!(
+            price_change_due_at(effective_at).unwrap(),
+            effective_at - STANDARD_MONTHLY_PRICE_NOTICE_LEAD_SECONDS
+        );
+        assert!(matches!(
+            price_change_due_at(STANDARD_MONTHLY_PRICE_NOTICE_LEAD_SECONDS),
+            Err(NoticeError::InvalidContent(
+                "price change notice would be due before the epoch"
+            ))
+        ));
     }
 }
