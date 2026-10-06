@@ -796,6 +796,42 @@ mod tests {
             })
         }
 
+        fn list_shares(&self) -> Result<super::super::api::ShareList> {
+            let state = self.state.borrow();
+            let mut links: Vec<_> = state
+                .shares
+                .iter()
+                .map(|(token, share)| super::super::api::ShareSummary {
+                    token: token.clone(),
+                    // The mock models the local free-link path; the real server derives this
+                    // from the caller's entitlement rather than from NewShare.
+                    share_class: "free".into(),
+                    max_views: share.max_views,
+                    view_count: 0,
+                    expires_at: None,
+                    revoked_at: None,
+                    created_at: String::new(),
+                })
+                .collect();
+            links.sort_by(|a, b| a.token.cmp(&b.token));
+            Ok(super::super::api::ShareList {
+                active_free_count: links
+                    .iter()
+                    .filter(|link| link.share_class == "free")
+                    .count() as i64,
+                links,
+            })
+        }
+
+        fn revoke_share(&self, token: &str) -> Result<()> {
+            let mut state = self.state.borrow_mut();
+            if state.shares.remove(token).is_some() {
+                Ok(())
+            } else {
+                Err(Error::NotFound(format!("share `{token}`")))
+            }
+        }
+
         fn create_org(&self, org: &super::super::api::NewOrg) -> Result<()> {
             let me = self.current_user();
             let mut s = self.state.borrow_mut();

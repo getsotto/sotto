@@ -318,6 +318,38 @@ pub struct Me {
     pub user_id: String,
 }
 
+/// Public server capability metadata. Older servers may not expose this route; callers treat the
+/// absence as an unknown capability rather than assuming hosted billing is available.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ServerInfo {
+    pub deployment_mode: String,
+    pub entitlement_model: String,
+}
+
+/// Account-level Cloud state returned by the eligibility endpoint.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EligibilityView {
+    pub model: String,
+    pub state: String,
+    pub deployment_mode: String,
+    pub account_initialized: bool,
+    pub billing_available: bool,
+    pub paid_through_epoch: Option<i64>,
+    pub recovery_until_epoch: Option<i64>,
+    pub export_until_epoch: Option<i64>,
+    pub actions: EligibilityActions,
+    pub next_actions: Vec<String>,
+    pub payer: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EligibilityActions {
+    pub setup: bool,
+    pub billing: bool,
+    pub export: bool,
+    pub revoke: bool,
+}
+
 /// A share link to create: the sealed blob + limits. `enc_blob`/`passphrase_salt` are base64.
 #[derive(Debug, Clone, Serialize)]
 pub struct NewShare {
@@ -334,6 +366,23 @@ pub struct CreatedShare {
     pub token: String,
     #[serde(default)]
     pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ShareSummary {
+    pub token: String,
+    pub share_class: String,
+    pub max_views: i32,
+    pub view_count: i32,
+    pub expires_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ShareList {
+    pub active_free_count: i64,
+    pub links: Vec<ShareSummary>,
 }
 
 /// Versioned Cloud exit-export manifest. It names only resources the caller can decrypt.
@@ -436,6 +485,10 @@ pub trait SyncApi {
     fn write_secrets(&self, env_id: &str, batch: &BatchRequest) -> Result<BatchResponse>;
     /// Create a share link; returns the public token.
     fn create_share(&self, share: &NewShare) -> Result<CreatedShare>;
+    /// List share metadata without ciphertext or fragment keys.
+    fn list_shares(&self) -> Result<ShareList>;
+    /// Revoke one of the caller's share links.
+    fn revoke_share(&self, token: &str) -> Result<()>;
 
     // --- teams: organisations, invites, and environment vault-key grants ---
 
@@ -556,5 +609,28 @@ mod tests {
         .unwrap();
         let label = forged.expiry_label().unwrap();
         assert!(!label.chars().any(char::is_control), "{label:?}");
+    }
+
+    #[test]
+    fn eligibility_view_matches_the_server_contract() {
+        let view: EligibilityView = serde_json::from_str(
+            r#"{
+                "model":"person_eligibility_v1",
+                "deployment_mode":"cloud",
+                "state":"export_only",
+                "account_initialized":true,
+                "billing_available":true,
+                "paid_through_epoch":null,
+                "recovery_until_epoch":1760000000,
+                "export_until_epoch":1761000000,
+                "actions":{"setup":false,"billing":false,"export":true,"revoke":false},
+                "next_actions":["export"],
+                "payer":"personal"
+            }"#,
+        )
+        .expect("eligibility response should decode");
+        assert_eq!(view.model, "person_eligibility_v1");
+        assert_eq!(view.state, "export_only");
+        assert_eq!(view.next_actions, vec!["export"]);
     }
 }

@@ -124,7 +124,7 @@ function publicOrigin(): string {
 }
 
 // The disallowed paths mirror the Caddyfile @ratelimited/@api matchers and the client-side
-// routes (/app, /s/, /auth/callback). Keep all three in sync with the routers in
+// routes (/app, /cloud, /s/, /auth/callback). Keep all four in sync with the routers in
 // crates/server/src/lib.rs - a new route needs a line here the same day.
 function robotsTxt(origin: string): string {
   return `# Generated at build time by web/vite.config.ts - edit the template, not the built copy.
@@ -132,8 +132,10 @@ function robotsTxt(origin: string): string {
 User-agent: *
 Allow: /
 Disallow: /app
+Disallow: /cloud
 Disallow: /s/
 Disallow: /auth
+# /account is the authenticated API; the browser Cloud surface lives at /cloud.
 Disallow: /account
 Disallow: /projects
 Disallow: /environments

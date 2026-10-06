@@ -98,6 +98,7 @@ export function VaultApp() {
           <button className="primary" type="button" onClick={checkSetupAgain} disabled={phase.checking}>
             {phase.checking ? "Checking…" : "Check setup again"}
           </button>
+          <p><a href="/cloud">Manage Cloud billing and recovery</a></p>
           {phase.error !== null && <p role="alert">{phase.error}</p>}
         </Shell>
       );
@@ -109,7 +110,7 @@ export function VaultApp() {
             The web client runs the same crypto core as the CLI, via WebAssembly. Your keys never
             leave this browser.
           </p>
-          <button className="primary" onClick={startLogin}>
+          <button className="primary" onClick={() => startLogin()}>
             Log in with GitHub
           </button>
         </Shell>
@@ -186,6 +187,7 @@ function UnlockForm({
         </button>
       </form>
       {error !== null && <p role="alert">{error}</p>}
+      <p><a href="/cloud">Manage Cloud billing and recovery</a></p>
     </Shell>
   );
 }

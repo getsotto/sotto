@@ -1,4 +1,5 @@
 import { AuthCallback } from "./AuthCallback";
+import { AccountApp } from "./AccountApp";
 import { Landing } from "./Landing";
 import { RecipientPage } from "./RecipientPage";
 import { SeoPage } from "./seo/SeoPage";
@@ -8,6 +9,7 @@ import { VaultApp } from "./VaultApp";
 
 // Minimal path routing (no router dependency):
 //   /app            → the vault app (login → unlock → view secrets)
+//   /cloud          → Cloud billing, recovery and export controls (no vault unlock)
 //   /s/:token       → the share recipient page (no account)
 //   /auth/callback  → the post-OAuth landing (SPA; the API endpoints are proxied elsewhere)
 //   /<guide-slug>   → an indexable guide page (see web/src/seo/pages.ts)
@@ -18,10 +20,14 @@ function route():
   | { name: "invalid-share" }
   | { name: "callback" }
   | { name: "guide"; page: SeoPageData }
+  | { name: "account" }
   | { name: "vault" } {
   const path = window.location.pathname;
   if (path === "/app" || path === "/app/") {
     return { name: "vault" };
+  }
+  if (path === "/cloud" || path === "/cloud/") {
+    return { name: "account" };
   }
   const share = /^\/s\/([^/]+)$/.exec(path);
   if (share !== null) {
@@ -71,5 +77,7 @@ export function App() {
       return <SeoPage page={current.page} />;
     case "vault":
       return <VaultApp />;
+    case "account":
+      return <AccountApp />;
   }
 }
