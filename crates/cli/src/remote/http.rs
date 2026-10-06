@@ -53,6 +53,33 @@ impl HttpClient {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
+
+    /// Discover hosted capability metadata without making local commands depend on it.
+    pub fn server_info(&self) -> Result<Option<super::api::ServerInfo>> {
+        let resp = self
+            .http
+            .get(self.url("/server/info"))
+            .send()
+            .map_err(net)?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        parse(resp).map(Some)
+    }
+
+    /// Read the account's Cloud state. A 404 is the supported fallback for older servers.
+    pub fn eligibility(&self) -> Result<Option<super::api::EligibilityView>> {
+        let resp = self
+            .http
+            .get(self.url("/account/eligibility"))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        parse(resp).map(Some)
+    }
 }
 
 fn net(e: reqwest::Error) -> Error {
@@ -60,19 +87,42 @@ fn net(e: reqwest::Error) -> Error {
 }
 
 /// Map a non-success response to an error, distinguishing concurrency conflicts and auth.
-fn server_error(resp: Response) -> Error {
-    let status = resp.status();
-    let body = resp.text().unwrap_or_default();
+fn classify_status(status: StatusCode, code: Option<&str>, body: String) -> Error {
+    let fallback = |message: &str| {
+        if body.trim().is_empty() {
+            message.to_owned()
+        } else {
+            body.clone()
+        }
+    };
     match status {
         StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
             Error::Conflict(format!("{status}: {body}"))
         }
         StatusCode::UNAUTHORIZED => Error::Server("unauthorised - run `sotto login`".into()),
         StatusCode::FORBIDDEN => Error::Forbidden(format!("{status}: {body}")),
-        // A quota / Team-feature gate: the server message says exactly what to do.
-        StatusCode::PAYMENT_REQUIRED => Error::Input(body),
+        StatusCode::PAYMENT_REQUIRED if code == Some("cloud_eligibility_required") => {
+            Error::CloudEligibility(fallback("hosted Cloud eligibility is required"))
+        }
+        StatusCode::PAYMENT_REQUIRED if code == Some("quota") => {
+            Error::Quota(fallback("quota exceeded"))
+        }
+        StatusCode::PAYMENT_REQUIRED => Error::Input(fallback("payment required")),
+        StatusCode::TOO_MANY_REQUESTS => Error::RateLimited(fallback("try again later")),
+        StatusCode::SERVICE_UNAVAILABLE => Error::Unavailable(fallback("server unavailable")),
         _ => Error::Server(format!("{status}: {body}")),
     }
+}
+
+fn server_error(resp: Response) -> Error {
+    let status = resp.status();
+    let code = resp
+        .headers()
+        .get("x-sotto-error-code")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().unwrap_or_default();
+    classify_status(status, code.as_deref(), body)
 }
 
 /// Parse a successful body, or turn a non-2xx response into an error.
@@ -226,6 +276,26 @@ impl SyncApi for HttpClient {
             .send()
             .map_err(net)?;
         parse(resp)
+    }
+
+    fn list_shares(&self) -> Result<super::api::ShareList> {
+        let resp = self
+            .http
+            .get(self.url("/shares"))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
+    fn revoke_share(&self, token: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/shares/{token}")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        ok(resp)
     }
 
     fn create_org(&self, org: &NewOrg) -> Result<()> {
@@ -473,5 +543,37 @@ mod tests {
             .expect("a 204 is a completed removal, not a parse failure");
         assert!(receipt.revoked_tokens.is_empty());
         assert_eq!(receipt.grants_deleted, 0);
+    }
+
+    #[test]
+    fn cloud_error_codes_have_stable_cli_categories() {
+        assert!(matches!(
+            classify_status(
+                StatusCode::PAYMENT_REQUIRED,
+                Some("cloud_eligibility_required"),
+                "renewal needed".into()
+            ),
+            Error::CloudEligibility(message) if message == "renewal needed"
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::PAYMENT_REQUIRED, Some("quota"), "limit".into()),
+            Error::Quota(message) if message == "limit"
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS, None, "slow down".into()),
+            Error::RateLimited(message) if message == "slow down"
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::SERVICE_UNAVAILABLE, Some("unavailable"), "offline".into()),
+            Error::Unavailable(message) if message == "offline"
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::PAYMENT_REQUIRED, None, "payment required".into()),
+            Error::Input(message) if message == "payment required"
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::SERVICE_UNAVAILABLE, None, String::new()),
+            Error::Unavailable(message) if message == "server unavailable"
+        ));
     }
 }
