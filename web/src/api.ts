@@ -162,6 +162,63 @@ export async function fetchEligibility(): Promise<EligibilityView> {
   };
 }
 
+export interface CloudNotice {
+  noticeId: string;
+  kind: string;
+  channel: string;
+  content: {
+    title: string;
+    detail: string;
+    effectiveAtEpoch: number | null;
+    deadlineEpoch: number | null;
+    amountPence: number | null;
+  };
+  dueAtEpoch: number;
+  status: string;
+  lastErrorCode: string | null;
+  deliveredAtEpoch: number | null;
+  createdAtEpoch: number;
+}
+
+export async function fetchCloudNotices(): Promise<CloudNotice[]> {
+  const body = await authedJson<Array<{
+    notice_id: string;
+    kind: string;
+    channel: string;
+    content: {
+      title: string;
+      detail: string;
+      effective_at_epoch: number | null;
+      deadline_epoch: number | null;
+      amount_pence: number | null;
+    };
+    due_at_epoch: number;
+    status: string;
+    last_error_code: string | null;
+    delivered_at_epoch: number | null;
+    created_at_epoch: number;
+  }>>(
+    "/account/notices",
+  );
+  return body.map((notice) => ({
+    noticeId: notice.notice_id,
+    kind: notice.kind,
+    channel: notice.channel,
+    content: {
+      title: notice.content.title,
+      detail: notice.content.detail,
+      effectiveAtEpoch: notice.content.effective_at_epoch,
+      deadlineEpoch: notice.content.deadline_epoch,
+      amountPence: notice.content.amount_pence,
+    },
+    dueAtEpoch: notice.due_at_epoch,
+    status: notice.status,
+    lastErrorCode: notice.last_error_code,
+    deliveredAtEpoch: notice.delivered_at_epoch,
+    createdAtEpoch: notice.created_at_epoch,
+  }));
+}
+
 export interface PersonalQuote {
   offer: "monthly" | "annual";
   amountPence: number;

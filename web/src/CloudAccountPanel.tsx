@@ -5,12 +5,14 @@ import {
   createPersonalCheckout,
   createPersonalPortal,
   fetchCloudExportChunk,
+  fetchCloudNotices,
   fetchEligibility,
   fetchPersonalOperation,
   fetchPersonalQuote,
   requestPersonalRefund,
   startCloudExport,
   type EligibilityView,
+  type CloudNotice,
   type PersonalLifecycle,
   type PersonalOperation,
   type PersonalQuote,
@@ -28,6 +30,7 @@ export function CloudAccountPanel() {
   const [lifecycle, setLifecycle] = useState<PersonalLifecycle | null>(null);
   const [refund, setRefund] = useState<RefundRequest | null>(null);
   const [operation, setOperation] = useState<PersonalOperation | null>(null);
+  const [notices, setNotices] = useState<CloudNotice[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -40,6 +43,15 @@ export function CloudAccountPanel() {
     } catch (e) { setError(message(e)); }
   }
   useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    if (eligibility === null) return;
+    void fetchCloudNotices()
+      .then(setNotices)
+      .catch(() => {
+        // Eligibility and vault recovery must remain usable when the notice endpoint is briefly
+        // unavailable. The next account visit will fetch the current durable list again.
+      });
+  }, [eligibility]);
   useEffect(() => {
     if (eligibility?.actions.billing !== true) return;
     let current = true;
@@ -120,6 +132,7 @@ export function CloudAccountPanel() {
     <h1>Cloud account</h1>
     <p className="muted">Billing and recovery controls are available here without unlocking your vault. Sotto Cloud stores only encrypted vault material.</p>
     {error !== null && <p role="alert">{error}</p>}{notice !== null && <p className="notice" role="status">{notice}</p>}
+    {notices.length > 0 && <section aria-labelledby="notices-heading"><h2 id="notices-heading">Account notices</h2><ul>{notices.map((item) => <li key={item.noticeId}><strong>{item.content.title}</strong><p>{item.content.detail}</p>{item.content.deadlineEpoch !== null && <p className="muted">Deadline: {date(item.content.deadlineEpoch)}</p>}{item.status === "failed" && <p role="alert">This notice could not be delivered{item.lastErrorCode === null ? "." : ` (${item.lastErrorCode}).`}</p>}</li>)}</ul></section>}
     <section aria-labelledby="status-heading"><h2 id="status-heading">Hosted access</h2><p><strong>{eligibility.state.replaceAll("_", " ")}</strong>{paidThrough !== null ? ` · paid through ${paidThrough}` : ""}</p>{recoveryUntil !== null && <p className="muted">Recovery is available until {recoveryUntil}.</p>}{eligibility.payer === null && eligibility.state === "paid" && <p className="muted">Your hosted access is sponsored or provided by another billing record. There is no personal upgrade to buy.</p>}{eligibility.state === "unavailable" && <p>Billing evidence is temporarily unavailable. Checkout is hidden until the account can be checked safely.</p>}</section>
     {eligibility.actions.billing && quote !== null && <section aria-labelledby="billing-heading"><h2 id="billing-heading">Choose hosted billing</h2><label>Term <select value={offer} onChange={(e) => setOffer(e.target.value as PersonalQuote["offer"])}><option value="monthly">Monthly</option><option value="annual">Annual</option></select></label><p>{pounds(quote.amountPence)} per {quote.interval}. Tax is shown at checkout.</p>{quote.founding && <p className="muted">Founding price: {quote.foundingRemainingPlaces ?? 0} places remain; {quote.foundingTerm}. Renews at {pounds(quote.nextRenewalAmountPence)}.</p>}<button className="primary" disabled={busy} onClick={() => void checkout()}>{busy ? "Opening checkout…" : "Continue to secure checkout"}</button></section>}
     {eligibility.state === "pending_initial_payment" && <section aria-labelledby="pending-heading"><h2 id="pending-heading">Payment confirmation pending</h2><p>Your checkout is waiting for the verified payment webhook. Hosted access stays unchanged until it arrives.</p>{operation?.checkoutUrl !== null && operation?.checkoutUrl !== undefined && <p><a href={operation.checkoutUrl}>Return to checkout</a></p>}<button disabled={busy} onClick={() => void refreshOperation()}>Refresh payment status</button></section>}
