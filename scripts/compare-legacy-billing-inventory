@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Compare two legacy billing inventories without printing their contents.
+
+The comparison is for the restart leg of the cutover rehearsal. Generated timestamps are expected
+to differ; counts, provenance and the no-side-effects activation gate are not.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+def load(path: str) -> dict:
+    with Path(path).open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict) or value.get("inventory_version") != 1:
+        raise ValueError(f"{path} is not a version 1 inventory")
+    activation = value.get("activation")
+    if not isinstance(activation, dict) or any(
+        activation.get(name) is not False
+        for name in ("writes_performed", "charges_created", "automatic_transition_approved")
+    ):
+        raise ValueError(f"{path} is not a read-only inventory")
+    return value
+
+
+def comparable(value: dict) -> dict:
+    return {key: value[key] for key in value if key != "generated_at"}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("before")
+    parser.add_argument("after")
+    args = parser.parse_args(argv)
+    try:
+        before = load(args.before)
+        after = load(args.after)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"legacy billing inventory comparison failed: {error}", file=sys.stderr)
+        return 1
+    if comparable(before) != comparable(after):
+        print("legacy billing inventory changed during the restart rehearsal", file=sys.stderr)
+        return 1
+    print(f"legacy billing inventory stable: {len(after.get('cohorts', []))} aggregate rows")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

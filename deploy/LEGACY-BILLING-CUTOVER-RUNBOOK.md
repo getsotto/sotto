@@ -47,7 +47,13 @@ token or link because a report labels its owner ambiguous.
 2. Run the inventory against the restored database and record its migration and Postgres
    provenance.
 3. Run it again after restarting the database. The cohort counts must be unchanged; only the
-   generated timestamp may differ.
+   generated timestamp may differ. Check that mechanically:
+
+   ```sh
+   scripts/compare-legacy-billing-inventory \
+     deploy/rehearsals/legacy-before.json \
+     deploy/rehearsals/legacy-after.json
+   ```
 4. Repeat with a fresh database migrated from this checkout and with Stripe unset. Sync, audit,
    machine authentication and free links must remain usable; the billing endpoint may remain
    unconfigured.
