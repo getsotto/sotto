@@ -50,10 +50,22 @@ class Journal(unittest.TestCase):
             [replay.Entry("journal-1", "project", "project-1", "user-1", 1_700_000_000_000_000, None)],
         )
 
-    def test_duplicate_resources_are_rejected(self):
+    def test_duplicate_tombstone_identity_is_rejected(self):
         path = self.write([entry(), entry(journal_id="journal-2")])
-        with self.assertRaisesRegex(ValueError, "repeats a resource"):
+        with self.assertRaisesRegex(ValueError, "repeats a tombstone identity"):
             replay.parse_journal(path)
+
+    def test_reused_resource_id_with_a_new_creation_time_is_allowed(self):
+        path = self.write(
+            [
+                entry(),
+                entry(
+                    journal_id="journal-2",
+                    expected_created_at=1_700_000_000_000_001,
+                ),
+            ]
+        )
+        self.assertEqual(len(replay.parse_journal(path)), 2)
 
     def test_shared_and_unknown_entries_are_rejected(self):
         path = self.write([entry(ownership_kind="shared", expected_owner_id=None)])

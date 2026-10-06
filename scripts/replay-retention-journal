@@ -50,7 +50,7 @@ def connection_env(url: str) -> dict[str, str]:
 def parse_journal(path: str) -> list[Entry]:
     entries: list[Entry] = []
     seen_journal_ids: set[str] = set()
-    seen_resources: set[tuple[str, str]] = set()
+    seen_tombstones: set[tuple[str, str, str, int, int | None]] = set()
     with open(path, "rb") as stream:
         for line_number, raw in enumerate(stream, 1):
             if len(raw) > MAX_LINE_BYTES:
@@ -87,8 +87,6 @@ def parse_journal(path: str) -> list[Entry]:
                 raise ValueError(f"journal line {line_number} has an invalid identity")
             if journal_id in seen_journal_ids:
                 raise ValueError(f"journal line {line_number} repeats journal_id")
-            if (resource_kind, resource_id) in seen_resources:
-                raise ValueError(f"journal line {line_number} repeats a resource")
             if resource_kind not in RESOURCE_KINDS:
                 raise ValueError(f"journal line {line_number} has an unsupported resource kind")
             if value["ownership_kind"] != "personal" or not isinstance(owner, str) or not owner:
@@ -99,8 +97,11 @@ def parse_journal(path: str) -> list[Entry]:
                 raise ValueError(f"journal line {line_number} has an invalid revision")
             if value["action"] != "deleted":
                 raise ValueError(f"journal line {line_number} has an unsupported action")
+            identity = (resource_kind, resource_id, owner, created_at, revision)
+            if identity in seen_tombstones:
+                raise ValueError(f"journal line {line_number} repeats a tombstone identity")
             seen_journal_ids.add(journal_id)
-            seen_resources.add((resource_kind, resource_id))
+            seen_tombstones.add(identity)
             entries.append(Entry(journal_id, resource_kind, resource_id, owner, created_at, revision))
     return entries
 
