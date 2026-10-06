@@ -84,6 +84,8 @@ pub mod notifications;
 pub mod org;
 pub mod person_eligibility;
 pub mod personal_billing;
+#[doc(hidden)]
+pub mod retention;
 // The lifecycle seam, HTTP adapter, and worker remain doc-hidden: deletion is enabled per
 // deployment rather than presented as a stable public API surface, and the internal seam is not
 // something an embedder should call directly.
