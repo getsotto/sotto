@@ -5,7 +5,9 @@ CREATE TABLE IF NOT EXISTS cloud_retention_jobs (
     job_id                  TEXT PRIMARY KEY,
     scope_kind              TEXT NOT NULL,
     scope_key               TEXT NOT NULL,
-    subject_user_id         TEXT REFERENCES users (id) ON DELETE SET NULL,
+    -- Keep the person identity as retention evidence even after the user row is removed. The
+    -- purge path rechecks ownership against live rows before deleting anything.
+    subject_user_id         TEXT,
     organisation_id         TEXT REFERENCES organizations (id) ON DELETE RESTRICT,
     eligibility_episode     TEXT NOT NULL,
     deadline_at             TIMESTAMPTZ NOT NULL,

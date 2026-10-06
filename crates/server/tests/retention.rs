@@ -159,3 +159,73 @@ async fn dry_run_is_idempotent_and_purge_deletes_only_the_explicit_personal_scop
     assert_eq!(row.get::<String, _>("action"), "deleted");
     cleanup(&pool, JOB_ID, USER_ID, PROJECT_ID).await;
 }
+
+#[tokio::test]
+async fn shared_scope_holds_and_cancellation_stops_due_work() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "retention-test-shared-user";
+    const PROJECT_ID: &str = "retention-test-shared-project";
+    const SHARED_JOB: &str = "retention:shared-job";
+    const CANCEL_JOB: &str = "retention:cancelled-job";
+    cleanup(&pool, SHARED_JOB, USER_ID, PROJECT_ID).await;
+    cleanup(&pool, CANCEL_JOB, USER_ID, PROJECT_ID).await;
+    seed_user_and_project(&pool, USER_ID, PROJECT_ID).await;
+
+    let mut shared = intent(SHARED_JOB, USER_ID);
+    shared.notice_event_key = "notice:shared-expiry".into();
+    retention::enqueue(&pool, &shared)
+        .await
+        .expect("enqueue shared retention job");
+    retention::add_scope_item(
+        &pool,
+        &ScopeItem {
+            job_id: SHARED_JOB.into(),
+            resource_kind: "project".into(),
+            resource_id: PROJECT_ID.into(),
+            ownership_kind: "shared".into(),
+            expected_revision: None,
+        },
+    )
+    .await
+    .expect("add shared scope item");
+    retention::mark_ready(&pool, SHARED_JOB)
+        .await
+        .expect("mark shared job ready");
+    retention::enable_purge(&pool, SHARED_JOB)
+        .await
+        .expect("enable shared purge attempt");
+    let held = retention::run_once(&pool, "retention-test-shared", RetentionMode::Purge)
+        .await
+        .expect("run shared purge")
+        .expect("shared job should be claimed");
+    assert_eq!(held.state, RetentionState::Held);
+    let project_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id=$1)")
+            .bind(PROJECT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("check shared project");
+    assert!(project_exists);
+
+    let mut cancelled = intent(CANCEL_JOB, USER_ID);
+    cancelled.notice_event_key = "notice:cancelled-expiry".into();
+    retention::enqueue(&pool, &cancelled)
+        .await
+        .expect("enqueue cancellation job");
+    retention::mark_ready(&pool, CANCEL_JOB)
+        .await
+        .expect("mark cancellation job ready");
+    assert!(retention::cancel(&pool, CANCEL_JOB, "repaid")
+        .await
+        .unwrap());
+    assert!(
+        retention::run_once(&pool, "retention-test-cancel", RetentionMode::Purge)
+            .await
+            .expect("cancelled job must not run")
+            .is_none()
+    );
+    cleanup(&pool, SHARED_JOB, USER_ID, PROJECT_ID).await;
+    cleanup(&pool, CANCEL_JOB, USER_ID, PROJECT_ID).await;
+}
