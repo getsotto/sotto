@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Replay retention deletions into an isolated database restored from an older dump.
+
+The journal is an append-only JSON-lines sidecar produced by ``backup.sh``.  It is deliberately
+kept outside the database dump: a dump taken before a purge must not be able to resurrect the
+purged rows when it is restored.  This command is fail-closed and prints counts only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.parse
+from dataclasses import dataclass
+
+MAX_LINE_BYTES = 16 * 1024
+FORMAT_VERSION = 1
+RESOURCE_KINDS = {"project", "environment", "share"}
+
+
+@dataclass(frozen=True)
+class Entry:
+    journal_id: str
+    resource_kind: str
+    resource_id: str
+    expected_owner_id: str
+    expected_created_at: int
+    expected_revision: int | None
+
+
+def connection_env(url: str) -> dict[str, str]:
+    parts = urllib.parse.urlsplit(url)
+    env = dict(os.environ)
+    env["PGHOST"] = parts.hostname or "localhost"
+    env["PGDATABASE"] = parts.path.lstrip("/")
+    if parts.port:
+        env["PGPORT"] = str(parts.port)
+    if parts.username:
+        env["PGUSER"] = urllib.parse.unquote(parts.username)
+    if parts.password:
+        env["PGPASSWORD"] = urllib.parse.unquote(parts.password)
+    return env
+
+
+def parse_journal(path: str) -> list[Entry]:
+    entries: list[Entry] = []
+    seen_journal_ids: set[str] = set()
+    seen_tombstones: set[tuple[str, str, str, int, int | None]] = set()
+    with open(path, "rb") as stream:
+        for line_number, raw in enumerate(stream, 1):
+            if len(raw) > MAX_LINE_BYTES:
+                raise ValueError(f"journal line {line_number} exceeds {MAX_LINE_BYTES} bytes")
+            if not raw.strip():
+                continue
+            try:
+                value = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError(f"journal line {line_number} is not valid JSON") from error
+            if not isinstance(value, dict):
+                raise ValueError(f"journal line {line_number} is not an object")
+            required = {
+                "format_version",
+                "journal_id",
+                "resource_kind",
+                "resource_id",
+                "ownership_kind",
+                "expected_owner_id",
+                "expected_created_at",
+                "expected_revision",
+                "action",
+            }
+            if set(value) != required | {"job_id", "tombstone", "recorded_at"}:
+                # The exported row contains these stable columns.  Reject both missing and
+                # unexpected fields so a hand-edited sidecar cannot silently widen the replay.
+                raise ValueError(f"journal line {line_number} has an unexpected shape")
+            journal_id = value["journal_id"]
+            resource_kind = value["resource_kind"]
+            resource_id = value["resource_id"]
+            owner = value["expected_owner_id"]
+            created_at = value["expected_created_at"]
+            revision = value["expected_revision"]
+            if value["format_version"] != FORMAT_VERSION:
+                raise ValueError(f"journal line {line_number} has an unsupported format version")
+            if not all(isinstance(item, str) and item and "\n" not in item for item in (journal_id, resource_kind, resource_id)):
+                raise ValueError(f"journal line {line_number} has an invalid identity")
+            if journal_id in seen_journal_ids:
+                raise ValueError(f"journal line {line_number} repeats journal_id")
+            if resource_kind not in RESOURCE_KINDS:
+                raise ValueError(f"journal line {line_number} has an unsupported resource kind")
+            if value["ownership_kind"] != "personal" or not isinstance(owner, str) or not owner:
+                raise ValueError(f"journal line {line_number} is not a personal tombstone")
+            if not isinstance(created_at, int) or isinstance(created_at, bool) or created_at <= 0:
+                raise ValueError(f"journal line {line_number} has an invalid creation time")
+            if revision is not None and (not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0):
+                raise ValueError(f"journal line {line_number} has an invalid revision")
+            if value["action"] != "deleted":
+                raise ValueError(f"journal line {line_number} has an unsupported action")
+            identity = (resource_kind, resource_id, owner, created_at, revision)
+            if identity in seen_tombstones:
+                raise ValueError(f"journal line {line_number} repeats a tombstone identity")
+            seen_journal_ids.add(journal_id)
+            seen_tombstones.add(identity)
+            entries.append(Entry(journal_id, resource_kind, resource_id, owner, created_at, revision))
+    return entries
+
+
+def copy_csv(entries: list[Entry]) -> str:
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    for entry in entries:
+        writer.writerow(
+            (
+                entry.resource_kind,
+                entry.resource_id,
+                entry.expected_owner_id,
+                entry.expected_created_at,
+                "" if entry.expected_revision is None else entry.expected_revision,
+            )
+        )
+    return output.getvalue()
+
+
+def replay(database_url: str, entries: list[Entry]) -> tuple[int, int]:
+    sql = """\
+BEGIN;
+CREATE TEMP TABLE retention_replay (
+    resource_kind text NOT NULL,
+    resource_id text NOT NULL,
+    owner_id text NOT NULL,
+    expected_created_at bigint NOT NULL,
+    expected_revision bigint
+);
+COPY retention_replay FROM STDIN WITH (FORMAT csv);
+{rows}\\.
+DELETE FROM environments e
+USING retention_replay r, projects p
+WHERE r.resource_kind = 'environment'
+  AND e.id = r.resource_id
+  AND e.project_id = p.id
+  AND p.owner_id = r.owner_id
+  AND p.org_id IS NULL
+  AND (extract(epoch FROM e.created_at) * 1000000)::bigint = r.expected_created_at
+  AND (r.expected_revision IS NULL OR e.revision = r.expected_revision);
+DELETE FROM projects p
+USING retention_replay r
+WHERE r.resource_kind = 'project'
+  AND p.id = r.resource_id
+  AND p.owner_id = r.owner_id
+  AND p.org_id IS NULL
+  AND (extract(epoch FROM p.created_at) * 1000000)::bigint = r.expected_created_at;
+DELETE FROM share_links s
+USING retention_replay r
+WHERE r.resource_kind = 'share'
+  AND s.id = r.resource_id
+  AND s.created_by = r.owner_id
+  AND (extract(epoch FROM s.created_at) * 1000000)::bigint = r.expected_created_at;
+SELECT count(*) FROM retention_replay;
+COMMIT;
+""".format(rows=copy_csv(entries))
+    result = subprocess.run(
+        ["psql", "-At", "-v", "ON_ERROR_STOP=1"],
+        input=sql,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=connection_env(database_url),
+    )
+    rows = [line for line in result.stdout.splitlines() if line]
+    deleted = sum(
+        int(match.group(1))
+        for line in rows
+        if (match := re.fullmatch(r"DELETE (\d+)", line)) is not None
+    )
+    return len(entries), deleted
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--database-url")
+    parser.add_argument("--journal", required=True)
+    parser.add_argument("--validate-only", action="store_true")
+    args = parser.parse_args()
+    if not args.validate_only and not args.database_url:
+        parser.error("--database-url is required unless --validate-only is used")
+    try:
+        entries = parse_journal(args.journal)
+        if args.validate_only:
+            print(f"retention tombstones validated: {len(entries)}")
+            return 0
+        total, deleted = replay(args.database_url, entries)
+        print(f"retention tombstones replayed: {total}; deletions applied: {deleted}")
+        return 0
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"retention tombstone replay failed: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

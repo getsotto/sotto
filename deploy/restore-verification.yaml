@@ -96,11 +96,24 @@ steps:
           echo "the backup bucket holds no dumps, so there is nothing to restore" >&2
           exit 1
         fi
+        newest_journal="$$(gcloud storage ls --long "$${bucket}/sotto-*.tombstones.jsonl" 2>/dev/null \
+          | awk '$$NF ~ /^gs:\/\// {print $$2, $$NF}' | sort | tail -1 | awk '{print $$2}' || true)"
+        if [ -z "$$newest_journal" ]; then
+          echo "the backup bucket holds no retention journal sidecars; refusing an unprotected restore" >&2
+          exit 1
+        fi
+        dump_stamp="$$(basename "$$newest" .dump | sed 's/^sotto-//')"
+        journal_stamp="$$(basename "$$newest_journal" .tombstones.jsonl | sed 's/^sotto-//')"
+        if [[ "$$journal_stamp" < "$$dump_stamp" ]]; then
+          echo "the newest retention journal predates the dump; refusing an unprotected restore" >&2
+          exit 1
+        fi
         gcloud storage cp "$$newest" /workspace/backup.dump
+        gcloud storage cp "$$newest_journal" /workspace/tombstones.jsonl
         # Name and size only. Both are already recorded in deploy/rehearsals, and neither says
         # anything about what is inside.
         echo "restoring $${newest} ($$(wc -c < /workspace/backup.dump) bytes)"
-        printf '%s' "$$newest" > /workspace/object-name
+        printf '%s\n%s' "$$newest" "$$newest_journal" > /workspace/object-name
 
   - id: restore
     name: postgres:16
@@ -145,6 +158,9 @@ steps:
         set -euo pipefail
         apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client
         scripts/check-restore --database-url "postgres://sotto@postgres:5432/restored"
+        scripts/replay-retention-journal \
+          --database-url "postgres://sotto@postgres:5432/restored" \
+          --journal /workspace/tombstones.jsonl
 
   # Only reached when every step above succeeded, because Cloud Build stops at the first
   # failure. That is the whole alerting design: whichever external checker owns this URL alerts

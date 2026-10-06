@@ -150,6 +150,13 @@ Postgres holds only ciphertext and metadata, but losing it loses your users' syn
 archive** (`pg_restore --list`) before anything leaves the box, and uploads it to whatever
 object storage `SOTTO_BACKUP_BUCKET` names - the scheme picks the tool:
 
+It also uploads `sotto-<stamp>.tombstones.jsonl`, a cumulative sidecar containing the retention
+deletion journal. The sidecar is deliberately separate from the dump: a dump taken before a
+purge must not resurrect ciphertext when it is restored. It contains resource identifiers and
+ownership checks, never ciphertext or secret values, and is validated before upload by
+[`replay-retention-journal`](../scripts/replay-retention-journal). Keep both objects under the
+same bucket lifecycle policy; a dump without its sidecar is not a restorable backup.
+
 | `SOTTO_BACKUP_BUCKET` | Uploads with | Works for |
 |---|---|---|
 | `gs://<bucket>` | `gsutil` | Google Cloud Storage |
@@ -314,7 +321,18 @@ gsutil rm gs://<bucket>/sotto-<stamp>.dump       # AccessDenied: needs storage.o
 ```
 
 Then rehearse the restore once against a scratch database - a backup that has never been restored
-is a hope, not a backup.
+is a hope, not a backup. Fetch the matching `.tombstones.jsonl` sidecar as well as the dump and,
+after the dump is restored, replay it before starting the server:
+
+```sh
+scripts/replay-retention-journal \
+  --database-url postgres://sotto@localhost:5432/restored \
+  --journal sotto-<stamp>.tombstones.jsonl
+```
+
+The replay is idempotent and checks owner, creation time and environment revision before each
+delete. Do not admit traffic or start workers until the restore checks and journal replay have
+both succeeded.
 
 ## Access logs
 
@@ -472,8 +490,9 @@ A backup nobody has restored is a hope. `backup.sh` validates each archive with
 cannot tell you the bytes survived the trip to the bucket, and it cannot tell you that what
 comes back is a database this code could run on. Only restoring one answers those.
 
-`deploy/restore-verification.yaml` does it monthly: fetch the newest object, restore it into a
-throwaway Postgres that dies with the build, and check what came back.
+`deploy/restore-verification.yaml` does it monthly: fetch the newest dump and newest cumulative
+sidecar, restore the dump into a throwaway Postgres that dies with the build, check what came back,
+then replay the sidecar before the heartbeat is sent.
 
 Where the dump goes is worth stating rather than leaving to inference. It is downloaded into the
 build's own workspace and restored into a container beside it, both inside your Cloud project,
@@ -484,6 +503,9 @@ this uploads only this repository's source, which is public.
 What it asserts, which is the rehearsal of 2026-08-31 written down:
 
 - `pg_restore` completes with no errors;
+- a retention sidecar exists and passes strict JSON-lines validation;
+- every deletion in that sidecar is replayed against the restored database with its ownership,
+  creation-time and revision guards, so purged rows cannot reappear;
 - every migration the dump recorded is marked successful, and none is a version this checkout
   does not carry. A deployment **behind** the branch passes: production is often a release or
   two back, and failing every month in between would train everyone to ignore the job. A

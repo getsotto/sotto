@@ -1,0 +1,31 @@
+#!/usr/bin/env sh
+# Export the cumulative retention journal as a JSON-lines sidecar.
+#
+# The sidecar is intentionally separate from pg_dump. It must be possible to replay deletions
+# recorded after an old dump was taken, and it contains only tombstone metadata, never ciphertext.
+set -eu
+
+if [ "$#" -ne 1 ]; then
+    echo "usage: scripts/export-retention-journal OUTPUT" >&2
+    exit 2
+fi
+
+output="$1"
+mkdir -p "$(dirname "$output")"
+docker compose -f docker-compose.prod.yml exec -T postgres \
+    psql -U sotto -d sotto -At -v ON_ERROR_STOP=1 \
+    -c "SELECT json_build_object(\
+      'format_version', 1,\
+      'journal_id', journal_id,\
+      'job_id', job_id,\
+      'resource_kind', resource_kind,\
+      'resource_id', resource_id,\
+      'ownership_kind', ownership_kind,\
+      'expected_owner_id', expected_owner_id,\
+      'expected_created_at', expected_created_at,\
+      'expected_revision', expected_revision,\
+      'action', action,\
+      'tombstone', tombstone,\
+      'recorded_at', recorded_at\
+    )::text FROM cloud_retention_tombstone_journal ORDER BY recorded_at, journal_id" \
+    > "$output"

@@ -695,18 +695,41 @@ pub async fn run_once(
         let tombstone = serde_json::json!({
             "resource_kind": resource_kind,
             "resource_id": resource_id,
+            "ownership_kind": ownership_kind,
+            "expected_owner_id": subject,
+            "expected_created_at": expected_created_at_epoch,
+            "expected_revision": expected_revision,
             "already_absent": deleted == 0,
         });
+        let receipt_id = format!("receipt:{}", Uuid::new_v4());
         sqlx::query(
             "INSERT INTO cloud_retention_receipts \
              (receipt_id, job_id, resource_kind, resource_id, action, tombstone) \
              VALUES ($1,$2,$3,$4,'deleted',$5) ON CONFLICT (job_id, resource_kind, resource_id, action) DO NOTHING",
         )
-        .bind(format!("receipt:{}", Uuid::new_v4()))
+        .bind(&receipt_id)
         .bind(&lease.job_id)
         .bind(&resource_kind)
         .bind(&resource_id)
-        .bind(tombstone)
+        .bind(&tombstone)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO cloud_retention_tombstone_journal \
+             (journal_id, job_id, resource_kind, resource_id, ownership_kind, expected_owner_id, \
+              expected_created_at, expected_revision, action, tombstone) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'deleted',$9) \
+             ON CONFLICT (job_id, resource_kind, resource_id, action) DO NOTHING",
+        )
+        .bind(format!("tombstone:{}", Uuid::new_v4()))
+        .bind(&lease.job_id)
+        .bind(&resource_kind)
+        .bind(&resource_id)
+        .bind(&ownership_kind)
+        .bind(subject)
+        .bind(expected_created_at_epoch)
+        .bind(expected_revision)
+        .bind(&tombstone)
         .execute(&mut *tx)
         .await?;
         sqlx::query(

@@ -34,6 +34,11 @@ async fn pool_or_skip() -> Option<PgPool> {
 }
 
 async fn cleanup(pool: &PgPool, job_id: &str, user_id: &str, project_id: &str) {
+    sqlx::query("DELETE FROM cloud_retention_tombstone_journal WHERE job_id=$1")
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("clean retention tombstone journal");
     sqlx::query("DELETE FROM cloud_retention_receipts WHERE job_id=$1")
         .bind(job_id)
         .execute(pool)
@@ -204,6 +209,20 @@ async fn dry_run_is_idempotent_and_purge_deletes_only_the_explicit_personal_scop
     .expect("load purge receipt");
     assert_eq!(row.get::<String, _>("state"), "deleted");
     assert_eq!(row.get::<String, _>("action"), "deleted");
+    let journal = sqlx::query(
+        "SELECT resource_kind, resource_id, ownership_kind, expected_owner_id, expected_created_at \
+         FROM cloud_retention_tombstone_journal WHERE job_id=$1 AND resource_id=$2",
+    )
+    .bind(JOB_ID)
+    .bind(PROJECT_ID)
+    .fetch_one(&pool)
+    .await
+    .expect("load retention tombstone journal");
+    assert_eq!(journal.get::<String, _>("resource_kind"), "project");
+    assert_eq!(journal.get::<String, _>("resource_id"), PROJECT_ID);
+    assert_eq!(journal.get::<String, _>("ownership_kind"), "personal");
+    assert_eq!(journal.get::<String, _>("expected_owner_id"), USER_ID);
+    assert!(journal.get::<i64, _>("expected_created_at") > 0);
     cleanup(&pool, JOB_ID, USER_ID, PROJECT_ID).await;
 }
 
