@@ -1,4 +1,5 @@
 import { AuthCallback } from "./AuthCallback";
+import { AccountApp } from "./AccountApp";
 import { Landing } from "./Landing";
 import { RecipientPage } from "./RecipientPage";
 import { SeoPage } from "./seo/SeoPage";
@@ -18,10 +19,14 @@ function route():
   | { name: "invalid-share" }
   | { name: "callback" }
   | { name: "guide"; page: SeoPageData }
+  | { name: "account" }
   | { name: "vault" } {
   const path = window.location.pathname;
   if (path === "/app" || path === "/app/") {
     return { name: "vault" };
+  }
+  if (path === "/account" || path === "/account/") {
+    return { name: "account" };
   }
   const share = /^\/s\/([^/]+)$/.exec(path);
   if (share !== null) {
@@ -71,5 +76,7 @@ export function App() {
       return <SeoPage page={current.page} />;
     case "vault":
       return <VaultApp />;
+    case "account":
+      return <AccountApp />;
   }
 }

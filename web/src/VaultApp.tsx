@@ -98,6 +98,7 @@ export function VaultApp() {
           <button className="primary" type="button" onClick={checkSetupAgain} disabled={phase.checking}>
             {phase.checking ? "Checking…" : "Check setup again"}
           </button>
+          <p><a href="/account">Manage Cloud billing and recovery</a></p>
           {phase.error !== null && <p role="alert">{phase.error}</p>}
         </Shell>
       );
@@ -186,6 +187,7 @@ function UnlockForm({
         </button>
       </form>
       {error !== null && <p role="alert">{error}</p>}
+      <p><a href="/account">Manage Cloud billing and recovery</a></p>
     </Shell>
   );
 }
