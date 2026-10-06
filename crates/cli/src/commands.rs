@@ -55,6 +55,14 @@ pub struct Status {
     pub project: Option<(String, String)>,
 }
 
+/// One historical version of a secret with its decrypted value and creation timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretHistoryItem {
+    pub version: i64,
+    pub created_at: i64,
+    pub value: Option<Vec<u8>>,
+}
+
 /// Secret operations bound to a store and keychain.
 pub struct App<'a> {
     store: &'a Store,
@@ -89,6 +97,53 @@ impl<'a> App<'a> {
     /// Remove a secret from the configured environment.
     pub fn remove(&self, config: &Config, name: &str) -> Result<()> {
         self.vault(config)?.delete(name)
+    }
+
+    /// Return the version history for a secret in the configured environment, newest first.
+    pub fn secret_history(&self, config: &Config, name: &str) -> Result<Vec<SecretHistoryItem>> {
+        let vault = self.vault(config)?;
+        let secret_id = vault
+            .find_id_by_name(name)?
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        let versions = self.store.secret_versions(&secret_id)?;
+        let mut history = Vec::with_capacity(versions.len());
+        for v in versions {
+            let decrypted = vault
+                .decrypt_at(&secret_id, v.version, &v.enc_value, &v.enc_data_key)
+                .ok();
+            history.push(SecretHistoryItem {
+                version: v.version,
+                created_at: v.created_at,
+                value: decrypted,
+            });
+        }
+        history.sort_by_key(|item| std::cmp::Reverse(item.version));
+        Ok(history)
+    }
+
+    /// Restore an earlier version of a secret as a new version (rollback).
+    pub fn rollback(&self, config: &Config, name: &str, version: i64) -> Result<()> {
+        let vault = self.vault(config)?;
+        let secret_id = vault
+            .find_id_by_name(name)?
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        let versions = self.store.secret_versions(&secret_id)?;
+        let target_ver = versions
+            .into_iter()
+            .find(|v| v.version == version)
+            .ok_or_else(|| Error::NotFound(format!("`{name}` has no version {version}")))?;
+        let value = vault
+            .decrypt_at(
+                &secret_id,
+                version,
+                &target_ver.enc_value,
+                &target_ver.enc_data_key,
+            )
+            .map_err(|_| {
+                Error::Input("that version does not decrypt under the current vault key".into())
+            })?;
+        vault.set(name, &value)?;
+        Ok(())
     }
 
     /// All secrets in the configured environment as `(name, value)` pairs (for `run`/`export`).
@@ -385,6 +440,51 @@ mod tests {
         ));
         assert!(matches!(
             app.env_diff(&config, "nope", "dev"),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn secret_history_and_rollback_flow() {
+        let (store, keychain, config) = unlocked();
+        let app = App::new(&store, &keychain);
+
+        // Version 1
+        app.set(&config, "API_KEY", b"v1-secret").unwrap();
+        // Version 2
+        app.set(&config, "API_KEY", b"v2-secret").unwrap();
+        // Version 3
+        app.set(&config, "API_KEY", b"v3-secret").unwrap();
+
+        let history = app.secret_history(&config, "API_KEY").unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].version, 3);
+        assert_eq!(history[0].value.as_deref(), Some(b"v3-secret".as_slice()));
+        assert_eq!(history[1].version, 2);
+        assert_eq!(history[1].value.as_deref(), Some(b"v2-secret".as_slice()));
+        assert_eq!(history[2].version, 1);
+        assert_eq!(history[2].value.as_deref(), Some(b"v1-secret".as_slice()));
+        assert!(history[0].created_at >= history[1].created_at);
+
+        // Roll back to version 2 (restores it as version 4)
+        app.rollback(&config, "API_KEY", 2).unwrap();
+        assert_eq!(app.get(&config, "API_KEY").unwrap(), b"v2-secret");
+
+        let history_after = app.secret_history(&config, "API_KEY").unwrap();
+        assert_eq!(history_after.len(), 4);
+        assert_eq!(history_after[0].version, 4);
+        assert_eq!(
+            history_after[0].value.as_deref(),
+            Some(b"v2-secret".as_slice())
+        );
+
+        // Non-existent secret or version errors
+        assert!(matches!(
+            app.secret_history(&config, "NON_EXISTENT"),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            app.rollback(&config, "API_KEY", 999),
             Err(Error::NotFound(_))
         ));
     }

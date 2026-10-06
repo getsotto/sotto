@@ -138,6 +138,14 @@ pub fn fetch_entries(server: &str, token: &MachineToken) -> Result<MachineFetch>
                 "SOTTO_TOKEN was rejected (revoked, expired, or invalid)".into(),
             ));
         }
+        if resp.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
+            let body = resp.text().unwrap_or_default();
+            return Err(Error::Input(if body.trim().is_empty() {
+                "machine access requires an eligible Cloud account".into()
+            } else {
+                body
+            }));
+        }
         if !resp.status().is_success() {
             return Err(Error::Server(format!(
                 "machine API error: {}",

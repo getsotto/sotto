@@ -79,12 +79,33 @@ pub struct StripeRetainedPaidTerm {
 }
 
 impl StripeRetainedPaidTerm {
+    #[cfg(test)]
+    pub(crate) fn for_test(observation: StripePersonalInvoiceObservation) -> Self {
+        Self { observation }
+    }
+
     pub fn invoice_id(&self) -> &str {
         self.observation.invoice_id()
     }
 
     pub fn allocation_reference(&self) -> &str {
         self.observation.allocation_reference()
+    }
+
+    pub fn customer_id(&self) -> &str {
+        self.observation.customer_id()
+    }
+
+    pub fn subscription_id(&self) -> &str {
+        self.observation.subscription_id()
+    }
+
+    pub fn provider_item_id(&self) -> &str {
+        self.observation.provider_item_id()
+    }
+
+    pub const fn interval(&self) -> crate::cloud_provider_stripe::StripeInterval {
+        self.observation.interval()
     }
 
     pub fn evidence_reference(&self) -> &str {

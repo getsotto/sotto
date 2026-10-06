@@ -7,6 +7,9 @@ import {
   fetchEntitlements,
   fetchMembers,
   fetchOrgs,
+  fetchSponsoredSeats,
+  fetchSponsoredQuote,
+  createSponsoredCheckout,
   grantOrgKey,
   inviteMember,
   type AuditEvent,
@@ -74,6 +77,8 @@ export function TeamPanel({
   encPrivateKeys: Uint8Array;
 }) {
   const [orgs, setOrgs] = useState<NamedOrg[] | null>(null);
+  const [orgsLoading, setOrgsLoading] = useState(true);
+  const [orgsError, setOrgsError] = useState<string | null>(null);
   const [openOrg, setOpenOrg] = useState<NamedOrg | null>(null);
   const [members, setMembers] = useState<Member[] | null>(null);
   const [membersLoading, setMembersLoading] = useState(false);
@@ -86,6 +91,13 @@ export function TeamPanel({
   const [inviteBusy, setInviteBusy] = useState(false);
   const [billingOutcome] = useState(parseBillingOutcome);
   const [deletionActive, setDeletionActive] = useState(false);
+  const [sponsoredSeats, setSponsoredSeats] = useState<import("./api").SponsoredSeat[]>([]);
+  const [sponsoredAvailable, setSponsoredAvailable] = useState<boolean | null>(null);
+  const [sponsoredBeneficiary, setSponsoredBeneficiary] = useState("");
+  const [sponsoredAction, setSponsoredAction] = useState<"add" | "remove" | "replace">("add");
+  const [sponsoredReplacement, setSponsoredReplacement] = useState("");
+  const [sponsoredUntil, setSponsoredUntil] = useState("");
+  const [sponsoredBusy, setSponsoredBusy] = useState(false);
   const orgLoadGeneration = useRef(0);
   const billingGeneration = useRef(0);
   const inviteInFlight = useRef(false);
@@ -96,15 +108,21 @@ export function TeamPanel({
     }
   }, [billingOutcome]);
 
+  async function loadOrgs() {
+    setOrgsLoading(true);
+    setOrgsError(null);
+    try {
+      const rows = await fetchOrgs();
+      setOrgs(rows.map((org) => ({ org, name: orgDisplayName(master, encPrivateKeys, org) })));
+    } catch (e) {
+      setOrgsError(message(e));
+    } finally {
+      setOrgsLoading(false);
+    }
+  }
+
   useEffect(() => {
-    void (async () => {
-      try {
-        const rows = await fetchOrgs();
-        setOrgs(rows.map((org) => ({ org, name: orgDisplayName(master, encPrivateKeys, org) })));
-      } catch (e) {
-        setError(message(e));
-      }
-    })();
+    void loadOrgs();
   }, [master, encPrivateKeys]);
 
   async function selectOrg(no: NamedOrg) {
@@ -120,6 +138,8 @@ export function TeamPanel({
     setAudit(null);
     setPlan(null);
     setDeletionActive(false);
+    setSponsoredSeats([]);
+    setSponsoredAvailable(null);
     try {
       const nextMembers = await fetchMembers(no.org.id);
       if (!isCurrent()) return;
@@ -128,6 +148,20 @@ export function TeamPanel({
       const entitlements = await fetchEntitlements(no.org.id);
       if (!isCurrent()) return;
       setPlan(entitlements);
+      if (["owner", "admin"].includes(no.org.role)) {
+        // Sponsored billing is opt-in and may be absent on older servers. It must not hide the
+        // established membership surface when that capability is unavailable.
+        try {
+          const nextSeats = await fetchSponsoredSeats(no.org.id);
+          if (!isCurrent()) return;
+          setSponsoredSeats(nextSeats);
+          setSponsoredAvailable(true);
+        } catch {
+          if (!isCurrent()) return;
+          setSponsoredSeats([]);
+          setSponsoredAvailable(false);
+        }
+      }
       // The audit log is admin/owner-only AND a Team feature; skip the fetch when gated.
       if (
         ["owner", "admin"].includes(no.org.role) &&
@@ -142,6 +176,42 @@ export function TeamPanel({
         setError(message(e));
         setMembersLoading(false);
       }
+    }
+  }
+
+  async function addSponsoredSeat() {
+    if (openOrg === null || sponsoredBeneficiary.trim() === "") return;
+    setSponsoredBusy(true);
+    setError(null);
+    try {
+      const beneficiaryId = sponsoredBeneficiary.trim();
+      const quote = await fetchSponsoredQuote(openOrg.org.id, {
+        action: sponsoredAction,
+        offer: "monthly",
+        beneficiaryIds: [beneficiaryId],
+      });
+      const effectiveFrom = Math.min(
+        Math.floor(Date.now() / 1000) + 30,
+        quote.quoteExpiresAtEpoch - 1,
+      );
+      const result = await createSponsoredCheckout(openOrg.org.id, {
+        action: sponsoredAction,
+        offer: "monthly",
+        beneficiaryId,
+        replacementBeneficiaryId: sponsoredAction === "replace" ? sponsoredReplacement.trim() : undefined,
+        quoteVersion: quote.quoteVersion,
+        quoteExpiresAtEpoch: quote.quoteExpiresAtEpoch,
+        effectiveFrom,
+        effectiveUntil: sponsoredUntil === "" ? undefined : Math.floor(new Date(`${sponsoredUntil}T23:59:59Z`).getTime() / 1000),
+        idempotencyKey: crypto.randomUUID(),
+        returnUrl: window.location.origin,
+      });
+      if (result.checkoutUrl !== null) window.location.assign(result.checkoutUrl);
+      else setNotice("Seat checkout is pending provider confirmation. Reload shortly.");
+    } catch (e) {
+      setError(message(e));
+    } finally {
+      setSponsoredBusy(false);
     }
   }
 
@@ -223,8 +293,18 @@ export function TeamPanel({
         <p className="muted">Checkout cancelled. Nothing was charged.</p>
       )}
       {error !== null && <p role="alert">{error}</p>}
-      {notice !== null && <p className="notice">{notice}</p>}
-      {orgs === null && error === null && <p className="muted">Loading…</p>}
+      {orgsError !== null && (
+        <p>
+          <span role="alert">{orgsError}</span>{" "}
+          <button disabled={orgsLoading} onClick={() => void loadOrgs()}>
+            {orgsLoading ? "Retrying…" : "Retry organisations"}
+          </button>
+        </p>
+      )}
+      <div role="status" aria-live="polite" aria-atomic="true">
+        {notice !== null && <p className="notice">{notice}</p>}
+      </div>
+      {orgsLoading && orgs === null && <p className="muted">Loading…</p>}
       {orgs !== null && (
         <ul className="items">
           {orgs.map((o) => (
@@ -299,6 +379,24 @@ export function TeamPanel({
                 </li>
               ))}
             </ul>
+          )}
+          {canManage && sponsoredAvailable === true && (
+            <section aria-labelledby="sponsored-heading">
+              <h3 id="sponsored-heading">Sponsored Cloud seats</h3>
+              <p className="muted">Seat changes are quoted before checkout and take effect only after the provider confirms payment.</p>
+              {sponsoredSeats.length === 0 ? <p className="muted">No sponsored seats are active.</p> : (
+                <ul className="items">
+                  {sponsoredSeats.map((seat) => <li key={seat.seatId}>{seat.beneficiaryId}<span className="meta">{seat.state} · {seat.offer}{seat.effectiveUntil === null ? " · ongoing" : ` · ends ${new Date(seat.effectiveUntil * 1000).toLocaleDateString("en-GB")}`}</span></li>)}
+                </ul>
+              )}
+              <form className="row" onSubmit={(e) => { e.preventDefault(); void addSponsoredSeat(); }}>
+                <label>Change <select value={sponsoredAction} onChange={(e) => setSponsoredAction(e.target.value as "add" | "remove" | "replace")} disabled={sponsoredBusy}><option value="add">Add seat</option><option value="remove">Remove seat</option><option value="replace">Replace seat</option></select></label>
+                <label>Beneficiary user id<input value={sponsoredBeneficiary} onChange={(e) => setSponsoredBeneficiary(e.target.value)} disabled={sponsoredBusy} /></label>
+                {sponsoredAction === "replace" && <label>Replacement user id<input value={sponsoredReplacement} onChange={(e) => setSponsoredReplacement(e.target.value)} disabled={sponsoredBusy} /></label>}
+                {sponsoredAction !== "add" && <label>Effective until<input type="date" value={sponsoredUntil} onChange={(e) => setSponsoredUntil(e.target.value)} disabled={sponsoredBusy} required /></label>}
+                <button type="submit" disabled={sponsoredBusy || sponsoredBeneficiary.trim() === "" || (sponsoredAction === "replace" && sponsoredReplacement.trim() === "")}>{sponsoredBusy ? "Preparing…" : sponsoredAction === "add" ? "Add seat" : sponsoredAction === "remove" ? "Schedule removal" : "Schedule replacement"}</button>
+              </form>
+            </section>
           )}
           {canManage && (
             <form

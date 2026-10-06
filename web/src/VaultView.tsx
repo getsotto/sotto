@@ -88,6 +88,10 @@ export function VaultView({
   const [openEnv, setOpenEnv] = useState<OpenEnv | null>(null);
   const [loadingEnvId, setLoadingEnvId] = useState<string | null>(null);
   const [revealed, setRevealed] = useState<Revealed | null>(null);
+  const [copyBusy, setCopyBusy] = useState(false);
+  const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
+  const copyGeneration = useRef(0);
+  const [secretQuery, setSecretQuery] = useState("");
   // Org members of the active project (loaded when an org env is opened), for the share picker.
   const [members, setMembers] = useState<Member[] | null>(null);
   const [shareTo, setShareTo] = useState("");
@@ -116,13 +120,15 @@ export function VaultView({
     try {
       const rows = await fetchProjects();
       setProjects(
-        rows.map((project) => {
-          const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
-          return {
-            project,
-            name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
-          };
-        }),
+        rows
+          .map((project) => {
+            const key = (project.orgId !== null ? keys.get(project.orgId) : undefined) ?? master;
+            return {
+              project,
+              name: nameOr(project.id, () => decryptProjectName(key, project.id, project.encName)),
+            };
+          })
+          .sort((a, b) => a.name.localeCompare(b.name)),
       );
     } catch (e) {
       setProjects([]);
@@ -134,10 +140,11 @@ export function VaultView({
 
   useEffect(() => {
     void (async () => {
+      // Organisation discovery is optional for personal projects. Keep it isolated so
+      // a failure does not prevent the independent project request.
+      const keys = new Map<string, Uint8Array>();
+      const roles = new Map<string, string>();
       try {
-        // Open every org key we hold first, so org project names decrypt on first paint.
-        const keys = new Map<string, Uint8Array>();
-        const roles = new Map<string, string>();
         for (const org of await fetchOrgs()) {
           roles.set(org.id, org.role);
           if (org.encOrgKey !== null) {
@@ -148,13 +155,13 @@ export function VaultView({
             }
           }
         }
-        setOrgKeys(keys);
-        setOrgRoles(roles);
-
-        await loadProjects(keys);
       } catch (e) {
-        setError(message(e));
+        setError(`organisations unavailable: ${message(e)}`);
       }
+      setOrgKeys(keys);
+      setOrgRoles(roles);
+
+      await loadProjects(keys);
     })();
   }, [master, encPrivateKeys]);
 
@@ -168,6 +175,7 @@ export function VaultView({
     setEnvs(null);
     setOpenEnv(null);
     setRevealed(null);
+    setSecretQuery("");
     setMembers(null);
     setShareTo(""); // drop a stale member pick so the next env's Share button starts disabled
     try {
@@ -177,7 +185,9 @@ export function VaultView({
         return;
       }
       setEnvs(
-        rows.map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(key, env.id, env.encName)) })),
+        rows
+          .map((env) => ({ env, name: nameOr(env.id, () => decryptEnvName(key, env.id, env.encName)) }))
+          .sort((a, b) => a.name.localeCompare(b.name)),
       );
     } catch (e) {
       if (load !== projectLoad.current) {
@@ -194,6 +204,7 @@ export function VaultView({
     setNotice(null);
     setOpenEnv(null);
     setRevealed(null);
+    setSecretQuery("");
     setMembers(null);
     setShareTo(""); // the new env reloads its own members; don't carry a stale pick across
     try {
@@ -389,12 +400,35 @@ export function VaultView({
     if (openEnv === null) {
       return;
     }
+    ++copyGeneration.current;
+    setCopyBusy(false);
+    setCopyFeedback(null);
     setError(null);
     try {
       const value = decryptSecretValue(openEnv.vaultKey, openEnv.envId, ns.entry);
       setRevealed({ name: ns.name, value, link: null });
     } catch (e) {
       setError(message(e));
+    }
+  }
+
+  async function copySecret(current: Revealed) {
+    if (copyBusy) return;
+    const generation = ++copyGeneration.current;
+    setCopyBusy(true);
+    setCopyFeedback(null);
+    try {
+      if (navigator.clipboard?.writeText === undefined) {
+        throw new Error("clipboard unavailable");
+      }
+      await navigator.clipboard.writeText(current.value);
+      if (generation === copyGeneration.current) setCopyFeedback("Secret copied.");
+    } catch {
+      if (generation === copyGeneration.current) {
+        setCopyFeedback("Copy failed. Select the value above and copy it manually.");
+      }
+    } finally {
+      if (generation === copyGeneration.current) setCopyBusy(false);
     }
   }
 
@@ -409,6 +443,12 @@ export function VaultView({
     }
   }
 
+  const normalizedSecretQuery = secretQuery.trim().toLocaleLowerCase();
+  const filteredSecrets =
+    openEnv?.secrets.filter((secret) =>
+      secret.name.toLocaleLowerCase().includes(normalizedSecretQuery),
+    ) ?? [];
+
   return (
     <Shell onLogout={onLogout}>
       <h1>Your vault</h1>
@@ -417,7 +457,9 @@ export function VaultView({
         reveal them.
       </p>
       {error !== null && <p role="alert">{error}</p>}
-      {notice !== null && <p className="notice">{notice}</p>}
+      <div role="status" aria-live="polite" aria-atomic="true">
+        {notice !== null && <p className="notice">{notice}</p>}
+      </div>
 
       <section>
         <h2>Projects</h2>
@@ -479,8 +521,21 @@ export function VaultView({
           {openEnv.secrets.length === 0 ? (
             <p className="muted">No secrets in this environment.</p>
           ) : (
-            <ul className="items">
-              {openEnv.secrets.map((s) => (
+            <>
+              <label>
+                Search secret names
+                <input
+                  type="search"
+                  value={secretQuery}
+                  onChange={(e) => setSecretQuery(e.target.value)}
+                  autoComplete="off"
+                />
+              </label>
+              {filteredSecrets.length === 0 ? (
+                <p className="muted">No secret names match this search.</p>
+              ) : (
+                <ul className="items">
+              {filteredSecrets.map((s) => (
                 <li key={s.entry.id}>
                   <button
                     onClick={() => reveal(s)}
@@ -490,7 +545,9 @@ export function VaultView({
                   </button>
                 </li>
               ))}
-            </ul>
+                </ul>
+              )}
+            </>
           )}
           {members !== null && members.length > 0 && (
             <form
@@ -552,6 +609,10 @@ export function VaultView({
             rows={3}
             spellCheck={false}
           />
+          <button disabled={copyBusy} onClick={() => void copySecret(revealed)}>
+            {copyBusy ? "Copying…" : "Copy secret"}
+          </button>
+          {copyFeedback !== null && <p role="status">{copyFeedback}</p>}
           {revealed.link === null ? (
             <button className="ghost" onClick={() => void share(revealed)}>
               Create one-time share link

@@ -17,8 +17,12 @@ use sotto_server::billing::{
     BillingState, ProviderResult, SubscriptionObservation, SubscriptionProvider,
     SubscriptionSnapshot, SubscriptionStatus, STRIPE_API_VERSION,
 };
+use sotto_server::billing_catalogue::BillingOffer;
+use sotto_server::billing_operations::{self, BeginOperation};
 use sotto_server::config::{BillingConfig, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS};
 use sotto_server::db;
+use sotto_server::founding_allocator::FoundingDate;
+use sotto_server::personal_billing;
 use sotto_server::state::AppState;
 
 const WEBHOOK_SECRET: &str = "whsec_test_secret";
@@ -34,6 +38,8 @@ fn app(pool: PgPool, configured: bool) -> Router {
     let state = AppState {
         deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
         telemetry_ingest: false,
+        cloud_action_enforcement_enabled: false,
+        machine_eligibility_enforcement_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,
@@ -42,6 +48,7 @@ fn app(pool: PgPool, configured: bool) -> Router {
                 api_key: "rk_test_never_called".into(),
                 webhook_secret: WEBHOOK_SECRET.into(),
                 price_id: "price_test".into(),
+                price_catalogue: None,
                 return_url: "https://app.sotto.test".into(),
             })
         }),
@@ -57,6 +64,7 @@ fn app(pool: PgPool, configured: bool) -> Router {
 
 struct TestProvider {
     observation: SubscriptionObservation,
+    personal_period_end: Option<i64>,
 }
 
 #[async_trait]
@@ -82,6 +90,13 @@ impl SubscriptionProvider for TestProvider {
         Ok(self.observation.clone())
     }
 
+    async fn personal_subscription_period_end(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<Option<i64>> {
+        Ok(self.personal_period_end)
+    }
+
     async fn cancel_subscription(
         &self,
         _subscription_id: &str,
@@ -96,6 +111,8 @@ fn app_with_provider(pool: PgPool, provider: Arc<dyn SubscriptionProvider>) -> R
     let state = AppState {
         deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
         telemetry_ingest: false,
+        cloud_action_enforcement_enabled: false,
+        machine_eligibility_enforcement_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,
@@ -220,6 +237,37 @@ async fn audit_count(pool: &PgPool, org_id: &str, action: &str) -> i64 {
         .fetch_one(pool)
         .await
         .expect("audit count")
+}
+
+async fn seed_personal_account(pool: &PgPool, user_id: &str, idempotency_key: &str) -> String {
+    let mut tx = pool.begin().await.expect("begin personal account seed");
+    let operation = match billing_operations::begin_personal_operation(
+        &mut tx,
+        user_id,
+        idempotency_key,
+        BillingOffer::StandardMonthly,
+        1,
+        2_000_000_000,
+        "https://app.sotto.test",
+        "https://app.sotto.test",
+    )
+    .await
+    .expect("seed personal operation")
+    {
+        BeginOperation::Created(operation) | BeginOperation::AlreadyExists(operation) => operation,
+    };
+    personal_billing::begin_account(
+        &mut tx,
+        user_id,
+        &operation.operation_id,
+        BillingOffer::StandardMonthly,
+        2_000_000_000,
+        1_700_000_000,
+    )
+    .await
+    .expect("seed personal account");
+    tx.commit().await.expect("commit personal account seed");
+    operation.operation_id
 }
 
 #[tokio::test]
@@ -508,6 +556,187 @@ async fn checkout_completed_grants_team_and_audits_once() {
 }
 
 #[tokio::test]
+async fn personal_paid_checkout_webhook_records_provider_term() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let user_id = "billing-user-personal-paid";
+    seed_user(&pool, user_id).await;
+    let operation_id = seed_personal_account(&pool, user_id, "personal-paid-webhook").await;
+    let provider = Arc::new(TestProvider {
+        observation: SubscriptionObservation::Missing,
+        personal_period_end: Some(1_900_000_000),
+    });
+    let app = app_with_provider(pool.clone(), provider);
+    let payload = serde_json::json!({
+        "id": "evt_personal_paid_webhook",
+        "created": 1_800_000_000,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "client_reference_id": format!("personal:{operation_id}"),
+            "payment_status": "paid",
+            "customer": "cus_personal_paid",
+            "subscription": "sub_personal_paid",
+            "payment_intent": "pi_personal_paid"
+        }}
+    })
+    .to_string();
+
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::OK
+    );
+    let account: (String, String, i64, String) = sqlx::query_as(
+        "SELECT state, stripe_subscription_id, paid_through_epoch, payment_reference \
+         FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("personal account after paid webhook");
+    assert_eq!(account.0, "active");
+    assert_eq!(account.1, "sub_personal_paid");
+    // Paid-through is stored as the UTC billing date anchor, so the provider's timestamp is
+    // normalised to midnight rather than retaining the time-of-day component.
+    assert_eq!(
+        account.2,
+        FoundingDate::from_unix_seconds(1_900_000_000)
+            .unwrap()
+            .to_unix_seconds()
+    );
+    assert_eq!(account.3, "pi_personal_paid");
+
+    let subscription_update = serde_json::json!({
+        "id": "evt_personal_paid_period",
+        "created": 1_800_000_001,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.updated",
+        "data": { "object": {
+            "id": "sub_personal_paid",
+            "status": "active",
+            "cancel_at_period_end": false,
+            "current_period_end": 1_900_000_001,
+            "items": {"data": [{"current_period_end": 2_000_000_000}]},
+            "metadata": {"personal_user_id": user_id}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &subscription_update,
+            Some(&stripe_signature(&subscription_update))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let rollover_epoch: i64 = sqlx::query_scalar(
+        "SELECT paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("personal account after subscription rollover");
+    assert_eq!(
+        rollover_epoch,
+        FoundingDate::from_unix_seconds(1_900_000_000)
+            .unwrap()
+            .to_unix_seconds()
+    );
+
+    let renewal_invoice = serde_json::json!({
+        "id": "evt_personal_paid_invoice",
+        "created": 1_800_000_002,
+        "api_version": STRIPE_API_VERSION,
+        "type": "invoice.paid",
+        "data": { "object": {
+            "id": "in_personal_paid",
+            "payment_intent": "pi_billing_webhook_renewal",
+            "period_end": 1_950_000_000,
+            "lines": {"data": [{
+                "parent": {
+                    "type": "subscription_item_details",
+                    "subscription_item_details": {
+                        "subscription": "sub_personal_paid"
+                    }
+                },
+                "period": {"end": 2_100_000_000}
+            }]},
+            "parent": {
+                "type": "subscription_details",
+                "subscription_details": {"subscription": "sub_personal_paid"}
+            }
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(
+            &app,
+            &renewal_invoice,
+            Some(&stripe_signature(&renewal_invoice))
+        )
+        .await,
+        StatusCode::OK
+    );
+    let renewed_epoch: i64 = sqlx::query_scalar(
+        "SELECT paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("renewed personal account");
+    assert_eq!(renewed_epoch, 2_100_000_000,);
+}
+
+#[tokio::test]
+async fn personal_incomplete_expired_webhook_cancels_pending_account() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let user_id = "billing-user-personal-expired";
+    seed_user(&pool, user_id).await;
+    let operation_id = seed_personal_account(&pool, user_id, "personal-expired-webhook").await;
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+    );
+    let payload = serde_json::json!({
+        "id": "evt_personal_incomplete_expired",
+        "created": 1_800_000_001,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.updated",
+        "data": { "object": {
+            "id": "sub_personal_expired",
+            "status": "incomplete_expired",
+            "cancel_at_period_end": false,
+            "metadata": {
+                "personal_user_id": user_id,
+                "operation_id": operation_id
+            }
+        }}
+    })
+    .to_string();
+
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::OK
+    );
+    let account: (String, String) = sqlx::query_as(
+        "SELECT state, stripe_subscription_id FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("personal account after incomplete expiry");
+    assert_eq!(account.0, "canceled");
+    assert_eq!(account.1, "sub_personal_expired");
+}
+
+#[tokio::test]
 async fn subscription_status_governs_tier() {
     let Some(pool) = pool_or_skip().await else {
         return;
@@ -642,6 +871,7 @@ async fn equal_timestamp_events_reconcile_with_the_provider() {
             id: "sub_test_equal".into(),
             status: SubscriptionStatus::Canceled,
         }),
+        personal_period_end: None,
     });
     let app = app_with_provider(pool.clone(), provider);
     let event = |id: &str, status: &str| {
@@ -720,6 +950,174 @@ async fn subscription_deleted_downgrades_via_stored_id() {
         audit_count(&pool, "billing-org-del", "billing.cancelled").await,
         1
     );
+}
+
+#[tokio::test]
+async fn sponsored_subscription_deleted_cancels_named_seats_without_downgrading_org() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let org_id = "billing-org-sponsored-deleted";
+    let owner_id = "billing-user-sponsored-owner";
+    let beneficiary_id = "billing-user-sponsored-beneficiary";
+    let operation_id = "sponsored:billing-deleted-operation";
+    for table in [
+        "billing_sponsored_seats",
+        "billing_sponsored_operations",
+        "billing_sponsored_subscription_items",
+        "billing_sponsored_subscriptions",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE organization_id = $1"))
+            .bind(org_id)
+            .execute(&pool)
+            .await
+            .expect("clean sponsored lifecycle fixture");
+    }
+    seed_user(&pool, owner_id).await;
+    seed_user(&pool, beneficiary_id).await;
+    seed_org(&pool, org_id, "team", owner_id, "owner").await;
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_customer_id, provider_subscription_id, status) \
+         VALUES ($1, 'cus_sponsored_deleted', 'sub_sponsored_deleted', 'active')",
+    )
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .expect("seed sponsored subscription");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_operations \
+         (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action, \
+          beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from, \
+          provider_idempotency_key, state, result_code) \
+         VALUES ($1, $2, $3, 'deleted-idempotency', 'deleted-hash', 'add', $4, \
+                 'standard_monthly', 1, 2000000000, 1700000000, 'deleted-provider-key', 'active', 'ok')",
+    )
+    .bind(operation_id)
+    .bind(org_id)
+    .bind(owner_id)
+    .bind(beneficiary_id)
+    .execute(&pool)
+    .await
+    .expect("seed sponsored operation");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_seats \
+         (seat_id, organization_id, beneficiary_id, offer, effective_from, state, operation_id) \
+         VALUES ('seat:billing-deleted', $1, $2, 'standard_monthly', 1700000000, 'active', $3)",
+    )
+    .bind(org_id)
+    .bind(beneficiary_id)
+    .bind(operation_id)
+    .execute(&pool)
+    .await
+    .expect("seed sponsored seat");
+
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+    );
+    let payload = serde_json::json!({
+        "id": "evt_sponsored_deleted",
+        "created": 1_800_000_000,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.deleted",
+        "data": { "object": {
+            "id": "sub_sponsored_deleted",
+            "customer": "cus_sponsored_deleted",
+            "metadata": {"organization_id": org_id}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &payload, Some(&stripe_signature(&payload))).await,
+        StatusCode::OK
+    );
+    let stored: (String, Option<String>) = sqlx::query_as(
+        "SELECT status, provider_subscription_id FROM billing_sponsored_subscriptions \
+         WHERE organization_id = $1",
+    )
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("sponsored lifecycle state");
+    assert_eq!(stored, ("canceled".into(), None));
+    let seat_state: String =
+        sqlx::query_scalar("SELECT state FROM billing_sponsored_seats WHERE organization_id = $1")
+            .bind(org_id)
+            .fetch_one(&pool)
+            .await
+            .expect("canceled sponsored seat");
+    assert_eq!(seat_state, "canceled");
+    assert_eq!(org_billing_state(&pool, org_id).await.0, "team");
+}
+
+#[tokio::test]
+async fn unmatched_sponsored_lifecycle_events_never_change_legacy_billing() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let free_org = "billing-org-sponsored-early-free";
+    let team_org = "billing-org-sponsored-early-team";
+    let free_owner = "billing-user-sponsored-early-free";
+    let team_owner = "billing-user-sponsored-early-team";
+    seed_user(&pool, free_owner).await;
+    seed_user(&pool, team_owner).await;
+    seed_org(&pool, free_org, "free", free_owner, "owner").await;
+    seed_org(&pool, team_org, "team", team_owner, "owner").await;
+    sqlx::query(
+        "UPDATE organizations SET stripe_subscription_id = 'sub_legacy_early' WHERE id = $1",
+    )
+    .bind(team_org)
+    .execute(&pool)
+    .await
+    .expect("seed legacy subscription link");
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: None,
+        }),
+    );
+    let updated = serde_json::json!({
+        "id": "evt_sponsored_early_updated",
+        "created": 1_800_000_000,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.updated",
+        "data": { "object": {
+            "id": "sub_sponsored_early",
+            "status": "active",
+            "cancel_at_period_end": false,
+            "metadata": {"organization_id": free_org}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &updated, Some(&stripe_signature(&updated))).await,
+        StatusCode::OK
+    );
+    assert_eq!(org_billing_state(&pool, free_org).await.0, "free");
+
+    let deleted = serde_json::json!({
+        "id": "evt_sponsored_early_deleted",
+        "created": 1_800_000_001,
+        "api_version": STRIPE_API_VERSION,
+        "type": "customer.subscription.deleted",
+        "data": { "object": {
+            "id": "sub_sponsored_early_deleted",
+            "metadata": {"organization_id": team_org}
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &deleted, Some(&stripe_signature(&deleted))).await,
+        StatusCode::OK
+    );
+    let team_state = org_billing_state(&pool, team_org).await;
+    assert_eq!(team_state.0, "team");
+    assert_eq!(team_state.2.as_deref(), Some("sub_legacy_early"));
 }
 
 #[tokio::test]
