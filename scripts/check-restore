@@ -34,6 +34,7 @@ MUST_EXIST = (
     "organization_deletions",
     "organization_deletion_metric_counters",
     "audit_events",
+    "cloud_retention_tombstone_journal",
 )
 
 MIGRATIONS_TABLE = "_sqlx_migrations"
