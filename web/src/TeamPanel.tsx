@@ -7,6 +7,9 @@ import {
   fetchEntitlements,
   fetchMembers,
   fetchOrgs,
+  fetchSponsoredSeats,
+  fetchSponsoredQuote,
+  createSponsoredCheckout,
   grantOrgKey,
   inviteMember,
   type AuditEvent,
@@ -88,6 +91,9 @@ export function TeamPanel({
   const [inviteBusy, setInviteBusy] = useState(false);
   const [billingOutcome] = useState(parseBillingOutcome);
   const [deletionActive, setDeletionActive] = useState(false);
+  const [sponsoredSeats, setSponsoredSeats] = useState<import("./api").SponsoredSeat[]>([]);
+  const [sponsoredBeneficiary, setSponsoredBeneficiary] = useState("");
+  const [sponsoredBusy, setSponsoredBusy] = useState(false);
   const orgLoadGeneration = useRef(0);
   const billingGeneration = useRef(0);
   const inviteInFlight = useRef(false);
@@ -128,6 +134,7 @@ export function TeamPanel({
     setAudit(null);
     setPlan(null);
     setDeletionActive(false);
+    setSponsoredSeats([]);
     try {
       const nextMembers = await fetchMembers(no.org.id);
       if (!isCurrent()) return;
@@ -136,6 +143,15 @@ export function TeamPanel({
       const entitlements = await fetchEntitlements(no.org.id);
       if (!isCurrent()) return;
       setPlan(entitlements);
+      if (["owner", "admin"].includes(no.org.role)) {
+        // Sponsored billing is opt-in and may be absent on older servers. It must not hide the
+        // established membership surface when that capability is unavailable.
+        try {
+          setSponsoredSeats(await fetchSponsoredSeats(no.org.id));
+        } catch {
+          setSponsoredSeats([]);
+        }
+      }
       // The audit log is admin/owner-only AND a Team feature; skip the fetch when gated.
       if (
         ["owner", "admin"].includes(no.org.role) &&
@@ -150,6 +166,36 @@ export function TeamPanel({
         setError(message(e));
         setMembersLoading(false);
       }
+    }
+  }
+
+  async function addSponsoredSeat() {
+    if (openOrg === null || sponsoredBeneficiary.trim() === "") return;
+    setSponsoredBusy(true);
+    setError(null);
+    try {
+      const beneficiaryId = sponsoredBeneficiary.trim();
+      const quote = await fetchSponsoredQuote(openOrg.org.id, {
+        action: "add",
+        offer: "monthly",
+        beneficiaryIds: [beneficiaryId],
+      });
+      const result = await createSponsoredCheckout(openOrg.org.id, {
+        action: "add",
+        offer: "monthly",
+        beneficiaryId,
+        quoteVersion: quote.quoteVersion,
+        quoteExpiresAtEpoch: quote.quoteExpiresAtEpoch,
+        effectiveFrom: Math.floor(Date.now() / 1000),
+        idempotencyKey: crypto.randomUUID(),
+        returnUrl: `${window.location.origin}/app?billing=complete`,
+      });
+      if (result.checkoutUrl !== null) window.location.assign(result.checkoutUrl);
+      else setNotice("Seat checkout is pending provider confirmation. Reload shortly.");
+    } catch (e) {
+      setError(message(e));
+    } finally {
+      setSponsoredBusy(false);
     }
   }
 
@@ -317,6 +363,21 @@ export function TeamPanel({
                 </li>
               ))}
             </ul>
+          )}
+          {canManage && (
+            <section aria-labelledby="sponsored-heading">
+              <h3 id="sponsored-heading">Sponsored Cloud seats</h3>
+              <p className="muted">Seat changes are quoted before checkout and take effect only after the provider confirms payment.</p>
+              {sponsoredSeats.length === 0 ? <p className="muted">No sponsored seats are active.</p> : (
+                <ul className="items">
+                  {sponsoredSeats.map((seat) => <li key={seat.seatId}>{seat.beneficiaryId}<span className="meta">{seat.state} · {seat.offer}{seat.effectiveUntil === null ? " · ongoing" : ` · ends ${new Date(seat.effectiveUntil * 1000).toLocaleDateString("en-GB")}`}</span></li>)}
+                </ul>
+              )}
+              <form className="row" onSubmit={(e) => { e.preventDefault(); void addSponsoredSeat(); }}>
+                <label>Beneficiary user id<input value={sponsoredBeneficiary} onChange={(e) => setSponsoredBeneficiary(e.target.value)} disabled={sponsoredBusy} /></label>
+                <button type="submit" disabled={sponsoredBusy || sponsoredBeneficiary.trim() === ""}>{sponsoredBusy ? "Preparing…" : "Add seat"}</button>
+              </form>
+            </section>
           )}
           {canManage && (
             <form
