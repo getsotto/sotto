@@ -1887,7 +1887,24 @@ fn env_list_json(environments: &[String], active: &str) -> Result<String> {
     to_json(&value)
 }
 
-/// Stable machine-readable shape for token list JSON output.
+/// Stable machine-readable shape for `sotto token ls --json`.
+///
+/// Returns a JSON array of one object per token, in the order the server listed them. Stdout
+/// contains JSON only; diagnostics stay on stderr. No token is emitted for an empty listing.
+///
+/// ```text
+/// [{"token_id":"token-1","name":"ci","created_by":"user-1","beneficiary_id":"user-1",
+///   "beneficiary_status":"verified","expires_at":"2026-01-01T00:00:00Z","expires_in_days":14}]
+/// ```
+///
+/// `created_by`, `beneficiary_id` and `beneficiary_status` are `null` when the server does not
+/// know them.
+///
+/// `expires_at` is an RFC 3339 UTC timestamp or `null`, and `expires_in_days` is the whole days
+/// until then, rounded down, or `null`. Both are `null` together against a server that predates
+/// token expiry, whose tokens never expire. Both are passed through exactly as the server sent
+/// them: days come from the server's clock and are never recomputed locally, and `0` means the
+/// token expires today rather than an unknown expiry.
 fn machine_token_list_json(tokens: &[remote::api::MachineTokenInfo]) -> Result<String> {
     let value: Vec<_> = tokens
         .iter()
@@ -1898,6 +1915,8 @@ fn machine_token_list_json(tokens: &[remote::api::MachineTokenInfo]) -> Result<S
                 "created_by": token.created_by,
                 "beneficiary_id": token.beneficiary_id,
                 "beneficiary_status": token.beneficiary_status,
+                "expires_at": token.expires_at,
+                "expires_in_days": token.expires_in_days,
             })
         })
         .collect();
@@ -2785,8 +2804,8 @@ mod tests {
                 created_by: Some("user-1".into()),
                 beneficiary_id: Some("user-1".into()),
                 beneficiary_status: Some("verified".into()),
-                expires_at: None,
-                expires_in_days: None,
+                expires_at: Some("2026-01-01T00:00:00Z".into()),
+                expires_in_days: Some(14),
             },
             MachineTokenInfo {
                 token_id: "token-2".into(),
@@ -2797,6 +2816,16 @@ mod tests {
                 beneficiary_status: Some("ambiguous".into()),
                 expires_at: None,
                 expires_in_days: None,
+            },
+            MachineTokenInfo {
+                token_id: "token-3".into(),
+                name: "expiring today".into(),
+                public_key: "unused".into(),
+                created_by: Some("user-2".into()),
+                beneficiary_id: Some("user-2".into()),
+                beneficiary_status: Some("verified".into()),
+                expires_at: Some("2026-01-01T00:00:00Z".into()),
+                expires_in_days: Some(0),
             },
         ];
         let value: serde_json::Value =
@@ -2809,6 +2838,28 @@ mod tests {
         assert!(value[1]["beneficiary_id"].is_null());
         assert_eq!(value[1]["beneficiary_status"], "ambiguous");
         assert_eq!(machine_token_list_json(&[]).unwrap(), "[]");
+        let first = value[0].as_object().unwrap();
+        assert_eq!(
+            first.get("expires_at"),
+            Some(&serde_json::Value::String("2026-01-01T00:00:00Z".into()))
+        );
+        assert_eq!(
+            first.get("expires_in_days"),
+            Some(&serde_json::Value::from(14))
+        );
+
+        let second = value[1].as_object().unwrap();
+        assert_eq!(second.get("expires_at"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            second.get("expires_in_days"),
+            Some(&serde_json::Value::Null)
+        );
+
+        let third = value[2].as_object().unwrap();
+        assert_eq!(
+            third.get("expires_in_days"),
+            Some(&serde_json::Value::from(0))
+        );
     }
 
     #[test]

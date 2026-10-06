@@ -7,6 +7,8 @@ import "./styles/landing.css";
 const REPO = "https://github.com/getsotto/sotto";
 const INSTALL_CMD =
   "curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh";
+const POWERSHELL_INSTALL_CMD =
+  "irm https://raw.githubusercontent.com/getsotto/sotto/main/install.ps1 | iex";
 
 // The marketing page an anonymous visitor gets at `/`. The vault app lives at /app; this page's
 // job is the top of the funnel: see it → install it. Everything is real, selectable text - the
@@ -41,11 +43,18 @@ export function Landing() {
           <code>{INSTALL_CMD}</code>
           <CopyButton text={INSTALL_CMD} />
         </div>
+        <p className="muted">On Windows, run this in PowerShell:</p>
+        <div className="install">
+          <code>{POWERSHELL_INSTALL_CMD}</code>
+          <CopyButton text={POWERSHELL_INSTALL_CMD} />
+        </div>
         <p className="muted">
-          Signed binaries for macOS and Linux. The installer verifies the checksum, and the
-          Sigstore signature when <code>cosign</code> is installed. Prefer to{" "}
-          <a href={`${REPO}/blob/main/install.sh`}>read it first</a>? Or grab a tarball from{" "}
-          <a href={`${REPO}/releases`}>releases</a>.
+          Prebuilt, signed binaries are available for macOS, Linux, and Windows x86_64. The
+          installers verify the archive&rsquo;s SHA-256 checksum and, when <code>cosign</code> is
+          installed, its Sigstore signature. Read the{" "}
+          <a href={`${REPO}/blob/main/install.sh`}>shell installer</a> or the{" "}
+          <a href={`${REPO}/blob/main/install.ps1`}>PowerShell installer</a>, or download a tarball
+          from <a href={`${REPO}/releases`}>releases</a>.
         </p>
       </section>
 
