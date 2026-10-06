@@ -20,6 +20,7 @@ import urllib.parse
 from dataclasses import dataclass
 
 MAX_LINE_BYTES = 16 * 1024
+FORMAT_VERSION = 1
 RESOURCE_KINDS = {"project", "environment", "share"}
 
 
@@ -64,6 +65,7 @@ def parse_journal(path: str) -> list[Entry]:
             if not isinstance(value, dict):
                 raise ValueError(f"journal line {line_number} is not an object")
             required = {
+                "format_version",
                 "journal_id",
                 "resource_kind",
                 "resource_id",
@@ -83,6 +85,8 @@ def parse_journal(path: str) -> list[Entry]:
             owner = value["expected_owner_id"]
             created_at = value["expected_created_at"]
             revision = value["expected_revision"]
+            if value["format_version"] != FORMAT_VERSION:
+                raise ValueError(f"journal line {line_number} has an unsupported format version")
             if not all(isinstance(item, str) and item and "\n" not in item for item in (journal_id, resource_kind, resource_id)):
                 raise ValueError(f"journal line {line_number} has an invalid identity")
             if journal_id in seen_journal_ids:

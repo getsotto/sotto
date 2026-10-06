@@ -18,6 +18,7 @@ LOADER.exec_module(replay)
 
 def entry(**overrides):
     value = {
+        "format_version": 1,
         "journal_id": "journal-1",
         "job_id": "job-1",
         "resource_kind": "project",
@@ -70,6 +71,11 @@ class Journal(unittest.TestCase):
     def test_shared_and_unknown_entries_are_rejected(self):
         path = self.write([entry(ownership_kind="shared", expected_owner_id=None)])
         with self.assertRaisesRegex(ValueError, "not a personal tombstone"):
+            replay.parse_journal(path)
+
+    def test_unknown_format_versions_are_rejected(self):
+        path = self.write([entry(format_version=2)])
+        with self.assertRaisesRegex(ValueError, "unsupported format version"):
             replay.parse_journal(path)
 
     def test_oversized_lines_are_rejected(self):
