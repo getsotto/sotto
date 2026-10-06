@@ -210,6 +210,7 @@ async fn shared_scope_holds_and_cancellation_stops_due_work() {
     assert!(project_exists);
 
     let mut cancelled = intent(CANCEL_JOB, USER_ID);
+    cancelled.eligibility_episode = "export-expiry:2".into();
     cancelled.notice_event_key = "notice:cancelled-expiry".into();
     retention::enqueue(&pool, &cancelled)
         .await
