@@ -242,6 +242,9 @@ enum Command {
         /// Allow writing to a terminal.
         #[arg(long)]
         reveal: bool,
+        /// Download the encrypted Cloud exit bundle instead of rendering plaintext.
+        #[arg(long, value_name = "PATH")]
+        cloud: Option<PathBuf>,
     },
     /// Import secrets from a .env file into the active environment.
     #[command(after_help = r#"Examples:
@@ -251,6 +254,9 @@ Values are imported literally: $OTHER and ${OTHER} are not expanded, and an inli
     Import {
         /// Path to the .env file.
         file: PathBuf,
+        /// Restore an encrypted Cloud exit bundle instead of importing dotenv values.
+        #[arg(long)]
+        cloud: bool,
     },
     /// Manage environments.
     Env {
@@ -410,9 +416,11 @@ fn run() -> Result<()> {
     if let Ok(token) = std::env::var("SOTTO_TOKEN") {
         match &cli.command {
             Some(Command::Run { args }) => return machine_run(&token, args.clone()),
-            Some(Command::Export { format, reveal }) => {
-                return machine_export(&token, *format, *reveal)
-            }
+            Some(Command::Export {
+                format,
+                reveal,
+                cloud: None,
+            }) => return machine_export(&token, *format, *reveal),
             _ => {} // every other command proceeds as a normal session
         }
     }
@@ -744,15 +752,27 @@ fn run() -> Result<()> {
             ensure_unlocked(&store, &keychain)?;
             run_injected(&app, &config, args)
         }
-        Command::Export { format, reveal } => {
-            let config = effective_config(&cwd, cli.env.as_deref())?;
-            ensure_unlocked(&store, &keychain)?;
-            export_secrets(&app, &config, format, reveal)
+        Command::Export {
+            format,
+            reveal,
+            cloud,
+        } => {
+            if let Some(path) = cloud {
+                cloud_export(&keychain, &path)
+            } else {
+                let config = effective_config(&cwd, cli.env.as_deref())?;
+                ensure_unlocked(&store, &keychain)?;
+                export_secrets(&app, &config, format, reveal)
+            }
         }
-        Command::Import { file } => {
-            let config = effective_config(&cwd, cli.env.as_deref())?;
-            ensure_unlocked(&store, &keychain)?;
-            import_dotenv(&app, &config, &file)
+        Command::Import { file, cloud } => {
+            if cloud {
+                cloud_import(&store, &keychain, &file)
+            } else {
+                let config = effective_config(&cwd, cli.env.as_deref())?;
+                ensure_unlocked(&store, &keychain)?;
+                import_dotenv(&app, &config, &file)
+            }
         }
         Command::Env { command } => match command {
             EnvCommand::Ls { json } => {
@@ -1223,6 +1243,42 @@ fn read_secret_key() -> Result<Vec<u8>> {
     };
     sotto_core::format::decode_key("SK", 1, input.trim())
         .map_err(|_| Error::Input("invalid Secret Key".into()))
+}
+
+fn cloud_export(keychain: &dyn Keychain, path: &Path) -> Result<()> {
+    let client = sync_client(keychain)?;
+    let bundle = {
+        let _spinner = sotto_cli::feedback::spinner("Downloading encrypted Cloud export...");
+        remote::export::download(&client)?
+    };
+    remote::export::write(&bundle, path)?;
+    eprintln!("wrote encrypted Cloud export to `{}`", path.display());
+    Ok(())
+}
+
+fn cloud_import(store: &Store, keychain: &dyn Keychain, path: &Path) -> Result<()> {
+    if store.get_identity()?.is_some() {
+        return Err(Error::AlreadyInitialized);
+    }
+    let bundle = remote::export::read(path)?;
+    let mut secret_key = read_secret_key()?;
+    let mut password = read_password("Master password: ")?;
+    let result = {
+        let _spinner = sotto_cli::feedback::spinner("Restoring encrypted Cloud export...");
+        remote::export::restore(
+            store,
+            keychain,
+            &bundle,
+            &secret_key,
+            &password,
+            SESSION_TTL,
+        )
+    };
+    secret_key.zeroize();
+    password.zeroize();
+    result?;
+    eprintln!("restored encrypted Cloud export; choose a project and environment locally");
+    Ok(())
 }
 
 /// Build an authenticated sync client from the configured server URL + stored session token.

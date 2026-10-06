@@ -336,6 +336,81 @@ pub struct CreatedShare {
     pub expires_at: Option<String>,
 }
 
+/// Versioned Cloud exit-export manifest. It names only resources the caller can decrypt.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportManifest {
+    pub version: i32,
+    pub export_id: String,
+    pub manifest_hash: String,
+    pub expires_at: String,
+    pub total_chunks: usize,
+    pub complete: bool,
+    pub projects: Vec<ExportProject>,
+    pub environments: Vec<ExportEnvironmentRef>,
+    #[serde(default)]
+    pub not_shared_environment_ids: Vec<String>,
+    pub omitted_environment_count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportProject {
+    pub id: String,
+    pub enc_name: String,
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportEnvironmentRef {
+    pub id: String,
+    pub project_id: String,
+    pub enc_name: String,
+    pub enc_vault_key: String,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportChunk {
+    pub version: i32,
+    pub export_id: String,
+    pub manifest_hash: String,
+    pub index: usize,
+    pub total_chunks: usize,
+    pub complete: bool,
+    pub account: Option<AccountBundle>,
+    pub environment: Option<ExportEnvironment>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportEnvironment {
+    pub id: String,
+    pub project_id: String,
+    pub enc_name: String,
+    pub enc_vault_key: String,
+    pub revision: i64,
+    pub content_hash: String,
+    pub secrets: Vec<ExportSecret>,
+    pub history: Vec<ExportHistory>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportSecret {
+    pub id: String,
+    pub enc_name: String,
+    pub enc_value: String,
+    pub enc_data_key: String,
+    pub version: i64,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportHistory {
+    pub secret_id: String,
+    pub version: i64,
+    pub enc_name: String,
+    pub enc_value: String,
+    pub enc_data_key: String,
+}
+
 /// The server operations the sync engine needs, abstracted for testability.
 pub trait SyncApi {
     /// Verify the session and return the authenticated user.
@@ -347,6 +422,10 @@ pub trait SyncApi {
     fn reset_account(&self, bundle: &AccountBundle) -> Result<()>;
     /// Download account crypto material, or `None` if the account isn't initialised.
     fn get_account(&self) -> Result<Option<AccountBundle>>;
+    /// Start a short-lived, versioned export of the caller's authorised resources.
+    fn start_export(&self) -> Result<ExportManifest>;
+    /// Fetch one opaque export chunk, rechecking the caller's grant and environment revision.
+    fn export_chunk(&self, export_id: &str, index: usize) -> Result<ExportChunk>;
     fn create_project(&self, project: &NewProject) -> Result<()>;
     fn create_environment(&self, project_id: &str, env: &NewEnvironment) -> Result<()>;
     /// List a project's environments (for reconstructing them on a new device).

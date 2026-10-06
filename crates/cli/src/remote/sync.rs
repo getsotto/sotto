@@ -635,6 +635,22 @@ mod tests {
             Ok(self.state.borrow().account.clone())
         }
 
+        fn start_export(&self) -> Result<super::super::api::ExportManifest> {
+            Err(Error::Server(
+                "export is not modelled by this sync mock".into(),
+            ))
+        }
+
+        fn export_chunk(
+            &self,
+            _export_id: &str,
+            _index: usize,
+        ) -> Result<super::super::api::ExportChunk> {
+            Err(Error::Server(
+                "export is not modelled by this sync mock".into(),
+            ))
+        }
+
         fn create_project(&self, project: &NewProject) -> Result<()> {
             self.state.borrow_mut().projects.insert(project.id.clone());
             Ok(())
