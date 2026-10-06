@@ -8,13 +8,14 @@ change an entitlement.
 ## Produce an inventory
 
 Run the command against a disposable copy first, then against the deployment's database using a
-read-only database role. The password is supplied in `DATABASE_URL` and is moved to `PGPASSWORD`
-by the command; it is never passed as a `psql` argument or printed.
+read-only database role. Keep the credential-bearing URL in the environment rather than putting
+it in the command's arguments, where local process inspection can expose it.
 
 ```sh
+export INVENTORY_DATABASE_URL="$DATABASE_URL"
 scripts/inventory-legacy-billing \
-  --database-url "$DATABASE_URL" \
   --output deploy/rehearsals/legacy-billing-$(date -u +%Y%m%dT%H%M%SZ).json
+unset INVENTORY_DATABASE_URL
 ```
 
 The report contains only aggregate counts, migration/Postgres provenance and proposed treatment.

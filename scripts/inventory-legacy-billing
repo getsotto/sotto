@@ -7,7 +7,10 @@ cohort and notice treatment before any row can be changed or charged. The output
 schema provenance and proposed treatment only; it never prints user, organisation, provider or
 resource identifiers.
 
-Usage: scripts/inventory-legacy-billing --database-url <url> [--output <path>]
+Usage: scripts/inventory-legacy-billing [--database-url <url>] [--output <path>]
+
+The database URL may also be supplied as INVENTORY_DATABASE_URL or DATABASE_URL. Prefer the
+environment form when the URL contains a password so it never appears in process arguments.
 """
 
 from __future__ import annotations
@@ -205,11 +208,14 @@ def write_report(report: dict, output: str | None) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database-url", required=True)
+    parser.add_argument("--database-url")
     parser.add_argument("--output", help="write the sanitised report to this path instead of stdout")
     args = parser.parse_args(argv)
+    database_url = args.database_url or os.environ.get("INVENTORY_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    if not database_url:
+        parser.error("a database URL is required via --database-url, INVENTORY_DATABASE_URL or DATABASE_URL")
     try:
-        rows, provenance = read_database(args.database_url)
+        rows, provenance = read_database(database_url)
         write_report(build_report(rows, provenance), args.output)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"legacy billing inventory failed: {error}", file=sys.stderr)

@@ -72,6 +72,12 @@ class Database(unittest.TestCase):
             self.assertNotIn("hunter2", " ".join(call.args[0]))
             self.assertEqual(call.kwargs["env"]["PGPASSWORD"], "hunter2")
 
+    def test_database_url_can_come_from_the_environment(self):
+        with mock.patch.dict(inventory.os.environ, {"INVENTORY_DATABASE_URL": "postgres://db/sotto"}):
+            with mock.patch.object(inventory, "read_database", return_value=([], {"latest_migration": "50", "postgres_version_num": "160000"})) as read:
+                self.assertEqual(inventory.main([]), 0)
+        read.assert_called_once_with("postgres://db/sotto")
+
 
 if __name__ == "__main__":
     unittest.main()
