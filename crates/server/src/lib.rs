@@ -79,6 +79,8 @@ pub mod error;
 pub mod export;
 pub mod health;
 pub mod machine;
+#[doc(hidden)]
+pub mod notifications;
 pub mod org;
 pub mod person_eligibility;
 pub mod personal_billing;
@@ -136,6 +138,7 @@ pub fn app(state: AppState) -> Router {
         .merge(org::router())
         .merge(billing::router())
         .merge(machine::router())
+        .merge(notifications::router())
         .merge(sync::router())
         .merge(share::router())
         .merge(server_info::router())
