@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS cloud_retention_jobs (
     deadline_at             TIMESTAMPTZ NOT NULL,
     notice_event_key        TEXT NOT NULL,
     notice_evidence_at      TIMESTAMPTZ,
+    dry_run_completed_at    TIMESTAMPTZ,
     expected_coverage_revision BIGINT,
     state                   TEXT NOT NULL DEFAULT 'planned',
     dry_run                 BOOLEAN NOT NULL DEFAULT TRUE,

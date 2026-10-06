@@ -5,6 +5,9 @@
 //! stored separately so a later dry run can be reviewed before a purge switch is ever enabled.
 //! This module intentionally has no startup worker or public route yet: retention policy and
 //! restore evidence remain activation gates.
+//!
+//! Scope item identifiers are canonical database identifiers. Share-link tokens supplied by a
+//! producer are resolved to their internal `share_links.id` while the scope is inserted.
 
 use std::fmt;
 
@@ -204,7 +207,6 @@ struct RetentionLease {
     subject_user_id: Option<String>,
     expected_coverage_revision: Option<i64>,
     dry_run: bool,
-    purge_enabled: bool,
     worker_id: String,
 }
 
@@ -269,6 +271,18 @@ pub async fn add_scope_item(pool: &PgPool, item: &ScopeItem) -> RetentionResult<
     if state != RetentionState::Planned.as_str() {
         return Err(RetentionError::Held("retention scope is immutable"));
     }
+    let resource_id = if item.resource_kind == "share" {
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM share_links WHERE id=$1 OR token=$1 \
+             ORDER BY (id=$1) DESC LIMIT 1",
+        )
+        .bind(&item.resource_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or_else(|| item.resource_id.clone())
+    } else {
+        item.resource_id.clone()
+    };
     let inserted = sqlx::query(
         "INSERT INTO cloud_retention_scope_items \
          (job_id, resource_kind, resource_id, ownership_kind, expected_created_at, expected_revision) \
@@ -276,7 +290,7 @@ pub async fn add_scope_item(pool: &PgPool, item: &ScopeItem) -> RetentionResult<
     )
     .bind(&item.job_id)
     .bind(&item.resource_kind)
-    .bind(&item.resource_id)
+    .bind(&resource_id)
     .bind(&item.ownership_kind)
     .bind(item.expected_created_at_epoch)
     .bind(item.expected_revision)
@@ -315,7 +329,7 @@ pub async fn mark_ready(pool: &PgPool, job_id: &str) -> RetentionResult<()> {
     bounded(job_id, MAX_KEY, "job_id")?;
     let affected = sqlx::query(
         "UPDATE cloud_retention_jobs SET state='ready', dry_run=TRUE, updated_at=now() \
-         WHERE job_id=$1 AND state IN ('planned','dry_run') AND notice_evidence_at IS NOT NULL \
+         WHERE job_id=$1 AND state='planned' AND notice_evidence_at IS NOT NULL \
            AND hold_code IS NULL",
     )
     .bind(job_id)
@@ -347,9 +361,9 @@ pub async fn cancel(pool: &PgPool, job_id: &str, reason: &str) -> RetentionResul
 pub async fn enable_purge(pool: &PgPool, job_id: &str) -> RetentionResult<()> {
     bounded(job_id, MAX_KEY, "job_id")?;
     let affected = sqlx::query(
-        "UPDATE cloud_retention_jobs SET purge_enabled=TRUE, dry_run=FALSE, updated_at=now() \
-         WHERE job_id=$1 AND state='ready' AND notice_evidence_at IS NOT NULL \
-           AND deadline_at <= now() AND hold_code IS NULL",
+        "UPDATE cloud_retention_jobs SET state='ready', purge_enabled=TRUE, dry_run=FALSE, updated_at=now() \
+         WHERE job_id=$1 AND state='dry_run' AND dry_run_completed_at IS NOT NULL \
+           AND notice_evidence_at IS NOT NULL AND deadline_at <= now() AND hold_code IS NULL",
     )
     .bind(job_id)
     .execute(pool)
@@ -404,9 +418,11 @@ async fn claim_due(
     let row = sqlx::query(
         "SELECT job_id FROM cloud_retention_jobs \
          WHERE deadline_at <= now() AND \
-           ((state IN ('ready','dry_run') AND $1 = 'dry_run') OR \
+           (($1 = 'dry_run' AND ((state='ready' AND dry_run=TRUE) OR state='dry_run')) OR \
             (state = 'ready' AND dry_run = FALSE AND purge_enabled = TRUE AND $1 = 'purge') OR \
-            (state = 'leased' AND lease_expires_at <= now())) \
+            (state = 'leased' AND lease_expires_at <= now() AND \
+             (($1 = 'dry_run' AND dry_run = TRUE) OR \
+              ($1 = 'purge' AND dry_run = FALSE AND purge_enabled = TRUE)))) \
          ORDER BY deadline_at, created_at, job_id LIMIT 1 FOR UPDATE SKIP LOCKED",
     )
     .bind(mode.as_str())
@@ -420,11 +436,17 @@ async fn claim_due(
     let row = sqlx::query(
         "UPDATE cloud_retention_jobs SET state='leased', lease_owner=$1, \
              lease_expires_at=now()+interval '5 minutes', attempt_count=attempt_count+1, updated_at=now() \
-         WHERE job_id=$2 AND (state='ready' OR (state='leased' AND lease_expires_at <= now())) \
-         RETURNING scope_kind, subject_user_id, expected_coverage_revision, dry_run, purge_enabled",
+         WHERE job_id=$2 AND \
+           (($3 = 'dry_run' AND ((state='ready' AND dry_run=TRUE) OR state='dry_run')) OR \
+            ($3 = 'purge' AND state='ready' AND dry_run=FALSE AND purge_enabled=TRUE) OR \
+            (state='leased' AND lease_expires_at <= now() AND \
+             (($3 = 'dry_run' AND dry_run=TRUE) OR \
+              ($3 = 'purge' AND dry_run=FALSE AND purge_enabled=TRUE)))) \
+         RETURNING scope_kind, subject_user_id, expected_coverage_revision, dry_run",
     )
     .bind(worker_id)
     .bind(&job_id)
+    .bind(mode.as_str())
     .fetch_one(&mut *tx)
     .await?;
     let lease = RetentionLease {
@@ -433,7 +455,6 @@ async fn claim_due(
         subject_user_id: row.try_get("subject_user_id")?,
         expected_coverage_revision: row.try_get("expected_coverage_revision")?,
         dry_run: row.try_get("dry_run")?,
-        purge_enabled: row.try_get("purge_enabled")?,
         worker_id: worker_id.to_owned(),
     };
     tx.commit().await?;
@@ -451,17 +472,6 @@ pub async fn run_once(
     let Some(lease) = claim_due(pool, worker_id, mode).await? else {
         return Ok(None);
     };
-    if mode == RetentionMode::Purge && (!lease.purge_enabled || lease.dry_run) {
-        release_as_hold(pool, &lease, "purge_switch_not_enabled").await?;
-        return Ok(Some(RetentionRun {
-            job_id: lease.job_id,
-            state: RetentionState::Held,
-            dry_run: lease.dry_run,
-            processed_items: 0,
-            held_items: 0,
-        }));
-    }
-
     let mut tx = pool.begin().await?;
     let lease_state = sqlx::query(
         "SELECT state, lease_owner FROM cloud_retention_jobs WHERE job_id=$1 FOR UPDATE",
@@ -745,17 +755,6 @@ pub async fn run_once(
     }))
 }
 
-async fn release_as_hold(
-    pool: &PgPool,
-    lease: &RetentionLease,
-    reason: &str,
-) -> RetentionResult<()> {
-    let mut tx = pool.begin().await?;
-    set_job_hold(&mut tx, lease, reason).await?;
-    tx.commit().await?;
-    Ok(())
-}
-
 async fn set_job_hold(
     tx: &mut Transaction<'_, Postgres>,
     lease: &RetentionLease,
@@ -784,7 +783,9 @@ async fn clear_lease(
     state: RetentionState,
 ) -> RetentionResult<()> {
     let affected = sqlx::query(
-        "UPDATE cloud_retention_jobs SET state=$1, lease_owner=NULL, lease_expires_at=NULL, updated_at=now() \
+        "UPDATE cloud_retention_jobs SET state=$1, lease_owner=NULL, lease_expires_at=NULL, \
+             dry_run_completed_at=CASE WHEN $1='dry_run' THEN now() ELSE dry_run_completed_at END, \
+             updated_at=now() \
          WHERE job_id=$2 AND state='leased' AND lease_owner=$3",
     )
     .bind(state.as_str())

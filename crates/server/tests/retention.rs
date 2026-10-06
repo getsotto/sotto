@@ -163,6 +163,13 @@ async fn dry_run_is_idempotent_and_purge_deletes_only_the_explicit_personal_scop
         .expect("dry run should claim a job");
     assert_eq!(dry_run.state, RetentionState::DryRun);
     assert_eq!(dry_run.processed_items, 1);
+    let repeated_dry_run =
+        retention::run_once(&pool, "retention-test-dry-run-again", RetentionMode::DryRun)
+            .await
+            .expect("repeat retention dry run")
+            .expect("repeat dry run should claim the same job");
+    assert_eq!(repeated_dry_run.state, RetentionState::DryRun);
+    assert_eq!(repeated_dry_run.processed_items, 1);
     let project_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id=$1)")
             .bind(PROJECT_ID)
@@ -171,12 +178,15 @@ async fn dry_run_is_idempotent_and_purge_deletes_only_the_explicit_personal_scop
             .expect("check dry-run project");
     assert!(project_exists);
 
-    retention::mark_ready(&pool, JOB_ID)
-        .await
-        .expect("re-arm retention job");
     retention::enable_purge(&pool, JOB_ID)
         .await
         .expect("enable explicit purge");
+    assert!(
+        retention::run_once(&pool, "retention-test-wrong-mode", RetentionMode::DryRun)
+            .await
+            .expect("wrong-mode dry run must be ignored")
+            .is_none()
+    );
     let purge = retention::run_once(&pool, "retention-test-purger", RetentionMode::Purge)
         .await
         .expect("run bounded purge")
@@ -233,6 +243,14 @@ async fn shared_scope_holds_and_cancellation_stops_due_work() {
     retention::mark_ready(&pool, SHARED_JOB)
         .await
         .expect("mark shared job ready");
+    retention::run_once(
+        &pool,
+        "retention-test-shared-dry-run",
+        RetentionMode::DryRun,
+    )
+    .await
+    .expect("run shared dry run")
+    .expect("shared dry run should claim a job");
     retention::enable_purge(&pool, SHARED_JOB)
         .await
         .expect("enable shared purge attempt");
@@ -311,6 +329,14 @@ async fn recreated_project_is_held_instead_of_being_purged() {
     retention::mark_ready(&pool, JOB_ID)
         .await
         .expect("mark recreated job ready");
+    retention::run_once(
+        &pool,
+        "retention-test-recreated-dry-run",
+        RetentionMode::DryRun,
+    )
+    .await
+    .expect("run recreated dry run")
+    .expect("recreated dry run should claim a job");
     retention::enable_purge(&pool, JOB_ID)
         .await
         .expect("enable recreated project purge");
