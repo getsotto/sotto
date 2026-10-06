@@ -6,12 +6,19 @@ use async_trait::async_trait;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{PgPool, Row};
 use std::str::FromStr;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
 
 use sotto_server::db;
 use sotto_server::notifications::{
     self, DeliveryOutcome, NoticeChannel, NoticeContent, NoticeError, NoticeIntent, NoticeKind,
     NoticeSender,
 };
+
+fn notification_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 async fn pool_or_skip() -> Option<PgPool> {
     if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
@@ -84,6 +91,7 @@ fn in_app_intent(user_id: &str, event_key: &str, due_at_epoch: i64) -> NoticeInt
 
 #[tokio::test]
 async fn enqueue_is_idempotent_and_cancelled_notice_is_not_listed() {
+    let _guard = notification_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -138,6 +146,7 @@ impl NoticeSender for RetrySender {
 
 #[tokio::test]
 async fn retry_keeps_lifecycle_due_date_and_records_provider_error() {
+    let _guard = notification_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -188,6 +197,7 @@ async fn retry_keeps_lifecycle_due_date_and_records_provider_error() {
 
 #[tokio::test]
 async fn verified_contact_cannot_be_reassigned_to_another_user() {
+    let _guard = notification_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -223,6 +233,7 @@ async fn verified_contact_cannot_be_reassigned_to_another_user() {
 
 #[tokio::test]
 async fn deleted_contact_fails_queued_email_without_breaking_the_outbox_row() {
+    let _guard = notification_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
