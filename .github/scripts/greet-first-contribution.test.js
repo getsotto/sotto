@@ -20,15 +20,30 @@ const ISSUE_MESSAGE =
 const PR_MESSAGE =
   "Thanks for your first pull request to Sotto, and welcome.\n\nPR body.";
 
+// Every login gets a stable numeric id, as on GitHub. A test that renames an
+// account passes the same id under a different login.
+const ACCOUNT_IDS = new Map();
+
+function accountId(login) {
+  if (!ACCOUNT_IDS.has(login)) {
+    ACCOUNT_IDS.set(login, 1000 + ACCOUNT_IDS.size);
+  }
+  return ACCOUNT_IDS.get(login);
+}
+
+function user(login, id = accountId(login)) {
+  return { login, id, type: "User" };
+}
+
 function issue(number, login, extra = {}) {
-  return { number, state: "open", user: { login, type: "User" }, ...extra };
+  return { number, state: "open", user: user(login), ...extra };
 }
 
 function pr(number, login, extra = {}) {
   return {
     number,
     state: "closed",
-    user: { login, type: "User" },
+    user: user(login),
     pull_request: { merged_at: null },
     ...extra,
   };
@@ -42,16 +57,51 @@ function userComment(body) {
   return { user: { login: "someone", type: "User" }, body };
 }
 
-function makeGithub({ history = [], comments = [], failures = {} } = {}) {
-  const calls = { listForRepo: [], listComments: [], createComment: [] };
+/**
+ * `logins` maps an account id to its current login, standing in for
+ * GET /user/{account_id}; unlisted ids resolve through ACCOUNT_IDS. With
+ * `filterByCreator`, listForRepo filters the way GitHub does: logins match
+ * case-insensitively, and a login no account holds any more returns an empty
+ * list rather than an error.
+ */
+function makeGithub({
+  history = [],
+  comments = [],
+  failures = {},
+  logins = {},
+  filterByCreator = false,
+} = {}) {
+  const calls = {
+    getUser: [],
+    listForRepo: [],
+    listComments: [],
+    createComment: [],
+  };
   const page = (items, params) =>
     items.slice(
       (params.page - 1) * params.per_page,
       params.page * params.per_page
     );
-  const listForRepo = async (params) => page(history, params);
+  const listForRepo = async (params) => {
+    const creator = params.creator.toLowerCase();
+    const items = filterByCreator
+      ? history.filter((item) => item.user.login.toLowerCase() === creator)
+      : history;
+    return page(items, params);
+  };
   const listComments = async (params) => page(comments, params);
   const github = {
+    request: async (route, params) => {
+      assert.equal(route, "GET /user/{account_id}");
+      calls.getUser.push(params);
+      if (failures.getUser) {
+        throw new Error(failures.getUser);
+      }
+      const login =
+        logins[params.account_id] ??
+        [...ACCOUNT_IDS].find(([, id]) => id === params.account_id)?.[0];
+      return { data: { login, id: params.account_id } };
+    },
     rest: {
       issues: {
         listForRepo,
@@ -242,8 +292,67 @@ test("a comments API failure propagates instead of risking a duplicate", async (
   assert.equal(calls.createComment.length, 0);
 });
 
+// PRs #408 to #411: the author changed "TayfurYldz" to "tayfuryldz" while
+// those runs were queued, so each event still carried the old casing while
+// the API returned their history under the new one. Comparing logins greeted
+// a contributor with at least nine earlier pull requests, four times over.
+test("a login whose case changed after the event is still recognised", async () => {
+  const id = 238304586;
+  const { github, calls } = makeGithub({
+    history: [
+      pr(258, "tayfuryldz", { user: user("tayfuryldz", id) }),
+      pr(407, "tayfuryldz", { user: user("tayfuryldz", id) }),
+    ],
+    logins: { [id]: "tayfuryldz" },
+    filterByCreator: true,
+  });
+  const event = pr(409, "TayfurYldz", { user: user("TayfurYldz", id) });
+  const result = await run(args({ github, context: makeContext(event, true) }));
+  assert.equal(result.greeted, false);
+  assert.equal(result.reason, "returning-contributor");
+  assert.equal(calls.createComment.length, 0);
+});
+
+// The same queue delay across a full rename: the event's login now belongs to
+// nobody, and GitHub answers creator=<unknown login> with an empty list, not
+// an error, so querying by the event's login would find no history at all.
+test("a full rename after the event still finds the author's history", async () => {
+  const id = 5150;
+  const { github, calls } = makeGithub({
+    history: [pr(12, "new-name", { user: user("new-name", id) })],
+    logins: { [id]: "new-name" },
+    filterByCreator: true,
+  });
+  const event = pr(50, "old-name", { user: user("old-name", id) });
+  const result = await run(args({ github, context: makeContext(event, true) }));
+  assert.deepEqual(calls.getUser, [{ account_id: id }]);
+  assert.equal(calls.listForRepo[0].creator, "new-name");
+  assert.equal(result.greeted, false);
+  assert.equal(calls.createComment.length, 0);
+});
+
+test("an earlier item counts by account id, whatever its login", () => {
+  const history = [pr(10, "Alice", { user: user("Alice", 1) })];
+  assert.equal(hasEarlierContribution(history, true, 1, 50), true);
+  // A released login can be claimed by another account; its items stay theirs.
+  assert.equal(hasEarlierContribution(history, true, 2, 50), false);
+});
+
+test("an account lookup failure propagates instead of assuming a newcomer", async () => {
+  const { github, calls } = makeGithub({
+    failures: { getUser: "boom" },
+  });
+  await assert.rejects(
+    run(args({ github, context: makeContext(pr(50, "alice"), true) })),
+    /boom/
+  );
+  assert.equal(calls.listForRepo.length, 0);
+  assert.equal(calls.createComment.length, 0);
+});
+
 test("the item itself is not its own earlier contribution", () => {
-  assert.equal(hasEarlierContribution([pr(50, "alice")], true, "alice", 50), false);
+  const item = pr(50, "alice");
+  assert.equal(hasEarlierContribution([item], true, item.user.id, 50), false);
 });
 
 test("hasGreeting needs a bot author carrying the marker", () => {

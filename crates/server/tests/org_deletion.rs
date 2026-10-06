@@ -299,6 +299,20 @@ async fn link_subscription(pool: &PgPool, org_id: &str) -> String {
     subscription_id
 }
 
+async fn link_sponsored_subscription(pool: &PgPool, org_id: &str) -> String {
+    let subscription_id = format!("sub-sponsored-deletion-{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO billing_sponsored_subscriptions \
+         (organization_id, provider_subscription_id, status) VALUES ($1, $2, 'active')",
+    )
+    .bind(org_id)
+    .bind(&subscription_id)
+    .execute(pool)
+    .await
+    .expect("link sponsored subscription fixture");
+    subscription_id
+}
+
 struct ProjectTreeIds {
     project: String,
     environment: String,
@@ -1762,6 +1776,52 @@ async fn worker_cancels_a_paid_subscription_before_purge() {
         ],
     )
     .await;
+    cleanup(&pool, &org_id, &owner_id).await;
+}
+
+#[tokio::test]
+async fn worker_cancels_legacy_and_sponsored_subscriptions_before_retention() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let _test_lock = prepare_deletion_test(&pool).await;
+    let (org_id, owner_id) = seed_owner(&pool).await;
+    let legacy_subscription = link_subscription(&pool, &org_id).await;
+    let sponsored_subscription = link_sponsored_subscription(&pool, &org_id).await;
+    let provider = TestProvider::new(
+        [
+            Ok(cancelled(&legacy_subscription)),
+            Ok(cancelled(&sponsored_subscription)),
+        ],
+        [],
+    );
+    let _requested = request(&pool, &org_id, &owner_id, &org_id)
+        .await
+        .expect("request deletion");
+    let requested_lease = claim_due(&pool, "dual-subscription-deletion-worker")
+        .await
+        .expect("claim requested")
+        .expect("requested work is due");
+    advance(&pool, &requested_lease, None)
+        .await
+        .expect("start billing cancellation")
+        .expect("billing transition");
+    let billing_lease = claim_due(&pool, "dual-subscription-deletion-worker")
+        .await
+        .expect("claim billing")
+        .expect("billing work is due");
+    let retention = advance(&pool, &billing_lease, Some(&provider))
+        .await
+        .expect("cancel both subscriptions")
+        .expect("retention transition");
+    assert_eq!(retention.state, DeletionState::Retention);
+    assert_eq!(provider.cancellation_calls(), 2);
+
+    sqlx::query("DELETE FROM billing_sponsored_subscriptions WHERE organization_id = $1")
+        .bind(&org_id)
+        .execute(&pool)
+        .await
+        .expect("delete sponsored subscription fixture");
     cleanup(&pool, &org_id, &owner_id).await;
 }
 

@@ -89,9 +89,25 @@ async fn run() -> Result<()> {
         organisation_deletion_retention_days: config.organisation_deletion_retention_days,
         organisation_deletion_metrics_token: config.organisation_deletion_metrics_token,
         organisation_deletion_operator_token: config.organisation_deletion_operator_token,
+        cloud_action_enforcement_enabled: config.cloud_action_enforcement_enabled,
+        machine_eligibility_enforcement_enabled: config.machine_eligibility_enforcement_enabled,
     };
 
     println!("deployment mode: {}", config.deployment_mode.as_str());
+    println!(
+        "provider refresh: ingest={}, worker={}, reconciliation={}",
+        config.provider_refresh_ingest_enabled,
+        config.provider_refresh_worker_enabled,
+        config.provider_refresh_reconciliation_enabled
+    );
+    println!(
+        "cloud action enforcement: {}",
+        config.cloud_action_enforcement_enabled
+    );
+    println!(
+        "machine eligibility enforcement: {}",
+        config.machine_eligibility_enforcement_enabled
+    );
 
     // Default-on telemetry must never be a surprise: say so at boot, with the off switch.
     if config.telemetry.ping_enabled && !config.telemetry.ingest_enabled {

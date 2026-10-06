@@ -1,6 +1,7 @@
 //! Loopback-backed tests for signed personal renewal failure evidence.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -12,31 +13,86 @@ use axum::Router;
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
+use sotto_server::cloud_provider::{
+    AllocationState, PayerKind, ProviderEnvironment, VerifiedAllocation,
+};
 use sotto_server::cloud_provider_stripe::{
     StripeAllocationBinding, StripeContractError, StripeCoverageConfig,
 };
+use sotto_server::cloud_provider_stripe_coverage::{
+    compose_personal_coverage, StripeCoverageCompositionResult, StripeCoverageRenewalState,
+};
 use sotto_server::cloud_provider_stripe_http::{
-    StripePersonalInvoiceHistory, StripePersonalInvoiceHistoryResult, StripeReadClient,
-    StripeReadLimits, StripeRenewalCurrentState, StripeRenewalObservationResult,
+    StripePersonalInvoiceHistory, StripePersonalInvoiceHistoryEntry,
+    StripePersonalInvoiceHistoryResult, StripeReadClient, StripeReadError, StripeReadLimits,
+    StripeRenewalCurrentState, StripeRenewalNeedsEvidence, StripeRenewalObservationResult,
+};
+use sotto_server::cloud_provider_stripe_renewal_store::{
+    accept_personal_renewal_failure, load_personal_renewal_failures,
+    StripeRenewalFailureDisposition, StripeRenewalFailureLoadError, StripeRenewalFailureLoadLimits,
 };
 use sotto_server::cloud_provider_stripe_renewals::{
     decode_personal_renewal_failure, StripeRenewalFailureNeedsEvidence, StripeRenewalFailureResult,
 };
+use sotto_server::db;
+use sqlx::postgres::PgConnectOptions;
+use sqlx::PgPool;
 use tokio::net::TcpListener;
+use tokio::sync::{Barrier, Notify};
 use url::Url;
 
 const SECRET: &str = "whsec_renewal_test";
 const NOW: i64 = 3_100;
 
+async fn store_pool_or_skip() -> Option<PgPool> {
+    if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping Stripe renewal store test: set SOTTO_RUN_DB_TESTS=1");
+        return None;
+    }
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL is required when DB tests are enabled");
+    let options = PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
+    assert!(
+        matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+        "refusing Stripe renewal store test against non-local host: {}",
+        options.get_host()
+    );
+    let pool = db::connect(&database_url).await.expect("connect");
+    db::migrate(&pool).await.expect("migrate");
+    Some(pool)
+}
+
 #[derive(Clone)]
 struct MockState {
     responses: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    requests: Arc<Mutex<Vec<String>>>,
+    pending_path: Arc<Mutex<Option<String>>>,
+    entered: Arc<Notify>,
 }
 
 struct MockServer {
     origin: Url,
     task: tokio::task::JoinHandle<()>,
+    responses: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    requests: Arc<Mutex<Vec<String>>>,
+    entered: Arc<Notify>,
+}
+
+impl MockServer {
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn replace_responses(&self, path: &str, responses: Vec<Value>) {
+        self.responses
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), responses);
+    }
+
+    async fn wait_for_pending_request(&self) {
+        self.entered.notified().await;
+    }
 }
 
 impl Drop for MockServer {
@@ -47,6 +103,21 @@ impl Drop for MockServer {
 
 async fn handler(State(state): State<MockState>, request: Request<Body>) -> Response<Body> {
     let path = request.uri().path().to_owned();
+    state
+        .requests
+        .lock()
+        .unwrap()
+        .push(format!("{} {}", request.method(), request.uri()));
+    let pending = state
+        .pending_path
+        .lock()
+        .unwrap()
+        .as_deref()
+        .is_some_and(|pending| pending == path);
+    if pending {
+        state.entered.notify_one();
+        std::future::pending::<()>().await;
+    }
     let value = state
         .responses
         .lock()
@@ -67,8 +138,21 @@ async fn handler(State(state): State<MockState>, request: Request<Body>) -> Resp
 }
 
 async fn mock_server(responses: HashMap<String, Vec<Value>>) -> MockServer {
+    mock_server_with_pending(responses, None).await
+}
+
+async fn mock_server_with_pending(
+    responses: HashMap<String, Vec<Value>>,
+    pending_path: Option<&str>,
+) -> MockServer {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(Notify::new());
+    let response_store = Arc::new(Mutex::new(responses));
     let state = MockState {
-        responses: Arc::new(Mutex::new(responses)),
+        responses: Arc::clone(&response_store),
+        requests: Arc::clone(&requests),
+        pending_path: Arc::new(Mutex::new(pending_path.map(str::to_owned))),
+        entered: Arc::clone(&entered),
     };
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -81,6 +165,9 @@ async fn mock_server(responses: HashMap<String, Vec<Value>>) -> MockServer {
     MockServer {
         origin: Url::parse(&format!("http://{address}/")).unwrap(),
         task,
+        responses: response_store,
+        requests,
+        entered,
     }
 }
 
@@ -135,13 +222,29 @@ fn paid_invoice() -> Value {
 }
 
 fn paid_line() -> Value {
+    paid_line_with("price_month", 1000, 2000)
+}
+
+fn paid_line_with(price: &str, period_start: i64, period_end: i64) -> Value {
     json!({
         "id":"il_paid","quantity":1,"livemode":false,
         "parent":{"type":"subscription_item_details","subscription_item_details":{
             "subscription":"sub_renewal","subscription_item":"si_renewal","proration":false
         }},
-        "pricing":{"type":"price_details","price_details":{"price":"price_month"}},
-        "period":{"start":1000,"end":2000}
+        "pricing":{"type":"price_details","price_details":{"price":price}},
+        "period":{"start":period_start,"end":period_end}
+    })
+}
+
+fn generic_open_invoice() -> Value {
+    json!({
+        "id":"in_open_generic",
+        "customer":"cus_renewal",
+        "parent":{"type":"subscription_details","subscription_details":{"subscription":"sub_renewal"}},
+        "status":"open","billing_reason":"manual","collection_method":"send_invoice",
+        "currency":"gbp","amount_paid":0,"amount_due":299,"amount_remaining":299,
+        "amount_overpaid":0,"amount_paid_off_stripe":0,"livemode":false,
+        "metadata":{"sotto_allocation_reference":"alloc_renewal"}
     })
 }
 
@@ -182,6 +285,10 @@ fn signed(value: &Value, timestamp: i64) -> (Vec<u8>, String) {
 }
 
 async fn history() -> StripePersonalInvoiceHistory {
+    history_with_line(paid_line()).await
+}
+
+async fn history_with_line(line: Value) -> StripePersonalInvoiceHistory {
     let mut responses = HashMap::new();
     responses.insert(
         "/v1/account".into(),
@@ -195,12 +302,100 @@ async fn history() -> StripePersonalInvoiceHistory {
     );
     responses.insert(
         "/v1/invoices".into(),
-        vec![list(vec![paid_invoice()], false)],
+        vec![list(vec![paid_invoice(), generic_open_invoice()], false)],
     );
     responses.insert("/v1/invoices/in_paid".into(), vec![paid_invoice()]);
     responses.insert(
+        "/v1/invoices/in_failed".into(),
+        vec![current_invoice("open")],
+    );
+    responses.insert(
+        "/v1/invoices/in_failed/lines".into(),
+        vec![list(vec![current_line()], false)],
+    );
+    responses.insert(
         "/v1/invoices/in_paid/lines".into(),
-        vec![list(vec![paid_line()], false)],
+        vec![list(vec![line], false)],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![list(
+            vec![json!({
+                "id":"inpay_paid","invoice":"in_paid","status":"paid","amount_paid":299,
+                "amount_requested":299,"currency":"gbp","livemode":false,
+                "payment":{"type":"payment_intent","payment_intent":"pi_paid"}
+            })],
+            false,
+        )],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![list(
+            vec![json!({
+                "id":"inpay_paid","invoice":"in_paid","status":"paid","amount_paid":299,
+                "amount_requested":299,"currency":"gbp","livemode":false,
+                "payment":{"type":"payment_intent","payment_intent":"pi_paid"}
+            })],
+            false,
+        )],
+    );
+    for path in ["/v1/refunds", "/v1/disputes", "/v1/credit_notes"] {
+        responses.insert(path.into(), vec![list(Vec::new(), false)]);
+    }
+    let server = mock_server(responses).await;
+    let client = StripeReadClient::for_test(
+        "sk_test_renewal",
+        &config(),
+        server.origin.clone(),
+        limits(),
+    )
+    .unwrap();
+    let mut session = client.session();
+    let result = client
+        .personal_invoice_history(&mut session, &binding())
+        .await
+        .unwrap();
+    let StripePersonalInvoiceHistoryResult::Observed(history) = result else {
+        panic!("expected observed history");
+    };
+    history
+}
+
+async fn history_with_current_invoice(line: Value) -> StripePersonalInvoiceHistory {
+    let mut responses = HashMap::new();
+    responses.insert(
+        "/v1/account".into(),
+        vec![json!({"id":"acct_test_renewal","object":"account","livemode":false})],
+    );
+    responses.insert(
+        "/v1/subscriptions/sub_renewal".into(),
+        vec![
+            json!({"id":"sub_renewal","customer":"cus_renewal","status":"active","livemode":false}),
+        ],
+    );
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![list(
+            vec![
+                paid_invoice(),
+                current_invoice("open"),
+                generic_open_invoice(),
+            ],
+            false,
+        )],
+    );
+    responses.insert("/v1/invoices/in_paid".into(), vec![paid_invoice()]);
+    responses.insert(
+        "/v1/invoices/in_failed".into(),
+        vec![current_invoice("open")],
+    );
+    responses.insert(
+        "/v1/invoices/in_failed/lines".into(),
+        vec![list(vec![current_line()], false)],
+    );
+    responses.insert(
+        "/v1/invoices/in_paid/lines".into(),
+        vec![list(vec![line], false)],
     );
     responses.insert(
         "/v1/invoice_payments".into(),
@@ -236,6 +431,192 @@ async fn history() -> StripePersonalInvoiceHistory {
 }
 
 #[tokio::test]
+async fn generic_history_keeps_non_cycle_invoices_without_current_billing_fields() {
+    let history = history().await;
+    assert!(history.entries().iter().any(|entry| matches!(
+        entry,
+        StripePersonalInvoiceHistoryEntry::NonPaid(invoice)
+            if invoice.invoice_id() == "in_open_generic" && invoice.status() == "open"
+    )));
+    assert!(history.entries().iter().any(|entry| matches!(
+        entry,
+        StripePersonalInvoiceHistoryEntry::Paid(term)
+            if term.invoice_id() == "in_paid"
+    )));
+}
+
+#[tokio::test]
+async fn loopback_history_signed_failure_current_open_composes_personal_candidate() {
+    let history = history_with_current_invoice(paid_line()).await;
+    let (raw, signature) = signed(&signed_failure(), NOW);
+    let StripeRenewalFailureResult::Linked(failure) = decode_personal_renewal_failure(
+        &raw,
+        &signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected linked failure");
+    };
+    let (client, mut session, _server) = current_client("open", None).await;
+    let StripeRenewalObservationResult::Observed(observation) = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap()
+    else {
+        panic!("expected current observation");
+    };
+    let result =
+        compose_personal_coverage(&config(), &binding(), &history, &[(*failure, *observation)])
+            .unwrap();
+    let StripeCoverageCompositionResult::Candidate(candidate) = result else {
+        panic!("expected coverage candidate");
+    };
+    assert_eq!(candidate.paid_terms().len(), 1);
+    assert_eq!(candidate.paid_terms()[0].invoice_id(), "in_paid");
+    assert!(candidate
+        .non_paid_invoices()
+        .iter()
+        .any(|invoice| invoice.invoice_id() == "in_open_generic"));
+    assert_eq!(candidate.renewals().len(), 1);
+    let renewal = &candidate.renewals()[0];
+    assert!(matches!(renewal.state(), StripeCoverageRenewalState::Open));
+    assert_eq!(renewal.predecessor_invoice_id(), "in_paid");
+    assert_eq!(
+        renewal.predecessor_evidence_reference(),
+        "stripe:invoice:in_paid:line:il_paid"
+    );
+    assert_eq!(renewal.interval().to_string(), "month");
+    assert!(candidate
+        .semantic_reference()
+        .starts_with("stripe-personal-coverage-v1:"));
+}
+
+#[tokio::test]
+async fn verified_retry_events_merge_without_changing_candidate_identity() {
+    let history = history_with_current_invoice(paid_line()).await;
+    let first_payload = signed_failure();
+    let (first_raw, first_signature) = signed(&first_payload, NOW);
+    let StripeRenewalFailureResult::Linked(first_failure) = decode_personal_renewal_failure(
+        &first_raw,
+        &first_signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected first linked failure");
+    };
+    let mut retry_payload = first_payload;
+    retry_payload["id"] = json!("evt_failure_retry");
+    let (retry_raw, retry_signature) = signed(&retry_payload, NOW);
+    let StripeRenewalFailureResult::Linked(retry_failure) = decode_personal_renewal_failure(
+        &retry_raw,
+        &retry_signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected retry linked failure");
+    };
+    let (first_client, mut first_session, _first_server) = current_client("open", None).await;
+    let (retry_client, mut retry_session, _retry_server) = current_client("open", None).await;
+    let StripeRenewalObservationResult::Observed(first_observation) = first_client
+        .personal_renewal_observation(&mut first_session, &binding(), &first_failure)
+        .await
+        .unwrap()
+    else {
+        panic!("expected first observation");
+    };
+    let StripeRenewalObservationResult::Observed(retry_observation) = retry_client
+        .personal_renewal_observation(&mut retry_session, &binding(), &retry_failure)
+        .await
+        .unwrap()
+    else {
+        panic!("expected retry observation");
+    };
+    let merged = compose_personal_coverage(
+        &config(),
+        &binding(),
+        &history,
+        &[
+            ((*first_failure).clone(), (*first_observation).clone()),
+            ((*retry_failure).clone(), (*retry_observation).clone()),
+        ],
+    )
+    .unwrap();
+    let single = compose_personal_coverage(
+        &config(),
+        &binding(),
+        &history,
+        &[((*first_failure).clone(), (*first_observation).clone())],
+    )
+    .unwrap();
+    let (
+        StripeCoverageCompositionResult::Candidate(merged),
+        StripeCoverageCompositionResult::Candidate(single),
+    ) = (merged, single)
+    else {
+        panic!("expected candidates");
+    };
+    assert_eq!(merged.semantic_reference(), single.semantic_reference());
+    assert_eq!(
+        merged.renewals()[0].event_ids(),
+        &["evt_failure_1", "evt_failure_retry"]
+    );
+    assert_eq!(merged.renewals()[0].predecessor_invoice_id(), "in_paid");
+}
+
+#[tokio::test]
+async fn verified_paid_transition_replaces_the_historical_non_paid_invoice() {
+    let history = history_with_current_invoice(paid_line()).await;
+    let (raw, signature) = signed(&signed_failure(), NOW);
+    let StripeRenewalFailureResult::Linked(failure) = decode_personal_renewal_failure(
+        &raw,
+        &signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected linked failure");
+    };
+    let (client, mut session, _server) = current_client("paid", None).await;
+    let StripeRenewalObservationResult::Observed(observation) = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap()
+    else {
+        panic!("expected paid observation");
+    };
+    let result =
+        compose_personal_coverage(&config(), &binding(), &history, &[(*failure, *observation)])
+            .unwrap();
+    let StripeCoverageCompositionResult::Candidate(candidate) = result else {
+        panic!("expected candidate");
+    };
+    assert_eq!(candidate.paid_terms().len(), 2);
+    assert!(!candidate
+        .non_paid_invoices()
+        .iter()
+        .any(|invoice| invoice.invoice_id() == "in_failed"));
+    assert!(matches!(
+        candidate.renewals()[0].state(),
+        StripeCoverageRenewalState::Paid
+    ));
+}
+
+#[tokio::test]
 async fn links_failure_to_exact_paid_predecessor_and_keeps_event_identity_separate() {
     let history = history().await;
     let (raw, signature) = signed(&signed_failure(), NOW);
@@ -259,6 +640,32 @@ async fn links_failure_to_exact_paid_predecessor_and_keeps_event_identity_separa
     assert_eq!(evidence.invoice_id(), "in_failed");
     assert_eq!(evidence.event_id(), "evt_failure_1");
     assert_ne!(evidence.renewal_id(), evidence.event_id());
+}
+
+#[tokio::test]
+async fn annual_history_and_signed_failure_keep_annual_price_provenance() {
+    let history = history_with_line(paid_line_with("price_year", 1000, 2000)).await;
+    let mut failure = signed_failure();
+    failure["data"]["object"]["lines"]["data"][0]["pricing"]["price_details"]["price"] =
+        json!("price_year");
+    let (raw, signature) = signed(&failure, NOW);
+    let result = decode_personal_renewal_failure(
+        &raw,
+        &signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap();
+    let StripeRenewalFailureResult::Linked(evidence) = result else {
+        panic!("expected annual linked failure");
+    };
+    assert_eq!(
+        evidence.interval(),
+        sotto_server::cloud_provider_stripe::StripeInterval::Year
+    );
 }
 
 #[tokio::test]
@@ -453,11 +860,35 @@ async fn linked_failure(
     *evidence
 }
 
+async fn linked_failure_for_event(
+    event_id: &str,
+) -> sotto_server::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence {
+    let history = history().await;
+    let mut payload = signed_failure();
+    payload["id"] = json!(event_id);
+    let (raw, signature) = signed(&payload, NOW);
+    let StripeRenewalFailureResult::Linked(evidence) = decode_personal_renewal_failure(
+        &raw,
+        &signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected linked failure");
+    };
+    *evidence
+}
+
 fn current_invoice(status: &str) -> Value {
     json!({
         "id":"in_failed", "customer":"cus_renewal",
         "parent":{"type":"subscription_details","subscription_details":{"subscription":"sub_renewal"}},
-        "status":status,"currency":"gbp","amount_paid": if status == "paid" { 299 } else { 0 },"amount_due":299,
+        "status":status,"billing_reason":"subscription_cycle",
+        "collection_method":"charge_automatically","currency":"gbp",
+        "amount_paid": if status == "paid" { 299 } else { 0 },"amount_due":299,
         "amount_remaining": if status == "open" { 299 } else { 0 },
         "amount_overpaid":0,"amount_paid_off_stripe":0,"livemode":false,
         "metadata":{"sotto_allocation_reference":"alloc_renewal"}
@@ -475,9 +906,364 @@ fn current_line() -> Value {
     })
 }
 
+#[tokio::test]
+async fn signed_failure_round_trips_through_the_durable_store_and_bounds_history() {
+    let Some(pool) = store_pool_or_skip().await else {
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4().to_string();
+    let beneficiary_id = format!("renewal-store-beneficiary-{suffix}");
+    let payer_id = format!("renewal-store-payer-{suffix}");
+    let allocation_id = format!("renewal-store-allocation-{suffix}");
+    let source_id = format!("renewal-store-source-{suffix}");
+    let external_reference = "alloc_renewal".to_owned();
+    let ownership_reference = format!("renewal-store-ownership-{suffix}");
+    let context = config().provider_context().unwrap();
+    let allocation = VerifiedAllocation::new(
+        &allocation_id,
+        &payer_id,
+        "cus_renewal",
+        PayerKind::Personal,
+        &beneficiary_id,
+        "sub_renewal",
+        "si_renewal",
+        &external_reference,
+        &source_id,
+        0,
+        None,
+        AllocationState::Active,
+        &ownership_reference,
+    )
+    .unwrap();
+    let mut first_payload = signed_failure();
+    first_payload["id"] = json!(format!("evt-renewal-store-first-{suffix}"));
+    let first_id = first_payload["id"].as_str().unwrap().to_owned();
+    let mut second_payload = signed_failure();
+    second_payload["id"] = json!(format!("evt-renewal-store-second-{suffix}"));
+    let second_id = second_payload["id"].as_str().unwrap().to_owned();
+
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'renewal-store', $1)",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cloud_coverage_coordinators \
+         (beneficiary_id, source_set_generation, collection_epoch) VALUES ($1, 1, 1)",
+    )
+    .bind(&beneficiary_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cloud_coverage_sources \
+         (source_id, beneficiary_id, provider_namespace, external_allocation_reference, \
+          ownership_evidence_reference, registration_operation_id, registration_source_set_generation) \
+         VALUES ($1, $2, 'stripe', $3, $4, $5, 1)",
+    )
+    .bind(&source_id)
+    .bind(&beneficiary_id)
+    .bind(&external_reference)
+    .bind(&ownership_reference)
+    .bind(format!("renewal-store-registration-{suffix}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cloud_provider_payers \
+         (payer_id, provider_namespace, provider_account_id, provider_environment, \
+          provider_customer_id, payer_kind) VALUES ($1, 'stripe', $2, 'test', $3, 'personal')",
+    )
+    .bind(&payer_id)
+    .bind(&context.account_id)
+    .bind("cus_renewal")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cloud_provider_allocations \
+         (allocation_id, payer_id, beneficiary_id, provider_namespace, provider_account_id, \
+          provider_environment, provider_subscription_id, provider_item_id, \
+          external_allocation_reference, coverage_source_id, effective_from, state, \
+          ownership_evidence_reference) \
+         VALUES ($1, $2, $3, 'stripe', $4, 'test', 'sub_renewal', 'si_renewal', $5, $6, 0, 'active', $7)",
+    )
+    .bind(&allocation_id)
+    .bind(&payer_id)
+    .bind(&beneficiary_id)
+    .bind(&context.account_id)
+    .bind(&external_reference)
+    .bind(&source_id)
+    .bind(&ownership_reference)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let first = linked_failure_for_event(&first_id).await;
+    let mut wrong_owner = allocation.clone();
+    wrong_owner.provider_item_id = "forged-item".into();
+    let mut reject_forged = pool.begin().await.unwrap();
+    assert!(matches!(
+        accept_personal_renewal_failure(
+            &mut reject_forged,
+            &context,
+            &wrong_owner,
+            &first,
+            true,
+        )
+        .await,
+        Err(
+            sotto_server::cloud_provider_stripe_renewal_store::StripeRenewalFailureStoreError::Provider(
+                sotto_server::cloud_provider::ProviderAdapterError::ProviderContextMismatch
+            )
+        )
+    ));
+    reject_forged.rollback().await.unwrap();
+    let forged_receipt_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = $1",
+    )
+    .bind(&first_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(forged_receipt_count, 0);
+
+    let mut accept = pool.begin().await.unwrap();
+    let accepted =
+        accept_personal_renewal_failure(&mut accept, &context, &allocation, &first, true)
+            .await
+            .unwrap();
+    assert_eq!(
+        accepted.disposition,
+        StripeRenewalFailureDisposition::Accepted
+    );
+    assert_eq!(accepted.accepted_generation, 1);
+    accept.commit().await.unwrap();
+
+    let loaded = load_personal_renewal_failures(
+        &pool,
+        &context,
+        &allocation,
+        StripeRenewalFailureLoadLimits::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(loaded, vec![first.clone()]);
+
+    let mut replay = pool.begin().await.unwrap();
+    let replayed =
+        accept_personal_renewal_failure(&mut replay, &context, &allocation, &first, true)
+            .await
+            .unwrap();
+    assert_eq!(
+        replayed.disposition,
+        StripeRenewalFailureDisposition::AlreadyAccepted
+    );
+    assert_eq!(replayed.accepted_generation, accepted.accepted_generation);
+    replay.commit().await.unwrap();
+
+    let second = linked_failure_for_event(&second_id).await;
+    let barrier = Arc::new(Barrier::new(2));
+    let first_pool = pool.clone();
+    let first_barrier = Arc::clone(&barrier);
+    let first_context = context.clone();
+    let first_allocation = allocation.clone();
+    let first_evidence = second.clone();
+    let first_task = tokio::spawn(async move {
+        first_barrier.wait().await;
+        let mut tx = first_pool.begin().await.unwrap();
+        let result = accept_personal_renewal_failure(
+            &mut tx,
+            &first_context,
+            &first_allocation,
+            &first_evidence,
+            true,
+        )
+        .await;
+        if result.is_ok() {
+            tx.commit().await.unwrap();
+        } else {
+            tx.rollback().await.unwrap();
+        }
+        result
+    });
+    let second_pool = pool.clone();
+    let second_barrier = Arc::clone(&barrier);
+    let second_context = context.clone();
+    let second_allocation = allocation.clone();
+    let second_evidence = second.clone();
+    let second_task = tokio::spawn(async move {
+        second_barrier.wait().await;
+        let mut tx = second_pool.begin().await.unwrap();
+        let result = accept_personal_renewal_failure(
+            &mut tx,
+            &second_context,
+            &second_allocation,
+            &second_evidence,
+            true,
+        )
+        .await;
+        if result.is_ok() {
+            tx.commit().await.unwrap();
+        } else {
+            tx.rollback().await.unwrap();
+        }
+        result
+    });
+    let first_result = first_task.await.unwrap().unwrap();
+    let second_result = second_task.await.unwrap().unwrap();
+    assert_eq!(first_result.accepted_generation, 2);
+    assert_eq!(second_result.accepted_generation, 2);
+    assert!(matches!(
+        [first_result.disposition, second_result.disposition],
+        [
+            StripeRenewalFailureDisposition::Accepted,
+            StripeRenewalFailureDisposition::AlreadyAccepted
+        ] | [
+            StripeRenewalFailureDisposition::AlreadyAccepted,
+            StripeRenewalFailureDisposition::Accepted
+        ]
+    ));
+
+    assert!(matches!(
+        load_personal_renewal_failures(
+            &pool,
+            &context,
+            &allocation,
+            StripeRenewalFailureLoadLimits {
+                max_rows: 1,
+                max_evidence_bytes: 256 * 1024,
+            },
+        )
+        .await,
+        Err(StripeRenewalFailureLoadError::TooManyRows { limit: 1 })
+    ));
+    assert!(matches!(
+        load_personal_renewal_failures(
+            &pool,
+            &context,
+            &allocation,
+            StripeRenewalFailureLoadLimits {
+                max_rows: 64,
+                max_evidence_bytes: 1,
+            },
+        )
+        .await,
+        Err(StripeRenewalFailureLoadError::BoundExceeded { limit: 1 })
+    ));
+    let current_history = history_with_current_invoice(paid_line()).await;
+    let (current_client, mut current_session, _current_server) = current_client("open", None).await;
+    let StripeRenewalObservationResult::Observed(current_observation) = current_client
+        .personal_renewal_observation(&mut current_session, &binding(), &loaded[0])
+        .await
+        .unwrap()
+    else {
+        panic!("expected reloaded evidence to produce a current observation");
+    };
+    let composed = compose_personal_coverage(
+        &config(),
+        &binding(),
+        &current_history,
+        &[(loaded[0].clone(), (*current_observation).clone())],
+    )
+    .unwrap();
+    let StripeCoverageCompositionResult::Candidate(candidate) = composed else {
+        panic!("expected reloaded evidence to compose a candidate");
+    };
+    assert!(matches!(
+        candidate.renewals()[0].state(),
+        StripeCoverageRenewalState::Open
+    ));
+    sqlx::query(
+        "UPDATE cloud_provider_stripe_renewal_failures \
+         SET evidence_reference = 'tampered-renewal-reference' WHERE event_id = $1",
+    )
+    .bind(&first_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut conflict = pool.begin().await.unwrap();
+    assert!(matches!(
+        accept_personal_renewal_failure(&mut conflict, &context, &allocation, &first, true).await,
+        Err(
+            sotto_server::cloud_provider_stripe_renewal_store::StripeRenewalFailureStoreError::EvidenceConflict
+        )
+    ));
+    conflict.rollback().await.unwrap();
+    assert!(matches!(
+        load_personal_renewal_failures(
+            &pool,
+            &context,
+            &allocation,
+            StripeRenewalFailureLoadLimits::default(),
+        )
+        .await,
+        Err(StripeRenewalFailureLoadError::Corrupt(_))
+    ));
+
+    sqlx::query("DELETE FROM cloud_provider_stripe_renewal_failures WHERE beneficiary_id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE beneficiary_id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id IN ($1, $2)")
+        .bind(&first_id)
+        .bind(&second_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
+        .bind(&allocation_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_sources WHERE source_id = $1")
+        .bind(&source_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_id = $1")
+        .bind(&payer_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&beneficiary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
 fn current_subscription(cancel_at_period_end: bool) -> Value {
     json!({"id":"sub_renewal","customer":"cus_renewal","status":"active","livemode":false,
         "cancel_at_period_end":cancel_at_period_end,"cancel_at":null,"canceled_at":null,"ended_at":null})
+}
+
+fn refund(status: &str) -> Value {
+    json!({
+        "object":"refund","id":"re_current","payment_intent":"pi_current",
+        "amount":100,"currency":"gbp","created":3200,"status":status,"livemode":false
+    })
+}
+
+fn dispute(status: &str) -> Value {
+    json!({
+        "object":"dispute","id":"dp_current","payment_intent":"pi_current",
+        "charge":"ch_current","amount":100,"currency":"gbp","created":3200,
+        "status":status,"livemode":false
+    })
 }
 
 async fn current_client(
@@ -490,6 +1276,107 @@ async fn current_client(
 ) {
     let invoice = current_invoice(status);
     let second = invoice_second.unwrap_or_else(|| invoice.clone());
+    current_client_with_parts(
+        invoice,
+        second,
+        current_line(),
+        current_line(),
+        current_subscription(false),
+        current_subscription(false),
+    )
+    .await
+}
+
+async fn current_client_with_parts(
+    invoice: Value,
+    second_invoice: Value,
+    first_line: Value,
+    second_line: Value,
+    first_subscription: Value,
+    second_subscription: Value,
+) -> (
+    StripeReadClient,
+    sotto_server::cloud_provider_stripe_http::StripeReadSession,
+    MockServer,
+) {
+    current_client_with_parts_and_limits(
+        invoice,
+        second_invoice,
+        first_line,
+        second_line,
+        first_subscription,
+        second_subscription,
+        limits(),
+    )
+    .await
+}
+
+async fn current_client_with_parts_and_limits(
+    invoice: Value,
+    second_invoice: Value,
+    first_line: Value,
+    second_line: Value,
+    first_subscription: Value,
+    second_subscription: Value,
+    read_limits: StripeReadLimits,
+) -> (
+    StripeReadClient,
+    sotto_server::cloud_provider_stripe_http::StripeReadSession,
+    MockServer,
+) {
+    current_client_with_line_lists_and_limits(
+        invoice,
+        second_invoice,
+        vec![first_line],
+        vec![second_line],
+        first_subscription,
+        second_subscription,
+        read_limits,
+    )
+    .await
+}
+
+async fn current_client_with_line_lists_and_limits(
+    invoice: Value,
+    second_invoice: Value,
+    first_lines: Vec<Value>,
+    second_lines: Vec<Value>,
+    first_subscription: Value,
+    second_subscription: Value,
+    read_limits: StripeReadLimits,
+) -> (
+    StripeReadClient,
+    sotto_server::cloud_provider_stripe_http::StripeReadSession,
+    MockServer,
+) {
+    current_client_with_line_lists_and_limits_pending(
+        invoice,
+        second_invoice,
+        first_lines,
+        second_lines,
+        first_subscription,
+        second_subscription,
+        read_limits,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn current_client_with_line_lists_and_limits_pending(
+    invoice: Value,
+    second_invoice: Value,
+    first_lines: Vec<Value>,
+    second_lines: Vec<Value>,
+    first_subscription: Value,
+    second_subscription: Value,
+    read_limits: StripeReadLimits,
+    pending_path: Option<&str>,
+) -> (
+    StripeReadClient,
+    sotto_server::cloud_provider_stripe_http::StripeReadSession,
+    MockServer,
+) {
     let mut responses = HashMap::new();
     responses.insert(
         "/v1/account".into(),
@@ -497,15 +1384,15 @@ async fn current_client(
     );
     responses.insert(
         "/v1/subscriptions/sub_renewal".into(),
-        vec![current_subscription(false), current_subscription(false)],
+        vec![first_subscription, second_subscription],
     );
-    responses.insert("/v1/invoices/in_failed".into(), vec![invoice, second]);
+    responses.insert(
+        "/v1/invoices/in_failed".into(),
+        vec![invoice, second_invoice],
+    );
     responses.insert(
         "/v1/invoices/in_failed/lines".into(),
-        vec![
-            list(vec![current_line()], false),
-            list(vec![current_line()], false),
-        ],
+        vec![list(first_lines, false), list(second_lines, false)],
     );
     responses.insert(
         "/v1/invoice_payments".into(),
@@ -521,12 +1408,12 @@ async fn current_client(
     for path in ["/v1/refunds", "/v1/disputes", "/v1/credit_notes"] {
         responses.insert(path.into(), vec![list(Vec::new(), false)]);
     }
-    let server = mock_server(responses).await;
+    let server = mock_server_with_pending(responses, pending_path).await;
     let client = StripeReadClient::for_test(
         "sk_test_renewal",
         &config(),
         server.origin.clone(),
-        limits(),
+        read_limits,
     )
     .unwrap();
     let session = client.session();
@@ -536,7 +1423,7 @@ async fn current_client(
 #[tokio::test]
 async fn current_paid_invoice_supersedes_historical_failure_and_preserves_cancellation_facts() {
     let failure = linked_failure().await;
-    let (client, mut session, _server) = current_client("paid", None).await;
+    let (client, mut session, server) = current_client("paid", None).await;
     let result = client
         .personal_renewal_observation(&mut session, &binding(), &failure)
         .await
@@ -548,6 +1435,10 @@ async fn current_paid_invoice_supersedes_historical_failure_and_preserves_cancel
     assert_eq!(observation.event_id(), "evt_failure_1");
     assert_eq!(observation.provider_account_id(), "acct_test_renewal");
     assert_eq!(observation.allocation_reference(), "alloc_renewal");
+    assert_eq!(observation.customer_id(), "cus_renewal");
+    assert_eq!(observation.subscription_id(), "sub_renewal");
+    assert_eq!(observation.provider_item_id(), "si_renewal");
+    assert_eq!(observation.renewal_id(), failure.renewal_id());
     assert_eq!(observation.period_start(), 2000);
     assert_eq!(observation.period_end(), 3000);
     assert!(matches!(
@@ -555,6 +1446,285 @@ async fn current_paid_invoice_supersedes_historical_failure_and_preserves_cancel
         StripeRenewalCurrentState::Paid { .. }
     ));
     assert!(!observation.cancellation().cancel_at_period_end());
+    assert_eq!(
+        server.requests(),
+        vec![
+            "GET /v1/account",
+            "GET /v1/subscriptions/sub_renewal",
+            "GET /v1/invoices/in_failed",
+            "GET /v1/invoices/in_failed/lines?limit=100",
+            "GET /v1/invoice_payments?invoice=in_failed&limit=100",
+            "GET /v1/refunds?payment_intent=pi_current&limit=100",
+            "GET /v1/disputes?payment_intent=pi_current&limit=100",
+            "GET /v1/credit_notes?invoice=in_failed&limit=100",
+            "GET /v1/invoices/in_failed",
+            "GET /v1/subscriptions/sub_renewal",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn subscription_cancellation_facts_round_trip_for_active_scheduled_and_ended_states() {
+    let failure = linked_failure().await;
+    for (status, cancel_at_period_end, cancel_at, canceled_at, ended_at) in [
+        ("active", false, None, None, None),
+        ("active", true, Some(3_500_i64), None, None),
+        ("canceled", false, None, Some(3_600_i64), Some(3_700_i64)),
+    ] {
+        let mut subscription = current_subscription(cancel_at_period_end);
+        subscription["status"] = json!(status);
+        subscription["cancel_at"] = cancel_at.map_or(Value::Null, |value| json!(value));
+        subscription["canceled_at"] = canceled_at.map_or(Value::Null, |value| json!(value));
+        subscription["ended_at"] = ended_at.map_or(Value::Null, |value| json!(value));
+        let second_subscription = subscription.clone();
+        let (client, mut session, _server) = current_client_with_parts(
+            current_invoice("paid"),
+            current_invoice("paid"),
+            current_line(),
+            current_line(),
+            subscription,
+            second_subscription,
+        )
+        .await;
+        let result = client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await
+            .unwrap();
+        let StripeRenewalObservationResult::Observed(observation) = result else {
+            panic!("expected observation");
+        };
+        assert_eq!(observation.cancellation().status(), Some(status));
+        assert_eq!(
+            observation.cancellation().cancel_at_period_end(),
+            cancel_at_period_end
+        );
+        assert_eq!(observation.cancellation().cancel_at(), cancel_at);
+        assert_eq!(observation.cancellation().canceled_at(), canceled_at);
+        assert_eq!(observation.cancellation().ended_at(), ended_at);
+    }
+}
+
+#[tokio::test]
+async fn paid_observation_reuses_the_validated_line_and_rejects_nonzero_remaining() {
+    let failure = linked_failure().await;
+    let mut changed_line = current_line();
+    changed_line["period"]["start"] = json!(4000);
+    changed_line["period"]["end"] = json!(5000);
+    let mut nonzero_remaining = current_invoice("paid");
+    nonzero_remaining["amount_remaining"] = json!(1);
+    let (client, mut session, server) = current_client_with_parts(
+        nonzero_remaining,
+        current_invoice("paid"),
+        current_line(),
+        changed_line,
+        current_subscription(false),
+        current_subscription(false),
+    )
+    .await;
+    let result = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        StripeRenewalObservationResult::NeedsEvidence(
+            StripeRenewalNeedsEvidence::UnsupportedSettlement
+        )
+    ));
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.contains("GET /v1/invoices/in_failed/lines"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn paid_observation_rejects_missing_null_and_negative_remaining() {
+    let failure = linked_failure().await;
+    for remaining in [None, Some(json!(null)), Some(json!(-1))] {
+        let mut invoice = current_invoice("paid");
+        match remaining {
+            None => {
+                invoice.as_object_mut().unwrap().remove("amount_remaining");
+            }
+            Some(value) => invoice["amount_remaining"] = value,
+        }
+        let (client, mut session, _server) = current_client_with_parts(
+            invoice,
+            current_invoice("paid"),
+            current_line(),
+            current_line(),
+            current_subscription(false),
+            current_subscription(false),
+        )
+        .await;
+        let result = client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::UnsupportedSettlement
+            )
+        ));
+    }
+}
+
+#[tokio::test]
+async fn paid_observation_keeps_the_first_line_interval() {
+    let failure = linked_failure().await;
+    let mut changed_line = current_line();
+    changed_line["period"]["start"] = json!(4000);
+    changed_line["period"]["end"] = json!(5000);
+    let (client, mut session, server) = current_client_with_parts(
+        current_invoice("paid"),
+        current_invoice("paid"),
+        current_line(),
+        changed_line,
+        current_subscription(false),
+        current_subscription(false),
+    )
+    .await;
+    let result = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap();
+    let StripeRenewalObservationResult::Observed(observation) = result else {
+        panic!("expected observation");
+    };
+    assert_eq!(observation.period_start(), failure.renewal_period_start());
+    assert_eq!(observation.period_end(), failure.renewal_period_end());
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.contains("GET /v1/invoices/in_failed/lines"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn paid_observation_retains_the_validated_term_and_does_not_read_the_second_line() {
+    let failure = linked_failure().await;
+    let mut alternate = current_line();
+    alternate["pricing"]["price_details"]["price"] = json!("price_year");
+    alternate["period"]["start"] = json!(9000);
+    alternate["period"]["end"] = json!(10000);
+    let (client, mut session, server) = current_client_with_parts(
+        current_invoice("paid"),
+        current_invoice("paid"),
+        current_line(),
+        alternate,
+        current_subscription(false),
+        current_subscription(false),
+    )
+    .await;
+    let result = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap();
+    let StripeRenewalObservationResult::Observed(observation) = result else {
+        panic!("expected observation");
+    };
+    let StripeRenewalCurrentState::Paid { term, .. } = observation.state() else {
+        panic!("expected paid state");
+    };
+    assert_eq!(term.invoice_id(), observation.invoice_id());
+    assert_eq!(
+        term.allocation_reference(),
+        observation.allocation_reference()
+    );
+    assert_eq!(term.customer_id(), observation.customer_id());
+    assert_eq!(term.subscription_id(), observation.subscription_id());
+    assert_eq!(term.provider_item_id(), observation.provider_item_id());
+    assert_eq!(term.period_start(), observation.period_start());
+    assert_eq!(term.period_end(), observation.period_end());
+    assert_eq!(term.period_start(), failure.renewal_period_start());
+    assert_eq!(term.period_end(), failure.renewal_period_end());
+    assert_eq!(term.interval(), failure.interval());
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.contains("GET /v1/invoices/in_failed/lines"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn current_invoice_requires_an_automatic_subscription_cycle() {
+    let failure = linked_failure().await;
+    for (field, value) in [
+        ("billing_reason", json!("manual")),
+        ("billing_reason", json!("future_billing_reason")),
+        ("collection_method", json!("send_invoice")),
+        ("collection_method", json!("future_collection_method")),
+    ] {
+        let mut invoice = current_invoice("paid");
+        invoice[field] = value.clone();
+        let (client, mut session, _server) = current_client_with_parts(
+            invoice,
+            current_invoice("paid"),
+            current_line(),
+            current_line(),
+            current_subscription(false),
+            current_subscription(false),
+        )
+        .await;
+        let result = client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::UnsupportedInvoiceField {
+                    field: actual,
+                    value: ref actual_value,
+                }
+            ) if actual == field && actual_value == value.as_str().unwrap()
+        ));
+    }
+}
+
+#[tokio::test]
+async fn current_invoice_requires_named_billing_fields() {
+    let failure = linked_failure().await;
+    for field in ["billing_reason", "collection_method"] {
+        for (remove, replacement) in [
+            (true, None),
+            (false, Some(json!(null))),
+            (false, Some(json!(42))),
+        ] {
+            let mut invoice = current_invoice("paid");
+            if remove {
+                invoice.as_object_mut().unwrap().remove(field);
+            } else {
+                invoice[field] = replacement.unwrap();
+            }
+            let (client, mut session, _server) = current_client_with_parts(
+                invoice,
+                current_invoice("paid"),
+                current_line(),
+                current_line(),
+                current_subscription(false),
+                current_subscription(false),
+            )
+            .await;
+            assert!(matches!(
+                client
+                    .personal_renewal_observation(&mut session, &binding(), &failure)
+                    .await,
+                Err(StripeReadError::MalformedResponse(actual)) if actual == format!("invoice.{field}")
+            ));
+        }
+    }
 }
 
 #[tokio::test]
@@ -592,6 +1762,154 @@ async fn closed_invoice_is_observed_without_shortening_a_paid_term() {
 }
 
 #[tokio::test]
+async fn current_invoice_status_and_settlement_boundaries_are_explicit() {
+    let failure = linked_failure().await;
+    for status in ["void", "uncollectible"] {
+        let mut invoice = current_invoice(status);
+        invoice["amount_remaining"] = json!(100);
+        let second_invoice = invoice.clone();
+        let (client, mut session, _server) = current_client_with_parts(
+            invoice,
+            second_invoice,
+            current_line(),
+            current_line(),
+            current_subscription(false),
+            current_subscription(false),
+        )
+        .await;
+        let result = client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            StripeRenewalObservationResult::Observed(observation)
+                if matches!(observation.state(), StripeRenewalCurrentState::ClosedUnpaid { status: actual } if actual == status)
+        ));
+    }
+
+    let mut partial_open = current_invoice("open");
+    partial_open["amount_remaining"] = json!(100);
+    let (client, mut session, _server) = current_client_with_parts(
+        partial_open,
+        current_invoice("open"),
+        current_line(),
+        current_line(),
+        current_subscription(false),
+        current_subscription(false),
+    )
+    .await;
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await,
+        Ok(StripeRenewalObservationResult::NeedsEvidence(
+            StripeRenewalNeedsEvidence::UnsupportedSettlement
+        ))
+    ));
+
+    for status in ["draft", "processing", "unknown"] {
+        let (client, mut session, _server) = current_client(status, None).await;
+        assert!(matches!(
+            client
+                .personal_renewal_observation(&mut session, &binding(), &failure)
+                .await,
+            Ok(StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::UnsupportedStatus(actual)
+            )) if actual == status
+        ));
+    }
+
+    let mut unknown_subscription = current_subscription(false);
+    unknown_subscription["status"] = json!("future_status");
+    let (client, mut session, _server) = current_client_with_parts(
+        current_invoice("paid"),
+        current_invoice("paid"),
+        current_line(),
+        current_line(),
+        unknown_subscription,
+        current_subscription(false),
+    )
+    .await;
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await,
+        Ok(StripeRenewalObservationResult::NeedsEvidence(
+            StripeRenewalNeedsEvidence::UnsupportedSubscriptionStatus(actual)
+        )) if actual == "future_status"
+    ));
+}
+
+#[tokio::test]
+async fn settlement_requires_complete_nonnegative_amounts_and_no_off_stripe_value() {
+    let failure = linked_failure().await;
+    for field in ["amount_due", "amount_remaining"] {
+        let mut invoice = current_invoice("void");
+        invoice.as_object_mut().unwrap().remove(field);
+        let (client, mut session, _server) = current_client_with_parts(
+            invoice,
+            current_invoice("void"),
+            current_line(),
+            current_line(),
+            current_subscription(false),
+            current_subscription(false),
+        )
+        .await;
+        assert!(matches!(
+            client
+                .personal_renewal_observation(&mut session, &binding(), &failure)
+                .await,
+            Ok(StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::UnsupportedSettlement
+            ))
+        ));
+    }
+    for field in ["amount_due", "amount_remaining"] {
+        let mut invoice = current_invoice("void");
+        invoice[field] = json!(-1);
+        let (client, mut session, _server) = current_client_with_parts(
+            invoice,
+            current_invoice("void"),
+            current_line(),
+            current_line(),
+            current_subscription(false),
+            current_subscription(false),
+        )
+        .await;
+        assert!(matches!(
+            client
+                .personal_renewal_observation(&mut session, &binding(), &failure)
+                .await,
+            Ok(StripeRenewalObservationResult::NeedsEvidence(
+                StripeRenewalNeedsEvidence::UnsupportedSettlement
+            ))
+        ));
+    }
+    for field in ["amount_overpaid", "amount_paid_off_stripe"] {
+        let mut invoice = current_invoice("paid");
+        invoice[field] = json!(1);
+        let (client, mut session, _server) = current_client_with_parts(
+            invoice,
+            current_invoice("paid"),
+            current_line(),
+            current_line(),
+            current_subscription(false),
+            current_subscription(false),
+        )
+        .await;
+        assert!(matches!(
+            client
+                .personal_renewal_observation(&mut session, &binding(), &failure)
+                .await,
+            Err(StripeReadError::Observation(
+                StripeContractError::UnsupportedSettlement(_)
+            ))
+        ));
+    }
+}
+
+#[tokio::test]
 async fn invoice_change_between_reads_returns_no_partial_observation() {
     let failure = linked_failure().await;
     let mut changed = current_invoice("paid");
@@ -609,5 +1927,964 @@ async fn invoice_change_between_reads_returns_no_partial_observation() {
                 ref fields,
             }
         ) if fields == &["allocation_reference"]
+    ));
+}
+
+#[tokio::test]
+async fn billing_and_cancellation_changes_name_the_provider_fields() {
+    let failure = linked_failure().await;
+    let mut changed_invoice = current_invoice("paid");
+    changed_invoice["billing_reason"] = json!("subscription_update");
+    let mut changed_subscription = current_subscription(false);
+    changed_subscription
+        .as_object_mut()
+        .unwrap()
+        .remove("canceled_at");
+    let (client, mut session, _server) = current_client_with_parts(
+        current_invoice("paid"),
+        changed_invoice,
+        current_line(),
+        current_line(),
+        current_subscription(false),
+        changed_subscription,
+    )
+    .await;
+    let result = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        StripeRenewalObservationResult::NeedsEvidence(
+            StripeRenewalNeedsEvidence::ChangedDuringRead {
+                resource: "invoice",
+                ref fields,
+            }
+        ) if fields == &["billing_reason"]
+    ));
+
+    let (client, mut session, _server) = current_client_with_parts(
+        current_invoice("paid"),
+        current_invoice("paid"),
+        current_line(),
+        current_line(),
+        current_subscription(false),
+        {
+            let mut subscription = current_subscription(false);
+            subscription.as_object_mut().unwrap().remove("canceled_at");
+            subscription
+        },
+    )
+    .await;
+    let result = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        StripeRenewalObservationResult::NeedsEvidence(
+            StripeRenewalNeedsEvidence::ChangedDuringRead {
+                resource: "subscription",
+                ref fields,
+            }
+        )
+        if fields == &["canceled_at"]
+    ));
+}
+
+#[tokio::test]
+async fn cancellation_fields_require_presence_and_valid_values() {
+    let failure = linked_failure().await;
+    let cases = [
+        ("cancel_at", json!(null), true),
+        ("cancel_at_period_end", json!(0), false),
+        ("canceled_at", json!(-1), false),
+    ];
+    for (field, value, remove) in cases {
+        let mut subscription = current_subscription(false);
+        if remove {
+            subscription.as_object_mut().unwrap().remove(field);
+        } else {
+            subscription[field] = value;
+        }
+        let (client, mut session, _server) = current_client_with_parts(
+            current_invoice("paid"),
+            current_invoice("paid"),
+            current_line(),
+            current_line(),
+            subscription,
+            current_subscription(false),
+        )
+        .await;
+        assert!(matches!(
+            client
+                .personal_renewal_observation(&mut session, &binding(), &failure)
+                .await,
+            Err(StripeReadError::MalformedResponse(actual)) if actual == format!("subscription.{field}")
+        ));
+    }
+}
+
+#[tokio::test]
+async fn every_nullable_cancellation_timestamp_rejects_missing_wrong_type_and_negative_values() {
+    let failure = linked_failure().await;
+    for field in ["cancel_at", "canceled_at", "ended_at"] {
+        for value in [json!("not a timestamp"), json!(-1)] {
+            let mut subscription = current_subscription(false);
+            subscription[field] = value;
+            let (client, mut session, _server) = current_client_with_parts(
+                current_invoice("paid"),
+                current_invoice("paid"),
+                current_line(),
+                current_line(),
+                subscription,
+                current_subscription(false),
+            )
+            .await;
+            assert!(matches!(
+                client
+                    .personal_renewal_observation(&mut session, &binding(), &failure)
+                    .await,
+                Err(StripeReadError::MalformedResponse(actual)) if actual == format!("subscription.{field}")
+            ));
+        }
+        let mut subscription = current_subscription(false);
+        subscription.as_object_mut().unwrap().remove(field);
+        let (client, mut session, _server) = current_client_with_parts(
+            current_invoice("paid"),
+            current_invoice("paid"),
+            current_line(),
+            current_line(),
+            subscription,
+            current_subscription(false),
+        )
+        .await;
+        assert!(matches!(
+            client
+                .personal_renewal_observation(&mut session, &binding(), &failure)
+                .await,
+            Err(StripeReadError::MalformedResponse(actual)) if actual == format!("subscription.{field}")
+        ));
+    }
+}
+
+#[tokio::test]
+async fn collection_method_change_is_reported_by_name() {
+    let failure = linked_failure().await;
+    let mut changed_invoice = current_invoice("paid");
+    changed_invoice["collection_method"] = json!("send_invoice");
+    let (client, mut session, _server) = current_client_with_parts(
+        current_invoice("paid"),
+        changed_invoice,
+        current_line(),
+        current_line(),
+        current_subscription(false),
+        current_subscription(false),
+    )
+    .await;
+    let result = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        StripeRenewalObservationResult::NeedsEvidence(
+            StripeRenewalNeedsEvidence::ChangedDuringRead {
+                resource: "invoice",
+                ref fields,
+            }
+        ) if fields == &["collection_method"]
+    ));
+}
+
+#[tokio::test]
+async fn contradictory_legacy_line_ownership_is_rejected() {
+    let failure = linked_failure().await;
+    let mut line = current_line();
+    line["subscription"] = json!("sub_other");
+    let (client, mut session, _server) = current_client_with_parts(
+        current_invoice("paid"),
+        current_invoice("paid"),
+        line,
+        current_line(),
+        current_subscription(false),
+        current_subscription(false),
+    )
+    .await;
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await,
+        Err(StripeReadError::Observation(
+            StripeContractError::ContextMismatch
+        ))
+    ));
+}
+
+#[tokio::test]
+async fn matching_legacy_line_ownership_remains_supported() {
+    let failure = linked_failure().await;
+    let mut line = current_line();
+    line["subscription"] = json!("sub_renewal");
+    line["subscription_item"] = json!("si_renewal");
+    let (client, mut session, _server) = current_client_with_parts(
+        current_invoice("paid"),
+        current_invoice("paid"),
+        line,
+        current_line(),
+        current_subscription(false),
+        current_subscription(false),
+    )
+    .await;
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await,
+        Ok(StripeRenewalObservationResult::Observed(_))
+    ));
+}
+
+#[tokio::test]
+async fn closed_invoice_rejects_remaining_balance_above_due() {
+    let failure = linked_failure().await;
+    let mut invoice = current_invoice("void");
+    invoice["amount_remaining"] = json!(300);
+    let (client, mut session, _server) = current_client_with_parts(
+        invoice,
+        current_invoice("void"),
+        current_line(),
+        current_line(),
+        current_subscription(false),
+        current_subscription(false),
+    )
+    .await;
+    let result = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        StripeRenewalObservationResult::NeedsEvidence(
+            StripeRenewalNeedsEvidence::UnsupportedSettlement
+        )
+    ));
+}
+
+#[tokio::test]
+async fn foreign_binding_and_session_are_rejected_before_resource_reads() {
+    let failure = linked_failure().await;
+    let (client, mut session, server) = current_client("paid", None).await;
+    let foreign = StripeAllocationBinding::new(
+        "alloc_other",
+        "cus_other",
+        "sub_other",
+        "si_other",
+        PayerKind::Personal,
+    )
+    .unwrap();
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut session, &foreign, &failure)
+            .await,
+        Err(StripeReadError::ContextMismatch)
+    ));
+    assert!(server.requests().is_empty());
+
+    let (other_client, other_session, other_server) = current_client("paid", None).await;
+    let mut foreign_session = other_session;
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut foreign_session, &binding(), &failure)
+            .await,
+        Err(StripeReadError::SessionClientMismatch)
+    ));
+    assert!(server.requests().is_empty());
+    assert!(other_server.requests().is_empty());
+    drop(other_client);
+}
+
+#[tokio::test]
+async fn client_account_and_environment_mismatches_stop_before_subscription_reads() {
+    let failure = linked_failure().await;
+    let (_base, _session, server) = current_client("paid", None).await;
+    let other_config = StripeCoverageConfig::new(
+        "acct_other",
+        ProviderEnvironment::Test,
+        "price_month",
+        "price_year",
+    )
+    .unwrap();
+    let client = StripeReadClient::for_test(
+        "sk_test_renewal",
+        &other_config,
+        server.origin.clone(),
+        limits(),
+    )
+    .unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await,
+        Err(StripeReadError::ContextMismatch)
+    ));
+    assert!(server
+        .requests()
+        .iter()
+        .all(|request| !request.contains("/v1/subscriptions/")));
+
+    let (_base, _session, server) = current_client("paid", None).await;
+    let live_config = StripeCoverageConfig::new(
+        "acct_test_renewal",
+        ProviderEnvironment::Live,
+        "price_month",
+        "price_year",
+    )
+    .unwrap();
+    let client = StripeReadClient::for_test(
+        "sk_live_renewal",
+        &live_config,
+        server.origin.clone(),
+        limits(),
+    )
+    .unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await,
+        Err(StripeReadError::ContextMismatch)
+    ));
+    assert!(server
+        .requests()
+        .iter()
+        .all(|request| !request.contains("/v1/subscriptions/")));
+}
+
+#[tokio::test]
+async fn each_binding_component_is_checked_before_any_resource_read() {
+    let failure = linked_failure().await;
+    let cases = [
+        (
+            "allocation",
+            "alloc_other",
+            "cus_renewal",
+            "sub_renewal",
+            "si_renewal",
+        ),
+        (
+            "customer",
+            "alloc_renewal",
+            "cus_other",
+            "sub_renewal",
+            "si_renewal",
+        ),
+        (
+            "subscription",
+            "alloc_renewal",
+            "cus_renewal",
+            "sub_other",
+            "si_renewal",
+        ),
+        (
+            "provider item",
+            "alloc_renewal",
+            "cus_renewal",
+            "sub_renewal",
+            "si_other",
+        ),
+    ];
+    for (field, allocation, customer, subscription, item) in cases {
+        let (client, mut session, server) = current_client("paid", None).await;
+        let foreign = StripeAllocationBinding::new(
+            allocation,
+            customer,
+            subscription,
+            item,
+            PayerKind::Personal,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                client
+                    .personal_renewal_observation(&mut session, &foreign, &failure)
+                    .await,
+                Err(StripeReadError::ContextMismatch)
+            ),
+            "{field}"
+        );
+        assert!(server.requests().is_empty(), "{field}");
+    }
+
+    assert!(matches!(
+        StripeAllocationBinding::new(
+            "alloc_renewal",
+            "cus_renewal",
+            "sub_renewal",
+            "si_renewal",
+            PayerKind::Sponsor,
+        ),
+        Err(StripeContractError::UnsupportedPayerKind)
+    ));
+
+    for legacy_field in ["subscription", "subscription_item"] {
+        let mut line = current_line();
+        line[legacy_field] = json!("not a valid ref");
+        let (client, mut session, server) = current_client_with_parts(
+            current_invoice("paid"),
+            current_invoice("paid"),
+            line,
+            current_line(),
+            current_subscription(false),
+            current_subscription(false),
+        )
+        .await;
+        assert!(
+            matches!(
+                client
+                    .personal_renewal_observation(&mut session, &binding(), &failure)
+                    .await,
+                Err(StripeReadError::MalformedResponse(_))
+            ),
+            "{legacy_field}"
+        );
+        assert!(server
+            .requests()
+            .iter()
+            .all(|request| !request.contains("/v1/invoice_payments")));
+    }
+}
+
+#[tokio::test]
+async fn each_current_invoice_context_component_is_checked_before_settlement_reads() {
+    let failure = linked_failure().await;
+    let mut cases = Vec::new();
+    let mut customer = current_invoice("paid");
+    customer["customer"] = json!("cus_other");
+    cases.push(customer);
+    let mut allocation = current_invoice("paid");
+    allocation["metadata"]["sotto_allocation_reference"] = json!("alloc_other");
+    cases.push(allocation);
+    let mut mode = current_invoice("paid");
+    mode["livemode"] = json!(true);
+    cases.push(mode);
+    let mut parent_type = current_invoice("paid");
+    parent_type["parent"]["type"] = json!("invoice_item_details");
+    cases.push(parent_type);
+    let mut nested_parent = current_invoice("paid");
+    nested_parent["parent"]["subscription_details"]["subscription"] = json!("sub_other");
+    cases.push(nested_parent);
+    for invoice in cases {
+        let (client, mut session, server) = current_client_with_parts(
+            invoice.clone(),
+            invoice,
+            current_line(),
+            current_line(),
+            current_subscription(false),
+            current_subscription(false),
+        )
+        .await;
+        assert!(matches!(
+            client
+                .personal_renewal_observation(&mut session, &binding(), &failure)
+                .await,
+            Err(StripeReadError::ContextMismatch)
+        ));
+        assert!(server
+            .requests()
+            .iter()
+            .all(|request| !request.contains("/v1/invoice_payments")));
+    }
+}
+
+#[tokio::test]
+async fn open_to_paid_header_transition_returns_changed_fields_without_retrying() {
+    let failure = linked_failure().await;
+    let mut paid = current_invoice("paid");
+    paid["amount_remaining"] = json!(0);
+    let (client, mut session, server) = current_client_with_parts(
+        current_invoice("open"),
+        paid,
+        current_line(),
+        current_line(),
+        current_subscription(false),
+        current_subscription(false),
+    )
+    .await;
+    let result = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        StripeRenewalObservationResult::NeedsEvidence(
+            StripeRenewalNeedsEvidence::ChangedDuringRead {
+                resource: "invoice",
+                ref fields,
+            }
+        ) if fields == &["status", "amount_paid", "amount_remaining"]
+    ));
+    assert_eq!(
+        server
+            .requests()
+            .iter()
+            .filter(|request| request.as_str() == "GET /v1/invoices/in_failed")
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn stable_paid_observation_matches_across_sessions() {
+    let failure = linked_failure().await;
+    let (client, mut first_session, server) = current_client("paid", None).await;
+    server.replace_responses(
+        "/v1/account",
+        vec![
+            json!({"id":"acct_test_renewal","livemode":false}),
+            json!({"id":"acct_test_renewal","livemode":false}),
+        ],
+    );
+    server.replace_responses(
+        "/v1/subscriptions/sub_renewal",
+        vec![
+            current_subscription(false),
+            current_subscription(false),
+            current_subscription(false),
+            current_subscription(false),
+        ],
+    );
+    server.replace_responses(
+        "/v1/invoices/in_failed",
+        vec![
+            current_invoice("paid"),
+            current_invoice("paid"),
+            current_invoice("paid"),
+            current_invoice("paid"),
+        ],
+    );
+    server.replace_responses(
+        "/v1/invoices/in_failed/lines",
+        vec![
+            list(vec![current_line()], false),
+            list(vec![current_line()], false),
+        ],
+    );
+    server.replace_responses(
+        "/v1/invoice_payments",
+        vec![
+            list(
+                vec![json!({
+                    "id":"inpay_current","invoice":"in_failed","status":"paid","amount_paid":299,
+                    "amount_requested":299,"currency":"gbp","livemode":false,
+                    "payment":{"type":"payment_intent","payment_intent":"pi_current"}
+                })],
+                false,
+            ),
+            list(
+                vec![json!({
+                    "id":"inpay_current","invoice":"in_failed","status":"paid","amount_paid":299,
+                    "amount_requested":299,"currency":"gbp","livemode":false,
+                    "payment":{"type":"payment_intent","payment_intent":"pi_current"}
+                })],
+                false,
+            ),
+        ],
+    );
+    for path in ["/v1/refunds", "/v1/disputes", "/v1/credit_notes"] {
+        server.replace_responses(path, vec![list(Vec::new(), false), list(Vec::new(), false)]);
+    }
+    let first = client
+        .personal_renewal_observation(&mut first_session, &binding(), &failure)
+        .await
+        .unwrap();
+    let mut second_session = client.session();
+    let second = client
+        .personal_renewal_observation(&mut second_session, &binding(), &failure)
+        .await
+        .unwrap();
+    let (
+        StripeRenewalObservationResult::Observed(first),
+        StripeRenewalObservationResult::Observed(second),
+    ) = (first, second)
+    else {
+        panic!("expected stable observations");
+    };
+    assert_eq!(first, second);
+}
+
+#[tokio::test]
+async fn current_line_contract_rejects_proration_quantity_period_and_price_changes() {
+    let failure = linked_failure().await;
+    let mut cases = Vec::new();
+    let mut prorated = current_line();
+    prorated["parent"]["subscription_item_details"]["proration"] = json!(true);
+    cases.push(prorated);
+    let mut wrong_quantity = current_line();
+    wrong_quantity["quantity"] = json!(2);
+    cases.push(wrong_quantity);
+    let mut wrong_period = current_line();
+    wrong_period["period"]["start"] = json!(2100);
+    cases.push(wrong_period);
+    let mut wrong_price = current_line();
+    wrong_price["pricing"]["price_details"]["price"] = json!("price_other");
+    cases.push(wrong_price);
+    for line in cases {
+        let (client, mut session, _server) = current_client_with_parts(
+            current_invoice("paid"),
+            current_invoice("paid"),
+            line,
+            current_line(),
+            current_subscription(false),
+            current_subscription(false),
+        )
+        .await;
+        let result = client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await;
+        assert!(matches!(
+            result,
+            Err(StripeReadError::Observation(
+                StripeContractError::ContextMismatch
+            )) | Err(StripeReadError::MalformedResponse("line.price"))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn current_line_contract_rejects_list_shape_and_missing_period_evidence() {
+    let failure = linked_failure().await;
+    let cases = [
+        (Vec::new(), "empty line list"),
+        (
+            {
+                let mut second = current_line();
+                second["id"] = json!("il_other");
+                vec![current_line(), second]
+            },
+            "multiple lines",
+        ),
+    ];
+    for (lines, label) in cases {
+        let (client, mut session, _server) = current_client_with_line_lists_and_limits(
+            current_invoice("paid"),
+            current_invoice("paid"),
+            lines,
+            vec![current_line()],
+            current_subscription(false),
+            current_subscription(false),
+            limits(),
+        )
+        .await;
+        assert!(
+            matches!(
+                client
+                    .personal_renewal_observation(&mut session, &binding(), &failure)
+                    .await,
+                Err(StripeReadError::Observation(
+                    StripeContractError::UnsupportedQuantity
+                )),
+            ),
+            "{label}"
+        );
+    }
+
+    for field in [
+        "id",
+        "period",
+        "period_start",
+        "invoice",
+        "parent",
+        "parent_type",
+        "pricing",
+    ] {
+        let mut line = current_line();
+        if field == "id" {
+            line.as_object_mut().unwrap().remove("id");
+        } else if field == "period" {
+            line["period"].as_object_mut().unwrap().remove("end");
+        } else if field == "period_start" {
+            line["period"].as_object_mut().unwrap().remove("start");
+        } else if field == "invoice" {
+            line["invoice"] = json!("in_other");
+        } else if field == "parent" {
+            line["parent"]["subscription_item_details"]
+                .as_object_mut()
+                .unwrap()
+                .remove("proration");
+        } else if field == "parent_type" {
+            line["parent"]["type"] = json!("invoice_item_details");
+        } else {
+            line["pricing"]["price_details"]
+                .as_object_mut()
+                .unwrap()
+                .remove("price");
+        }
+        let (client, mut session, _server) = current_client_with_parts(
+            current_invoice("paid"),
+            current_invoice("paid"),
+            line,
+            current_line(),
+            current_subscription(false),
+            current_subscription(false),
+        )
+        .await;
+        let result = client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await;
+        match field {
+            "id" => assert!(matches!(
+                result,
+                Err(StripeReadError::MalformedResponse("list.data.id"))
+            )),
+            "pricing" => assert!(matches!(
+                result,
+                Err(StripeReadError::MalformedResponse("line.price"))
+            )),
+            _ => assert!(matches!(
+                result,
+                Err(StripeReadError::Observation(
+                    StripeContractError::ContextMismatch
+                ))
+            )),
+        }
+    }
+
+    let (client, mut session, server) = current_client("paid", None).await;
+    let mut second_page_line = current_line();
+    second_page_line["id"] = json!("il_other");
+    server.replace_responses(
+        "/v1/invoices/in_failed/lines",
+        vec![
+            list(vec![current_line()], true),
+            list(vec![second_page_line], false),
+        ],
+    );
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await,
+        Err(StripeReadError::Observation(
+            StripeContractError::UnsupportedQuantity
+        ))
+    ));
+    assert!(server.requests().iter().any(|request| request
+        .contains("/v1/invoices/in_failed/lines?limit=100&starting_after=il_failed")));
+}
+
+#[tokio::test]
+async fn current_observation_consumes_one_shared_request_budget() {
+    let failure = linked_failure().await;
+    let mut read_limits = limits();
+    read_limits.max_requests = 9;
+    let (client, mut session, _server) = current_client_with_parts_and_limits(
+        current_invoice("paid"),
+        current_invoice("paid"),
+        current_line(),
+        current_line(),
+        current_subscription(false),
+        current_subscription(false),
+        read_limits,
+    )
+    .await;
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await,
+        Err(StripeReadError::RequestBoundExceeded)
+    ));
+}
+
+#[tokio::test]
+async fn history_and_renewal_share_page_budget_and_stop_before_a_new_correction_read() {
+    let failure = linked_failure().await;
+    let mut responses = HashMap::new();
+    responses.insert(
+        "/v1/account".into(),
+        vec![json!({"id":"acct_test_renewal","livemode":false})],
+    );
+    responses.insert(
+        "/v1/subscriptions/sub_renewal".into(),
+        vec![
+            json!({"id":"sub_renewal","customer":"cus_renewal","status":"active","livemode":false}),
+            json!({"id":"sub_renewal","customer":"cus_renewal","status":"active","livemode":false,"cancel_at_period_end":false,"cancel_at":null,"canceled_at":null,"ended_at":null}),
+            json!({"id":"sub_renewal","customer":"cus_renewal","status":"active","livemode":false,"cancel_at_period_end":false,"cancel_at":null,"canceled_at":null,"ended_at":null}),
+        ],
+    );
+    responses.insert(
+        "/v1/invoices".into(),
+        vec![list(vec![paid_invoice()], false)],
+    );
+    responses.insert("/v1/invoices/in_paid".into(), vec![paid_invoice()]);
+    responses.insert(
+        "/v1/invoices/in_paid/lines".into(),
+        vec![list(vec![paid_line()], false)],
+    );
+    responses.insert(
+        "/v1/invoices/in_failed".into(),
+        vec![current_invoice("paid"), current_invoice("paid")],
+    );
+    responses.insert(
+        "/v1/invoices/in_failed/lines".into(),
+        vec![list(vec![current_line()], false)],
+    );
+    responses.insert(
+        "/v1/invoice_payments".into(),
+        vec![
+            list(
+                vec![json!({
+                    "id":"inpay_paid","invoice":"in_paid","status":"paid","amount_paid":299,
+                    "amount_requested":299,"currency":"gbp","livemode":false,
+                    "payment":{"type":"payment_intent","payment_intent":"pi_paid"}
+                })],
+                false,
+            ),
+            list(
+                vec![json!({
+                    "id":"inpay_current","invoice":"in_failed","status":"paid","amount_paid":299,
+                    "amount_requested":299,"currency":"gbp","livemode":false,
+                    "payment":{"type":"payment_intent","payment_intent":"pi_current"}
+                })],
+                false,
+            ),
+        ],
+    );
+    for path in ["/v1/refunds", "/v1/disputes", "/v1/credit_notes"] {
+        responses.insert(
+            path.into(),
+            vec![list(Vec::new(), false), list(Vec::new(), false)],
+        );
+    }
+    let server = mock_server(responses).await;
+    let mut read_limits = limits();
+    read_limits.max_pages = 10;
+    let client = StripeReadClient::for_test(
+        "sk_test_renewal",
+        &config(),
+        server.origin.clone(),
+        read_limits,
+    )
+    .unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .personal_invoice_history(&mut session, &binding())
+            .await,
+        Ok(StripePersonalInvoiceHistoryResult::Observed(_))
+    ));
+    assert!(matches!(
+        client
+            .personal_renewal_observation(&mut session, &binding(), &failure)
+            .await,
+        Err(StripeReadError::PageBoundExceeded)
+    ));
+    let requests = server.requests();
+    assert!(requests
+        .iter()
+        .any(|request| request.contains("GET /v1/disputes?payment_intent=pi_current")));
+    assert!(!requests
+        .iter()
+        .any(|request| request.contains("GET /v1/credit_notes?invoice=in_failed")));
+    assert_eq!(
+        requests.last().map(String::as_str),
+        Some("GET /v1/disputes?payment_intent=pi_current&limit=100")
+    );
+}
+
+#[tokio::test]
+async fn late_pending_response_hits_the_shared_deadline_without_partial_observation() {
+    let failure = linked_failure().await;
+    let mut read_limits = limits();
+    read_limits.session_timeout = std::time::Duration::from_millis(50);
+    let (client, session, server) = current_client_with_line_lists_and_limits_pending(
+        current_invoice("paid"),
+        current_invoice("paid"),
+        vec![current_line()],
+        vec![current_line()],
+        current_subscription(false),
+        current_subscription(false),
+        read_limits,
+        Some("/v1/invoices/in_failed/lines"),
+    )
+    .await;
+    let binding = binding();
+    let task = tokio::spawn(async move {
+        let mut session = session;
+        client
+            .personal_renewal_observation(&mut session, &binding, &failure)
+            .await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        server.wait_for_pending_request(),
+    )
+    .await
+    .expect("pending request entered");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+        .await
+        .expect("bounded teardown")
+        .expect("observation task");
+    assert!(matches!(result, Err(StripeReadError::Timeout)));
+    assert!(server
+        .requests()
+        .iter()
+        .all(|request| !request.contains("/v1/invoice_payments")));
+}
+
+#[tokio::test]
+async fn associated_refund_preserves_the_paid_term_and_unknown_correction_stays_unresolved() {
+    let failure = linked_failure().await;
+    let (client, mut session, server) = current_client("paid", None).await;
+    server.replace_responses("/v1/refunds", vec![list(vec![refund("succeeded")], false)]);
+    let result = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap();
+    let StripeRenewalObservationResult::Observed(observation) = result else {
+        panic!("expected observed paid term");
+    };
+    let StripeRenewalCurrentState::Paid { term, .. } = observation.state() else {
+        panic!("expected paid state");
+    };
+    assert_eq!(term.period_start(), failure.renewal_period_start());
+    assert_eq!(term.period_end(), failure.renewal_period_end());
+    assert_eq!(term.invoice_id(), "in_failed");
+    assert!(server
+        .requests()
+        .iter()
+        .any(|request| request.contains("GET /v1/refunds?payment_intent=pi_current")));
+
+    let (client, mut session, server) = current_client("paid", None).await;
+    server.replace_responses(
+        "/v1/disputes",
+        vec![list(vec![dispute("under_review")], false)],
+    );
+    let result = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap();
+    let StripeRenewalObservationResult::Observed(observation) = result else {
+        panic!("expected observed paid term with dispute");
+    };
+    let StripeRenewalCurrentState::Paid { term, .. } = observation.state() else {
+        panic!("expected paid state with dispute");
+    };
+    assert_eq!(term.period_end(), failure.renewal_period_end());
+    assert_eq!(observation.cancellation().status(), Some("active"));
+
+    let (client, mut session, server) = current_client("paid", None).await;
+    server.replace_responses(
+        "/v1/refunds",
+        vec![list(vec![refund("future_status")], false)],
+    );
+    let result = client
+        .personal_renewal_observation(&mut session, &binding(), &failure)
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        StripeRenewalObservationResult::NeedsEvidence(
+            StripeRenewalNeedsEvidence::UnsupportedSettlement
+        )
     ));
 }

@@ -107,6 +107,91 @@ describe("VaultApp startup transitions", () => {
     expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
   });
 
+  it("shows setup guidance for a missing account and advances after a successful re-check", async () => {
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    vi.mocked(api.fetchAccount)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(account());
+
+    render(<VaultApp />);
+
+    expect(await screen.findByText("Finish setting up Sotto")).toBeInTheDocument();
+    expect(screen.getByText(/sotto push/)).toBeInTheDocument();
+    expect(screen.queryByText("Unlock your vault")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Check setup again" }));
+
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+    expect(api.fetchAccount).toHaveBeenCalledTimes(2);
+  });
+
+  it("allows another setup check after the account is still missing", async () => {
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    const recheck = deferred<api.Account | null>();
+    vi.mocked(api.fetchAccount)
+      .mockResolvedValueOnce(null)
+      .mockReturnValueOnce(recheck.promise)
+      .mockResolvedValueOnce(account());
+
+    render(<VaultApp />);
+
+    expect(await screen.findByText("Finish setting up Sotto")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Check setup again" }));
+
+    expect(screen.getByRole("button", { name: "Checking…" })).toBeDisabled();
+    expect(screen.queryByText("Unlock your vault")).not.toBeInTheDocument();
+    expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+
+    await act(async () => {
+      recheck.resolve(null);
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Account setup is not published yet.",
+    );
+    const retry = screen.getByRole("button", { name: "Check setup again" });
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.fetchAccount).toHaveBeenCalledTimes(3);
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+  });
+
+  it("allows another setup check after a request failure", async () => {
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    const recheck = deferred<api.Account | null>();
+    vi.mocked(api.fetchAccount)
+      .mockResolvedValueOnce(null)
+      .mockReturnValueOnce(recheck.promise)
+      .mockResolvedValueOnce(account());
+
+    render(<VaultApp />);
+
+    expect(await screen.findByText("Finish setting up Sotto")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Check setup again" }));
+
+    expect(screen.getByRole("button", { name: "Checking…" })).toBeDisabled();
+    expect(screen.queryByText("Unlock your vault")).not.toBeInTheDocument();
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+
+    await act(async () => {
+      recheck.reject(new Error("temporary request failure"));
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent("temporary request failure");
+    const retry = screen.getByRole("button", { name: "Check setup again" });
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.fetchAccount).toHaveBeenCalledTimes(3);
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+  });
+
   it("shows an alert and Reload on an account-request rejection, and Reload triggers one reload", async () => {
     vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
     vi.mocked(api.fetchAccount).mockRejectedValue(new Error("server error (500)"));
@@ -122,6 +207,57 @@ describe("VaultApp startup transitions", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Reload" }));
     expect(reload).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("VaultApp unlock retries", () => {
+  it("recovers from a derivation failure using the latest form values", async () => {
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    const storedAccount = account();
+    vi.mocked(api.fetchAccount).mockResolvedValue(storedAccount);
+    const firstDerivation = deferred<Uint8Array>();
+    vi.mocked(vaultCrypto.deriveMasterKey)
+      .mockReturnValueOnce(firstDerivation.promise)
+      .mockResolvedValueOnce(new Uint8Array([7]));
+
+    render(<VaultApp />);
+
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Master password"), {
+      target: { value: "wrong password" },
+    });
+    fireEvent.change(screen.getByLabelText("Secret key (SK1-…)"), {
+      target: { value: "SK1-test" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Unlock" }));
+
+    expect(screen.getByRole("button", { name: "Deriving key…" })).toBeDisabled();
+    expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
+
+    await act(async () => {
+      firstDerivation.reject(new Error("internal derivation detail"));
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Couldn't unlock - check your master password and secret key.",
+    );
+    expect(screen.getByRole("alert")).not.toHaveTextContent("internal derivation detail");
+    expect(screen.getByRole("button", { name: "Unlock" })).toBeEnabled();
+    expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Master password"), {
+      target: { value: "corrected password" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Unlock" }));
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(vaultCrypto.deriveMasterKey).toHaveBeenNthCalledWith(
+      2,
+      "corrected password",
+      "SK1-test",
+      storedAccount.salt,
+    );
+    expect(await screen.findByText("vault-view")).toBeInTheDocument();
   });
 });
 

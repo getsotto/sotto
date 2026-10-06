@@ -41,16 +41,25 @@ docker compose -f docker-compose.prod.yml up -d
 ```
 
 `SOTTO_DEPLOYMENT_MODE` identifies who operates the instance and defaults to `self_hosted`.
-Set it to `cloud` only on an instance operated by Sotto. It is currently discovery metadata only:
-it does not enable Stripe billing, remove the existing organisation limits, or change access by
-itself. Check the value after deployment with:
+Set it to `cloud` on the operated Sotto service. Stripe credentials with `self_hosted` are rejected
+at boot so a deployment cannot silently lose billing or accidentally apply the wrong entitlement
+policy. Check the value after deployment with:
 
 ```sh
 curl -fsS https://<your-domain>/server/info
 ```
 
 The response is safe to expose publicly and reports the deployment mode plus the current
-entitlement model. Stripe configuration does not select this mode.
+entitlement model. Stripe configuration must be paired with `cloud`; the mode remains an explicit operator setting.
+
+Human hosted action checks are shadow-only by default. They record would-deny decisions while
+existing ACL, grant, lifecycle, and export responses remain unchanged. Do not set
+`SOTTO_CLOUD_ACTION_ENFORCEMENT=1` until the Cloud transition and export gates have been
+rehearsed and approved.
+
+Hosted machine-token eligibility is separately dormant. Do not set
+`SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT=1` until the accountable-beneficiary migration and legacy
+token inventory have been reviewed; self-hosted machine access does not depend on Cloud billing.
 
 Database migrations run automatically on server boot. Pin a released version with
 `SOTTO_IMAGE_TAG=vX.Y.Z` in `.env` (default: `latest`). To build everything from source instead -

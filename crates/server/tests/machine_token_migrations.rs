@@ -24,6 +24,7 @@ mod support {
 use support::migrations::{migrator_before, DisposableDatabase};
 
 const EXPIRY_MIGRATION: i64 = 29;
+const BENEFICIARY_MIGRATION: i64 = 45;
 
 /// The stored form of a bearer token: the same BLAKE2b the server's `session::hash_token` uses,
 /// which is crate-private. The seeded token has to authenticate through the real extractor.
@@ -35,6 +36,8 @@ fn app(pool: PgPool) -> Router {
     let state = AppState {
         deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
         telemetry_ingest: false,
+        cloud_action_enforcement_enabled: false,
+        machine_eligibility_enforcement_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,
@@ -149,5 +152,101 @@ async fn migration_0029_gives_existing_tokens_ninety_days_from_upgrade() {
         .expect("oneshot");
     assert_eq!(resp.status(), StatusCode::OK);
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn migration_0045_backfills_verified_beneficiaries_and_marks_orphans_ambiguous() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    migrator_before(BENEFICIARY_MIGRATION)
+        .run(&database.pool)
+        .await
+        .expect("apply migrations through 0044");
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ('beneficiary-owner', 'github', 'beneficiary-owner')",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("insert owner");
+    sqlx::query(
+        "INSERT INTO projects (id, owner_id, enc_name) VALUES ('beneficiary-p', 'beneficiary-owner', 'p')",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("insert project");
+    sqlx::query(
+        "INSERT INTO environments (id, project_id, enc_name) VALUES ('beneficiary-e', 'beneficiary-p', 'e')",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("insert environment");
+    for (id, created_by) in [
+        ("beneficiary-known", Some("beneficiary-owner")),
+        ("beneficiary-orphan", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO machine_tokens \
+             (id, env_id, name, token_hash, public_key, enc_vault_key, created_by, expires_at) \
+             VALUES ($1, 'beneficiary-e', 'ci', $2, $3, $4, $5, now() + interval '30 days')",
+        )
+        .bind(id)
+        .bind(hash_token(id))
+        .bind([0xABu8; 32].as_slice())
+        .bind(b"sealed-grant".as_slice())
+        .bind(created_by)
+        .execute(&database.pool)
+        .await
+        .expect("insert pre-migration token");
+    }
+
+    db::migrate(&database.pool)
+        .await
+        .expect("apply beneficiary migration");
+
+    let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT id, beneficiary_id, beneficiary_status FROM machine_tokens ORDER BY id",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .expect("read beneficiary backfill");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "beneficiary-known".into(),
+                Some("beneficiary-owner".into()),
+                "verified".into()
+            ),
+            ("beneficiary-orphan".into(), None, "ambiguous".into()),
+        ]
+    );
+
+    // A deleted beneficiary is deliberately no longer presented as verified. Use a separate
+    // user so deleting the beneficiary cannot cascade through the environment fixture.
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ('beneficiary-deleted', 'github', 'beneficiary-deleted')",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("insert beneficiary");
+    sqlx::query(
+        "UPDATE machine_tokens SET beneficiary_id = 'beneficiary-deleted' WHERE id = 'beneficiary-known'",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("assign beneficiary");
+    sqlx::query("DELETE FROM users WHERE id = 'beneficiary-deleted'")
+        .execute(&database.pool)
+        .await
+        .expect("delete beneficiary");
+    let after_delete: (Option<String>, String) = sqlx::query_as(
+        "SELECT beneficiary_id, beneficiary_status FROM machine_tokens WHERE id = 'beneficiary-known'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .expect("read deleted beneficiary");
+    assert_eq!(after_delete, (None, "ambiguous".into()));
     database.cleanup().await;
 }

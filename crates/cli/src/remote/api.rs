@@ -166,6 +166,12 @@ pub struct MachineTokenInfo {
     pub public_key: String,
     /// The user who created the token, if still known.
     pub created_by: Option<String>,
+    /// The human account whose hosted eligibility is accountable for this token, if known.
+    #[serde(default)]
+    pub beneficiary_id: Option<String>,
+    /// `verified` or `ambiguous`; absent from servers predating machine accountability.
+    #[serde(default)]
+    pub beneficiary_status: Option<String>,
     /// When the token stops authenticating (UTC, RFC 3339). Absent from servers that predate
     /// token expiry, whose tokens never expire.
     #[serde(default)]
@@ -312,6 +318,38 @@ pub struct Me {
     pub user_id: String,
 }
 
+/// Public server capability metadata. Older servers may not expose this route; callers treat the
+/// absence as an unknown capability rather than assuming hosted billing is available.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ServerInfo {
+    pub deployment_mode: String,
+    pub entitlement_model: String,
+}
+
+/// Account-level Cloud state returned by the eligibility endpoint.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EligibilityView {
+    pub model: String,
+    pub state: String,
+    pub deployment_mode: String,
+    pub account_initialized: bool,
+    pub billing_available: bool,
+    pub paid_through_epoch: Option<i64>,
+    pub recovery_until_epoch: Option<i64>,
+    pub export_until_epoch: Option<i64>,
+    pub actions: EligibilityActions,
+    pub next_actions: Vec<String>,
+    pub payer: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct EligibilityActions {
+    pub setup: bool,
+    pub billing: bool,
+    pub export: bool,
+    pub revoke: bool,
+}
+
 /// A share link to create: the sealed blob + limits. `enc_blob`/`passphrase_salt` are base64.
 #[derive(Debug, Clone, Serialize)]
 pub struct NewShare {
@@ -330,6 +368,98 @@ pub struct CreatedShare {
     pub expires_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ShareSummary {
+    pub token: String,
+    pub share_class: String,
+    pub max_views: i32,
+    pub view_count: i32,
+    pub expires_at: Option<String>,
+    pub revoked_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ShareList {
+    pub active_free_count: i64,
+    pub links: Vec<ShareSummary>,
+}
+
+/// Versioned Cloud exit-export manifest. It names only resources the caller can decrypt.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportManifest {
+    pub version: i32,
+    pub export_id: String,
+    pub manifest_hash: String,
+    pub expires_at: String,
+    pub total_chunks: usize,
+    pub complete: bool,
+    pub projects: Vec<ExportProject>,
+    pub environments: Vec<ExportEnvironmentRef>,
+    #[serde(default)]
+    pub not_shared_environment_ids: Vec<String>,
+    pub omitted_environment_count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportProject {
+    pub id: String,
+    pub enc_name: String,
+    pub org_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportEnvironmentRef {
+    pub id: String,
+    pub project_id: String,
+    pub enc_name: String,
+    pub enc_vault_key: String,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportChunk {
+    pub version: i32,
+    pub export_id: String,
+    pub manifest_hash: String,
+    pub index: usize,
+    pub total_chunks: usize,
+    pub complete: bool,
+    pub account: Option<AccountBundle>,
+    pub environment: Option<ExportEnvironment>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportEnvironment {
+    pub id: String,
+    pub project_id: String,
+    pub enc_name: String,
+    pub enc_vault_key: String,
+    pub revision: i64,
+    pub content_hash: String,
+    pub secrets: Vec<ExportSecret>,
+    pub history: Vec<ExportHistory>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportSecret {
+    pub id: String,
+    pub enc_name: String,
+    pub enc_value: String,
+    pub enc_data_key: String,
+    pub version: i64,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExportHistory {
+    pub secret_id: String,
+    pub version: i64,
+    pub enc_name: String,
+    pub enc_value: String,
+    pub enc_data_key: String,
+}
+
 /// The server operations the sync engine needs, abstracted for testability.
 pub trait SyncApi {
     /// Verify the session and return the authenticated user.
@@ -341,6 +471,10 @@ pub trait SyncApi {
     fn reset_account(&self, bundle: &AccountBundle) -> Result<()>;
     /// Download account crypto material, or `None` if the account isn't initialised.
     fn get_account(&self) -> Result<Option<AccountBundle>>;
+    /// Start a short-lived, versioned export of the caller's authorised resources.
+    fn start_export(&self) -> Result<ExportManifest>;
+    /// Fetch one opaque export chunk, rechecking the caller's grant and environment revision.
+    fn export_chunk(&self, export_id: &str, index: usize) -> Result<ExportChunk>;
     fn create_project(&self, project: &NewProject) -> Result<()>;
     fn create_environment(&self, project_id: &str, env: &NewEnvironment) -> Result<()>;
     /// List a project's environments (for reconstructing them on a new device).
@@ -351,6 +485,10 @@ pub trait SyncApi {
     fn write_secrets(&self, env_id: &str, batch: &BatchRequest) -> Result<BatchResponse>;
     /// Create a share link; returns the public token.
     fn create_share(&self, share: &NewShare) -> Result<CreatedShare>;
+    /// List share metadata without ciphertext or fragment keys.
+    fn list_shares(&self) -> Result<ShareList>;
+    /// Revoke one of the caller's share links.
+    fn revoke_share(&self, token: &str) -> Result<()>;
 
     // --- teams: organisations, invites, and environment vault-key grants ---
 
@@ -471,5 +609,28 @@ mod tests {
         .unwrap();
         let label = forged.expiry_label().unwrap();
         assert!(!label.chars().any(char::is_control), "{label:?}");
+    }
+
+    #[test]
+    fn eligibility_view_matches_the_server_contract() {
+        let view: EligibilityView = serde_json::from_str(
+            r#"{
+                "model":"person_eligibility_v1",
+                "deployment_mode":"cloud",
+                "state":"export_only",
+                "account_initialized":true,
+                "billing_available":true,
+                "paid_through_epoch":null,
+                "recovery_until_epoch":1760000000,
+                "export_until_epoch":1761000000,
+                "actions":{"setup":false,"billing":false,"export":true,"revoke":false},
+                "next_actions":["export"],
+                "payer":"personal"
+            }"#,
+        )
+        .expect("eligibility response should decode");
+        assert_eq!(view.model, "person_eligibility_v1");
+        assert_eq!(view.state, "export_only");
+        assert_eq!(view.next_actions, vec!["export"]);
     }
 }

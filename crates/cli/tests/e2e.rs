@@ -67,6 +67,8 @@ impl TestServer {
                 let state = sotto_server::state::AppState {
                     deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
                     telemetry_ingest: false,
+                    cloud_action_enforcement_enabled: false,
+        machine_eligibility_enforcement_enabled: false,
                     pool,
                     oauth: None,
                     oauth_config: None,

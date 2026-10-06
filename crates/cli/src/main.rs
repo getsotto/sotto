@@ -108,6 +108,11 @@ enum Command {
     },
     /// Log out of the sync server (clear the stored session token).
     Logout,
+    /// Show the Cloud server, eligibility and safe next actions without unlocking the vault.
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommand,
+    },
     /// Create a one-time / expiring share link for a secret and print it.
     #[command(
         after_help = "Examples:\n  sotto share DATABASE_URL\n  sotto share DATABASE_URL --views 3\n  sotto share DATABASE_URL --expire 3600"
@@ -115,13 +120,12 @@ enum Command {
     Share {
         /// The secret name to share.
         name: Option<String>,
-        /// How many times the link may be viewed before it burns (1-100).
+        /// How many times the link may be viewed before it burns (1-100; default: 1).
         #[arg(
             long,
-            default_value_t = 1,
             value_parser = clap::value_parser!(i32).range(1..=sotto_cli::remote::share::MAX_VIEWS as i64)
         )]
-        views: i32,
+        views: Option<i32>,
         /// Link lifetime in seconds (1-2592000; default: no expiry).
         #[arg(
             long,
@@ -173,6 +177,9 @@ enum Command {
         stdin: bool,
     },
     /// Print a secret's value. Refuses to print to a terminal without --reveal.
+    #[command(
+        after_help = "Interactive selection:\n  Omitting NAME opens a picker when stdin, stdout, and stderr are terminals, TERM is not dumb, and CI is not active. Scripts must supply NAME. A picker selection is copied to the clipboard automatically unless --no-copy is used. --no-copy does not allow plaintext terminal output; use --reveal to print it. Supplying NAME alone does not copy.\n\nExamples:\n  sotto get\n  sotto get DATABASE_URL --copy\n  sotto get DATABASE_URL --reveal"
+    )]
     Get {
         name: Option<String>,
         /// Allow printing the secret to a terminal.
@@ -240,11 +247,26 @@ enum Command {
         /// Allow writing to a terminal.
         #[arg(long)]
         reveal: bool,
+        /// Download the encrypted Cloud exit bundle instead of rendering plaintext.
+        #[arg(long, value_name = "PATH")]
+        cloud: Option<PathBuf>,
     },
     /// Import secrets from a .env file into the active environment.
+    #[command(after_help = r#"Examples:
+  sotto import .env
+
+Values are imported literally: $OTHER and ${OTHER} are not expanded, and an inline # is part of the value; whole lines beginning with # are comments. Unquoted surrounding whitespace is trimmed, while matching quotes preserve spaces inside the value. Single-quoted values are literal. Double-quoted values decode \n, \r, \t, \\, and \". Physical multiline values are unsupported; use a double-quoted \n escape to store a newline."#)]
     Import {
         /// Path to the .env file.
         file: PathBuf,
+        /// Restore an encrypted Cloud exit bundle instead of importing dotenv values.
+        #[arg(long)]
+        cloud: bool,
+    },
+    /// Manage the metadata of links created by `sotto share` (ciphertext and fragment keys are never listed).
+    Shares {
+        #[command(subcommand)]
+        command: SharesCommand,
     },
     /// Manage environments.
     Env {
@@ -320,9 +342,33 @@ enum TokenCommand {
         expires_in_days: Option<u32>,
     },
     /// List the active environment's machine tokens.
-    Ls,
+    Ls {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Revoke a machine token (its access dies immediately; also run `sotto rotate` to re-key).
     Revoke { token_id: String },
+}
+
+#[derive(Subcommand)]
+enum CloudCommand {
+    /// Show server capability and account eligibility. `--json` is stable for CI diagnostics.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SharesCommand {
+    /// List link metadata without ciphertext or fragment material.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke one of your links by its public token.
+    Revoke { token: String },
 }
 
 #[derive(Subcommand)]
@@ -400,9 +446,11 @@ fn run() -> Result<()> {
     if let Ok(token) = std::env::var("SOTTO_TOKEN") {
         match &cli.command {
             Some(Command::Run { args }) => return machine_run(&token, args.clone()),
-            Some(Command::Export { format, reveal }) => {
-                return machine_export(&token, *format, *reveal)
-            }
+            Some(Command::Export {
+                format,
+                reveal,
+                cloud: None,
+            }) => return machine_export(&token, *format, *reveal),
             _ => {} // every other command proceeds as a normal session
         }
     }
@@ -519,6 +567,9 @@ fn run() -> Result<()> {
             eprintln!("logged out");
             Ok(())
         }
+        Command::Cloud { command } => match command {
+            CloudCommand::Status { json } => cloud_status(&keychain, json),
+        },
         Command::Share {
             name,
             views,
@@ -540,6 +591,29 @@ fn run() -> Result<()> {
                     }
                 },
             };
+            let can_prompt = prompts::can_prompt();
+            let views = match views {
+                Some(views) => views,
+                None if can_prompt => match prompts::prompt_share_views(&theme)? {
+                    Some(views) => views,
+                    None => {
+                        eprintln!("aborted");
+                        return Ok(());
+                    }
+                },
+                None => 1,
+            };
+            let expire = match expire {
+                Some(expire) => Some(expire),
+                None if can_prompt => match prompts::prompt_share_lifetime(&theme)? {
+                    Some(expire) => expire,
+                    None => {
+                        eprintln!("aborted");
+                        return Ok(());
+                    }
+                },
+                None => None,
+            };
             share(
                 &app,
                 &keychain,
@@ -554,6 +628,10 @@ fn run() -> Result<()> {
                 },
             )
         }
+        Command::Shares { command } => match command {
+            SharesCommand::Ls { json } => list_shares(&keychain, json),
+            SharesCommand::Revoke { token } => revoke_share(&keychain, &token),
+        },
         Command::Push => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
             ensure_unlocked(&store, &keychain)?;
@@ -711,15 +789,27 @@ fn run() -> Result<()> {
             ensure_unlocked(&store, &keychain)?;
             run_injected(&app, &config, args)
         }
-        Command::Export { format, reveal } => {
-            let config = effective_config(&cwd, cli.env.as_deref())?;
-            ensure_unlocked(&store, &keychain)?;
-            export_secrets(&app, &config, format, reveal)
+        Command::Export {
+            format,
+            reveal,
+            cloud,
+        } => {
+            if let Some(path) = cloud {
+                cloud_export(&keychain, &path)
+            } else {
+                let config = effective_config(&cwd, cli.env.as_deref())?;
+                ensure_unlocked(&store, &keychain)?;
+                export_secrets(&app, &config, format, reveal)
+            }
         }
-        Command::Import { file } => {
-            let config = effective_config(&cwd, cli.env.as_deref())?;
-            ensure_unlocked(&store, &keychain)?;
-            import_dotenv(&app, &config, &file)
+        Command::Import { file, cloud } => {
+            if cloud {
+                cloud_import(&store, &keychain, &file)
+            } else {
+                let config = effective_config(&cwd, cli.env.as_deref())?;
+                ensure_unlocked(&store, &keychain)?;
+                import_dotenv(&app, &config, &file)
+            }
         }
         Command::Env { command } => match command {
             EnvCommand::Ls { json } => {
@@ -965,17 +1055,25 @@ fn token_command(
             println!("{}", issued.token);
             Ok(())
         }
-        TokenCommand::Ls => {
-            for t in remote::SyncApi::list_machine_tokens(&client, &env.id)? {
+        TokenCommand::Ls { json } => {
+            let tokens = remote::SyncApi::list_machine_tokens(&client, &env.id)?;
+            if json {
+                println!("{}", machine_token_list_json(&tokens)?);
+                return Ok(());
+            }
+            for t in tokens {
                 let expiry = t
                     .expiry_label()
                     .map(|label| format!("  {label}"))
                     .unwrap_or_default();
                 println!(
-                    "{}  {}  {}{expiry}",
+                    "{}  {}  {}  accountable: {}{expiry}",
                     t.token_id,
                     t.name,
-                    t.created_by.as_deref().unwrap_or("(unknown creator)")
+                    t.created_by.as_deref().unwrap_or("(unknown creator)"),
+                    t.beneficiary_id
+                        .as_deref()
+                        .unwrap_or("(ambiguous beneficiary)")
                 );
             }
             Ok(())
@@ -1184,6 +1282,42 @@ fn read_secret_key() -> Result<Vec<u8>> {
         .map_err(|_| Error::Input("invalid Secret Key".into()))
 }
 
+fn cloud_export(keychain: &dyn Keychain, path: &Path) -> Result<()> {
+    let client = sync_client(keychain)?;
+    let bundle = {
+        let _spinner = sotto_cli::feedback::spinner("Downloading encrypted Cloud export...");
+        remote::export::download(&client)?
+    };
+    remote::export::write(&bundle, path)?;
+    eprintln!("wrote encrypted Cloud export to `{}`", path.display());
+    Ok(())
+}
+
+fn cloud_import(store: &Store, keychain: &dyn Keychain, path: &Path) -> Result<()> {
+    if store.get_identity()?.is_some() {
+        return Err(Error::AlreadyInitialized);
+    }
+    let bundle = remote::export::read(path)?;
+    let mut secret_key = read_secret_key()?;
+    let mut password = read_password("Master password: ")?;
+    let result = {
+        let _spinner = sotto_cli::feedback::spinner("Restoring encrypted Cloud export...");
+        remote::export::restore(
+            store,
+            keychain,
+            &bundle,
+            &secret_key,
+            &password,
+            SESSION_TTL,
+        )
+    };
+    secret_key.zeroize();
+    password.zeroize();
+    result?;
+    eprintln!("restored encrypted Cloud export; choose a project and environment locally");
+    Ok(())
+}
+
 /// Build an authenticated sync client from the configured server URL + stored session token.
 fn sync_client(keychain: &dyn Keychain) -> Result<remote::HttpClient> {
     let config_path = sotto_cli::paths::config_path()?;
@@ -1191,6 +1325,130 @@ fn sync_client(keychain: &dyn Keychain) -> Result<remote::HttpClient> {
     let token = remote::auth::current_session(keychain)?
         .ok_or_else(|| Error::Input("not logged in; run `sotto login`".into()))?;
     Ok(remote::HttpClient::new(server, token))
+}
+
+/// Show Cloud capability and eligibility information without unlocking local state or opening a
+/// browser. Missing endpoints are deliberately rendered as an older-server message so the
+/// command remains useful while a self-hosted instance is upgraded.
+fn cloud_status(keychain: &dyn Keychain, json: bool) -> Result<()> {
+    let config_path = sotto_cli::paths::config_path()?;
+    let server = remote::config::server_url(None, &config_path)?;
+    let web_base = remote::config::web_base(&config_path)?;
+    let client = sync_client(keychain)?;
+    let server_info = client.server_info()?;
+    let eligibility = client.eligibility()?;
+    let billing_url = billing_handoff_url(eligibility.as_ref(), &web_base);
+
+    if json {
+        let value = serde_json::json!({
+            "server": server,
+            "billing_url": billing_url,
+            "server_info": server_info,
+            "eligibility": eligibility,
+        });
+        println!("{}", to_json(&value)?);
+        return Ok(());
+    }
+
+    println!("server: {server}");
+    match server_info {
+        Some(info) => {
+            println!("deployment: {}", info.deployment_mode);
+            println!("entitlement model: {}", info.entitlement_model);
+        }
+        None => println!("server capability discovery unavailable (older server)"),
+    }
+    match eligibility {
+        Some(view) => {
+            println!("eligibility model: {}", view.model);
+            println!("eligibility: {}", view.state);
+            println!("billing available: {}", view.billing_available);
+            println!(
+                "actions: setup={} billing={} export={} revoke={}",
+                view.actions.setup, view.actions.billing, view.actions.export, view.actions.revoke
+            );
+            if !view.next_actions.is_empty() {
+                println!("next actions: {}", view.next_actions.join(", "));
+            }
+            if let Some(url) = billing_url {
+                println!("billing url: {url}");
+            }
+            if let Some(epoch) = view.paid_through_epoch {
+                println!("paid through: {epoch}");
+            }
+            if let Some(epoch) = view.recovery_until_epoch {
+                println!("recovery until: {epoch}");
+            }
+            if let Some(epoch) = view.export_until_epoch {
+                println!("export until: {epoch}");
+            }
+        }
+        None => println!("account eligibility unavailable (older server)"),
+    }
+    Ok(())
+}
+
+fn billing_handoff_url(
+    eligibility: Option<&remote::api::EligibilityView>,
+    web_base: &str,
+) -> Option<String> {
+    if !eligibility.is_some_and(|view| view.billing_available) {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(web_base).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return None;
+    }
+    Some(format!("{}/cloud", web_base.trim_end_matches('/')))
+}
+
+fn list_shares(keychain: &dyn Keychain, json: bool) -> Result<()> {
+    let client = sync_client(keychain)?;
+    let list = remote::SyncApi::list_shares(&client)?;
+    if json {
+        println!("{}", to_json(&list)?);
+        return Ok(());
+    }
+
+    println!("active free links: {}", list.active_free_count);
+    if list.links.is_empty() {
+        println!("no share links");
+        return Ok(());
+    }
+    for link in list.links {
+        let expiry = link
+            .expires_at
+            .as_deref()
+            .map(|value| format!("expires {value}"))
+            .unwrap_or_else(|| "no expiry".into());
+        let revoked = link
+            .revoked_at
+            .as_deref()
+            .map(|value| format!(", revoked {value}"))
+            .unwrap_or_default();
+        println!(
+            "{}  class={}  views={}/{}  {expiry}{revoked}",
+            link.token, link.share_class, link.view_count, link.max_views
+        );
+    }
+    Ok(())
+}
+
+fn revoke_share(keychain: &dyn Keychain, token: &str) -> Result<()> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(Error::Input("share token must not be empty".into()));
+    }
+    let client = sync_client(keychain)?;
+    remote::SyncApi::revoke_share(&client, token)?;
+    eprintln!("revoked share {token}");
+    Ok(())
 }
 
 /// Log in to the sync server via the loopback OAuth flow, then persist the session + server URL.
@@ -1564,6 +1822,12 @@ fn env_use(
     name: Option<String>,
     theme: &sotto_cli::theme::Theme,
 ) -> Result<()> {
+    if name.is_none() && !prompts::can_prompt() {
+        return Err(Error::MissingArgument(
+            "missing required argument <NAME>; provide an environment name or run in an interactive terminal".into(),
+        ));
+    }
+
     let (mut config, dir) = Config::discover(cwd)?;
     let name = match name {
         Some(name) => name,
@@ -1619,6 +1883,42 @@ fn env_list_json(environments: &[String], active: &str) -> Result<String> {
     let value: Vec<_> = environments
         .iter()
         .map(|name| serde_json::json!({ "name": name, "active": name == active }))
+        .collect();
+    to_json(&value)
+}
+
+/// Stable machine-readable shape for `sotto token ls --json`.
+///
+/// Returns a JSON array of one object per token, in the order the server listed them. Stdout
+/// contains JSON only; diagnostics stay on stderr. No token is emitted for an empty listing.
+///
+/// ```text
+/// [{"token_id":"token-1","name":"ci","created_by":"user-1","beneficiary_id":"user-1",
+///   "beneficiary_status":"verified","expires_at":"2026-01-01T00:00:00Z","expires_in_days":14}]
+/// ```
+///
+/// `created_by`, `beneficiary_id` and `beneficiary_status` are `null` when the server does not
+/// know them.
+///
+/// `expires_at` is an RFC 3339 UTC timestamp or `null`, and `expires_in_days` is the whole days
+/// until then, rounded down, or `null`. Both are `null` together against a server that predates
+/// token expiry, whose tokens never expire. Both are passed through exactly as the server sent
+/// them: days come from the server's clock and are never recomputed locally, and `0` means the
+/// token expires today rather than an unknown expiry.
+fn machine_token_list_json(tokens: &[remote::api::MachineTokenInfo]) -> Result<String> {
+    let value: Vec<_> = tokens
+        .iter()
+        .map(|token| {
+            serde_json::json!({
+                "token_id": token.token_id,
+                "name": token.name,
+                "created_by": token.created_by,
+                "beneficiary_id": token.beneficiary_id,
+                "beneficiary_status": token.beneficiary_status,
+                "expires_at": token.expires_at,
+                "expires_in_days": token.expires_in_days,
+            })
+        })
         .collect();
     to_json(&value)
 }
@@ -1887,14 +2187,16 @@ mod tests {
     use sotto_cli::commands::App;
     use sotto_cli::config::Config;
     use sotto_cli::keychain::MemoryKeychain;
+    use sotto_cli::remote::api::MachineTokenInfo;
     use sotto_cli::session;
     use sotto_cli::store::Store;
     use sotto_cli::vault::Vault;
     use std::time::Duration;
 
     use super::{
-        display_secret, env_list_json, history_line, import_dotenv, login_config, set_confirmation,
-        Cli, Command, EnvCommand, ThemeCommand, TokenCommand,
+        display_secret, env_list_json, history_line, import_dotenv, login_config,
+        machine_token_list_json, set_confirmation, Cli, CloudCommand, Command, EnvCommand,
+        SharesCommand, ThemeCommand, TokenCommand,
     };
 
     #[test]
@@ -1942,6 +2244,28 @@ mod tests {
         assert!(help.contains("sotto run --env staging -- npm test"));
         assert!(help.contains("sotto run -- python -c \"print('hello')\""));
         assert!(help.contains("Sotto options go before --"));
+    }
+
+    #[test]
+    fn import_help_explains_literal_and_quoted_values() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("import")
+            .expect("import subcommand should exist")
+            .render_long_help()
+            .to_string();
+
+        for expected in [
+            "sotto import .env",
+            "$OTHER",
+            "${OTHER}",
+            "inline # is part of the value",
+            "Single-quoted values are literal",
+            "Physical multiline values are unsupported",
+            "Double-quoted values decode",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
     }
 
     #[test]
@@ -2151,6 +2475,29 @@ mod tests {
     }
 
     #[test]
+    fn get_help_explains_interactive_selection_and_copying() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let get = command
+            .find_subcommand_mut("get")
+            .expect("get subcommand should exist");
+        let help = get.render_long_help().to_string();
+
+        for expected in [
+            "Omitting NAME opens a picker",
+            "Scripts must supply NAME",
+            "copied to the clipboard automatically unless --no-copy is used",
+            "--no-copy does not allow plaintext terminal output",
+            "Supplying NAME alone does not copy",
+            "sotto get DATABASE_URL --copy",
+            "sotto get DATABASE_URL --reveal",
+        ] {
+            assert!(help.contains(expected), "missing get help text: {expected}");
+        }
+    }
+
+    #[test]
     fn copy_flags_parse_for_get_and_share() {
         let cli = Cli::try_parse_from(["sotto", "get", "KEY", "-c"]).unwrap();
         assert!(matches!(
@@ -2188,7 +2535,7 @@ mod tests {
             let value = views.to_string();
             let cli = Cli::try_parse_from(["sotto", "share", "KEY", "--views", &value]).unwrap();
             assert!(
-                matches!(cli.command, Some(Command::Share { views: parsed, .. }) if parsed == views)
+                matches!(cli.command, Some(Command::Share { views: Some(parsed), .. }) if parsed == views)
             );
         }
         for expire in [1, sotto_cli::remote::share::MAX_TTL_SECONDS] {
@@ -2214,7 +2561,7 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Share {
-                views: 1,
+                views: None,
                 expire: None,
                 ..
             })
@@ -2365,6 +2712,154 @@ mod tests {
             panic!("expected EnvCommand::Ls");
         };
         assert!(!json);
+    }
+
+    #[test]
+    fn token_ls_json_parser_parses_flag() {
+        let cli = Cli::try_parse_from(["sotto", "token", "ls", "--json"])
+            .expect("sotto token ls --json should parse");
+        let Some(Command::Token {
+            command: TokenCommand::Ls { json },
+        }) = cli.command
+        else {
+            panic!("expected TokenCommand::Ls");
+        };
+        assert!(json);
+    }
+
+    #[test]
+    fn cloud_and_share_management_commands_parse_without_local_setup() {
+        let cli = Cli::try_parse_from(["sotto", "cloud", "status", "--json"])
+            .expect("sotto cloud status --json should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Cloud {
+                command: CloudCommand::Status { json: true }
+            })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["sotto", "shares", "ls"]).expect("sotto shares ls should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Shares {
+                command: SharesCommand::Ls { json: false }
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "shares", "revoke", "share-token"])
+            .expect("sotto shares revoke should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Shares {
+                command: SharesCommand::Revoke { token }
+            }) if token == "share-token"
+        ));
+    }
+
+    #[test]
+    fn billing_handoff_is_available_for_existing_cloud_billing_accounts() {
+        let view = sotto_cli::remote::api::EligibilityView {
+            model: "person_eligibility_v1".into(),
+            state: "paid".into(),
+            deployment_mode: "cloud".into(),
+            account_initialized: true,
+            billing_available: true,
+            paid_through_epoch: Some(1),
+            recovery_until_epoch: None,
+            export_until_epoch: None,
+            actions: sotto_cli::remote::api::EligibilityActions {
+                setup: false,
+                billing: false,
+                export: false,
+                revoke: true,
+            },
+            next_actions: vec!["revoke".into()],
+            payer: Some("personal".into()),
+        };
+        assert_eq!(
+            super::billing_handoff_url(Some(&view), "https://app.example"),
+            Some("https://app.example/cloud".into())
+        );
+        assert_eq!(
+            super::billing_handoff_url(Some(&view), "javascript:alert(1)"),
+            None
+        );
+        assert_eq!(
+            super::billing_handoff_url(
+                Some(&view),
+                "https://app.example/?redirect=https%3A%2F%2Fevil.example"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn token_ls_json_preserves_metadata_and_null_creator() {
+        let tokens = vec![
+            MachineTokenInfo {
+                token_id: "token-1".into(),
+                name: "nightly \"build\" 🚀".into(),
+                public_key: "unused".into(),
+                created_by: Some("user-1".into()),
+                beneficiary_id: Some("user-1".into()),
+                beneficiary_status: Some("verified".into()),
+                expires_at: Some("2026-01-01T00:00:00Z".into()),
+                expires_in_days: Some(14),
+            },
+            MachineTokenInfo {
+                token_id: "token-2".into(),
+                name: "backup".into(),
+                public_key: "unused".into(),
+                created_by: None,
+                beneficiary_id: None,
+                beneficiary_status: Some("ambiguous".into()),
+                expires_at: None,
+                expires_in_days: None,
+            },
+            MachineTokenInfo {
+                token_id: "token-3".into(),
+                name: "expiring today".into(),
+                public_key: "unused".into(),
+                created_by: Some("user-2".into()),
+                beneficiary_id: Some("user-2".into()),
+                beneficiary_status: Some("verified".into()),
+                expires_at: Some("2026-01-01T00:00:00Z".into()),
+                expires_in_days: Some(0),
+            },
+        ];
+        let value: serde_json::Value =
+            serde_json::from_str(&machine_token_list_json(&tokens).unwrap()).unwrap();
+        assert_eq!(value[0]["name"], "nightly \"build\" 🚀");
+        assert_eq!(value[0]["created_by"], "user-1");
+        assert_eq!(value[0]["beneficiary_id"], "user-1");
+        assert_eq!(value[0]["beneficiary_status"], "verified");
+        assert!(value[1]["created_by"].is_null());
+        assert!(value[1]["beneficiary_id"].is_null());
+        assert_eq!(value[1]["beneficiary_status"], "ambiguous");
+        assert_eq!(machine_token_list_json(&[]).unwrap(), "[]");
+        let first = value[0].as_object().unwrap();
+        assert_eq!(
+            first.get("expires_at"),
+            Some(&serde_json::Value::String("2026-01-01T00:00:00Z".into()))
+        );
+        assert_eq!(
+            first.get("expires_in_days"),
+            Some(&serde_json::Value::from(14))
+        );
+
+        let second = value[1].as_object().unwrap();
+        assert_eq!(second.get("expires_at"), Some(&serde_json::Value::Null));
+        assert_eq!(
+            second.get("expires_in_days"),
+            Some(&serde_json::Value::Null)
+        );
+
+        let third = value[2].as_object().unwrap();
+        assert_eq!(
+            third.get("expires_in_days"),
+            Some(&serde_json::Value::from(0))
+        );
     }
 
     #[test]

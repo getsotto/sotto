@@ -321,9 +321,15 @@ async fn snapshot(pool: &PgPool, query: &str) -> Vec<Value> {
 
 async fn coverage_snapshot(pool: &PgPool) -> Vec<Vec<Value>> {
     let queries = [
-        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_coordinators ORDER BY beneficiary_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT beneficiary_id, source_set_generation, \
+         collection_epoch, current_attempt_id FROM cloud_coverage_coordinators \
+         ORDER BY beneficiary_id) t",
         "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_sources ORDER BY source_id) t",
-        "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_collection_attempts ORDER BY beneficiary_id, attempt_id) t",
+        "SELECT to_jsonb(t) AS value FROM (SELECT attempt_id, beneficiary_id, collection_epoch, \
+         source_set_generation, expected_projection_revision, source_bindings, status, \
+         aggregate_evidence_reference, canonical_result, projection_revision, created_at, \
+         completed_at FROM cloud_coverage_collection_attempts \
+         ORDER BY beneficiary_id, attempt_id) t",
         "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_revisions ORDER BY beneficiary_id, revision) t",
         "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_revision_facts ORDER BY beneficiary_id, revision, coverage_id) t",
         "SELECT to_jsonb(t) AS value FROM (SELECT * FROM cloud_coverage_heads ORDER BY beneficiary_id) t",
@@ -359,11 +365,12 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
     assert_eq!(coverage_snapshot(&database.pool).await, before);
 
     let mut tx = database.pool.begin().await.expect("begin pending load");
-    let pending = begin_collection(&mut tx, &first, "legacy-pending-a")
-        .await
-        .expect("load legacy pending attempt");
-    tx.commit().await.expect("commit pending load");
-    assert_eq!(pending.status, CollectionStatus::Pending);
+    let pending = begin_collection(&mut tx, &first, "legacy-pending-a").await;
+    tx.rollback().await.expect("rollback legacy pending load");
+    assert!(matches!(
+        pending,
+        Err(ReconciliationError::CollectionConflict)
+    ));
 
     let observation = SourceObservation::Complete {
         source_id: first_binding.source_id.clone(),
@@ -376,11 +383,25 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
             failed_renewal_id: None,
         }],
     };
-    let mut tx = database.pool.begin().await.expect("begin pending finish");
-    finish_collection(&mut tx, &pending, "new-aggregate-evidence", &[observation])
+    let mut tx = database
+        .pool
+        .begin()
         .await
-        .expect("finish upgraded pending attempt");
-    tx.commit().await.expect("commit pending finish");
+        .expect("begin fresh pending collection");
+    let fresh = begin_collection(&mut tx, &first, "fresh-pending-a")
+        .await
+        .expect("begin fresh pending collection");
+    tx.commit().await.expect("commit fresh pending collection");
+    assert_eq!(fresh.provider_invalidation_generation, Some(0));
+    let mut tx = database
+        .pool
+        .begin()
+        .await
+        .expect("begin fresh pending finish");
+    finish_collection(&mut tx, &fresh, "new-aggregate-evidence", &[observation])
+        .await
+        .expect("finish fresh pending attempt");
+    tx.commit().await.expect("commit fresh pending finish");
 
     let mut tx = database.pool.begin().await.expect("begin superseded load");
     let superseded = begin_collection(&mut tx, &first, "legacy-superseded-a")
@@ -588,29 +609,36 @@ async fn populated_0024_upgrade_preserves_coverage_and_scopes_attempt_identity()
     old.run(&legacy_only.pool)
         .await
         .expect("apply legacy migrations for identity check");
-    let (legacy_first, legacy_second, _, _) = seed_legacy_database(&legacy_only.pool).await;
-    let mut tx = legacy_only
-        .pool
-        .begin()
-        .await
-        .expect("begin legacy first identity");
-    begin_collection(&mut tx, &legacy_first, "same-textual-id")
-        .await
-        .expect("legacy first identity operation");
-    tx.commit().await.expect("commit legacy first identity");
-    let mut tx = legacy_only
-        .pool
-        .begin()
-        .await
-        .expect("begin legacy second identity");
-    let duplicate = begin_collection(&mut tx, &legacy_second, "same-textual-id").await;
+    let (legacy_first, legacy_second, legacy_first_binding, legacy_second_binding) =
+        seed_legacy_database(&legacy_only.pool).await;
+    let first_json = serde_json::to_string(&[&legacy_first_binding]).expect("encode first binding");
+    sqlx::query(
+        "INSERT INTO cloud_coverage_collection_attempts \
+         (attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
+          expected_projection_revision, source_bindings, status) \
+         VALUES ('same-textual-id', $1, 99, 1, 2, $2::jsonb, 'pending')",
+    )
+    .bind(&legacy_first)
+    .bind(&first_json)
+    .execute(&legacy_only.pool)
+    .await
+    .expect("legacy first identity operation");
+    let second_json =
+        serde_json::to_string(&[&legacy_second_binding]).expect("encode second binding");
+    let duplicate = sqlx::query(
+        "INSERT INTO cloud_coverage_collection_attempts \
+         (attempt_id, beneficiary_id, collection_epoch, source_set_generation, \
+          expected_projection_revision, source_bindings, status) \
+         VALUES ('same-textual-id', $1, 99, 1, 2, $2::jsonb, 'pending')",
+    )
+    .bind(&legacy_second)
+    .bind(&second_json)
+    .execute(&legacy_only.pool)
+    .await;
     assert!(
         duplicate.is_err(),
         "pre migration schema must reject a cross beneficiary textual attempt id"
     );
-    tx.rollback()
-        .await
-        .expect("rollback legacy duplicate identity");
     legacy_only.cleanup().await;
 
     let fresh = DisposableDatabase::create()
@@ -722,5 +750,86 @@ async fn migration_0028_preserves_legacy_provider_replay() {
         replay.outcome,
         sotto_server::cloud_provider::ApplyDisposition::AlreadyApplied
     );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn migration_0038_allows_named_allocations_to_share_a_provider_item() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    db::migrate(&database.pool)
+        .await
+        .expect("apply current migrations");
+
+    for beneficiary in ["sponsored-beneficiary-a", "sponsored-beneficiary-b"] {
+        sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'sponsored-migration', $1)",
+        )
+        .bind(beneficiary)
+        .execute(&database.pool)
+        .await
+        .expect("insert sponsored beneficiary");
+    }
+    for (source, beneficiary, reference) in [
+        (
+            "sponsored-source-a",
+            "sponsored-beneficiary-a",
+            "sponsored-reference-a",
+        ),
+        (
+            "sponsored-source-b",
+            "sponsored-beneficiary-b",
+            "sponsored-reference-b",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO cloud_coverage_sources (source_id, beneficiary_id, provider_namespace, external_allocation_reference, ownership_evidence_reference, registration_operation_id, registration_source_set_generation) VALUES ($1, $2, 'stripe', $3, 'sponsored-ownership', $1, 1)",
+        )
+        .bind(source)
+        .bind(beneficiary)
+        .bind(reference)
+        .execute(&database.pool)
+        .await
+        .expect("insert sponsored source");
+    }
+    sqlx::query(
+        "INSERT INTO cloud_provider_payers (payer_id, provider_namespace, provider_account_id, provider_environment, provider_customer_id, payer_kind) VALUES ('sponsored-payer', 'stripe', 'acct_sponsored', 'test', 'cus_sponsored', 'sponsor')",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("insert sponsored payer");
+    for (allocation, beneficiary, source, reference) in [
+        (
+            "sponsored-allocation-a",
+            "sponsored-beneficiary-a",
+            "sponsored-source-a",
+            "sponsored-reference-a",
+        ),
+        (
+            "sponsored-allocation-b",
+            "sponsored-beneficiary-b",
+            "sponsored-source-b",
+            "sponsored-reference-b",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO cloud_provider_allocations (allocation_id, payer_id, payer_kind, beneficiary_id, provider_namespace, provider_account_id, provider_environment, provider_subscription_id, provider_item_id, external_allocation_reference, coverage_source_id, effective_from, state, ownership_evidence_reference) VALUES ($1, 'sponsored-payer', 'sponsor', $2, 'stripe', 'acct_sponsored', 'test', 'sub_sponsored', 'si_grouped', $3, $4, 0, 'active', 'sponsored-ownership')",
+        )
+        .bind(allocation)
+        .bind(beneficiary)
+        .bind(reference)
+        .bind(source)
+        .execute(&database.pool)
+        .await
+        .expect("insert shared provider item allocation");
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_allocations WHERE provider_subscription_id = 'sub_sponsored' AND provider_item_id = 'si_grouped'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .expect("count shared provider item allocations");
+    assert_eq!(count, 2);
     database.cleanup().await;
 }
