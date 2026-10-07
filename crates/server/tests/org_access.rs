@@ -39,6 +39,7 @@ fn app(pool: PgPool) -> Router {
                 webhook_secret: "whsec_test".into(),
                 price_id: "price_test".into(),
                 price_catalogue: None,
+                cloud_sales_enabled: false,
                 return_url: "https://app.sotto.test".into(),
             },
         )),

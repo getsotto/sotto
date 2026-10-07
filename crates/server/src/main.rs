@@ -94,8 +94,9 @@ async fn run() -> Result<()> {
     };
 
     println!("deployment mode: {}", config.deployment_mode.as_str());
+    println!("cloud sales: {}", config.cloud_sales_enabled);
     println!(
-        "provider refresh: ingest={}, worker={}, reconciliation={}",
+        "provider refresh configuration (runtime wiring pending): ingest={}, worker={}, reconciliation={}",
         config.provider_refresh_ingest_enabled,
         config.provider_refresh_worker_enabled,
         config.provider_refresh_reconciliation_enabled
@@ -107,6 +108,18 @@ async fn run() -> Result<()> {
     println!(
         "machine eligibility enforcement: {}",
         config.machine_eligibility_enforcement_enabled
+    );
+    println!(
+        "sponsored billing event handling: {}",
+        std::env::var("SOTTO_SPONSORED_BILLING_ENABLED").as_deref() == Ok("1")
+    );
+    println!(
+        "billing corrections: {}",
+        std::env::var("SOTTO_BILLING_CORRECTIONS_ENABLED").as_deref() == Ok("1")
+    );
+    println!(
+        "organisation deletion routes and worker: {}",
+        config.organisation_deletion_worker_enabled
     );
 
     // Default-on telemetry must never be a surprise: say so at boot, with the off switch.

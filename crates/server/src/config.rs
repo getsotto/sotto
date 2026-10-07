@@ -63,6 +63,7 @@ const PROVIDER_REFRESH_WORKER_ENV: &str = "SOTTO_PROVIDER_REFRESH_WORKER_ENABLED
 const PROVIDER_REFRESH_RECONCILIATION_ENV: &str = "SOTTO_PROVIDER_REFRESH_RECONCILIATION_ENABLED";
 const CLOUD_ACTION_ENFORCEMENT_ENV: &str = "SOTTO_CLOUD_ACTION_ENFORCEMENT";
 const MACHINE_ELIGIBILITY_ENFORCEMENT_ENV: &str = "SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT";
+const CLOUD_SALES_ENV: &str = "SOTTO_CLOUD_SALES_ENABLED";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -96,6 +97,9 @@ pub struct Config {
     pub cloud_action_enforcement_enabled: bool,
     /// Whether hosted machine retrieval and creation apply the accountable beneficiary policy.
     pub machine_eligibility_enforcement_enabled: bool,
+    /// Whether new hosted subscriptions may be quoted or purchased. Existing billing management
+    /// and verified webhooks stay available when this is off.
+    pub cloud_sales_enabled: bool,
 }
 
 /// Anonymous version-ping telemetry settings (see [`crate::telemetry`]).
@@ -111,7 +115,7 @@ pub struct TelemetryConfig {
     pub ingest_enabled: bool,
 }
 
-/// Stripe billing credentials, the legacy organisation price, and the optional hosted catalogue.
+/// Stripe billing credentials, legacy organisation price, and optional hosted catalogue.
 ///
 /// The ids come from the Stripe dashboard; amounts and recurrence are validated separately so
 /// pricing remains an operational decision without allowing arbitrary client-selected prices.
@@ -124,9 +128,11 @@ pub struct BillingConfig {
     pub webhook_secret: String,
     /// The legacy Price id (`price_…`) of the flat per-org monthly Team subscription.
     pub price_id: String,
-    /// The optional server-owned four-offer catalogue. Legacy organisation billing remains
-    /// available when these are absent; a partial catalogue is rejected at boot.
+    /// The optional server-owned four-offer catalogue. Partial configuration is rejected at
+    /// boot, and new hosted sales require all four prices plus the explicit sales switch.
     pub price_catalogue: Option<BillingPriceIds>,
+    /// Explicit purchase gate. Management, cancellation, refunds, and webhooks do not use it.
+    pub cloud_sales_enabled: bool,
     /// Where Stripe-hosted pages send the browser back to (the web app origin).
     pub return_url: String,
 }
@@ -176,6 +182,8 @@ impl Config {
             .map_err(|_| Error::Config("DATABASE_URL is not set".into()))?;
         let bind_addr = std::env::var("SOTTO_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
         let deployment_mode = DeploymentMode::from_env_result(std::env::var(DeploymentMode::ENV))?;
+        let cloud_sales_enabled =
+            feature_flag_is_enabled(std::env::var(CLOUD_SALES_ENV).ok().as_deref());
         let stripe_variables_present = [
             "STRIPE_API_KEY",
             "STRIPE_WEBHOOK_SECRET",
@@ -224,6 +232,7 @@ impl Config {
                     webhook_secret,
                     price_id,
                     price_catalogue: billing_price_catalogue,
+                    cloud_sales_enabled,
                     return_url: billing_return_url(&public_base_url, web_origin.as_deref()),
                 }),
                 _ => None,
@@ -240,6 +249,12 @@ impl Config {
                     .into(),
             ));
         }
+        validate_cloud_sales_configuration(
+            cloud_sales_enabled,
+            deployment_mode,
+            billing.is_some(),
+            hosted_catalogue_configured,
+        )?;
 
         let telemetry = TelemetryConfig {
             ping_enabled: telemetry_ping_enabled(
@@ -291,6 +306,7 @@ impl Config {
             provider_refresh_reconciliation_enabled,
             cloud_action_enforcement_enabled,
             machine_eligibility_enforcement_enabled,
+            cloud_sales_enabled,
         })
     }
 }
@@ -310,6 +326,24 @@ fn validate_deployment_billing_boundary(
         return Err(Error::Config(
             "Stripe configuration requires SOTTO_DEPLOYMENT_MODE=cloud".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_cloud_sales_configuration(
+    enabled: bool,
+    deployment_mode: DeploymentMode,
+    billing_configured: bool,
+    hosted_catalogue_configured: bool,
+) -> Result<()> {
+    if enabled
+        && (deployment_mode != DeploymentMode::Cloud
+            || !billing_configured
+            || !hosted_catalogue_configured)
+    {
+        return Err(Error::Config(format!(
+            "{CLOUD_SALES_ENV}=1 requires SOTTO_DEPLOYMENT_MODE=cloud, complete Stripe credentials, and all four hosted price ids"
+        )));
     }
     Ok(())
 }
@@ -437,7 +471,7 @@ mod tests {
         billing_price_catalogue_from_values, billing_return_url, feature_flag_is_enabled,
         organisation_deletion_retention_from_env_result, organisation_deletion_worker_is_enabled,
         parse_organisation_deletion_retention_days, telemetry_ping_enabled,
-        validate_deployment_billing_boundary, DeploymentMode,
+        validate_cloud_sales_configuration, validate_deployment_billing_boundary, DeploymentMode,
         DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
     };
 
@@ -477,6 +511,30 @@ mod tests {
         assert!(validate_deployment_billing_boundary(DeploymentMode::SelfHosted, true).is_err());
         assert!(validate_deployment_billing_boundary(DeploymentMode::SelfHosted, false).is_ok());
         assert!(validate_deployment_billing_boundary(DeploymentMode::Cloud, true).is_ok());
+    }
+
+    #[test]
+    fn cloud_sales_requires_cloud_billing_and_all_hosted_prices() {
+        assert!(validate_cloud_sales_configuration(
+            false,
+            DeploymentMode::SelfHosted,
+            false,
+            false,
+        )
+        .is_ok());
+        assert!(
+            validate_cloud_sales_configuration(true, DeploymentMode::SelfHosted, true, true,)
+                .is_err()
+        );
+        assert!(
+            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, false, true,).is_err()
+        );
+        assert!(
+            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, false,).is_err()
+        );
+        assert!(
+            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, true,).is_ok()
+        );
     }
 
     #[test]

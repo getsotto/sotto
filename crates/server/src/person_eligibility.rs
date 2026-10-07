@@ -231,10 +231,9 @@ pub(crate) async fn load_view(state: &AppState, user_id: &str) -> Result<Eligibi
 
     Ok(evaluate_input(&EligibilityInput {
         deployment_mode: state.deployment_mode,
-        billing_available: state
-            .billing
-            .as_ref()
-            .is_some_and(|billing| billing.price_catalogue().is_some()),
+        billing_available: state.billing.as_ref().is_some_and(|billing| {
+            billing.cloud_sales_enabled() && billing.price_catalogue().is_some()
+        }),
         account_initialized,
         personal_billing_state: personal.as_ref().map(|account| account.state),
         coverage,

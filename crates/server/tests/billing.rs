@@ -49,6 +49,7 @@ fn app(pool: PgPool, configured: bool) -> Router {
                 webhook_secret: WEBHOOK_SECRET.into(),
                 price_id: "price_test".into(),
                 price_catalogue: None,
+                cloud_sales_enabled: true,
                 return_url: "https://app.sotto.test".into(),
             })
         }),
@@ -116,10 +117,11 @@ fn app_with_provider(pool: PgPool, provider: Arc<dyn SubscriptionProvider>) -> R
         pool,
         oauth: None,
         oauth_config: None,
-        billing: Some(BillingState::with_provider(
+        billing: Some(BillingState::with_provider_and_cloud_sales(
             provider,
             WEBHOOK_SECRET.into(),
             "https://app.sotto.test".into(),
+            true,
         )),
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
