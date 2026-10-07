@@ -31,6 +31,7 @@ backlog/
 
 # Operator-only Cloud procedures stay in the local deployment checkout, not the public repo.
 deploy/CLOUD-OPERATIONS-RUNBOOK.md
+deploy/cloud-launch-evidence/
 
 # Python bytecode. CONTRIBUTING.md runs the script tests with -B so none is written; this is
 # for the times a bare python3 invocation makes some anyway.

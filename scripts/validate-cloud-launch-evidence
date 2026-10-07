@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Check a Cloud launch evidence index and write a sanitised summary.
+
+Completeness is not launch authorisation. The source record should remain in a private operator
+location; the output contains only fixed labels, results, counts, and fingerprints.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+from cloud_launch_evidence import (
+    PINNED_API_VERSION,
+    REQUIRED_CHECKS,
+    REQUIRED_DECISIONS,
+    REQUIRED_REQUIREMENTS,
+    SCHEMA,
+    validate,
+)
+
+
+def _write_json_atomically(path: str | Path, value: dict) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=destination.parent, prefix=f".{destination.name}.", delete=False
+        ) as stream:
+            temporary_path = Path(stream.name)
+            json.dump(value, stream, indent=2)
+            stream.write("\n")
+        os.replace(temporary_path, destination)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _template() -> dict:
+    app_sha = "replace-with-full-tested-commit-sha"
+    digest = "replace-with-64-character-artifact-sha256"
+    return {
+        "schema": SCHEMA,
+        "app_sha": app_sha,
+        "stripe_api_version": PINNED_API_VERSION,
+        "captured_at": datetime.now().astimezone().isoformat(),
+        "requirements": [
+            {"id": item, "result": "not_run", "tested_sha": app_sha, "evidence_sha256": digest}
+            for item in REQUIRED_REQUIREMENTS
+        ],
+        "decisions": [
+            {"id": item, "state": "unresolved", "record_sha256": digest}
+            for item in REQUIRED_DECISIONS
+        ],
+        "checks": [
+            {"check": item, "result": "not_run", "tested_sha": app_sha, "artifact_sha256": digest}
+            for item in REQUIRED_CHECKS
+        ],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", nargs="?", help="private Cloud launch evidence JSON")
+    parser.add_argument("--output", help="path for the sanitised evidence summary")
+    parser.add_argument("--template", help="write a not-run template at this path")
+    args = parser.parse_args(argv)
+    if args.template and (args.input or args.output):
+        parser.error("--template cannot be combined with an input or --output")
+    if args.template:
+        try:
+            _write_json_atomically(args.template, _template())
+        except OSError as error:
+            print(f"could not write Cloud launch template: {error}", file=sys.stderr)
+            return 1
+        print(f"wrote not-run Cloud launch template: {args.template}")
+        return 0
+    if not args.input or not args.output:
+        parser.error("input and --output are required unless --template is used")
+    try:
+        report, failures = validate(args.input)
+        _write_json_atomically(args.output, report)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        print(f"Cloud launch evidence check failed: {error}", file=sys.stderr)
+        return 1
+
+    if failures:
+        print("Cloud launch evidence is incomplete: " + ", ".join(failures), file=sys.stderr)
+        return 1
+    print("Cloud launch evidence index is complete; this is not launch authorisation")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
