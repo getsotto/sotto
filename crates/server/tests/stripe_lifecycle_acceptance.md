@@ -34,7 +34,7 @@ Every row must be observed on the same application commit and pinned API version
 | `human_export_and_restore` | A human export contains encrypted material, restores in a clean database, and excludes environments never granted to the person. |
 | `retention_scope_and_restore` | A scoped retention run deletes only the named resources; the tombstone sidecar replays into a restored dump without resurrecting them. |
 
-The first eight rows use the personal account surface. The next five use the organisation seat
+The first nine rows use the personal account surface. The next four use the organisation seat
 surface. The final four exercise the lifecycle controls and restore tools. Record provider
 identifiers while the run is private; the acceptance report below fingerprints them before it is
 shared.
