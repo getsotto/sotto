@@ -79,6 +79,17 @@ class LifecycleEvidence(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "api_version"):
             validator.validate(self.write(value))
 
+    def test_template_contains_every_case_and_cannot_pass_as_is(self):
+        destination = self.output()
+        self.assertEqual(validator.main(["--template", destination]), 0)
+        value = json.loads(Path(destination).read_text(encoding="utf-8"))
+        self.assertEqual(
+            [row["scenario"] for row in value["scenarios"]],
+            list(validator.REQUIRED_SCENARIOS),
+        )
+        with self.assertRaisesRegex(ValueError, "commit SHA"):
+            validator.validate(self.write(value))
+
     def test_provider_ids_are_not_emitted(self):
         value = evidence()
         value["scenarios"][0]["provider_ids"] = ["sub_secret_123"]

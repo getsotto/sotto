@@ -127,9 +127,33 @@ def validate(path: str) -> tuple[dict, list[str]]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", help="operator-produced lifecycle evidence JSON")
-    parser.add_argument("--output", required=True, help="path for the sanitised acceptance report")
+    parser.add_argument("input", nargs="?", help="operator-produced lifecycle evidence JSON")
+    parser.add_argument("--output", help="path for the sanitised acceptance report")
+    parser.add_argument("--template", help="write a not-run manifest template at this path")
     args = parser.parse_args(argv)
+    if args.template:
+        template = {
+            "schema": SCHEMA,
+            "app_sha": "replace-with-the-tested-commit-sha",
+            "api_version": PINNED_API_VERSION,
+            "sandbox_account_id": "replace-with-the-test-account-id",
+            "captured_at": datetime.now().astimezone().isoformat(),
+            "scenarios": [
+                {"scenario": scenario, "result": "not_run", "checks": ["replace with observed checks"], "provider_ids": []}
+                for scenario in REQUIRED_SCENARIOS
+            ],
+        }
+        try:
+            destination = Path(args.template)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(json.dumps(template, indent=2) + "\n", encoding="utf-8")
+        except OSError as error:
+            print(f"could not write lifecycle template: {error}", file=sys.stderr)
+            return 1
+        print(f"wrote not-run lifecycle template: {destination}")
+        return 0
+    if not args.input or not args.output:
+        parser.error("input and --output are required unless --template is used")
     try:
         report, failures = validate(args.input)
         output = Path(args.output)
