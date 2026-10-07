@@ -52,6 +52,18 @@ curl -fsS https://<your-domain>/server/info
 The response is safe to expose publicly and reports the deployment mode plus the current
 entitlement model. Stripe configuration must be paired with `cloud`; the mode remains an explicit operator setting.
 
+New hosted purchases have a separate default-off switch, `SOTTO_CLOUD_SALES_ENABLED=0`. Turning it
+off pauses new quotes and checkout sessions while existing billing portals, cancellation, refund
+handling, and verified webhook settlement remain available. Enabling it requires Cloud mode, all
+Stripe credentials, and the complete four-price hosted catalogue. It does not authorise a launch
+by itself. Operator procedures and deployment controls are maintained separately from the public
+deployment guide.
+
+Hosted catalogue variables are `STRIPE_STANDARD_MONTHLY_PRICE_ID`,
+`STRIPE_STANDARD_ANNUAL_PRICE_ID`, `STRIPE_FOUNDING_MONTHLY_PRICE_ID`, and
+`STRIPE_FOUNDING_ANNUAL_PRICE_ID`. Compose passes them separately from the legacy
+`STRIPE_PRICE_ID`. The catalogue must be complete; partial configuration fails at boot.
+
 Human hosted action checks are shadow-only by default. They record would-deny decisions while
 existing ACL, grant, lifecycle, and export responses remain unchanged. Do not set
 `SOTTO_CLOUD_ACTION_ENFORCEMENT=1` until the Cloud transition and export gates have been
@@ -1115,19 +1127,26 @@ accepted residual risk, and self-hosting is the escape hatch):
   `sotto-server` directly, the server does **not** self-throttle - supply equivalent rate limiting
   at your own edge.
 
-## Billing (optional)
+## Legacy organisation billing (optional)
 
-The server ships with Stripe billing dark: without the `STRIPE_*` variables, billing endpoints
-return 503 and orgs are tiered manually. To turn it on:
+Without Stripe credentials, billing endpoints return 503 and existing organisations remain on their
+stored tier. The legacy per-organisation checkout is still present for compatibility, but new
+Cloud sales stay disabled unless `SOTTO_CLOUD_SALES_ENABLED=1` and the complete hosted catalogue
+are configured. Do not use this procedure as a Cloud launch checklist; hosted sales require a
+separate operator review and the dedicated lifecycle evidence gate.
 
-1. In the Stripe dashboard: create a Product with one monthly Price (the flat per-org Team
-   subscription) and note the `price_…` id.
-2. Add a webhook endpoint for `https://<SOTTO_DOMAIN>/billing/webhook`, set its API version to
+1. In Stripe Workbench, configure the account and Prices that match the server-owned catalogue.
+   Keep the four hosted Price ids together: standard monthly, standard annual, founding monthly,
+   founding annual.
+2. Configure a restricted API key and add a webhook endpoint for
+   `https://<SOTTO_DOMAIN>/billing/webhook`, set its API version to
    `2026-07-29.dahlia`, and subscribe it to `checkout.session.completed`,
-   `customer.subscription.updated`, and `customer.subscription.deleted`; note its `whsec_…`
-   signing secret. The endpoint version must match the server's pinned Stripe version.
-3. Fill `STRIPE_API_KEY`, `STRIPE_WEBHOOK_SECRET`, and `STRIPE_PRICE_ID` in `.env`, then
-   `docker compose -f docker-compose.prod.yml up -d --force-recreate server`.
+   `checkout.session.async_payment_succeeded`, `checkout.session.expired`,
+   `customer.subscription.updated`, `customer.subscription.deleted`, and `invoice.paid`; keep the
+   endpoint's `whsec_…` signing secret private. Its version must match the server pin.
+3. Fill the API key, webhook secret, legacy `STRIPE_PRICE_ID`, and all four hosted Price ids in
+   `.env`. Leave `SOTTO_CLOUD_SALES_ENABLED=0` until the sandbox lifecycle and policy checklist
+   are reviewed. Recreate the server to apply configuration.
 
 Card data never touches the server - checkout and subscription management happen on
 Stripe-hosted pages, and the webhook only assigns the org's tier.

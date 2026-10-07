@@ -48,8 +48,14 @@ services:
       # Human hosted action enforcement is a deliberate rollout switch; keep it shadow-only by
       # default until the Cloud transition and export gates are approved.
       SOTTO_CLOUD_ACTION_ENFORCEMENT: ${SOTTO_CLOUD_ACTION_ENFORCEMENT:-0}
+      # New Cloud subscriptions stay unavailable until the full lifecycle and public terms are
+      # approved. This does not disable customer management or verified webhook processing.
+      SOTTO_CLOUD_SALES_ENABLED: ${SOTTO_CLOUD_SALES_ENABLED:-0}
       # Machine eligibility enforcement remains dormant until the hosted CI policy is approved.
       SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT: ${SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT:-0}
+      SOTTO_PROVIDER_REFRESH_INGEST_ENABLED: ${SOTTO_PROVIDER_REFRESH_INGEST_ENABLED:-0}
+      SOTTO_PROVIDER_REFRESH_WORKER_ENABLED: ${SOTTO_PROVIDER_REFRESH_WORKER_ENABLED:-0}
+      SOTTO_PROVIDER_REFRESH_RECONCILIATION_ENABLED: ${SOTTO_PROVIDER_REFRESH_RECONCILIATION_ENABLED:-0}
       # Optional: without these the server still boots (health + migrations), but login and every
       # authenticated endpoint return 503. Fill them in for a usable instance.
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
@@ -58,6 +64,13 @@ services:
       STRIPE_API_KEY: ${STRIPE_API_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_PRICE_ID: ${STRIPE_PRICE_ID:-}
+      STRIPE_STANDARD_MONTHLY_PRICE_ID: ${STRIPE_STANDARD_MONTHLY_PRICE_ID:-}
+      STRIPE_STANDARD_ANNUAL_PRICE_ID: ${STRIPE_STANDARD_ANNUAL_PRICE_ID:-}
+      STRIPE_FOUNDING_MONTHLY_PRICE_ID: ${STRIPE_FOUNDING_MONTHLY_PRICE_ID:-}
+      STRIPE_FOUNDING_ANNUAL_PRICE_ID: ${STRIPE_FOUNDING_ANNUAL_PRICE_ID:-}
+      SOTTO_SPONSORED_BILLING_ENABLED: ${SOTTO_SPONSORED_BILLING_ENABLED:-0}
+      SOTTO_BILLING_CORRECTIONS_ENABLED: ${SOTTO_BILLING_CORRECTIONS_ENABLED:-0}
+      SOTTO_BILLING_OPERATOR_TOKEN: ${SOTTO_BILLING_OPERATOR_TOKEN:-}
       # Anonymous daily version ping (random instance uuid + version + os/arch, nothing else -
       # README §Telemetry). On by default; set SOTTO_TELEMETRY=off in deploy/.env to opt out.
       SOTTO_TELEMETRY: ${SOTTO_TELEMETRY:-}
@@ -86,6 +99,8 @@ services:
       args:
         # The client flag is compiled into the SPA; keep it off until the final enablement PR.
         VITE_ORGANISATION_DELETION_ENABLED: ${VITE_ORGANISATION_DELETION_ENABLED:-false}
+        # Staged pricing copy is hidden until the offer and terms are approved for publication.
+        VITE_CLOUD_PRICING_VISIBLE: ${VITE_CLOUD_PRICING_VISIBLE:-false}
         # Baked into the SPA's crawler-facing metadata at build time, so the box
         # declares its own canonical address rather than the hosted site's.
         SOTTO_PUBLIC_URL: https://${SOTTO_DOMAIN:?set SOTTO_DOMAIN in deploy/.env}
