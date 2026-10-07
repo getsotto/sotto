@@ -334,7 +334,10 @@ export function TeamPanel({
                 : ""}
             </p>
           )}
-          {plan !== null && canManage && plan.billingEnabled && (
+          {plan !== null &&
+            canManage &&
+            plan.billingEnabled &&
+            (plan.tier === "team" || plan.purchasesEnabled) && (
             <p>
               {plan.tier !== "team" ? (
                 <button

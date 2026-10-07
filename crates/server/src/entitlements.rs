@@ -172,9 +172,11 @@ struct EntitlementsView {
     trial_ends_at: Option<String>,
     /// The numeric limits in effect; `null` on the Team tier (unlimited).
     limits: Option<Limits>,
-    /// Whether this instance can take payment (the `STRIPE_*` variables are set). Clients hide
-    /// upgrade affordances when `false` - a self-hosted instance has no checkout to offer.
+    /// Whether billing is configured, so existing customers can still manage their subscription.
     billing_enabled: bool,
+    /// Whether new hosted purchases are currently available. This can be paused independently of
+    /// billing management and settlement.
+    purchases_enabled: bool,
 }
 
 /// `GET /orgs/{org_id}/entitlements` - the org's plan, visible to any member.
@@ -218,5 +220,10 @@ async fn get_entitlements(
         },
         billing_enabled: state.deployment_mode == crate::config::DeploymentMode::Cloud
             && state.billing.is_some(),
+        purchases_enabled: state.deployment_mode == crate::config::DeploymentMode::Cloud
+            && state
+                .billing
+                .as_ref()
+                .is_some_and(crate::billing::BillingState::cloud_sales_enabled),
     }))
 }

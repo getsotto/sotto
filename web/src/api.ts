@@ -697,8 +697,10 @@ export interface Entitlements {
   effectiveTier: string;
   trialEndsAt: string | null;
   limits: { maxMembers: number; maxOrgProjects: number } | null;
-  /// Whether this instance can take payment; upgrade controls are hidden when `false`.
+  /// Whether configured billing can still manage an existing subscription.
   billingEnabled: boolean;
+  /// Whether new hosted purchases are enabled; falls back for servers that predate this field.
+  purchasesEnabled: boolean;
 }
 
 /// The org's plan (tier, trial, limits), visible to any member.
@@ -709,6 +711,7 @@ export async function fetchEntitlements(orgId: string): Promise<Entitlements> {
     trial_ends_at: string | null;
     limits: { max_members: number; max_org_projects: number } | null;
     billing_enabled: boolean;
+    purchases_enabled?: boolean;
   }>(`/orgs/${encodeURIComponent(orgId)}/entitlements`);
   return {
     tier: r.tier,
@@ -718,6 +721,7 @@ export async function fetchEntitlements(orgId: string): Promise<Entitlements> {
       ? { maxMembers: r.limits.max_members, maxOrgProjects: r.limits.max_org_projects }
       : null,
     billingEnabled: r.billing_enabled,
+    purchasesEnabled: r.purchases_enabled ?? r.billing_enabled,
   };
 }
 

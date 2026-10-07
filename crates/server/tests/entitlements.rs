@@ -29,6 +29,31 @@ fn app(pool: PgPool) -> Router {
 }
 
 fn app_with_mode(pool: PgPool, deployment_mode: sotto_server::config::DeploymentMode) -> Router {
+    app_with_billing(pool, deployment_mode, None)
+}
+
+fn app_with_cloud_sales(pool: PgPool, cloud_sales_enabled: bool) -> Router {
+    let billing =
+        sotto_server::billing::BillingState::from_config(sotto_server::config::BillingConfig {
+            api_key: "rk_test_never_called".into(),
+            webhook_secret: "whsec_test".into(),
+            price_id: "price_test".into(),
+            price_catalogue: None,
+            cloud_sales_enabled,
+            return_url: "https://app.sotto.test".into(),
+        });
+    app_with_billing(
+        pool,
+        sotto_server::config::DeploymentMode::Cloud,
+        Some(billing),
+    )
+}
+
+fn app_with_billing(
+    pool: PgPool,
+    deployment_mode: sotto_server::config::DeploymentMode,
+    billing: Option<sotto_server::billing::BillingState>,
+) -> Router {
     let state = AppState {
         deployment_mode,
         telemetry_ingest: false,
@@ -37,7 +62,7 @@ fn app_with_mode(pool: PgPool, deployment_mode: sotto_server::config::Deployment
         pool,
         oauth: None,
         oauth_config: None,
-        billing: None,
+        billing,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
@@ -189,6 +214,7 @@ async fn trial_grants_team_then_expiry_enforces_free_limits() {
     assert!(body.contains("\"limits\":null"));
     // This harness runs without STRIPE_* config, so the view must tell clients billing is off.
     assert!(body.contains("\"billing_enabled\":false"));
+    assert!(body.contains("\"purchases_enabled\":false"));
     assert_eq!(
         send(&pool, "GET", &format!("/orgs/{o}/audit"), &owner, None)
             .await
@@ -329,6 +355,32 @@ async fn trial_grants_team_then_expiry_enforces_free_limits() {
         .0,
         StatusCode::CREATED
     );
+}
+
+#[tokio::test]
+async fn entitlement_separates_sales_from_existing_billing_management() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let org_id = "ent-sales-gate-o";
+    reset_orgs(&pool, &[org_id]).await;
+    let owner = fresh_session(&pool, "ent-sales-gate-owner", "ent-sales-gate-owner-s").await;
+    send(&pool, "POST", "/orgs", &owner, Some(org_body(org_id))).await;
+
+    for (sales_enabled, expected) in [(false, "false"), (true, "true")] {
+        let app = app_with_cloud_sales(pool.clone(), sales_enabled);
+        let (status, body) = send_with_app(
+            &app,
+            "GET",
+            &format!("/orgs/{org_id}/entitlements"),
+            &owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"billing_enabled\":true"));
+        assert!(body.contains(&format!("\"purchases_enabled\":{expected}")));
+    }
 }
 
 #[tokio::test]
