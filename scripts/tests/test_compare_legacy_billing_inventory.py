@@ -53,6 +53,16 @@ class Comparison(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a read-only"):
             compare.load(self.write(bad))
 
+    def test_incomplete_report_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "incomplete inventory shape"):
+            compare.load(self.write({"inventory_version": 1, "activation": {"writes_performed": False}}))
+
+    def test_incomplete_cohort_row_is_rejected(self):
+        bad = report()
+        del bad["cohorts"][0]["count"]
+        with self.assertRaisesRegex(ValueError, "invalid cohort row"):
+            compare.load(self.write(bad))
+
 
 if __name__ == "__main__":
     unittest.main()
