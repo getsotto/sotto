@@ -90,6 +90,11 @@ class LifecycleEvidence(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "commit SHA"):
             validator.validate(self.write(value))
 
+    def test_template_and_validation_modes_cannot_be_combined(self):
+        with self.assertRaises(SystemExit) as error:
+            validator.main(["evidence.json", "--template", self.output(), "--output", self.output()])
+        self.assertEqual(error.exception.code, 2)
+
     def test_provider_ids_are_not_emitted(self):
         value = evidence()
         value["scenarios"][0]["provider_ids"] = ["sub_secret_123"]

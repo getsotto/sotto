@@ -131,6 +131,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", help="path for the sanitised acceptance report")
     parser.add_argument("--template", help="write a not-run manifest template at this path")
     args = parser.parse_args(argv)
+    if args.template and (args.input or args.output):
+        parser.error("--template cannot be combined with an input or --output")
     if args.template:
         template = {
             "schema": SCHEMA,
