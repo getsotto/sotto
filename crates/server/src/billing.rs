@@ -1181,6 +1181,14 @@ fn cloud_sales_config(state: &AppState) -> Result<&BillingState> {
     Ok(billing)
 }
 
+fn ensure_cloud_sales_for_operation(sales_enabled: bool, operation_exists: bool) -> Result<()> {
+    if operation_exists {
+        Ok(())
+    } else {
+        ensure_cloud_sales_enabled(sales_enabled)
+    }
+}
+
 fn ensure_cloud_sales_enabled(enabled: bool) -> Result<()> {
     if enabled {
         Ok(())
@@ -1430,7 +1438,21 @@ async fn sponsored_checkout(
     Path(org_id): Path<String>,
     Json(input): Json<SponsoredCheckoutRequest>,
 ) -> Result<Json<SponsoredOperationView>> {
-    let billing = sponsored_sales_config(&state)?;
+    let billing = sponsored_billing_config(&state)?;
+    let existing_operation = if billing.cloud_sales_enabled() {
+        false
+    } else {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM billing_sponsored_operations \
+             WHERE organization_id = $1 AND actor_user_id = $2 AND idempotency_key = $3)",
+        )
+        .bind(&org_id)
+        .bind(&user.user_id)
+        .bind(&input.idempotency_key)
+        .fetch_one(&state.pool)
+        .await?
+    };
+    ensure_cloud_sales_for_operation(billing.cloud_sales_enabled(), existing_operation)?;
     let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted sponsored billing is not configured".into()))?;
@@ -1824,7 +1846,20 @@ async fn personal_checkout(
     user: AuthUser,
     Json(request): Json<PersonalCheckoutRequest>,
 ) -> Result<Json<PersonalCheckoutView>> {
-    let billing = cloud_sales_config(&state)?;
+    let billing = billing_config(&state)?;
+    let existing_operation = if billing.cloud_sales_enabled() {
+        false
+    } else {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM billing_operations \
+             WHERE actor_user_id = $1 AND idempotency_key = $2)",
+        )
+        .bind(&user.user_id)
+        .bind(&request.idempotency_key)
+        .fetch_one(&state.pool)
+        .await?
+    };
+    ensure_cloud_sales_for_operation(billing.cloud_sales_enabled(), existing_operation)?;
     let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
@@ -4128,6 +4163,16 @@ mod tests {
             Err(Error::NotConfigured(_))
         ));
         assert!(ensure_cloud_sales_enabled(true).is_ok());
+    }
+
+    #[test]
+    fn sales_pause_allows_only_replays_of_persisted_operations() {
+        assert!(ensure_cloud_sales_for_operation(false, true).is_ok());
+        assert!(matches!(
+            ensure_cloud_sales_for_operation(false, false),
+            Err(Error::NotConfigured(_))
+        ));
+        assert!(ensure_cloud_sales_for_operation(true, false).is_ok());
     }
 
     /// The vault app moved behind `/app` when the site root became the marketing page; a payer
