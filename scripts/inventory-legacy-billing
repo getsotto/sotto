@@ -229,7 +229,7 @@ def write_report(report: dict, output: str | None) -> None:
     ) as temporary:
         temporary.write(rendered)
         temporary_path = Path(temporary.name)
-    temporary_path.chmod(0o600)
+        temporary_path.chmod(0o600)
     temporary_path.replace(destination)
 
 
