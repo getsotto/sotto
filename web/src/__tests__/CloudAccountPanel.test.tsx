@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -39,6 +40,19 @@ describe("CloudAccountPanel", () => {
   beforeEach(() => vi.resetAllMocks());
 
   beforeEach(() => vi.mocked(api.fetchCloudNotices).mockResolvedValue([]));
+
+  it("requests initial eligibility only once during StrictMode effect replay", async () => {
+    vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "unavailable" });
+
+    render(
+      <StrictMode>
+        <CloudAccountPanel />
+      </StrictMode>,
+    );
+
+    expect(await screen.findByText(/temporarily unavailable/)).toBeInTheDocument();
+    expect(api.fetchEligibility).toHaveBeenCalledTimes(1);
+  });
 
   it("does not offer checkout while eligibility evidence is unavailable", async () => {
     vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "unavailable" });
