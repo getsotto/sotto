@@ -63,8 +63,13 @@ UNION ALL
 SELECT 'personal_billing_state', state, count(*)::text
 FROM billing_personal_accounts GROUP BY 1, 2
 UNION ALL
-SELECT 'sponsored_billing_state', status, count(*)::text
-FROM billing_sponsored_subscriptions GROUP BY 1, 2
+SELECT 'sponsored_billing_state', CASE
+    WHEN o.lifecycle_state = 'deleted' THEN 'quarantine_deleted_organisation'
+    ELSE s.status
+END, count(*)::text
+FROM billing_sponsored_subscriptions s
+JOIN organizations o ON o.id = s.organization_id
+GROUP BY 1, 2
 UNION ALL
 SELECT 'project_ownership', CASE WHEN org_id IS NULL THEN 'personal' ELSE 'organisation' END, count(*)::text
 FROM projects GROUP BY 1, 2
