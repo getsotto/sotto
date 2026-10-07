@@ -60,6 +60,11 @@ class CloudLaunchEvidence(unittest.TestCase):
         path.write_text(json.dumps(value), encoding="utf-8")
         return path
 
+    def write_raw(self, value, name="raw-input.json"):
+        path = self.root / name
+        path.write_text(value, encoding="utf-8")
+        return path
+
     def test_complete_index_is_reported_as_evidence_not_authorisation(self):
         source = self.write(complete_record())
         report, failures = validator.validate(source)
@@ -106,6 +111,12 @@ class CloudLaunchEvidence(unittest.TestCase):
         value["customer_id"] = "cus_sensitive"
         with self.assertRaisesRegex(ValueError, "incomplete shape"):
             validator.validate(self.write(value))
+
+    def test_duplicate_json_result_fields_are_rejected(self):
+        raw = json.dumps(complete_record())
+        raw = raw.replace('"result": "passed"', '"result": "failed", "result": "passed"', 1)
+        with self.assertRaisesRegex(ValueError, "duplicate JSON field"):
+            validator.validate(self.write_raw(raw))
 
     def test_wrong_stripe_api_version_is_rejected(self):
         value = complete_record()

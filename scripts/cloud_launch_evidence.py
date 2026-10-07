@@ -32,6 +32,15 @@ def fingerprint(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Cloud launch evidence contains a duplicate JSON field")
+        result[key] = value
+    return result
+
+
 def _require_digest(value: object, name: str) -> str:
     if not isinstance(value, str) or not SHA256_RE.fullmatch(value):
         raise ValueError(f"{name} must be a lowercase sha256 digest")
@@ -110,7 +119,7 @@ def _validate_rows(value, *, field, expected_ids, id_field, allowed_results, can
 def validate(path: str | Path) -> tuple[dict, list[str]]:
     """Validate one launch evidence index and return a sanitised report and incomplete rows."""
     with Path(path).open(encoding="utf-8") as stream:
-        value = json.load(stream)
+        value = json.load(stream, object_pairs_hook=_unique_object)
     if not isinstance(value, dict):
         raise ValueError("Cloud launch evidence must be an object")
     expected_keys = {
