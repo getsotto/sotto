@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   cancelPersonalBilling,
@@ -25,6 +25,9 @@ function date(epoch: number | null): string | null { return epoch === null ? nul
 
 export function CloudAccountPanel() {
   const [eligibility, setEligibility] = useState<EligibilityView | null>(null);
+  const [eligibilityLoading, setEligibilityLoading] = useState(true);
+  const [eligibilityAttempted, setEligibilityAttempted] = useState(false);
+  const eligibilityRequestInFlight = useRef(false);
   const [offer, setOffer] = useState<PersonalQuote["offer"]>("monthly");
   const [quote, setQuote] = useState<PersonalQuote | null>(null);
   const [lifecycle, setLifecycle] = useState<PersonalLifecycle | null>(null);
@@ -36,11 +39,19 @@ export function CloudAccountPanel() {
   const [notice, setNotice] = useState<string | null>(null);
 
   async function load() {
+    if (eligibilityRequestInFlight.current) return;
+    eligibilityRequestInFlight.current = true;
+    setEligibilityLoading(true);
     setError(null);
     try {
       const next = await fetchEligibility();
       setEligibility(next);
     } catch (e) { setError(message(e)); }
+    finally {
+      eligibilityRequestInFlight.current = false;
+      setEligibilityAttempted(true);
+      setEligibilityLoading(false);
+    }
   }
   useEffect(() => { void load(); }, []);
   useEffect(() => {
@@ -126,7 +137,12 @@ export function CloudAccountPanel() {
     finally { setBusy(false); }
   }
 
-  if (eligibility === null) return <><h1>Cloud account</h1>{error !== null ? <p role="alert">{error}</p> : <p className="muted">Loading account status…</p>}</>;
+  if (eligibility === null) return <>
+    <h1>Cloud account</h1>
+    {error !== null && <p role="alert">{error}</p>}
+    {eligibilityLoading && <p className="muted" role="status">{eligibilityAttempted ? "Checking account status again…" : "Loading account status…"}</p>}
+    {eligibilityAttempted && <button disabled={eligibilityLoading} aria-busy={eligibilityLoading} onClick={() => void load()}>{eligibilityLoading ? "Retrying…" : "Retry account status"}</button>}
+  </>;
   const paidThrough = date(eligibility.paidThroughEpoch); const recoveryUntil = date(eligibility.recoveryUntilEpoch); const exportUntil = date(eligibility.exportUntilEpoch);
   return <>
     <h1>Cloud account</h1>
