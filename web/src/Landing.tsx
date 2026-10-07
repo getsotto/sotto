@@ -14,7 +14,9 @@ const CLOUD_PRICING_VISIBLE = import.meta.env.VITE_CLOUD_PRICING_VISIBLE === "tr
 // The marketing page an anonymous visitor gets at `/`. The vault app lives at /app; this page's
 // job is the top of the funnel: see it → install it. Everything is real, selectable text - the
 // terminal below is a transcript of actual CLI output, not an image.
-export function Landing() {
+export function Landing({
+  cloudPricingVisible = CLOUD_PRICING_VISIBLE,
+}: { cloudPricingVisible?: boolean } = {}) {
   return (
     <main className="landing">
       <header>
@@ -120,7 +122,7 @@ export function Landing() {
 
       <section id="pricing">
         <h2>Pricing</h2>
-        {CLOUD_PRICING_VISIBLE ? <CloudPricing /> : <LegacyPricing />}
+        {cloudPricingVisible ? <CloudPricing /> : <LegacyPricing />}
       </section>
 
       <CommunitySection />
