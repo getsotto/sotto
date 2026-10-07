@@ -21,7 +21,7 @@ REQUIRED_CHECKS = (
     "database",
     "native_wasm_crypto",
     "previous_minor_clients",
-    "stripe_sandbox",
+    "stripe_lifecycle_17_scenarios",
     "restore_rehearsal",
     "production_smoke",
     "incident_drill",
