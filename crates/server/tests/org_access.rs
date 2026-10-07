@@ -24,7 +24,7 @@ async fn pool_or_skip() -> Option<PgPool> {
     Some(pool)
 }
 
-fn app(pool: PgPool) -> Router {
+fn app_with_cloud_sales(pool: PgPool, cloud_sales_enabled: bool) -> Router {
     let state = AppState {
         deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
         telemetry_ingest: false,
@@ -39,7 +39,7 @@ fn app(pool: PgPool) -> Router {
                 webhook_secret: "whsec_test".into(),
                 price_id: "price_test".into(),
                 price_catalogue: None,
-                cloud_sales_enabled: false,
+                cloud_sales_enabled,
                 return_url: "https://app.sotto.test".into(),
             },
         )),
@@ -90,6 +90,17 @@ async fn request(
     token: Option<&str>,
     body: Option<String>,
 ) -> (StatusCode, String) {
+    request_with_cloud_sales(pool, method, uri, token, body, false).await
+}
+
+async fn request_with_cloud_sales(
+    pool: &PgPool,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: Option<String>,
+    cloud_sales_enabled: bool,
+) -> (StatusCode, String) {
     let mut builder = Request::builder().method(method).uri(uri);
     if let Some(t) = token {
         builder = builder.header("authorization", format!("Bearer {t}"));
@@ -101,7 +112,10 @@ async fn request(
             .expect("req"),
         None => builder.body(Body::empty()).expect("req"),
     };
-    let resp = app(pool.clone()).oneshot(req).await.expect("oneshot");
+    let resp = app_with_cloud_sales(pool.clone(), cloud_sales_enabled)
+        .oneshot(req)
+        .await
+        .expect("oneshot");
     let status = resp.status();
     (status, body_text(resp).await)
 }
@@ -591,7 +605,7 @@ async fn deleting_org_keeps_reads_and_freezes_every_org_write() {
     ];
     for (method, uri, body) in writes {
         assert_eq!(
-            request(&pool, method, &uri, Some(&owner), Some(body))
+            request_with_cloud_sales(&pool, method, &uri, Some(&owner), Some(body), true)
                 .await
                 .0,
             StatusCode::CONFLICT,
