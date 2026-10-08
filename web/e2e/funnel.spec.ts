@@ -423,7 +423,7 @@ test("a revealed secret can be hidden and revealed again", async ({ page }) => {
   await secretButton.click();
   await expect(page.locator("textarea.secret-value")).toHaveValue(fixture.secret_value);
 
-  await page.getByRole("button", { name: "Hide secret" }).click();
+  await page.getByRole("button", { name: "Hide secret" }).press("Enter");
   await expect(page.locator("textarea.secret-value")).toHaveCount(0);
   await expect(
     page.getByLabel("Share link (burns after one view):"),
@@ -434,7 +434,6 @@ test("a revealed secret can be hidden and revealed again", async ({ page }) => {
   await secretButton.press("Enter");
   await expect(page.locator("textarea.secret-value")).toHaveValue(fixture.secret_value);
 });
-
 
 test("a pending share cannot restore a hidden secret", async ({ page }) => {
   let releaseShare!: () => void;
