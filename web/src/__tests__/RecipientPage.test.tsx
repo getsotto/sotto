@@ -68,6 +68,16 @@ describe("RecipientPage", () => {
     expect(api.fetchShare).not.toHaveBeenCalled();
   });
 
+  it("focuses the revealed heading after a successful reveal", async () => {
+    render(<RecipientPage token="share-token" />);
+    const reveal = screen.getByRole("button", { name: "Reveal secret" });
+    reveal.focus();
+    expect(reveal).toHaveFocus();
+    fireEvent.click(reveal);
+    expect(await screen.findByRole("textbox", { name: "Shared secret" })).toHaveValue(secret);
+    expect(screen.getByRole("heading", { name: "Shared secret" })).toHaveFocus();
+  });
+
   it("reports a missing fragment without fetching the share", async () => {
     window.location.hash = "";
     render(<RecipientPage token="share-token" />);
@@ -130,12 +140,16 @@ describe("RecipientPage", () => {
     expect(textarea).toHaveValue(secret);
     expect(writeText).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+    const copy = screen.getByRole("button", { name: "Copy secret" });
+    copy.focus();
+    fireEvent.click(copy);
     expect(writeText).toHaveBeenCalledWith(secret);
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Shared secret" })).not.toHaveFocus();
 
     await act(async () => write.resolve());
     expect(await screen.findByRole("status")).toHaveTextContent("Copied to clipboard.");
+    expect(copy).toHaveFocus();
     expect(api.fetchShare).toHaveBeenCalledTimes(1);
   });
 
@@ -147,9 +161,12 @@ describe("RecipientPage", () => {
     });
 
     const textarea = await revealSecret();
-    fireEvent.click(screen.getByRole("button", { name: "Copy secret" }));
+    const copy = screen.getByRole("button", { name: "Copy secret" });
+    copy.focus();
+    fireEvent.click(copy);
 
     expect(await screen.findByRole("alert")).toHaveTextContent("copy it manually");
+    expect(copy).toHaveFocus();
     expect(textarea).toHaveValue(secret);
     expect(api.fetchShare).toHaveBeenCalledTimes(1);
   });

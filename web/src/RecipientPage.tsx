@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { fetchShare, ShareUnavailable } from "./api";
 import { urlSafeB64ToBytes } from "./base64";
@@ -16,6 +16,13 @@ export function RecipientPage({ token }: { token: string }) {
   const [passphrase, setPassphrase] = useState("");
   const [copyStatus, setCopyStatus] = useState<"idle" | "copying" | "copied" | "failed">("idle");
   const copyingRef = useRef(false);
+  const revealedHeadingRef = useRef<HTMLHeadingElement>(null);
+
+  useEffect(() => {
+    if (state.kind === "revealed") {
+      revealedHeadingRef.current?.focus();
+    }
+  }, [state.kind]);
 
   // Runs once per click. The fetch burns a view, so it must not run on mount or a prefetch.
   async function reveal() {
@@ -77,7 +84,9 @@ export function RecipientPage({ token }: { token: string }) {
   if (state.kind === "revealed") {
     return (
       <Shell>
-        <h1 id="recipient-secret-heading">Shared secret</h1>
+        <h1 id="recipient-secret-heading" ref={revealedHeadingRef} tabIndex={-1}>
+          Shared secret
+        </h1>
         <p className="muted">
           This secret has now been viewed - copy it, it may not be available again.
         </p>
