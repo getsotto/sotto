@@ -150,13 +150,16 @@ describe("VaultView selection loading", () => {
   it("keeps personal projects usable when organisation discovery fails", async () => {
     vi.mocked(api.fetchOrgs).mockRejectedValue(new Error("organisations unavailable"));
     vi.mocked(api.fetchProjects).mockResolvedValue([project("personal-project")]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("personal-env")]);
 
     renderVault();
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "organisations unavailable: organisations unavailable",
     );
-    expect(await screen.findByRole("button", { name: /personal-project/ })).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: /personal-project/ }));
+    expect(await screen.findByRole("button", { name: /personal-env/ })).toBeInTheDocument();
+    expect(api.fetchEnvironments).toHaveBeenCalledWith("personal-project");
     expect(api.fetchProjects).toHaveBeenCalledTimes(1);
   });
 
