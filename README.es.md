@@ -110,12 +110,23 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
-sotto share DATABASE_URL --views 3
-sotto share DATABASE_URL --expire 3600   # lifetime in seconds
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-De forma predeterminada, un enlace compartido permite una vista y no caduca; el enlace deja de funcionar después de la última vista.
+En un terminal interactivo, cada límite omitido abre su propio menú. El menú de visualizaciones
+ofrece 1, 2, 3, 5 o 10 visualizaciones y un valor personalizado; el menú de duración ofrece sin
+caducidad, 1 hora, 1 día, 7 días, 30 días o un número de segundos personalizado. Los valores
+personalizados deben ser de 1 a 100 visualizaciones o de 1 a 2592000 segundos. Proporcionar
+`DATABASE_URL` omite solo la selección del secreto: `--views` omite el menú de visualizaciones y
+`--expire` omite el menú de duración de forma independiente. Pulsa Esc o Ctrl-C en cualquier menú
+de selección para cancelar sin crear un enlace.
+
+El uso no interactivo requiere un nombre de secreto explícito. Cuando se omite cualquiera de los
+límites, se aplica su valor predeterminado: una visualización y sin caducidad. Para omitir los tres
+menús de selección en un terminal interactivo, proporciona el nombre y ambos límites, por ejemplo
+`sotto share DATABASE_URL --views 3 --expire 3600`. Es posible que todavía se soliciten el
+desbloqueo y la frase de contraseña.
 
 Para explorar los secretos de forma interactiva, consulta la [guía del panel](#panel-interactivo).
 
@@ -130,6 +141,7 @@ sotto ls --env staging
 
 Exportar escribe texto plano, por lo que necesita `--reveal` en un terminal, igual que `sotto get`.
 Usa `sotto share --no-copy` para desactivar la copia interactiva, o `--copy` para solicitarla explícitamente.
+Estas opciones solo controlan el portapapeles; `--no-copy` no omite los menús de límites del enlace.
 El borrado del portapapeles es una medida de mejor esfuerzo: si reemplazas el contenido se protege el nuevo valor,
 mientras que los gestores del portapapeles, la suspensión o la terminación del proceso auxiliar pueden conservar una copia.
 

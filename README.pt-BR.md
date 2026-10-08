@@ -110,12 +110,23 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
-sotto share DATABASE_URL --views 3
-sotto share DATABASE_URL --expire 3600   # lifetime in seconds
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-Por padrão, um compartilhamento permite uma visualização e não expira; o link deixa de funcionar após a última visualização.
+Em um terminal interativo, cada limite omitido abre seu próprio menu. O menu de visualizações
+oferece 1, 2, 3, 5 ou 10 visualizações e um valor personalizado; o menu de duração oferece sem
+expiração, 1 hora, 1 dia, 7 dias, 30 dias ou um número de segundos personalizado. Os valores
+personalizados devem ser de 1 a 100 visualizações ou de 1 a 2592000 segundos. Fornecer
+`DATABASE_URL` ignora apenas a seleção do segredo: `--views` ignora o menu de visualizações e
+`--expire` ignora o menu de duração de forma independente. Pressione Esc ou Ctrl-C em qualquer
+menu de seleção para cancelar sem criar um compartilhamento.
+
+O uso não interativo exige um nome de segredo explícito. Quando qualquer limite é omitido, seu
+valor padrão é aplicado: uma visualização e sem expiração. Para ignorar os três menus de seleção
+em um terminal interativo, forneça o nome e ambos os limites, por exemplo
+`sotto share DATABASE_URL --views 3 --expire 3600`. As solicitações de desbloqueio e frase secreta
+ainda podem ser exibidas.
 
 Para explorar os segredos interativamente, consulte o [guia do painel](#painel-interativo).
 
@@ -130,6 +141,7 @@ sotto ls --env staging
 
 A exportação escreve texto puro, portanto precisa de `--reveal` em um terminal, assim como `sotto get`.
 Use `sotto share --no-copy` para desativar a cópia interativa, ou `--copy` para solicitá-la explicitamente.
+Essas opções controlam apenas a área de transferência; `--no-copy` não ignora os menus de limites do compartilhamento.
 A limpeza da área de transferência é uma medida de melhor esforço: substituir o conteúdo protege o novo valor,
 enquanto gerenciadores da área de transferência, suspensão ou encerramento do processo auxiliar podem manter uma cópia.
 

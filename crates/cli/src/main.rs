@@ -115,7 +115,7 @@ enum Command {
     },
     /// Create a one-time / expiring share link for a secret and print it.
     #[command(
-        after_help = "Examples:\n  sotto share DATABASE_URL\n  sotto share DATABASE_URL --views 3\n  sotto share DATABASE_URL --expire 3600"
+        after_help = "Interactive selection:\n  Omitting NAME opens a secret picker. After a secret is selected, each omitted limit opens its own menu: view presets are 1, 2, 3, 5 and 10 plus custom (1-100); lifetime presets are no expiry, 1 hour, 1 day, 7 days and 30 days plus custom (1-2592000 seconds). Supplying NAME skips only the secret picker. --views and --expire each skip their corresponding limit menu. Press Esc or Ctrl-C to cancel a selection.\n\nNon-interactive use:\n  Scripts must supply NAME. Omitted limits retain the defaults of one view and no expiry. --no-copy controls clipboard behaviour only; it does not skip selection menus. Unlock and --passphrase prompts may still apply.\n\nExamples:\n  sotto share DATABASE_URL\n  sotto share DATABASE_URL --views 3 --expire 3600"
     )]
     Share {
         /// The secret name to share.
@@ -2612,7 +2612,7 @@ mod tests {
     }
 
     #[test]
-    fn share_help_explains_supported_limits() {
+    fn share_help_explains_interactive_selection_and_supported_limits() {
         let mut command = Cli::command();
         let help = command
             .find_subcommand_mut("share")
@@ -2620,8 +2620,25 @@ mod tests {
             .render_long_help()
             .to_string();
 
-        assert!(help.contains("1-100"), "{help}");
-        assert!(help.contains("1-2592000"), "{help}");
+        for expected in [
+            "Omitting NAME opens a secret picker",
+            "each omitted limit opens its own menu",
+            "1-100",
+            "1-2592000",
+            "Supplying NAME skips only the secret picker",
+            "--views and --expire each skip their corresponding limit menu",
+            "Press Esc or Ctrl-C",
+            "Scripts must supply NAME",
+            "one view and no expiry",
+            "--no-copy controls clipboard behaviour only",
+            "Unlock and --passphrase prompts may still apply",
+            "sotto share DATABASE_URL --views 3 --expire 3600",
+        ] {
+            assert!(
+                help.contains(expected),
+                "missing share help text: {expected}"
+            );
+        }
     }
 
     #[test]
