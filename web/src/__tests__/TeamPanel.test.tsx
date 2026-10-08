@@ -1,5 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "../api";
@@ -440,6 +441,71 @@ describe("TeamPanel billing request ownership", () => {
       assign.mockRestore();
     },
   );
+});
+
+describe("TeamPanel checkout return", () => {
+  let originalUrl: string;
+
+  beforeEach(() => {
+    originalUrl = window.location.href;
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([org("org-a")]);
+  });
+
+  afterEach(() => {
+    window.history.replaceState(null, "", originalUrl);
+  });
+
+  function renderTeamPanel() {
+    return render(
+      <StrictMode>
+        <TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />
+      </StrictMode>,
+    );
+  }
+
+  it.each([
+    {
+      outcome: "success",
+      message: "Payment received. Your Team plan activates as soon as Stripe confirms, usually within seconds.",
+    },
+    { outcome: "cancelled", message: "Checkout cancelled. Nothing was charged." },
+  ])("shows a $outcome return once and preserves the rest of the url", async ({ outcome, message }) => {
+    window.history.replaceState(
+      null,
+      "",
+      `/account/team?view=activity&billing=${outcome}&view=members#org-a`,
+    );
+
+    const { unmount } = renderTeamPanel();
+    expect(await screen.findByRole("button", { name: /org-a/ })).toBeInTheDocument();
+    expect(screen.getByText(message)).toBeInTheDocument();
+    expect(
+      screen.queryByText(outcome === "success" ? /Checkout cancelled\./ : /Payment received\./),
+    ).not.toBeInTheDocument();
+    expect(window.location.pathname + window.location.search + window.location.hash).toBe(
+      "/account/team?view=activity&view=members#org-a",
+    );
+
+    unmount();
+    renderTeamPanel();
+    expect(await screen.findByRole("button", { name: /org-a/ })).toBeInTheDocument();
+    expect(screen.queryByText(/Payment received\./)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Checkout cancelled\./)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { name: "absent", url: "/account/team?view=activity&view=members#org-a" },
+    { name: "unknown", url: "/account/team?view=activity&billing=unknown&view=members#org-a" },
+  ])("leaves an $name outcome unchanged", async ({ url }) => {
+    window.history.replaceState(null, "", url);
+
+    renderTeamPanel();
+    expect(await screen.findByRole("button", { name: /org-a/ })).toBeInTheDocument();
+    expect(screen.queryByText(/Payment received\./)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Checkout cancelled\./)).not.toBeInTheDocument();
+    expect(window.location.pathname + window.location.search + window.location.hash).toBe(url);
+  });
 });
 
 describe("TeamPanel organisation-list recovery", () => {
