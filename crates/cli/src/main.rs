@@ -380,7 +380,17 @@ enum OrgCommand {
     /// Invite an existing Sotto user into an org by email; prints their user id.
     Invite { org_id: String, email: String },
     /// List an org's members and their ids.
-    Members { org_id: String },
+    #[command(after_help = r#"Examples:
+  sotto org members <org-id>
+  sotto org members <org-id> --json
+
+--json prints one {"user_id":...,"role":...,"has_keys":...} object per member, where has_keys reports whether an account public key is on file. The key itself is never printed. Stdout carries the JSON array only; diagnostics stay on stderr."#)]
+    Members {
+        org_id: String,
+        /// Output as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a member and rotate every environment they could access.
     Remove { org_id: String, user_id: String },
     /// Show the org's plan: tier, trial, and the limits in effect.
@@ -944,8 +954,13 @@ fn org_command(store: &Store, keychain: &dyn Keychain, command: OrgCommand) -> R
             println!("{}", invited.user_id);
             Ok(())
         }
-        OrgCommand::Members { org_id } => {
-            for m in remote::team::members(&client, &org_id)? {
+        OrgCommand::Members { org_id, json } => {
+            let members = remote::team::members(&client, &org_id)?;
+            if json {
+                println!("{}", org_members_json(&members)?);
+                return Ok(());
+            }
+            for m in members {
                 let keys = if m.public_key.is_some() {
                     "keys"
                 } else {
@@ -1887,6 +1902,32 @@ fn env_list_json(environments: &[String], active: &str) -> Result<String> {
     to_json(&value)
 }
 
+/// Stable machine-readable shape for `sotto org members <org-id> --json`.
+///
+/// Returns a JSON array of one object per member, in the order the server listed them. Stdout
+/// contains JSON only; diagnostics stay on stderr. An organisation with no members yields `[]`.
+///
+/// ```text
+/// [{"user_id":"user-1","role":"admin","has_keys":true},
+///  {"user_id":"user-2","role":"member","has_keys":false}]
+/// ```
+///
+/// `has_keys` reports whether the member has an account public key on file, so a script can tell
+/// a member who cannot be granted a vault key. The key itself is never serialised.
+fn org_members_json(members: &[remote::api::MemberInfo]) -> Result<String> {
+    let value: Vec<_> = members
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "user_id": m.user_id,
+                "role": m.role,
+                "has_keys": m.public_key.is_some(),
+            })
+        })
+        .collect();
+    to_json(&value)
+}
+
 /// Stable machine-readable shape for `sotto token ls --json`.
 ///
 /// Returns a JSON array of one object per token, in the order the server listed them. Stdout
@@ -2187,7 +2228,7 @@ mod tests {
     use sotto_cli::commands::App;
     use sotto_cli::config::Config;
     use sotto_cli::keychain::MemoryKeychain;
-    use sotto_cli::remote::api::MachineTokenInfo;
+    use sotto_cli::remote::api::{MachineTokenInfo, MemberInfo};
     use sotto_cli::session;
     use sotto_cli::store::Store;
     use sotto_cli::vault::Vault;
@@ -2195,8 +2236,8 @@ mod tests {
 
     use super::{
         display_secret, env_list_json, history_line, import_dotenv, login_config,
-        machine_token_list_json, set_confirmation, Cli, CloudCommand, Command, EnvCommand,
-        SharesCommand, ThemeCommand, TokenCommand,
+        machine_token_list_json, org_members_json, set_confirmation, Cli, CloudCommand, Command,
+        EnvCommand, OrgCommand, SharesCommand, ThemeCommand, TokenCommand,
     };
 
     #[test]
@@ -2725,6 +2766,68 @@ mod tests {
             panic!("expected TokenCommand::Ls");
         };
         assert!(json);
+    }
+
+    #[test]
+    fn org_members_json_parser_parses_flag() {
+        let cli = Cli::try_parse_from(["sotto", "org", "members", "org-1", "--json"])
+            .expect("sotto org members --json should parse");
+        let Some(Command::Org {
+            command: OrgCommand::Members { org_id, json },
+        }) = cli.command
+        else {
+            panic!("expected OrgCommand::Members");
+        };
+        assert_eq!(org_id, "org-1");
+        assert!(json);
+
+        let cli = Cli::try_parse_from(["sotto", "org", "members", "org-1"])
+            .expect("sotto org members should parse");
+        let Some(Command::Org {
+            command: OrgCommand::Members { org_id, json },
+        }) = cli.command
+        else {
+            panic!("expected OrgCommand::Members");
+        };
+        assert_eq!(org_id, "org-1");
+        assert!(!json);
+    }
+
+    #[test]
+    fn org_members_json_reports_key_presence_and_omits_the_key() {
+        let members = vec![
+            MemberInfo {
+                user_id: "user-1".into(),
+                role: "admin".into(),
+                public_key: Some("cHVibGljLWtleQ".into()),
+            },
+            MemberInfo {
+                user_id: "user-2".into(),
+                role: "member".into(),
+                public_key: None,
+            },
+            MemberInfo {
+                user_id: "quote\"and\\slash".into(),
+                role: "member".into(),
+                public_key: Some("cHVibGljLWtleQ".into()),
+            },
+        ];
+        let value: serde_json::Value =
+            serde_json::from_str(&org_members_json(&members).unwrap()).unwrap();
+
+        assert_eq!(value[0]["user_id"], "user-1");
+        assert_eq!(value[0]["role"], "admin");
+        assert_eq!(value[0]["has_keys"], true);
+        assert_eq!(value[1]["has_keys"], false);
+        assert_eq!(value[2]["user_id"], "quote\"and\\slash");
+
+        let first = value[0].as_object().unwrap();
+        assert!(first.contains_key("user_id"));
+        assert!(first.contains_key("role"));
+        assert!(first.contains_key("has_keys"));
+        assert!(!first.contains_key("public_key"));
+
+        assert_eq!(org_members_json(&[]).unwrap(), "[]");
     }
 
     #[test]
