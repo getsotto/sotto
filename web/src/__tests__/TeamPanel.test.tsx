@@ -274,6 +274,64 @@ describe("TeamPanel invitations", () => {
     expect(api.fetchMembers).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["open", "seal", "upload"] as const)(
+    "keeps an invitation successful when the optional org-key %s fails",
+    async (failure) => {
+      const encOrgKey = new Uint8Array([2]);
+      const orgKey = new Uint8Array([3]);
+      const publicKey = new Uint8Array([4]);
+      const sealedKey = new Uint8Array([5]);
+      vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...adminOrg, encOrgKey }]);
+      vi.mocked(vault.openOrgKey).mockReturnValue(orgKey);
+      vi.mocked(vault.decryptOrgName).mockReturnValue("org-a");
+      vi.mocked(vault.sealGrantTo).mockReturnValue(sealedKey);
+      vi.mocked(api.inviteMember).mockResolvedValue({ userId: "user-b", publicKey });
+      vi.mocked(api.fetchMembers)
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([member("user-b")]);
+
+      const input = await openInviteForm();
+      expect(vault.openOrgKey).toHaveBeenCalledOnce();
+      // Inject only after the organisation name has been decrypted successfully.
+      if (failure === "open") {
+        vi.mocked(vault.openOrgKey).mockImplementationOnce(() => {
+          throw new Error("synthetic key-opening failure");
+        });
+      } else if (failure === "seal") {
+        vi.mocked(vault.sealGrantTo).mockImplementationOnce(() => {
+          throw new Error("synthetic sealing failure");
+        });
+      } else {
+        vi.mocked(api.grantOrgKey).mockRejectedValueOnce(new Error("synthetic upload failure"));
+      }
+      fireEvent.change(input, { target: { value: "teammate@example.com" } });
+      fireEvent.submit(input.closest("form")!);
+
+      expect(await screen.findByText("user-b")).toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("invited teammate@example.com (user-b)");
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(input).toHaveValue("");
+      expect(input).toBeEnabled();
+      fireEvent.change(input, { target: { value: "next@example.com" } });
+      expect(screen.getByRole("button", { name: "Invite" })).toBeEnabled();
+      expect(api.inviteMember).toHaveBeenCalledExactlyOnceWith("org-a", "teammate@example.com");
+      expect(api.fetchMembers).toHaveBeenCalledTimes(2);
+      expect(api.fetchMembers).toHaveBeenNthCalledWith(2, "org-a");
+      expect(vault.openOrgKey).toHaveBeenCalledTimes(2);
+      expect(vault.openOrgKey).toHaveBeenLastCalledWith(new Uint8Array(32), new Uint8Array([1]), encOrgKey);
+      if (failure === "open") {
+        expect(vault.sealGrantTo).not.toHaveBeenCalled();
+      } else {
+        expect(vault.sealGrantTo).toHaveBeenCalledExactlyOnceWith(publicKey, orgKey);
+      }
+      if (failure === "upload") {
+        expect(api.grantOrgKey).toHaveBeenCalledExactlyOnceWith("org-a", "user-b", sealedKey);
+      } else {
+        expect(api.grantOrgKey).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it("preserves the email and restores the form after an invitation failure", async () => {
     const pending = deferred<{ userId: string; publicKey: Uint8Array | null }>();
     vi.mocked(api.inviteMember).mockReturnValue(pending.promise);
