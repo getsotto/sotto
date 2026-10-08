@@ -24,7 +24,7 @@ y recuperación de cuentas por pérdida de claves.
 | Componente | Disponible ahora |
 | --- | --- |
 | Núcleo criptográfico | KDF, AEAD XChaCha20-Poly1305 + AAD, encapsulado de claves, concesiones mediante sealed box X25519, la jerarquía de bóvedas de entorno, reencapsulado de claves de datos (rotación), criptografía de enlaces para compartir y codificación de claves, con vectores de referencia nativo↔WASM |
-| CLI | `init`, gestión local de secretos, inyección con `run`, sincronización `login`/`push`/`pull`, `setup` para dispositivos nuevos, `share`; equipos: `org create/ls/invite/members/remove`, `grant`, `clone`, `rotate`, `token create/ls/revoke` de máquina (con modo `SOTTO_TOKEN` para CI), `reset` por pérdida del kit de emergencia |
+| CLI | `init`, gestión local de secretos, inyección con `run`, sincronización `login`/`push`/`pull`, `setup` para dispositivos nuevos, `share`; equipos: `org create/ls/invite/members/remove/plan`, `grant`, `clone`, `rotate`, `token create/ls/revoke` de máquina (con modo `SOTTO_TOKEN` para CI), `reset` por pérdida del kit de emergencia |
 | Servidor | Inicio de sesión OAuth + sesiones, sincronización de cuentas + instantáneas (escrituras versionadas, ETag), organizaciones + membresías + roles, concesiones de claves de bóveda por miembro, rotación transaccional de claves, tokens de máquina, restablecimiento de cuentas y enlaces para compartir - solo texto cifrado |
 | Web | Inicio de sesión (sesión con cookie), desbloqueo en el navegador + descifrado de la bóveda con tu propia concesión, creación y recepción de enlaces de un solo uso, y un panel de equipo: organizaciones, miembros, invitación por correo y compartición de un entorno con un miembro |
 
@@ -144,9 +144,35 @@ Trabajo en equipo:
 sotto org create acme                      # prints the org id
 sotto init --org <org-id>                  # an org-owned project
 sotto org invite <org-id> dev@example.com  # invite an existing Sotto user
+sotto org plan <org-id>                    # tier, trial, and limits for this organisation
 sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
+
+`sotto org plan <org-id>` lee la vista de derechos actual del servidor configurado para esa
+organización. Debes haber iniciado sesión (`sotto login`); el cofre local no necesita estar
+desbloqueado. Muestra el nivel asignado, el nivel efectivo (el que aplica los límites ahora), un
+fin de prueba opcional, y o bien límites de miembros y proyectos de organización o
+`limits: none (Team)`.
+
+Salida ilustrativa estilo Free:
+
+```text
+tier:      free
+effective: free
+limits:    3 members, 1 org project(s)
+```
+
+Salida ilustrativa Team:
+
+```text
+tier:      team
+effective: team
+limits:    none (Team)
+```
+
+Estos ejemplos son ilustrativos; las organizaciones reales pueden mostrar niveles, pruebas y
+límites distintos.
 
 Los tokens de máquina caducan. Un token nuevo dura 90 días salvo que pases `--expires-in-days` con
 un valor de 1 a 365, y `sotto token ls` muestra cuándo termina cada uno. Dos semanas antes,

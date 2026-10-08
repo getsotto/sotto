@@ -22,7 +22,7 @@ and lost-key account recovery.
 | Component | Available now |
 | --- | --- |
 | Crypto core | KDF, XChaCha20-Poly1305 AEAD + AAD, key wrapping, X25519 sealed-box grants, the environment vault hierarchy, data-key rewrap (rotation), share-link crypto, and key encoding - with native↔WASM golden vectors |
-| CLI | `init`, local secret management, `run`-style injection, `login`/`push`/`pull` sync, new-device `setup`, `share`; teams: `org create/ls/invite/members/remove`, `grant`, `clone`, `rotate`, machine `token create/ls/revoke` (with `SOTTO_TOKEN` mode for CI), lost-kit `reset` |
+| CLI | `init`, local secret management, `run`-style injection, `login`/`push`/`pull` sync, new-device `setup`, `share`; teams: `org create/ls/invite/members/remove/plan`, `grant`, `clone`, `rotate`, machine `token create/ls/revoke` (with `SOTTO_TOKEN` mode for CI), lost-kit `reset` |
 | Server | OAuth login + sessions, account + snapshot sync (versioned writes, ETag), orgs + memberships + roles, per-member vault-key grants, transactional key rotation, machine tokens, account reset, and share links - ciphertext only |
 | Web | Login (cookie session), in-browser unlock + vault decryption via your own grant, one-time share create/receive, and a team panel: orgs, members, invite by email, share an environment with a member |
 
@@ -141,9 +141,33 @@ Working with a team:
 sotto org create acme                      # prints the org id
 sotto init --org <org-id>                  # an org-owned project
 sotto org invite <org-id> dev@example.com  # invite an existing Sotto user
+sotto org plan <org-id>                    # tier, trial, and limits for this organisation
 sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
+
+`sotto org plan <org-id>` reads the configured server's current entitlement view for that
+organisation. You must be logged in (`sotto login`); the local vault does not need to be unlocked.
+It prints the assigned tier, the effective tier (the tier whose limits apply now), an optional
+trial end, and either member and organisation-project limits or `limits: none (Team)`.
+
+Illustrative Free-style output:
+
+```text
+tier:      free
+effective: free
+limits:    3 members, 1 org project(s)
+```
+
+Illustrative Team output:
+
+```text
+tier:      team
+effective: team
+limits:    none (Team)
+```
+
+These examples are illustrative; real organisations may show different tiers, trials, and limits.
 
 Machine tokens expire. A new token lasts 90 days unless you pass `--expires-in-days` with anything
 from 1 to 365, and `sotto token ls` shows when each one ends. Two weeks before that, `sotto run` and
