@@ -25,7 +25,7 @@ export function AuthCallback() {
   // a brand new flow rather than reuse what is left in the URL or session storage.
   function retry() {
     window.history.replaceState(null, "", "/auth/callback");
-    startLogin();
+    startLogin(sessionStorage.getItem("sotto_oauth_destination") ?? "/app");
   }
 
   return (
