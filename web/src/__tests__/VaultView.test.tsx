@@ -147,6 +147,37 @@ describe("VaultView selection loading", () => {
     expect(screen.queryByRole("status", { name: "Secret search results" })).not.toBeInTheDocument();
   });
 
+  it("keeps personal projects usable when organisation discovery fails", async () => {
+    vi.mocked(api.fetchOrgs).mockRejectedValue(new Error("organisations unavailable"));
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("personal-project")]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("personal-env")]);
+
+    renderVault();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "organisations unavailable: organisations unavailable",
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /personal-project/ }));
+    expect(await screen.findByRole("button", { name: /personal-env/ })).toBeInTheDocument();
+    expect(api.fetchEnvironments).toHaveBeenCalledWith("personal-project");
+    expect(api.fetchProjects).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps organisation projects visible by fallback id when organisation discovery fails", async () => {
+    vi.mocked(api.fetchOrgs).mockRejectedValue(new Error("organisations unavailable"));
+    vi.mocked(api.fetchProjects).mockResolvedValue([
+      { id: "org-project", encName: new Uint8Array([1]), orgId: "org-1" },
+    ]);
+    vi.mocked(vault.decryptProjectName).mockImplementation(() => {
+      throw new Error("missing org key");
+    });
+
+    renderVault();
+
+    expect(await screen.findByRole("button", { name: /org-project/ })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("organisations unavailable");
+  });
+
   it("keeps environments from the latest project when requests resolve out of order", async () => {
     const first = deferred<Environment[]>();
     const second = deferred<Environment[]>();
