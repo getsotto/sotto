@@ -1024,6 +1024,12 @@ export async function createShare(encBlob: Uint8Array, maxViews: number): Promis
     ...CREDS,
   });
   if (!resp.ok) {
+    if (resp.headers.get("x-sotto-error-code") === "quota") {
+      const explanation = (await readBody(() => resp.text())).trim();
+      if (explanation !== "") {
+        throw new Error(`Could not create the share link: ${explanation}`);
+      }
+    }
     throw new Error(`server error (${resp.status})`);
   }
   const body = (await readBody(() => resp.json())) as { token: string };

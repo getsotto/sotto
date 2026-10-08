@@ -94,6 +94,28 @@ describe("VaultView selection loading", () => {
     vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
   });
 
+  it("renders share-creation quota feedback as text without retrying", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("Alpha")]);
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("synthetic-value");
+    vi.mocked(vault.sealForShare).mockReturnValue({
+      encBlob: new Uint8Array([1]), fragmentKey: new Uint8Array(32),
+    });
+    const explanation = "Could not create the share link: quota reached <b>3 active links</b>";
+    vi.mocked(api.createShare).mockRejectedValue(new Error(explanation));
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Alpha" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create one-time share link" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(explanation);
+    expect(alert.querySelector("b")).toBeNull();
+    expect(api.createShare).toHaveBeenCalledExactlyOnceWith(new Uint8Array([1]), 1);
+    expect(screen.getByRole("textbox", { name: "Alpha" })).toHaveValue("synthetic-value");
+  });
+
   it("filters loaded secret names locally and clears the query on environment switch", async () => {
     vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a"), environment("env-b")]);
     vi.mocked(api.fetchSecrets).mockImplementation((envId) =>
