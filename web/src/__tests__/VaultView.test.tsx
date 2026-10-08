@@ -884,6 +884,31 @@ describe("VaultView secret copying", () => {
 });
 
 describe("VaultView empty states", () => {
+  it("does not show an empty-projects message while projects are loading", async () => {
+    vi.resetAllMocks();
+    const request = deferred<Project[]>();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockReturnValue(request.promise);
+    renderVault();
+
+    expect(await screen.findByText("Loading…")).toBeInTheDocument();
+    expect(screen.queryByText(/No synced projects are available/)).not.toBeInTheDocument();
+
+    await act(async () => request.resolve([]));
+    expect(await screen.findByText(/No synced projects are available/)).toBeInTheDocument();
+  });
+
+  it("shows a project-load error without claiming the account is empty", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockRejectedValue(new Error("projects unavailable"));
+    renderVault();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("projects unavailable");
+    expect(screen.queryByText(/No synced projects are available/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry projects" })).toBeInTheDocument();
+  });
+
   it("explains a successfully loaded empty project list", async () => {
     vi.resetAllMocks();
     vi.mocked(api.fetchOrgs).mockResolvedValue([]);
