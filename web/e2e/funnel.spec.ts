@@ -138,6 +138,39 @@ test("a body the app cannot read is not blamed on the network", async ({ page })
   await expect(page.getByText(/unexpected end of json/i)).toHaveCount(0);
 });
 
+test("an account with no synced projects shows project guidance", async ({ page }) => {
+  await page.route("**/projects", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
+  await loginAndUnlock(page);
+  await expect(page.getByText(/No synced projects are available for this account/)).toBeVisible();
+  await expect(page.getByText("sotto push")).toBeVisible();
+});
+
+test("a selected project with no environments explains what is missing", async ({ page }) => {
+  await page.route("**/projects/*/environments", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
+  await loginAndUnlock(page);
+  await page.getByRole("button", { name: new RegExp(fixture.project_name) }).first().click();
+  await expect(page.getByText("No environments are available in this project.")).toBeVisible();
+});
+
+test("a populated vault does not show empty-state guidance", async ({ page }) => {
+  await loginAndUnlock(page);
+  const project = page.getByRole("button", { name: new RegExp(fixture.project_name) }).first();
+  await expect(project).toBeVisible();
+  await expect(page.getByText(/No synced projects are available for this account/)).toHaveCount(0);
+  await project.click();
+  const environments = page
+    .getByRole("heading", { name: "Environments" })
+    .locator("xpath=following-sibling::ul[1]");
+  await expect(environments.getByRole("button").first()).toBeVisible();
+  await expect(page.getByText("No environments are available in this project.")).toHaveCount(0);
+});
+
 test("login, unlock, invite, and checkout", async ({ page }) => {
   await loginAndUnlock(page);
 
