@@ -1,7 +1,7 @@
 {
   "components": [
     {
-      "checked_at": "2026-10-10T13:39:23Z",
+      "checked_at": "2026-10-10T18:00:49Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -165,8 +165,8 @@
         },
         {
           "date": "2026-10-10",
-          "ok": 3,
-          "total": 3
+          "ok": 4,
+          "total": 4
         }
       ],
       "description": "Serving requests and reaching its database",
@@ -176,7 +176,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-10-10T13:39:23Z",
+      "checked_at": "2026-10-10T18:00:49Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -340,8 +340,8 @@
         },
         {
           "date": "2026-10-10",
-          "ok": 3,
-          "total": 3
+          "ok": 4,
+          "total": 4
         }
       ],
       "description": "The application shell loads",
@@ -351,7 +351,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-10-10T13:39:23Z",
+      "checked_at": "2026-10-10T18:00:49Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -515,8 +515,8 @@
         },
         {
           "date": "2026-10-10",
-          "ok": 3,
-          "total": 3
+          "ok": 4,
+          "total": 4
         }
       ],
       "description": "The GitHub sign-in flow starts",
@@ -526,7 +526,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-10-10T13:39:23Z",
+      "checked_at": "2026-10-10T18:00:49Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -690,8 +690,8 @@
         },
         {
           "date": "2026-10-10",
-          "ok": 3,
-          "total": 3
+          "ok": 4,
+          "total": 4
         }
       ],
       "description": "Subscription webhooks are accepted and authenticated",
@@ -701,7 +701,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-10-10T13:39:23Z",
+      "checked_at": "2026-10-10T18:00:49Z",
       "days": [
         {
           "date": "2026-09-12",
@@ -845,8 +845,8 @@
         },
         {
           "date": "2026-10-10",
-          "ok": 3,
-          "total": 3
+          "ok": 4,
+          "total": 4
         }
       ],
       "description": "A canary machine token can retrieve its grant and its secrets",
@@ -856,6 +856,6 @@
       "state": "ok"
     }
   ],
-  "generated_at": "2026-10-10T13:39:23Z",
+  "generated_at": "2026-10-10T18:00:49Z",
   "schema": 1
 }
