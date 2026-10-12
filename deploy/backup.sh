@@ -34,7 +34,8 @@ esac
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DUMP="$(mktemp /tmp/sotto-pgdump.XXXXXX)"
-trap 'rm -f "$DUMP"' EXIT INT TERM
+JOURNAL="$(mktemp /tmp/sotto-retention-journal.XXXXXX)"
+trap 'rm -f "$DUMP" "$JOURNAL"' EXIT INT TERM
 
 # Custom-format dump (compressed, pg_restore-able) taken inside the postgres container, so no
 # Postgres client tools are needed on the host.
@@ -43,10 +44,18 @@ docker compose -f docker-compose.prod.yml exec -T postgres pg_dump -U sotto -Fc 
 # A valid archive can list its contents; an empty or truncated file cannot.
 docker compose -f docker-compose.prod.yml exec -T postgres pg_restore --list < "$DUMP" > /dev/null
 
+# Retention deletions are kept in a cumulative sidecar. A dump can predate a purge, so restoring
+# only the database bytes would resurrect the deleted ciphertext. Validate the sidecar before it
+# leaves the host; the validator prints a count and never prints resource identifiers.
+../scripts/export-retention-journal "$JOURNAL"
+../scripts/replay-retention-journal --validate-only --journal "$JOURNAL"
+
 DEST="$BUCKET/sotto-$STAMP.dump"
+JOURNAL_DEST="$BUCKET/sotto-$STAMP.tombstones.jsonl"
 case "$BUCKET" in
-    gs://*) gsutil -q cp "$DUMP" "$DEST" ;;
-    s3://*) aws s3 cp --only-show-errors "$DUMP" "$DEST" ;;
-    *) rclone copyto "$DUMP" "$DEST" ;;
+    gs://*) gsutil -q cp "$DUMP" "$DEST" && gsutil -q cp "$JOURNAL" "$JOURNAL_DEST" ;;
+    s3://*) aws s3 cp --only-show-errors "$DUMP" "$DEST" && aws s3 cp --only-show-errors "$JOURNAL" "$JOURNAL_DEST" ;;
+    *) rclone copyto "$DUMP" "$DEST" && rclone copyto "$JOURNAL" "$JOURNAL_DEST" ;;
 esac
 echo "backup ok: $DEST ($(wc -c < "$DUMP" | tr -d ' ') bytes)"
+echo "retention journal ok: $JOURNAL_DEST ($(wc -c < "$JOURNAL" | tr -d ' ') bytes)"

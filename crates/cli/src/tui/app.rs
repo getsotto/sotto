@@ -27,6 +27,28 @@ pub enum SecretModalField {
     Value,
 }
 
+/// Outcome of a transient footer notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusKind {
+    /// The requested action completed.
+    Success,
+    /// The requested action was rejected or failed.
+    Failure,
+    /// A neutral notice that is neither a completion nor a failure.
+    Information,
+}
+
+/// Footer notice that replaces the shortcut line until it expires.
+#[derive(Debug, Clone)]
+pub struct StatusNotice {
+    pub kind: StatusKind,
+    pub message: String,
+    pub recorded_at: Instant,
+}
+
+/// How long a footer notice replaces the shortcut line.
+const STATUS_VISIBLE_FOR: Duration = Duration::from_secs(5);
+
 /// Generate a cryptographically secure random secret string using the core CSPRNG.
 pub fn generate_random_secret(length: usize) -> String {
     const CHARSET: &[u8] =
@@ -78,7 +100,7 @@ pub struct TuiApp<'a> {
     pub decrypted_cache: Option<Zeroizing<Vec<u8>>>,
     pub reveal_animation_start: Option<Instant>,
     pub show_help: bool,
-    pub status_message: Option<(String, Instant)>,
+    pub status_message: Option<StatusNotice>,
     pub running: bool,
 }
 
@@ -271,16 +293,23 @@ impl<'a> TuiApp<'a> {
             match std::str::from_utf8(&zeroized) {
                 Ok(text) => match crate::clipboard::copy(text) {
                     Ok(()) => {
-                        self.set_status(format!(
-                            "Copied `{secret_name}` to clipboard (clears in 45s)"
-                        ));
+                        self.set_status(
+                            StatusKind::Success,
+                            format!("Copied `{secret_name}` to clipboard (clears in 45s)"),
+                        );
                     }
                     Err(err) => {
-                        self.set_status(format!("Clipboard copy failed: {err}"));
+                        self.set_status(
+                            StatusKind::Failure,
+                            format!("Clipboard copy failed: {err}"),
+                        );
                     }
                 },
                 Err(_) => {
-                    self.set_status("Cannot copy: secret contains non-UTF-8 bytes".into());
+                    self.set_status(
+                        StatusKind::Failure,
+                        "Cannot copy: secret contains non-UTF-8 bytes".into(),
+                    );
                 }
             }
         }
@@ -290,7 +319,10 @@ impl<'a> TuiApp<'a> {
     /// Switch to the next available environment in the project.
     pub fn cycle_environment(&mut self) -> Result<()> {
         if self.environments.len() <= 1 {
-            self.set_status("Only one environment configured".into());
+            self.set_status(
+                StatusKind::Information,
+                "Only one environment configured".into(),
+            );
             return Ok(());
         }
 
@@ -299,10 +331,10 @@ impl<'a> TuiApp<'a> {
         self.search_query.clear();
         self.search_mode = false;
         self.refresh_secrets()?;
-        self.set_status(format!(
-            "Switched to environment `{}`",
-            self.config.environment
-        ));
+        self.set_status(
+            StatusKind::Success,
+            format!("Switched to environment `{}`", self.config.environment),
+        );
         Ok(())
     }
 
@@ -311,19 +343,23 @@ impl<'a> TuiApp<'a> {
         self.show_help = !self.show_help;
     }
 
-    /// Record a transient status notification message.
-    pub fn set_status(&mut self, message: String) {
-        self.status_message = Some((message, Instant::now()));
+    /// Record a transient status notification and its outcome.
+    pub fn set_status(&mut self, kind: StatusKind, message: String) {
+        self.status_message = Some(StatusNotice {
+            kind,
+            message,
+            recorded_at: Instant::now(),
+        });
     }
 
-    /// Retrieve the current status notification if it hasn't expired.
-    pub fn active_status(&self) -> Option<&str> {
-        if let Some((msg, time)) = &self.status_message {
-            if time.elapsed() < Duration::from_secs(5) {
-                return Some(msg.as_str());
-            }
+    /// Retrieve the current status notification if it has not expired.
+    pub fn active_status(&self) -> Option<&StatusNotice> {
+        let notice = self.status_message.as_ref()?;
+        if notice.recorded_at.elapsed() < STATUS_VISIBLE_FOR {
+            Some(notice)
+        } else {
+            None
         }
-        None
     }
 
     /// Open the theme switcher modal, discovering available themes and capturing the original theme.
@@ -413,13 +449,22 @@ impl<'a> TuiApp<'a> {
                     }
                     if let Err(err) = crate::theme::save_theme_preference(&theme_name, &config_path)
                     {
-                        self.set_status(format!("Failed to persist theme preference: {err}"));
+                        self.set_status(
+                            StatusKind::Failure,
+                            format!("Failed to persist theme preference: {err}"),
+                        );
                     } else {
-                        self.set_status(format!("Theme set to `{theme_name}`"));
+                        self.set_status(
+                            StatusKind::Success,
+                            format!("Theme set to `{theme_name}`"),
+                        );
                     }
                 }
                 None => {
-                    self.set_status("Failed to locate configuration file".into());
+                    self.set_status(
+                        StatusKind::Failure,
+                        "Failed to locate configuration file".into(),
+                    );
                 }
             }
         }
@@ -468,11 +513,14 @@ impl<'a> TuiApp<'a> {
                     self.show_history_modal = false;
                 }
                 Err(_) => {
-                    self.set_status("Cannot edit: secret contains non-UTF-8 bytes".into());
+                    self.set_status(
+                        StatusKind::Failure,
+                        "Cannot edit: secret contains non-UTF-8 bytes".into(),
+                    );
                 }
             }
         } else {
-            self.set_status("No secret selected to edit".into());
+            self.set_status(StatusKind::Information, "No secret selected to edit".into());
         }
         Ok(())
     }
@@ -534,22 +582,48 @@ impl<'a> TuiApp<'a> {
     pub fn generate_secret_modal_value(&mut self) {
         let generated = generate_random_secret(32);
         self.secret_modal_value = Zeroizing::new(generated);
-        self.set_status("Generated 32-character random secret".into());
+        self.set_status(
+            StatusKind::Success,
+            "Generated 32-character random secret".into(),
+        );
     }
 
     /// Commit and save the secret modal contents to the active vault.
     pub fn commit_secret_modal(&mut self) -> Result<()> {
         let name = self.secret_modal_name.trim().to_string();
         if name.is_empty() {
-            self.set_status("Secret name cannot be empty".into());
+            self.set_status(StatusKind::Failure, "Secret name cannot be empty".into());
             return Ok(());
         }
         if name.contains(|c: char| c.is_whitespace()) {
-            self.set_status("Secret name cannot contain whitespace".into());
+            self.set_status(
+                StatusKind::Failure,
+                "Secret name cannot contain whitespace".into(),
+            );
             return Ok(());
         }
 
         let is_new = self.secret_modal_mode == SecretModalMode::New;
+        if is_new {
+            // New must not replace a live secret. Check every name in the
+            // environment, not just the ones the search filter shows, and
+            // leave the dialogue open with its fields intact.
+            let exists = self
+                .app
+                .list_items(&self.config)?
+                .iter()
+                .any(|item| item.name == name);
+            if exists {
+                self.set_status(
+                    StatusKind::Failure,
+                    format!(
+                        "Secret `{name}` already exists in `{}`. Pick another name or use Edit",
+                        self.config.environment
+                    ),
+                );
+                return Ok(());
+            }
+        }
         self.app
             .set(&self.config, &name, self.secret_modal_value.as_bytes())?;
         self.refresh_secrets()?;
@@ -564,15 +638,15 @@ impl<'a> TuiApp<'a> {
         }
 
         if is_new {
-            self.set_status(format!(
-                "Created secret `{name}` in `{}`",
-                self.config.environment
-            ));
+            self.set_status(
+                StatusKind::Success,
+                format!("Created secret `{name}` in `{}`", self.config.environment),
+            );
         } else {
-            self.set_status(format!(
-                "Updated secret `{name}` in `{}`",
-                self.config.environment
-            ));
+            self.set_status(
+                StatusKind::Success,
+                format!("Updated secret `{name}` in `{}`", self.config.environment),
+            );
         }
 
         self.close_secret_modal();
@@ -590,7 +664,10 @@ impl<'a> TuiApp<'a> {
             self.show_secret_modal = false;
             self.show_history_modal = false;
         } else {
-            self.set_status("No secret selected to delete".into());
+            self.set_status(
+                StatusKind::Information,
+                "No secret selected to delete".into(),
+            );
         }
     }
 
@@ -610,10 +687,10 @@ impl<'a> TuiApp<'a> {
 
         self.app.remove(&self.config, &name)?;
         self.refresh_secrets()?;
-        self.set_status(format!(
-            "Deleted secret `{name}` from `{}`",
-            self.config.environment
-        ));
+        self.set_status(
+            StatusKind::Success,
+            format!("Deleted secret `{name}` from `{}`", self.config.environment),
+        );
         self.close_delete_modal();
         Ok(())
     }
@@ -635,11 +712,17 @@ impl<'a> TuiApp<'a> {
                     self.show_delete_modal = false;
                 }
                 Err(err) => {
-                    self.set_status(format!("Failed to load version history: {err}"));
+                    self.set_status(
+                        StatusKind::Failure,
+                        format!("Failed to load version history: {err}"),
+                    );
                 }
             }
         } else {
-            self.set_status("No secret selected to view history".into());
+            self.set_status(
+                StatusKind::Information,
+                "No secret selected to view history".into(),
+            );
         }
         Ok(())
     }
@@ -698,20 +781,30 @@ impl<'a> TuiApp<'a> {
                         Ok(()) => {
                             let name = &self.history_modal_secret_name;
                             let ver = item.version;
-                            self.set_status(format!(
-                                "Copied `{name}` (v{ver}) to clipboard (clears in 45s)"
-                            ));
+                            self.set_status(
+                                StatusKind::Success,
+                                format!("Copied `{name}` (v{ver}) to clipboard (clears in 45s)"),
+                            );
                         }
                         Err(err) => {
-                            self.set_status(format!("Clipboard copy failed: {err}"));
+                            self.set_status(
+                                StatusKind::Failure,
+                                format!("Clipboard copy failed: {err}"),
+                            );
                         }
                     },
                     Err(_) => {
-                        self.set_status("Cannot copy: version contains non-UTF-8 bytes".into());
+                        self.set_status(
+                            StatusKind::Failure,
+                            "Cannot copy: version contains non-UTF-8 bytes".into(),
+                        );
                     }
                 }
             } else {
-                self.set_status("Cannot copy: version value is unreadable".into());
+                self.set_status(
+                    StatusKind::Failure,
+                    "Cannot copy: version value is unreadable".into(),
+                );
             }
         }
         Ok(())
@@ -738,12 +831,15 @@ impl<'a> TuiApp<'a> {
                         .map(|s| s.version)
                         .unwrap_or(target_version + 1);
                     self.close_history_modal();
-                    self.set_status(format!(
-                        "Restored `{secret_name}` to v{target_version} (saved as v{new_version})"
-                    ));
+                    self.set_status(
+                        StatusKind::Success,
+                        format!(
+                            "Restored `{secret_name}` to v{target_version} (saved as v{new_version})"
+                        ),
+                    );
                 }
                 Err(err) => {
-                    self.set_status(format!("Rollback failed: {err}"));
+                    self.set_status(StatusKind::Failure, format!("Rollback failed: {err}"));
                 }
             }
         }
@@ -1127,7 +1223,10 @@ mod tests {
         tui_app.commit_secret_modal().unwrap();
         assert!(tui_app.show_secret_modal);
         assert_eq!(
-            tui_app.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+            tui_app
+                .status_message
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
             Some("Secret name cannot be empty")
         );
 
@@ -1138,7 +1237,10 @@ mod tests {
         tui_app.commit_secret_modal().unwrap();
         assert!(tui_app.show_secret_modal);
         assert_eq!(
-            tui_app.status_message.as_ref().map(|(msg, _)| msg.as_str()),
+            tui_app
+                .status_message
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
             Some("Secret name cannot contain whitespace")
         );
 
@@ -1176,6 +1278,63 @@ mod tests {
         // Verify stored value
         let fetched = app.get(&tui_app.config, "API").unwrap();
         assert_eq!(fetched, b"key1");
+    }
+
+    #[test]
+    fn secret_modal_new_rejects_an_existing_name_and_keeps_the_dialogue_open() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::default();
+        let app = App::new(&store, &keychain);
+        app.set(&config, "EXISTING", b"original-dummy").unwrap();
+        app.set(&config, "OTHER", b"other-dummy").unwrap();
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        // Hide EXISTING behind the search filter: the check must still see it.
+        tui_app.search_query = "OTHER".into();
+        tui_app.apply_filter();
+        assert_eq!(tui_app.filtered_indices.len(), 1);
+
+        tui_app.open_new_secret_modal();
+        tui_app.secret_modal_name = "EXISTING".into();
+        tui_app.secret_modal_value = Zeroizing::new("replacement-dummy".into());
+        tui_app.commit_secret_modal().unwrap();
+
+        // The dialogue stays open, with its fields retained and a clear message.
+        assert!(tui_app.show_secret_modal);
+        assert_eq!(tui_app.secret_modal_name, "EXISTING");
+        assert_eq!(tui_app.secret_modal_value.as_str(), "replacement-dummy");
+        assert_eq!(
+            tui_app
+                .status_message
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
+            Some("Secret `EXISTING` already exists in `dev`. Pick another name or use Edit")
+        );
+
+        // The stored value and its history are untouched.
+        assert_eq!(
+            app.get(&tui_app.config, "EXISTING").unwrap(),
+            b"original-dummy"
+        );
+        assert_eq!(
+            app.secret_history(&tui_app.config, "EXISTING")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A different name still works from the same dialogue.
+        tui_app.secret_modal_name = "FRESH".into();
+        tui_app.commit_secret_modal().unwrap();
+        assert!(!tui_app.show_secret_modal);
+        assert_eq!(
+            app.get(&tui_app.config, "FRESH").unwrap(),
+            b"replacement-dummy"
+        );
+        assert_eq!(
+            app.get(&tui_app.config, "EXISTING").unwrap(),
+            b"original-dummy"
+        );
     }
 
     #[test]
@@ -1254,7 +1413,10 @@ mod tests {
         assert!(!tui_app.show_delete_modal);
         assert_eq!(tui_app.secrets.len(), 0);
         assert_eq!(
-            tui_app.status_message.as_ref().map(|(m, _)| m.as_str()),
+            tui_app
+                .status_message
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
             Some("Deleted secret `TARGET` from `dev`")
         );
     }
@@ -1313,7 +1475,10 @@ mod tests {
         let restored_val = app.get(&tui_app.config, "HOST_KEY").unwrap();
         assert_eq!(restored_val, b"v2-staging");
         assert_eq!(
-            tui_app.status_message.as_ref().map(|(m, _)| m.as_str()),
+            tui_app
+                .status_message
+                .as_ref()
+                .map(|notice| notice.message.as_str()),
             Some("Restored `HOST_KEY` to v2 (saved as v4)")
         );
     }

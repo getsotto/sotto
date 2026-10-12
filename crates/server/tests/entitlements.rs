@@ -25,13 +25,44 @@ async fn pool_or_skip() -> Option<PgPool> {
 }
 
 fn app(pool: PgPool) -> Router {
+    app_with_mode(pool, sotto_server::config::DeploymentMode::Cloud)
+}
+
+fn app_with_mode(pool: PgPool, deployment_mode: sotto_server::config::DeploymentMode) -> Router {
+    app_with_billing(pool, deployment_mode, None)
+}
+
+fn app_with_cloud_sales(pool: PgPool, cloud_sales_enabled: bool) -> Router {
+    let billing =
+        sotto_server::billing::BillingState::from_config(sotto_server::config::BillingConfig {
+            api_key: "rk_test_never_called".into(),
+            webhook_secret: "whsec_test".into(),
+            price_id: "price_test".into(),
+            price_catalogue: None,
+            cloud_sales_enabled,
+            return_url: "https://app.sotto.test".into(),
+        });
+    app_with_billing(
+        pool,
+        sotto_server::config::DeploymentMode::Cloud,
+        Some(billing),
+    )
+}
+
+fn app_with_billing(
+    pool: PgPool,
+    deployment_mode: sotto_server::config::DeploymentMode,
+    billing: Option<sotto_server::billing::BillingState>,
+) -> Router {
     let state = AppState {
-        deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
+        deployment_mode,
         telemetry_ingest: false,
+        cloud_action_enforcement_enabled: false,
+        machine_eligibility_enforcement_enabled: false,
         pool,
         oauth: None,
         oauth_config: None,
-        billing: None,
+        billing,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
@@ -96,6 +127,16 @@ async fn send(
     token: &str,
     body: Option<String>,
 ) -> (StatusCode, String) {
+    send_with_app(&app(pool.clone()), method, uri, token, body).await
+}
+
+async fn send_with_app(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<String>,
+) -> (StatusCode, String) {
     let builder = Request::builder()
         .method(method)
         .uri(uri)
@@ -107,7 +148,7 @@ async fn send(
             .expect("req"),
         None => builder.body(Body::empty()).expect("req"),
     };
-    let resp = app(pool.clone()).oneshot(req).await.expect("oneshot");
+    let resp = app.clone().oneshot(req).await.expect("oneshot");
     let status = resp.status();
     (status, body_text(resp).await)
 }
@@ -173,6 +214,7 @@ async fn trial_grants_team_then_expiry_enforces_free_limits() {
     assert!(body.contains("\"limits\":null"));
     // This harness runs without STRIPE_* config, so the view must tell clients billing is off.
     assert!(body.contains("\"billing_enabled\":false"));
+    assert!(body.contains("\"purchases_enabled\":false"));
     assert_eq!(
         send(&pool, "GET", &format!("/orgs/{o}/audit"), &owner, None)
             .await
@@ -313,6 +355,60 @@ async fn trial_grants_team_then_expiry_enforces_free_limits() {
         .0,
         StatusCode::CREATED
     );
+}
+
+#[tokio::test]
+async fn entitlement_separates_sales_from_existing_billing_management() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let org_id = "ent-sales-gate-o";
+    reset_orgs(&pool, &[org_id]).await;
+    let owner = fresh_session(&pool, "ent-sales-gate-owner", "ent-sales-gate-owner-s").await;
+    send(&pool, "POST", "/orgs", &owner, Some(org_body(org_id))).await;
+
+    for (sales_enabled, expected) in [(false, "false"), (true, "true")] {
+        let app = app_with_cloud_sales(pool.clone(), sales_enabled);
+        let (status, body) = send_with_app(
+            &app,
+            "GET",
+            &format!("/orgs/{org_id}/entitlements"),
+            &owner,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("\"billing_enabled\":true"));
+        assert!(body.contains(&format!("\"purchases_enabled\":{expected}")));
+    }
+}
+
+#[tokio::test]
+async fn self_hosted_entitlements_report_unlimited_access() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let org_id = "ent-self-hosted-o";
+    reset_orgs(&pool, &[org_id]).await;
+    let owner = fresh_session(&pool, "ent-self-hosted-owner", "ent-self-hosted-owner-s").await;
+    send(&pool, "POST", "/orgs", &owner, Some(org_body(org_id))).await;
+
+    let self_hosted = app_with_mode(
+        pool.clone(),
+        sotto_server::config::DeploymentMode::SelfHosted,
+    );
+    let (status, body) = send_with_app(
+        &self_hosted,
+        "GET",
+        &format!("/orgs/{org_id}/entitlements"),
+        &owner,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "self hosted entitlements: {body}");
+    assert!(body.contains("\"effective_tier\":\"team\""));
+    assert!(body.contains("\"limits\":null"));
+    assert!(body.contains("\"billing_enabled\":false"));
 }
 
 #[tokio::test]

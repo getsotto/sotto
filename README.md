@@ -107,12 +107,23 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
-sotto share DATABASE_URL --views 3
-sotto share DATABASE_URL --expire 3600   # lifetime in seconds
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-By default, a share allows one view and has no expiry; the link burns after the last view.
+In an interactive terminal, each omitted share limit opens its own menu. The view menu offers
+1, 2, 3, 5 or 10 views and a custom value; the lifetime menu offers no expiry, 1 hour, 1 day,
+7 days, 30 days or a custom number of seconds. Custom values must be 1-100 views or
+1-2592000 seconds. Supplying `DATABASE_URL` skips secret selection only: `--views` skips the view
+menu and `--expire` skips the lifetime menu independently. Press Esc or Ctrl-C in any selection
+menu to cancel without creating a share.
+
+Non-interactive use requires an explicit secret name. When either limit flag is omitted there,
+its existing default applies: one view and no expiry. To bypass all three selection menus in an
+interactive terminal, supply the name and both limits, for example
+`sotto share DATABASE_URL --views 3 --expire 3600`. Unlock and passphrase prompts may still apply.
+
+To browse secrets interactively, see the [dashboard guide](#interactive-dashboard).
 
 Use `--env` to select an environment for one command without changing the project's default:
 
@@ -125,6 +136,7 @@ sotto ls --env staging
 
 Export writes plaintext, so it needs `--reveal` on a terminal, just like `sotto get`.
 Use `sotto share --no-copy` to disable interactive copying, or `--copy` to request it explicitly.
+These flags control the clipboard only; `--no-copy` does not skip the share limit menus.
 Clipboard clearing is best-effort: replacing the clipboard protects the newer content, while
 clipboard managers, suspension, or a terminated helper may retain a history copy.
 
@@ -147,6 +159,75 @@ Machine tokens expire. A new token lasts 90 days unless you pass `--expires-in-d
 from 1 to 365, and `sotto token ls` shows when each one ends. Two weeks before that, `sotto run` and
 `sotto export` print a warning in the CI log. To replace a token, create a new one, update the CI
 secret, then revoke the old one with `sotto token revoke`.
+
+### Cloud status
+
+To inspect the configured server and your account's Cloud eligibility, first log in:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+The command needs an active login but does not unlock the local vault or open a browser. It reports the configured `server`, the server's `server_info`, the account `eligibility`, and a `billing_url` only when the returned state says billing is available. The human-readable output also shows `actions`, `next_actions`, and any optional `paid_through_epoch`, `recovery_until_epoch`, or `export_until_epoch` values. A missing `server_info` or `eligibility` means that an older server does not expose that endpoint; it is not proof that access is allowed or denied.
+
+The JSON form is useful for scripts. Its top-level shape is:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+The example is synthetic; `actions` and the optional dates come from the returned account state, and older servers can return null for either endpoint. `sotto cloud status` only reports status and may print a billing URL. It does not start a purchase or change eligibility. For local vault and environment diagnostics, use `sotto status`; that view is separate from the server and account information above.
+
+### Interactive dashboard
+
+From an initialised project, run `sotto` without a subcommand to browse its local secrets:
+
+```sh
+sotto
+```
+
+A local identity must exist and be unlocked before the dashboard opens. Sotto prompts for the
+master password when needed. The dashboard requires terminals on stdin, stdout, and stderr.
+If one is missing, CI is active, or `TERM=dumb`, a bare invocation writes help to stderr and exits
+with code 2.
+Use `sotto --help` to request help explicitly.
+
+Use the arrow keys or `j` and `k` to navigate. Press `/` to search, `?` for help, and Tab to switch
+environments. This switch lasts only for the dashboard session; `sotto env use` changes the
+project's default. Press `r` to reveal or conceal the selected value, `c` to copy it to the
+clipboard, and `q` to quit. `Esc` closes the current search or dialog; from the main view, it
+clears an active search or quits.
+
+Press `t` to browse themes with a live preview. Use the arrow keys to preview each theme, then
+press `Enter` to save your choice or `Esc` to cancel. The [theme precedence rules](#output-themes)
+explain how command and environment overrides affect the saved preference.
 
 ### Output themes
 

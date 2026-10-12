@@ -53,6 +53,7 @@ interface OpenEnv {
   secrets: NamedSecret[];
 }
 interface Revealed {
+  id: string;
   name: string;
   value: string;
   link: string | null;
@@ -91,6 +92,7 @@ export function VaultView({
   const [copyBusy, setCopyBusy] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
   const copyGeneration = useRef(0);
+  const [secretQuery, setSecretQuery] = useState("");
   // Org members of the active project (loaded when an org env is opened), for the share picker.
   const [members, setMembers] = useState<Member[] | null>(null);
   const [shareTo, setShareTo] = useState("");
@@ -107,6 +109,8 @@ export function VaultView({
   // Selection loads can resolve out of order; only the latest generation may update the view.
   const projectLoad = useRef(0);
   const envLoad = useRef(0);
+  const revealGeneration = useRef(0);
+  const secretButtons = useRef(new Map<string, HTMLButtonElement>());
 
   /// The name-decryption key for a project: its org key when we hold one, else the master key.
   function nameKeyFor(orgId: string | null): Uint8Array {
@@ -174,6 +178,7 @@ export function VaultView({
     setEnvs(null);
     setOpenEnv(null);
     setRevealed(null);
+    setSecretQuery("");
     setMembers(null);
     setShareTo(""); // drop a stale member pick so the next env's Share button starts disabled
     try {
@@ -202,6 +207,7 @@ export function VaultView({
     setNotice(null);
     setOpenEnv(null);
     setRevealed(null);
+    setSecretQuery("");
     setMembers(null);
     setShareTo(""); // the new env reloads its own members; don't carry a stale pick across
     try {
@@ -403,7 +409,8 @@ export function VaultView({
     setError(null);
     try {
       const value = decryptSecretValue(openEnv.vaultKey, openEnv.envId, ns.entry);
-      setRevealed({ name: ns.name, value, link: null });
+      ++revealGeneration.current;
+      setRevealed({ id: ns.entry.id, name: ns.name, value, link: null });
     } catch (e) {
       setError(message(e));
     }
@@ -430,14 +437,42 @@ export function VaultView({
   }
 
   async function share(current: Revealed) {
+    const generation = revealGeneration.current;
     try {
       const { encBlob, fragmentKey } = sealForShare(current.value);
       const token = await createShare(encBlob, 1);
+      if (generation !== revealGeneration.current) {
+        return;
+      }
       const link = `${window.location.origin}/s/${token}#${bytesToUrlSafeB64(fragmentKey)}`;
       setRevealed({ ...current, link });
     } catch (e) {
-      setError(message(e));
+      if (generation === revealGeneration.current) {
+        setError(message(e));
+      }
     }
+  }
+
+  const normalizedSecretQuery = secretQuery.trim().toLocaleLowerCase();
+  const filteredSecrets =
+    openEnv?.secrets.filter((secret) =>
+      secret.name.toLocaleLowerCase().includes(normalizedSecretQuery),
+    ) ?? [];
+  const secretSearchStatus =
+    normalizedSecretQuery === ""
+      ? `${filteredSecrets.length} secret ${filteredSecrets.length === 1 ? "name" : "names"} available.`
+      : filteredSecrets.length === 0
+        ? "No secret names match this search."
+        : `${filteredSecrets.length} secret ${filteredSecrets.length === 1 ? "name matches" : "names match"} this search.`;
+
+  function hideRevealed() {
+    if (revealed === null) {
+      return;
+    }
+    const id = revealed.id;
+    ++revealGeneration.current;
+    setRevealed(null);
+    secretButtons.current.get(id)?.focus();
   }
 
   return (
@@ -522,18 +557,47 @@ export function VaultView({
           {openEnv.secrets.length === 0 ? (
             <p className="muted">No secrets in this environment.</p>
           ) : (
-            <ul className="items">
-              {openEnv.secrets.map((s) => (
+            <>
+              <label>
+                Search secret names
+                <input
+                  type="search"
+                  value={secretQuery}
+                  onChange={(e) => setSecretQuery(e.target.value)}
+                  autoComplete="off"
+                />
+              </label>
+              <p
+                className="muted"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+                aria-label="Secret search results"
+              >
+                {secretSearchStatus}
+              </p>
+              {filteredSecrets.length > 0 && (
+                <ul className="items">
+              {filteredSecrets.map((s) => (
                 <li key={s.entry.id}>
                   <button
+                    ref={(node) => {
+                      if (node === null) {
+                        secretButtons.current.delete(s.entry.id);
+                      } else {
+                        secretButtons.current.set(s.entry.id, node);
+                      }
+                    }}
                     onClick={() => reveal(s)}
-                    aria-current={revealed?.name === s.name ? "true" : undefined}
+                    aria-current={revealed?.id === s.entry.id ? "true" : undefined}
                   >
                     {s.name}
                   </button>
                 </li>
               ))}
-            </ul>
+                </ul>
+              )}
+            </>
           )}
           {members !== null && members.length > 0 && (
             <form
@@ -599,6 +663,9 @@ export function VaultView({
             {copyBusy ? "Copying…" : "Copy secret"}
           </button>
           {copyFeedback !== null && <p role="status">{copyFeedback}</p>}
+          <button className="ghost" onClick={hideRevealed}>
+            Hide secret
+          </button>
           {revealed.link === null ? (
             <button className="ghost" onClick={() => void share(revealed)}>
               Create one-time share link

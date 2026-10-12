@@ -124,7 +124,8 @@ async fn list_events(
         ));
     }
     // The audit log is the flagship Team feature; the trial covers it, expiry gates it.
-    crate::entitlements::require_team(&state.pool, &org_id, "the audit log").await?;
+    crate::entitlements::require_team(&state.pool, state.deployment_mode, &org_id, "the audit log")
+        .await?;
 
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let rows: Vec<EventRow> = sqlx::query_as(

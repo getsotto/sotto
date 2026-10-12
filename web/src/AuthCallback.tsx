@@ -16,7 +16,9 @@ export function AuthCallback() {
       setError("Login could not be verified (state mismatch).");
       return;
     }
-    window.location.replace("/app");
+    const destination = sessionStorage.getItem("sotto_oauth_destination");
+    sessionStorage.removeItem("sotto_oauth_destination");
+    window.location.replace(destination === "/cloud" ? "/cloud" : "/app");
   }, []);
 
   // The state we stored is consumed above and the callback is fail-closed, so a retry has to start

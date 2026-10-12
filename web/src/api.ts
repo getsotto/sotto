@@ -116,6 +116,381 @@ export async function logout(): Promise<void> {
   }
 }
 
+export type EligibilityState =
+  | "free"
+  | "pending_initial_payment"
+  | "paid"
+  | "renewal_recovery"
+  | "export_only"
+  | "expired"
+  | "unavailable";
+
+export interface EligibilityView {
+  state: EligibilityState;
+  accountInitialized: boolean;
+  billingAvailable: boolean;
+  paidThroughEpoch: number | null;
+  recoveryUntilEpoch: number | null;
+  exportUntilEpoch: number | null;
+  actions: { setup: boolean; billing: boolean; export: boolean; revoke: boolean };
+  payer: "personal" | null;
+  deploymentMode: "cloud" | "self_hosted";
+}
+
+export async function fetchEligibility(): Promise<EligibilityView> {
+  const body = await authedJson<{
+    state: EligibilityState;
+    account_initialized: boolean;
+    billing_available: boolean;
+    paid_through_epoch: number | null;
+    recovery_until_epoch: number | null;
+    export_until_epoch: number | null;
+    actions: { setup: boolean; billing: boolean; export: boolean; revoke: boolean };
+    payer: "personal" | null;
+    deployment_mode: "cloud" | "self_hosted";
+  }>("/account/eligibility");
+  return {
+    state: body.state,
+    accountInitialized: body.account_initialized,
+    billingAvailable: body.billing_available,
+    paidThroughEpoch: body.paid_through_epoch,
+    recoveryUntilEpoch: body.recovery_until_epoch,
+    exportUntilEpoch: body.export_until_epoch,
+    actions: body.actions,
+    payer: body.payer,
+    deploymentMode: body.deployment_mode,
+  };
+}
+
+export interface CloudNotice {
+  noticeId: string;
+  kind: string;
+  channel: string;
+  content: {
+    title: string;
+    detail: string;
+    effectiveAtEpoch: number | null;
+    deadlineEpoch: number | null;
+    amountPence: number | null;
+  };
+  dueAtEpoch: number;
+  status: string;
+  lastErrorCode: string | null;
+  deliveredAtEpoch: number | null;
+  createdAtEpoch: number;
+}
+
+export async function fetchCloudNotices(): Promise<CloudNotice[]> {
+  const body = await authedJson<Array<{
+    notice_id: string;
+    kind: string;
+    channel: string;
+    content: {
+      title: string;
+      detail: string;
+      effective_at_epoch: number | null;
+      deadline_epoch: number | null;
+      amount_pence: number | null;
+    };
+    due_at_epoch: number;
+    status: string;
+    last_error_code: string | null;
+    delivered_at_epoch: number | null;
+    created_at_epoch: number;
+  }>>(
+    "/account/notices",
+  );
+  return body.map((notice) => ({
+    noticeId: notice.notice_id,
+    kind: notice.kind,
+    channel: notice.channel,
+    content: {
+      title: notice.content.title,
+      detail: notice.content.detail,
+      effectiveAtEpoch: notice.content.effective_at_epoch,
+      deadlineEpoch: notice.content.deadline_epoch,
+      amountPence: notice.content.amount_pence,
+    },
+    dueAtEpoch: notice.due_at_epoch,
+    status: notice.status,
+    lastErrorCode: notice.last_error_code,
+    deliveredAtEpoch: notice.delivered_at_epoch,
+    createdAtEpoch: notice.created_at_epoch,
+  }));
+}
+
+export interface PersonalQuote {
+  offer: "monthly" | "annual";
+  amountPence: number;
+  currency: string;
+  interval: string;
+  taxTreatment: string;
+  quoteVersion: number;
+  quoteExpiresAtEpoch: number;
+  founding: boolean;
+  foundingRemainingPlaces: number | null;
+  foundingTerm: string | null;
+  nextRenewalAmountPence: number;
+}
+
+export async function fetchPersonalQuote(offer: PersonalQuote["offer"]): Promise<PersonalQuote> {
+  const body = await authedJson<{
+    offer: PersonalQuote["offer"];
+    amount_pence: number;
+    currency: string;
+    interval: string;
+    tax_treatment: string;
+    quote_version: number;
+    quote_expires_at_epoch: number;
+    founding: boolean;
+    founding_remaining_places: number | null;
+    founding_term: string | null;
+    next_renewal_amount_pence: number;
+  }>(`/billing/personal/quote?offer=${encodeURIComponent(offer)}`);
+  return {
+    offer: body.offer,
+    amountPence: body.amount_pence,
+    currency: body.currency,
+    interval: body.interval,
+    taxTreatment: body.tax_treatment,
+    quoteVersion: body.quote_version,
+    quoteExpiresAtEpoch: body.quote_expires_at_epoch,
+    founding: body.founding,
+    foundingRemainingPlaces: body.founding_remaining_places,
+    foundingTerm: body.founding_term,
+    nextRenewalAmountPence: body.next_renewal_amount_pence,
+  };
+}
+
+export interface PersonalCheckoutResult {
+  operationId: string;
+  state: string;
+  checkoutUrl: string | null;
+}
+
+export async function createPersonalCheckout(input: {
+  offer: PersonalQuote["offer"];
+  idempotencyKey: string;
+  quoteVersion: number;
+  quoteExpiresAtEpoch: number;
+  returnUrl: string;
+}): Promise<PersonalCheckoutResult> {
+  const body = await postJson<{
+    operation_id: string;
+    state: string;
+    checkout_url: string | null;
+  }>("/billing/personal/checkout", {
+    offer: input.offer,
+    idempotency_key: input.idempotencyKey,
+    quote_version: input.quoteVersion,
+    quote_expires_at_epoch: input.quoteExpiresAtEpoch,
+    return_url: input.returnUrl,
+  });
+  return { operationId: body.operation_id, state: body.state, checkoutUrl: body.checkout_url };
+}
+
+export interface PersonalOperation {
+  operationId: string;
+  offer: string;
+  state: string;
+  checkoutUrl: string | null;
+}
+
+export async function fetchPersonalOperation(operationId: string): Promise<PersonalOperation> {
+  const body = await authedJson<{
+    operation_id: string;
+    offer: string;
+    state: string;
+    checkout_url: string | null;
+  }>(`/billing/personal/operations/${encodeURIComponent(operationId)}`);
+  return {
+    operationId: body.operation_id,
+    offer: body.offer,
+    state: body.state,
+    checkoutUrl: body.checkout_url,
+  };
+}
+
+export interface PersonalLifecycle {
+  state: string;
+  paidThroughDate: string | null;
+  cancelAtPeriodEnd: boolean;
+  portalUrl: string | null;
+}
+
+export async function createPersonalPortal(): Promise<PersonalLifecycle> {
+  return parsePersonalLifecycle(await postJson<PersonalLifecycleResponse>("/billing/personal/portal", {}));
+}
+
+export async function cancelPersonalBilling(idempotencyKey: string): Promise<PersonalLifecycle> {
+  return parsePersonalLifecycle(
+    await postJson<PersonalLifecycleResponse>("/billing/personal/cancel", {
+      idempotency_key: idempotencyKey,
+    }),
+  );
+}
+
+interface PersonalLifecycleResponse {
+  state: string;
+  paid_through_date: string | null;
+  cancel_at_period_end: boolean;
+  portal_url: string | null;
+}
+
+function parsePersonalLifecycle(body: PersonalLifecycleResponse): PersonalLifecycle {
+  return {
+    state: body.state,
+    paidThroughDate: body.paid_through_date,
+    cancelAtPeriodEnd: body.cancel_at_period_end,
+    portalUrl: body.portal_url,
+  };
+}
+
+export interface RefundRequest {
+  requestId: string;
+  state: string;
+  reason: string;
+  amountPence: number | null;
+  fullRefundRequested: boolean;
+  preservePaidTerm: boolean;
+  effectiveAtEpoch: number | null;
+}
+
+function parseRefund(body: {
+  request_id: string;
+  state: string;
+  reason: string;
+  amount_pence: number | null;
+  full_refund_requested: boolean;
+  preserve_paid_term: boolean;
+  effective_at_epoch: number | null;
+}): RefundRequest {
+  return {
+    requestId: body.request_id,
+    state: body.state,
+    reason: body.reason,
+    amountPence: body.amount_pence,
+    fullRefundRequested: body.full_refund_requested,
+    preservePaidTerm: body.preserve_paid_term,
+    effectiveAtEpoch: body.effective_at_epoch,
+  };
+}
+
+export async function requestPersonalRefund(input: {
+  reason: string;
+  amountPence?: number;
+  fullRefund: boolean;
+  idempotencyKey: string;
+}): Promise<RefundRequest> {
+  return parseRefund(
+    await postJson("/billing/personal/refunds", {
+      reason: input.reason,
+      amount_pence: input.amountPence ?? null,
+      full_refund: input.fullRefund,
+      idempotency_key: input.idempotencyKey,
+    }),
+  );
+}
+
+export async function fetchPersonalRefund(requestId: string): Promise<RefundRequest> {
+  return parseRefund(await authedJson(`/billing/personal/refunds/${encodeURIComponent(requestId)}`));
+}
+
+export interface SponsoredSeat {
+  seatId: string;
+  beneficiaryId: string;
+  offer: string;
+  effectiveFrom: number;
+  effectiveUntil: number | null;
+  state: string;
+}
+
+export async function fetchSponsoredSeats(orgId: string): Promise<SponsoredSeat[]> {
+  const rows = await authedJson<Array<{
+    seat_id: string; beneficiary_id: string; offer: string;
+    effective_from: number; effective_until: number | null; state: string;
+  }>>(`/orgs/${encodeURIComponent(orgId)}/billing/sponsored/seats`);
+  return rows.map((row) => ({ seatId: row.seat_id, beneficiaryId: row.beneficiary_id, offer: row.offer, effectiveFrom: row.effective_from, effectiveUntil: row.effective_until, state: row.state }));
+}
+
+export interface SponsoredQuote {
+  action: string;
+  seatCount: number;
+  amountPence: number;
+  currency: string;
+  interval: string;
+  quoteVersion: number;
+  quoteExpiresAtEpoch: number;
+}
+
+export async function fetchSponsoredQuote(orgId: string, input: { action: string; offer: string; beneficiaryIds: string[] }): Promise<SponsoredQuote> {
+  const body = await postJson<{
+    action: string; seat_count: number; amount_pence: number; currency: string; interval: string;
+    quote_version: number; quote_expires_at_epoch: number;
+  }>(`/orgs/${encodeURIComponent(orgId)}/billing/sponsored/quote`, {
+    action: input.action,
+    offer: input.offer,
+    beneficiary_ids: input.beneficiaryIds,
+  });
+  return { action: body.action, seatCount: body.seat_count, amountPence: body.amount_pence, currency: body.currency, interval: body.interval, quoteVersion: body.quote_version, quoteExpiresAtEpoch: body.quote_expires_at_epoch };
+}
+
+export async function createSponsoredCheckout(orgId: string, input: {
+  action: string; offer: string; beneficiaryId: string; replacementBeneficiaryId?: string;
+  quoteVersion: number; quoteExpiresAtEpoch: number; effectiveFrom: number; effectiveUntil?: number;
+  idempotencyKey: string; returnUrl: string;
+}): Promise<{ operationId: string; state: string; checkoutUrl: string | null }> {
+  const body = await postJson<{ operation_id: string; state: string; provider_checkout_url: string | null }>(`/orgs/${encodeURIComponent(orgId)}/billing/sponsored/checkout`, {
+    action: input.action, offer: input.offer, beneficiary_id: input.beneficiaryId, replacement_beneficiary_id: input.replacementBeneficiaryId ?? null,
+    quote_version: input.quoteVersion, quote_expires_at_epoch: input.quoteExpiresAtEpoch, effective_from: input.effectiveFrom,
+    effective_until: input.effectiveUntil ?? null, idempotency_key: input.idempotencyKey, return_url: input.returnUrl,
+  });
+  return { operationId: body.operation_id, state: body.state, checkoutUrl: body.provider_checkout_url };
+}
+
+export interface ExportManifest {
+  version: number;
+  exportId: string;
+  manifestHash: string;
+  expiresAt: string;
+  totalChunks: number;
+  complete: boolean;
+  projects: unknown[];
+  environments: unknown[];
+  notSharedEnvironmentIds: string[];
+  omittedEnvironmentCount: number;
+}
+
+export async function startCloudExport(): Promise<ExportManifest> {
+  const resp = await request("/account/export", { method: "POST", ...CREDS });
+  if (!resp.ok) throw new Error(`export could not be started (server error ${resp.status})`);
+  const body = await readBody(() => resp.json()) as {
+    version: number; export_id: string; manifest_hash: string; expires_at: string;
+    total_chunks: number; complete: boolean; projects: unknown[]; environments: unknown[];
+    not_shared_environment_ids: string[]; omitted_environment_count: number;
+  };
+  return { version: body.version, exportId: body.export_id, manifestHash: body.manifest_hash,
+    expiresAt: body.expires_at, totalChunks: body.total_chunks, complete: body.complete,
+    projects: body.projects, environments: body.environments,
+    notSharedEnvironmentIds: body.not_shared_environment_ids,
+    omittedEnvironmentCount: body.omitted_environment_count };
+}
+
+export async function fetchCloudExportChunk(exportId: string, index: number): Promise<unknown> {
+  return authedJson(`/account/export/${encodeURIComponent(exportId)}/chunks/${index}`);
+}
+
+async function postJson<T>(path: string, value: unknown): Promise<T> {
+  const resp = await request(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(value),
+    ...CREDS,
+  });
+  if (!resp.ok) throw new Error(`server error (${resp.status})`);
+  return readBody(() => resp.json()) as Promise<T>;
+}
+
 export interface Account {
   /// KDF salt, needed to derive the master key.
   salt: Uint8Array;
@@ -322,8 +697,10 @@ export interface Entitlements {
   effectiveTier: string;
   trialEndsAt: string | null;
   limits: { maxMembers: number; maxOrgProjects: number } | null;
-  /// Whether this instance can take payment; upgrade controls are hidden when `false`.
+  /// Whether configured billing can still manage an existing subscription.
   billingEnabled: boolean;
+  /// Whether new hosted purchases are enabled; falls back for servers that predate this field.
+  purchasesEnabled: boolean;
 }
 
 /// The org's plan (tier, trial, limits), visible to any member.
@@ -334,6 +711,7 @@ export async function fetchEntitlements(orgId: string): Promise<Entitlements> {
     trial_ends_at: string | null;
     limits: { max_members: number; max_org_projects: number } | null;
     billing_enabled: boolean;
+    purchases_enabled?: boolean;
   }>(`/orgs/${encodeURIComponent(orgId)}/entitlements`);
   return {
     tier: r.tier,
@@ -343,6 +721,7 @@ export async function fetchEntitlements(orgId: string): Promise<Entitlements> {
       ? { maxMembers: r.limits.max_members, maxOrgProjects: r.limits.max_org_projects }
       : null,
     billingEnabled: r.billing_enabled,
+    purchasesEnabled: r.purchases_enabled ?? r.billing_enabled,
   };
 }
 

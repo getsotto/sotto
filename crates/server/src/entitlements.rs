@@ -15,6 +15,7 @@ use serde::Serialize;
 use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::auth::AuthUser;
+use crate::config::DeploymentMode;
 use crate::error::{Error, Result};
 use crate::org;
 use crate::state::AppState;
@@ -56,7 +57,15 @@ pub async fn effective_tier(pool: &PgPool, org_id: &str) -> Result<Tier> {
 }
 
 /// Gate a Team-only feature: `402` with an actionable message on the free tier.
-pub async fn require_team(pool: &PgPool, org_id: &str, feature: &str) -> Result<()> {
+pub async fn require_team(
+    pool: &PgPool,
+    deployment_mode: DeploymentMode,
+    org_id: &str,
+    feature: &str,
+) -> Result<()> {
+    if deployment_mode == DeploymentMode::SelfHosted {
+        return Ok(());
+    }
     match effective_tier(pool, org_id).await? {
         Tier::Team => Ok(()),
         Tier::Free => Err(Error::Quota(format!(
@@ -88,8 +97,14 @@ async fn effective_tier_locked(tx: &mut Transaction<'_, Postgres>, org_id: &str)
 /// Quota gate for adding a member (free tier: at most [`FREE_MAX_MEMBERS`]). Runs inside `tx` and
 /// locks the org row, so the count and the caller's insert commit atomically - two concurrent adds
 /// can't both pass the check and overshoot the limit.
-pub async fn check_can_add_member(tx: &mut Transaction<'_, Postgres>, org_id: &str) -> Result<()> {
-    if effective_tier_locked(tx, org_id).await? == Tier::Team {
+pub async fn check_can_add_member(
+    tx: &mut Transaction<'_, Postgres>,
+    deployment_mode: DeploymentMode,
+    org_id: &str,
+) -> Result<()> {
+    if deployment_mode == DeploymentMode::SelfHosted
+        || effective_tier_locked(tx, org_id).await? == Tier::Team
+    {
         return Ok(());
     }
     let members: i64 =
@@ -113,10 +128,13 @@ pub async fn check_can_add_member(tx: &mut Transaction<'_, Postgres>, org_id: &s
 /// the same lock so a concurrent re-create of a just-created id isn't mistaken for a new one.
 pub async fn check_can_create_org_project(
     tx: &mut Transaction<'_, Postgres>,
+    deployment_mode: DeploymentMode,
     org_id: &str,
     project_id: &str,
 ) -> Result<()> {
-    if effective_tier_locked(tx, org_id).await? == Tier::Team {
+    if deployment_mode == DeploymentMode::SelfHosted
+        || effective_tier_locked(tx, org_id).await? == Tier::Team
+    {
         return Ok(());
     }
     let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM projects WHERE id = $1")
@@ -154,9 +172,11 @@ struct EntitlementsView {
     trial_ends_at: Option<String>,
     /// The numeric limits in effect; `null` on the Team tier (unlimited).
     limits: Option<Limits>,
-    /// Whether this instance can take payment (the `STRIPE_*` variables are set). Clients hide
-    /// upgrade affordances when `false` - a self-hosted instance has no checkout to offer.
+    /// Whether billing is configured, so existing customers can still manage their subscription.
     billing_enabled: bool,
+    /// Whether new hosted purchases are currently available. This can be paused independently of
+    /// billing management and settlement.
+    purchases_enabled: bool,
 }
 
 /// `GET /orgs/{org_id}/entitlements` - the org's plan, visible to any member.
@@ -176,7 +196,13 @@ async fn get_entitlements(
     .bind(&org_id)
     .fetch_one(&state.pool)
     .await?;
-    let effective = effective_tier(&state.pool, &org_id).await?;
+    let effective = if state.deployment_mode == crate::config::DeploymentMode::SelfHosted {
+        // Self-hosted deployments have no commercial tier or quota. Report the unlimited view
+        // that matches the write gates so clients do not hide features that are available.
+        Tier::Team
+    } else {
+        effective_tier(&state.pool, &org_id).await?
+    };
 
     Ok(Json(EntitlementsView {
         tier,
@@ -192,6 +218,12 @@ async fn get_entitlements(
                 max_org_projects: FREE_MAX_ORG_PROJECTS,
             }),
         },
-        billing_enabled: state.billing.is_some(),
+        billing_enabled: state.deployment_mode == crate::config::DeploymentMode::Cloud
+            && state.billing.is_some(),
+        purchases_enabled: state.deployment_mode == crate::config::DeploymentMode::Cloud
+            && state
+                .billing
+                .as_ref()
+                .is_some_and(crate::billing::BillingState::cloud_sales_enabled),
     }))
 }

@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use thiserror::Error;
 
-use crate::cloud_provider_refresh_jobs::{self, RefreshJobError, RefreshJobLease};
+use crate::cloud_provider_refresh_inputs::{self, RefreshInputError, RefreshJobInputs};
+use crate::cloud_provider_refresh_jobs::{self, RefreshJobError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshExecutionError {
@@ -38,13 +39,15 @@ pub enum RefreshExecutionErrorInput {
 
 #[async_trait]
 pub trait RefreshJobExecutor: Send {
-    async fn execute(&mut self, lease: &RefreshJobLease) -> Result<(), RefreshExecutionError>;
+    async fn execute(&mut self, inputs: &RefreshJobInputs) -> Result<(), RefreshExecutionError>;
 }
 
 #[derive(Debug, Error)]
 pub enum RefreshWorkerError {
     #[error("refresh queue error: {0}")]
     Queue(#[from] RefreshJobError),
+    #[error("refresh input error: {0}")]
+    Input(#[from] RefreshInputError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +71,24 @@ pub async fn run_once<E: RefreshJobExecutor + ?Sized>(
     let Some(lease) = cloud_provider_refresh_jobs::claim_due(pool, worker_id).await? else {
         return Ok(RefreshWorkerOutcome::Idle);
     };
-    match executor.execute(&lease).await {
+    let inputs = match cloud_provider_refresh_inputs::load(pool, &lease).await {
+        Ok(inputs) => inputs,
+        Err(RefreshInputError::Database(error)) => {
+            return Err(RefreshWorkerError::Input(RefreshInputError::Database(
+                error,
+            )));
+        }
+        Err(_error) => {
+            let retrying =
+                cloud_provider_refresh_jobs::fail(pool, &lease, "refresh_input_invalid").await?;
+            return Ok(if retrying {
+                RefreshWorkerOutcome::Retried
+            } else {
+                RefreshWorkerOutcome::Poisoned
+            });
+        }
+    };
+    match executor.execute(&inputs).await {
         Ok(()) => {
             cloud_provider_refresh_jobs::complete(pool, &lease).await?;
             Ok(RefreshWorkerOutcome::Completed)

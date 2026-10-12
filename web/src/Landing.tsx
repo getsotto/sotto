@@ -7,11 +7,16 @@ import "./styles/landing.css";
 const REPO = "https://github.com/getsotto/sotto";
 const INSTALL_CMD =
   "curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh";
+const POWERSHELL_INSTALL_CMD =
+  "irm https://raw.githubusercontent.com/getsotto/sotto/main/install.ps1 | iex";
+const CLOUD_PRICING_VISIBLE = import.meta.env.VITE_CLOUD_PRICING_VISIBLE === "true";
 
 // The marketing page an anonymous visitor gets at `/`. The vault app lives at /app; this page's
 // job is the top of the funnel: see it → install it. Everything is real, selectable text - the
 // terminal below is a transcript of actual CLI output, not an image.
-export function Landing() {
+export function Landing({
+  cloudPricingVisible = CLOUD_PRICING_VISIBLE,
+}: { cloudPricingVisible?: boolean } = {}) {
   return (
     <main className="landing">
       <header>
@@ -41,11 +46,18 @@ export function Landing() {
           <code>{INSTALL_CMD}</code>
           <CopyButton text={INSTALL_CMD} />
         </div>
+        <p className="muted">On Windows, run this in PowerShell:</p>
+        <div className="install">
+          <code>{POWERSHELL_INSTALL_CMD}</code>
+          <CopyButton text={POWERSHELL_INSTALL_CMD} />
+        </div>
         <p className="muted">
-          Signed binaries for macOS and Linux. The installer verifies the checksum, and the
-          Sigstore signature when <code>cosign</code> is installed. Prefer to{" "}
-          <a href={`${REPO}/blob/main/install.sh`}>read it first</a>? Or grab a tarball from{" "}
-          <a href={`${REPO}/releases`}>releases</a>.
+          Prebuilt, signed binaries are available for macOS, Linux, and Windows x86_64. The
+          installers verify the archive&rsquo;s SHA-256 checksum and, when <code>cosign</code> is
+          installed, its Sigstore signature. Read the{" "}
+          <a href={`${REPO}/blob/main/install.sh`}>shell installer</a> or the{" "}
+          <a href={`${REPO}/blob/main/install.ps1`}>PowerShell installer</a>, or download a tarball
+          from <a href={`${REPO}/releases`}>releases</a>.
         </p>
       </section>
 
@@ -110,34 +122,7 @@ export function Landing() {
 
       <section id="pricing">
         <h2>Pricing</h2>
-        <div className="plans">
-          <div className="plan">
-            <h3>Free</h3>
-            <p className="price">£0</p>
-            <ul>
-              <li>Personal projects: unlimited, free forever</li>
-              <li>Organisations with up to 3 members and 1 shared project</li>
-              <li>One-time, burn-after-reading share links</li>
-              <li>Every new org starts a 14-day Team trial</li>
-            </ul>
-          </div>
-          <div className="plan">
-            <h3>Team</h3>
-            <p className="price">
-              £15<span className="per"> / month per organisation</span>
-            </p>
-            <ul>
-              <li>Unlimited members</li>
-              <li>Unlimited shared projects</li>
-              <li>Audit log</li>
-              <li>Flat: the price doesn&rsquo;t scale with team size</li>
-            </ul>
-          </div>
-        </div>
-        <p className="muted">
-          Or run it yourself: the <a href={`${REPO}/blob/main/deploy/README.md`}>server is
-            self-hostable</a> and Apache-2.0. Self-hosted organisations use the same plan limits by default: up to 3 members and 1 shared project on Free. Operators can assign tiers manually; see the deployment runbook.
-        </p>
+        {cloudPricingVisible ? <CloudPricing /> : <LegacyPricing />}
       </section>
 
       <CommunitySection />
@@ -180,6 +165,85 @@ sotto share DATABASE_URL     # one-time link for a single secret`}</code>
         </p>
       </footer>
     </main>
+  );
+}
+
+function LegacyPricing() {
+  return (
+    <>
+      <div className="plans">
+        <div className="plan">
+          <h3>Free</h3>
+          <p className="price">£0</p>
+          <ul>
+            <li>Personal projects: unlimited, free forever</li>
+            <li>Organisations with up to 3 members and 1 shared project</li>
+            <li>One-time, burn-after-reading share links</li>
+            <li>Every new org starts a 14-day Team trial</li>
+          </ul>
+        </div>
+        <div className="plan">
+          <h3>Team</h3>
+          <p className="price">
+            £15<span className="per"> / month per organisation</span>
+          </p>
+          <ul>
+            <li>Unlimited members</li>
+            <li>Unlimited shared projects</li>
+            <li>Audit log</li>
+            <li>Flat: the price doesn&rsquo;t scale with team size</li>
+          </ul>
+        </div>
+      </div>
+      <p className="muted">
+        Or run it yourself: the <a href={`${REPO}/blob/main/deploy/README.md`}>server is
+          self-hostable</a> and Apache-2.0. Self-hosted organisations use the same plan limits by
+        default: up to 3 members and 1 shared project on Free. Operators can assign tiers manually;
+        see the deployment runbook.
+      </p>
+    </>
+  );
+}
+
+function CloudPricing() {
+  return (
+    <>
+      <div className="plans">
+        <div className="plan">
+          <h3>Local and self-hosted</h3>
+          <p className="price">Free</p>
+          <ul>
+            <li>Open-source Sotto, running on your devices or your own server</li>
+            <li>Keep control of hosting and operating costs</li>
+            <li>Share links remain free for recipients</li>
+          </ul>
+        </div>
+        <div className="plan">
+          <h3>Sotto Cloud</h3>
+          <p className="price">£2.99<span className="per"> / person / month</span></p>
+          <ul>
+            <li>Or £29.99 per person / year</li>
+            <li>First 100 named paid seats: £1.99 monthly for 12 months, then £2.99; or £19.99 for the first year, then £29.99</li>
+            <li>No trial; hosted access starts after payment is confirmed</li>
+          </ul>
+        </div>
+      </div>
+      <p className="muted">
+        Cloud is operated by Sotto and has no SLA. The source is open and can be self-hosted.
+        Prices and applicable taxes are confirmed at checkout. Free one-time links have a limit
+        of three active links per account, one view each, with a seven-day expiry.
+      </p>
+      <SelfHostedPricingNote />
+    </>
+  );
+}
+
+function SelfHostedPricingNote() {
+  return (
+    <p className="muted">
+      Or run it yourself: the <a href={`${REPO}/blob/main/deploy/README.md`}>server is
+        self-hostable</a> and Apache-2.0.
+    </p>
   );
 }
 

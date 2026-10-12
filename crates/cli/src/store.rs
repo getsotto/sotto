@@ -234,6 +234,26 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Run a group of local restore writes atomically.
+    pub fn transaction<T>(
+        &self,
+        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let value = operation(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    /// Remove the identity and account keys after a failed restore rollback.
+    pub fn clear_identity(&self) -> Result<()> {
+        self.transaction(|tx| {
+            tx.execute("DELETE FROM identity WHERE id = 1", [])?;
+            tx.execute("DELETE FROM account_keys WHERE id = 1", [])?;
+            Ok(())
+        })
+    }
+
     // --- projects ---
 
     pub fn create_project(&self, name: &str) -> Result<Project> {

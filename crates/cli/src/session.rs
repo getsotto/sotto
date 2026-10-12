@@ -163,6 +163,14 @@ pub fn restore(
     cache_session(keychain, &master_key, ttl)
 }
 
+/// Remove the local credentials after a restore whose resource import failed.
+pub fn rollback_restore(store: &Store, keychain: &dyn Keychain) -> Result<()> {
+    let store_result = store.clear_identity();
+    let _ = keychain.delete(KC_SECRET_KEY);
+    let _ = keychain.delete(KC_SESSION);
+    store_result
+}
+
 /// Re-derive the master key from the password, verify it, and start a session.
 pub fn unlock(
     store: &Store,

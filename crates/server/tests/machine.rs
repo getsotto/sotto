@@ -27,9 +27,23 @@ async fn pool_or_skip() -> Option<PgPool> {
 }
 
 fn app(pool: PgPool) -> Router {
+    app_with_policy(
+        pool,
+        sotto_server::config::DeploymentMode::SelfHosted,
+        false,
+    )
+}
+
+fn app_with_policy(
+    pool: PgPool,
+    deployment_mode: sotto_server::config::DeploymentMode,
+    machine_eligibility_enforcement_enabled: bool,
+) -> Router {
     let state = AppState {
-        deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
+        deployment_mode,
         telemetry_ingest: false,
+        cloud_action_enforcement_enabled: false,
+        machine_eligibility_enforcement_enabled,
         pool,
         oauth: None,
         oauth_config: None,
@@ -85,6 +99,16 @@ async fn request(
     token: &str,
     body: Option<String>,
 ) -> (StatusCode, String) {
+    request_with_router(app(pool.clone()), method, uri, token, body).await
+}
+
+async fn request_with_router(
+    router: Router,
+    method: &str,
+    uri: &str,
+    token: &str,
+    body: Option<String>,
+) -> (StatusCode, String) {
     let builder = Request::builder()
         .method(method)
         .uri(uri)
@@ -96,7 +120,7 @@ async fn request(
             .expect("req"),
         None => builder.body(Body::empty()).expect("req"),
     };
-    let resp = app(pool.clone()).oneshot(req).await.expect("oneshot");
+    let resp = router.oneshot(req).await.expect("oneshot");
     let status = resp.status();
     (status, body_text(resp).await)
 }
@@ -236,6 +260,57 @@ async fn machine_reads_its_grant_and_secrets() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(&token_id));
     assert!(body.contains(&b64(&[0xAB; 32])));
+    assert!(body.contains("beneficiary_id"));
+    assert!(body.contains("mt-read-owner"));
+    assert!(body.contains("\"beneficiary_status\":\"verified\""));
+}
+
+#[tokio::test]
+async fn hosted_machine_policy_rejects_an_ineligible_beneficiary() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (o, p, e) = ("mt-policy-o", "mt-policy-p", "mt-policy-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-policy-owner").await;
+    let (_token_id, api_token) = create_token(&pool, &owner, e, b"machine-grant").await;
+
+    let (status, body) = request_with_router(
+        app_with_policy(
+            pool.clone(),
+            sotto_server::config::DeploymentMode::Cloud,
+            true,
+        ),
+        "GET",
+        "/machine/grant",
+        &api_token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+    assert!(body.contains("machine access requires an eligible Cloud account"));
+
+    let (status, body) = request_with_router(
+        app_with_policy(
+            pool.clone(),
+            sotto_server::config::DeploymentMode::Cloud,
+            true,
+        ),
+        "POST",
+        &format!("/environments/{e}/tokens"),
+        &owner,
+        Some(token_body("blocked", b"machine-grant")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+    assert!(body.contains("machine access requires an eligible Cloud account"));
+
+    let (status, _) = get(&pool, &api_token, "/machine/grant").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "self-hosted machine access remains local"
+    );
 }
 
 #[tokio::test]

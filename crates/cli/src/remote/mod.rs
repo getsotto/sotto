@@ -9,6 +9,7 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod export;
 pub mod http;
 pub mod machine;
 pub mod share;

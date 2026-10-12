@@ -5,8 +5,10 @@
  *
  * An author is greeted once on their first issue and once on their first pull
  * request in this repository. An earlier item of the same kind counts whether
- * it is open, closed, or merged; items from other authors never count; and
+ * it is open, closed, or merged; items from other accounts never count; and
  * items numbered after the current one cannot block the earliest greeting.
+ * Authors are identified by account id, never by login, because a login can
+ * change between the event and the run (see run()).
  * A bot greeting already on the item suppresses a second post, so rerunning
  * the workflow is safe. Any API error propagates and fails the check rather
  * than being mistaken for a new contributor.
@@ -22,14 +24,14 @@ function isPullRequestItem(item) {
 }
 
 /**
- * True when `history` holds an item of the same kind by the same author with
+ * True when `history` holds an item of the same kind by the same account with
  * a lower number than the item being greeted.
  */
-function hasEarlierContribution(history, isPr, author, number) {
+function hasEarlierContribution(history, isPr, authorId, number) {
   return history.some(
     (item) =>
       item.user &&
-      item.user.login === author &&
+      item.user.id === authorId &&
       isPullRequestItem(item) === isPr &&
       item.number < number
   );
@@ -62,18 +64,29 @@ async function run({ github, context, core, issueMessage, prMessage }) {
 
   const kind = isPr ? "pull request" : "issue";
   const number = item.number;
-  const author = item.user.login;
+  const authorId = item.user.id;
   const message = isPr ? prMessage : issueMessage;
   if (!message) {
     throw new Error(`No greeting message configured for a first ${kind}.`);
   }
 
+  // The payload's login is the one the author had when the event fired, and
+  // a run can sit queued for minutes after that. An author who renamed in
+  // between (PRs #408 to #411, "TayfurYldz" to "tayfuryldz") has their
+  // history listed under the new login, and GitHub answers creator=<a login
+  // nobody holds> with an empty list, not an error. So look up the account's
+  // current login by its id, which never changes.
+  const { data: account } = await github.request("GET /user/{account_id}", {
+    account_id: authorId,
+  });
+  const author = account.login;
+
   core.info(`Checking whether ${author}'s ${kind} #${number} is their first.`);
 
   // creator narrows the scan to this author's items; state: all counts open,
-  // closed, and merged alike. paginate follows every page, and the login
-  // check inside hasEarlierContribution keeps other authors out even if the
-  // API ever returns them.
+  // closed, and merged alike. paginate follows every page, and the id check
+  // inside hasEarlierContribution keeps other accounts out even if the API
+  // ever returns them.
   const history = await github.paginate(github.rest.issues.listForRepo, {
     owner,
     repo,
@@ -82,7 +95,7 @@ async function run({ github, context, core, issueMessage, prMessage }) {
     per_page: 100,
   });
 
-  if (hasEarlierContribution(history, isPr, author, number)) {
+  if (hasEarlierContribution(history, isPr, authorId, number)) {
     core.info(`${author} already has an earlier ${kind} here; no greeting.`);
     return { greeted: false, reason: "returning-contributor" };
   }

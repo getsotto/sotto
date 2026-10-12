@@ -87,7 +87,7 @@ export const guidePages: SeoPageData[] = [
       },
     ],
     closingTitle: "Stop pasting secrets into chat",
-    closingBody: "Free for personal use. One command to install, one command to share your first secret.",
+    closingBody: "Use a free one-time link to share your first secret. No account is needed by the recipient.",
   },
   {
     slug: "share-env-files",
@@ -134,7 +134,7 @@ export const guidePages: SeoPageData[] = [
       },
     ],
     closingTitle: "One vault, whole team",
-    closingBody: "Free for teams of up to three, with one shared project. Import your .env in under a minute.",
+    closingBody: "Sotto is open source and can be self-hosted. Import your .env in under a minute.",
   },
   {
     slug: "one-time-secret-links",
@@ -180,7 +180,7 @@ export const guidePages: SeoPageData[] = [
       },
     ],
     closingTitle: "Send your first burning link",
-    closingBody: "Free for personal use. No recipient account required, ever.",
+    closingBody: "The recipient opens a free one-time link without creating an account.",
   },
   {
     slug: "share-api-keys-securely",
@@ -229,7 +229,7 @@ export const guidePages: SeoPageData[] = [
       },
     ],
     closingTitle: "Keys change. Chat is forever.",
-    closingBody: "Free for personal use, and for teams of up to three sharing one project.",
+    closingBody: "Run Sotto locally or self-host it, and share a free one-time link with anyone.",
   },
   {
     slug: "send-password-securely",
@@ -275,7 +275,7 @@ export const guidePages: SeoPageData[] = [
       },
     ],
     closingTitle: "Stop texting passwords in plain text",
-    closingBody: "Free for personal use. First burning link in under a minute.",
+    closingBody: "Create a free one-time link in under a minute; the recipient needs no account.",
   },
   {
     slug: "self-hosted-secret-management",

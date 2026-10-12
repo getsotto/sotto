@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Compare two legacy billing inventories without printing their contents.
+
+The comparison is for the restart leg of the cutover rehearsal. Generated timestamps are expected
+to differ; counts, provenance and the no-side-effects activation gate are not.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+def load(path: str) -> dict:
+    with Path(path).open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict) or value.get("inventory_version") != 1:
+        raise ValueError(f"{path} is not a version 1 inventory")
+    if set(value) != {"inventory_version", "generated_at", "source", "provenance", "cohorts", "activation"}:
+        raise ValueError(f"{path} has an incomplete inventory shape")
+    if value["source"] != "read_only_postgres_aggregate" or not isinstance(value["generated_at"], str):
+        raise ValueError(f"{path} has invalid inventory provenance")
+    provenance = value["provenance"]
+    if (
+        not isinstance(provenance, dict)
+        or set(provenance) != {"latest_migration", "postgres_version_num"}
+        or not all(isinstance(item, str) and item for item in provenance.values())
+    ):
+        raise ValueError(f"{path} has invalid database provenance")
+    cohorts = value["cohorts"]
+    if not isinstance(cohorts, list):
+        raise ValueError(f"{path} has invalid cohort rows")
+    seen_rows = set()
+    for row in cohorts:
+        if not isinstance(row, dict) or set(row) != {"category", "label", "count", "proposed_treatment"}:
+            raise ValueError(f"{path} has an invalid cohort row")
+        if (
+            not isinstance(row["category"], str)
+            or not row["category"]
+            or not isinstance(row["label"], str)
+            or not row["label"]
+            or not isinstance(row["proposed_treatment"], str)
+            or not row["proposed_treatment"]
+            or not isinstance(row["count"], int)
+            or isinstance(row["count"], bool)
+            or row["count"] < 0
+        ):
+            raise ValueError(f"{path} has an invalid cohort row")
+        identity = (row["category"], row["label"])
+        if identity in seen_rows:
+            raise ValueError(f"{path} repeats a cohort row")
+        seen_rows.add(identity)
+    activation = value.get("activation")
+    if not isinstance(activation, dict) or set(activation) != {
+        "writes_performed",
+        "charges_created",
+        "automatic_transition_approved",
+        "decision_gate",
+    } or any(
+        activation.get(name) is not False
+        for name in ("writes_performed", "charges_created", "automatic_transition_approved")
+    ) or activation["decision_gate"] != "D09":
+        raise ValueError(f"{path} is not a read-only inventory")
+    return value
+
+
+def comparable(value: dict) -> dict:
+    return {key: value[key] for key in value if key != "generated_at"}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("before")
+    parser.add_argument("after")
+    args = parser.parse_args(argv)
+    try:
+        before = load(args.before)
+        after = load(args.after)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"legacy billing inventory comparison failed: {error}", file=sys.stderr)
+        return 1
+    if comparable(before) != comparable(after):
+        print("legacy billing inventory changed during the restart rehearsal", file=sys.stderr)
+        return 1
+    print(f"legacy billing inventory stable: {len(after.get('cohorts', []))} aggregate rows")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

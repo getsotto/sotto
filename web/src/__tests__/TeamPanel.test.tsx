@@ -51,6 +51,7 @@ const freePlan: Entitlements = {
   trialEndsAt: null,
   limits: { maxMembers: 3, maxOrgProjects: 1 },
   billingEnabled: false,
+  purchasesEnabled: false,
 };
 
 describe("TeamPanel organisation loading", () => {
@@ -371,13 +372,43 @@ describe("TeamPanel billing request ownership", () => {
   const admin = (id: string): Org => ({
     id, encName: new Uint8Array(), role: "admin", encOrgKey: null,
   });
-  const billablePlan: Entitlements = { ...freePlan, billingEnabled: true };
+  const billablePlan: Entitlements = { ...freePlan, billingEnabled: true, purchasesEnabled: true };
 
   beforeEach(() => {
     vi.resetAllMocks();
     vi.mocked(api.fetchOrgs).mockResolvedValue([admin("org-a"), admin("org-b")]);
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchAudit).mockResolvedValue([]);
     vi.mocked(api.fetchEntitlements).mockResolvedValue(billablePlan);
+  });
+
+  it("hides upgrades while sales are paused but keeps the existing billing portal", async () => {
+    vi.mocked(api.fetchEntitlements).mockResolvedValue({
+      ...billablePlan,
+      tier: "team",
+      effectiveTier: "team",
+      limits: null,
+      purchasesEnabled: false,
+    });
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+
+    expect(await screen.findByRole("button", { name: "Manage billing" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Upgrade to Team" })).not.toBeInTheDocument();
+  });
+
+  it("does not offer a new upgrade when sales are paused", async () => {
+    vi.mocked(api.fetchEntitlements).mockResolvedValue({
+      ...billablePlan,
+      purchasesEnabled: false,
+    });
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+
+    await screen.findByText(/Plan:/);
+    expect(screen.queryByRole("button", { name: "Upgrade to Team" })).not.toBeInTheDocument();
   });
 
   it.each(["success", "failure"] as const)(

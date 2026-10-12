@@ -25,6 +25,7 @@ const SESSION_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
 pub const SESSION_COOKIE: &str = "sotto_session";
 
 /// The authenticated principal, produced by extracting and validating the bearer token.
+#[derive(Clone)]
 pub struct AuthUser {
     pub user_id: String,
 }
@@ -141,6 +142,9 @@ impl FromRequestParts<AppState> for AuthUser {
     type Rejection = Error;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self> {
+        if let Some(user) = parts.extensions.get::<AuthUser>() {
+            return Ok(user.clone());
+        }
         let token = token_from_headers(&parts.headers).ok_or(Error::Unauthorized)?;
         let user_id = resolve(&state.pool, &token)
             .await?

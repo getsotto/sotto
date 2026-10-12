@@ -16,7 +16,11 @@ for (const javaScriptEnabled of [true, false]) {
       const page = await context.newPage();
       await page.goto("/");
       // The static copy button is disabled. Wait for React when scripting is on.
-      if (javaScriptEnabled) await expect(page.getByRole("button", { name: "Copy", exact: true })).toBeEnabled();
+      if (javaScriptEnabled) {
+        await expect(
+          page.locator(".install").first().getByRole("button", { name: "Copy", exact: true }),
+        ).toBeEnabled();
+      }
       const nav = page.getByRole("navigation", { name: "Guides", exact: true });
       const expected = guidePages.map((guide) => ({ href: `/${guide.slug}`, label: guide.navLabel }));
       const readLinks = () => nav.locator("a").evaluateAll((anchors) => anchors.map((anchor) => ({
@@ -37,6 +41,53 @@ for (const javaScriptEnabled of [true, false]) {
     }
   });
 }
+
+async function routeAuthenticatedMissingAccount(page: import("@playwright/test").Page) {
+  await page.route("**/auth/me", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ user_id: "setup-user" }) }),
+  );
+  await page.route("**/account", (route) => route.fulfill({ status: 404, body: "" }));
+}
+
+test("missing account setup retry failure stays actionable", async ({ page }) => {
+  await routeAuthenticatedMissingAccount(page);
+  await page.goto("/app");
+  await expect(page.getByRole("heading", { name: "Finish setting up Sotto" })).toBeVisible();
+
+  await page.unroute("**/account");
+  await page.route("**/account", (route) => route.fulfill({ status: 503, body: "" }));
+  await page.getByRole("button", { name: "Check setup again" }).click();
+
+  await expect(page.getByRole("heading", { name: "Finish setting up Sotto" })).toBeVisible();
+  await expect(page.getByRole("alert")).toContainText("server error (503)");
+});
+
+test("missing account setup can log out", async ({ page }) => {
+  await routeAuthenticatedMissingAccount(page);
+  await page.route("**/auth/logout", (route) => route.fulfill({ status: 200, body: "" }));
+  await page.goto("/app");
+  await page.getByRole("button", { name: "Log out" }).click();
+  await expect(page.getByRole("button", { name: "Log in with GitHub" })).toBeVisible();
+});
+
+test("missing account setup retry is keyboard accessible", async ({ page }) => {
+  await routeAuthenticatedMissingAccount(page);
+  await page.goto("/app");
+  const retry = page.getByRole("button", { name: "Check setup again" });
+  await retry.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("alert")).toContainText("Account setup is not published yet.");
+});
+
+test("missing account setup fits a narrow mobile viewport", async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 640 });
+  await routeAuthenticatedMissingAccount(page);
+  await page.goto("/app");
+  await expect(page.getByRole("heading", { name: "Finish setting up Sotto" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Check setup again" })).toBeVisible();
+  const overflows = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth);
+  expect(overflows).toBe(false);
+});
 
 // The funnel regression suite (Launch gate 4): login → unlock → TeamPanel invite → Upgrade →
 // checkout handoff → return. See docs/OUTREACH.md and
@@ -387,4 +438,68 @@ test("guide routes render their page client-side", async ({ page }) => {
   await expect(
     page.getByRole("heading", { name: "Share .env files without the screenshot dance." }),
   ).toBeVisible();
+});
+
+test("a revealed secret can be hidden and revealed again", async ({ page }) => {
+  await loginAndUnlock(page);
+  const project = page
+    .getByRole("button", { name: new RegExp(fixture.project_name) })
+    .first();
+  await project.click();
+  const envButton = page
+    .getByRole("heading", { name: "Environments" })
+    .locator("xpath=following-sibling::ul[1]")
+    .getByRole("button")
+    .first();
+  await envButton.click();
+  const secretButton = page.getByRole("button", { name: fixture.secret_name });
+  await secretButton.click();
+  await expect(page.locator("textarea.secret-value")).toHaveValue(fixture.secret_value);
+
+  await page.getByRole("button", { name: "Hide secret" }).press("Enter");
+  await expect(page.locator("textarea.secret-value")).toHaveCount(0);
+  await expect(
+    page.getByLabel("Share link (burns after one view):"),
+  ).toHaveCount(0);
+  await expect(secretButton).not.toHaveAttribute("aria-current");
+  await expect(secretButton).toBeFocused();
+
+  await secretButton.press("Enter");
+  await expect(page.locator("textarea.secret-value")).toHaveValue(fixture.secret_value);
+});
+
+test("a pending share cannot restore a hidden secret", async ({ page }) => {
+  let releaseShare!: () => void;
+  const shareReleased = new Promise<void>((resolve) => { releaseShare = resolve; });
+  await page.route("**/shares", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    await shareReleased;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ token: "delayed-e2e-token" }),
+    });
+  });
+
+  await loginAndUnlock(page);
+  await page
+    .getByRole("button", { name: new RegExp(fixture.project_name) })
+    .first()
+    .click();
+  await page
+    .getByRole("heading", { name: "Environments" })
+    .locator("xpath=following-sibling::ul[1]")
+    .getByRole("button")
+    .first()
+    .click();
+  await page.getByRole("button", { name: fixture.secret_name }).click();
+  await page.getByRole("button", { name: "Create one-time share link" }).click();
+  await page.getByRole("button", { name: "Hide secret" }).click();
+  releaseShare();
+
+  await expect(page.locator("textarea.secret-value")).toHaveCount(0);
+  await expect(page.locator("textarea.share-link")).toHaveCount(0);
 });

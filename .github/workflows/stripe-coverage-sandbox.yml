@@ -1,0 +1,52 @@
+name: Stripe coverage sandbox
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stripe-coverage-sandbox
+  cancel-in-progress: false
+
+jobs:
+  contract:
+    name: read coverage contract in Stripe test mode
+    if: github.repository == 'getsotto/sotto' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: stripe-coverage-sandbox
+    env:
+      SOTTO_RUN_STRIPE_SANDBOX_TESTS: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Run the bounded read contract
+        env:
+          STRIPE_SANDBOX_READ_KEY: ${{ secrets.STRIPE_SANDBOX_READ_KEY }}
+          STRIPE_SANDBOX_ACCOUNT_ID: ${{ secrets.STRIPE_SANDBOX_ACCOUNT_ID }}
+          STRIPE_SANDBOX_CUSTOMER_ID: ${{ secrets.STRIPE_SANDBOX_CUSTOMER_ID }}
+          STRIPE_SANDBOX_SUBSCRIPTION_ID: ${{ secrets.STRIPE_SANDBOX_SUBSCRIPTION_ID }}
+          STRIPE_SANDBOX_MONTHLY_PRICE_ID: ${{ secrets.STRIPE_SANDBOX_MONTHLY_PRICE_ID }}
+          STRIPE_SANDBOX_ANNUAL_PRICE_ID: ${{ secrets.STRIPE_SANDBOX_ANNUAL_PRICE_ID }}
+          STRIPE_SANDBOX_ALLOCATION_REFERENCE: ${{ secrets.STRIPE_SANDBOX_ALLOCATION_REFERENCE }}
+          STRIPE_SANDBOX_PROVIDER_ITEM_ID: ${{ secrets.STRIPE_SANDBOX_PROVIDER_ITEM_ID }}
+        run: |
+          export STRIPE_SANDBOX_REPORT="$RUNNER_TEMP/stripe-sandbox-contract.json"
+          cargo test -p sotto-server --test cloud_provider_stripe_sandbox -- --nocapture
+
+      - name: Upload the sanitised compatibility report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: stripe-sandbox-contract
+          path: ${{ runner.temp }}/stripe-sandbox-contract.json
+          if-no-files-found: ignore
+          retention-days: 30

@@ -6,6 +6,7 @@ import { App } from "../App";
 
 vi.mock("../Landing", () => ({ Landing: () => <div>landing</div> }));
 vi.mock("../VaultApp", () => ({ VaultApp: () => <div>vault</div> }));
+vi.mock("../AccountApp", () => ({ AccountApp: () => <div>account</div> }));
 vi.mock("../AuthCallback", () => ({ AuthCallback: () => <div>callback</div> }));
 vi.mock("../seo/SeoPage", () => ({ SeoPage: () => <div>guide</div> }));
 vi.mock("../RecipientPage", () => ({
@@ -21,6 +22,15 @@ function visit(path: string) {
 }
 
 describe("App share-link routing", () => {
+  it("routes the account surface separately from the vault", () => {
+    visit("/cloud");
+
+    render(<App />);
+
+    expect(screen.getByText("account")).toBeInTheDocument();
+    expect(screen.queryByText("vault")).not.toBeInTheDocument();
+  });
+
   it.each(["/s/%", "/s/%FF"])("renders an invalid link for the malformed share path %s", (path) => {
     visit(path);
 

@@ -110,12 +110,25 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
-sotto share DATABASE_URL --views 3
-sotto share DATABASE_URL --expire 3600   # lifetime in seconds
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-De forma predeterminada, un enlace compartido permite una vista y no caduca; el enlace deja de funcionar después de la última vista.
+En un terminal interactivo, cada límite omitido abre su propio menú. El menú de visualizaciones
+ofrece 1, 2, 3, 5 o 10 visualizaciones y un valor personalizado; el menú de duración ofrece sin
+caducidad, 1 hora, 1 día, 7 días, 30 días o un número de segundos personalizado. Los valores
+personalizados deben ser de 1 a 100 visualizaciones o de 1 a 2592000 segundos. Proporcionar
+`DATABASE_URL` omite solo la selección del secreto: `--views` omite el menú de visualizaciones y
+`--expire` omite el menú de duración de forma independiente. Pulsa Esc o Ctrl-C en cualquier menú
+de selección para cancelar sin crear un enlace.
+
+El uso no interactivo requiere un nombre de secreto explícito. Cuando se omite cualquiera de los
+límites, se aplica su valor predeterminado: una visualización y sin caducidad. Para omitir los tres
+menús de selección en un terminal interactivo, proporciona el nombre y ambos límites, por ejemplo
+`sotto share DATABASE_URL --views 3 --expire 3600`. Es posible que todavía se soliciten el
+desbloqueo y la frase de contraseña.
+
+Para explorar los secretos de forma interactiva, consulta la [guía del panel](#panel-interactivo).
 
 Usa `--env` para elegir un entorno para un solo comando sin cambiar el entorno predeterminado del proyecto:
 
@@ -128,6 +141,7 @@ sotto ls --env staging
 
 Exportar escribe texto plano, por lo que necesita `--reveal` en un terminal, igual que `sotto get`.
 Usa `sotto share --no-copy` para desactivar la copia interactiva, o `--copy` para solicitarla explícitamente.
+Estas opciones solo controlan el portapapeles; `--no-copy` no omite los menús de límites del enlace.
 El borrado del portapapeles es una medida de mejor esfuerzo: si reemplazas el contenido se protege el nuevo valor,
 mientras que los gestores del portapapeles, la suspensión o la terminación del proceso auxiliar pueden conservar una copia.
 
@@ -150,6 +164,77 @@ Los tokens de máquina caducan. Un token nuevo dura 90 días salvo que pases `--
 un valor de 1 a 365, y `sotto token ls` muestra cuándo termina cada uno. Dos semanas antes,
 `sotto run` y `sotto export` muestran un aviso en el registro de la CI. Para sustituir un token,
 crea uno nuevo, actualiza el secreto de la CI y después revoca el antiguo con `sotto token revoke`.
+
+### Estado de Cloud
+
+Para consultar el servidor configurado y la elegibilidad de tu cuenta para Cloud, inicia sesión primero:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+El comando necesita una sesión activa, pero no desbloquea el almacén local ni abre un navegador. Muestra el `server` configurado, el `server_info` del servidor, la `eligibility` de la cuenta y un `billing_url` solo cuando el estado devuelto indica que la facturación está disponible. La salida legible también muestra `actions`, `next_actions` y los valores opcionales `paid_through_epoch`, `recovery_until_epoch` o `export_until_epoch`. Si falta `server_info` o `eligibility`, significa que un servidor antiguo no expone ese endpoint; no demuestra que el acceso esté permitido o denegado.
+
+El formato JSON es útil para scripts. Su estructura de nivel superior es:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+El ejemplo es sintético; `actions` y las fechas opcionales proceden del estado devuelto de la cuenta, y los servidores antiguos pueden devolver null para cualquiera de los dos endpoints. `sotto cloud status` solo informa del estado y puede mostrar una URL de facturación. No inicia una compra ni cambia la elegibilidad. Para diagnosticar el almacén local y los entornos, usa `sotto status`; esa vista es independiente de la información del servidor y de la cuenta anterior.
+
+### Panel interactivo
+
+Desde un proyecto inicializado, ejecuta `sotto` sin subcomandos para explorar sus secretos locales:
+
+```sh
+sotto
+```
+
+Debes tener una identidad local desbloqueada antes de abrir el panel. Si hace falta, Sotto pide la
+contraseña maestra. La entrada, la salida y la salida de error estándar deben estar conectadas a
+terminales.
+Si falta alguna, la CI está activa o `TERM=dumb`, la invocación sin subcomandos escribe la ayuda
+en la salida de error estándar y termina con el código 2. Usa `sotto --help` para solicitar la
+ayuda expresamente.
+
+Usa las flechas o `j` y `k` para desplazarte. Pulsa `/` para buscar, `?` para abrir la ayuda y Tab
+para cambiar de entorno. Este cambio solo dura mientras el panel está abierto; `sotto env use`
+cambia el entorno predeterminado del proyecto. Pulsa `r` para mostrar u ocultar el valor
+seleccionado, `c` para copiarlo al portapapeles y `q` para salir. `Esc` cierra la búsqueda o el
+diálogo actual; en la vista principal, borra una búsqueda activa o sale.
+
+Pulsa `t` para recorrer los temas con vista previa en directo. Usa las flechas para ver cada tema
+y pulsa `Enter` para guardar tu elección o `Esc` para cancelar. Las
+[reglas de precedencia de los temas](#temas-de-salida) explican cómo los ajustes del comando y del
+entorno afectan a la preferencia guardada.
 
 ### Temas de salida
 

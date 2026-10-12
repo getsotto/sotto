@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Produce a read-only, sanitised inventory for the legacy billing cutover.
+
+This command is deliberately an inventory rather than a migration. Existing organisations may
+have paid, trial, manually assigned or contradictory legacy state, and D09 requires an approved
+cohort and notice treatment before any row can be changed or charged. The output contains counts,
+schema provenance and proposed treatment only; it never prints user, organisation, provider or
+resource identifiers.
+
+Usage: scripts/inventory-legacy-billing [--database-url <url>] [--output <path>]
+
+The database URL may also be supplied as INVENTORY_DATABASE_URL or DATABASE_URL. Prefer the
+environment form when the URL contains a password so it never appears in process arguments.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+from datetime import datetime, timezone
+from pathlib import Path
+
+INVENTORY_VERSION = 1
+LIBPQ_QUERY_OPTIONS = {
+    "sslmode": "PGSSLMODE",
+    "sslrootcert": "PGSSLROOTCERT",
+    "sslcert": "PGSSLCERT",
+    "sslkey": "PGSSLKEY",
+    "sslcrl": "PGSSLCRL",
+    "sslcrldir": "PGSSLCRLDIR",
+    "gssencmode": "PGGSSENCMODE",
+    "channel_binding": "PGCHANNELBINDING",
+    "connect_timeout": "PGCONNECT_TIMEOUT",
+    "application_name": "PGAPPNAME",
+}
+
+# Every SELECT below returns only a label and a count. Keep the query explicit so a future column
+# containing an identifier or customer data cannot leak into an operator report by accident.
+INVENTORY_SQL = r"""
+SELECT 'organisation_cohort' AS category, CASE
+    WHEN stripe_subscription_id IS NOT NULL AND stripe_customer_id IS NULL
+        THEN 'quarantine_provider_link_incomplete'
+    WHEN stripe_subscription_id IS NOT NULL AND tier <> 'team'
+        THEN 'quarantine_paid_tier_mismatch'
+    WHEN stripe_subscription_id IS NOT NULL THEN 'legacy_paid'
+    WHEN stripe_customer_id IS NOT NULL THEN 'quarantine_provider_link_incomplete'
+    WHEN tier = 'team' AND trial_ends_at IS NOT NULL AND trial_ends_at > now()
+        THEN 'legacy_trial'
+    WHEN tier = 'team' THEN 'legacy_manual_team'
+    WHEN tier = 'free' AND trial_ends_at IS NOT NULL AND trial_ends_at > now()
+        THEN 'quarantine_trial_tier_mismatch'
+    ELSE 'legacy_free'
+END AS label, count(*)::text
+FROM organizations
+WHERE lifecycle_state <> 'deleted'
+GROUP BY 1, 2
+UNION ALL
+SELECT 'personal_billing_state', state, count(*)::text
+FROM billing_personal_accounts GROUP BY 1, 2
+UNION ALL
+SELECT 'sponsored_billing_state', CASE
+    WHEN o.lifecycle_state = 'deleted' THEN 'quarantine_deleted_organisation'
+    ELSE s.status
+END, count(*)::text
+FROM billing_sponsored_subscriptions s
+JOIN organizations o ON o.id = s.organization_id
+GROUP BY 1, 2
+UNION ALL
+SELECT 'project_ownership', CASE WHEN org_id IS NULL THEN 'personal' ELSE 'organisation' END, count(*)::text
+FROM projects GROUP BY 1, 2
+UNION ALL
+SELECT 'machine_token_state', CASE
+    WHEN mt.revoked_at IS NULL AND p.org_id IS NULL THEN 'active_personal'
+    WHEN mt.revoked_at IS NULL THEN 'active_organisation'
+    WHEN p.org_id IS NULL THEN 'revoked_personal'
+    ELSE 'revoked_organisation'
+END, count(*)::text
+FROM machine_tokens mt JOIN environments e ON e.id = mt.env_id JOIN projects p ON p.id = e.project_id
+GROUP BY 1, 2
+UNION ALL
+SELECT 'share_link_state', CASE
+    WHEN revoked_at IS NOT NULL THEN 'revoked'
+    WHEN expires_at IS NOT NULL AND expires_at <= now() THEN 'expired'
+    ELSE 'active'
+END, count(*)::text
+FROM share_links GROUP BY 1, 2
+UNION ALL
+SELECT 'membership_role', role, count(*)::text
+FROM organization_memberships GROUP BY 1, 2
+UNION ALL
+SELECT 'legacy_subscription_link', CASE
+    WHEN stripe_subscription_id IS NOT NULL THEN 'organisation_subscription'
+    ELSE 'no_organisation_subscription'
+END, count(*)::text
+FROM organizations
+WHERE lifecycle_state <> 'deleted'
+GROUP BY 1, 2
+UNION ALL
+SELECT 'personal_provider_link', CASE
+    WHEN stripe_subscription_id IS NOT NULL AND stripe_customer_id IS NOT NULL THEN 'complete'
+    WHEN stripe_subscription_id IS NULL AND stripe_customer_id IS NULL THEN 'none'
+    ELSE 'incomplete'
+END, count(*)::text
+FROM billing_personal_accounts GROUP BY 1, 2
+ORDER BY 1, 2;
+"""
+
+
+def connection_env(url: str) -> dict[str, str]:
+    """Pass a database password through the environment, never a process argument."""
+    parts = urllib.parse.urlsplit(url)
+    env = dict(os.environ)
+    env["PGHOST"] = parts.hostname or "localhost"
+    env["PGDATABASE"] = parts.path.lstrip("/")
+    if parts.port:
+        env["PGPORT"] = str(parts.port)
+    if parts.username:
+        env["PGUSER"] = urllib.parse.unquote(parts.username)
+    if parts.password:
+        env["PGPASSWORD"] = urllib.parse.unquote(parts.password)
+    for option, variable in LIBPQ_QUERY_OPTIONS.items():
+        values = urllib.parse.parse_qs(parts.query, keep_blank_values=True).get(option, [])
+        if len(values) > 1:
+            raise ValueError(f"database URL has repeated {option}")
+        if values:
+            env[variable] = urllib.parse.unquote(values[0])
+    return env
+
+
+def read_database(url: str) -> tuple[list[tuple[str, str, int]], dict[str, str]]:
+    """Read aggregate rows and schema provenance using two read-only psql calls."""
+    env = connection_env(url)
+    result = subprocess.run(
+        ["psql", "-At", "-F", "\t", "-v", "ON_ERROR_STOP=1", "-c", INVENTORY_SQL],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    rows: list[tuple[str, str, int]] = []
+    for line_number, line in enumerate(result.stdout.splitlines(), 1):
+        parts = line.split("\t")
+        if len(parts) != 3 or not parts[0] or not parts[1]:
+            raise ValueError(f"inventory query returned malformed row {line_number}")
+        try:
+            count = int(parts[2])
+        except ValueError as error:
+            raise ValueError(f"inventory query returned malformed count {line_number}") from error
+        if count < 0:
+            raise ValueError(f"inventory query returned a negative count {line_number}")
+        rows.append((parts[0], parts[1], count))
+    provenance_result = subprocess.run(
+        [
+            "psql",
+            "-At",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            "SELECT (SELECT COALESCE(max(version), 0)::text FROM _sqlx_migrations), current_setting('server_version_num');",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    values = provenance_result.stdout.strip().split("|")
+    if len(values) != 2 or not all(values):
+        raise ValueError("database provenance query returned malformed output")
+    return rows, {"latest_migration": values[0], "postgres_version_num": values[1]}
+
+
+def proposed_treatment(label: str) -> str:
+    if label == "legacy_paid":
+        return "preserve_legacy_coverage_pending_approval"
+    if label == "legacy_trial":
+        return "preserve_trial_until_approved_transition"
+    if label == "legacy_free":
+        return "preserve_free_access"
+    if label == "legacy_manual_team":
+        return "quarantine_manual_review"
+    if label.startswith("quarantine_"):
+        return "quarantine_ambiguous"
+    return "report_only"
+
+
+def build_report(rows: list[tuple[str, str, int]], provenance: dict[str, str]) -> dict:
+    cohorts = []
+    for category, label, count in rows:
+        treatment = proposed_treatment(label) if category == "organisation_cohort" else "report_only"
+        cohorts.append(
+            {
+                "category": category,
+                "label": label,
+                "count": count,
+                "proposed_treatment": treatment,
+            }
+        )
+    return {
+        "inventory_version": INVENTORY_VERSION,
+        "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "source": "read_only_postgres_aggregate",
+        "provenance": provenance,
+        "cohorts": cohorts,
+        "activation": {
+            "writes_performed": False,
+            "charges_created": False,
+            "automatic_transition_approved": False,
+            "decision_gate": "D09",
+        },
+    }
+
+
+def write_report(report: dict, output: str | None) -> None:
+    rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if output is None:
+        sys.stdout.write(rendered)
+        return
+    destination = Path(output)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # A report is operational data. Write it privately first, then replace the destination so a
+    # killed run never leaves a half-report that someone mistakes for a complete inventory.
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=destination.parent, prefix=f".{destination.name}.", delete=False
+    ) as temporary:
+        temporary.write(rendered)
+        temporary_path = Path(temporary.name)
+        temporary_path.chmod(0o600)
+    temporary_path.replace(destination)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--database-url")
+    parser.add_argument("--output", help="write the sanitised report to this path instead of stdout")
+    args = parser.parse_args(argv)
+    database_url = args.database_url or os.environ.get("INVENTORY_DATABASE_URL") or os.environ.get("DATABASE_URL")
+    if not database_url:
+        parser.error("a database URL is required via --database-url, INVENTORY_DATABASE_URL or DATABASE_URL")
+    try:
+        rows, provenance = read_database(database_url)
+        write_report(build_report(rows, provenance), args.output)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"legacy billing inventory failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

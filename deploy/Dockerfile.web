@@ -18,6 +18,8 @@ WORKDIR /app
 COPY . .
 ARG VITE_ORGANISATION_DELETION_ENABLED=false
 ENV VITE_ORGANISATION_DELETION_ENABLED=${VITE_ORGANISATION_DELETION_ENABLED}
+ARG VITE_CLOUD_PRICING_VISIBLE=false
+ENV VITE_CLOUD_PRICING_VISIBLE=${VITE_CLOUD_PRICING_VISIBLE}
 # Baked into crawler-facing metadata (canonical address, social tags, structured data,
 # crawler rules, sitemap) by web/vite.config.ts. Same meaning as the server's variable.
 ARG SOTTO_PUBLIC_URL=https://getsotto.co.uk

@@ -109,6 +109,32 @@ pub struct StripePaymentSettlement {
     livemode: bool,
 }
 
+impl StripePaymentSettlement {
+    pub fn invoice_id(&self) -> &str {
+        &self.invoice_id
+    }
+
+    pub fn payment_intent_id(&self) -> &str {
+        &self.payment_intent_id
+    }
+
+    pub const fn amount_paid(&self) -> i64 {
+        self.amount_paid
+    }
+
+    pub const fn amount_requested(&self) -> i64 {
+        self.amount_requested
+    }
+
+    pub fn currency(&self) -> &str {
+        &self.currency
+    }
+
+    pub const fn livemode(&self) -> bool {
+        self.livemode
+    }
+}
+
 /// A validated personal invoice observation assembled from authenticated Stripe resources.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripePersonalInvoiceObservation {
@@ -332,8 +358,9 @@ pub enum StripeAccountProvenance {
 /// Durable personal ownership resolved by the caller before evidence can authorise coverage.
 ///
 /// The value copied from invoice metadata is only a claim. It must match this trusted binding;
-/// metadata alone never establishes a beneficiary or allocation. Sponsor allocations are rejected
-/// until their quantity and multi-beneficiary receipt contract is implemented.
+/// metadata alone never establishes a beneficiary or allocation. Sponsored allocations use the
+/// grouped, named manifest contract in [`crate::cloud_provider_stripe_sponsored`] rather than this
+/// personal-seat binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StripeAllocationBinding {
     allocation_reference: String,
@@ -620,12 +647,13 @@ pub fn decode_paid_invoice(
     });
     let normalized_bytes = serde_json::to_vec(&normalized)
         .map_err(|_| StripeContractError::NormalizationSerialization)?;
-    let verified_event = VerifiedProviderEvent::from_payload(
+    let verified_event = VerifiedProviderEvent::from_payload_with_object_id(
         event.id.clone(),
         event.event_type,
         event.created,
         Some(subscription_id.clone()),
         Some(allocation_reference.clone()),
+        invoice_id.clone(),
         &normalized_bytes,
     )
     .map_err(StripeContractError::ProviderEvidence)?;

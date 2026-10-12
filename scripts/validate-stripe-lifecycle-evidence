@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Validate and sanitise a complete Stripe Cloud lifecycle acceptance run.
+
+The input is an operator-produced JSON manifest from a disposable Stripe test-mode run. Every
+required scenario must be observed as passed against one application SHA and the pinned Stripe
+API version. The output contains only fingerprints and aggregate check counts, so it can be
+attached to an acceptance record without publishing provider identifiers or payment details.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+
+PINNED_API_VERSION = "2026-07-29.dahlia"
+SCHEMA = "sotto-stripe-lifecycle-acceptance-v1"
+REQUIRED_SCENARIOS = (
+    "personal_monthly_initial",
+    "personal_annual_initial",
+    "personal_founding_monthly_initial",
+    "personal_founding_annual_initial",
+    "personal_renewal",
+    "personal_interval_switch",
+    "personal_cancellation",
+    "personal_full_refund_cancellation",
+    "personal_failed_renewal_recovery",
+    "sponsored_initial_mixed_items",
+    "sponsored_anniversary",
+    "sponsored_seat_replacement",
+    "sponsored_payer_transfer",
+    "webhook_replay_and_out_of_order_delivery",
+    "ambiguous_provider_outcome_and_worker_restart",
+    "human_export_and_restore",
+    "retention_scope_and_restore",
+)
+ID_RE = re.compile(r"^[A-Za-z0-9_:.\-/]+$")
+
+
+def fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def require_string(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def validate(path: str) -> tuple[dict, list[str]]:
+    with Path(path).open(encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError("lifecycle evidence must be an object")
+    expected = {"schema", "app_sha", "api_version", "sandbox_account_id", "captured_at", "scenarios"}
+    if set(value) != expected:
+        raise ValueError("lifecycle evidence has an incomplete shape")
+    if value["schema"] != SCHEMA:
+        raise ValueError(f"unsupported lifecycle evidence schema: {value['schema']!r}")
+    app_sha = require_string(value["app_sha"], "app_sha")
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", app_sha):
+        raise ValueError("app_sha must be a commit SHA")
+    if value["api_version"] != PINNED_API_VERSION:
+        raise ValueError(f"api_version must be {PINNED_API_VERSION}")
+    account_id = require_string(value["sandbox_account_id"], "sandbox_account_id")
+    if not ID_RE.fullmatch(account_id):
+        raise ValueError("sandbox_account_id contains unsupported characters")
+    require_string(value["captured_at"], "captured_at")
+    scenarios = value["scenarios"]
+    if not isinstance(scenarios, list) or len(scenarios) != len(REQUIRED_SCENARIOS):
+        raise ValueError("lifecycle evidence must contain exactly one row for every required scenario")
+
+    required = set(REQUIRED_SCENARIOS)
+    seen: set[str] = set()
+    sanitised: list[dict] = []
+    failures: list[str] = []
+    for row in scenarios:
+        if not isinstance(row, dict):
+            raise ValueError("each lifecycle scenario must be an object")
+        expected_row = {"scenario", "result", "checks", "provider_ids"}
+        if set(row) != expected_row:
+            raise ValueError("lifecycle scenario has an incomplete shape")
+        scenario = require_string(row["scenario"], "scenario")
+        if scenario not in required or scenario in seen:
+            raise ValueError(f"unexpected or duplicate scenario: {scenario}")
+        seen.add(scenario)
+        result = row["result"]
+        if result not in {"passed", "failed", "blocked", "not_run"}:
+            raise ValueError(f"invalid result for {scenario}: {result!r}")
+        checks = row["checks"]
+        if not isinstance(checks, list) or not checks or not all(isinstance(check, str) and check for check in checks):
+            raise ValueError(f"checks for {scenario} must be a non-empty list of strings")
+        provider_ids = row["provider_ids"]
+        if not isinstance(provider_ids, list) or not all(isinstance(item, str) and ID_RE.fullmatch(item) for item in provider_ids):
+            raise ValueError(f"provider_ids for {scenario} must contain only provider identifiers")
+        if result != "passed":
+            failures.append(f"{scenario}: {result}")
+        sanitised.append(
+            {
+                "scenario": scenario,
+                "result": result,
+                "check_count": len(checks),
+                "provider_id_fingerprints": [fingerprint(item) for item in provider_ids],
+            }
+        )
+    missing = required - seen
+    if missing:
+        raise ValueError(f"missing required scenarios: {', '.join(sorted(missing))}")
+    return (
+        {
+            "schema": SCHEMA,
+            "app_sha": app_sha,
+            "api_version": PINNED_API_VERSION,
+            "sandbox_account_fingerprint": fingerprint(account_id),
+            "captured_at": value["captured_at"],
+            "scenario_count": len(sanitised),
+            "check_count": sum(item["check_count"] for item in sanitised),
+            "scenarios": sorted(sanitised, key=lambda item: item["scenario"]),
+        },
+        failures,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", nargs="?", help="operator-produced lifecycle evidence JSON")
+    parser.add_argument("--output", help="path for the sanitised acceptance report")
+    parser.add_argument("--template", help="write a not-run manifest template at this path")
+    args = parser.parse_args(argv)
+    if args.template and (args.input or args.output):
+        parser.error("--template cannot be combined with an input or --output")
+    if args.template:
+        template = {
+            "schema": SCHEMA,
+            "app_sha": "replace-with-the-tested-commit-sha",
+            "api_version": PINNED_API_VERSION,
+            "sandbox_account_id": "replace-with-the-test-account-id",
+            "captured_at": datetime.now().astimezone().isoformat(),
+            "scenarios": [
+                {"scenario": scenario, "result": "not_run", "checks": ["replace with observed checks"], "provider_ids": []}
+                for scenario in REQUIRED_SCENARIOS
+            ],
+        }
+        try:
+            destination = Path(args.template)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(json.dumps(template, indent=2) + "\n", encoding="utf-8")
+        except OSError as error:
+            print(f"could not write lifecycle template: {error}", file=sys.stderr)
+            return 1
+        print(f"wrote not-run lifecycle template: {destination}")
+        return 0
+    if not args.input or not args.output:
+        parser.error("input and --output are required unless --template is used")
+    try:
+        report, failures = validate(args.input)
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"Stripe lifecycle acceptance failed: {error}", file=sys.stderr)
+        return 1
+    if failures:
+        print("Stripe lifecycle acceptance is incomplete: " + ", ".join(failures), file=sys.stderr)
+        return 1
+    print(f"Stripe lifecycle acceptance passed: {report['scenario_count']} scenarios, {report['check_count']} checks")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

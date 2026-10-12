@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use reqwest::blocking::{Client, Response};
-use reqwest::header::IF_NONE_MATCH;
+use reqwest::header::{CONTENT_TYPE, IF_NONE_MATCH};
 use reqwest::StatusCode;
 use serde::de::DeserializeOwned;
 
@@ -15,8 +15,9 @@ use crate::error::{Error, Result};
 
 use super::api::{
     AccountBundle, BatchRequest, BatchResponse, CreatedMachineToken, CreatedShare, EnvironmentInfo,
-    GrantView, Invited, MachineTokenInfo, Me, MemberInfo, NewEnvironment, NewOrg, NewProject,
-    NewShare, OrgInfo, RemovalReceipt, RotateRequest, RotateResponse, Snapshot, SyncApi,
+    ExportChunk, ExportManifest, GrantView, Invited, MachineTokenInfo, Me, MemberInfo,
+    NewEnvironment, NewOrg, NewProject, NewShare, OrgInfo, RemovalReceipt, RotateRequest,
+    RotateResponse, Snapshot, SyncApi,
 };
 
 /// Row shapes for the two "list of ids" endpoints (each returns `[{ "user_id"|"env_id": ... }]`).
@@ -52,6 +53,27 @@ impl HttpClient {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
+
+    /// Discover hosted capability metadata without making local commands depend on it.
+    pub fn server_info(&self) -> Result<Option<super::api::ServerInfo>> {
+        let resp = self
+            .http
+            .get(self.url("/server/info"))
+            .send()
+            .map_err(net)?;
+        parse_optional_json(resp)
+    }
+
+    /// Read the account's Cloud state. A 404 is the supported fallback for older servers.
+    pub fn eligibility(&self) -> Result<Option<super::api::EligibilityView>> {
+        let resp = self
+            .http
+            .get(self.url("/account/eligibility"))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse_optional_json(resp)
+    }
 }
 
 fn net(e: reqwest::Error) -> Error {
@@ -59,19 +81,42 @@ fn net(e: reqwest::Error) -> Error {
 }
 
 /// Map a non-success response to an error, distinguishing concurrency conflicts and auth.
-fn server_error(resp: Response) -> Error {
-    let status = resp.status();
-    let body = resp.text().unwrap_or_default();
+fn classify_status(status: StatusCode, code: Option<&str>, body: String) -> Error {
+    let fallback = |message: &str| {
+        if body.trim().is_empty() {
+            message.to_owned()
+        } else {
+            body.clone()
+        }
+    };
     match status {
         StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
             Error::Conflict(format!("{status}: {body}"))
         }
         StatusCode::UNAUTHORIZED => Error::Server("unauthorised - run `sotto login`".into()),
         StatusCode::FORBIDDEN => Error::Forbidden(format!("{status}: {body}")),
-        // A quota / Team-feature gate: the server message says exactly what to do.
-        StatusCode::PAYMENT_REQUIRED => Error::Input(body),
+        StatusCode::PAYMENT_REQUIRED if code == Some("cloud_eligibility_required") => {
+            Error::CloudEligibility(fallback("hosted Cloud eligibility is required"))
+        }
+        StatusCode::PAYMENT_REQUIRED if code == Some("quota") => {
+            Error::Quota(fallback("quota exceeded"))
+        }
+        StatusCode::PAYMENT_REQUIRED => Error::Input(fallback("payment required")),
+        StatusCode::TOO_MANY_REQUESTS => Error::RateLimited(fallback("try again later")),
+        StatusCode::SERVICE_UNAVAILABLE => Error::Unavailable(fallback("server unavailable")),
         _ => Error::Server(format!("{status}: {body}")),
     }
+}
+
+fn server_error(resp: Response) -> Error {
+    let status = resp.status();
+    let code = resp
+        .headers()
+        .get("x-sotto-error-code")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().unwrap_or_default();
+    classify_status(status, code.as_deref(), body)
 }
 
 /// Parse a successful body, or turn a non-2xx response into an error.
@@ -81,6 +126,35 @@ fn parse<T: DeserializeOwned>(resp: Response) -> Result<T> {
     } else {
         Err(server_error(resp))
     }
+}
+
+/// Parse an optional discovery response. Older reverse proxies can serve the SPA document with a
+/// successful status for an unknown API route; that is the same compatibility case as a 404.
+fn parse_optional_json<T: DeserializeOwned>(resp: Response) -> Result<Option<T>> {
+    if !resp.status().is_success() {
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        return Err(server_error(resp));
+    }
+
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.text().map_err(|e| Error::Server(e.to_string()))?;
+    let trimmed = body.trim_start();
+    if content_type
+        .as_deref()
+        .is_some_and(|value| !value.to_ascii_lowercase().contains("json"))
+        || trimmed.starts_with('<')
+    {
+        return Ok(None);
+    }
+    serde_json::from_str(trimmed)
+        .map(Some)
+        .map_err(|e| Error::Server(e.to_string()))
 }
 
 /// Expect a 2xx with no body of interest.
@@ -136,6 +210,26 @@ impl SyncApi for HttpClient {
             return Ok(None);
         }
         parse(resp).map(Some)
+    }
+
+    fn start_export(&self) -> Result<ExportManifest> {
+        let resp = self
+            .http
+            .post(self.url("/account/export"))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
+    fn export_chunk(&self, export_id: &str, index: usize) -> Result<ExportChunk> {
+        let resp = self
+            .http
+            .get(self.url(&format!("/account/export/{export_id}/chunks/{index}")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
     }
 
     fn create_project(&self, project: &NewProject) -> Result<()> {
@@ -205,6 +299,29 @@ impl SyncApi for HttpClient {
             .send()
             .map_err(net)?;
         parse(resp)
+    }
+
+    fn list_shares(&self) -> Result<super::api::ShareList> {
+        let resp = self
+            .http
+            .get(self.url("/shares"))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        parse(resp)
+    }
+
+    fn revoke_share(&self, token: &str) -> Result<()> {
+        let resp = self
+            .http
+            .delete(self.url(&format!("/shares/{token}")))
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(net)?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Err(Error::NotFound(format!("share `{token}`")));
+        }
+        ok(resp)
     }
 
     fn create_org(&self, org: &NewOrg) -> Result<()> {
@@ -452,5 +569,57 @@ mod tests {
             .expect("a 204 is a completed removal, not a parse failure");
         assert!(receipt.revoked_tokens.is_empty());
         assert_eq!(receipt.grants_deleted, 0);
+    }
+
+    #[test]
+    fn cloud_error_codes_have_stable_cli_categories() {
+        assert!(matches!(
+            classify_status(
+                StatusCode::PAYMENT_REQUIRED,
+                Some("cloud_eligibility_required"),
+                "renewal needed".into()
+            ),
+            Error::CloudEligibility(message) if message == "renewal needed"
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::PAYMENT_REQUIRED, Some("quota"), "limit".into()),
+            Error::Quota(message) if message == "limit"
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS, None, "slow down".into()),
+            Error::RateLimited(message) if message == "slow down"
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::SERVICE_UNAVAILABLE, Some("unavailable"), "offline".into()),
+            Error::Unavailable(message) if message == "offline"
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::PAYMENT_REQUIRED, None, "payment required".into()),
+            Error::Input(message) if message == "payment required"
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::SERVICE_UNAVAILABLE, None, String::new()),
+            Error::Unavailable(message) if message == "server unavailable"
+        ));
+    }
+
+    #[test]
+    fn discovery_treats_an_older_spa_fallback_as_missing() {
+        let base = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n<html>old app</html>",
+        );
+        assert!(HttpClient::new(base, "session".into())
+            .server_info()
+            .expect("SPA fallback should not be an error")
+            .is_none());
+    }
+
+    #[test]
+    fn revoking_an_unknown_share_is_not_found() {
+        let base = serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nmissing",
+        );
+        let result = HttpClient::new(base, "session".into()).revoke_share("typo");
+        assert!(matches!(result, Err(Error::NotFound(message)) if message == "share `typo`"));
     }
 }

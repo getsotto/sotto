@@ -124,7 +124,7 @@ function publicOrigin(): string {
 }
 
 // The disallowed paths mirror the Caddyfile @ratelimited/@api matchers and the client-side
-// routes (/app, /s/, /auth/callback). Keep all three in sync with the routers in
+// routes (/app, /cloud, /s/, /auth/callback). Keep all four in sync with the routers in
 // crates/server/src/lib.rs - a new route needs a line here the same day.
 function robotsTxt(origin: string): string {
   return `# Generated at build time by web/vite.config.ts - edit the template, not the built copy.
@@ -132,8 +132,10 @@ function robotsTxt(origin: string): string {
 User-agent: *
 Allow: /
 Disallow: /app
+Disallow: /cloud
 Disallow: /s/
 Disallow: /auth
+# /account is the authenticated API; the browser Cloud surface lives at /cloud.
 Disallow: /account
 Disallow: /projects
 Disallow: /environments
@@ -258,7 +260,11 @@ function guideFile(
   );
   return swapOnce(html, "</head>", `${faqJsonLd(page)}\n  </head>`, "head closing tag");
 }
-const seoSnapshot = (statusUrl: string | undefined) => `<main class="landing">
+export const pricingSnapshot = (cloudPricingVisible: boolean) => cloudPricingVisible
+  ? `<section id="pricing"><h2>Pricing</h2><div class="plans"><div class="plan"><h3>Local and self-hosted</h3><p class="price">Free</p><ul><li>Open-source Sotto, running on your devices or your own server</li><li>Keep control of hosting and operating costs</li><li>Share links remain free for recipients</li></ul></div><div class="plan"><h3>Sotto Cloud</h3><p class="price">£2.99<span class="per"> / person / month</span></p><ul><li>Or £29.99 per person / year</li><li>First 100 named paid seats: £1.99 monthly for 12 months, then £2.99; or £19.99 for the first year, then £29.99</li><li>No trial; hosted access starts after payment is confirmed</li></ul></div></div><p class="muted">Cloud is operated by Sotto and has no SLA. The source is open and can be self-hosted. Prices and applicable taxes are confirmed at checkout. Free one-time links have a limit of three active links per account, one view each, with a seven-day expiry.</p><p class="muted">Or run it yourself: the <a href="https://github.com/getsotto/sotto/blob/main/deploy/README.md">server is self-hostable</a> and Apache-2.0.</p></section>`
+  : `<section id="pricing"><h2>Pricing</h2><div class="plans"><div class="plan"><h3>Free</h3><p class="price">£0</p><ul><li>Personal projects: unlimited, free forever</li><li>Organisations with up to 3 members and 1 shared project</li><li>One-time, burn-after-reading share links</li><li>Every new org starts a 14-day Team trial</li></ul></div><div class="plan"><h3>Team</h3><p class="price">£15<span class="per"> / month per organisation</span></p><ul><li>Unlimited members</li><li>Unlimited shared projects</li><li>Audit log</li><li>Flat: the price doesn’t scale with team size</li></ul></div></div><p class="muted">Or run it yourself: the <a href="https://github.com/getsotto/sotto/blob/main/deploy/README.md">server is self-hostable</a> and Apache-2.0. Self-hosted organisations use the same plan limits by default: up to 3 members and 1 shared project on Free. Operators can assign tiers manually; see the deployment runbook.</p></section>`;
+
+export const seoSnapshot = (statusUrl: string | undefined, cloudPricingVisible: boolean) => `<main class="landing">
 <header><span class="wordmark">Sotto</span><nav aria-label="Site"><a href="#how">How it works</a><a href="#trust">Trust</a><a href="#pricing">Pricing</a><a href="#open-source">Contribute</a><a href="https://github.com/getsotto/sotto">GitHub</a><a class="login" href="/app">Log in</a></nav></header>
 <section class="hero"><h1>Stop Slacking your <code>.env</code> files.</h1><p class="lead">Sotto syncs secrets across your team with end-to-end encryption. Values are encrypted on your machine before they leave it and decrypted only on your teammates’ machines. The server stores ciphertext it cannot read.</p><div class="install"><code>curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh</code><button class="sm" type="button" disabled aria-live="polite">Copy</button></div><p class="muted">Signed binaries for macOS and Linux. The installer verifies the checksum, and the Sigstore signature when <code>cosign</code> is installed. Prefer to <a href="https://github.com/getsotto/sotto/blob/main/install.sh">read it first</a>? Or grab a tarball from <a href="https://github.com/getsotto/sotto/releases">releases</a>.</p></section>
 <pre class="term"><code>$ sotto init
@@ -283,7 +289,7 @@ https://getsotto.co.uk/s/00112233445566778899aabbccddeeff#AAECAwQFBgcICQoLDA0ODx
 $ </code></pre>
 <section id="how"><h2>How it works</h2><ol class="steps"><li><strong>Encrypt locally.</strong> Your vault key is derived on your machine from your master password and secret key. Neither is ever sent anywhere.</li><li><strong>Sync ciphertext.</strong> The server stores and versions encrypted blobs. It never receives a plaintext value or a usable key, so there is nothing on it worth stealing.</li><li><strong>Decrypt on your devices.</strong> One Rust crypto core runs everywhere: the CLI natively, the browser through WebAssembly, with golden vectors in CI proving both produce identical bytes.</li></ol><p>Teams work the same way: sharing an environment grants its key to a member (an X25519 sealed box), so access is cryptographic, not a permission bit on the server. Removing a member rotates the keys.</p></section>
 <section id="trust"><h2>Should you trust this?</h2><p>Not blindly. Sotto is pre-1.0 and has <strong>not had a third-party cryptographic audit</strong> yet. You should know that before putting anything important in it. Here is what you can verify yourself, today:</p><ul><li>A published <a href="https://github.com/getsotto/sotto/blob/main/THREAT-MODEL.md">threat model</a> with explicit non-goals.</li><li>One shared crypto core: the CLI and the browser client run the same Rust code, held to byte-for-byte golden vectors in CI.</li><li>Sigstore-signed releases with a documented <a href="https://github.com/getsotto/sotto/blob/main/SECURITY.md">verification procedure</a>.</li><li>Telemetry is four anonymous fields, opt-out, and pinned by a unit test so it cannot quietly grow.</li><li>Apache-2.0, and self-hostable from one docker-compose.</li></ul><p>Honest guidance: use it for your team’s development and staging secrets today. Keep the production crown jewels where they are until the audit.</p></section>
-<section id="pricing"><h2>Pricing</h2><div class="plans"><div class="plan"><h3>Free</h3><p class="price">£0</p><ul><li>Personal projects: unlimited, free forever</li><li>Organisations with up to 3 members and 1 shared project</li><li>One-time, burn-after-reading share links</li><li>Every new org starts a 14-day Team trial</li></ul></div><div class="plan"><h3>Team</h3><p class="price">£15<span class="per"> / month per organisation</span></p><ul><li>Unlimited members</li><li>Unlimited shared projects</li><li>Audit log</li><li>Flat: the price doesn’t scale with team size</li></ul></div></div><p class="muted">Or run it yourself: the <a href="https://github.com/getsotto/sotto/blob/main/deploy/README.md">server is self-hostable</a> and Apache-2.0. Self-hosted organisations use the same plan limits by default: up to 3 members and 1 shared project on Free. Operators can assign tiers manually; see the deployment runbook.</p></section>
+${pricingSnapshot(cloudPricingVisible)}
 <section id="open-source"><h2>Open source</h2><p>Apache-2.0. One repo, one crypto core. Star it if Sotto saved you from pasting a <code>.env</code> into Slack; pick a good first issue if you want to help.</p><p class="community-actions"><a href="https://github.com/getsotto/sotto">Star on GitHub</a><a href="https://github.com/getsotto/sotto/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22">Good first issues</a><a href="https://github.com/getsotto/sotto/blob/main/CONTRIBUTING.md">Contributing</a></p></section>
 <section id="start"><h2>Get started</h2><pre class="quickstart"><code>sotto init                   # create your identity; SAVE the Emergency Kit
 sotto set DATABASE_URL       # hidden prompt; encrypted before it touches disk
@@ -314,7 +320,7 @@ function seoPrerenderPlugin(): Plugin {
       }
       const origin = publicOrigin();
       return html
-        .replace(ROOT_PATTERN, `<div id="root">${seoSnapshot(clientEnv.VITE_STATUS_URL)}</div>`)
+        .replace(ROOT_PATTERN, `<div id="root">${seoSnapshot(clientEnv.VITE_STATUS_URL, clientEnv.VITE_CLOUD_PRICING_VISIBLE === "true")}</div>`)
         .split("__SOTTO_PUBLIC_URL__")
         .join(origin);
     },
@@ -330,7 +336,7 @@ function seoPrerenderPlugin(): Plugin {
       const dir = options.dir ?? "dist";
       const origin = publicOrigin();
       const base = readFileSync(join(dir, "index.html"), "utf8");
-      const landingMount = `<div id="root">${seoSnapshot(clientEnv.VITE_STATUS_URL)}</div>`;
+      const landingMount = `<div id="root">${seoSnapshot(clientEnv.VITE_STATUS_URL, clientEnv.VITE_CLOUD_PRICING_VISIBLE === "true")}</div>`;
       for (const page of guidePages) {
         writeFileSync(join(dir, `${page.slug}.html`), guideFile(base, origin, landingMount, page));
       }

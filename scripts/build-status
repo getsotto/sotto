@@ -48,6 +48,12 @@ PARTIAL = ("Some systems are down", "down")
 MAJOR = ("Major outage", "down")
 UNKNOWN = ("Status unknown", "unknown")
 
+STATE_LABELS = {
+    OK: "Operational",
+    DOWN: "Outage",
+    UNCONFIGURED: "Unconfigured",
+}
+
 
 def overall(components: list[dict]) -> tuple[str, str]:
     measured = [c for c in components if c.get("state") in (OK, DOWN)]
@@ -236,61 +242,410 @@ def build(summary: dict, issues: list[dict], today: dt.date, truncated: bool = F
 # The proper fix is to put it there and have both this page and the app follow it.
 STYLE = """
 :root {
-  --paper: #fbfaf8; --paper-sunk: #f4f2ed;
-  --ink: #1a1917; --ink-2: #57544e; --ink-3: #8a867d;
+  /* neutrals from Sordino colors.css */
+  --paper: #fbfaf8;
+  --paper-raised: #ffffff;
+  --paper-sunk: #f4f2ed;
+  --ink: #1a1917;
+  --ink-2: #57544e;
+  --ink-3: #8a867d;
   --hairline: #e4e0d8;
+  --hairline-2: #d3cec4;
+
+  /* links & focus */
   --link: #2f5fb0;
-  --ok: #2f7a4d; --alert: #b23a2e;
-  --font-system: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  /* semantic status tokens */
+  --ok: #2f7a4d;
+  --ok-bg: #f0f7f1;
+  --ok-border: #cfe0d2;
+  --ok-ring: rgba(47, 122, 77, 0.16);
+  --ok-text: #1d5232;
+
+  --alert: #b23a2e;
+  --alert-bg: #fdf2f0;
+  --alert-border: #ebd0cc;
+  --alert-ring: rgba(178, 58, 46, 0.16);
+  --alert-text: #82271d;
+
+  --unknown-ring: rgba(138, 134, 125, 0.16);
+
+  --radius: 6px;
+  --radius-sm: 4px;
+
+  --font-system: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }
 * { box-sizing: border-box; }
 body {
-  margin: 0; padding: 3rem 1.5rem 6rem;
+  margin: 0; padding: 2.5rem 1.5rem 6rem;
   background: var(--paper); color: var(--ink);
   font-family: var(--font-system); font-size: 1rem; line-height: 1.55;
   -webkit-font-smoothing: antialiased;
 }
-main { max-width: 46rem; margin: 0 auto; }
-h1 { font-size: 1.75rem; letter-spacing: -0.011em; line-height: 1.2; margin: 0 0 0.25rem; }
-h2 { font-size: 1.375rem; line-height: 1.2; margin: 3rem 0 1rem; font-weight: 600; }
-h3 { font-size: 1rem; margin: 0; font-weight: 600; }
+main { max-width: 48rem; margin: 0 auto; }
+
+/* ---- Masthead ---- */
+.masthead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  padding-bottom: 1.25rem;
+  margin-bottom: 2.5rem;
+  border-bottom: 1px solid var(--hairline);
+}
+.wordmark {
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  color: var(--ink);
+  text-decoration: none;
+}
+.wordmark:hover { color: var(--ink); }
+.masthead nav {
+  display: flex;
+  align-items: baseline;
+  gap: 1.25rem;
+  font-size: 0.875rem;
+}
+.masthead nav a {
+  color: var(--ink-2);
+  text-decoration: none;
+  transition: color 0.15s ease;
+}
+.masthead nav a:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+
+/* ---- Intro & Headings ---- */
+.page-intro { margin-bottom: 1.5rem; }
+h1 { font-size: 1.75rem; letter-spacing: -0.015em; line-height: 1.2; margin: 0 0 0.25rem; font-weight: 600; }
+h2 { font-size: 1.25rem; line-height: 1.2; margin: 0 0 1rem; font-weight: 600; letter-spacing: -0.01em; }
+.section-block { margin-top: 3rem; }
 p { margin: 0 0 1rem; }
-a { color: var(--link); }
+a { color: var(--link); text-underline-offset: 2px; }
 .meta { color: var(--ink-3); font-size: 0.8125rem; margin: 0; }
-.banner { margin: 2rem 0 0; padding: 1rem 1.25rem; border: 1px solid var(--hairline);
-          border-radius: 4px; background: #fff; display: flex; align-items: baseline;
-          gap: 0.75rem; }
-.banner strong { font-size: 1.125rem; font-weight: 600; }
-.dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; flex: none; }
-.dot.ok { background: var(--ok); } .dot.down { background: var(--alert); }
-.dot.unknown, .dot.unconfigured { background: var(--ink-3); }
-.component { padding: 1.25rem 0; border-bottom: 1px solid var(--hairline); }
+
+/* ---- Status Banner ---- */
+.banner {
+  margin: 1.5rem 0 0;
+  padding: 1.125rem 1.375rem;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--paper-raised);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.banner.ok {
+  background: var(--ok-bg);
+  border-color: var(--ok-border);
+}
+.banner.down {
+  background: var(--alert-bg);
+  border-color: var(--alert-border);
+}
+.banner.unknown {
+  background: var(--paper-sunk);
+  border-color: var(--hairline);
+}
+.banner-main {
+  display: flex;
+  align-items: center;
+  gap: 0.875rem;
+}
+.banner strong {
+  font-size: 1.125rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.banner.ok strong { color: var(--ok-text); }
+.banner.down strong { color: var(--alert-text); }
+.banner-meta {
+  font-size: 0.8125rem;
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+}
+.dot-wrapper {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.125rem;
+  height: 1.125rem;
+  flex: none;
+}
+.dot {
+  width: 0.625rem;
+  height: 0.625rem;
+  border-radius: 50%;
+  flex: none;
+}
+.dot.ok {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px var(--ok-ring);
+}
+.dot.down {
+  background: var(--alert);
+  box-shadow: 0 0 0 3px var(--alert-ring);
+}
+.dot.unknown, .dot.unconfigured {
+  background: var(--ink-3);
+  box-shadow: 0 0 0 3px var(--unknown-ring);
+}
+
+/* ---- Components Card ---- */
+.components-card {
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--paper-raised);
+  overflow: hidden;
+}
+.component {
+  padding: 1.25rem 1.5rem;
+  border-bottom: 1px solid var(--hairline);
+}
 .component:last-of-type { border-bottom: 0; }
-.component-head { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
-.state { font-size: 0.8125rem; color: var(--ink-2); white-space: nowrap; }
-.desc { color: var(--ink-2); font-size: 0.875rem; margin: 0.125rem 0 0; }
-.bars { display: flex; gap: 1px; margin: 0.75rem 0 0.375rem; height: 1.75rem;
-        align-items: stretch; }
-.bar { flex: 1 1 0; min-width: 1px; border-radius: 1px; background: var(--ok); }
+.component-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.component-title h3 {
+  font-size: 1rem;
+  margin: 0;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+.component-meta {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-shrink: 0;
+}
+.uptime {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--ink-2);
+}
+.state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8125rem;
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.desc { color: var(--ink-2); font-size: 0.875rem; margin: 0.25rem 0 0; }
+.bars {
+  display: flex;
+  gap: 2px;
+  margin: 0.875rem 0 0.375rem;
+  height: 1.875rem;
+  align-items: stretch;
+}
+.bar {
+  flex: 1 1 0;
+  min-width: 1px;
+  border-radius: 2px;
+  background: var(--ok);
+  transition: transform 0.15s ease, opacity 0.15s ease;
+  cursor: pointer;
+}
+.bar:hover {
+  transform: scaleY(1.15);
+  opacity: 0.82;
+}
 .bar.down { background: var(--alert); }
 .bar.partial { background: linear-gradient(var(--alert) 50%, var(--ok) 50%); }
-.bar.none { background: var(--paper-sunk); }
-.scale { display: flex; justify-content: space-between; color: var(--ink-3); font-size: 0.8125rem; }
-.incident { padding: 1.25rem 0; border-bottom: 1px solid var(--hairline); }
-.incident:last-of-type { border-bottom: 0; }
-.stage { font-family: var(--font-mono); font-size: 0.8125rem; color: var(--ink-2);
-         text-transform: uppercase; letter-spacing: 0.02em; }
-.update { margin: 0.75rem 0 0; padding-left: 0.875rem; border-left: 2px solid var(--hairline); }
-.update time { display: block; font-family: var(--font-mono); font-size: 0.8125rem;
-               color: var(--ink-3); }
-footer { margin-top: 4rem; color: var(--ink-3); font-size: 0.8125rem; }
+.bar.none { background: var(--paper-sunk); cursor: default; }
+.bar.none:hover { transform: none; opacity: 1; }
+.scale {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--ink-3);
+  font-size: 0.75rem;
+  font-family: var(--font-mono);
+  margin-top: 0.375rem;
+}
+
+/* ---- Incidents Section ---- */
+.incident {
+  padding: 1.25rem 1.5rem;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--paper-raised);
+  margin-bottom: 1rem;
+}
+.incident:last-of-type { margin-bottom: 0; }
+.incident-header { margin-bottom: 0.75rem; }
+.incident-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.incident-title-row h3 {
+  margin: 0;
+  font-size: 1.0625rem;
+  font-weight: 600;
+}
+.incident-title-row h3 a {
+  color: var(--ink);
+  text-decoration: none;
+}
+.incident-title-row h3 a:hover {
+  color: var(--link);
+  text-decoration: underline;
+}
+.stage-badge {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 0.2rem 0.5rem;
+  border-radius: var(--radius-sm);
+  flex: none;
+}
+.stage-resolved {
+  background: var(--ok-bg);
+  color: var(--ok-text);
+  border: 1px solid var(--ok-border);
+}
+.stage-investigating, .stage-identified, .stage-monitoring {
+  background: var(--alert-bg);
+  color: var(--alert-text);
+  border: 1px solid var(--alert-border);
+}
+.timeline {
+  margin-top: 0.875rem;
+  padding-left: 0.875rem;
+  border-left: 2px solid var(--hairline);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.update time {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--ink-3);
+  margin-bottom: 0.125rem;
+}
+.update-body {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+/* ---- Empty Incidents & Notices ---- */
+.empty-incidents-card {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 1.25rem 1.5rem;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--paper-raised);
+}
+.empty-icon-wrap {
+  width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 50%;
+  background: var(--ok-bg);
+  color: var(--ok);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+.empty-incidents-card strong {
+  display: block;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--ink);
+  margin-bottom: 0.125rem;
+}
+.empty-incidents-card .desc {
+  margin: 0;
+  font-size: 0.8125rem;
+  color: var(--ink-2);
+}
+.notice-card {
+  padding: 1rem 1.25rem;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--paper-raised);
+  margin-bottom: 1rem;
+}
+.notice-card.alert {
+  background: var(--alert-bg);
+  border-color: var(--alert-border);
+}
+.notice-card p { margin: 0; }
+
+/* ---- Footer ---- */
+footer {
+  margin-top: 4.5rem;
+  padding-top: 1.75rem;
+  border-top: 1px solid var(--hairline);
+}
+footer nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+  margin-bottom: 1.25rem;
+  font-size: 0.875rem;
+}
+footer nav a {
+  color: var(--ink-2);
+  text-decoration: none;
+}
+footer nav a:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+footer p {
+  color: var(--ink-3);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  margin: 0 0 0.5rem;
+}
+footer p:last-child { margin-bottom: 0; }
+
+/* ---- Dark Mode ---- */
 @media (prefers-color-scheme: dark) {
-  /* --ink-2, --hairline and --link are chosen here; the rest are --term-* verbatim. */
-  :root { --paper: #16150f; --paper-sunk: #201e17; --ink: #d9d4c6; --ink-2: #b8b3a4;
-          --ink-3: #857f6d; --hairline: #2e2b22; --link: #9db6e0;
-          --ok: #86b57e; --alert: #e0705f; }
-  .banner { background: var(--paper-sunk); }
+  :root {
+    --paper: #16150f;
+    --paper-raised: #201e17;
+    --paper-sunk: #1b1913;
+    --ink: #d9d4c6;
+    --ink-2: #b8b3a4;
+    --ink-3: #857f6d;
+    --hairline: #2e2b22;
+    --hairline-2: #3d392f;
+    --link: #9db6e0;
+    --ok: #86b57e;
+    --ok-bg: #192418;
+    --ok-border: #283e27;
+    --ok-ring: rgba(134, 181, 126, 0.2);
+    --ok-text: #a8d5a1;
+    --alert: #e0705f;
+    --alert-bg: #2b1a18;
+    --alert-border: #4d2b27;
+    --alert-ring: rgba(224, 112, 95, 0.2);
+    --alert-text: #f3a396;
+    --unknown-ring: rgba(133, 127, 109, 0.2);
+  }
 }
 """
 
@@ -343,34 +698,47 @@ def render_component(row: dict) -> str:
         # invited to trust a number nobody could stand behind.
         summary = (f'{up["percent"]:.2f}% of {up["total"]} '
                    f'{"check" if up["total"] == 1 else "checks"}')
+        percent_label = f'{up["percent"]:.2f}% uptime'
     else:
         summary = "not measured"
+        percent_label = "not measured"
+
     lines = [row["description"], row["detail"]]
-    described = "".join(f'\n        <p class="desc">{e(line)}</p>' for line in lines if line)
+    described = "".join(f'\n            <p class="desc">{e(line)}</p>' for line in lines if line)
+    state_label = STATE_LABELS.get(row["state"], row["state"])
+
     return f"""      <section class="component">
         <div class="component-head">
-          <h3>{e(row["name"])}</h3>
-          <span class="state"><span class="dot {e(row["state"])}"></span> {e(row["state"])}</span>
-        </div>{described}
+          <div class="component-title">
+            <h3>{e(row["name"])}</h3>{described}
+          </div>
+          <div class="component-meta">
+            <span class="uptime">{e(percent_label)}</span>
+            <span class="state"><span class="dot {e(row["state"])}"></span> {e(state_label)}</span>
+          </div>
+        </div>
         <div class="bars" role="img"
              aria-label="{e(row["name"])}: {e(summary)} over the last 90 days">{bars}</div>
-        <div class="scale"><span>90 days ago</span><span>{e(summary)}</span><span>today</span></div>
+        <div class="scale"><span>90 days ago</span><span class="scale-summary">{e(summary)}</span><span>Today</span></div>
       </section>
 """
 
 
 def render_incident(incident: dict) -> str:
     updates = "".join(
-        f'        <div class="update"><time>{e(u["at"])}</time>{e(u["body"])}</div>\n'
+        f'          <div class="update"><time>{e(u["at"])}</time><p class="update-body">{e(u["body"])}</p></div>\n'
         for u in incident["updates"]
     )
+    timeline = f'        <div class="timeline">\n{updates}        </div>\n' if updates else ""
     return f"""      <article class="incident">
-        <div class="component-head">
-          <h3><a href="{e(incident["url"])}">{e(incident["title"])}</a></h3>
-          <span class="stage">{e(incident["stage"])}</span>
+        <div class="incident-header">
+          <div class="incident-title-row">
+            <h3><a href="{e(incident["url"])}">{e(incident["title"])}</a></h3>
+            <span class="stage-badge stage-{e(incident["stage"])}">{e(incident["stage"])}</span>
+          </div>
+          <p class="meta">Opened {e(incident["opened"])}</p>
         </div>
-        <p class="meta">Opened {e(incident["opened"])}</p>
-{updates}      </article>
+{timeline}      </article>
 """
 
 
@@ -397,20 +765,32 @@ def favicon_link(source: pathlib.Path = FAVICON_SOURCE) -> str:
 def render(model: dict, now: dt.datetime) -> str:
     components = "".join(render_component(r) for r in model["rows"])
     if model.get("incidents_unavailable"):
-        incidents = ('      <p class="desc">The incident log could not be read when this page '
+        incidents = ('      <div class="notice-card alert">\n'
+                     '        <p class="desc">The incident log could not be read when this page '
                      'was built, so it is not shown. That is not the same as there being '
-                     'none.</p>\n')
+                     'none.</p>\n      </div>\n')
     elif model["incidents"]:
         incidents = "".join(render_incident(i) for i in model["incidents"])
     else:
-        incidents = ('      <p class="desc">No incidents in the last 90 days. Anything still '
-                     'open is listed however old it is.</p>\n')
+        incidents = ('      <div class="empty-incidents-card">\n'
+                     '        <div class="empty-icon-wrap" aria-hidden="true">\n'
+                     '          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">\n'
+                     '            <polyline points="20 6 9 17 4 12"></polyline>\n'
+                     '          </svg>\n'
+                     '        </div>\n'
+                     '        <div>\n'
+                     '          <strong>All systems clear</strong>\n'
+                     '          <p class="desc">No incidents in the last 90 days. Anything still '
+                     'open is listed however old it is.</p>\n'
+                     '        </div>\n'
+                     '      </div>\n')
     if model.get("truncated"):
         # Only reachable if there are more incidents in the window than the fetch asked for.
         # Saying so beats a list that is quietly short: this page is worth exactly as much as
         # its worst unstated omission.
-        incidents += ('      <p class="desc">More incidents matched than this page fetched, so '
-                      'the list above is incomplete.</p>\n')
+        incidents += ('      <div class="notice-card muted">\n'
+                      '        <p class="desc">More incidents matched than this page fetched, so '
+                      'the list above is incomplete.</p>\n      </div>\n')
 
     cadences = [r["cadence"] for r in model["rows"] if r["cadence"]]
     if cadences:
@@ -422,6 +802,8 @@ def render(model: dict, now: dt.datetime) -> str:
                     f"component so far. A day nobody checked is shown blank rather than green.")
     else:
         sampling = "No checks have been recorded yet."
+
+    checked_meta = f'Last checked {e(model["generated_at"])}' if model.get("generated_at") else ""
 
     return f"""<!doctype html>
 <html lang="en">
@@ -435,19 +817,45 @@ def render(model: dict, now: dt.datetime) -> str:
 </head>
 <body>
 <main>
-  <h1>Sotto status</h1>
-  <p class="meta">Last checked {e(model["generated_at"])}</p>
+  <header class="masthead">
+    <a href="https://getsotto.co.uk" class="wordmark">Sotto</a>
+    <nav aria-label="Site">
+      <a href="https://getsotto.co.uk">Home</a>
+      <a href="https://github.com/getsotto/sotto">GitHub</a>
+    </nav>
+  </header>
 
-  <div class="banner">
-    <span class="dot {e(model["tone"])}"></span>
-    <strong>{e(model["banner"])}</strong>
+  <div class="page-intro">
+    <h1>Sotto status</h1>
+    <p class="meta">{checked_meta}</p>
   </div>
 
-  <h2>Components</h2>
-{components}
-  <h2>Past incidents</h2>
-{incidents}
+  <div class="banner {e(model["tone"])}">
+    <div class="banner-main">
+      <span class="dot-wrapper"><span class="dot {e(model["tone"])}"></span></span>
+      <strong>{e(model["banner"])}</strong>
+    </div>
+    <span class="banner-meta">{checked_meta}</span>
+  </div>
+
+  <section class="section-block">
+    <h2>Components</h2>
+    <div class="components-card">
+{components}    </div>
+  </section>
+
+  <section class="section-block">
+    <h2>Past incidents</h2>
+{incidents}  </section>
+
   <footer>
+    <nav aria-label="Footer">
+      <a href="https://getsotto.co.uk">Home</a>
+      <a href="https://github.com/getsotto/sotto">GitHub</a>
+      <a href="https://github.com/getsotto/sotto/releases">Releases</a>
+      <a href="https://github.com/getsotto/sotto/blob/main/SECURITY.md">Security</a>
+      <a href="https://github.com/getsotto/sotto/blob/main/THREAT-MODEL.md">Threat model</a>
+    </nav>
     <p>{e(sampling)}</p>
     <p>This page is built from the checks in
        <a href="https://github.com/getsotto/sotto">getsotto/sotto</a> and published separately

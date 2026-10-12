@@ -752,3 +752,84 @@ async fn migration_0028_preserves_legacy_provider_replay() {
     );
     database.cleanup().await;
 }
+
+#[tokio::test]
+async fn migration_0038_allows_named_allocations_to_share_a_provider_item() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    db::migrate(&database.pool)
+        .await
+        .expect("apply current migrations");
+
+    for beneficiary in ["sponsored-beneficiary-a", "sponsored-beneficiary-b"] {
+        sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'sponsored-migration', $1)",
+        )
+        .bind(beneficiary)
+        .execute(&database.pool)
+        .await
+        .expect("insert sponsored beneficiary");
+    }
+    for (source, beneficiary, reference) in [
+        (
+            "sponsored-source-a",
+            "sponsored-beneficiary-a",
+            "sponsored-reference-a",
+        ),
+        (
+            "sponsored-source-b",
+            "sponsored-beneficiary-b",
+            "sponsored-reference-b",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO cloud_coverage_sources (source_id, beneficiary_id, provider_namespace, external_allocation_reference, ownership_evidence_reference, registration_operation_id, registration_source_set_generation) VALUES ($1, $2, 'stripe', $3, 'sponsored-ownership', $1, 1)",
+        )
+        .bind(source)
+        .bind(beneficiary)
+        .bind(reference)
+        .execute(&database.pool)
+        .await
+        .expect("insert sponsored source");
+    }
+    sqlx::query(
+        "INSERT INTO cloud_provider_payers (payer_id, provider_namespace, provider_account_id, provider_environment, provider_customer_id, payer_kind) VALUES ('sponsored-payer', 'stripe', 'acct_sponsored', 'test', 'cus_sponsored', 'sponsor')",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("insert sponsored payer");
+    for (allocation, beneficiary, source, reference) in [
+        (
+            "sponsored-allocation-a",
+            "sponsored-beneficiary-a",
+            "sponsored-source-a",
+            "sponsored-reference-a",
+        ),
+        (
+            "sponsored-allocation-b",
+            "sponsored-beneficiary-b",
+            "sponsored-source-b",
+            "sponsored-reference-b",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO cloud_provider_allocations (allocation_id, payer_id, payer_kind, beneficiary_id, provider_namespace, provider_account_id, provider_environment, provider_subscription_id, provider_item_id, external_allocation_reference, coverage_source_id, effective_from, state, ownership_evidence_reference) VALUES ($1, 'sponsored-payer', 'sponsor', $2, 'stripe', 'acct_sponsored', 'test', 'sub_sponsored', 'si_grouped', $3, $4, 0, 'active', 'sponsored-ownership')",
+        )
+        .bind(allocation)
+        .bind(beneficiary)
+        .bind(reference)
+        .bind(source)
+        .execute(&database.pool)
+        .await
+        .expect("insert shared provider item allocation");
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_provider_allocations WHERE provider_subscription_id = 'sub_sponsored' AND provider_item_id = 'si_grouped'",
+    )
+    .fetch_one(&database.pool)
+    .await
+    .expect("count shared provider item allocations");
+    assert_eq!(count, 2);
+    database.cleanup().await;
+}

@@ -25,8 +25,10 @@ record.
   [README.md](README.md#enabling-organisation-deletion). The remaining two rules need counter
   history and thresholds no deployment has yet had the throughput to calibrate, and the rules file
   says so.
-- Run the backup script and restore the dump into an isolated scratch database. Complete the
-  rehearsal record at the end of this document before enabling the client control.
+- Run the backup script and restore the dump plus its `.tombstones.jsonl` sidecar into an isolated
+  scratch database. Replay the sidecar with `scripts/replay-retention-journal` before any server
+  or worker is admitted. Complete the rehearsal record at the end of this document before enabling
+  the client control.
 - Confirm that the configured billing provider's API version, restricted key, and webhook endpoint
   match the [billing deployment settings](README.md#billing-optional).
 
@@ -145,7 +147,9 @@ Use [`backup.sh`](backup.sh) and the restore procedure in [`README.md`](README.m
 database, never the live database. Verify that:
 
 - migrations apply cleanly;
-- deletion rows, tombstones, audit events, and metric counters are present;
+- deletion rows, the retention tombstone journal, audit events, and metric counters are present;
+- the cumulative tombstone sidecar has been replayed successfully, so purged ciphertext and old
+  grants cannot reappear from the older dump;
 - the restored server remains healthy with both deletion flags disabled;
 - the deletion routes return `404` on that restored server, confirming the gate holds after a
   restore; and
