@@ -110,12 +110,23 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
-sotto share DATABASE_URL --views 3
-sotto share DATABASE_URL --expire 3600   # lifetime in seconds
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-Par défaut, un partage autorise une vue et n’expire pas ; le lien cesse de fonctionner après la dernière vue.
+Dans un terminal interactif, chaque limite omise ouvre son propre menu. Le menu des consultations
+propose 1, 2, 3, 5 ou 10 consultations ainsi qu'une valeur personnalisée ; le menu de durée propose
+aucune expiration, 1 heure, 1 jour, 7 jours, 30 jours ou un nombre de secondes personnalisé. Les
+valeurs personnalisées doivent être comprises entre 1 et 100 consultations ou entre 1 et 2592000
+secondes. Fournir `DATABASE_URL` ignore uniquement la sélection du secret : `--views` ignore le
+menu des consultations et `--expire` ignore indépendamment le menu de durée. Appuyez sur Échap ou
+Ctrl-C dans un menu de sélection pour annuler sans créer de partage.
+
+L'utilisation non interactive exige un nom de secret explicite. Lorsqu'une limite est omise, sa
+valeur par défaut s'applique : une consultation et aucune expiration. Pour ignorer les trois menus
+de sélection dans un terminal interactif, fournissez le nom et les deux limites, par exemple
+`sotto share DATABASE_URL --views 3 --expire 3600`. Les invites de déverrouillage et de phrase
+secrète peuvent toujours s'appliquer.
 
 Pour parcourir les secrets de façon interactive, consultez le [guide du tableau de bord](#tableau-de-bord-interactif).
 
@@ -130,6 +141,7 @@ sotto ls --env staging
 
 L'export écrit en clair ; il nécessite donc `--reveal` dans un terminal, comme `sotto get`.
 Utilisez `sotto share --no-copy` pour désactiver la copie interactive, ou `--copy` pour la demander explicitement.
+Ces options contrôlent uniquement le presse-papiers ; `--no-copy` n'ignore pas les menus de limites du partage.
 L'effacement du presse-papiers est une mesure de meilleur effort : remplacer son contenu protège la nouvelle valeur,
 mais les gestionnaires de presse-papiers, la suspension ou l'arrêt du processus auxiliaire peuvent conserver une copie.
 

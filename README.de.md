@@ -110,12 +110,23 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
-sotto share DATABASE_URL --views 3
-sotto share DATABASE_URL --expire 3600   # lifetime in seconds
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-Standardmäßig erlaubt eine Freigabe einen Aufruf und hat kein Ablaufdatum; der Link verfällt nach dem letzten Aufruf.
+In einem interaktiven Terminal öffnet jede ausgelassene Freigabegrenze ein eigenes Menü. Das
+Aufrufmenü bietet 1, 2, 3, 5 oder 10 Aufrufe sowie einen benutzerdefinierten Wert; das
+Gültigkeitsmenü bietet kein Ablaufdatum, 1 Stunde, 1 Tag, 7 Tage, 30 Tage oder eine
+benutzerdefinierte Anzahl von Sekunden. Benutzerdefinierte Werte müssen 1 bis 100 Aufrufe oder 1
+bis 2592000 Sekunden umfassen. Die Angabe von `DATABASE_URL` überspringt nur die Secret-Auswahl:
+`--views` überspringt das Aufrufmenü und `--expire` unabhängig davon das Gültigkeitsmenü. Drücke
+Esc oder Strg-C in einem Auswahlmenü, um abzubrechen, ohne eine Freigabe zu erstellen.
+
+Die nicht interaktive Verwendung erfordert einen ausdrücklichen Secret-Namen. Wird eine Grenze
+ausgelassen, gilt deren Standardwert: ein Aufruf und kein Ablaufdatum. Um alle drei Auswahlmenüs
+in einem interaktiven Terminal zu überspringen, gib den Namen und beide Grenzen an, zum Beispiel
+`sotto share DATABASE_URL --views 3 --expire 3600`. Aufforderungen zum Entsperren und zur Eingabe
+einer Passphrase können weiterhin erscheinen.
 
 Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
 
@@ -130,6 +141,7 @@ sotto ls --env staging
 
 Der Export schreibt Klartext und benötigt daher in einem Terminal `--reveal`, genau wie `sotto get`.
 Verwende `sotto share --no-copy`, um das interaktive Kopieren zu deaktivieren, oder `--copy`, um es ausdrücklich anzufordern.
+Diese Optionen steuern nur die Zwischenablage; `--no-copy` überspringt die Freigabegrenzen-Menüs nicht.
 Das Löschen der Zwischenablage erfolgt nach bestem Bemühen: Das Ersetzen des Inhalts schützt den neuen Wert,
 während Zwischenablage-Manager, Ruhezustand oder ein beendeter Hilfsprozess eine Kopie behalten können.
 

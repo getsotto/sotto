@@ -107,12 +107,21 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
-sotto share DATABASE_URL --views 3
-sotto share DATABASE_URL --expire 3600   # lifetime in seconds
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-By default, a share allows one view and has no expiry; the link burns after the last view.
+In an interactive terminal, each omitted share limit opens its own menu. The view menu offers
+1, 2, 3, 5 or 10 views and a custom value; the lifetime menu offers no expiry, 1 hour, 1 day,
+7 days, 30 days or a custom number of seconds. Custom values must be 1-100 views or
+1-2592000 seconds. Supplying `DATABASE_URL` skips secret selection only: `--views` skips the view
+menu and `--expire` skips the lifetime menu independently. Press Esc or Ctrl-C in any selection
+menu to cancel without creating a share.
+
+Non-interactive use requires an explicit secret name. When either limit flag is omitted there,
+its existing default applies: one view and no expiry. To bypass all three selection menus in an
+interactive terminal, supply the name and both limits, for example
+`sotto share DATABASE_URL --views 3 --expire 3600`. Unlock and passphrase prompts may still apply.
 
 To browse secrets interactively, see the [dashboard guide](#interactive-dashboard).
 
@@ -127,6 +136,7 @@ sotto ls --env staging
 
 Export writes plaintext, so it needs `--reveal` on a terminal, just like `sotto get`.
 Use `sotto share --no-copy` to disable interactive copying, or `--copy` to request it explicitly.
+These flags control the clipboard only; `--no-copy` does not skip the share limit menus.
 Clipboard clearing is best-effort: replacing the clipboard protects the newer content, while
 clipboard managers, suspension, or a terminated helper may retain a history copy.
 
