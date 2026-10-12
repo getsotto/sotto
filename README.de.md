@@ -110,12 +110,23 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 sotto run -- npm start       # inject the environment's secrets into any command
 sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # one-time link; copied automatically in an interactive terminal
-sotto share DATABASE_URL --views 3
-sotto share DATABASE_URL --expire 3600   # lifetime in seconds
+sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
 ```
 
-Standardmäßig erlaubt eine Freigabe einen Aufruf und hat kein Ablaufdatum; der Link verfällt nach dem letzten Aufruf.
+In einem interaktiven Terminal öffnet jede ausgelassene Freigabegrenze ein eigenes Menü. Das
+Aufrufmenü bietet 1, 2, 3, 5 oder 10 Aufrufe sowie einen benutzerdefinierten Wert; das
+Gültigkeitsmenü bietet kein Ablaufdatum, 1 Stunde, 1 Tag, 7 Tage, 30 Tage oder eine
+benutzerdefinierte Anzahl von Sekunden. Benutzerdefinierte Werte müssen 1 bis 100 Aufrufe oder 1
+bis 2592000 Sekunden umfassen. Die Angabe von `DATABASE_URL` überspringt nur die Secret-Auswahl:
+`--views` überspringt das Aufrufmenü und `--expire` unabhängig davon das Gültigkeitsmenü. Drücke
+Esc oder Strg-C in einem Auswahlmenü, um abzubrechen, ohne eine Freigabe zu erstellen.
+
+Die nicht interaktive Verwendung erfordert einen ausdrücklichen Secret-Namen. Wird eine Grenze
+ausgelassen, gilt deren Standardwert: ein Aufruf und kein Ablaufdatum. Um alle drei Auswahlmenüs
+in einem interaktiven Terminal zu überspringen, gib den Namen und beide Grenzen an, zum Beispiel
+`sotto share DATABASE_URL --views 3 --expire 3600`. Aufforderungen zum Entsperren und zur Eingabe
+einer Passphrase können weiterhin erscheinen.
 
 Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
 
@@ -130,6 +141,7 @@ sotto ls --env staging
 
 Der Export schreibt Klartext und benötigt daher in einem Terminal `--reveal`, genau wie `sotto get`.
 Verwende `sotto share --no-copy`, um das interaktive Kopieren zu deaktivieren, oder `--copy`, um es ausdrücklich anzufordern.
+Diese Optionen steuern nur die Zwischenablage; `--no-copy` überspringt die Freigabegrenzen-Menüs nicht.
 Das Löschen der Zwischenablage erfolgt nach bestem Bemühen: Das Ersetzen des Inhalts schützt den neuen Wert,
 während Zwischenablage-Manager, Ruhezustand oder ein beendeter Hilfsprozess eine Kopie behalten können.
 
@@ -152,6 +164,51 @@ Maschinen-Tokens laufen ab. Ein neues Token gilt 90 Tage, sofern du nicht `--exp
 einem Wert von 1 bis 365 angibst, und `sotto token ls` zeigt, wann jedes endet. Zwei Wochen vorher
 geben `sotto run` und `sotto export` eine Warnung im CI-Log aus. Um ein Token zu ersetzen, erstelle
 ein neues, aktualisiere das CI-Secret und widerrufe dann das alte mit `sotto token revoke`.
+
+### Cloud-Status
+
+Um den konfigurierten Server und die Cloud-Berechtigung deines Kontos zu prüfen, melde dich zuerst an:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+Der Befehl benötigt eine aktive Anmeldung, entsperrt aber weder den lokalen Tresor noch öffnet er einen Browser. Er zeigt den konfigurierten `server`, die `server_info` des Servers, die `eligibility` des Kontos und nur dann eine `billing_url`, wenn der zurückgegebene Status verfügbare Abrechnung meldet. Die lesbare Ausgabe zeigt außerdem `actions`, `next_actions` und optionale Werte für `paid_through_epoch`, `recovery_until_epoch` oder `export_until_epoch`. Fehlt `server_info` oder `eligibility`, stellt ein älterer Server diesen Endpoint nicht bereit; daraus folgt nicht, dass der Zugriff erlaubt oder verweigert ist.
+
+Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht so aus:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
 
 ### Interaktives Dashboard
 

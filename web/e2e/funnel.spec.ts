@@ -138,6 +138,39 @@ test("a body the app cannot read is not blamed on the network", async ({ page })
   await expect(page.getByText(/unexpected end of json/i)).toHaveCount(0);
 });
 
+test("an account with no synced projects shows project guidance", async ({ page }) => {
+  await page.route("**/projects", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
+  await loginAndUnlock(page);
+  await expect(page.getByText(/No synced projects are available for this account/)).toBeVisible();
+  await expect(page.getByText("sotto push")).toBeVisible();
+});
+
+test("a selected project with no environments explains what is missing", async ({ page }) => {
+  await page.route("**/projects/*/environments", async (route) => {
+    if (route.request().method() !== "GET") return route.continue();
+    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
+  await loginAndUnlock(page);
+  await page.getByRole("button", { name: new RegExp(fixture.project_name) }).first().click();
+  await expect(page.getByText("No environments are available in this project.")).toBeVisible();
+});
+
+test("a populated vault does not show empty-state guidance", async ({ page }) => {
+  await loginAndUnlock(page);
+  const project = page.getByRole("button", { name: new RegExp(fixture.project_name) }).first();
+  await expect(project).toBeVisible();
+  await expect(page.getByText(/No synced projects are available for this account/)).toHaveCount(0);
+  await project.click();
+  const environments = page
+    .getByRole("heading", { name: "Environments" })
+    .locator("xpath=following-sibling::ul[1]");
+  await expect(environments.getByRole("button").first()).toBeVisible();
+  await expect(page.getByText("No environments are available in this project.")).toHaveCount(0);
+});
+
 test("login, unlock, invite, and checkout", async ({ page }) => {
   await loginAndUnlock(page);
 
@@ -405,4 +438,68 @@ test("guide routes render their page client-side", async ({ page }) => {
   await expect(
     page.getByRole("heading", { name: "Share .env files without the screenshot dance." }),
   ).toBeVisible();
+});
+
+test("a revealed secret can be hidden and revealed again", async ({ page }) => {
+  await loginAndUnlock(page);
+  const project = page
+    .getByRole("button", { name: new RegExp(fixture.project_name) })
+    .first();
+  await project.click();
+  const envButton = page
+    .getByRole("heading", { name: "Environments" })
+    .locator("xpath=following-sibling::ul[1]")
+    .getByRole("button")
+    .first();
+  await envButton.click();
+  const secretButton = page.getByRole("button", { name: fixture.secret_name });
+  await secretButton.click();
+  await expect(page.locator("textarea.secret-value")).toHaveValue(fixture.secret_value);
+
+  await page.getByRole("button", { name: "Hide secret" }).press("Enter");
+  await expect(page.locator("textarea.secret-value")).toHaveCount(0);
+  await expect(
+    page.getByLabel("Share link (burns after one view):"),
+  ).toHaveCount(0);
+  await expect(secretButton).not.toHaveAttribute("aria-current");
+  await expect(secretButton).toBeFocused();
+
+  await secretButton.press("Enter");
+  await expect(page.locator("textarea.secret-value")).toHaveValue(fixture.secret_value);
+});
+
+test("a pending share cannot restore a hidden secret", async ({ page }) => {
+  let releaseShare!: () => void;
+  const shareReleased = new Promise<void>((resolve) => { releaseShare = resolve; });
+  await page.route("**/shares", async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.continue();
+      return;
+    }
+    await shareReleased;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ token: "delayed-e2e-token" }),
+    });
+  });
+
+  await loginAndUnlock(page);
+  await page
+    .getByRole("button", { name: new RegExp(fixture.project_name) })
+    .first()
+    .click();
+  await page
+    .getByRole("heading", { name: "Environments" })
+    .locator("xpath=following-sibling::ul[1]")
+    .getByRole("button")
+    .first()
+    .click();
+  await page.getByRole("button", { name: fixture.secret_name }).click();
+  await page.getByRole("button", { name: "Create one-time share link" }).click();
+  await page.getByRole("button", { name: "Hide secret" }).click();
+  releaseShare();
+
+  await expect(page.locator("textarea.secret-value")).toHaveCount(0);
+  await expect(page.locator("textarea.share-link")).toHaveCount(0);
 });

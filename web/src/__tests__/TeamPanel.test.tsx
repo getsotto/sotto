@@ -15,6 +15,9 @@ vi.mock("../api", () => ({
   fetchEntitlements: vi.fn(),
   fetchMembers: vi.fn(),
   fetchOrgs: vi.fn(),
+  fetchSponsoredSeats: vi.fn(),
+  fetchSponsoredQuote: vi.fn(),
+  createSponsoredCheckout: vi.fn(),
   grantOrgKey: vi.fn(),
   inviteMember: vi.fn(),
 }));
@@ -26,6 +29,11 @@ vi.mock("../vault", () => ({
 }));
 
 afterEach(cleanup);
+
+function resetMocks() {
+  vi.resetAllMocks();
+  vi.mocked(api.fetchSponsoredSeats).mockResolvedValue([]);
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -56,7 +64,7 @@ const freePlan: Entitlements = {
 
 describe("TeamPanel organisation loading", () => {
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMocks();
     vi.mocked(api.fetchOrgs).mockResolvedValue([org("org-a"), org("org-b")]);
     vi.mocked(api.fetchEntitlements).mockResolvedValue(freePlan);
   });
@@ -161,7 +169,7 @@ describe("TeamPanel organisation names", () => {
   const encName = new Uint8Array([5]);
 
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMocks();
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchEntitlements).mockResolvedValue(freePlan);
   });
@@ -239,7 +247,7 @@ describe("TeamPanel invitations", () => {
   };
 
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMocks();
     vi.mocked(api.fetchOrgs).mockResolvedValue([adminOrg]);
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchEntitlements).mockResolvedValue(freePlan);
@@ -375,11 +383,51 @@ describe("TeamPanel billing request ownership", () => {
   const billablePlan: Entitlements = { ...freePlan, billingEnabled: true, purchasesEnabled: true };
 
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMocks();
     vi.mocked(api.fetchOrgs).mockResolvedValue([admin("org-a"), admin("org-b")]);
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchAudit).mockResolvedValue([]);
     vi.mocked(api.fetchEntitlements).mockResolvedValue(billablePlan);
+  });
+
+  it("uses the canonical offer for sponsored quotes and checkout", async () => {
+    vi.mocked(api.fetchSponsoredQuote).mockResolvedValue({
+      action: "add",
+      seatCount: 1,
+      amountPence: 299,
+      currency: "gbp",
+      interval: "month",
+      quoteVersion: 1,
+      quoteExpiresAtEpoch: 2_000_000_000,
+    });
+    vi.mocked(api.createSponsoredCheckout).mockResolvedValue({
+      operationId: "sponsored-operation-1",
+      state: "pending",
+      checkoutUrl: null,
+    });
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
+      target: { value: "beneficiary-a" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add seat" }));
+
+    expect(await screen.findByText(/pending provider confirmation/)).toBeInTheDocument();
+    expect(api.fetchSponsoredQuote).toHaveBeenCalledWith("org-a", {
+      action: "add",
+      offer: "standard_monthly",
+      beneficiaryIds: ["beneficiary-a"],
+    });
+    expect(api.createSponsoredCheckout).toHaveBeenCalledWith(
+      "org-a",
+      expect.objectContaining({
+        action: "add",
+        offer: "standard_monthly",
+        beneficiaryId: "beneficiary-a",
+      }),
+    );
   });
 
   it("hides upgrades while sales are paused but keeps the existing billing portal", async () => {
@@ -444,7 +492,7 @@ describe("TeamPanel billing request ownership", () => {
 
 describe("TeamPanel organisation-list recovery", () => {
   it("retries a failed organisation-list request", async () => {
-    vi.resetAllMocks();
+    resetMocks();
     vi.mocked(api.fetchOrgs)
       .mockRejectedValueOnce(new Error("organisations unavailable"))
       .mockResolvedValueOnce([org("org-recovered")]);
@@ -467,7 +515,7 @@ describe("TeamPanel audit visibility", () => {
     ["admin", "team", true],
     ["member", "team", false],
   ] as const)("gates audit for %s with effective %s", async (role, effectiveTier, allowed) => {
-    vi.resetAllMocks();
+    resetMocks();
     vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), role }]);
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchEntitlements).mockResolvedValue({
@@ -489,7 +537,7 @@ describe("TeamPanel audit visibility", () => {
 });
 
 it("renders a populated audit response for an allowed organisation", async () => {
-  vi.resetAllMocks();
+  resetMocks();
   vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), role: "owner" }]);
   vi.mocked(api.fetchMembers).mockResolvedValue([]);
   vi.mocked(api.fetchEntitlements).mockResolvedValue({ ...freePlan, effectiveTier: "team" });
@@ -503,7 +551,7 @@ it("renders a populated audit response for an allowed organisation", async () =>
 });
 
 it("clears an old audit log when switching to a gated organisation", async () => {
-  vi.resetAllMocks();
+  resetMocks();
   vi.mocked(api.fetchOrgs).mockResolvedValue([
     { ...org("org-a"), role: "owner" },
     { ...org("org-b"), role: "member" },
