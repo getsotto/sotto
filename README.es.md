@@ -165,6 +165,51 @@ un valor de 1 a 365, y `sotto token ls` muestra cuándo termina cada uno. Dos se
 `sotto run` y `sotto export` muestran un aviso en el registro de la CI. Para sustituir un token,
 crea uno nuevo, actualiza el secreto de la CI y después revoca el antiguo con `sotto token revoke`.
 
+### Estado de Cloud
+
+Para consultar el servidor configurado y la elegibilidad de tu cuenta para Cloud, inicia sesión primero:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+El comando necesita una sesión activa, pero no desbloquea el almacén local ni abre un navegador. Muestra el `server` configurado, el `server_info` del servidor, la `eligibility` de la cuenta y un `billing_url` solo cuando el estado devuelto indica que la facturación está disponible. La salida legible también muestra `actions`, `next_actions` y los valores opcionales `paid_through_epoch`, `recovery_until_epoch` o `export_until_epoch`. Si falta `server_info` o `eligibility`, significa que un servidor antiguo no expone ese endpoint; no demuestra que el acceso esté permitido o denegado.
+
+El formato JSON es útil para scripts. Su estructura de nivel superior es:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+El ejemplo es sintético; `actions` y las fechas opcionales proceden del estado devuelto de la cuenta, y los servidores antiguos pueden devolver null para cualquiera de los dos endpoints. `sotto cloud status` solo informa del estado y puede mostrar una URL de facturación. No inicia una compra ni cambia la elegibilidad. Para diagnosticar el almacén local y los entornos, usa `sotto status`; esa vista es independiente de la información del servidor y de la cuenta anterior.
+
 ### Panel interactivo
 
 Desde un proyecto inicializado, ejecuta `sotto` sin subcomandos para explorar sus secretos locales:

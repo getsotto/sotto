@@ -165,6 +165,51 @@ einem Wert von 1 bis 365 angibst, und `sotto token ls` zeigt, wann jedes endet. 
 geben `sotto run` und `sotto export` eine Warnung im CI-Log aus. Um ein Token zu ersetzen, erstelle
 ein neues, aktualisiere das CI-Secret und widerrufe dann das alte mit `sotto token revoke`.
 
+### Cloud-Status
+
+Um den konfigurierten Server und die Cloud-Berechtigung deines Kontos zu prüfen, melde dich zuerst an:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+Der Befehl benötigt eine aktive Anmeldung, entsperrt aber weder den lokalen Tresor noch öffnet er einen Browser. Er zeigt den konfigurierten `server`, die `server_info` des Servers, die `eligibility` des Kontos und nur dann eine `billing_url`, wenn der zurückgegebene Status verfügbare Abrechnung meldet. Die lesbare Ausgabe zeigt außerdem `actions`, `next_actions` und optionale Werte für `paid_through_epoch`, `recovery_until_epoch` oder `export_until_epoch`. Fehlt `server_info` oder `eligibility`, stellt ein älterer Server diesen Endpoint nicht bereit; daraus folgt nicht, dass der Zugriff erlaubt oder verweigert ist.
+
+Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht so aus:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
+
 ### Interaktives Dashboard
 
 Führe `sotto` ohne Unterbefehl in einem initialisierten Projekt aus, um dessen lokale Secrets zu

@@ -160,6 +160,51 @@ from 1 to 365, and `sotto token ls` shows when each one ends. Two weeks before t
 `sotto export` print a warning in the CI log. To replace a token, create a new one, update the CI
 secret, then revoke the old one with `sotto token revoke`.
 
+### Cloud status
+
+To inspect the configured server and your account's Cloud eligibility, first log in:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+The command needs an active login but does not unlock the local vault or open a browser. It reports the configured `server`, the server's `server_info`, the account `eligibility`, and a `billing_url` only when the returned state says billing is available. The human-readable output also shows `actions`, `next_actions`, and any optional `paid_through_epoch`, `recovery_until_epoch`, or `export_until_epoch` values. A missing `server_info` or `eligibility` means that an older server does not expose that endpoint; it is not proof that access is allowed or denied.
+
+The JSON form is useful for scripts. Its top-level shape is:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+The example is synthetic; `actions` and the optional dates come from the returned account state, and older servers can return null for either endpoint. `sotto cloud status` only reports status and may print a billing URL. It does not start a purchase or change eligibility. For local vault and environment diagnostics, use `sotto status`; that view is separate from the server and account information above.
+
 ### Interactive dashboard
 
 From an initialised project, run `sotto` without a subcommand to browse its local secrets:

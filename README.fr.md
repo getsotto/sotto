@@ -166,6 +166,51 @@ avec une valeur de 1 à 365, et `sotto token ls` indique quand chacun prend fin.
 token, créez-en un nouveau, mettez à jour le secret de la CI, puis révoquez l'ancien avec
 `sotto token revoke`.
 
+### État Cloud
+
+Pour consulter le serveur configuré et l'éligibilité Cloud de votre compte, connectez-vous d'abord :
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+La commande nécessite une session active, mais ne déverrouille pas le coffre local et n'ouvre pas de navigateur. Elle affiche le `server` configuré, le `server_info` du serveur, l'`eligibility` du compte et un `billing_url` uniquement lorsque l'état renvoyé indique que la facturation est disponible. La sortie lisible affiche également `actions`, `next_actions` et les valeurs facultatives `paid_through_epoch`, `recovery_until_epoch` ou `export_until_epoch`. L'absence de `server_info` ou d'`eligibility` signifie qu'un serveur ancien n'expose pas cet endpoint ; elle ne prouve pas que l'accès est autorisé ou refusé.
+
+Le format JSON est pratique pour les scripts. Sa structure de premier niveau est :
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+L'exemple est synthétique ; `actions` et les dates facultatives proviennent de l'état renvoyé du compte, et les serveurs anciens peuvent renvoyer null pour l'un ou l'autre endpoint. `sotto cloud status` ne fait que signaler l'état et peut afficher une URL de facturation. Il ne lance pas d'achat et ne modifie pas l'éligibilité. Pour diagnostiquer le coffre local et les environnements, utilisez `sotto status` ; cette vue est distincte des informations du serveur et du compte ci-dessus.
+
 ### Tableau de bord interactif
 
 Depuis un projet initialisé, lancez `sotto` sans sous-commande pour parcourir ses secrets locaux :

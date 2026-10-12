@@ -165,6 +165,51 @@ com um valor de 1 a 365, e `sotto token ls` mostra quando cada um termina. Duas 
 `sotto run` e `sotto export` exibem um aviso no log da CI. Para substituir um token, crie um novo,
 atualize o segredo da CI e depois revogue o antigo com `sotto token revoke`.
 
+### Status do Cloud
+
+Para consultar o servidor configurado e a elegibilidade do Cloud da sua conta, faça login primeiro:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+O comando exige uma sessão ativa, mas não desbloqueia o cofre local nem abre um navegador. Ele mostra o `server` configurado, o `server_info` do servidor, a `eligibility` da conta e um `billing_url` somente quando o estado retornado indica que a cobrança está disponível. A saída legível também mostra `actions`, `next_actions` e os valores opcionais `paid_through_epoch`, `recovery_until_epoch` ou `export_until_epoch`. A ausência de `server_info` ou `eligibility` significa que um servidor antigo não oferece esse endpoint; isso não prova que o acesso esteja permitido ou negado.
+
+O formato JSON é útil para scripts. Sua estrutura de nível superior é:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "person"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+O exemplo é sintético; `actions` e as datas opcionais vêm do estado retornado da conta, e servidores antigos podem retornar null para qualquer um dos dois endpoints. `sotto cloud status` apenas informa o status e pode mostrar uma URL de cobrança. Ele não inicia uma compra nem altera a elegibilidade. Para diagnósticos do cofre local e dos ambientes, use `sotto status`; essa visão é separada das informações do servidor e da conta acima.
+
 ### Painel interativo
 
 Em um projeto inicializado, execute `sotto` sem subcomando para explorar os segredos locais:
