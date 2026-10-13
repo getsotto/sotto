@@ -1,5 +1,6 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "../api";
@@ -15,6 +16,9 @@ vi.mock("../api", () => ({
   fetchEntitlements: vi.fn(),
   fetchMembers: vi.fn(),
   fetchOrgs: vi.fn(),
+  fetchSponsoredSeats: vi.fn(),
+  fetchSponsoredQuote: vi.fn(),
+  createSponsoredCheckout: vi.fn(),
   grantOrgKey: vi.fn(),
   inviteMember: vi.fn(),
 }));
@@ -26,6 +30,11 @@ vi.mock("../vault", () => ({
 }));
 
 afterEach(cleanup);
+
+function resetMocks() {
+  vi.resetAllMocks();
+  vi.mocked(api.fetchSponsoredSeats).mockResolvedValue([]);
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -56,7 +65,7 @@ const freePlan: Entitlements = {
 
 describe("TeamPanel organisation loading", () => {
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMocks();
     vi.mocked(api.fetchOrgs).mockResolvedValue([org("org-a"), org("org-b")]);
     vi.mocked(api.fetchEntitlements).mockResolvedValue(freePlan);
   });
@@ -161,7 +170,7 @@ describe("TeamPanel organisation names", () => {
   const encName = new Uint8Array([5]);
 
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMocks();
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchEntitlements).mockResolvedValue(freePlan);
   });
@@ -239,7 +248,7 @@ describe("TeamPanel invitations", () => {
   };
 
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMocks();
     vi.mocked(api.fetchOrgs).mockResolvedValue([adminOrg]);
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchEntitlements).mockResolvedValue(freePlan);
@@ -375,11 +384,136 @@ describe("TeamPanel billing request ownership", () => {
   const billablePlan: Entitlements = { ...freePlan, billingEnabled: true, purchasesEnabled: true };
 
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetMocks();
     vi.mocked(api.fetchOrgs).mockResolvedValue([admin("org-a"), admin("org-b")]);
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchAudit).mockResolvedValue([]);
     vi.mocked(api.fetchEntitlements).mockResolvedValue(billablePlan);
+  });
+
+  it("uses the server selected offer for sponsored checkout", async () => {
+    vi.mocked(api.fetchSponsoredQuote).mockResolvedValue({
+      action: "add",
+      offer: "founding_monthly",
+      seatCount: 1,
+      amountPence: 199,
+      currency: "gbp",
+      interval: "month",
+      quoteVersion: 1,
+      quoteExpiresAtEpoch: 2_000_000_000,
+      founding: true,
+      foundingRemainingPlaces: 42,
+      foundingTerm: "for the first monthly billing term",
+      nextRenewalAmountPence: 299,
+    });
+    vi.mocked(api.createSponsoredCheckout).mockResolvedValue({
+      operationId: "sponsored-operation-1",
+      state: "pending",
+      checkoutUrl: null,
+    });
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
+      target: { value: "beneficiary-a" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+
+    expect(await screen.findByText(/£1\.99 per month/)).toBeInTheDocument();
+    expect(screen.getByText(/£2\.99 per month/)).toBeInTheDocument();
+    expect(api.createSponsoredCheckout).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Continue to checkout" }));
+    expect(await screen.findByText(/pending provider confirmation/)).toBeInTheDocument();
+    expect(api.fetchSponsoredQuote).toHaveBeenCalledWith("org-a", {
+      action: "add",
+      offer: "standard_monthly",
+      beneficiaryIds: ["beneficiary-a"],
+    });
+    expect(api.createSponsoredCheckout).toHaveBeenCalledWith(
+      "org-a",
+      expect.objectContaining({
+        action: "add",
+        offer: "founding_monthly",
+        beneficiaryId: "beneficiary-a",
+      }),
+    );
+  });
+
+  it("requires a fresh sponsored quote after a checkout conflict", async () => {
+    vi.mocked(api.fetchSponsoredQuote).mockResolvedValue({
+      action: "add",
+      offer: "founding_monthly",
+      seatCount: 1,
+      amountPence: 199,
+      currency: "gbp",
+      interval: "month",
+      quoteVersion: 1,
+      quoteExpiresAtEpoch: 2_000_000_000,
+      founding: true,
+      foundingRemainingPlaces: 42,
+      foundingTerm: "for the first monthly billing term",
+      nextRenewalAmountPence: 299,
+    });
+    vi.mocked(api.createSponsoredCheckout).mockRejectedValueOnce(new Error("server error (409)"));
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
+      target: { value: "beneficiary-a" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    await screen.findByText(/£1\.99 per month/);
+    fireEvent.click(screen.getByRole("button", { name: "Continue to checkout" }));
+
+    expect(await screen.findByText("server error (409)")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    await waitFor(() => expect(api.fetchSponsoredQuote).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("button", { name: "Continue to checkout" })).toBeInTheDocument();
+    expect(api.createSponsoredCheckout).toHaveBeenCalledTimes(1);
+  });
+
+  it("replays the same sponsored operation after a transient provider error", async () => {
+    vi.mocked(api.fetchSponsoredQuote).mockResolvedValue({
+      action: "add",
+      offer: "founding_monthly",
+      seatCount: 1,
+      amountPence: 199,
+      currency: "gbp",
+      interval: "month",
+      quoteVersion: 1,
+      quoteExpiresAtEpoch: 2_000_000_000,
+      founding: true,
+      foundingRemainingPlaces: 42,
+      foundingTerm: "for the first monthly billing term",
+      nextRenewalAmountPence: 299,
+    });
+    vi.mocked(api.createSponsoredCheckout)
+      .mockRejectedValueOnce(new Error("server error (502)"))
+      .mockResolvedValueOnce({
+        operationId: "sponsored-operation-1",
+        state: "provider_pending",
+        checkoutUrl: null,
+      });
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
+      target: { value: "beneficiary-a" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    await screen.findByText(/£1\.99 per month/);
+    fireEvent.click(screen.getByRole("button", { name: "Continue to checkout" }));
+    await screen.findByText("server error (502)");
+    fireEvent.click(screen.getByRole("button", { name: "Continue to checkout" }));
+
+    expect(await screen.findByText(/pending provider confirmation/)).toBeInTheDocument();
+    expect(api.createSponsoredCheckout).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.createSponsoredCheckout).mock.calls[1]).toEqual(
+      vi.mocked(api.createSponsoredCheckout).mock.calls[0],
+    );
   });
 
   it("hides upgrades while sales are paused but keeps the existing billing portal", async () => {
@@ -442,9 +576,74 @@ describe("TeamPanel billing request ownership", () => {
   );
 });
 
+describe("TeamPanel checkout return", () => {
+  let originalUrl: string;
+
+  beforeEach(() => {
+    originalUrl = window.location.href;
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([org("org-a")]);
+  });
+
+  afterEach(() => {
+    window.history.replaceState(null, "", originalUrl);
+  });
+
+  function renderTeamPanel() {
+    return render(
+      <StrictMode>
+        <TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />
+      </StrictMode>,
+    );
+  }
+
+  it.each([
+    {
+      outcome: "success",
+      message: "Payment received. Your Team plan activates as soon as Stripe confirms, usually within seconds.",
+    },
+    { outcome: "cancelled", message: "Checkout cancelled. Nothing was charged." },
+  ])("shows a $outcome return once and preserves the rest of the url", async ({ outcome, message }) => {
+    window.history.replaceState(
+      null,
+      "",
+      `/account/team?view=activity&billing=${outcome}&view=members#org-a`,
+    );
+
+    const { unmount } = renderTeamPanel();
+    expect(await screen.findByRole("button", { name: /org-a/ })).toBeInTheDocument();
+    expect(screen.getByText(message)).toBeInTheDocument();
+    expect(
+      screen.queryByText(outcome === "success" ? /Checkout cancelled\./ : /Payment received\./),
+    ).not.toBeInTheDocument();
+    expect(window.location.pathname + window.location.search + window.location.hash).toBe(
+      "/account/team?view=activity&view=members#org-a",
+    );
+
+    unmount();
+    renderTeamPanel();
+    expect(await screen.findByRole("button", { name: /org-a/ })).toBeInTheDocument();
+    expect(screen.queryByText(/Payment received\./)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Checkout cancelled\./)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    { name: "absent", url: "/account/team?view=activity&view=members#org-a" },
+    { name: "unknown", url: "/account/team?view=activity&billing=unknown&view=members#org-a" },
+  ])("leaves an $name outcome unchanged", async ({ url }) => {
+    window.history.replaceState(null, "", url);
+
+    renderTeamPanel();
+    expect(await screen.findByRole("button", { name: /org-a/ })).toBeInTheDocument();
+    expect(screen.queryByText(/Payment received\./)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Checkout cancelled\./)).not.toBeInTheDocument();
+    expect(window.location.pathname + window.location.search + window.location.hash).toBe(url);
+  });
+});
+
 describe("TeamPanel organisation-list recovery", () => {
   it("retries a failed organisation-list request", async () => {
-    vi.resetAllMocks();
+    resetMocks();
     vi.mocked(api.fetchOrgs)
       .mockRejectedValueOnce(new Error("organisations unavailable"))
       .mockResolvedValueOnce([org("org-recovered")]);
@@ -467,7 +666,7 @@ describe("TeamPanel audit visibility", () => {
     ["admin", "team", true],
     ["member", "team", false],
   ] as const)("gates audit for %s with effective %s", async (role, effectiveTier, allowed) => {
-    vi.resetAllMocks();
+    resetMocks();
     vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), role }]);
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchEntitlements).mockResolvedValue({
@@ -489,7 +688,7 @@ describe("TeamPanel audit visibility", () => {
 });
 
 it("renders a populated audit response for an allowed organisation", async () => {
-  vi.resetAllMocks();
+  resetMocks();
   vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), role: "owner" }]);
   vi.mocked(api.fetchMembers).mockResolvedValue([]);
   vi.mocked(api.fetchEntitlements).mockResolvedValue({ ...freePlan, effectiveTier: "team" });
@@ -503,7 +702,7 @@ it("renders a populated audit response for an allowed organisation", async () =>
 });
 
 it("clears an old audit log when switching to a gated organisation", async () => {
-  vi.resetAllMocks();
+  resetMocks();
   vi.mocked(api.fetchOrgs).mockResolvedValue([
     { ...org("org-a"), role: "owner" },
     { ...org("org-b"), role: "member" },

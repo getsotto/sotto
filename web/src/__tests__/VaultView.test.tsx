@@ -106,18 +106,28 @@ describe("VaultView selection loading", () => {
     await screen.findByRole("button", { name: "Alpha" });
 
     const search = screen.getByRole("searchbox", { name: "Search secret names" });
+    const resultStatus = screen.getByRole("status", { name: "Secret search results" });
+    expect(resultStatus).toHaveTextContent("2 secret names available.");
+    search.focus();
     fireEvent.change(search, { target: { value: "ALP" } });
     expect(screen.getByRole("button", { name: "Alpha" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Beta" })).toBeNull();
+    expect(resultStatus).toHaveTextContent("1 secret name matches this search.");
+    expect(search).toHaveFocus();
     expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
 
     fireEvent.change(search, { target: { value: "missing" } });
-    expect(screen.getByText("No secret names match this search.")).toBeTruthy();
+    expect(resultStatus).toHaveTextContent("No secret names match this search.");
+    expect(search).toHaveFocus();
 
     fireEvent.change(search, { target: { value: "" } });
     expect(screen.getByRole("button", { name: "Alpha" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Beta" })).toBeInTheDocument();
+    expect(resultStatus).toHaveTextContent("2 secret names available.");
+    expect(search).toHaveFocus();
     expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
 
     fireEvent.click(screen.getByRole("button", { name: "env-b" }));
     await screen.findByRole("button", { name: "Gamma" });
@@ -134,6 +144,38 @@ describe("VaultView selection loading", () => {
 
     expect(await screen.findByText("No secrets in this environment.")).toBeInTheDocument();
     expect(screen.queryByRole("searchbox", { name: "Search secret names" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "Secret search results" })).not.toBeInTheDocument();
+  });
+
+  it("keeps personal projects usable when organisation discovery fails", async () => {
+    vi.mocked(api.fetchOrgs).mockRejectedValue(new Error("organisations unavailable"));
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("personal-project")]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("personal-env")]);
+
+    renderVault();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "organisations unavailable: organisations unavailable",
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /personal-project/ }));
+    expect(await screen.findByRole("button", { name: /personal-env/ })).toBeInTheDocument();
+    expect(api.fetchEnvironments).toHaveBeenCalledWith("personal-project");
+    expect(api.fetchProjects).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps organisation projects visible by fallback id when organisation discovery fails", async () => {
+    vi.mocked(api.fetchOrgs).mockRejectedValue(new Error("organisations unavailable"));
+    vi.mocked(api.fetchProjects).mockResolvedValue([
+      { id: "org-project", encName: new Uint8Array([1]), orgId: "org-1" },
+    ]);
+    vi.mocked(vault.decryptProjectName).mockImplementation(() => {
+      throw new Error("missing org key");
+    });
+
+    renderVault();
+
+    expect(await screen.findByRole("button", { name: /org-project/ })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("organisations unavailable");
   });
 
   it("keeps environments from the latest project when requests resolve out of order", async () => {
@@ -1016,5 +1058,151 @@ describe("VaultView secret copying", () => {
     expect(await screen.findByText("Secret copied.", { selector: '[role="status"]' })).toBeInTheDocument();
     expect(screen.queryByText("Copy failed. Select the value above and copy it manually.")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Copy secret" })).toBeEnabled();
+  });
+});
+
+describe("VaultView secret hiding", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("project-a")]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([]);
+    vi.mocked(api.fetchMyGrant).mockResolvedValue(new Uint8Array([7]));
+    vi.mocked(api.fetchSecrets).mockResolvedValue([]);
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.decryptSecretName).mockImplementation((_key, _envId, entry) => entry.id);
+    vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
+  });
+  it("hides a revealed secret, returns focus, and allows revealing it again", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptSecretName).mockReturnValue("secret-a");
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("secret-value");
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    const secretButton = await screen.findByRole("button", { name: "secret-a" });
+
+    fireEvent.click(secretButton);
+    expect(screen.getByDisplayValue("secret-value")).toBeInTheDocument();
+    expect(secretButton).toHaveAttribute("aria-current", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide secret" }));
+    expect(screen.queryByDisplayValue("secret-value")).not.toBeInTheDocument();
+    expect(secretButton).not.toHaveAttribute("aria-current");
+    expect(secretButton).toHaveFocus();
+
+    fireEvent.click(secretButton);
+    expect(screen.getByDisplayValue("secret-value")).toBeInTheDocument();
+  });
+
+  it("keeps a newly revealed secret selected after an older share finishes", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a"), secret("secret-b")]);
+    vi.mocked(vault.decryptSecretName).mockImplementation((_key, _env, entry) => entry.id);
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("secret-value");
+    vi.mocked(vault.sealForShare).mockReturnValue({
+      encBlob: new Uint8Array([1]), fragmentKey: new Uint8Array([2]),
+    });
+    const shareRequest = deferred<string>();
+    vi.mocked(api.createShare).mockReturnValue(shareRequest.promise);
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "secret-a" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create one-time share link" }));
+    await waitFor(() => expect(api.createShare).toHaveBeenCalledOnce());
+
+    const secretB = screen.getByRole("button", { name: "secret-b" });
+    fireEvent.click(secretB);
+    await act(async () => shareRequest.resolve("late-token"));
+
+    expect(secretB).toHaveAttribute("aria-current", "true");
+    expect(screen.queryByDisplayValue(/late-token/)).not.toBeInTheDocument();
+    expect(screen.getByDisplayValue("secret-value")).toBeInTheDocument();
+  });
+
+  it("does not restore a hidden secret when a pending share finishes", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptSecretName).mockReturnValue("secret-a");
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("secret-value");
+    vi.mocked(vault.sealForShare).mockReturnValue({
+      encBlob: new Uint8Array([1]),
+      fragmentKey: new Uint8Array([2]),
+    });
+    const shareRequest = deferred<string>();
+    vi.mocked(api.createShare).mockReturnValue(shareRequest.promise);
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "secret-a" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create one-time share link" }));
+    await waitFor(() => expect(api.createShare).toHaveBeenCalledOnce());
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide secret" }));
+    await act(async () => shareRequest.resolve("late-token"));
+
+    expect(screen.queryByDisplayValue("secret-value")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue(/late-token/)).not.toBeInTheDocument();
+  });
+});
+
+describe("VaultView empty states", () => {
+  it("does not show an empty-projects message while projects are loading", async () => {
+    vi.resetAllMocks();
+    const request = deferred<Project[]>();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockReturnValue(request.promise);
+    renderVault();
+
+    expect(await screen.findByText("Loading…")).toBeInTheDocument();
+    expect(screen.queryByText(/No synced projects are available/)).not.toBeInTheDocument();
+
+    await act(async () => request.resolve([]));
+    expect(await screen.findByText(/No synced projects are available/)).toBeInTheDocument();
+  });
+
+  it("shows a project-load error without claiming the account is empty", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockRejectedValue(new Error("projects unavailable"));
+    renderVault();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("projects unavailable");
+    expect(screen.queryByText(/No synced projects are available/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry projects" })).toBeInTheDocument();
+  });
+
+  it("explains a successfully loaded empty project list", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockResolvedValue([]);
+    renderVault();
+
+    expect(
+      await screen.findByText(/No synced projects are available for this account/),
+    ).toBeInTheDocument();
+    expect(screen.getByText("sotto login")).toBeInTheDocument();
+    expect(screen.getByText("sotto push")).toBeInTheDocument();
+    expect(screen.queryByText("Loading…")).not.toBeInTheDocument();
+  });
+
+  it("explains a successfully loaded empty environment list", async () => {
+    vi.resetAllMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("project-a")]);
+    vi.mocked(vault.decryptProjectName).mockReturnValue("project-a");
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([]);
+    renderVault();
+
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    expect(
+      await screen.findByText("No environments are available in this project."),
+    ).toBeInTheDocument();
   });
 });

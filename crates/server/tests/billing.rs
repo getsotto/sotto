@@ -11,6 +11,7 @@ use sha2::Sha256;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 use sotto_server::auth::session;
 use sotto_server::billing::{
@@ -21,7 +22,10 @@ use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_operations::{self, BeginOperation};
 use sotto_server::config::{BillingConfig, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS};
 use sotto_server::db;
-use sotto_server::founding_allocator::FoundingDate;
+use sotto_server::founding_allocator::{
+    reserve_with_payer_kind_until, FoundingDate, FoundingOffer, FoundingPayerKind,
+    ReservationOutcome,
+};
 use sotto_server::personal_billing;
 use sotto_server::state::AppState;
 
@@ -689,6 +693,160 @@ async fn personal_paid_checkout_webhook_records_provider_term() {
     .await
     .expect("renewed personal account");
     assert_eq!(renewed_epoch, 2_100_000_000,);
+}
+
+#[tokio::test]
+async fn delayed_personal_checkout_payment_honours_timely_founding_reservation() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let fixture = Uuid::new_v4().simple().to_string();
+    let user_id = format!("billing-user-delayed-founding-{fixture}");
+    seed_user(&pool, &user_id).await;
+    let operation_id =
+        seed_personal_account(&pool, &user_id, &format!("delayed-founding-{fixture}")).await;
+    let checkout_created_at = 1_800_000_000;
+    let quote_expires_at = checkout_created_at + 1_800;
+    let checkout_deadline = quote_expires_at + 1_800;
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET offer = 'founding_monthly', pending_expires_at_epoch = $2 \
+         WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .bind(checkout_deadline)
+    .execute(&pool)
+    .await
+    .expect("set founding offer");
+    sqlx::query(
+        "UPDATE billing_operations SET offer = 'founding_monthly', quote_expires_at_epoch = $2 \
+         WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .bind(quote_expires_at)
+    .execute(&pool)
+    .await
+    .expect("set founding quote");
+    let mut reservation_tx = pool.begin().await.expect("begin founding reservation");
+    assert!(matches!(
+        reserve_with_payer_kind_until(
+            &mut reservation_tx,
+            &format!("founding:{operation_id}"),
+            &operation_id,
+            &user_id,
+            FoundingPayerKind::Personal,
+            &user_id,
+            FoundingOffer::Monthly,
+            1,
+            quote_expires_at,
+            checkout_deadline,
+            checkout_created_at,
+        )
+        .await
+        .expect("reserve founding place"),
+        ReservationOutcome::Created(_)
+    ));
+    reservation_tx.commit().await.expect("commit reservation");
+
+    let app = app_with_provider(
+        pool.clone(),
+        Arc::new(TestProvider {
+            observation: SubscriptionObservation::Missing,
+            personal_period_end: Some(1_900_000_000),
+        }),
+    );
+    let checkout_completed_at = checkout_created_at + 1_700;
+    let completed = serde_json::json!({
+        "id": format!("evt_delayed_founding_checkout_completed_{fixture}"),
+        "created": checkout_completed_at,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "id": "cs_delayed_founding",
+            "client_reference_id": format!("personal:{operation_id}"),
+            "payment_status": "unpaid",
+            "customer": "cus_delayed_founding",
+            "subscription": "sub_delayed_founding",
+            "payment_intent": "pi_delayed_founding"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &completed, Some(&stripe_signature(&completed))).await,
+        StatusCode::OK
+    );
+    let recorded_completion: Option<i64> = sqlx::query_scalar(
+        "SELECT checkout_completed_by_epoch FROM billing_founding_reservations WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("record Checkout completion timestamp");
+    assert_eq!(recorded_completion, Some(checkout_completed_at));
+
+    let paid_at = checkout_completed_at + 5 * 24 * 60 * 60;
+    let succeeded = serde_json::json!({
+        "id": format!("evt_delayed_founding_payment_succeeded_{fixture}"),
+        "created": paid_at,
+        "api_version": STRIPE_API_VERSION,
+        "type": "checkout.session.async_payment_succeeded",
+        "data": { "object": {
+            "id": "cs_delayed_founding",
+            "client_reference_id": format!("personal:{operation_id}"),
+            "payment_status": "paid",
+            "status": "complete",
+            "expires_at": checkout_deadline,
+            "customer": "cus_delayed_founding",
+            "subscription": "sub_delayed_founding",
+            "payment_intent": "pi_delayed_founding"
+        }}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &succeeded, Some(&stripe_signature(&succeeded))).await,
+        StatusCode::OK
+    );
+    let (account_state, reservation_state): (String, String) = sqlx::query_as(
+        "SELECT a.state, r.status FROM billing_personal_accounts a \
+         JOIN billing_founding_reservations r ON r.operation_id = a.operation_id \
+         WHERE a.operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read delayed Checkout settlement");
+    assert_eq!(account_state, "active");
+    assert_eq!(reservation_state, "confirmed");
+
+    sqlx::query("DELETE FROM billing_founding_awards WHERE beneficiary_id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean founding award");
+    sqlx::query("DELETE FROM billing_founding_reservations WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean founding reservation");
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal account");
+    sqlx::query("DELETE FROM billing_personal_events WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean personal billing events");
+    sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("clean billing operation");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("clean delayed founding user");
 }
 
 #[tokio::test]
