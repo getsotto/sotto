@@ -80,7 +80,7 @@ describe("CloudAccountPanel", () => {
       .mockRejectedValueOnce(new Error("synthetic status failure"))
       .mockImplementationOnce(() => new Promise((resolve) => { resolveRetry = resolve; }));
     vi.mocked(api.fetchPersonalQuote).mockResolvedValue({
-      offer: "monthly", amountPence: 299, currency: "gbp", interval: "month", taxTreatment: "shown_at_checkout",
+      offer: "standard_monthly", amountPence: 299, currency: "gbp", interval: "month", taxTreatment: "shown_at_checkout",
       quoteVersion: 1, quoteExpiresAtEpoch: 2_000_000_000, founding: false,
       foundingRemainingPlaces: null, foundingTerm: null, nextRenewalAmountPence: 499,
     });
