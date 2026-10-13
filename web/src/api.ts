@@ -424,24 +424,44 @@ export async function fetchSponsoredSeats(orgId: string): Promise<SponsoredSeat[
 
 export interface SponsoredQuote {
   action: string;
+  offer: BillingOffer;
   seatCount: number;
   amountPence: number;
   currency: string;
   interval: string;
   quoteVersion: number;
   quoteExpiresAtEpoch: number;
+  founding: boolean;
+  foundingRemainingPlaces: number | null;
+  foundingTerm: string | null;
+  nextRenewalAmountPence: number;
 }
 
 export async function fetchSponsoredQuote(orgId: string, input: { action: string; offer: BillingOffer; beneficiaryIds: string[] }): Promise<SponsoredQuote> {
   const body = await postJson<{
-    action: string; seat_count: number; amount_pence: number; currency: string; interval: string;
+    action: string; offer: BillingOffer; seat_count: number; amount_pence: number; currency: string; interval: string;
     quote_version: number; quote_expires_at_epoch: number;
+    founding: boolean; founding_remaining_places: number | null; founding_term: string | null;
+    next_renewal_amount_pence: number;
   }>(`/orgs/${encodeURIComponent(orgId)}/billing/sponsored/quote`, {
     action: input.action,
     offer: input.offer,
     beneficiary_ids: input.beneficiaryIds,
   });
-  return { action: body.action, seatCount: body.seat_count, amountPence: body.amount_pence, currency: body.currency, interval: body.interval, quoteVersion: body.quote_version, quoteExpiresAtEpoch: body.quote_expires_at_epoch };
+  return {
+    action: body.action,
+    offer: body.offer,
+    seatCount: body.seat_count,
+    amountPence: body.amount_pence,
+    currency: body.currency,
+    interval: body.interval,
+    quoteVersion: body.quote_version,
+    quoteExpiresAtEpoch: body.quote_expires_at_epoch,
+    founding: body.founding,
+    foundingRemainingPlaces: body.founding_remaining_places,
+    foundingTerm: body.founding_term,
+    nextRenewalAmountPence: body.next_renewal_amount_pence,
+  };
 }
 
 export async function createSponsoredCheckout(orgId: string, input: {

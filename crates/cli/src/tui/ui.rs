@@ -1802,6 +1802,51 @@ mod tests {
     }
 
     #[test]
+    fn render_history_modal_handles_unreadable_binary_and_readable_values() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.show_history_modal = true;
+        tui_app.history_modal_secret_name = "DUMMY_KEY".into();
+        tui_app.history_modal_items = vec![
+            crate::commands::SecretHistoryItem {
+                version: 3,
+                created_at: 0,
+                value: None,
+            },
+            crate::commands::SecretHistoryItem {
+                version: 2,
+                created_at: 0,
+                value: Some(vec![0xff]),
+            },
+            crate::commands::SecretHistoryItem {
+                version: 1,
+                created_at: 0,
+                value: Some(b"readable-dummy".to_vec()),
+            },
+        ];
+
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let masked = buffer_lines(&terminal).join("\n");
+        assert!(masked.contains("[unreadable]"));
+        assert!(masked.contains("(1B)"));
+        assert!(masked.contains("(14B)"));
+        assert!(!masked.contains("[binary data]"));
+        assert!(!masked.contains("readable-dummy"));
+
+        tui_app.toggle_history_reveal();
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let revealed = buffer_lines(&terminal).join("\n");
+        assert!(revealed.contains("[unreadable]"));
+        assert!(revealed.contains("[binary data]"));
+        assert!(revealed.contains("readable-dummy"));
+    }
+
+    #[test]
     fn render_history_modal_scrolling() {
         let (store, keychain, config) = unlocked();
         let theme = Theme::nord();
