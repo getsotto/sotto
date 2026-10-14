@@ -168,10 +168,36 @@ sotto grant <user-id>                      # share the active environment (they 
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
-Los tokens de máquina caducan. Un token nuevo dura 90 días salvo que pases `--expires-in-days` con
-un valor de 1 a 365, y `sotto token ls` muestra cuándo termina cada uno. Dos semanas antes,
-`sotto run` y `sotto export` muestran un aviso en el registro de la CI. Para sustituir un token,
-crea uno nuevo, actualiza el secreto de la CI y después revoca el antiguo con `sotto token revoke`.
+Los tokens de máquina caducan. Uno nuevo dura 90 días, salvo que indiques `--expires-in-days` con
+un valor de 1 a 365; `sotto token ls` muestra cuándo termina cada uno. Dos semanas antes,
+`sotto run` y `sotto export` muestran un aviso en el registro de la CI.
+
+Los comandos de tokens usan el acceso del usuario con sesión iniciada y el entorno seleccionado.
+En un entorno de una organización, solo un administrador o propietario puede gestionar tokens
+de máquina. Los listados incluyen solo metadatos de tokens activos: se omiten los revocados y
+caducados, y el listado no permite recuperar la credencial que se muestra una sola vez al crear
+un token con `sotto token create`. El JSON incluye `token_id`, `name`, `created_by`,
+`beneficiary_id`, `beneficiary_status`, `expires_at` y `expires_in_days`; los campos de
+caducidad pueden ser null. El `token_id` es el ID que se revoca, no el nombre del token ni el
+secreto `SOTTO_TOKEN`.
+
+Usa estos comandos para consultar, sustituir y revocar un token. La selección del entorno solo
+se aplica a este comando:
+
+```sh
+sotto token ls
+sotto token ls --json
+sotto --env staging token ls --json
+sotto token create --name ci
+sotto token revoke <token-id>
+```
+
+Para sustituir un token de CI, identifica el ID antiguo en el listado, crea uno nuevo, actualiza
+el secreto de la CI y verifica que la CI lo use; después revoca el ID antiguo con
+`sotto token revoke <token-id>`. La revocación impide de inmediato que ese token se autentique
+en la API, pero no rota la clave del entorno. Para un entorno de una organización, consulta las
+instrucciones existentes de `sotto rotate` cuando sea necesario rotar la clave. Ni la revocación
+ni la rotación pueden borrar el texto plano que ya se haya copiado.
 
 ### Estado de Cloud
 

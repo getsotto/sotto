@@ -168,11 +168,36 @@ sotto grant <user-id>                      # share the active environment (they 
 sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
 ```
 
-Les tokens machine expirent. Un nouveau token dure 90 jours, sauf si vous passez `--expires-in-days`
-avec une valeur de 1 à 365, et `sotto token ls` indique quand chacun prend fin. Deux semaines avant,
-`sotto run` et `sotto export` affichent un avertissement dans le journal de la CI. Pour remplacer un
-token, créez-en un nouveau, mettez à jour le secret de la CI, puis révoquez l'ancien avec
-`sotto token revoke`.
+Les tokens machine expirent. Un nouveau token dure 90 jours, sauf si vous passez
+`--expires-in-days` avec une valeur de 1 à 365 ; `sotto token ls` indique quand chacun expire.
+Deux semaines avant, `sotto run` et `sotto export` affichent un avertissement dans le journal de la CI.
+
+Les commandes de gestion des tokens utilisent l'accès de l'utilisateur connecté et l'environnement
+sélectionné. Dans un environnement d'organisation, seuls un administrateur ou un propriétaire
+peut gérer les tokens machine. La liste contient uniquement les métadonnées des tokens actifs :
+les tokens révoqués et expirés sont omis, et elle ne permet pas de retrouver l'identifiant secret
+affiché une seule fois lors de la création avec `sotto token create`. Le JSON contient `token_id`,
+`name`, `created_by`, `beneficiary_id`, `beneficiary_status`, `expires_at` et
+`expires_in_days` ; les champs d'expiration peuvent être null. Le `token_id` est l'ID à révoquer,
+pas le nom du token ni le secret `SOTTO_TOKEN`.
+
+Utilisez ces commandes pour consulter, remplacer et révoquer un token. Le choix d'environnement
+ne s'applique qu'à cette commande :
+
+```sh
+sotto token ls
+sotto token ls --json
+sotto --env staging token ls --json
+sotto token create --name ci
+sotto token revoke <token-id>
+```
+
+Pour remplacer un token CI, identifiez l'ancien ID dans la liste, créez un remplacement, mettez
+à jour le secret CI et vérifiez que la CI l'utilise, puis révoquez l'ancien ID avec
+`sotto token revoke <token-id>`. La révocation empêche immédiatement ce token de s'authentifier
+auprès de l'API, mais ne renouvelle pas la clé d'environnement. Pour un environnement
+d'organisation, suivez les instructions existantes de `sotto rotate` si la rotation de la clé
+est nécessaire. Ni la révocation ni la rotation ne peuvent effacer du texte brut déjà copié.
 
 ### État Cloud
 
