@@ -1,8 +1,8 @@
-/* Sotto - Sordino spacing, edges, elevation
+/* Sotto - Precision Micro-Radii, Edges, Structure
  *
- * Separation comes from whitespace and hairlines - never from shadow. There is
- * no elevation system on purpose: nothing floats above the content. Radius is
- * small; the surface is a document, not a set of pills.
+ * Visual Archetype: Engineered Industrial / Modern Vault
+ * Micro-radii: 3px–6px tight technical corners.
+ * Structural hairlines and metallic edges.
  */
 
 :root {
@@ -18,25 +18,26 @@
   --space-8:  4rem;    /* 64 */
   --space-9:  6rem;    /* 96 */
 
-  /* ---- Radius (quiet; hairlines do the real work) ---------------------- */
+  /* ---- Radius (Precision Micro-Radii) ---------------------------------- */
   --radius-none: 0;
-  --radius-sm:   3px;  /* inputs, buttons */
-  --radius:      4px;  /* cards, boxes, the terminal window */
-  --radius-lg:   6px;  /* the outermost app frame, sparingly */
+  --radius-sm:   3px;  /* inputs, small buttons, status badges */
+  --radius:      5px;  /* cards, boxes, terminal window */
+  --radius-lg:   6px;  /* outermost vault frame, dialogs */
 
   /* ---- Borders --------------------------------------------------------- */
   --border-width: 1px;
   --border-hairline: 1px solid var(--hairline);
   --border-input:    1px solid var(--hairline-2);
 
-  /* ---- Focus ring (never removed) -------------------------------------- */
-  --focus-ring: 2px solid var(--focus);
+  /* ---- Focus ring (Precision Cyan Indicator) --------------------------- */
+  --focus-ring:   2px solid var(--focus);
   --focus-offset: 2px;
 
-  /* ---- Elevation: there is none ---------------------------------------- */
-  --shadow-none: none;
+  /* ---- Elevation ------------------------------------------------------- */
+  --shadow-none:   none;
+  --shadow-subtle: 0 1px 3px rgba(0, 0, 0, 0.4);
 
   /* ---- Layout ---------------------------------------------------------- */
   --page-pad: var(--space-6);
-  --stack:    var(--space-4); /* default vertical rhythm between blocks */
+  --stack:    var(--space-4);
 }

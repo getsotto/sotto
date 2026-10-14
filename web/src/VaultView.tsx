@@ -106,6 +106,8 @@ export function VaultView({
   const rotatingEnvRef = useRef<string | null>(null);
   const [sharingEnvId, setSharingEnvId] = useState<string | null>(null);
   const sharingEnvRef = useRef<string | null>(null);
+  const [creatingShare, setCreatingShare] = useState(false);
+  const creatingShareRef = useRef(false);
   // Selection loads can resolve out of order; only the latest generation may update the view.
   const projectLoad = useRef(0);
   const envLoad = useRef(0);
@@ -437,6 +439,12 @@ export function VaultView({
   }
 
   async function share(current: Revealed) {
+    if (creatingShareRef.current) {
+      return;
+    }
+    creatingShareRef.current = true;
+    setCreatingShare(true);
+    setError(null);
     const generation = revealGeneration.current;
     try {
       const { encBlob, fragmentKey } = sealForShare(current.value);
@@ -450,6 +458,9 @@ export function VaultView({
       if (generation === revealGeneration.current) {
         setError(message(e));
       }
+    } finally {
+      creatingShareRef.current = false;
+      setCreatingShare(false);
     }
   }
 
@@ -667,8 +678,12 @@ export function VaultView({
             Hide secret
           </button>
           {revealed.link === null ? (
-            <button className="ghost" onClick={() => void share(revealed)}>
-              Create one-time share link
+            <button
+              className="ghost"
+              onClick={() => void share(revealed)}
+              disabled={creatingShare}
+            >
+              {creatingShare ? "Creating…" : "Create one-time share link"}
             </button>
           ) : (
             <>

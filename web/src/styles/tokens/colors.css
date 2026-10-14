@@ -1,69 +1,140 @@
-/* Sotto - Sordino colour system
+/* Sotto - Engineered Industrial Vault Colour System
  *
- * Two honest contexts, one philosophy: the interface defers.
- *   · PAPER  - the web app and docs. Warm near-white, near-black ink, hairlines.
- *              Not a dark-mode vault; a quiet document. The only colour that ever
- *              raises its voice is the alert red on role="alert".
- *   · TERMINAL - the CLI. Sparing ANSI: dim for diagnostics (stderr), red for
- *              error/warning, green for a confirmation, bright+bold for the one
- *              loud thing - a revealed value. Everything honours NO_COLOR.
- *
- * A token is added only to QUIET something, never to decorate it.
+ * Visual Archetype: Engineered Industrial / Modern Vault
+ * Surfaces: Slate, matte gunmetal, cold titanium
+ * Accent: Cold Titanium Cyan / Cryo-Blue (#06B6D4 / #38BDF8)
+ * Theming: Adaptive / System-Synced (Dark Vault default, Machined Light mode)
  */
 
 :root {
-  /* ---- Base neutrals: warm paper → ink ---------------------------------- */
-  --paper:        #fbfaf8; /* app / page background */
-  --paper-raised: #ffffff; /* the rare lifted surface (a field) */
-  --paper-sunk:   #f4f2ed; /* the one boxed thing: a code block, a secret box */
-  --ink:          #1a1917; /* primary text - near-black, warm */
-  --ink-2:        #57544e; /* secondary text, help copy */
-  --ink-3:        #8a867d; /* meta, placeholders, disabled */
-  --hairline:     #e4e0d8; /* borders, rules - separation without weight */
-  --hairline-2:   #d3cec4; /* a slightly firmer edge (inputs) */
+  color-scheme: dark;
 
-  /* ---- Platform voice: links + focus ----------------------------------- */
-  /* The browser's blue, quieted a shade. We keep the platform's voice; we
-     don't repaint it. */
-  --link:         #2f5fb0;
-  --link-visited: #5a4a8f;
-  --focus:        #2f5fb0; /* focus ring - always visible, never removed */
+  /* ---- Monochromatic Scale --------------------------------------------- */
+  --mono-0:    #ffffff;
+  --mono-50:   #f8fafc;
+  --mono-100:  #f1f5f9;
+  --mono-200:  #e2e8f0;
+  --mono-300:  #cbd5e1;
+  --mono-400:  #94a3b8;
+  --mono-500:  #64748b;
+  --mono-600:  #475569;
+  --mono-700:  #334155;
+  --mono-800:  #1e293b;
+  --mono-900:  #0f172a;
+  --mono-950:  #070a10;
+  --mono-1000: #000000;
 
-  /* ---- Semantic: the two things allowed to be loud ---------------------- */
-  --alert:        #b23a2e; /* role="alert" - an error the user must see */
-  --alert-bg:     #fbf0ee;
-  --alert-border: #e6c3bd;
-  --ok:           #2f7a4d; /* a quiet confirmation (a notice) */
-  --ok-bg:        #eef5ef;
+  /* ---- Dark Vault Neutrals (Obsidian Slate → Titanium) ------------------ */
+  --paper:        #0b0f17; /* app / page background: deep obsidian slate */
+  --paper-raised: #111827; /* lifted surface (fields, cards) */
+  --paper-sunk:   #070a10; /* recessed surface (code blocks, secret vaults) */
+  --ink:          #f8fafc; /* primary text: titanium near-white */
+  --ink-2:        #94a3b8; /* secondary text, technical labels */
+  --ink-3:        #94a3b8; /* meta text: contrast-safe (>= 4.5:1 on --paper and --paper-raised) */
+  --disabled:     #64748b; /* disabled-only controls */
+  --hairline:     #1e293b; /* borders, rules: precision separation */
+  --hairline-2:   #334155; /* inputs, active edges, chamfers */
 
-  /* ---- Terminal (ANSI, sparing) ---------------------------------------- */
-  --term-bg:      #16150f; /* near-black, faintly warm */
-  --term-chrome:  #201e17; /* window bar */
-  --term-fg:      #d9d4c6; /* default terminal text (stdout) */
-  --term-dim:     #857f6d; /* stderr: prompts, spinners, diagnostics */
-  --term-prompt:  #6f6a5a; /* the $ */
-  --term-error:   #e0705f; /* error: / warning: */
-  --term-ok:      #86b57e; /* a success confirmation */
-  --term-value:   #f4efe2; /* a revealed secret - the loud byte-for-byte value */
-  --term-accent:  #c7b47e; /* a key name / id echoed to stdout */
-  --term-selection: #3a3628;
+  /* ---- Signature Brand Accent: Cold Titanium Cyan / Cryo-Blue ------------ */
+  --accent:          #06b6d4; /* primary cyan pop */
+  --accent-hover:    #38bdf8; /* bright cryo glow */
+  --accent-contrast: #050811; /* text on primary accent buttons */
+  --accent-glow:     rgba(6, 182, 212, 0.25);
 
-  /* ---- Named aliases (use these in components) ------------------------- */
-  --text-body:    var(--ink);
-  --text-muted:   var(--ink-2);
-  --text-meta:    var(--ink-3);
-  --surface:      var(--paper);
+  /* ---- Semantic Accents ------------------------------------------------ */
+  --blue:         #38bdf8;
+  --amber:        #f59e0b;
+  --red:          #fb7185;
+
+  /* ---- Links + Focus --------------------------------------------------- */
+  --link:         #38bdf8;
+  --link-visited: #818cf8;
+  --focus:        #06b6d4; /* focus ring */
+
+  /* ---- Semantic Status ------------------------------------------------- */
+  --alert:        #fb7185; /* warning / critical error */
+  --alert-bg:     #1e1015;
+  --alert-border: #881337;
+  --ok:           #34d399; /* verified / secure status */
+  --ok-bg:        #0b1b14;
+
+  /* ---- Terminal Telemetry (ANSI / CLI) --------------------------------- */
+  --term-bg:        #070a10; /* deep subterranean terminal black */
+  --term-chrome:    #0f172a; /* window chrome */
+  --term-fg:        #f1f5f9; /* default stdout text */
+  --term-dim:       #64748b; /* stderr: prompts, telemetry */
+  --term-prompt:    #06b6d4; /* the $ prompt: cyan glow */
+  --term-error:     #fb7185; /* error / warning */
+  --term-ok:        #34d399; /* success confirmation */
+  --term-value:     #38bdf8; /* revealed secret: loud cryo value */
+  --term-accent:    #67e8f9; /* key names, ids echoed to stdout */
+  --term-selection: #1e293b;
+
+  /* ---- Named aliases --------------------------------------------------- */
+  --text-body:      var(--ink);
+  --text-muted:     var(--ink-2);
+  --text-meta:      var(--ink-3);
+  --surface:        var(--paper);
   --surface-raised: var(--paper-raised);
-  --surface-sunk: var(--paper-sunk);
-  --border:       var(--hairline);
-  --border-strong: var(--hairline-2);
+  --surface-sunk:   var(--paper-sunk);
+  --border:         var(--hairline);
+  --border-strong:  var(--hairline-2);
+  --brand-mark:     url("/mark-dark.svg");
 }
 
-/* NO_COLOR / high-contrast honoured: a plain monochrome terminal, no ANSI.
-   Mirrors the CLI honouring the NO_COLOR env var - colour is never required. */
+/* ---- Machined Light Mode (Brushed Steel / Aluminum) -------------------- */
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+
+    --paper:        #f8fafc; /* brushed aluminum / pale steel */
+    --paper-raised: #ffffff; /* pure white surface */
+    --paper-sunk:   #f1f5f9; /* recessed machined panel */
+    --ink:          #0f172a; /* deep slate primary ink */
+    --ink-2:        #334155; /* secondary steel text */
+    --ink-3:        #475569; /* meta text: contrast-safe (>= 7:1 on --paper and --paper-raised) */
+    --disabled:     #94a3b8; /* disabled-only controls */
+    --hairline:     #e2e8f0; /* hairline steel rules */
+    --hairline-2:   #cbd5e1; /* input borders */
+
+    --accent:          #0369a1; /* high-contrast cryo cobalt (5.86:1 on white) */
+    --accent-hover:    #075985; /* darker hover shade (7.34:1 on white) */
+    --accent-contrast: #ffffff;
+    --accent-glow:     rgba(3, 105, 161, 0.15);
+
+    --blue:         #0284c7;
+    --amber:        #d97706;
+    --red:          #e11d48;
+
+    --link:         #0369a1; /* >= 4.5:1 against #f8fafc and #ffffff */
+    --link-visited: #4f46e5;
+    --focus:        #0369a1;
+
+    --alert:        #e11d48;
+    --alert-bg:     #fff1f2;
+    --alert-border: #fecdd3;
+    --ok:           #047857; /* 4.88:1 on #ecfdf5 (--ok-bg) */
+    --ok-bg:        #ecfdf5;
+
+    --term-bg:        #0f172a;
+    --term-chrome:    #1e293b;
+    --term-fg:        #f8fafc;
+    --term-dim:       #94a3b8;
+    --term-prompt:    #38bdf8;
+    --term-error:     #fb7185;
+    --term-ok:        #34d399;
+    --term-value:     #67e8f9;
+    --term-accent:    #38bdf8;
+    --term-selection: #334155;
+
+    --brand-mark:     url("/mark-light.svg");
+  }
+}
+
+/* High contrast / NO_COLOR */
 [data-no-color] {
-  --term-dim:    #b8b3a4;
-  --term-prompt: #b8b3a4;
+  --term-dim:    #94a3b8;
+  --term-prompt: #94a3b8;
   --term-error:  var(--term-fg);
   --term-ok:     var(--term-fg);
   --term-value:  var(--term-fg);

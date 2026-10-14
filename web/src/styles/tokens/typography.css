@@ -1,47 +1,46 @@
-/* Sotto - Sordino typography
+/* Sotto - Technical Precision Typography
  *
- * Two families, both from the platform. We never ship a webfont: type must be
- * legible before any styling loads, on any machine, offline. system-ui is the
- * app/doc voice; a monospace stack carries every byte that matters - secret
- * values, keys, commands, ids, terminal output.
- *
- * There is no display face. Emphasis is size and space, not a second typeface.
+ * Visual Archetype: Engineered Industrial / Modern Vault
+ * Stacks:
+ *   · Display / UI: Space Grotesk / Inter (Sharp, geometric neo-grotesque)
+ *   · Data / Telemetry / Secrets: JetBrains Mono / SF Mono (Slits, zeros, distinct glyphs)
  */
 
 :root {
   /* ---- Families -------------------------------------------------------- */
-  --font-system: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
-                 Helvetica, Arial, sans-serif;
-  --font-mono:   ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
-                 "Liberation Mono", monospace;
+  --font-system:  "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                  Helvetica, Arial, sans-serif;
+  --font-mono:    "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+                  "Liberation Mono", monospace;
+  --font-display: "Space Grotesk", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 
-  /* ---- Type scale (restrained; a quiet minor-third-ish ramp) ----------- */
+  /* ---- Type scale (precision telemetry ramp) -------------------------- */
   --text-xs:    0.8125rem; /* 13px - meta, captions, audit rows */
-  --text-sm:    0.875rem;  /* 14px - help copy, secondary */
+  --text-sm:    0.875rem;  /* 14px - help copy, telemetry labels */
   --text-base:  1rem;      /* 16px - body, controls */
   --text-md:    1.125rem;  /* 18px - lead paragraph */
   --text-lg:    1.375rem;  /* 22px - section heading (h2) */
   --text-xl:    1.75rem;   /* 28px - page heading (h1) */
-  --text-2xl:   2.25rem;   /* 36px - the rare large moment */
+  --text-2xl:   2.25rem;   /* 36px - hero moments */
 
-  /* ---- Weights (bold is reserved for the loud value) ------------------- */
+  /* ---- Weights --------------------------------------------------------- */
   --weight-normal:   400;
   --weight-medium:   500;
   --weight-semibold: 600;
-  --weight-bold:     700; /* a revealed secret, and almost nothing else */
+  --weight-bold:     700;
 
   /* ---- Line height ----------------------------------------------------- */
-  --leading-tight:   1.2;  /* headings */
-  --leading-snug:    1.35; /* controls, list items */
-  --leading-normal:  1.55; /* body */
-  --leading-relaxed: 1.7;  /* long help copy */
+  --leading-tight:   1.2;
+  --leading-snug:    1.35;
+  --leading-normal:  1.55;
+  --leading-relaxed: 1.7;
 
   /* ---- Tracking -------------------------------------------------------- */
-  --tracking-tight:  -0.011em; /* large headings */
+  --tracking-tight:  -0.02em;
   --tracking-normal: 0;
-  --tracking-wide:   0.02em;   /* small caps-ish labels */
+  --tracking-wide:   0.04em;
 
   /* ---- Measure --------------------------------------------------------- */
-  --measure:      66ch; /* body column - a comfortable reading width */
+  --measure:        66ch;
   --measure-narrow: 46ch;
 }

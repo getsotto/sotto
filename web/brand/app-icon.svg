@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none" role="img" aria-label="Sotto App Icon">
+  <defs>
+    <!-- Background Vault Plate Gradient -->
+    <linearGradient id="vaultPlate" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1E293B" />
+      <stop offset="40%" stop-color="#0F172A" />
+      <stop offset="100%" stop-color="#050811" />
+    </linearGradient>
+
+    <!-- Hairline Chamfer Border -->
+    <linearGradient id="plateBorder" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#475569" />
+      <stop offset="50%" stop-color="#1E293B" />
+      <stop offset="100%" stop-color="#334155" />
+    </linearGradient>
+
+    <!-- Ambient Core Glow -->
+    <radialGradient id="radialCyan" cx="256" cy="256" r="220" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#06B6D4" stop-opacity="0.32" />
+      <stop offset="50%" stop-color="#0284C7" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#000000" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Upper Tumbler Metallic -->
+    <linearGradient id="tumblerUpper" x1="120" y1="90" x2="380" y2="300" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="40%" stop-color="#CBD5E1" />
+      <stop offset="100%" stop-color="#64748B" />
+    </linearGradient>
+
+    <!-- Lower Tumbler Metallic -->
+    <linearGradient id="tumblerLower" x1="392" y1="422" x2="132" y2="212" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F8FAFC" />
+      <stop offset="40%" stop-color="#94A3B8" />
+      <stop offset="100%" stop-color="#475569" />
+    </linearGradient>
+
+    <!-- Core Cyan Gradient -->
+    <linearGradient id="cipherCyan" x1="220" y1="220" x2="292" y2="292" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#67E8F9" />
+      <stop offset="60%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#06B6D4" />
+    </linearGradient>
+  </defs>
+
+  <!-- Enclosure Plate (Micro-Radii Squircle with Chamfered Precision Feel) -->
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#vaultPlate)" stroke="url(#plateBorder)" stroke-width="4" />
+
+  <!-- Subtle Precision Grid Crosshairs in Background -->
+  <line x1="256" y1="48" x2="256" y2="88" stroke="#334155" stroke-width="2" stroke-linecap="round" opacity="0.6" />
+  <line x1="256" y1="424" x2="256" y2="464" stroke="#334155" stroke-width="2" stroke-linecap="round" opacity="0.6" />
+  <line x1="48" y1="256" x2="88" y2="256" stroke="#334155" stroke-width="2" stroke-linecap="round" opacity="0.6" />
+  <line x1="424" y1="256" x2="464" y2="256" stroke="#334155" stroke-width="2" stroke-linecap="round" opacity="0.6" />
+
+  <!-- Radial Cyan Field -->
+  <circle cx="256" cy="256" r="210" fill="url(#radialCyan)" />
+
+  <!-- UPPER MECHANICAL TUMBLER -->
+  <path d="
+    M 372 152
+    L 332 108
+    L 204 108
+    C 152 108 116 144 116 196
+    C 116 236 140 264 176 284
+    L 242 320
+    L 268 304
+    L 220 274
+    C 192 258 178 240 178 214
+    C 178 188 198 168 228 168
+    L 326 168
+    L 372 152
+    Z
+  " fill="url(#tumblerUpper)" stroke="#1E293B" stroke-width="3" stroke-linejoin="round" />
+
+  <!-- LOWER MECHANICAL TUMBLER -->
+  <path d="
+    M 140 360
+    L 180 404
+    L 308 404
+    C 360 404 396 368 396 316
+    C 396 276 372 248 336 228
+    L 270 192
+    L 244 208
+    L 292 238
+    C 320 254 334 272 334 298
+    C 334 324 314 344 284 344
+    L 186 344
+    L 140 360
+    Z
+  " fill="url(#tumblerLower)" stroke="#1E293B" stroke-width="3" stroke-linejoin="round" />
+
+  <!-- MECHANICAL CLEARANCE GAP LINE (Precision Seam Highlight) -->
+  <path d="M 244 208 L 270 192 L 336 228" stroke="#38BDF8" stroke-width="3" stroke-linecap="round" opacity="0.8" />
+  <path d="M 268 304 L 242 320 L 176 284" stroke="#38BDF8" stroke-width="3" stroke-linecap="round" opacity="0.8" />
+
+  <!-- CIPHER CORE DIAMOND -->
+  <polygon points="256,222 290,256 256,290 222,256" fill="url(#cipherCyan)" />
+  <circle cx="256" cy="256" r="5" fill="#0B0F17" />
+  <circle cx="256" cy="256" r="2.5" fill="#67E8F9" />
+</svg>

@@ -44,7 +44,20 @@
 }
 
 .landing header nav a.login {
-  color: var(--link);
+  color: var(--accent);
+  font-weight: var(--weight-semibold);
+  border: 1px solid var(--hairline-2);
+  padding: 4px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--paper-raised);
+  text-decoration: none;
+  transition: all var(--duration-fast) var(--ease);
+}
+
+.landing header nav a.login:hover {
+  background: var(--paper-sunk);
+  border-color: var(--accent);
+  text-decoration: none;
 }
 
 /* ---- Hero: the one rare large moment --------------------------------------- */
@@ -220,7 +233,9 @@
   padding: var(--space-5);
   overflow-x: auto;
   background: var(--term-bg);
+  border: 1px solid var(--hairline-2);
   border-radius: var(--radius);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
   color: var(--term-fg);
   font-family: var(--font-mono);
   font-size: var(--text-sm);

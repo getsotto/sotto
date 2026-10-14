@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="120" viewBox="0 0 480 120" fill="none" role="img" aria-label="Sotto Logo">
+  <defs>
+    <!-- Scaled Mark Transform -->
+  </defs>
+
+  <!-- Scaled Mark matching sotto text cap-height -->
+  <g transform="translate(20, 26) scale(0.098)">
+    
+
+  <defs>
+    <!-- Titanium Upper Tumbler Gradient -->
+    <linearGradient id="titaniumUpper" x1="120" y1="90" x2="380" y2="300" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F1F5F9" />
+      <stop offset="60%" stop-color="#94A3B8" />
+      <stop offset="100%" stop-color="#64748B" />
+    </linearGradient>
+
+    <!-- Titanium Lower Tumbler Gradient -->
+    <linearGradient id="titaniumLower" x1="392" y1="422" x2="132" y2="212" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F1F5F9" />
+      <stop offset="60%" stop-color="#94A3B8" />
+      <stop offset="100%" stop-color="#64748B" />
+    </linearGradient>
+
+    <!-- Cryo Cyan Core Glow Gradient -->
+    <linearGradient id="cyanCoreGrad" x1="220" y1="220" x2="292" y2="292" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#67E8F9" />
+      <stop offset="50%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#06B6D4" />
+    </linearGradient>
+
+    <!-- Cryo Glow Filter -->
+    <filter id="coreGlow" x="180" y="180" width="152" height="152" filterUnits="userSpaceOnUse">
+      <feGaussianBlur stdDeviation="12" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Cryo Cyan Radiant Energy Behind Core -->
+  <circle cx="256" cy="256" r="36" fill="#38BDF8" opacity="0.25" filter="url(#coreGlow)" />
+
+  <!-- UPPER MECHANICAL TUMBLER / J-SHACKLE -->
+  <!-- Top arm sweeps from top-right, curves through upper crown, down left wall, facets inward to interlock notch -->
+  <path d="
+    M 376 156
+    L 336 108
+    L 204 108
+    C 152 108 116 144 116 196
+    C 116 236 140 264 176 284
+    L 242 320
+    L 268 304
+    L 220 274
+    C 192 258 178 240 178 214
+    C 178 188 198 168 228 168
+    L 326 168
+    L 376 156
+    Z
+  " fill="url(#titaniumUpper)" stroke="#334155" stroke-width="2" stroke-linejoin="round" />
+
+  <!-- LOWER MECHANICAL TUMBLER / J-SHACKLE (Inverted Symmetry) -->
+  <!-- Bottom arm sweeps from bottom-left, curves through lower crown, up right wall, facets inward to interlock notch -->
+  <path d="
+    M 136 356
+    L 176 404
+    L 308 404
+    C 360 404 396 368 396 316
+    C 396 276 372 248 336 228
+    L 270 192
+    L 244 208
+    L 292 238
+    C 320 254 334 272 334 298
+    C 334 324 314 344 284 344
+    L 186 344
+    L 136 356
+    Z
+  " fill="url(#titaniumLower)" stroke="#334155" stroke-width="2" stroke-linejoin="round" />
+
+  <!-- INTERLOCKING CRYOGENIC CIPHER CORE (Precision Diamond / Bevel Keyway) -->
+  <polygon points="256,224 288,256 256,288 224,256" fill="url(#cyanCoreGrad)" />
+  <circle cx="256" cy="256" r="4" fill="#0B0F17" />
+
+  </g>
+
+  <!-- SOTTO Technical Grotesque Wordmark -->
+  <text x="82" y="66" font-family="'Space Grotesk', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="46" font-weight="700" letter-spacing="-0.04em" fill="#F8FAFC">sotto</text>
+
+  <!-- Subtitle / Wedge Tagline -->
+  <text x="84" y="90" font-family="'JetBrains Mono', 'SF Mono', ui-monospace, monospace" font-size="12" font-weight="500" letter-spacing="-0.01em" fill="#64748B">zero-knowledge secret sync</text>
+</svg>

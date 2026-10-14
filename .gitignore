@@ -24,6 +24,8 @@ deploy/rehearsals/
 *.swp
 .idea/
 .vscode/
+.worktrees/
+.claude/
 
 # Internal planning docs - kept out of the public open-core repo.
 docs/

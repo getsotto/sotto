@@ -17,10 +17,16 @@
 @import "./tokens/spacing.css";
 @import "./tokens/motion.css";
 
-/* ---- Page: a quiet document on warm paper -------------------------------- */
+/* ---- Page: adaptive engineered vault surfaces ---------------------------- */
 
 :root {
-  color-scheme: light;
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+  }
 }
 
 html {
@@ -54,25 +60,42 @@ main > header {
 }
 
 .wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-display, var(--font-system));
   font-size: var(--text-xl);
-  font-weight: var(--weight-semibold);
-  letter-spacing: -0.02em;
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.03em;
   line-height: 1;
   color: var(--ink);
+}
+
+.wordmark::before {
+  content: "";
+  display: inline-block;
+  width: 0.88em;
+  height: 0.88em;
+  background-image: var(--brand-mark);
+  background-size: contain;
+  background-repeat: no-repeat;
+  flex-shrink: 0;
 }
 
 /* ---- Type ----------------------------------------------------------------- */
 
 h1 {
   margin: 0 0 var(--space-2);
+  font-family: var(--font-display, var(--font-system));
   font-size: var(--text-lg);
-  font-weight: var(--weight-semibold);
+  font-weight: var(--weight-bold);
   line-height: var(--leading-tight);
   letter-spacing: var(--tracking-tight);
 }
 
 h2 {
   margin: 0 0 var(--space-3);
+  font-family: var(--font-display, var(--font-system));
   font-size: var(--text-md);
   font-weight: var(--weight-semibold);
   line-height: var(--leading-tight);
@@ -226,15 +249,17 @@ button:disabled {
 
 /* The one committing action on a page. */
 button.primary {
-  background: var(--ink);
-  color: var(--paper);
-  border-color: var(--ink);
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border-color: var(--accent);
+  font-weight: var(--weight-semibold);
 }
 
 button.primary:hover,
 button.primary:active {
-  background: #000000;
-  border-color: #000000;
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  box-shadow: 0 0 12px var(--accent-glow);
 }
 
 button.ghost {
