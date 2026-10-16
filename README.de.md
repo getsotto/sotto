@@ -327,6 +327,43 @@ Ohne `sotto.toml` und ohne lokale Identität:
 
 Fehlt `sotto.toml`, ist kein Projekt ausgewählt. Eine fehlerhafte oder unlesbare Datei führt zu einem Fehler.
 
+### Sperren, entsperren und abmelden
+
+Bei einer bereits initialisierten lokalen Identität kannst du den Tresor sperren,
+seinen Status prüfen und ihn bei Bedarf wieder entsperren:
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` löscht die zwischengespeicherte lokale Hauptschlüssel-Sitzung, die
+nachfolgende CLI-Befehle verwenden. Deine Identität, der verschlüsselte Tresor und
+die gespeicherte Anmeldung am Synchronisierungsserver bleiben erhalten.
+`sotto unlock` verwendet dein Hauptpasswort, wenn keine gültige Sitzung im Cache
+vorliegt. Befehle, die lokale Daten entschlüsseln müssen, fordern bei Bedarf
+ebenfalls zum Entsperren auf. Die Statusfelder erklärt
+[Lokalen Status prüfen](#lokalen-status-prüfen).
+
+Die lokale Sitzung gilt 12 Stunden ab dem Zwischenspeichern des Schlüssels, nicht
+ab deiner letzten Aktivität. Der Ablauf wird beim Lesen des Schlüssels aus dem
+Cache geprüft. `sotto unlock` verlängert diese Dauer nicht, wenn der Tresor bereits
+entsperrt ist. Weder Sperren noch Ablauf löschen Klartext, den laufende Anwendungen
+bereits enthalten.
+
+Um auch die gespeicherte CLI-Anmeldung am Synchronisierungsserver zu löschen,
+führe beide Befehle aus:
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` entfernt das gespeicherte Server-Sitzungstoken der CLI, unabhängig
+vom lokalen Entsperr-Cache. Browser-Sitzungen und andere Geräte werden dadurch
+nicht abgemeldet.
+
 ### Ausgabe-Themes
 
 Die CLI enthält fünf integrierte Themes: `nord` (die Standardeinstellung), `sordino`,

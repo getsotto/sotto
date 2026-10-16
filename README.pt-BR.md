@@ -324,6 +324,42 @@ Sem `sotto.toml` nem identidade local:
 
 Sem `sotto.toml`, nenhum projeto está selecionado. Um arquivo inválido ou ilegível causa um erro.
 
+### Bloquear, desbloquear e sair
+
+Com uma identidade local já inicializada, bloqueie o cofre, confira seu estado e
+desbloqueie-o quando precisar usá-lo novamente:
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` limpa a sessão local da chave mestra em cache usada pelos próximos
+comandos da CLI. Não exclui sua identidade, o cofre criptografado nem o login salvo
+do servidor de sincronização. `sotto unlock` usa sua senha mestra quando não há uma
+sessão válida em cache. Os comandos que precisam descriptografar dados locais
+também solicitam o desbloqueio quando necessário. Consulte
+[Consultar o estado local](#consultar-o-estado-local) para conhecer os campos de estado.
+
+A sessão local dura 12 horas a partir do armazenamento da chave em cache, não da
+sua última atividade. A expiração é verificada quando a chave em cache é lida.
+Executar `sotto unlock` quando o cofre já está desbloqueado não prolonga esse prazo.
+Nem o bloqueio nem a expiração limpam o texto sem criptografia que os aplicativos
+em execução já possuem.
+
+Para limpar também o login da CLI salvo no servidor de sincronização, execute
+os dois comandos:
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` remove o token de sessão do servidor armazenado pela CLI,
+independentemente do cache de desbloqueio local. Não encerra sessões do navegador
+nem de outros dispositivos.
+
 ### Temas de saída
 
 A CLI traz cinco temas integrados: `nord` (o padrão), `sordino`, `terminal`, `monochrome` e

@@ -326,6 +326,41 @@ Sin un `sotto.toml` ni identidad local:
 
 Si falta `sotto.toml`, no hay ningún proyecto seleccionado. Un archivo mal formado o ilegible produce un error.
 
+### Bloquear, desbloquear y cerrar sesión
+
+Con una identidad local ya inicializada, bloquea la bóveda, consulta su estado y
+desbloquéala cuando vuelvas a necesitarla:
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` borra la sesión local de la clave maestra en caché que utilizan los
+siguientes comandos de la CLI. No elimina tu identidad, la bóveda cifrada ni el
+inicio de sesión guardado del servidor de sincronización. `sotto unlock` utiliza
+tu contraseña maestra cuando no hay una sesión válida en caché. Los comandos que
+necesitan descifrar datos locales también solicitan el desbloqueo cuando hace falta.
+Consulta [Consultar el estado local](#consultar-el-estado-local) para conocer los campos de estado.
+
+La sesión local dura 12 horas desde que se guarda la clave en caché, no desde tu
+última actividad. La caducidad se comprueba al leer la clave en caché. Ejecutar
+`sotto unlock` cuando ya está desbloqueada no prolonga ese plazo. Ni el bloqueo ni
+la caducidad borran el texto sin cifrar que ya tienen las aplicaciones en ejecución.
+
+Para borrar también el inicio de sesión guardado de la CLI en el servidor de
+sincronización, ejecuta ambos comandos:
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` elimina el token de sesión del servidor guardado por la CLI,
+independientemente de la caché de desbloqueo local. No cierra las sesiones del
+navegador ni las de otros dispositivos.
+
 ### Temas de salida
 
 La CLI incluye cinco temas integrados: `nord` (el predeterminado), `sordino`, `terminal`,
