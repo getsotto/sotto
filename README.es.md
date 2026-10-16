@@ -402,6 +402,42 @@ border = "#331144"
 Guardado como `synth.toml`, ese archivo añade un tema `synth`. Aplícalo con
 `sotto theme set synth`, o para un solo comando con `sotto --theme synth <command>`.
 
+### Restaurar una versión anterior de un secreto
+
+Empieza en un proyecto ya configurado y mantén seleccionado el mismo entorno durante todo el proceso.
+Necesitas una sesión iniciada y el almacén local desbloqueado. El historial procede del servidor:
+los valores que nunca se han enviado no están disponibles allí para recuperarlos.
+
+```sh
+sotto history DATABASE_URL
+```
+
+Elige un número de versión positivo y legible del historial. El ejemplo siguiente usa `2`;
+sustitúyelo por una versión disponible, sin el prefijo `v` que se muestra.
+
+```sh
+sotto rollback DATABASE_URL 2
+sotto push
+```
+
+Rollback restaura el valor elegido como una nueva versión local. No borra ni reescribe el
+historial anterior, y el servidor no se actualiza hasta el envío posterior.
+
+Para obtener JSON con solo metadatos:
+
+```sh
+sotto history DATABASE_URL --json
+```
+
+Cada fila contiene `version`, `readable` (si se pudo descifrar el valor) y `size_bytes`
+(el número de bytes del texto sin cifrar, o null si la versión es ilegible). No se imprimen valores.
+En cambio, `--reveal` imprime los valores secretos y no se puede combinar con `--json`.
+
+Si no hay historial en el servidor, comprueba el entorno seleccionado y si se ha enviado.
+Un envío ahora no recupera valores antiguos que nunca se sincronizaron. Para una versión
+ilegible, sigue la sugerencia de la CLI: ejecuta `sotto pull` e inténtalo de nuevo;
+esto no garantiza que las claves disponibles permitan descifrar esa versión.
+
 ### Otro dispositivo
 
 ```sh

@@ -388,6 +388,42 @@ border = "#331144"
 Saved as `synth.toml`, that file adds a `synth` theme. Apply it with `sotto theme set synth`,
 or for one command with `sotto --theme synth <command>`.
 
+### Restore an earlier secret version
+
+Start in an existing configured project and keep the same environment selected throughout.
+You need a logged-in session and an unlocked local store. History comes from the server:
+values that have never been pushed are not available there for recovery.
+
+```sh
+sotto history DATABASE_URL
+```
+
+Choose a readable, positive version number from the history. The example below uses `2`;
+replace it with an available version, without the displayed `v` prefix.
+
+```sh
+sotto rollback DATABASE_URL 2
+sotto push
+```
+
+Rollback restores the chosen value as a new local version. It does not erase or rewrite
+older history, and the server is not updated until the subsequent push.
+
+For metadata-only JSON, use:
+
+```sh
+sotto history DATABASE_URL --json
+```
+
+Each row has `version`, `readable` (whether the value could be decrypted) and `size_bytes`
+(the plaintext byte count, or null for an unreadable version). No values are printed.
+By contrast, `--reveal` prints secret values; it cannot be combined with `--json`.
+
+If there is no server history, check the selected environment and whether it has been
+pushed. Pushing now cannot recover older values that were never synced. For an unreadable
+version, follow the CLI's suggestion to run `sotto pull` and try again; pulling does not
+guarantee that a version can be decrypted with the available keys.
+
 ### Another device
 
 ```sh
