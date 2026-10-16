@@ -1151,6 +1151,133 @@ describe("VaultView secret copying", () => {
   });
 });
 
+describe("VaultView share-link copying", () => {
+  const fragmentKey = new Uint8Array([11, 12]);
+  const shareLink = () =>
+    `${window.location.origin}/s/share-token#${bytesToUrlSafeB64(fragmentKey)}`;
+  let clipboardDescriptor: PropertyDescriptor | undefined;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    vi.mocked(api.fetchOrgs).mockResolvedValue([]);
+    vi.mocked(api.fetchProjects).mockResolvedValue([project("project-a")]);
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchMyGrant).mockResolvedValue(new Uint8Array([7]));
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a"), secret("secret-b")]);
+    vi.mocked(api.createShare).mockResolvedValue("share-token");
+    vi.mocked(vault.decryptProjectName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.decryptEnvName).mockImplementation((_key, id) => id);
+    vi.mocked(vault.decryptSecretName).mockImplementation((_key, _env, entry) => entry.id);
+    vi.mocked(vault.openEnvGrant).mockReturnValue(new Uint8Array([8]));
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("super-secret");
+    vi.mocked(vault.sealForShare).mockReturnValue({
+      encBlob: new Uint8Array([10]),
+      fragmentKey,
+    });
+  });
+
+  afterEach(() => {
+    if (clipboardDescriptor) {
+      Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+    } else {
+      Reflect.deleteProperty(navigator, "clipboard");
+    }
+  });
+
+  async function createShareLink() {
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    fireEvent.click(await screen.findByRole("button", { name: "secret-a" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create one-time share link" }));
+    const linkField = await screen.findByLabelText("Share link (burns after one view):");
+    expect(linkField).toHaveValue(shareLink());
+    return linkField;
+  }
+
+  it("copies the full share URL only after explicit activation", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    const linkField = await createShareLink();
+    expect(writeText).not.toHaveBeenCalled();
+    expect(api.createShare).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy share link" }));
+    expect(await screen.findByText("Share link copied.", { selector: '[role="status"]' })).toBeInTheDocument();
+    expect(writeText).toHaveBeenCalledExactlyOnceWith(shareLink());
+    expect(api.createShare).toHaveBeenCalledTimes(1);
+    expect(linkField).toHaveValue(shareLink());
+    expect(screen.queryByText("Secret copied.")).not.toBeInTheDocument();
+  });
+
+  it("keeps the link available when the clipboard API is missing", async () => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: undefined });
+
+    const linkField = await createShareLink();
+    fireEvent.click(screen.getByRole("button", { name: "Copy share link" }));
+
+    expect(
+      await screen.findByText("Copy failed. Select the share link above and copy it manually.", {
+        selector: '[role="status"]',
+      }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Share link copied.")).not.toBeInTheDocument();
+    expect(linkField).toHaveValue(shareLink());
+    expect(screen.getByRole("button", { name: "Copy share link" })).toBeEnabled();
+  });
+
+  it("keeps the link available after a clipboard write rejects and allows retry", async () => {
+    const retry = deferred<void>();
+    const writeText = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("permission denied"))
+      .mockImplementationOnce(() => retry.promise);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    const linkField = await createShareLink();
+    fireEvent.click(screen.getByRole("button", { name: "Copy share link" }));
+    expect(
+      await screen.findByText("Copy failed. Select the share link above and copy it manually.", {
+        selector: '[role="status"]',
+      }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy share link" }));
+    expect(
+      screen.queryByText("Copy failed. Select the share link above and copy it manually."),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copying…" })).toBeDisabled();
+    expect(writeText).toHaveBeenCalledTimes(2);
+    expect(writeText).toHaveBeenNthCalledWith(1, shareLink());
+    expect(writeText).toHaveBeenNthCalledWith(2, shareLink());
+    expect(api.createShare).toHaveBeenCalledTimes(1);
+    expect(linkField).toHaveValue(shareLink());
+
+    await act(async () => retry.resolve());
+    expect(await screen.findByText("Share link copied.", { selector: '[role="status"]' })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy share link" })).toBeEnabled();
+  });
+
+  it("does not show stale link-copy feedback after switching secrets", async () => {
+    const writeText = vi.fn().mockReturnValue(deferred<void>().promise);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+
+    await createShareLink();
+    fireEvent.click(screen.getByRole("button", { name: "Copy share link" }));
+    expect(screen.getByRole("button", { name: "Copying…" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "secret-b" }));
+    expect(screen.queryByLabelText("Share link (burns after one view):")).not.toBeInTheDocument();
+    expect(screen.queryByText("Share link copied.")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Copy failed. Select the share link above and copy it manually."),
+    ).not.toBeInTheDocument();
+    expect(api.createShare).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("VaultView secret hiding", () => {
   beforeEach(() => {
     vi.resetAllMocks();

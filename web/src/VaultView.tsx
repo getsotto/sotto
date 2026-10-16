@@ -92,6 +92,9 @@ export function VaultView({
   const [copyBusy, setCopyBusy] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState<string | null>(null);
   const copyGeneration = useRef(0);
+  const [linkCopyBusy, setLinkCopyBusy] = useState(false);
+  const [linkCopyFeedback, setLinkCopyFeedback] = useState<string | null>(null);
+  const linkCopyGeneration = useRef(0);
   const [secretQuery, setSecretQuery] = useState("");
   // Org members of the active project (loaded when an org env is opened), for the share picker.
   const [members, setMembers] = useState<Member[] | null>(null);
@@ -408,6 +411,9 @@ export function VaultView({
     ++copyGeneration.current;
     setCopyBusy(false);
     setCopyFeedback(null);
+    ++linkCopyGeneration.current;
+    setLinkCopyBusy(false);
+    setLinkCopyFeedback(null);
     setError(null);
     try {
       const value = decryptSecretValue(openEnv.vaultKey, openEnv.envId, ns.entry);
@@ -435,6 +441,34 @@ export function VaultView({
       }
     } finally {
       if (generation === copyGeneration.current) setCopyBusy(false);
+    }
+  }
+
+  async function copyShareLink(current: Revealed) {
+    if (current.link === null || linkCopyBusy) {
+      return;
+    }
+    const generation = ++linkCopyGeneration.current;
+    setLinkCopyBusy(true);
+    setLinkCopyFeedback(null);
+    try {
+      if (navigator.clipboard?.writeText === undefined) {
+        throw new Error("clipboard unavailable");
+      }
+      await navigator.clipboard.writeText(current.link);
+      if (generation === linkCopyGeneration.current) {
+        setLinkCopyFeedback("Share link copied.");
+      }
+    } catch {
+      if (generation === linkCopyGeneration.current) {
+        setLinkCopyFeedback(
+          "Copy failed. Select the share link above and copy it manually.",
+        );
+      }
+    } finally {
+      if (generation === linkCopyGeneration.current) {
+        setLinkCopyBusy(false);
+      }
     }
   }
 
@@ -482,6 +516,9 @@ export function VaultView({
     }
     const id = revealed.id;
     ++revealGeneration.current;
+    ++linkCopyGeneration.current;
+    setLinkCopyBusy(false);
+    setLinkCopyFeedback(null);
     setRevealed(null);
     secretButtons.current.get(id)?.focus();
   }
@@ -698,6 +735,15 @@ export function VaultView({
                 rows={2}
                 spellCheck={false}
               />
+              <button
+                disabled={linkCopyBusy}
+                onClick={() => void copyShareLink(revealed)}
+              >
+                {linkCopyBusy ? "Copying…" : "Copy share link"}
+              </button>
+              {linkCopyFeedback !== null && (
+                <p role="status">{linkCopyFeedback}</p>
+              )}
             </>
           )}
         </section>
