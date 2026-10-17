@@ -11,6 +11,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use clap::{CommandFactory, Parser, Subcommand};
+use inquire::Confirm;
 use zeroize::{Zeroize, Zeroizing};
 
 use sotto_cli::clipboard;
@@ -339,6 +340,12 @@ enum EnvCommand {
 enum TaskCommand {
     /// Validate `sotto.tasks.toml` without opening the local secret store.
     Validate,
+    /// Approve one declared task for one environment after reviewing its full command.
+    Approve { name: String },
+    /// List local task approvals for this project.
+    Approvals,
+    /// Revoke approval for one task and environment.
+    Revoke { name: String },
 }
 
 #[derive(Subcommand)]
@@ -476,6 +483,31 @@ fn run() -> Result<()> {
         let noun = if count == 1 { "task" } else { "tasks" };
         println!("valid: {count} {noun}");
         return Ok(());
+    }
+
+    // Task approvals are a separate local capability. These commands use only the project
+    // declaration and approval store; they never open the secret store or keychain.
+    if let Some(Command::Task { command }) = &cli.command {
+        match command {
+            TaskCommand::Approve { name } => {
+                let environment = cli.env.as_deref().ok_or_else(|| {
+                    Error::MissingArgument(
+                        "missing required option --env <ENVIRONMENT> for task approval".into(),
+                    )
+                })?;
+                return approve_task(name, environment);
+            }
+            TaskCommand::Approvals => return list_task_approvals(cli.env.as_deref()),
+            TaskCommand::Revoke { name } => {
+                let environment = cli.env.as_deref().ok_or_else(|| {
+                    Error::MissingArgument(
+                        "missing required option --env <ENVIRONMENT> for task revocation".into(),
+                    )
+                })?;
+                return revoke_task_approval(name, environment);
+            }
+            TaskCommand::Validate => {}
+        }
     }
 
     // Machine mode: with SOTTO_TOKEN set, `run`/`export` decrypt entirely in memory - no store,
@@ -711,7 +743,12 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Task { command } => match command {
-            TaskCommand::Validate => unreachable!("task validation is handled before store init"),
+            TaskCommand::Validate
+            | TaskCommand::Approve { .. }
+            | TaskCommand::Approvals
+            | TaskCommand::Revoke { .. } => {
+                unreachable!("task commands are handled before store init")
+            }
         },
         Command::Status { json } => status(&app, &cwd, json, &theme),
         Command::Set { name, value, stdin } => {
@@ -888,6 +925,224 @@ fn run() -> Result<()> {
         },
         Command::Completions { .. } => unreachable!("completions are handled before store init"),
         Command::Theme { .. } => unreachable!("theme commands are handled before store init"),
+    }
+}
+
+fn approve_task(name: &str, environment: &str) -> Result<()> {
+    if !prompts::can_prompt() {
+        return Err(Error::MissingArgument(
+            "task approval requires an interactive terminal; no approval was recorded".into(),
+        ));
+    }
+
+    let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+    let (config, project_root) = Config::discover(&cwd)?;
+    let project_root = std::fs::canonicalize(&project_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    let project_root_key = sotto_cli::agent_approvals::project_root_key(&project_root);
+    let manifest = sotto_cli::agent_tasks::TaskManifest::load_from(&project_root)?;
+    let task = manifest
+        .tasks()
+        .iter()
+        .find(|task| task.name() == name)
+        .ok_or_else(|| Error::NotFound(format!("agent task `{name}`")))?;
+    if !task
+        .environments()
+        .iter()
+        .any(|allowed| allowed == environment)
+    {
+        return Err(Error::Input(format!(
+            "task `{name}` does not allow environment {environment:?}"
+        )));
+    }
+
+    println!("Review this task before approving it:");
+    let resolved_executable = task.resolve_executable(&project_root)?;
+
+    println!("Project identity: {:?}", config.project_id);
+    println!("Project root: {:?}", project_root);
+    println!("Task: {:?}", task.name());
+    println!("Description: {}", task.description());
+    println!("Resolved executable: {resolved_executable:?}");
+    if task.args().is_empty() {
+        println!("Arguments: (none)");
+    } else {
+        for (index, argument) in task.args().iter().enumerate() {
+            println!("Argument {index}: {argument:?}");
+        }
+    }
+    println!(
+        "Working directory: {:?}",
+        task.working_directory(&project_root)
+    );
+    println!("Sotto environment: {environment:?}");
+    match task.timeout_seconds() {
+        Some(seconds) => println!("Declared execution limit: {seconds} seconds"),
+        None => println!("Declared execution limit: not set"),
+    }
+    println!(
+        "Trust warning: Sotto is not a sandbox. Current project code will receive this environment's plaintext secrets and may disclose them."
+    );
+
+    let confirmed = match Confirm::new("Approve this task and environment?")
+        .with_default(false)
+        .prompt()
+    {
+        Ok(confirmed) => confirmed,
+        Err(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
+        ) => false,
+        Err(error) => return Err(Error::Input(format!("approval prompt failed: {error}"))),
+    };
+    if !confirmed {
+        eprintln!("approval cancelled");
+        return Ok(());
+    }
+
+    let declaration_fingerprint = manifest.fingerprint_for(name)?;
+    let fingerprint = sotto_cli::agent_approvals::approval_fingerprint(
+        &declaration_fingerprint,
+        &resolved_executable,
+    )?;
+    let approvals = open_task_approval_store(&project_root)?;
+    approvals.approve(
+        &config.project_id,
+        &project_root_key,
+        name,
+        environment,
+        &fingerprint,
+    )?;
+    eprintln!("approved task {name:?} for environment {environment:?}");
+    Ok(())
+}
+
+fn list_task_approvals(environment: Option<&str>) -> Result<()> {
+    if environment.is_some_and(str::is_empty) {
+        return Err(Error::Input(
+            "task approval environment filter must not be empty".into(),
+        ));
+    }
+    let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+    let (config, project_root) = Config::discover(&cwd)?;
+    let project_root = std::fs::canonicalize(&project_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    let project_root_key = sotto_cli::agent_approvals::project_root_key(&project_root);
+    let approvals = open_task_approval_store(&project_root)?;
+    let rows = approvals.list(&config.project_id, &project_root_key)?;
+    let rows = rows
+        .into_iter()
+        .filter(|approval| environment.is_none_or(|env| approval.environment == env))
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        println!("no task approvals for this project");
+        return Ok(());
+    }
+    for approval in rows {
+        println!("{:?} --env {:?}", approval.task_name, approval.environment);
+    }
+    Ok(())
+}
+
+fn revoke_task_approval(name: &str, environment: &str) -> Result<()> {
+    let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+    let (config, project_root) = Config::discover(&cwd)?;
+    let project_root = std::fs::canonicalize(&project_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    let project_root_key = sotto_cli::agent_approvals::project_root_key(&project_root);
+    let approvals = open_task_approval_store(&project_root)?;
+    if approvals.revoke(&config.project_id, &project_root_key, name, environment)? {
+        eprintln!("revoked approval for task {name:?} and environment {environment:?}");
+    } else {
+        eprintln!("no approval found for task {name:?} and environment {environment:?}");
+    }
+    Ok(())
+}
+
+fn open_task_approval_store(
+    project_root: &Path,
+) -> Result<sotto_cli::agent_approvals::ApprovalStore> {
+    let data_dir = sotto_cli::paths::data_dir()?;
+    ensure_approval_data_dir_outside_project(&data_dir, project_root)?;
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|error| Error::Io(format!("creating {}: {error}", data_dir.display())))?;
+    let data_dir = std::fs::canonicalize(&data_dir)
+        .map_err(|error| Error::Io(format!("resolving approval data directory: {error}")))?;
+    ensure_approval_data_dir_outside_project(&data_dir, project_root)?;
+    sotto_cli::agent_approvals::ApprovalStore::open(&data_dir)
+}
+
+fn ensure_approval_data_dir_outside_project(data_dir: &Path, project_root: &Path) -> Result<()> {
+    let resolved = resolve_path_with_missing_tail(data_dir)?;
+    if resolved.starts_with(project_root) {
+        return Err(Error::Input(
+            "task approvals must be stored outside the project checkout; change SOTTO_DATA_DIR"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve existing path components (including symlinks) without creating a missing tail.
+fn resolve_path_with_missing_tail(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| Error::Io(format!("resolving current directory: {error}")))?
+            .join(path)
+    };
+
+    let mut resolved = PathBuf::new();
+    let mut has_missing_component = false;
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            std::path::Component::RootDir => resolved.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+                if has_missing_component {
+                    match std::fs::canonicalize(&resolved) {
+                        Ok(canonical) => {
+                            resolved = canonical;
+                            has_missing_component = false;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(Error::Io(format!(
+                                "resolving approval data directory {}: {error}",
+                                resolved.display()
+                            )))
+                        }
+                    }
+                }
+            }
+            std::path::Component::Normal(name) if has_missing_component => resolved.push(name),
+            std::path::Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match std::fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        resolved = candidate;
+                        has_missing_component = true;
+                    }
+                    Err(error) => {
+                        return Err(Error::Io(format!(
+                            "resolving approval data directory {}: {error}",
+                            candidate.display()
+                        )))
+                    }
+                }
+            }
+        }
+    }
+    match std::fs::canonicalize(&resolved) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(resolved),
+        Err(error) => Err(Error::Io(format!(
+            "resolving approval data directory {}: {error}",
+            resolved.display()
+        ))),
     }
 }
 

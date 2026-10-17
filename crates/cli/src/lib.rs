@@ -13,6 +13,7 @@
 //! - [`error`] - CLI errors with documented exit codes
 
 pub mod account;
+pub mod agent_approvals;
 pub mod agent_tasks;
 pub mod clipboard;
 pub mod commands;

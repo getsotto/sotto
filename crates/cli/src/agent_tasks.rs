@@ -4,6 +4,8 @@
 //! process; later approval and execution layers consume the validated task representation.
 
 use std::collections::HashSet;
+use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -231,6 +233,91 @@ impl TaskDeclaration {
             None => project_root.to_path_buf(),
         }
     }
+
+    /// Resolve the declared executable to the concrete file that would be launched.
+    pub fn resolve_executable(&self, project_root: &Path) -> Result<PathBuf> {
+        match self.executable_target(project_root) {
+            ExecutableTarget::Path(path) => canonical_executable(&path),
+            ExecutableTarget::SearchPath(name) => {
+                let search_path = env::var_os("PATH").ok_or_else(|| {
+                    Error::NotFound(format!(
+                        "task executable {name:?} cannot be resolved without PATH"
+                    ))
+                })?;
+                self.resolve_executable_with_path(project_root, &name, &search_path)
+            }
+        }
+    }
+
+    fn resolve_executable_with_path(
+        &self,
+        project_root: &Path,
+        name: &str,
+        search_path: &std::ffi::OsStr,
+    ) -> Result<PathBuf> {
+        let working_directory = self.working_directory(project_root);
+        for directory in env::split_paths(search_path) {
+            let directory = if directory.as_os_str().is_empty() {
+                working_directory.clone()
+            } else if directory.is_absolute() {
+                directory
+            } else {
+                working_directory.join(directory)
+            };
+            for candidate in executable_candidates(&directory, name) {
+                if let Ok(resolved) = canonical_executable(&candidate) {
+                    return Ok(resolved);
+                }
+            }
+        }
+        Err(Error::NotFound(format!(
+            "task executable {name:?} could not be resolved on PATH"
+        )))
+    }
+}
+
+fn canonical_executable(path: &Path) -> Result<PathBuf> {
+    let resolved = fs::canonicalize(path)
+        .map_err(|_| Error::NotFound(format!("task executable {:?} was not found", path)))?;
+    let metadata = fs::metadata(&resolved)
+        .map_err(|_| Error::NotFound(format!("task executable {:?} was not found", path)))?;
+    if !metadata.is_file() || !is_executable(&metadata) {
+        return Err(Error::NotFound(format!(
+            "task executable {:?} is not an executable file",
+            path
+        )));
+    }
+    Ok(resolved)
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_: &fs::Metadata) -> bool {
+    true
+}
+
+fn executable_candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
+    let base = directory.join(name);
+    #[cfg(windows)]
+    {
+        if base.extension().is_some() {
+            return vec![base];
+        }
+        let extensions = env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+        return std::env::split_paths(&extensions)
+            .map(|extension| {
+                let suffix = extension.to_string_lossy();
+                PathBuf::from(format!("{}{}", base.display(), suffix))
+            })
+            .collect();
+    }
+    #[cfg(not(windows))]
+    vec![base]
 }
 
 fn parse_manifest(path: &Path, text: &str) -> Result<TaskManifest> {
@@ -329,11 +416,14 @@ fn validate_task(task: &TaskDeclaration, index: usize) -> Result<()> {
     }
     let mut environments = HashSet::with_capacity(task.environments.len());
     for environment in &task.environments {
-        if environment.len() > MAX_TEXT_LENGTH || environment.contains('\0') {
+        if environment.is_empty()
+            || environment.len() > MAX_TEXT_LENGTH
+            || environment.contains('\0')
+        {
             return Err(task_error(
                 index,
                 "environments",
-                "each environment name must be at most 4096 bytes and contain no NUL character",
+                "each environment name must be non-empty, at most 4096 bytes and contain no NUL character",
             ));
         }
         if !environments.insert(environment.as_str()) {
@@ -428,6 +518,7 @@ environments = ["dev"]
         for invalid in [
             VALID.replace("name = \"test\"", "name = \"Bad Name\""),
             VALID.replace("environments = [\"dev\"]", "environments = []"),
+            VALID.replace("environments = [\"dev\"]", "environments = [\"\"]"),
             VALID.replace(
                 "environments = [\"dev\"]",
                 "environments = [\"dev\"]\ntimeout_seconds = 0",
@@ -512,6 +603,33 @@ environments = ["dev"]
             relative_executable.tasks[0].executable_target(root),
             ExecutableTarget::Path(root.join("scripts/test.sh"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_a_bare_executable_to_the_concrete_path_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let binaries = temp.path().join("bin");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(&binaries).unwrap();
+        let executable = binaries.join("fixture-tool");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = TaskManifest::parse(
+            Path::new("sotto.tasks.toml"),
+            &VALID.replace("cargo", "fixture-tool"),
+        )
+        .unwrap();
+        let task = &manifest.tasks()[0];
+
+        let resolved = task
+            .resolve_executable_with_path(&project_root, "fixture-tool", binaries.as_os_str())
+            .unwrap();
+
+        assert_eq!(resolved, std::fs::canonicalize(executable).unwrap());
     }
 
     #[test]
