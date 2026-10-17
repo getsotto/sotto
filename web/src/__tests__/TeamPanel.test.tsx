@@ -666,6 +666,86 @@ describe("TeamPanel billing request ownership", () => {
     expect(api.createSponsoredCheckout).toHaveBeenCalledTimes(1);
   });
 
+  it("starts a fresh sponsored checkout after a terminal failure", async () => {
+    const quote: api.SponsoredQuote = {
+      action: "add",
+      offer: "founding_monthly",
+      seatCount: 1,
+      amountPence: 199,
+      currency: "gbp",
+      interval: "month",
+      quoteVersion: 1,
+      quoteExpiresAtEpoch: 2_000_000_000,
+      founding: true,
+      foundingRemainingPlaces: 42,
+      foundingTerm: "for the first monthly billing term",
+      nextRenewalAmountPence: 299,
+    };
+    const freshQuote: api.SponsoredQuote = {
+      ...quote,
+      offer: "standard_monthly",
+      amountPence: 299,
+      quoteVersion: 2,
+      quoteExpiresAtEpoch: 2_000_000_300,
+      founding: false,
+      foundingRemainingPlaces: null,
+      foundingTerm: null,
+    };
+    const refreshed = deferred<api.SponsoredQuote>();
+    vi.mocked(api.fetchSponsoredQuote)
+      .mockResolvedValueOnce(quote)
+      .mockReturnValueOnce(refreshed.promise);
+    vi.mocked(api.createSponsoredCheckout)
+      .mockResolvedValueOnce({ operationId: "failed-seat", state: "failed", checkoutUrl: null })
+      .mockResolvedValueOnce({ operationId: "fresh-seat", state: "pending", checkoutUrl: null });
+
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await screen.findByRole("heading", { name: "Sponsored Cloud seats" });
+    fireEvent.change(screen.getByLabelText("Beneficiary user id"), {
+      target: { value: "beneficiary-a" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    await screen.findByText(/£1\.99 per month/);
+    fireEvent.click(screen.getByRole("button", { name: "Continue to checkout" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "The previous seat change expired or was rejected. Review a fresh quote to try again.",
+    );
+    expect(screen.queryByText(/£1\.99 per month/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Continue to checkout" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/pending provider confirmation/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Review seat price" })).toBeEnabled();
+    expect(api.createSponsoredCheckout).toHaveBeenCalledTimes(1);
+    const firstAttempt = vi.mocked(api.createSponsoredCheckout).mock.calls[0][1];
+
+    fireEvent.click(screen.getByRole("button", { name: "Review seat price" }));
+    expect(api.fetchSponsoredQuote).toHaveBeenCalledTimes(2);
+    expect(api.fetchSponsoredQuote).toHaveBeenLastCalledWith("org-a", {
+      action: "add", offer: "standard_monthly", beneficiaryIds: ["beneficiary-a"],
+    });
+    expect(api.createSponsoredCheckout).toHaveBeenCalledTimes(1);
+    await act(async () => { refreshed.resolve(freshQuote); });
+    expect(screen.getByText(/£2\.99 per month/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.createSponsoredCheckout).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Continue to checkout" }));
+
+    expect(await screen.findByText(/pending provider confirmation/)).toBeInTheDocument();
+    expect(api.createSponsoredCheckout).toHaveBeenCalledTimes(2);
+    expect(api.createSponsoredCheckout).toHaveBeenLastCalledWith("org-a", expect.objectContaining({
+      action: "add",
+      beneficiaryId: "beneficiary-a",
+      offer: freshQuote.offer,
+      quoteVersion: freshQuote.quoteVersion,
+      quoteExpiresAtEpoch: freshQuote.quoteExpiresAtEpoch,
+      idempotencyKey: expect.any(String),
+    }));
+    expect(vi.mocked(api.createSponsoredCheckout).mock.calls[1][1].idempotencyKey)
+      .not.toBe(firstAttempt.idempotencyKey);
+    expect(api.fetchSponsoredQuote).toHaveBeenCalledTimes(2);
+  });
+
   it("replays the same sponsored operation after a transient provider error", async () => {
     vi.mocked(api.fetchSponsoredQuote).mockResolvedValue({
       action: "add",
