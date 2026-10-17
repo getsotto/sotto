@@ -247,6 +247,37 @@ in der ersten Umgebung) oder `>` (nur in der zweiten). Ohne `--confirm` ist die 
 Eine bestätigte Kopie fügt Geheimnisse hinzu und aktualisiert sie, lässt aber Schlüssel unverändert,
 die nur in der Zielumgebung vorhanden sind.
 
+### Ein Secret entfernen
+
+Um ein veraltetes Secret aus `staging` zu entfernen, ohne die Standardumgebung zu ändern:
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` entfernt das Secret aus der gewählten Umgebung im lokalen Tresor.
+`sotto push` synchronisiert die Entfernung nach `sotto login` mit dem Server.
+Führe `sotto pull` für dieselbe Umgebung auf einem anderen Gerät aus, um die
+Entfernung zu übernehmen. Der letzte Befehl gehört auf das andere Gerät.
+
+Im interaktiven Terminal öffnet `sotto rm` ohne Namen die Secret-Auswahl.
+Danach wird eine Bestätigung abgefragt, wobei Nein voreingestellt ist;
+Abbrechen oder Ablehnen lässt das Secret unverändert. `--yes` (oder `-y`)
+überspringt nur die Bestätigung, nicht die Auswahl bei fehlendem Namen oder
+eine erforderliche Entsperrabfrage.
+
+Interaktive Abfragen erfordern Terminals für stdin, stdout und stderr, einen
+`TERM`-Wert ungleich »dumb« und eine inaktive `CI`-Umgebung. Ohne interaktives
+Terminal ist ein Name erforderlich; das benannte Secret wird auch ohne `--yes`
+ohne Bestätigungsfrage entfernt.
+
+Entfernte Secrets erscheinen nicht mehr in normalen Abfragen oder Listen;
+der Versionsverlauf bleibt jedoch erhalten. Das ist keine sichere Löschung und
+widerruft keine Zugangsdaten beim externen Anbieter. Zur Wiederherstellung
+dienen `sotto history` und `sotto rollback`.
+
 ### Ein Secret teilen
 
 `sotto share` verschlüsselt ein Secret in einen Einmal-Link. Der Schlüssel steht im Link hinter dem

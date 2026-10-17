@@ -252,6 +252,36 @@ le premier environnement) ou `>` (seulement dans le second). Sans `--confirm`, l
 simulation. Une copie confirmée ajoute et met à jour les secrets, mais laisse intactes les clés
 présentes uniquement dans la destination.
 
+### Supprimer un secret
+
+Pour supprimer un secret obsolète de `staging` sans changer l'environnement par défaut :
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` supprime le secret de l'environnement sélectionné dans le coffre local.
+`sotto push` synchronise la suppression avec le serveur après `sotto login` ;
+exécutez `sotto pull` pour le même environnement sur un autre appareil pour
+récupérer ce changement. La dernière commande s'exécute sur cet autre appareil.
+
+Dans un terminal interactif, `sotto rm` sans nom ouvre le sélecteur de secrets.
+Une confirmation est alors demandée, avec Non par défaut ; annuler ou refuser
+laisse le secret inchangé. `--yes` (ou `-y`) évite la confirmation, mais pas
+le sélecteur si aucun nom n'est fourni, ni une demande de déverrouillage requise.
+
+Les invites interactives exigent que stdin, stdout et stderr soient des terminaux,
+que `TERM` ne soit pas « dumb » et que `CI` ne soit pas actif. Sans interaction,
+le nom est obligatoire ; une suppression nommée ne demande pas de confirmation,
+même sans `--yes`.
+
+Les secrets supprimés disparaissent des lectures et listes ordinaires, mais leur
+historique de versions est conservé. Ce n'est pas un effacement sécurisé et cela
+ne révoque pas l'identifiant chez son fournisseur externe. Consultez
+`sotto history` et `sotto rollback` pour la restauration.
+
 ### Partager un secret
 
 `sotto share` chiffre un secret dans un lien à usage unique. La clé se trouve après le `#` du lien,

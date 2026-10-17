@@ -243,6 +243,34 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 environment) or `>` (only in the second). Without `--confirm`, copying is a dry-run. A confirmed
 copy adds and updates secrets but leaves keys that exist only in the destination untouched.
 
+### Remove a secret
+
+To remove an obsolete secret from `staging` without changing your default environment:
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` removes the secret from the selected environment in your local vault.
+`sotto push` synchronises the removal with the server after `sotto login`; run
+`sotto pull` for that same environment on another device to receive the removal.
+Run the final command on the other device, not the device that made the change.
+
+In an interactive terminal, `sotto rm` without a name opens the secret picker.
+Removal then asks for confirmation, with No as the default; cancelling or declining
+does not remove anything. `--yes` (or `-y`) skips confirmation but never skips
+the picker when the name is omitted or a required unlock prompt.
+
+Interactive prompts require stdin, stdout and stderr to be terminals, a non-dumb
+`TERM`, and `CI` not being active. In non-interactive use, the name is required;
+a named removal proceeds without confirmation even if `--yes` is absent.
+
+Removed secrets disappear from ordinary reads and listings, but their version
+history remains. This is not secure erasure and does not revoke a credential at
+its external provider. Use `sotto history` and `sotto rollback` for recovery.
+
 ### Share a secret
 
 `sotto share` encrypts one secret into a one-time link. The key sits after the `#` in the link,
