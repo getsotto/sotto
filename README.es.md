@@ -30,7 +30,7 @@ el servidor solo almacena texto cifrado.
 | Modo | Qué obtienes |
 | --- | --- |
 | Local | La CLI y una bóveda cifrada en tu propia máquina. Sin cuenta y sin servidor. |
-| Autoalojado | El mismo servidor Apache-2.0 en infraestructura que tú operas. No aplica límites de plan ni comprobaciones del servicio alojado; consulta [Autoalojamiento](#autoalojamiento). |
+| Autoalojado | El mismo servidor Apache-2.0 en infraestructura que tú operas. Los servidores posteriores a v0.9.0 no aplican límites de plan ni comprobaciones del servicio alojado; consulta [Autoalojamiento](#autoalojamiento). |
 | Sotto Cloud | El servidor que Sotto opera en [getsotto.co.uk](https://getsotto.co.uk), para cuando prefieres no gestionar uno. `sotto login` lo usa por defecto. Los planes y límites están en la [página de precios](https://getsotto.co.uk/#pricing), y el estado del servicio, en [status.getsotto.co.uk](https://status.getsotto.co.uk). |
 
 Puedes empezar en local y añadir un servidor más adelante: después de `sotto login`, `sotto push`
@@ -341,7 +341,7 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    3 members, 1 org project(s)
 ```
 
-Un servidor autoalojado no aplica límites de plan, así que siempre informa `team` como nivel
+Un servidor autoalojado posterior a v0.9.0 no aplica límites de plan, así que siempre informa `team` como nivel
 efectivo, sean cuales sean el nivel y el fin de prueba que la organización tenga guardados:
 
 ```text
@@ -371,7 +371,7 @@ actividad y metadatos, no una forma de recuperar valores secretos; no ofrece pag
 histórico completo.
 
 En Sotto Cloud, la organización necesita una suscripción Team efectiva, incluido un periodo de
-prueba Team activo. Las implementaciones autoalojadas omiten esta comprobación del plan, pero quien
+prueba Team activo. Las implementaciones autoalojadas posteriores a v0.9.0 omiten esta comprobación del plan, pero quien
 ejecute el comando debe conservar el rol de propietario o administrador. Si no hay eventos, el
 comando no muestra filas y termina correctamente.
 
@@ -583,6 +583,10 @@ el [`Dockerfile`](Dockerfile) construye la imagen del servidor (las migraciones 
 `SOTTO_DEPLOYMENT_MODE` vale `self_hosted` por defecto. En ese modo el servidor no aplica límites
 de plan ni otras restricciones del servicio alojado, y no necesita una cuenta de Stripe. El modo
 `cloud` es para el servicio que opera Sotto; lee el manual antes de activarlo.
+
+Los servidores con la v0.9.0 o anteriores todavía no tienen este ajuste. Aplican los mismos límites
+de plan que el servicio alojado cuando termina la prueba de una organización; un operador puede
+levantarlos para una organización con `UPDATE organizations SET tier = 'team' WHERE id = '<org-id>';` en la base de datos del servidor.
 
 Apunta la CLI a tu servidor una vez; los comandos posteriores lo reutilizan:
 

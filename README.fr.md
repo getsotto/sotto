@@ -30,7 +30,7 @@ choix, le serveur ne stocke jamais que du texte chiffré.
 | Mode | Ce que vous obtenez |
 | --- | --- |
 | Local | La CLI et un coffre chiffré sur votre propre machine. Ni compte ni serveur. |
-| Auto-hébergé | Le même serveur Apache-2.0 sur une infrastructure que vous exploitez. Il n'applique ni limites de forfait ni contrôles du service hébergé ; voir [Auto-hébergement](#auto-hébergement). |
+| Auto-hébergé | Le même serveur Apache-2.0 sur une infrastructure que vous exploitez. Les serveurs postérieurs à v0.9.0 n'appliquent ni limites de forfait ni contrôles du service hébergé ; voir [Auto-hébergement](#auto-hébergement). |
 | Sotto Cloud | Le serveur que Sotto exploite sur [getsotto.co.uk](https://getsotto.co.uk), si vous préférez ne pas en gérer un. `sotto login` l'utilise par défaut. Les forfaits et les limites figurent sur la [page des tarifs](https://getsotto.co.uk/#pricing), et l'état du service sur [status.getsotto.co.uk](https://status.getsotto.co.uk). |
 
 Vous pouvez commencer en local et ajouter un serveur plus tard : après `sotto login`, `sotto push`
@@ -347,7 +347,7 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    3 members, 1 org project(s)
 ```
 
-Un serveur auto-hébergé n'applique aucune limite de forfait : il indique donc toujours `team` comme
+Un serveur auto-hébergé postérieur à v0.9.0 n'applique aucune limite de forfait : il indique donc toujours `team` comme
 niveau effectif, quels que soient le niveau et la fin d'essai enregistrés pour l'organisation :
 
 ```text
@@ -378,7 +378,7 @@ au format `timestamp  action  actor`, avec éventuellement les champs `target=..
 des valeurs secrètes ; elle ne fournit ni pagination ni archive historique complète.
 
 Sur Sotto Cloud, l’organisation doit disposer du niveau Team effectif, y compris pendant un essai
-Team actif. Les déploiements auto-hébergés ignorent ce contrôle de forfait, mais l’appelant doit
+Team actif. Les déploiements auto-hébergés postérieurs à v0.9.0 ignorent ce contrôle de forfait, mais l’appelant doit
 toujours avoir le rôle de propriétaire ou d’administrateur. S’il n’y a aucun événement, la commande
 n’affiche aucune ligne et se termine avec succès.
 
@@ -591,6 +591,11 @@ le [`Dockerfile`](Dockerfile) construit l'image du serveur (les migrations s'ex�
 `SOTTO_DEPLOYMENT_MODE` vaut `self_hosted` par défaut. Dans ce mode, le serveur n'applique ni
 limites de forfait ni autres restrictions du service hébergé, et il n'a besoin d'aucun compte Stripe.
 Le mode `cloud` est destiné au service exploité par Sotto ; lisez le guide avant de l'activer.
+
+Les serveurs en v0.9.0 ou version antérieure n'ont pas encore ce réglage. Ils appliquent les mêmes
+limites de forfait que le service hébergé une fois l'essai d'une organisation terminé ; un
+opérateur peut les lever pour une organisation avec `UPDATE organizations SET tier = 'team' WHERE id = '<org-id>';` dans la base de
+données du serveur.
 
 Faites pointer la CLI vers votre serveur une fois ; les commandes suivantes le réutilisent :
 

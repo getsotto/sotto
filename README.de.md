@@ -30,7 +30,7 @@ dich entscheidest: Der Server speichert immer nur Chiffrat.
 | Modus | Was du bekommst |
 | --- | --- |
 | Lokal | Die CLI und ein verschlüsselter Tresor auf deinem eigenen Rechner. Kein Konto und kein Server. |
-| Selbst gehostet | Derselbe Apache-2.0-Server auf Infrastruktur, die du betreibst. Er wendet keine Plan-Limits und keine Prüfungen des gehosteten Dienstes an; siehe [Selbst hosten](#selbst-hosten). |
+| Selbst gehostet | Derselbe Apache-2.0-Server auf Infrastruktur, die du betreibst. Server, die neuer als v0.9.0 sind, wenden keine Plan-Limits und keine Prüfungen des gehosteten Dienstes an; siehe [Selbst hosten](#selbst-hosten). |
 | Sotto Cloud | Der Server, den Sotto unter [getsotto.co.uk](https://getsotto.co.uk) betreibt, wenn du lieber keinen eigenen betreibst. `sotto login` verwendet ihn standardmäßig. Pläne und Limits stehen auf der [Preisseite](https://getsotto.co.uk/#pricing), den Dienststatus findest du unter [status.getsotto.co.uk](https://status.getsotto.co.uk). |
 
 Du kannst lokal anfangen und später einen Server hinzufügen: Nach `sotto login` lädt `sotto push`
@@ -342,7 +342,7 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    3 members, 1 org project(s)
 ```
 
-Ein selbst gehosteter Server wendet keine Plan-Limits an und meldet daher immer `team` als wirksame
+Ein selbst gehosteter Server, der neuer als v0.9.0 ist, wendet keine Plan-Limits an und meldet daher immer `team` als wirksame
 Stufe, unabhängig davon, welche Stufe und welches Trial-Ende für die Organisation gespeichert sind:
 
 ```text
@@ -372,7 +372,7 @@ eine begrenzte Aktivitäts-/Metadatenansicht, nicht um eine Möglichkeit, Secret
 Seitennavigation oder ein vollständiges historisches Archiv gibt es nicht.
 
 In Sotto Cloud benötigt die Organisation eine wirksame Team-Berechtigung, einschließlich eines
-aktiven Team-Testzeitraums. Selbst gehostete Deployments überspringen diese Planprüfung, aber der
+aktiven Team-Testzeitraums. Selbst gehostete Deployments mit einer neueren Version als v0.9.0 überspringen diese Planprüfung, aber der
 Aufrufer braucht weiterhin die Rolle als Inhaber oder Administrator. Wenn keine Ereignisse vorhanden
 sind, gibt der Befehl keine Zeilen aus und wird erfolgreich beendet.
 
@@ -589,6 +589,11 @@ das [`Dockerfile`](Dockerfile) baut das Server-Image (Migrationen laufen beim St
 keine Plan-Limits oder anderen Einschränkungen des gehosteten Dienstes an und braucht kein
 Stripe-Konto. Der Modus `cloud` ist für den Dienst gedacht, den Sotto betreibt; lies die Anleitung,
 bevor du ihn setzt.
+
+Server mit v0.9.0 oder älter haben diese Einstellung noch nicht. Sie wenden nach dem Ende des
+Trials einer Organisation dieselben Plan-Limits an wie der gehostete Dienst; ein Operator kann sie
+für eine Organisation mit `UPDATE organizations SET tier = 'team' WHERE id = '<org-id>';` in der Datenbank des Servers
+aufheben.
 
 Richte die CLI einmal auf deinen Server aus; spätere Befehle verwenden ihn weiter:
 

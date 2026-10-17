@@ -28,7 +28,7 @@ only ever stores ciphertext.
 | Mode | What you get |
 | --- | --- |
 | Local | The CLI and an encrypted vault on your own machine. No account and no server. |
-| Self-hosted | The same Apache-2.0 server on infrastructure you operate. It applies no plan limits and no hosted-service checks; see [Self-hosting](#self-hosting). |
+| Self-hosted | The same Apache-2.0 server on infrastructure you operate. Servers newer than v0.9.0 apply no plan limits or hosted-service checks; see [Self-hosting](#self-hosting). |
 | Sotto Cloud | The server Sotto operates at [getsotto.co.uk](https://getsotto.co.uk), for when you would rather not run one. `sotto login` uses it by default. Plans and limits are on the [pricing page](https://getsotto.co.uk/#pricing), and service status is at [status.getsotto.co.uk](https://status.getsotto.co.uk). |
 
 You can start locally and add a server later: after `sotto login`, `sotto push` uploads the active
@@ -335,7 +335,7 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    3 members, 1 org project(s)
 ```
 
-A self-hosted server applies no plan limits, so it always reports the effective tier as `team`,
+A self-hosted server newer than v0.9.0 applies no plan limits, so it always reports the effective tier as `team`,
 whatever tier and trial end the organisation has stored:
 
 ```text
@@ -363,7 +363,7 @@ is a bounded activity/metadata view, not a way to retrieve secret values, and it
 pagination or a complete historical archive.
 
 On Sotto Cloud, the organisation needs effective Team entitlement, including an active Team trial.
-Self-hosted deployments skip this plan gate, but the caller still needs the owner/admin role. If no
+Self-hosted servers newer than v0.9.0 skip this plan gate, but the caller still needs the owner/admin role. If no
 events are available, the command prints no rows and exits successfully.
 
 ### Machine tokens and CI
@@ -569,6 +569,10 @@ from **one origin** (so the session cookie and CSP stay same-origin) - the inclu
 `SOTTO_DEPLOYMENT_MODE` defaults to `self_hosted`. In that mode the server applies no plan limits
 or other hosted-service restrictions, and it needs no Stripe account. The `cloud` mode is for the
 service Sotto operates; read the runbook before you set it.
+
+Servers from v0.9.0 and earlier do not have this setting. They apply the same plan limits as
+the hosted service once an organisation's trial ends; an operator can lift them for one
+organisation with `UPDATE organizations SET tier = 'team' WHERE id = '<org-id>';` in the server's database.
 
 Point the CLI at your server once; later commands reuse it:
 

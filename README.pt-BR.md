@@ -30,7 +30,7 @@ escolha, o servidor só armazena texto cifrado.
 | Modo | O que você recebe |
 | --- | --- |
 | Local | A CLI e um cofre criptografado na sua própria máquina. Sem conta e sem servidor. |
-| Auto-hospedado | O mesmo servidor Apache-2.0 em uma infraestrutura que você opera. Ele não aplica limites de plano nem verificações do serviço hospedado; consulte [Auto-hospedagem](#auto-hospedagem). |
+| Auto-hospedado | O mesmo servidor Apache-2.0 em uma infraestrutura que você opera. Servidores mais novos que a v0.9.0 não aplicam limites de plano nem verificações do serviço hospedado; consulte [Auto-hospedagem](#auto-hospedagem). |
 | Sotto Cloud | O servidor que o Sotto opera em [getsotto.co.uk](https://getsotto.co.uk), para quando você prefere não manter um. `sotto login` usa esse servidor por padrão. Os planos e limites estão na [página de preços](https://getsotto.co.uk/#pricing), e o status do serviço em [status.getsotto.co.uk](https://status.getsotto.co.uk). |
 
 Você pode começar localmente e adicionar um servidor depois: após `sotto login`, `sotto push` envia o
@@ -340,7 +340,7 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    3 members, 1 org project(s)
 ```
 
-Um servidor auto-hospedado não aplica limites de plano, então sempre informa `team` como nível
+Um servidor auto-hospedado mais novo que a v0.9.0 não aplica limites de plano, então sempre informa `team` como nível
 efetivo, sejam quais forem o nível e o fim de trial que a organização tenha armazenados:
 
 ```text
@@ -370,7 +370,7 @@ metadados, não uma forma de recuperar valores secretos; não há paginação ne
 completo.
 
 No Sotto Cloud, a organização precisa de uma habilitação Team efetiva, incluindo um período de teste
-Team ativo. Implantações auto-hospedadas ignoram essa verificação do plano, mas quem chama o comando
+Team ativo. Implantações auto-hospedadas mais novas que a v0.9.0 ignoram essa verificação do plano, mas quem chama o comando
 ainda precisa ter o papel de proprietário ou administrador. Se não houver eventos, o comando não
 imprime linhas e termina com sucesso.
 
@@ -579,6 +579,10 @@ monta a imagem do servidor (as migrations rodam na inicialização).
 `SOTTO_DEPLOYMENT_MODE` vale `self_hosted` por padrão. Nesse modo, o servidor não aplica limites
 de plano nem outras restrições do serviço hospedado, e não precisa de uma conta Stripe. O modo
 `cloud` é para o serviço que o Sotto opera; leia o passo a passo antes de defini-lo.
+
+Servidores na v0.9.0 ou em versões anteriores ainda não têm essa configuração. Eles aplicam os
+mesmos limites de plano do serviço hospedado quando o trial de uma organização termina; um operador
+pode removê-los para uma organização com `UPDATE organizations SET tier = 'team' WHERE id = '<org-id>';` no banco de dados do servidor.
 
 Aponte a CLI para o seu servidor uma vez; os comandos seguintes o reutilizam:
 
