@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "../api";
@@ -126,6 +126,30 @@ describe("payer transfer journeys", () => {
     expect(await screen.findByText(/expired at the renewal boundary/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Accept transfer request" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Decline request" })).not.toBeInTheDocument();
+  });
+
+  it("expires an open invitation at its deadline without a refresh or click", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(2_000_000_000_000);
+    try {
+      vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
+        transfers: [
+          transfer({ transferId: "soon", consentExpiresAtEpoch: 2_000_000_001, effectiveFrom: 2_000_000_100 }),
+          transfer({ transferId: "later", consentExpiresAtEpoch: 2_000_000_600, effectiveFrom: 2_000_000_700 }),
+        ],
+        nextCursor: null,
+      });
+      render(<PayerTransferInbox />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(screen.getAllByRole("button", { name: "Accept transfer request" })).toHaveLength(2);
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+      expect(screen.getAllByRole("button", { name: "Accept transfer request" })).toHaveLength(1);
+      expect(screen.getByText(/expired at the renewal boundary/i)).toBeInTheDocument();
+      expect(api.fetchPayerTransfers).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps personal payer invitations unaccepted until setup is available", async () => {

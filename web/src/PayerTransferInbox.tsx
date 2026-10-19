@@ -58,6 +58,9 @@ function withTransfer(transfers: PayerTransfer[], updated: PayerTransfer): Payer
   return next.sort((left, right) => right.transferId.localeCompare(left.transferId));
 }
 
+// setTimeout cannot wait longer than 2^31 - 1 ms; a longer wait re-arms when the timer fires.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
 export function PayerTransferInbox() {
   const [available, setAvailable] = useState(false);
   const [setupAvailable, setSetupAvailable] = useState(false);
@@ -69,6 +72,7 @@ export function PayerTransferInbox() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [expiryTick, setExpiryTick] = useState(0);
 
   async function refresh() {
     setLoading(true);
@@ -125,6 +129,19 @@ export function PayerTransferInbox() {
     window.addEventListener("sotto:payer-transfer-updated", onTransferUpdated);
     return () => window.removeEventListener("sotto:payer-transfer-updated", onTransferUpdated);
   }, [available]);
+
+  useEffect(() => {
+    // Re-render when the nearest open invitation reaches its deadline, so expiry shows without a refresh.
+    const nowMs = Date.now();
+    const deadlines = transfers
+      .filter((transfer) => transfer.state === "awaiting_consent")
+      .map((transfer) => Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom) * 1000)
+      .filter((deadlineMs) => deadlineMs > nowMs);
+    if (deadlines.length === 0) return;
+    const delay = Math.min(Math.min(...deadlines) - nowMs, MAX_TIMER_DELAY_MS);
+    const timer = window.setTimeout(() => setExpiryTick((tick) => tick + 1), delay);
+    return () => window.clearTimeout(timer);
+  }, [transfers, expiryTick]);
 
   useEffect(() => {
     if (loading) return;
