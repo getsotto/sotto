@@ -74,6 +74,9 @@ diese README folgt dagegen dem Branch `main`, der dem neuesten Release voraus se
 beschriebener Befehl existiert in deiner installierten Version daher möglicherweise noch nicht.
 `sotto --help` listet die Befehle auf, die deine Version unterstützt.
 
+In [COMPATIBILITY.md](COMPATIBILITY.md) findest du die Versionsanforderungen der Integrationen,
+die angegebenen Plattformen und die derzeit verfügbaren Testergebnisse.
+
 ### Homebrew (Vorschau)
 
 Der [Sotto-Tap](https://github.com/getsotto/homebrew-tap) bietet einen weiteren

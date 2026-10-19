@@ -74,6 +74,9 @@ enquanto este README acompanha a branch `main`, que pode estar à frente da rele
 isso, um comando descrito aqui pode ainda não existir na versão que você instalou. `sotto --help`
 lista os comandos que a sua versão suporta.
 
+Consulte [COMPATIBILITY.md](COMPATIBILITY.md) para ver os requisitos de versão das integrações,
+as plataformas declaradas e as evidências de teste disponíveis atualmente.
+
 ### Homebrew (prévia)
 
 O [tap do Sotto](https://github.com/getsotto/homebrew-tap) oferece outra forma

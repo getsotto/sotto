@@ -72,6 +72,9 @@ this README follows the `main` branch, which can be ahead of the latest release.
 here may therefore not exist in your installed version yet; `sotto --help` lists the commands your
 version supports.
 
+See [COMPATIBILITY.md](COMPATIBILITY.md) for integration version requirements, platform claims,
+and the evidence currently available for them.
+
 ### Homebrew (preview)
 
 The [Sotto tap](https://github.com/getsotto/homebrew-tap) provides another

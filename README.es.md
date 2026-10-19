@@ -74,6 +74,9 @@ mientras que este README sigue la rama `main`, que puede ir por delante de la ú
 eso es posible que un comando descrito aquí aún no exista en la versión que tienes instalada;
 `sotto --help` muestra los comandos que admite tu versión.
 
+Consulta [COMPATIBILITY.md](COMPATIBILITY.md) para ver los requisitos de versión de las
+integraciones, las plataformas declaradas y las pruebas disponibles actualmente.
+
 ### Homebrew (versión preliminar)
 
 El [tap de Sotto](https://github.com/getsotto/homebrew-tap) ofrece otra vía de

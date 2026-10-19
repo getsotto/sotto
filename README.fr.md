@@ -74,6 +74,9 @@ alors que ce README suit la branche `main`, qui peut être en avance sur la dern
 commande décrite ici n'existe donc peut-être pas encore dans la version que vous avez installée ;
 `sotto --help` liste les commandes qu'elle prend en charge.
 
+Consultez [COMPATIBILITY.md](COMPATIBILITY.md) pour connaître les versions requises par les
+intégrations, les plateformes annoncées et les tests actuellement disponibles.
+
 ### Homebrew (aperçu)
 
 Le [tap Sotto](https://github.com/getsotto/homebrew-tap) propose une autre
