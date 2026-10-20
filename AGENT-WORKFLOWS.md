@@ -55,6 +55,12 @@ Validate the declaration before approving it:
 sotto task validate
 ```
 
+List declared tasks in the project:
+
+```sh
+sotto task ls
+```
+
 ## Approve and run from the CLI
 
 Approval is a local, interactive action. Sotto displays the project identity, resolved executable,
@@ -122,8 +128,9 @@ and Sotto waits for them to stop before exiting.
 - **No Sotto project found:** run the command from the project directory or one of its
   subdirectories, and confirm `sotto init` created the project configuration.
 - **Task file missing or invalid:** create or correct `sotto.tasks.toml`, then run
-  `sotto task validate`. Unknown fields, duplicate names, and unsupported file versions are
+  `sotto task validate` or `sotto task ls`. Unknown fields, duplicate names, and unsupported file versions are
   rejected.
+- **Inspect project declarations vs. approvals:** `sotto task ls` lists declared tasks in `sotto.tasks.toml`, while `sotto task approvals` lists which of those declarations have received local developer approval for specific environments.
 - **Environment not allowed:** add the environment to that task's `environments` array, review
   the change, and approve the task/environment pair again.
 - **No current approval:** inspect the displayed command and run `sotto task approve <name> --env
