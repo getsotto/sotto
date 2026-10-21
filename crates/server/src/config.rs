@@ -76,6 +76,7 @@ const BILLING_TRANSFER_EXECUTION_ENV: &str = "SOTTO_BILLING_TRANSFER_EXECUTION_E
 const BILLING_TRANSFER_SETUP_ENV: &str = "SOTTO_BILLING_TRANSFER_SETUP_ENABLED";
 const BILLING_TRANSFER_OPERATOR_TOKEN_ENV: &str = "SOTTO_BILLING_TRANSFER_OPERATOR_TOKEN";
 const CLOUD_RETENTION_DRY_RUN_ENV: &str = "SOTTO_CLOUD_RETENTION_DRY_RUN_ENABLED";
+const CLOUD_SHARED_RETENTION_DRY_RUN_ENV: &str = "SOTTO_CLOUD_SHARED_RETENTION_DRY_RUN_ENABLED";
 const CLOUD_RETENTION_OPERATOR_TOKEN_ENV: &str = "SOTTO_CLOUD_RETENTION_OPERATOR_TOKEN";
 const CLOUD_CONTACT_ENROLMENT_ENV: &str = "SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED";
 const CLOUD_CONTACT_EMAIL_SEND_ENV: &str = "SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED";
@@ -146,6 +147,8 @@ pub struct Config {
     pub billing_transfer_operator_token: Option<String>,
     /// Whether personal Cloud expiry candidates are reconciled and dry-run. Defaults off.
     pub cloud_retention_dry_run_enabled: bool,
+    /// Whether shared organisation Cloud retention candidates are reconciled and dry-run. Defaults off.
+    pub cloud_shared_retention_dry_run_enabled: bool,
     /// Dedicated bearer token for protected Cloud retention inspection and non-destructive actions.
     pub cloud_retention_operator_token: Option<String>,
     /// Contact-enrolment and verification-email settings. Both switches default off.
@@ -270,6 +273,11 @@ impl Config {
         let billing_transfer_operator_token = env_nonempty(BILLING_TRANSFER_OPERATOR_TOKEN_ENV);
         let cloud_retention_dry_run_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_RETENTION_DRY_RUN_ENV).ok().as_deref());
+        let cloud_shared_retention_dry_run_enabled = feature_flag_is_enabled(
+            std::env::var(CLOUD_SHARED_RETENTION_DRY_RUN_ENV)
+                .ok()
+                .as_deref(),
+        );
         let cloud_retention_operator_token = env_nonempty(CLOUD_RETENTION_OPERATOR_TOKEN_ENV);
         let founding_schedule_preflight_verified = feature_flag_is_enabled(
             std::env::var(FOUNDING_SCHEDULE_PREFLIGHT_ENV)
@@ -493,7 +501,7 @@ impl Config {
             billing.as_ref(),
         )?;
         validate_cloud_retention_configuration(
-            cloud_retention_dry_run_enabled,
+            cloud_retention_dry_run_enabled || cloud_shared_retention_dry_run_enabled,
             cloud_retention_operator_token.as_deref(),
             deployment_mode,
         )?;
@@ -534,6 +542,7 @@ impl Config {
             billing_transfer_setup_enabled,
             billing_transfer_operator_token,
             cloud_retention_dry_run_enabled,
+            cloud_shared_retention_dry_run_enabled,
             cloud_retention_operator_token,
             contact_verification,
             cloud_notice_dispatch_enabled,

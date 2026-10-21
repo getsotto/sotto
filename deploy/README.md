@@ -154,6 +154,14 @@ after the person's existing export deadline. It never deletes resources, writes 
 tombstones, or enables the retention purge path. Keep it off until a current-candidate backup and
 tombstone restore has been verified and the customer-notice evidence has been reviewed.
 
+Shared organisation expiry review has a separate default-off switch:
+`SOTTO_CLOUD_SHARED_RETENTION_DRY_RUN_ENABLED=1`. It scans organisations whose current owners and
+admins have all lost Cloud eligibility, queues an in-app export notice for each, and starts the
+30-day shared-data export window no earlier than when those notices are first queued. The worker
+snapshots shared scope and performs validation-only dry runs; it cannot purge shared data. Keep this
+switch off until the shared-scope evidence, customer notices, backup and tombstone restore have been
+reviewed. Enabling personal expiry review does not enable the shared scanner.
+
 The protected `/ops/cloud/retention` inspection and action routes are mounted only when
 `SOTTO_CLOUD_RETENTION_OPERATOR_TOKEN` is configured. Use a dedicated value of at least 32
 characters; do not reuse a billing, deployment, or metrics token. The surface returns fixed reason

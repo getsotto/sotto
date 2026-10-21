@@ -263,6 +263,8 @@ async fn reconcile_expiry_candidate(
         notice_event_key,
         notice_evidence_epoch,
         expected_coverage_revision: Some(revision),
+        expected_scope_generation: None,
+        eligibility_loss_epoch: None,
     };
     if retention::enqueue_in_tx(&mut tx, &intent)
         .await
@@ -290,7 +292,8 @@ async fn reconcile_expiry_candidate(
     }
 
     let mut scope =
-        snapshot_personal_scope(&mut tx, user_id, &intent.job_id, deadline_epoch).await?;
+        snapshot_personal_scope(&mut tx, user_id, &intent.job_id, now_epoch, deadline_epoch)
+            .await?;
     let over_bound = scope.len() > MAX_SCOPE_ITEMS;
     scope.truncate(MAX_SCOPE_ITEMS);
     for (item, hold_code) in scope {
@@ -367,6 +370,7 @@ async fn snapshot_personal_scope(
     tx: &mut Transaction<'_, Postgres>,
     user_id: &str,
     job_id: &str,
+    now_epoch: i64,
     deadline_epoch: i64,
 ) -> Result<Vec<(ScopeItem, Option<&'static str>)>> {
     let projects = sqlx::query(
@@ -392,7 +396,8 @@ async fn snapshot_personal_scope(
     .fetch_all(&mut **tx)
     .await?;
     let shares = sqlx::query(
-        "SELECT id, share_class, extract(epoch from expires_at)::bigint AS expires_epoch, \
+        "SELECT id, share_class,max_views,view_count,revoked_at IS NOT NULL AS revoked, \
+                extract(epoch from expires_at)::bigint AS expires_epoch, \
                 (extract(epoch from created_at) * 1000000)::bigint AS created_epoch \
          FROM share_links WHERE created_by=$1 \
          ORDER BY id COLLATE \"C\" LIMIT $2 FOR UPDATE",
@@ -440,9 +445,10 @@ async fn snapshot_personal_scope(
         let id: String = row.try_get("id")?;
         let share_class: String = row.try_get("share_class")?;
         let expires_epoch: Option<i64> = row.try_get("expires_epoch")?;
+        let max_views: i32 = row.try_get("max_views")?;
+        let view_count: i32 = row.try_get("view_count")?;
+        let revoked: bool = row.try_get("revoked")?;
         let created: i64 = row.try_get("created_epoch")?;
-        let known_bounded = matches!(share_class.as_str(), "free" | "paid")
-            && expires_epoch.is_some_and(|expiry| expiry <= deadline_epoch);
         scope.push((
             ScopeItem {
                 job_id: job_id.to_owned(),
@@ -452,7 +458,15 @@ async fn snapshot_personal_scope(
                 expected_created_at_epoch: created,
                 expected_revision: None,
             },
-            (!known_bounded).then_some("share_lifetime_unproven"),
+            retention::share_lifetime_hold(
+                &share_class,
+                expires_epoch,
+                max_views,
+                view_count,
+                revoked,
+                now_epoch,
+                deadline_epoch,
+            ),
         ));
     }
     Ok(scope)
@@ -543,22 +557,45 @@ fn epoch_now() -> i64 {
 
 /// Start the default-off dry-run reconciler. It has no provider and no purge-mode call site.
 pub fn spawn(state: AppState) {
-    if !state.cloud_retention_dry_run_enabled || state.deployment_mode != DeploymentMode::Cloud {
+    if (!state.cloud_retention_dry_run_enabled && !state.cloud_shared_retention_dry_run_enabled)
+        || state.deployment_mode != DeploymentMode::Cloud
+    {
         return;
     }
     tokio::spawn(async move {
         let worker_id = format!("retention-worker:{}", Uuid::new_v4());
         loop {
-            if reconcile_once(&state).await.is_err() {
+            if state.cloud_retention_dry_run_enabled && reconcile_once(&state).await.is_err() {
                 eprintln!("cloud retention candidate reconciliation failed");
             }
-            for _ in 0..128 {
-                match retention::run_dry_run_once(&state.pool, &worker_id).await {
-                    Ok(Some(_)) => {}
-                    Ok(None) => break,
-                    Err(_) => {
-                        eprintln!("cloud retention dry run failed");
-                        break;
+            if state.cloud_shared_retention_dry_run_enabled
+                && crate::cloud_shared_retention::reconcile_once(&state)
+                    .await
+                    .is_err()
+            {
+                eprintln!("cloud shared retention candidate reconciliation failed");
+            }
+            if state.cloud_retention_dry_run_enabled {
+                for _ in 0..128 {
+                    match retention::run_dry_run_once(&state.pool, &worker_id).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            eprintln!("cloud retention dry run failed");
+                            break;
+                        }
+                    }
+                }
+            }
+            if state.cloud_shared_retention_dry_run_enabled {
+                for _ in 0..128 {
+                    match retention::run_shared_dry_run_once(&state.pool, &worker_id).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            eprintln!("cloud shared retention dry run failed");
+                            break;
+                        }
                     }
                 }
             }

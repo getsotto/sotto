@@ -51,6 +51,7 @@ pub enum NoticeKind {
     FailedRenewal,
     RecoveryEnd,
     ExportDeadline,
+    SharedExportDeadline,
     ImpendingPurge,
     SponsorshipChange,
     PayerTransferInvitation,
@@ -69,6 +70,7 @@ impl NoticeKind {
             Self::FailedRenewal => "failed_renewal",
             Self::RecoveryEnd => "recovery_end",
             Self::ExportDeadline => "export_deadline",
+            Self::SharedExportDeadline => "shared_export_deadline",
             Self::ImpendingPurge => "impending_purge",
             Self::SponsorshipChange => "sponsorship_change",
             Self::PayerTransferInvitation => "payer_transfer_invitation",
@@ -369,6 +371,38 @@ pub async fn enqueue_checkout_outcome_in_tx(
     Ok(())
 }
 
+/// Queue the shared-organisation export notice for one current owner or admin. The same event key
+/// is used for every recipient; the organisation id remains internal in `scope_id`.
+pub(crate) async fn enqueue_shared_export_deadline_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    recipient_user_id: &str,
+    organisation_id: &str,
+    event_key: &str,
+    effective_at_epoch: i64,
+    deadline_epoch: i64,
+) -> NoticeResult<()> {
+    let intent = NoticeIntent {
+        recipient_user_id: recipient_user_id.to_owned(),
+        event_key: event_key.to_owned(),
+        policy_key: "shared-export-deadline-v1".to_owned(),
+        kind: NoticeKind::SharedExportDeadline,
+        channel: NoticeChannel::InApp,
+        contact_id: None,
+        scope_id: Some(organisation_id.to_owned()),
+        due_at_epoch: effective_at_epoch,
+        content: NoticeContent {
+            title: "Shared organisation data is in its export period".into(),
+            detail: "Download an encrypted export of shared organisation data before its export deadline.".into(),
+            effective_at_epoch: Some(effective_at_epoch),
+            deadline_epoch: Some(deadline_epoch),
+            amount_pence: None,
+            price_interval: None,
+        },
+    };
+    enqueue_in_tx(tx, &intent).await?;
+    Ok(())
+}
+
 /// Notify the affected seat holders and current billing administrators that a provider schedule
 /// accepted a named sponsorship change. The notice is due at its effective boundary and the
 /// dispatcher rechecks the live operation and recipients before sending.
@@ -653,6 +687,7 @@ fn notice_kind_from_str(value: &str) -> Option<NoticeKind> {
         "failed_renewal" => NoticeKind::FailedRenewal,
         "recovery_end" => NoticeKind::RecoveryEnd,
         "export_deadline" => NoticeKind::ExportDeadline,
+        "shared_export_deadline" => NoticeKind::SharedExportDeadline,
         "impending_purge" => NoticeKind::ImpendingPurge,
         "sponsorship_change" => NoticeKind::SponsorshipChange,
         "payer_transfer_invitation" => NoticeKind::PayerTransferInvitation,
@@ -1269,6 +1304,7 @@ fn safe_notice_kind(value: &str) -> &'static str {
         "failed_renewal" => "failed_renewal",
         "recovery_end" => "recovery_end",
         "export_deadline" => "export_deadline",
+        "shared_export_deadline" => "shared_export_deadline",
         "impending_purge" => "impending_purge",
         "sponsorship_change" => "sponsorship_change",
         "payer_transfer_invitation" => "payer_transfer_invitation",
@@ -1692,6 +1728,26 @@ async fn record_first_provider_attempt(pool: &PgPool, lease: &NoticeLease) -> No
 }
 
 async fn notice_is_current(pool: &PgPool, lease: &NoticeLease) -> NoticeResult<Option<bool>> {
+    if lease.kind == "shared_export_deadline" {
+        let current: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM cloud_notice_outbox notice \
+             JOIN organizations org ON org.id=notice.scope_id AND org.lifecycle_state='active' \
+             JOIN organization_memberships membership ON membership.org_id=org.id \
+               AND membership.user_id=notice.recipient_user_id AND membership.role IN ('owner','admin') \
+             JOIN cloud_retention_jobs job ON job.organisation_id=org.id \
+               AND job.scope_kind='shared_organisation' AND job.notice_event_key=notice.event_key \
+             WHERE notice.notice_id=$1 AND notice.channel='email' AND notice.status='leased' \
+               AND notice.lease_owner=$2 AND notice.lease_expires_at>now() \
+               AND notice.policy_key='shared-export-deadline-v1' \
+               AND job.state IN ('ready','dry_run') AND job.dry_run=TRUE AND job.purge_enabled=FALSE \
+               AND job.deadline_at>now() AND notice.due_at<=now())",
+        )
+        .bind(&lease.notice_id)
+        .bind(&lease.worker_id)
+        .fetch_one(pool)
+        .await?;
+        return Ok(Some(current));
+    }
     let current: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM cloud_notice_outbox notice \
          JOIN cloud_verified_contacts contact ON contact.contact_id=notice.contact_id \

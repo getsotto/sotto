@@ -359,6 +359,10 @@ pub struct TransferSubscriptionSchedule {
 pub struct RefundReceipt {
     pub refund_id: String,
     pub status: String,
+    pub payment_reference: String,
+    pub charge_id: Option<String>,
+    pub amount_pence: i64,
+    pub currency: String,
 }
 
 impl SubscriptionObservation {
@@ -642,6 +646,17 @@ pub trait SubscriptionProvider: Send + Sync {
     /// read before another create call is attempted.
     async fn get_refund(&self, _provider_refund_id: &str) -> ProviderResult<RefundReceipt> {
         Err(ProviderError::unsupported("refund_lookup"))
+    }
+
+    /// Read the amount available immediately before a successful refund. Stripe's charge
+    /// aggregate includes the successful refund being checked, so subtract its amount first.
+    async fn get_refundable_amount(
+        &self,
+        _payment_reference: &str,
+        _charge_id: &str,
+        _refund_amount_pence: i64,
+    ) -> ProviderResult<(i64, String)> {
+        Err(ProviderError::unsupported("payment_lookup"))
     }
 
     async fn get_subscription(
@@ -1908,9 +1923,26 @@ impl SubscriptionProvider for StripeBilling {
             .as_str()
             .filter(|status| !status.is_empty())
             .ok_or_else(ProviderError::malformed_response)?;
+        let payment_reference = value["payment_intent"]
+            .as_str()
+            .filter(|payment_reference| !payment_reference.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let amount_pence = value["amount"]
+            .as_i64()
+            .filter(|amount| *amount > 0)
+            .ok_or_else(ProviderError::malformed_response)?;
+        let currency = value["currency"]
+            .as_str()
+            .filter(|currency| !currency.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let charge_id = parse_refund_charge_id(&value)?;
         Ok(RefundReceipt {
             refund_id: refund_id.to_string(),
             status: status.to_string(),
+            payment_reference: payment_reference.to_string(),
+            charge_id,
+            amount_pence,
+            currency: currency.to_string(),
         })
     }
 
@@ -1918,7 +1950,12 @@ impl SubscriptionProvider for StripeBilling {
         if !provider_refund_id.starts_with("re_") {
             return Err(ProviderError::malformed_response());
         }
-        let value = stripe_get(&self.api_key, &format!("refunds/{provider_refund_id}")).await?;
+        let value = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("refunds/{provider_refund_id}"),
+        )
+        .await?;
         let refund_id = value["id"]
             .as_str()
             .filter(|id| *id == provider_refund_id)
@@ -1927,10 +1964,95 @@ impl SubscriptionProvider for StripeBilling {
             .as_str()
             .filter(|status| !status.is_empty())
             .ok_or_else(ProviderError::malformed_response)?;
+        let payment_reference = value["payment_intent"]
+            .as_str()
+            .filter(|payment_reference| !payment_reference.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let amount_pence = value["amount"]
+            .as_i64()
+            .filter(|amount| *amount > 0)
+            .ok_or_else(ProviderError::malformed_response)?;
+        let currency = value["currency"]
+            .as_str()
+            .filter(|currency| !currency.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let charge_id = parse_refund_charge_id(&value)?;
         Ok(RefundReceipt {
             refund_id: refund_id.to_string(),
             status: status.to_string(),
+            payment_reference: payment_reference.to_string(),
+            charge_id,
+            amount_pence,
+            currency: currency.to_string(),
         })
+    }
+
+    async fn get_refundable_amount(
+        &self,
+        payment_reference: &str,
+        expected_charge_id: &str,
+        refund_amount_pence: i64,
+    ) -> ProviderResult<(i64, String)> {
+        if !payment_reference.starts_with("pi_")
+            || !expected_charge_id.starts_with("ch_")
+            || refund_amount_pence <= 0
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let payment = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("payment_intents/{payment_reference}"),
+        )
+        .await?;
+        if payment["id"].as_str() != Some(payment_reference)
+            || payment["status"].as_str() != Some("succeeded")
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let amount_received = payment["amount_received"]
+            .as_i64()
+            .filter(|amount| *amount > 0)
+            .ok_or_else(ProviderError::malformed_response)?;
+        let currency = payment["currency"]
+            .as_str()
+            .filter(|currency| !currency.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let charge_id = payment["latest_charge"]
+            .as_str()
+            .filter(|id| id.starts_with("ch_"))
+            .ok_or_else(ProviderError::malformed_response)?;
+        if charge_id != expected_charge_id {
+            return Err(ProviderError::malformed_response());
+        }
+        let charge = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("charges/{charge_id}"),
+        )
+        .await?;
+        if charge["id"].as_str() != Some(charge_id)
+            || charge["payment_intent"].as_str() != Some(payment_reference)
+            || charge["currency"].as_str() != Some(currency)
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let captured_amount = charge["amount_captured"]
+            .as_i64()
+            .filter(|amount| *amount > 0)
+            .ok_or_else(ProviderError::malformed_response)?;
+        let amount_refunded = charge["amount_refunded"]
+            .as_i64()
+            .filter(|amount| *amount >= refund_amount_pence)
+            .ok_or_else(ProviderError::malformed_response)?;
+        if captured_amount != amount_received || amount_refunded > captured_amount {
+            return Err(ProviderError::malformed_response());
+        }
+        let refundable = amount_received
+            .checked_sub(amount_refunded - refund_amount_pence)
+            .filter(|amount| *amount > 0)
+            .ok_or_else(ProviderError::malformed_response)?;
+        Ok((refundable, currency.to_string()))
     }
 
     async fn get_subscription(
@@ -2341,6 +2463,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/billing/refunds/{request_id}/review",
             post(operator_review_refund),
+        )
+        .route(
+            "/billing/refunds/{request_id}/resolve",
+            post(operator_resolve_refund),
         )
         .route(
             "/billing/refunds/{request_id}/process",
@@ -4690,6 +4816,11 @@ struct BillingRefundReviewRequest {
     result_code: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BillingRefundResolutionRequest {
+    provider_refund_id: String,
+}
+
 #[derive(Debug, Serialize)]
 struct PersonalRefundView {
     request_id: String,
@@ -4866,6 +4997,147 @@ async fn operator_review_refund(
     Ok(Json(personal_refund_view(request)))
 }
 
+async fn operator_resolve_refund(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+    Json(resolution): Json<BillingRefundResolutionRequest>,
+) -> Result<Json<PersonalRefundView>> {
+    require_billing_corrections()?;
+    require_billing_operator(&headers)?;
+    let billing = billing_config(&state)?;
+    let mut tx = state.pool.begin().await?;
+    let current = billing_refunds::load_for_operator(&mut tx, &request_id)
+        .await
+        .map_err(Error::from)?;
+    if current.state != billing_refunds::CorrectionState::Unknown
+        || current.provider_refund_id.is_some()
+        || current.result_code.as_deref() != Some("refund_create_horizon_expired")
+    {
+        return Err(Error::Conflict(
+            "billing refund is not awaiting ambiguous-create resolution".into(),
+        ));
+    }
+    tx.rollback().await?;
+
+    let receipt = billing
+        .provider
+        .get_refund(&resolution.provider_refund_id)
+        .await
+        .map_err(ProviderError::into_error)?;
+    if !validate_refund_receipt(&*billing.provider, &current, &receipt).await? {
+        return Err(Error::Conflict(
+            "provider refund amount does not match the approved correction".into(),
+        ));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let request = match receipt.status.as_str() {
+        "succeeded" => billing_refunds::record_provider_refund(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            true,
+            None,
+        )
+        .await
+        .map_err(Error::from)?,
+        "pending" | "requires_action" => {
+            billing_refunds::record_provider_pending(&mut tx, &request_id, &receipt.refund_id)
+                .await
+                .map_err(Error::from)?
+        }
+        status @ ("failed" | "canceled") => billing_refunds::record_provider_refund(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            false,
+            Some(status),
+        )
+        .await
+        .map_err(Error::from)?,
+        _ => billing_refunds::record_provider_unknown(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            "provider_status_unrecognised",
+        )
+        .await
+        .map_err(Error::from)?,
+    };
+    tx.commit().await?;
+    Ok(Json(personal_refund_view(request)))
+}
+
+async fn validate_refund_receipt(
+    provider: &dyn SubscriptionProvider,
+    request: &billing_refunds::BillingRefundRequest,
+    receipt: &RefundReceipt,
+) -> Result<bool> {
+    let refundable_amount = if request.full_refund_requested && receipt.status == "succeeded" {
+        let Some(charge_id) = receipt.charge_id.as_deref() else {
+            return Ok(false);
+        };
+        if !refund_receipt_matches_charge(receipt, charge_id) {
+            return Ok(false);
+        }
+        Some(
+            provider
+                .get_refundable_amount(&request.payment_reference, charge_id, receipt.amount_pence)
+                .await
+                .map_err(ProviderError::into_error)?,
+        )
+    } else {
+        None
+    };
+    if request.full_refund_requested && receipt.status != "succeeded" {
+        return Ok(
+            receipt.payment_reference == request.payment_reference && receipt.currency == "gbp"
+        );
+    }
+    Ok(refund_receipt_matches_approved_correction(
+        request,
+        receipt,
+        refundable_amount.as_ref(),
+    ))
+}
+
+fn refund_receipt_matches_charge(receipt: &RefundReceipt, expected_charge_id: &str) -> bool {
+    receipt.charge_id.as_deref() == Some(expected_charge_id)
+        && expected_charge_id.starts_with("ch_")
+}
+
+fn parse_refund_charge_id(value: &serde_json::Value) -> ProviderResult<Option<String>> {
+    match value.get("charge") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(charge) => stripe_reference(charge)
+            .filter(|charge_id| charge_id.starts_with("ch_"))
+            .map(Some)
+            .ok_or_else(ProviderError::malformed_response),
+    }
+}
+
+fn refund_receipt_matches_approved_correction(
+    request: &billing_refunds::BillingRefundRequest,
+    receipt: &RefundReceipt,
+    refundable_amount: Option<&(i64, String)>,
+) -> bool {
+    if receipt.payment_reference != request.payment_reference || receipt.currency != "gbp" {
+        return false;
+    }
+    let partial_amount = request
+        .amount_pence
+        .map(|amount| (amount, "gbp".to_string()));
+    let expected_amount = if request.full_refund_requested {
+        refundable_amount
+    } else {
+        partial_amount.as_ref()
+    };
+    expected_amount.is_some_and(|(amount, currency)| {
+        currency == &receipt.currency && *amount == receipt.amount_pence
+    })
+}
+
 async fn operator_process_refund(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4889,10 +5161,59 @@ async fn operator_process_refund(
         let next = billing_refunds::begin_provider_refund(&mut tx, &request_id)
             .await
             .map_err(Error::from)?;
-        tx.commit().await?;
         next
     } else {
+        current
+    };
+    let create_claim_token = if current.state == billing_refunds::CorrectionState::ProviderPending
+        && current.provider_refund_id.is_none()
+    {
+        let claim_token = uuid::Uuid::new_v4();
+        match billing_refunds::claim_or_park_provider_refund_create(
+            &mut tx,
+            &request_id,
+            claim_token,
+        )
+        .await
+        .map_err(Error::from)?
+        {
+            billing_refunds::RefundCreateClaim::Claimed { token, .. } => {
+                tx.commit().await?;
+                let mut check_tx = state.pool.begin().await?;
+                let still_current = billing_refunds::provider_refund_create_claim_is_current(
+                    &mut check_tx,
+                    &request_id,
+                    token,
+                )
+                .await
+                .map_err(Error::from)?;
+                let latest = billing_refunds::load_for_operator(&mut check_tx, &request_id)
+                    .await
+                    .map_err(Error::from)?;
+                check_tx.rollback().await?;
+                if !still_current {
+                    return Ok(Json(personal_refund_view(latest)));
+                }
+                Some(token)
+            }
+            billing_refunds::RefundCreateClaim::InFlight(request)
+            | billing_refunds::RefundCreateClaim::Parked(request) => {
+                tx.commit().await?;
+                return Ok(Json(personal_refund_view(request)));
+            }
+        }
+    } else {
         tx.rollback().await?;
+        None
+    };
+    let current = if create_claim_token.is_some() {
+        let mut read_tx = state.pool.begin().await?;
+        let current = billing_refunds::load_for_operator(&mut read_tx, &request_id)
+            .await
+            .map_err(Error::from)?;
+        read_tx.rollback().await?;
+        current
+    } else {
         current
     };
     if current.state == billing_refunds::CorrectionState::TerminationPending {
@@ -4913,7 +5234,10 @@ async fn operator_process_refund(
         tx.commit().await?;
         return Ok(Json(personal_refund_view(request)));
     }
-    if current.state != billing_refunds::CorrectionState::ProviderPending {
+    let has_known_refund = current.provider_refund_id.is_some();
+    if current.state != billing_refunds::CorrectionState::ProviderPending
+        && !(current.state == billing_refunds::CorrectionState::Unknown && has_known_refund)
+    {
         return Ok(Json(personal_refund_view(current)));
     }
     let provider_key = format!("sotto-refund:{request_id}");
@@ -4923,7 +5247,7 @@ async fn operator_process_refund(
             .get_refund(provider_refund_id)
             .await
             .map_err(ProviderError::into_error)?
-    } else {
+    } else if create_claim_token.is_some() {
         billing
             .provider
             .create_refund(
@@ -4933,7 +5257,22 @@ async fn operator_process_refund(
             )
             .await
             .map_err(ProviderError::into_error)?
+    } else {
+        return Ok(Json(personal_refund_view(current)));
     };
+    if !validate_refund_receipt(&*billing.provider, &current, &receipt).await? {
+        let mut tx = state.pool.begin().await?;
+        let request = billing_refunds::record_provider_unknown(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            "provider_refund_evidence_mismatch",
+        )
+        .await
+        .map_err(Error::from)?;
+        tx.commit().await?;
+        return Ok(Json(personal_refund_view(request)));
+    }
     let mut tx = state.pool.begin().await?;
     let request = match receipt.status.as_str() {
         "succeeded" => billing_refunds::record_provider_refund(
@@ -4950,12 +5289,20 @@ async fn operator_process_refund(
                 .await
                 .map_err(Error::from)?
         }
-        status => billing_refunds::record_provider_refund(
+        status @ ("failed" | "canceled") => billing_refunds::record_provider_refund(
             &mut tx,
             &request_id,
             &receipt.refund_id,
             false,
             Some(status),
+        )
+        .await
+        .map_err(Error::from)?,
+        _ => billing_refunds::record_provider_unknown(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            "provider_status_unrecognised",
         )
         .await
         .map_err(Error::from)?,
@@ -11926,6 +12273,69 @@ mod tests {
         (format!("http://{address}"), request, server)
     }
 
+    #[derive(Clone)]
+    struct RefundHttpState {
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn refund_http_mock(
+        State(state): State<RefundHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let path = request.uri().to_string();
+        state
+            .requests
+            .lock()
+            .expect("refund request log lock")
+            .push(path.clone());
+        match path.as_str() {
+            "/v1/refunds/re_verified" => axum::Json(serde_json::json!({
+                "id": "re_verified",
+                "status": "succeeded",
+                "payment_intent": "pi_expected",
+                "charge": "ch_expected",
+                "amount": 299,
+                "currency": "gbp"
+            }))
+            .into_response(),
+            "/v1/payment_intents/pi_expected" => axum::Json(serde_json::json!({
+                "id": "pi_expected",
+                "status": "succeeded",
+                "amount_received": 799,
+                "currency": "gbp",
+                "latest_charge": "ch_expected"
+            }))
+            .into_response(),
+            "/v1/charges/ch_expected" => axum::Json(serde_json::json!({
+                "id": "ch_expected",
+                "payment_intent": "pi_expected",
+                "currency": "gbp",
+                "amount_captured": 799,
+                "amount_refunded": 799
+            }))
+            .into_response(),
+            _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn refund_http_server() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>)
+    {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind refund mock");
+        let address = listener.local_addr().expect("refund mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route("/{*path}", axum::routing::any(refund_http_mock))
+            .with_state(RefundHttpState {
+                requests: requests.clone(),
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve refund mock");
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
     type CapturedSponsoredCheckoutRequests = Arc<Mutex<Vec<(Option<String>, String)>>>;
 
     #[derive(Clone)]
@@ -12831,6 +13241,46 @@ mod tests {
         let body = request.as_deref().expect("preview request was sent");
         assert!(body.contains("subscription=sub-preview"));
         drop(request);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn refund_recovery_uses_charge_totals_without_listing_refunds() {
+        let (origin, requests, server) = refund_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_test".into(),
+            api_origin: origin,
+        };
+        let refund = provider
+            .get_refund("re_verified")
+            .await
+            .expect("retrieve the existing refund by its Stripe id");
+        assert_eq!(refund.refund_id, "re_verified");
+        assert_eq!(refund.payment_reference, "pi_expected");
+        assert_eq!(refund.charge_id.as_deref(), Some("ch_expected"));
+        assert_eq!(refund.amount_pence, 299);
+        assert_eq!(refund.currency, "gbp");
+        assert_eq!(
+            provider
+                .get_refundable_amount("pi_expected", "ch_expected", 299)
+                .await
+                .expect("read the remaining amount for full-refund validation"),
+            (299, "gbp".into())
+        );
+        assert!(provider
+            .get_refundable_amount("pi_expected", "ch_other", 299)
+            .await
+            .is_err());
+        assert_eq!(
+            *requests.lock().expect("refund request log lock"),
+            [
+                "/v1/refunds/re_verified".to_string(),
+                "/v1/payment_intents/pi_expected".to_string(),
+                "/v1/charges/ch_expected".to_string(),
+                "/v1/payment_intents/pi_expected".to_string()
+            ]
+        );
         server.abort();
     }
 
@@ -15388,5 +15838,100 @@ mod tests {
         assert!(operational
             .iter()
             .all(|error| !error.is_evidence_rejection()));
+    }
+
+    #[test]
+    fn operator_refund_evidence_must_match_payment_and_approved_amount() {
+        let request = billing_refunds::BillingRefundRequest {
+            request_id: "refund:request".into(),
+            requester_user_id: "user".into(),
+            beneficiary_id: "user".into(),
+            organization_id: None,
+            payer_kind: PayerKind::Personal,
+            payment_reference: "pi_expected".into(),
+            subscription_id: "sub_expected".into(),
+            amount_pence: Some(299),
+            reason: "billing_error".into(),
+            policy_version: "policy".into(),
+            idempotency_key: "key".into(),
+            request_hash: "hash".into(),
+            full_refund_requested: false,
+            state: billing_refunds::CorrectionState::Unknown,
+            preserve_paid_term: true,
+            early_termination_confirmed_at_epoch: None,
+            effective_at_epoch: None,
+            provider_refund_id: None,
+            provider_refund_started_at_epoch: Some(1_900_000_000),
+            result_code: Some("refund_create_horizon_expired".into()),
+        };
+        let receipt = RefundReceipt {
+            refund_id: "re_verified".into(),
+            status: "succeeded".into(),
+            payment_reference: "pi_expected".into(),
+            charge_id: Some("ch_expected".into()),
+            amount_pence: 299,
+            currency: "gbp".into(),
+        };
+        assert!(refund_receipt_matches_approved_correction(
+            &request, &receipt, None
+        ));
+
+        let mut wrong_payment = receipt.clone();
+        wrong_payment.payment_reference = "pi_other".into();
+        assert!(!refund_receipt_matches_approved_correction(
+            &request,
+            &wrong_payment,
+            None
+        ));
+        let mut wrong_amount = receipt.clone();
+        wrong_amount.amount_pence = 300;
+        assert!(!refund_receipt_matches_approved_correction(
+            &request,
+            &wrong_amount,
+            None
+        ));
+        let mut wrong_currency = receipt;
+        wrong_currency.currency = "usd".into();
+        assert!(!refund_receipt_matches_approved_correction(
+            &request,
+            &wrong_currency,
+            None
+        ));
+
+        let mut full_refund = request;
+        full_refund.full_refund_requested = true;
+        full_refund.amount_pence = None;
+        let full_receipt = RefundReceipt {
+            refund_id: "re_full".into(),
+            status: "succeeded".into(),
+            payment_reference: "pi_expected".into(),
+            charge_id: Some("ch_expected".into()),
+            amount_pence: 299,
+            currency: "gbp".into(),
+        };
+        assert!(refund_receipt_matches_approved_correction(
+            &full_refund,
+            &full_receipt,
+            Some(&(299, "gbp".into()))
+        ));
+        assert!(!refund_receipt_matches_approved_correction(
+            &full_refund,
+            &full_receipt,
+            None
+        ));
+        assert!(!refund_receipt_matches_approved_correction(
+            &full_refund,
+            &full_receipt,
+            Some(&(300, "gbp".into()))
+        ));
+        let mut incomplete_full_receipt = full_receipt.clone();
+        incomplete_full_receipt.amount_pence = 100;
+        assert!(!refund_receipt_matches_approved_correction(
+            &full_refund,
+            &incomplete_full_receipt,
+            Some(&(299, "gbp".into()))
+        ));
+        assert!(refund_receipt_matches_charge(&full_receipt, "ch_expected"));
+        assert!(!refund_receipt_matches_charge(&full_receipt, "ch_other"));
     }
 }

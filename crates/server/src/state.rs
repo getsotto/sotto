@@ -58,6 +58,8 @@ pub struct AppState {
     pub billing_transfer_setup_enabled: bool,
     /// Whether the dormant Cloud retention candidate and dry-run worker is started.
     pub cloud_retention_dry_run_enabled: bool,
+    /// Whether the shared organisation retention scanner and dry-run worker is started.
+    pub cloud_shared_retention_dry_run_enabled: bool,
     /// Dedicated bearer token for Cloud retention operator routes.
     pub cloud_retention_operator_token: Option<String>,
 }

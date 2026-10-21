@@ -258,6 +258,7 @@ async fn run() -> Result<()> {
         billing_transfer_execution_enabled: config.billing_transfer_execution_enabled,
         billing_transfer_setup_enabled: config.billing_transfer_setup_enabled,
         cloud_retention_dry_run_enabled: config.cloud_retention_dry_run_enabled,
+        cloud_shared_retention_dry_run_enabled: config.cloud_shared_retention_dry_run_enabled,
         cloud_retention_operator_token: config.cloud_retention_operator_token.clone(),
     };
 
@@ -334,6 +335,10 @@ async fn run() -> Result<()> {
         "Cloud personal retention dry run: {}",
         config.cloud_retention_dry_run_enabled
     );
+    println!(
+        "Cloud shared organisation retention dry run: {}",
+        config.cloud_shared_retention_dry_run_enabled
+    );
 
     // Default-on telemetry must never be a surprise: say so at boot, with the off switch.
     if config.telemetry.ping_enabled && !config.telemetry.ingest_enabled {
@@ -359,7 +364,7 @@ async fn run() -> Result<()> {
         })?;
         sotto_server::sponsored_billing_recovery_executor::spawn(pool.clone(), billing);
     }
-    if config.cloud_retention_dry_run_enabled {
+    if config.cloud_retention_dry_run_enabled || config.cloud_shared_retention_dry_run_enabled {
         sotto_server::cloud_retention_lifecycle::spawn(state.clone());
     }
     if config.founding_schedule_worker_enabled {

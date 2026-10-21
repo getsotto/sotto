@@ -100,6 +100,8 @@ fn intent(job_id: &str, user_id: &str) -> RetentionIntent {
         notice_event_key: format!("notice:export-expiry:{user_id}"),
         notice_evidence_epoch: Some(1),
         expected_coverage_revision: None,
+        expected_scope_generation: None,
+        eligibility_loss_epoch: None,
     }
 }
 
@@ -338,7 +340,7 @@ async fn shared_scope_holds_and_cancellation_stops_due_work() {
     retention::mark_ready(&pool, SHARED_JOB)
         .await
         .expect("mark shared job ready");
-    retention::run_once(
+    let shared_dry_run = retention::run_once(
         &pool,
         "retention-test-shared-dry-run",
         RetentionMode::DryRun,
@@ -346,14 +348,13 @@ async fn shared_scope_holds_and_cancellation_stops_due_work() {
     .await
     .expect("run shared dry run")
     .expect("shared dry run should claim a job");
-    retention::enable_purge(&pool, SHARED_JOB)
-        .await
-        .expect("enable shared purge attempt");
-    let held = retention::run_once(&pool, "retention-test-shared", RetentionMode::Purge)
-        .await
-        .expect("run shared purge")
-        .expect("shared job should be claimed");
-    assert_eq!(held.state, RetentionState::Held);
+    assert_eq!(shared_dry_run.state, RetentionState::Held);
+    assert!(matches!(
+        retention::enable_purge(&pool, SHARED_JOB).await,
+        Err(retention::RetentionError::Held(
+            "purge prerequisites are not met"
+        ))
+    ));
     let project_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id=$1)")
             .bind(PROJECT_ID)

@@ -49,6 +49,7 @@ services:
       # default until the Cloud transition and export gates are approved.
       SOTTO_CLOUD_ACTION_ENFORCEMENT: ${SOTTO_CLOUD_ACTION_ENFORCEMENT:-0}
       SOTTO_CLOUD_RETENTION_DRY_RUN_ENABLED: ${SOTTO_CLOUD_RETENTION_DRY_RUN_ENABLED:-0}
+      SOTTO_CLOUD_SHARED_RETENTION_DRY_RUN_ENABLED: ${SOTTO_CLOUD_SHARED_RETENTION_DRY_RUN_ENABLED:-0}
       SOTTO_CLOUD_RETENTION_OPERATOR_TOKEN: ${SOTTO_CLOUD_RETENTION_OPERATOR_TOKEN:-}
       # New Cloud subscriptions stay unavailable until the full lifecycle and public terms are
       # approved. This does not disable customer management or verified webhook processing.

@@ -88,6 +88,7 @@ impl TestServer {
                     organisation_deletion_operator_token: None,
                     billing_transfer_operator_token: None,
                     cloud_retention_dry_run_enabled: false,
+                    cloud_shared_retention_dry_run_enabled: false,
                     cloud_retention_operator_token: None,
                 };
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

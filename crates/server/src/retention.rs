@@ -103,6 +103,8 @@ pub struct RetentionIntent {
     pub notice_event_key: String,
     pub notice_evidence_epoch: Option<i64>,
     pub expected_coverage_revision: Option<i64>,
+    pub expected_scope_generation: Option<i64>,
+    pub eligibility_loss_epoch: Option<i64>,
 }
 
 impl RetentionIntent {
@@ -130,13 +132,31 @@ impl RetentionIntent {
                     .subject_user_id
                     .as_deref()
                     .is_some_and(|id| !id.trim().is_empty())
-                    && self.organisation_id.is_none() => {}
-            ScopeKind::SharedOrganisation | ScopeKind::OrphanOrganisation
+                    && self.organisation_id.is_none()
+                    && self.expected_scope_generation.is_none()
+                    && self.eligibility_loss_epoch.is_none() => {}
+            ScopeKind::SharedOrganisation
                 if self.subject_user_id.is_none()
                     && self
                         .organisation_id
                         .as_deref()
-                        .is_some_and(|id| !id.trim().is_empty()) => {}
+                        .is_some_and(|id| !id.trim().is_empty())
+                    && self
+                        .expected_scope_generation
+                        .is_some_and(|generation| generation >= 0)
+                    && (self.eligibility_loss_epoch.is_some_and(|epoch| epoch >= 0)
+                        || (!self.eligibility_episode.starts_with("shared-export:")
+                            && self.eligibility_loss_epoch.is_none())) => {}
+            ScopeKind::OrphanOrganisation
+                if self.subject_user_id.is_none()
+                    && self
+                        .organisation_id
+                        .as_deref()
+                        .is_some_and(|id| !id.trim().is_empty())
+                    && self
+                        .expected_scope_generation
+                        .is_some_and(|generation| generation >= 0)
+                    && self.eligibility_loss_epoch.is_none() => {}
             _ => return Err(RetentionError::InvalidInput("scope ownership")),
         }
         Ok(())
@@ -166,7 +186,7 @@ impl ScopeItem {
         }
         if !matches!(
             self.resource_kind.as_str(),
-            "project" | "environment" | "share"
+            "project" | "environment" | "grant" | "machine_token" | "share"
         ) {
             return Err(RetentionError::InvalidInput("resource_kind"));
         }
@@ -228,6 +248,9 @@ struct RetentionLease {
     scope_kind: String,
     subject_user_id: Option<String>,
     expected_coverage_revision: Option<i64>,
+    expected_scope_generation: Option<i64>,
+    eligibility_loss_epoch: Option<i64>,
+    organisation_id: Option<String>,
     dry_run: bool,
     deadline_epoch: i64,
     notice_event_key: String,
@@ -240,6 +263,30 @@ fn bounded(value: &str, max: usize, field: &'static str) -> RetentionResult<()> 
         return Err(RetentionError::InvalidInput(field));
     }
     Ok(())
+}
+
+pub(crate) fn share_lifetime_hold(
+    share_class: &str,
+    expires_at: Option<i64>,
+    max_views: i32,
+    view_count: i32,
+    revoked: bool,
+    now: i64,
+    creator_deadline: i64,
+) -> Option<&'static str> {
+    if !matches!(share_class, "free" | "paid" | "legacy") {
+        return Some("share_lifetime_unproven");
+    }
+    let inactive =
+        revoked || view_count >= max_views || expires_at.is_some_and(|expiry| expiry <= now);
+    if share_class == "free"
+        && !inactive
+        && expires_at.is_none_or(|expiry| expiry > creator_deadline)
+    {
+        Some("free_share_promise_after_deadline")
+    } else {
+        None
+    }
 }
 
 pub async fn enqueue(pool: &PgPool, intent: &RetentionIntent) -> RetentionResult<EnqueueOutcome> {
@@ -257,9 +304,10 @@ pub async fn enqueue_in_tx(
     let inserted = sqlx::query(
         "INSERT INTO cloud_retention_jobs \
          (job_id, scope_kind, scope_key, subject_user_id, organisation_id, eligibility_episode, \
-          deadline_at, notice_event_key, notice_evidence_at, expected_coverage_revision) \
+          deadline_at, notice_event_key, notice_evidence_at, expected_coverage_revision, expected_scope_generation, eligibility_loss_at) \
          VALUES ($1,$2,$3,$4,$5,$6,to_timestamp($7),$8,\
-                 CASE WHEN $9::bigint IS NULL THEN NULL ELSE to_timestamp($9) END,$10) \
+                 CASE WHEN $9::bigint IS NULL THEN NULL ELSE to_timestamp($9) END,$10,$11, \
+                 CASE WHEN $12::bigint IS NULL THEN NULL ELSE to_timestamp($12) END) \
          ON CONFLICT (scope_kind, scope_key, eligibility_episode) DO NOTHING",
     )
     .bind(&intent.job_id)
@@ -272,6 +320,8 @@ pub async fn enqueue_in_tx(
     .bind(&intent.notice_event_key)
     .bind(intent.notice_evidence_epoch)
     .bind(intent.expected_coverage_revision)
+    .bind(intent.expected_scope_generation)
+    .bind(intent.eligibility_loss_epoch)
     .execute(&mut **tx)
     .await?
     .rows_affected();
@@ -280,7 +330,8 @@ pub async fn enqueue_in_tx(
     }
     let existing = sqlx::query(
         "SELECT subject_user_id, organisation_id, extract(epoch from deadline_at)::bigint AS deadline_epoch, notice_event_key, \
-                extract(epoch from notice_evidence_at)::bigint AS notice_evidence_epoch, expected_coverage_revision, \
+                extract(epoch from notice_evidence_at)::bigint AS notice_evidence_epoch, expected_coverage_revision, expected_scope_generation, \
+                extract(epoch from eligibility_loss_at)::bigint AS eligibility_loss_epoch, \
                 state, dry_run, purge_enabled, job_id \
          FROM cloud_retention_jobs WHERE scope_kind=$1 AND scope_key=$2 \
            AND eligibility_episode=$3 FOR UPDATE",
@@ -297,6 +348,8 @@ pub async fn enqueue_in_tx(
     let notice_event_key: String = existing.try_get("notice_event_key")?;
     let notice_evidence_epoch: Option<i64> = existing.try_get("notice_evidence_epoch")?;
     let expected_coverage_revision: Option<i64> = existing.try_get("expected_coverage_revision")?;
+    let expected_scope_generation: Option<i64> = existing.try_get("expected_scope_generation")?;
+    let eligibility_loss_epoch: Option<i64> = existing.try_get("eligibility_loss_epoch")?;
     let state: String = existing.try_get("state")?;
     let dry_run: bool = existing.try_get("dry_run")?;
     let purge_enabled: bool = existing.try_get("purge_enabled")?;
@@ -347,6 +400,41 @@ pub async fn enqueue_in_tx(
         .bind(&job_id)
         .execute(&mut **tx)
         .await?;
+    }
+    if expected_scope_generation != intent.expected_scope_generation
+        && !matches!(state.as_str(), "cancelled" | "completed" | "failed")
+    {
+        if intent.scope_kind != ScopeKind::SharedOrganisation || !dry_run || purge_enabled {
+            return Err(RetentionError::IdentityConflict);
+        }
+        let affected = sqlx::query(
+            "UPDATE cloud_retention_jobs SET expected_scope_generation=$2, \
+                    state=CASE WHEN state='held' AND hold_code='operator_hold' \
+                               THEN state ELSE 'ready' END, \
+                    hold_code=CASE WHEN state='held' AND hold_code='operator_hold' \
+                                   THEN hold_code ELSE NULL END, \
+                    dry_run_completed_at=NULL, lease_owner=NULL, \
+                    lease_expires_at=NULL, updated_at=now() \
+             WHERE job_id=$1 AND dry_run=TRUE AND purge_enabled=FALSE",
+        )
+        .bind(&job_id)
+        .bind(intent.expected_scope_generation)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if affected != 1 {
+            return Err(RetentionError::IdentityConflict);
+        }
+        sqlx::query(
+            "UPDATE cloud_retention_scope_items SET state='planned', hold_code=NULL, updated_at=now() \
+             WHERE job_id=$1 AND state IN ('dry_run','held')",
+        )
+        .bind(&job_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if eligibility_loss_epoch != intent.eligibility_loss_epoch {
+        return Err(RetentionError::IdentityConflict);
     }
     match (notice_evidence_epoch, intent.notice_evidence_epoch) {
         (Some(stored), Some(incoming)) if stored == incoming => {}
@@ -529,7 +617,8 @@ pub async fn apply_operator_action(
                      dry_run_completed_at=NULL, lease_owner=NULL, lease_expires_at=NULL, updated_at=now() \
                  WHERE job_id=$1 AND state='held' AND dry_run=TRUE AND purge_enabled=FALSE \
                    AND notice_evidence_at IS NOT NULL AND deadline_at <= now() \
-                   AND hold_code IS DISTINCT FROM 'scope_exceeds_bound'",
+                   AND hold_code IS DISTINCT FROM 'scope_exceeds_bound' \
+                   AND hold_code NOT IN ('no_verified_owner_contact','notice_window_elapsed')",
             )
             .bind(job_id)
             .execute(&mut *tx)
@@ -568,18 +657,27 @@ pub async fn apply_operator_action(
 
 pub async fn enable_purge(pool: &PgPool, job_id: &str) -> RetentionResult<()> {
     bounded(job_id, MAX_KEY, "job_id")?;
+    let mut tx = pool.begin().await?;
     let affected = sqlx::query(
         "UPDATE cloud_retention_jobs SET state='ready', purge_enabled=TRUE, dry_run=FALSE, updated_at=now() \
-         WHERE job_id=$1 AND state='dry_run' AND dry_run_completed_at IS NOT NULL \
+         WHERE job_id=$1 AND scope_kind='personal' AND state='dry_run' AND dry_run_completed_at IS NOT NULL \
            AND notice_evidence_at IS NOT NULL AND deadline_at <= now() AND hold_code IS NULL",
     )
     .bind(job_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if affected != 1 {
         return Err(RetentionError::Held("purge prerequisites are not met"));
     }
+    sqlx::query(
+        "UPDATE cloud_retention_scope_items SET state='planned',updated_at=now() \
+         WHERE job_id=$1 AND state='dry_run'",
+    )
+    .bind(job_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -621,12 +719,14 @@ async fn claim_due(
     worker_id: &str,
     mode: RetentionMode,
     personal_only: bool,
+    shared_only: bool,
 ) -> RetentionResult<Option<RetentionLease>> {
     bounded(worker_id, MAX_KEY, "worker_id")?;
     let mut tx = pool.begin().await?;
     let row = sqlx::query(
         "SELECT job_id FROM cloud_retention_jobs \
-         WHERE deadline_at <= now() AND ($2=FALSE OR scope_kind='personal') AND \
+         WHERE deadline_at <= now() AND ($2=FALSE OR scope_kind='personal') \
+           AND ($3=FALSE OR scope_kind='shared_organisation') AND \
            (($1 = 'dry_run' AND state='ready' AND dry_run=TRUE) OR \
             (state = 'ready' AND dry_run = FALSE AND purge_enabled = TRUE AND $1 = 'purge') OR \
             (state = 'leased' AND lease_expires_at <= now() AND \
@@ -636,6 +736,7 @@ async fn claim_due(
     )
     .bind(mode.as_str())
     .bind(personal_only)
+    .bind(shared_only)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
@@ -646,26 +747,33 @@ async fn claim_due(
     let row = sqlx::query(
         "UPDATE cloud_retention_jobs SET state='leased', lease_owner=$1, \
              lease_expires_at=now()+interval '5 minutes', attempt_count=attempt_count+1, updated_at=now() \
-         WHERE job_id=$2 AND \
+        WHERE job_id=$2 AND ($4=FALSE OR scope_kind='personal') \
+           AND ($5=FALSE OR scope_kind='shared_organisation') AND \
            (($3 = 'dry_run' AND state='ready' AND dry_run=TRUE) OR \
             ($3 = 'purge' AND state='ready' AND dry_run=FALSE AND purge_enabled=TRUE) OR \
             (state='leased' AND lease_expires_at <= now() AND \
              (($3 = 'dry_run' AND dry_run=TRUE) OR \
               ($3 = 'purge' AND dry_run=FALSE AND purge_enabled=TRUE)))) \
-         RETURNING scope_kind, subject_user_id, expected_coverage_revision, dry_run, \
+         RETURNING scope_kind, subject_user_id, organisation_id, expected_coverage_revision, expected_scope_generation, \
+                   extract(epoch FROM eligibility_loss_at)::bigint AS eligibility_loss_epoch, dry_run, \
                    extract(epoch from deadline_at)::bigint AS deadline_epoch, \
                    notice_event_key, extract(epoch from notice_evidence_at)::bigint AS notice_evidence_epoch",
     )
     .bind(worker_id)
     .bind(&job_id)
     .bind(mode.as_str())
+    .bind(personal_only)
+    .bind(shared_only)
     .fetch_one(&mut *tx)
     .await?;
     let lease = RetentionLease {
         job_id,
         scope_kind: row.try_get("scope_kind")?,
         subject_user_id: row.try_get("subject_user_id")?,
+        organisation_id: row.try_get("organisation_id")?,
         expected_coverage_revision: row.try_get("expected_coverage_revision")?,
+        expected_scope_generation: row.try_get("expected_scope_generation")?,
+        eligibility_loss_epoch: row.try_get("eligibility_loss_epoch")?,
         dry_run: row.try_get("dry_run")?,
         deadline_epoch: row.try_get("deadline_epoch")?,
         notice_event_key: row.try_get("notice_event_key")?,
@@ -684,7 +792,7 @@ pub async fn run_once(
     worker_id: &str,
     mode: RetentionMode,
 ) -> RetentionResult<Option<RetentionRun>> {
-    run_once_with_scope(pool, worker_id, mode, false).await
+    run_once_with_scope(pool, worker_id, mode, false, false).await
 }
 
 /// Production entry point: it can only claim personal dry-run jobs. The mode and scope are fixed
@@ -693,7 +801,16 @@ pub async fn run_dry_run_once(
     pool: &PgPool,
     worker_id: &str,
 ) -> RetentionResult<Option<RetentionRun>> {
-    run_once_with_scope(pool, worker_id, RetentionMode::DryRun, true).await
+    run_once_with_scope(pool, worker_id, RetentionMode::DryRun, true, false).await
+}
+
+/// Run one non-destructive dry-run batch for a qualified shared organisation scope.
+/// Orphaned organisations remain held and cannot be claimed by this entry point.
+pub async fn run_shared_dry_run_once(
+    pool: &PgPool,
+    worker_id: &str,
+) -> RetentionResult<Option<RetentionRun>> {
+    run_once_with_scope(pool, worker_id, RetentionMode::DryRun, false, true).await
 }
 
 async fn run_once_with_scope(
@@ -701,8 +818,9 @@ async fn run_once_with_scope(
     worker_id: &str,
     mode: RetentionMode,
     personal_only: bool,
+    shared_only: bool,
 ) -> RetentionResult<Option<RetentionRun>> {
-    let Some(lease) = claim_due(pool, worker_id, mode, personal_only).await? else {
+    let Some(lease) = claim_due(pool, worker_id, mode, personal_only, shared_only).await? else {
         return Ok(None);
     };
     let mut tx = pool.begin().await?;
@@ -733,6 +851,9 @@ async fn run_once_with_scope(
     } else {
         None
     };
+    if mode == RetentionMode::DryRun && lease.scope_kind == ScopeKind::SharedOrganisation.as_str() {
+        lock_shared_scope_rows(&mut tx, &lease).await?;
+    }
     // Keep the candidate writer's lock order: coverage head, exact notice, owner, then job. The
     // owner lock prevents new personal resources appearing between the inventory check and the
     // dry-run result, while the notice lock prevents cancellation after evidence was checked.
@@ -862,25 +983,95 @@ async fn run_once_with_scope(
     .bind(BATCH_SIZE)
     .fetch_all(&mut *tx)
     .await?;
-    if mode == RetentionMode::DryRun {
-        if !personal_only {
-            clear_lease(&mut tx, &lease, RetentionState::DryRun).await?;
+    if mode == RetentionMode::DryRun && lease.scope_kind == ScopeKind::SharedOrganisation.as_str() {
+        if let Some(reason) = validate_shared_dry_run(&mut tx, &lease).await? {
+            set_job_hold(&mut tx, &lease, reason).await?;
+            sqlx::query(
+                "UPDATE cloud_retention_scope_items SET state='held',hold_code=$2,updated_at=now() \
+                 WHERE job_id=$1 AND state='planned'",
+            )
+            .bind(&lease.job_id)
+            .bind(reason)
+            .execute(&mut *tx)
+            .await?;
+            let held: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM cloud_retention_scope_items WHERE job_id=$1 AND state='held'",
+            )
+            .bind(&lease.job_id)
+            .fetch_one(&mut *tx)
+            .await?;
             tx.commit().await?;
             return Ok(Some(RetentionRun {
                 job_id: lease.job_id,
-                state: RetentionState::DryRun,
+                state: RetentionState::Held,
                 dry_run: true,
-                processed_items: items.len(),
-                held_items: items
-                    .iter()
-                    .filter(|item| {
-                        item.try_get::<String, _>("ownership_kind")
-                            .map(|kind| kind == "shared")
-                            .unwrap_or(false)
-                    })
-                    .count(),
+                processed_items: 0,
+                held_items: held as usize,
             }));
         }
+        for item in &items {
+            let kind: String = item.try_get("resource_kind")?;
+            let id: String = item.try_get("resource_id")?;
+            let created: i64 = item.try_get("expected_created_at")?;
+            let revision: Option<i64> = item.try_get("expected_revision")?;
+            let reason =
+                validate_shared_resource(&mut tx, &lease, &kind, &id, created, revision).await?;
+            if let Some(reason) = reason {
+                sqlx::query(
+                    "UPDATE cloud_retention_scope_items SET state='held',hold_code=$4,updated_at=now() \
+                     WHERE job_id=$1 AND resource_kind=$2 AND resource_id=$3 AND state='planned'",
+                )
+                .bind(&lease.job_id)
+                .bind(&kind)
+                .bind(&id)
+                .bind(reason)
+                .execute(&mut *tx)
+                .await?;
+                set_job_hold(&mut tx, &lease, reason).await?;
+                tx.commit().await?;
+                return Ok(Some(RetentionRun {
+                    job_id: lease.job_id,
+                    state: RetentionState::Held,
+                    dry_run: true,
+                    processed_items: 0,
+                    held_items: 1,
+                }));
+            }
+            sqlx::query(
+                "UPDATE cloud_retention_scope_items SET state='dry_run',updated_at=now() \
+                 WHERE job_id=$1 AND resource_kind=$2 AND resource_id=$3 AND state='planned'",
+            )
+            .bind(&lease.job_id)
+            .bind(&kind)
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_retention_scope_items WHERE job_id=$1 AND state='planned'",
+        )
+        .bind(&lease.job_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if remaining > 0 {
+            clear_lease(&mut tx, &lease, RetentionState::Ready).await?;
+        } else {
+            clear_lease(&mut tx, &lease, RetentionState::DryRun).await?;
+        }
+        tx.commit().await?;
+        return Ok(Some(RetentionRun {
+            job_id: lease.job_id,
+            state: if remaining > 0 {
+                RetentionState::Ready
+            } else {
+                RetentionState::DryRun
+            },
+            dry_run: true,
+            processed_items: items.len(),
+            held_items: 0,
+        }));
+    }
+    if mode == RetentionMode::DryRun {
         let mut processed = 0;
         let mut hold_reason = None;
         for item in &items {
@@ -1365,6 +1556,442 @@ async fn validate_dry_run_evidence(
     Ok(None)
 }
 
+/// Lock the shared scope in the same order as candidate creation: participants, organisation,
+/// memberships, then the retention job. The organisation lock serialises membership writers and
+/// the generation triggers fence resource/grant changes during later validation.
+async fn lock_shared_scope_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &RetentionLease,
+) -> RetentionResult<()> {
+    let org_id = lease
+        .organisation_id
+        .as_deref()
+        .ok_or(RetentionError::Held("organisation scope is missing"))?;
+    let users: Vec<String> = sqlx::query_scalar(
+        "SELECT user_id FROM organization_memberships WHERE org_id=$1 AND role IN ('owner','admin') \
+         ORDER BY user_id COLLATE \"C\" LIMIT 257",
+    )
+    .bind(org_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if users.len() > 256 {
+        return Ok(());
+    }
+    let locked_users: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM users WHERE id=ANY($1) ORDER BY id COLLATE \"C\" FOR UPDATE",
+    )
+    .bind(&users)
+    .fetch_all(&mut **tx)
+    .await?;
+    if locked_users != users {
+        return Err(RetentionError::Held("organisation membership changed"));
+    }
+    sqlx::query("SELECT id FROM organizations WHERE id=$1 FOR UPDATE")
+        .bind(org_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    sqlx::query(
+        "SELECT user_id FROM organization_memberships WHERE org_id=$1 AND role IN ('owner','admin') \
+         ORDER BY user_id COLLATE \"C\" FOR UPDATE",
+    )
+    .bind(org_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn validate_shared_dry_run(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &RetentionLease,
+) -> RetentionResult<Option<&'static str>> {
+    if lease.scope_kind != ScopeKind::SharedOrganisation.as_str() {
+        return Ok(Some("unsupported_scope"));
+    }
+    let Some(org_id) = lease.organisation_id.as_deref() else {
+        return Ok(Some("organisation_scope_missing"));
+    };
+    let Some(expected_generation) = lease.expected_scope_generation else {
+        return Ok(Some("scope_generation_missing"));
+    };
+    let org =
+        sqlx::query("SELECT lifecycle_state, retention_generation FROM organizations WHERE id=$1")
+            .bind(org_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(org) = org else {
+        return Ok(Some("organisation_missing"));
+    };
+    let lifecycle: String = org.try_get("lifecycle_state")?;
+    let generation: i64 = org.try_get("retention_generation")?;
+    if lifecycle != "active" {
+        return Ok(Some("organisation_not_active"));
+    }
+    if generation != expected_generation {
+        return Ok(Some("scope_generation_changed"));
+    }
+    let deletion_pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM organization_deletions WHERE org_id=$1 \
+         AND state NOT IN ('cancelled','completed'))",
+    )
+    .bind(org_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if deletion_pending {
+        return Ok(Some("organisation_deletion_active"));
+    }
+    let transfer_pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM billing_transfer_intents WHERE state IN \
+           ('awaiting_consent','pending','destination_prepared','destination_paid', \
+            'source_adjustment_pending','source_restoration_pending','unknown') \
+         AND (source_organization_id=$1 OR destination_organization_id=$1))",
+    )
+    .bind(org_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if transfer_pending {
+        return Ok(Some("ownership_transition_pending"));
+    }
+    let Some(expected_notice_epoch) = lease.deadline_epoch.checked_sub(EXPORT_WINDOW_SECONDS)
+    else {
+        return Ok(Some("notice_deadline_invalid"));
+    };
+    let Some(expected_loss) = lease.eligibility_loss_epoch else {
+        return Ok(Some("eligibility_boundary_missing"));
+    };
+    if expected_notice_epoch < expected_loss
+        || lease.notice_evidence_epoch != Some(expected_notice_epoch)
+    {
+        return Ok(Some("notice_evidence_missing"));
+    }
+    let members = sqlx::query(
+        "SELECT user_id, role FROM organization_memberships WHERE org_id=$1 \
+         AND role IN ('owner','admin') ORDER BY user_id COLLATE \"C\" LIMIT 257",
+    )
+    .bind(org_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if members.is_empty() {
+        return Ok(Some("owner_admin_missing"));
+    }
+    if members.len() > 256 {
+        return Ok(Some("owner_admin_population_exceeds_bound"));
+    }
+    let notice_count: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT notice.recipient_user_id) FROM cloud_notice_outbox notice \
+         JOIN organization_memberships membership ON membership.org_id=notice.scope_id \
+           AND membership.user_id=notice.recipient_user_id AND membership.role IN ('owner','admin') \
+         WHERE notice.scope_id=$1 AND notice.event_key=$2 AND notice.policy_key='shared-export-deadline-v1' \
+           AND notice.kind='shared_export_deadline' AND notice.channel='in_app' \
+           AND notice.due_at=to_timestamp($3) AND notice.created_at<=to_timestamp($3) \
+           AND notice.status<>'cancelled'",
+    )
+    .bind(org_id)
+    .bind(&lease.notice_event_key)
+    .bind(expected_notice_epoch)
+    .fetch_one(&mut **tx)
+    .await?;
+    if notice_count != members.len() as i64 {
+        return Ok(Some("notice_evidence_incomplete"));
+    }
+    let reachable: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM cloud_verified_contacts contact \
+         JOIN organization_memberships membership ON membership.user_id=contact.user_id \
+         WHERE membership.org_id=$1 AND membership.role IN ('owner','admin') \
+           AND contact.channel='email' AND contact.revoked_at IS NULL)",
+    )
+    .bind(org_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !reachable {
+        return Ok(Some("no_verified_owner_contact"));
+    }
+    let now: i64 = sqlx::query_scalar("SELECT extract(epoch FROM now())::bigint")
+        .fetch_one(&mut **tx)
+        .await?;
+    let mut latest_loss = None;
+    for member in members {
+        let user_id: String = member.try_get("user_id")?;
+        let Some(loss_epoch) = shared_admin_loss_epoch(tx, &user_id, now).await? else {
+            return Ok(Some("owner_admin_eligibility_unproven"));
+        };
+        latest_loss = Some(latest_loss.map_or(loss_epoch, |latest: i64| latest.max(loss_epoch)));
+    }
+    if latest_loss != Some(expected_loss) {
+        return Ok(Some("eligibility_boundary_changed"));
+    }
+    validate_shared_scope_inventory(tx, lease).await
+}
+
+pub(crate) async fn shared_admin_loss_epoch(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: &str,
+    now: i64,
+) -> RetentionResult<Option<i64>> {
+    Ok(match shared_admin_eligibility(tx, user_id, now).await? {
+        SharedAdminEligibility::Lost(epoch) => Some(epoch),
+        SharedAdminEligibility::StillEligible | SharedAdminEligibility::Unknown => None,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedAdminEligibility {
+    StillEligible,
+    Lost(i64),
+    Unknown,
+}
+
+pub(crate) async fn shared_admin_eligibility(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: &str,
+    now: i64,
+) -> RetentionResult<SharedAdminEligibility> {
+    let account = crate::personal_billing::load_account(tx, user_id)
+        .await
+        .map_err(|error| match error {
+            crate::personal_billing::PersonalBillingError::Database(error) => {
+                RetentionError::Database(error)
+            }
+            _ => RetentionError::Held("owner eligibility is corrupt"),
+        })?;
+    let coordinator: Option<String> = sqlx::query_scalar(
+        "SELECT beneficiary_id FROM cloud_coverage_coordinators WHERE beneficiary_id=$1 FOR SHARE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let coverage = match crate::cloud_coverage_authority::load_current_in_transaction(
+        tx, user_id, now,
+    )
+    .await
+    {
+        Ok(crate::cloud_coverage_authority::AuthorityState::Current { loaded, .. }) => {
+            match crate::cloud_coverage::evaluate(&loaded.coverage, now) {
+                Ok(decision) => crate::person_eligibility::CoverageInput::Decision(decision),
+                Err(_) => crate::person_eligibility::CoverageInput::Unavailable,
+            }
+        }
+        Ok(crate::cloud_coverage_authority::AuthorityState::Missing) => {
+            crate::person_eligibility::CoverageInput::Missing
+        }
+        Ok(crate::cloud_coverage_authority::AuthorityState::Stale) => {
+            crate::person_eligibility::CoverageInput::Unavailable
+        }
+        Err(crate::cloud_coverage_authority::AuthorityError::Database(error))
+        | Err(crate::cloud_coverage_authority::AuthorityError::Store(StoreError::Database(
+            error,
+        ))) => {
+            return Err(RetentionError::Database(error));
+        }
+        Err(_) => crate::person_eligibility::CoverageInput::Unavailable,
+    };
+    let _ = coordinator;
+    let view =
+        crate::person_eligibility::evaluate_input(&crate::person_eligibility::EligibilityInput {
+            deployment_mode: crate::config::DeploymentMode::Cloud,
+            billing_available: true,
+            account_initialized: true,
+            personal_billing_state: account.map(|account| account.state),
+            coverage,
+        });
+    Ok(match view.state {
+        crate::person_eligibility::EligibilityState::Paid
+        | crate::person_eligibility::EligibilityState::RenewalRecovery => {
+            SharedAdminEligibility::StillEligible
+        }
+        crate::person_eligibility::EligibilityState::ExportOnly
+        | crate::person_eligibility::EligibilityState::Expired => view
+            .export_until_epoch
+            .and_then(|deadline| deadline.checked_sub(EXPORT_WINDOW_SECONDS))
+            .map_or(
+                SharedAdminEligibility::Unknown,
+                SharedAdminEligibility::Lost,
+            ),
+        _ => SharedAdminEligibility::Unknown,
+    })
+}
+
+async fn validate_shared_scope_inventory(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &RetentionLease,
+) -> RetentionResult<Option<&'static str>> {
+    let org_id = lease
+        .organisation_id
+        .as_deref()
+        .ok_or(RetentionError::Held("organisation scope is missing"))?;
+    let mut expected = HashSet::new();
+    let projects = sqlx::query(
+        "SELECT id, (extract(epoch FROM created_at)*1000000)::bigint AS created_at \
+         FROM projects WHERE org_id=$1 ORDER BY id COLLATE \"C\" LIMIT 4097",
+    )
+    .bind(org_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if projects.len() > 4096 {
+        return Ok(Some("scope_exceeds_bound"));
+    }
+    for row in projects {
+        expected.insert((
+            "project".to_owned(),
+            row.try_get::<String, _>("id")?,
+            row.try_get::<i64, _>("created_at")?,
+            None,
+        ));
+    }
+    let environments = sqlx::query(
+        "SELECT e.id,e.revision,(extract(epoch FROM e.created_at)*1000000)::bigint AS created_at \
+         FROM environments e JOIN projects p ON p.id=e.project_id WHERE p.org_id=$1 \
+         ORDER BY e.id COLLATE \"C\" LIMIT 4097",
+    )
+    .bind(org_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if expected.len() + environments.len() > 4096 {
+        return Ok(Some("scope_exceeds_bound"));
+    }
+    for row in environments {
+        expected.insert((
+            "environment".to_owned(),
+            row.try_get::<String, _>("id")?,
+            row.try_get::<i64, _>("created_at")?,
+            Some(row.try_get::<i64, _>("revision")?),
+        ));
+    }
+    let grants = sqlx::query(
+        "SELECT g.env_id,g.user_id,(extract(epoch FROM g.created_at)*1000000)::bigint AS created_at \
+         FROM environment_grants g JOIN environments e ON e.id=g.env_id \
+         JOIN projects p ON p.id=e.project_id WHERE p.org_id=$1 \
+         ORDER BY g.env_id COLLATE \"C\",g.user_id COLLATE \"C\" LIMIT 4097",
+    )
+    .bind(org_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if expected.len() + grants.len() > 4096 {
+        return Ok(Some("scope_exceeds_bound"));
+    }
+    for row in grants {
+        let env_id: String = row.try_get("env_id")?;
+        let user_id: String = row.try_get("user_id")?;
+        expected.insert((
+            "grant".to_owned(),
+            serde_json::json!([env_id, user_id]).to_string(),
+            row.try_get::<i64, _>("created_at")?,
+            None,
+        ));
+    }
+    let tokens = sqlx::query(
+        "SELECT m.id,m.env_id,(extract(epoch FROM m.created_at)*1000000)::bigint AS created_at \
+         FROM machine_tokens m JOIN environments e ON e.id=m.env_id \
+         JOIN projects p ON p.id=e.project_id WHERE p.org_id=$1 \
+         ORDER BY m.id COLLATE \"C\" LIMIT 4097",
+    )
+    .bind(org_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if expected.len() + tokens.len() > 4096 {
+        return Ok(Some("scope_exceeds_bound"));
+    }
+    for row in tokens {
+        let token_id: String = row.try_get("id")?;
+        let env_id: String = row.try_get("env_id")?;
+        expected.insert((
+            "machine_token".to_owned(),
+            serde_json::json!([token_id, env_id]).to_string(),
+            row.try_get::<i64, _>("created_at")?,
+            None,
+        ));
+    }
+    let rows = sqlx::query(
+        "SELECT resource_kind,resource_id,expected_created_at,expected_revision \
+         FROM cloud_retention_scope_items WHERE job_id=$1 ORDER BY resource_kind,resource_id LIMIT 4097",
+    )
+    .bind(&lease.job_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if rows.len() > 4096 {
+        return Ok(Some("scope_exceeds_bound"));
+    }
+    let mut actual = HashSet::new();
+    for row in rows {
+        actual.insert((
+            row.try_get::<String, _>("resource_kind")?,
+            row.try_get::<String, _>("resource_id")?,
+            row.try_get::<i64, _>("expected_created_at")?,
+            row.try_get::<Option<i64>, _>("expected_revision")?,
+        ));
+    }
+    if expected != actual {
+        return Ok(Some("scope_changed"));
+    }
+    Ok(None)
+}
+
+async fn validate_shared_resource(
+    tx: &mut Transaction<'_, Postgres>,
+    lease: &RetentionLease,
+    kind: &str,
+    id: &str,
+    created: i64,
+    revision: Option<i64>,
+) -> RetentionResult<Option<&'static str>> {
+    let org_id = lease
+        .organisation_id
+        .as_deref()
+        .ok_or(RetentionError::Held("organisation scope is missing"))?;
+    let found =
+        match kind {
+            "project" => {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1 AND org_id=$2 \
+             AND (extract(epoch FROM created_at)*1000000)::bigint=$3)",
+                )
+                .bind(id)
+                .bind(org_id)
+                .bind(created)
+                .fetch_one(&mut **tx)
+                .await?
+            }
+            "environment" => sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM environments e JOIN projects p ON p.id=e.project_id \
+             WHERE e.id=$1 AND p.org_id=$2 AND e.revision=$3 \
+               AND (extract(epoch FROM e.created_at)*1000000)::bigint=$4)",
+            )
+            .bind(id)
+            .bind(org_id)
+            .bind(revision)
+            .bind(created)
+            .fetch_one(&mut **tx)
+            .await?,
+            "grant" => {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM environment_grants g \
+                 JOIN environments e ON e.id=g.env_id JOIN projects p ON p.id=e.project_id \
+                 WHERE p.org_id=$2 AND jsonb_build_array(g.env_id,g.user_id)=$1::jsonb \
+                   AND (extract(epoch FROM g.created_at)*1000000)::bigint=$3)",
+                )
+                .bind(id)
+                .bind(org_id)
+                .bind(created)
+                .fetch_one(&mut **tx)
+                .await?
+            }
+            "machine_token" => {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM machine_tokens m \
+                 JOIN environments e ON e.id=m.env_id JOIN projects p ON p.id=e.project_id \
+                 WHERE p.org_id=$2 AND jsonb_build_array(m.id,m.env_id)=$1::jsonb \
+                   AND (extract(epoch FROM m.created_at)*1000000)::bigint=$3)",
+                )
+                .bind(id)
+                .bind(org_id)
+                .bind(created)
+                .fetch_one(&mut **tx)
+                .await?
+            }
+            _ => return Ok(Some("unsupported_resource_kind")),
+        };
+    Ok((!found).then_some("resource_identity_changed"))
+}
+
 async fn validate_dry_run_resource(
     tx: &mut Transaction<'_, Postgres>,
     lease: &RetentionLease,
@@ -1442,7 +2069,9 @@ async fn validate_dry_run_resource(
         }
         "share" => {
             let row = sqlx::query(
-                "SELECT created_by, share_class, extract(epoch from expires_at)::bigint AS expires_epoch, \
+                "SELECT created_by, share_class, max_views, view_count, revoked_at IS NOT NULL AS revoked, \
+                        extract(epoch from expires_at)::bigint AS expires_epoch, \
+                        extract(epoch from now())::bigint AS now_epoch, \
                         (extract(epoch from created_at) * 1000000)::bigint AS created_epoch \
                  FROM share_links WHERE id=$1 FOR UPDATE",
             )
@@ -1454,14 +2083,24 @@ async fn validate_dry_run_resource(
                 Some(row) => {
                     let owner: String = row.try_get("created_by")?;
                     let share_class: String = row.try_get("share_class")?;
+                    let max_views: i32 = row.try_get("max_views")?;
+                    let view_count: i32 = row.try_get("view_count")?;
+                    let revoked: bool = row.try_get("revoked")?;
                     let expires_at: Option<i64> = row.try_get("expires_epoch")?;
+                    let now: i64 = row.try_get("now_epoch")?;
                     let created: i64 = row.try_get("created_epoch")?;
                     if owner != subject {
                         Some("resource_identity_changed")
-                    } else if !matches!(share_class.as_str(), "free" | "paid")
-                        || expires_at.is_none_or(|expiry| expiry > lease.deadline_epoch)
-                    {
-                        Some("share_lifetime_unproven")
+                    } else if let Some(reason) = share_lifetime_hold(
+                        &share_class,
+                        expires_at,
+                        max_views,
+                        view_count,
+                        revoked,
+                        now,
+                        lease.deadline_epoch,
+                    ) {
+                        Some(reason)
                     } else if created != expected_created_at {
                         Some("resource_identity_changed")
                     } else {
@@ -1540,6 +2179,8 @@ mod tests {
             notice_event_key: "notice:export-expiry:user-1".into(),
             notice_evidence_epoch: Some(1_899_000_000),
             expected_coverage_revision: Some(4),
+            expected_scope_generation: None,
+            eligibility_loss_epoch: None,
         }
     }
 
@@ -1569,5 +2210,43 @@ mod tests {
         assert_eq!(RetentionMode::DryRun.as_str(), "dry_run");
         assert_eq!(RetentionMode::Purge.as_str(), "purge");
         assert_eq!(RetentionState::Held.as_str(), "held");
+    }
+
+    #[test]
+    fn share_lifetimes_keep_free_promises_and_end_paid_legacy_at_creator_deadline() {
+        let deadline = 1_900_000_000;
+        let now = deadline - 86_400;
+        assert_eq!(
+            share_lifetime_hold("free", Some(deadline - 1), 1, 0, false, now, deadline),
+            None
+        );
+        assert_eq!(
+            share_lifetime_hold("free", Some(deadline + 1), 1, 0, false, now, deadline),
+            Some("free_share_promise_after_deadline")
+        );
+        for class in ["paid", "legacy"] {
+            assert_eq!(
+                share_lifetime_hold(class, Some(deadline + 1), 1, 0, false, now, deadline),
+                None
+            );
+            assert_eq!(
+                share_lifetime_hold(class, None, 1, 0, false, now, deadline),
+                None
+            );
+        }
+        for (class, expiry, views, revoked) in [
+            ("free", Some(deadline + 1), 1, false),
+            ("paid", Some(deadline + 1), 0, true),
+            ("free", Some(now - 1), 0, false),
+        ] {
+            assert_eq!(
+                share_lifetime_hold(class, expiry, 1, views, revoked, now, deadline),
+                None
+            );
+        }
+        assert_eq!(
+            share_lifetime_hold("unknown", None, 1, 0, false, now, deadline),
+            Some("share_lifetime_unproven")
+        );
     }
 }

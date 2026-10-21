@@ -90,6 +90,7 @@ pub mod cloud_provider_stripe_sponsored_refresh;
 pub mod cloud_provider_stripe_sponsored_store;
 #[doc(hidden)]
 pub mod cloud_retention_lifecycle;
+pub mod cloud_shared_retention;
 pub mod community;
 pub mod config;
 pub mod contact_email;
