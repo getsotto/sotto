@@ -253,6 +253,43 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 ambiente) ou `>` (só no segundo). Sem `--confirm`, a cópia é uma simulação. Uma cópia confirmada
 adiciona e atualiza segredos, mas mantém intactas as chaves que existem apenas no destino.
 
+### Importar um arquivo dotenv
+
+`sotto import .env` importa valores para o ambiente ativo do projeto. Use `--env` para direcionar a um ambiente existente diferente para um comando sem alterar o padrão configurado do projeto:
+
+```sh
+sotto import .env
+sotto import --env staging .env.staging
+```
+
+A importação modifica o ambiente de destino diretamente:
+- O nome de um segredo existente é atualizado para o valor importado.
+- Um nome que não existia antes é adicionado.
+- Um nome pré-existente ausente no arquivo dotenv é mantido inalterado.
+
+Por exemplo, o ambiente `staging` existente contém:
+- `DATABASE_URL=postgres://old.example/app`
+- `LEGACY_MODE=enabled`
+
+O arquivo `.env.staging` contém:
+
+```dotenv
+DATABASE_URL=postgres://staging.example/app
+CACHE_TTL=30
+```
+
+Após a importação, `DATABASE_URL` tem o novo valor, `CACHE_TTL` é adicionado e `LEGACY_MODE` permanece `enabled`.
+
+Uma importação dotenv comum grava no cofre local, não sincroniza automaticamente e não exclui nem consome o arquivo dotenv de origem. Sincronize com o servidor separadamente após o login:
+
+```sh
+sotto push --env staging
+```
+
+Para reverter uma alteração, consulte [Restaurar uma versão anterior de um segredo](#restaurar-uma-versão-anterior-de-um-segredo). O histórico vem do servidor: valores que nunca foram enviados não estão disponíveis lá para recuperação. As gravações são aplicadas segredo por segredo conforme são analisadas; não há sinalizador de pré-visualização de importação nem reversão transacional se uma gravação posterior falhar.
+
+Consulte `sotto import --help` para conhecer as regras de aspas, espaços em branco e valores literais. Essa importação dotenv comum é diferente de `sotto import --cloud`, que restaura um pacote de saída criptografado do Cloud em vez de importar valores dotenv.
+
 ### Compartilhar um segredo
 
 `sotto share` criptografa um segredo em um link de uso único. A chave fica depois do `#` no link,

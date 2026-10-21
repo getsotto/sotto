@@ -254,6 +254,43 @@ in der ersten Umgebung) oder `>` (nur in der zweiten). Ohne `--confirm` ist die 
 Eine bestätigte Kopie fügt Geheimnisse hinzu und aktualisiert sie, lässt aber Schlüssel unverändert,
 die nur in der Zielumgebung vorhanden sind.
 
+### Eine Dotenv-Datei importieren
+
+`sotto import .env` importiert Werte in die aktive Umgebung des Projekts. Verwende `--env`, um für einen einzelnen Befehl eine andere vorhandene Umgebung auszuwählen, ohne den Standard des Projekts zu ändern:
+
+```sh
+sotto import .env
+sotto import --env staging .env.staging
+```
+
+Der Import ändert die Zielumgebung direkt:
+- Der Name eines vorhandenen Secrets wird auf den importierten Wert aktualisiert.
+- Ein zuvor nicht vorhandener Name wird hinzugefügt.
+- Ein vorhandener Name, der in der Dotenv-Datei fehlt, bleibt unverändert erhalten.
+
+Zum Beispiel enthält die vorhandene Umgebung `staging`:
+- `DATABASE_URL=postgres://old.example/app`
+- `LEGACY_MODE=enabled`
+
+Die Datei `.env.staging` enthält:
+
+```dotenv
+DATABASE_URL=postgres://staging.example/app
+CACHE_TTL=30
+```
+
+Nach dem Import hat `DATABASE_URL` den neuen Wert, `CACHE_TTL` wird hinzugefügt und `LEGACY_MODE` bleibt `enabled`.
+
+Ein gewöhnlicher Dotenv-Import schreibt in den lokalen Tresor, synchronisiert nicht automatisch und löscht oder verbraucht die Dotenv-Quelldatei nicht. Synchronisiere nach der Anmeldung separat mit dem Server:
+
+```sh
+sotto push --env staging
+```
+
+Zum Zurücksetzen einer Änderung siehe [Eine frühere Secret-Version wiederherstellen](#eine-frühere-secret-version-wiederherstellen). Der Verlauf stammt vom Server: Werte, die nie übertragen wurden, stehen dort nicht zur Wiederherstellung bereit. Schreibvorgänge werden Secret für Secret beim Parsen angewendet; es gibt keine Import-Vorschauoption und kein transaktionales Rollback, falls ein späterer Schreibvorgang fehlschlägt.
+
+Informationen zu Anführungszeichen, Leerzeichen und Literalwerten findest du unter `sotto import --help`. Dieser gewöhnliche Dotenv-Import unterscheidet sich von `sotto import --cloud`, das ein verschlüsseltes Cloud-Exit-Bundle wiederherstellt, anstatt Dotenv-Werte zu importieren.
+
 ### Ein Secret teilen
 
 `sotto share` verschlüsselt ein Secret in einen Einmal-Link. Der Schlüssel steht im Link hinter dem

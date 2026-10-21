@@ -251,6 +251,43 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 environment) or `>` (only in the second). Without `--confirm`, copying is a dry-run. A confirmed
 copy adds and updates secrets but leaves keys that exist only in the destination untouched.
 
+### Import a dotenv file
+
+`sotto import .env` imports values into the project's active environment. Use `--env` to target a different existing environment for one command without changing the project's default:
+
+```sh
+sotto import .env
+sotto import --env staging .env.staging
+```
+
+Importing modifies the target environment in place:
+- An existing secret name is updated to the imported value.
+- A name that did not exist before is added.
+- A pre-existing name absent from the dotenv file is retained unchanged.
+
+For example, the existing `staging` environment has:
+- `DATABASE_URL=postgres://old.example/app`
+- `LEGACY_MODE=enabled`
+
+The `.env.staging` file contains:
+
+```dotenv
+DATABASE_URL=postgres://staging.example/app
+CACHE_TTL=30
+```
+
+After importing, `DATABASE_URL` has the new value, `CACHE_TTL` is added, and `LEGACY_MODE` remains `enabled`.
+
+An ordinary dotenv import writes to the local vault, does not synchronise automatically, and does not delete or consume the source dotenv file. Sync to the server separately after login:
+
+```sh
+sotto push --env staging
+```
+
+To roll back a change, see [Restore an earlier secret version](#restore-an-earlier-secret-version). History comes from the server: values never pushed are not available there for recovery. Writes are applied secret by secret as they are parsed; there is no import preview flag or transactional rollback if a later write fails.
+
+Refer to `sotto import --help` for quoting, whitespace and literal-value rules. This ordinary dotenv import is distinct from `sotto import --cloud`, which restores an encrypted Cloud exit bundle instead of importing dotenv values.
+
 ### Share a secret
 
 `sotto share` encrypts one secret into a one-time link. The key sits after the `#` in the link,

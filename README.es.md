@@ -254,6 +254,43 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 entorno) o `>` (solo en el segundo). Sin `--confirm`, la copia es una simulación. Una copia confirmada
 añade y actualiza secretos, pero deja intactas las claves que solo existen en el destino.
 
+### Importar un archivo dotenv
+
+`sotto import .env` importa valores en el entorno activo del proyecto. Usa `--env` para seleccionar un entorno existente diferente durante un solo comando sin cambiar el valor predeterminado del proyecto:
+
+```sh
+sotto import .env
+sotto import --env staging .env.staging
+```
+
+La importación modifica el entorno de destino en su lugar:
+- El nombre de un secreto existente se actualiza con el valor importado.
+- Se añade un nombre que no existía antes.
+- Un nombre preexistente que no aparece en el archivo dotenv se conserva sin cambios.
+
+Por ejemplo, el entorno `staging` existente contiene:
+- `DATABASE_URL=postgres://old.example/app`
+- `LEGACY_MODE=enabled`
+
+El archivo `.env.staging` contiene:
+
+```dotenv
+DATABASE_URL=postgres://staging.example/app
+CACHE_TTL=30
+```
+
+Tras la importación, `DATABASE_URL` tiene el nuevo valor, se añade `CACHE_TTL` y `LEGACY_MODE` permanece `enabled`.
+
+Una importación dotenv ordinaria escribe en la bóveda local, no se sincroniza automáticamente y no elimina ni consume el archivo dotenv de origen. Sincroniza con el servidor por separado tras iniciar sesión:
+
+```sh
+sotto push --env staging
+```
+
+Para revertir un cambio, consulta [Restaurar una versión anterior de un secreto](#restaurar-una-versión-anterior-de-un-secreto). El historial procede del servidor: los valores que nunca se han subido no están disponibles allí para su recuperación. Las escrituras se aplican secreto a secreto a medida que se procesan; no existe ninguna opción de vista previa de importación ni reversión transaccional si falla una escritura posterior.
+
+Consulta `sotto import --help` para conocer las reglas de entrecomillado, espacios en blanco y valores literales. Esta importación dotenv ordinaria es distinta de `sotto import --cloud`, que restaura un paquete de salida cifrado de Cloud en lugar de importar valores dotenv.
+
 ### Compartir un secreto
 
 `sotto share` cifra un secreto en un enlace de un solo uso. La clave va después del `#` del enlace,
