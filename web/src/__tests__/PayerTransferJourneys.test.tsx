@@ -70,6 +70,16 @@ function member(userId: string, role: string): api.Member {
   return { userId, role, publicKey: null };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
   vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: true, setupAvailable: true });
@@ -217,6 +227,65 @@ describe("payer transfer journeys", () => {
     }));
     await waitFor(() => expect(api.beginPayerTransfer).toHaveBeenCalledWith({ quote, idempotencyKey: expect.any(String) }));
     expect(await screen.findByText(/The other payer must accept it/)).toBeInTheDocument();
+  });
+
+  it("shows a recoverable error when the initial organisation lookup fails", async () => {
+    vi.mocked(api.fetchOrgs).mockRejectedValue(new Error("Synthetic network error"));
+    render(<PersonalTransferStart />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/organisations could not be loaded/i);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    expect(screen.queryByLabelText("Organisation")).not.toBeInTheDocument();
+    expect(api.quotePayerTransfer).not.toHaveBeenCalled();
+    expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+  });
+
+  it("reloads initial data in place after a successful retry", async () => {
+    const firstOrgs = deferred<api.Org[]>();
+    vi.mocked(api.fetchOrgs).mockReturnValueOnce(firstOrgs.promise);
+    render(<PersonalTransferStart />);
+    await waitFor(() => expect(api.fetchPayerTransferCapabilities).toHaveBeenCalled());
+    await act(async () => { firstOrgs.reject(new Error("Synthetic network error")); });
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+
+    const retryOrgs = deferred<api.Org[]>();
+    vi.mocked(api.fetchOrgs).mockReturnValueOnce(retryOrgs.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    const retrying = await screen.findByRole("button", { name: "Retrying…" });
+    expect(retrying).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent(/Loading organisations/i);
+    expect(api.quotePayerTransfer).not.toHaveBeenCalled();
+    expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+
+    fireEvent.click(retrying);
+    expect(api.fetchOrgs).toHaveBeenCalledTimes(2);
+
+    await act(async () => { retryOrgs.resolve([org("org-b", "member")]); });
+    expect(await screen.findByLabelText("Organisation")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /org-b/ })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.quotePayerTransfer).not.toHaveBeenCalled();
+    expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+  });
+
+  it("keeps the personal transfer section recoverable after a repeated organisation failure", async () => {
+    vi.mocked(api.fetchOrgs)
+      .mockRejectedValueOnce(new Error("Synthetic network error"))
+      .mockRejectedValueOnce(new Error("Synthetic network error"));
+    render(<PersonalTransferStart />);
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/organisations could not be loaded/i);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    expect(screen.queryByLabelText("Organisation")).not.toBeInTheDocument();
+  });
+
+  it("still hides personal transfer start when the server reports transfers unavailable", async () => {
+    vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: false, setupAvailable: false });
+    const view = render(<PersonalTransferStart />);
+    await waitFor(() => expect(api.fetchPayerTransferCapabilities).toHaveBeenCalled());
+    expect(view.container).toBeEmptyDOMElement();
+    expect(api.fetchOrgs).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
   });
 
   it("does not claim a second payer must accept when the caller can authorise both sides", async () => {
