@@ -464,6 +464,38 @@ Without a `sotto.toml` or local identity:
 
 An absent `sotto.toml` means no project is selected. A malformed or unreadable file is an error.
 
+### Lock, unlock and log out
+
+For an already-initialised local identity, lock the vault, check its state, then
+unlock it when you need it again:
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` clears the cached local master-key session used by subsequent CLI
+commands. It does not delete your identity, encrypted vault or saved sync-server
+login. `sotto unlock` uses your master password when no valid cached session is
+available. Commands that need local decryption also request unlocking when needed.
+See [Inspect local status](#inspect-local-status) for the status fields.
+
+The local session lasts 12 hours from when the key is cached, not from your last
+activity. Expiry is checked when the cached key is read. Running `sotto unlock`
+while already unlocked does not extend that lifetime. Neither locking nor expiry
+clears plaintext already held by running applications.
+
+To clear the CLI's saved sync-server login as well, run both commands:
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` removes the CLI's stored server session token, independently of the
+local unlock cache. It does not sign out browser sessions or other devices.
+
 ### Cloud status
 
 To inspect the configured server and your account's Cloud eligibility, first log in:

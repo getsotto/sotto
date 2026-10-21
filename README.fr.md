@@ -483,6 +483,42 @@ Sans `sotto.toml` ni identité locale :
 
 L'absence de `sotto.toml` signifie qu'aucun projet n'est sélectionné. Un fichier invalide ou illisible provoque une erreur.
 
+### Verrouiller, déverrouiller et se déconnecter
+
+Pour une identité locale déjà initialisée, verrouillez le coffre, vérifiez son
+état, puis déverrouillez-le lorsque vous en avez de nouveau besoin :
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` efface la session locale de clé maîtresse en cache utilisée par les
+commandes CLI suivantes. Cette commande ne supprime ni votre identité, ni le coffre
+chiffré, ni la connexion enregistrée au serveur de synchronisation. `sotto unlock`
+utilise votre mot de passe maître lorsqu'aucune session valide n'est en cache. Les
+commandes nécessitant un déchiffrement local demandent aussi le déverrouillage si
+nécessaire. Consultez [Consulter l'état local](#consulter-létat-local) pour les champs d'état.
+
+La session locale dure 12 heures à partir de la mise en cache de la clé, et non de
+votre dernière activité. L'expiration est vérifiée lors de la lecture de la clé en
+cache. Exécuter `sotto unlock` alors que le coffre est déjà déverrouillé ne prolonge
+pas cette durée. Ni le verrouillage ni l'expiration n'effacent le texte en clair
+déjà détenu par les applications en cours d'exécution.
+
+Pour effacer aussi la connexion de la CLI au serveur de synchronisation,
+exécutez les deux commandes :
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` supprime le jeton de session du serveur enregistré par la CLI,
+indépendamment du cache de déverrouillage local. Cette commande ne déconnecte pas
+les sessions du navigateur ni les autres appareils.
+
 ### État Cloud
 
 Pour consulter le serveur configuré et l'éligibilité Cloud de votre compte, connectez-vous d'abord :
