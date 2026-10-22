@@ -714,6 +714,7 @@ mod pty_tests {
         );
         assert!(
             stderr.contains("not logged in; run `sotto login`")
+                || stderr.contains("unauthorised - run `sotto login`")
                 || stderr.contains("share link")
                 || stdout.contains("share link"),
             "expected share completion: stderr={stderr}, stdout={stdout}"

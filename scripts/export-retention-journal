@@ -15,7 +15,7 @@ mkdir -p "$(dirname "$output")"
 docker compose -f docker-compose.prod.yml exec -T postgres \
     psql -U sotto -d sotto -At -v ON_ERROR_STOP=1 \
     -c "SELECT json_build_object(\
-      'format_version', 1,\
+      'format_version', 2,\
       'journal_id', journal_id,\
       'job_id', job_id,\
       'resource_kind', resource_kind,\

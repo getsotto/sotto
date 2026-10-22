@@ -67,6 +67,8 @@ consistent Stripe snapshot.
 The object and list references were checked with `stripe docs api` on 25 September 2026:
 [the refund object](https://docs.stripe.com/api/refunds/object),
 [list refunds](https://docs.stripe.com/api/refunds/list),
+[the PaymentIntent object](https://docs.stripe.com/api/payment_intents/object),
+[the Charge object](https://docs.stripe.com/api/charges/object),
 [the dispute object](https://docs.stripe.com/api/disputes/object),
 [list disputes](https://docs.stripe.com/api/disputes/list),
 [the credit note object](https://docs.stripe.com/api/credit_notes/object) and
@@ -80,6 +82,8 @@ set to the previous page's last ID. The shared session budget applies across all
 
 | Endpoint | Required and validated | Nullable, kept as absent | Parent and mode rule |
 | --- | --- | --- | --- |
+| `GET /v1/payment_intents/:id` | `id`, `status`, `amount_received`, `currency`, `latest_charge` | none of the retained fields | ID must match the requested PaymentIntent and status must be `succeeded`. `latest_charge` identifies the charge whose aggregate is used for a successful full-refund check. |
+| `GET /v1/charges/:id` | `id`, `payment_intent`, `currency`, `amount_captured`, `amount_refunded` | none of the retained fields | Charge ID, PaymentIntent, currency and captured amount must match the verified payment. For a succeeded candidate refund, `amount_refunded` must include at least that refund's amount; subtracting it yields the pre-refund refundable balance without enumerating the refund history. |
 | `GET /v1/refunds?payment_intent=:id` | `object` (`refund`), `id`, `amount`, `currency`, `created` | `payment_intent`, `charge`, `status` | A present `payment_intent` naming another PaymentIntent is a parent mismatch. An absent one stays `None`; the filter is not treated as proof of ownership. Refunds document no `livemode`, so none is required; a present value must match the verified account. |
 | `GET /v1/disputes?payment_intent=:id` | `object` (`dispute`), `id`, `charge`, `amount`, `currency`, `created`, `status`, `livemode` | `payment_intent` | A present `payment_intent` naming another PaymentIntent is a parent mismatch; an absent one stays `None`. `livemode` is required and must match the verified account. |
 | `GET /v1/credit_notes?invoice=:id` | `object` (`credit_note`), `id`, `invoice`, `customer`, `amount`, `pre_payment_amount`, `post_payment_amount`, `currency`, `created`, `status`, `type`, `livemode` | none of the retained fields | `invoice` is required, so any value other than the requested invoice is a parent mismatch. `customer` is kept as evidence, not checked against a binding. `livemode` is required and must match the verified account. |

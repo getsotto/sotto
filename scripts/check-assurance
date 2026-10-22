@@ -14,11 +14,16 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / ".ci" / "assurance-checks.json"
 API_RETRY_DELAYS = (1, 2, 4)
+ASSURANCE_STATUS_RETRY_DELAYS = (1, 2, 4, 8)
 RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 
 class AssuranceError(Exception):
     """The run could not produce a valid assurance verdict."""
+
+
+class IncompleteAssuranceError(AssuranceError):
+    """GitHub has not published every required job result yet."""
 
 
 def load_manifest(path=DEFAULT_MANIFEST):
@@ -47,13 +52,17 @@ def validate_run(manifest, group_name, run, jobs, *, expected_sha=None, tested_s
         raise AssuranceError(f"unknown assurance group: {group_name}")
     group = groups[group_name]
     errors = []
+    incomplete = []
     if run.get("workflow_path") != group["workflow"]:
         errors.append("workflow path does not match manifest")
     if expected_attempt is not None and run.get("run_attempt") != expected_attempt:
         errors.append("run attempt does not match the requested attempt")
     if expected_sha is not None and run.get("head_sha") != expected_sha:
         errors.append("run source does not match the checked-out source")
-    if run.get("status") not in {"in_progress", "completed"}:
+    # GitHub can briefly report the parent workflow as queued while a rerun's
+    # completion job is already executing. Required job conclusions below are
+    # the actual gate, so accepting this status cannot pass unfinished jobs.
+    if run.get("status") not in {"queued", "in_progress", "completed"}:
         errors.append(f"run has unexpected status {run.get('status')!r}")
 
     expected = set(group["required_jobs"])
@@ -68,14 +77,20 @@ def validate_run(manifest, group_name, run, jobs, *, expected_sha=None, tested_s
     missing = sorted(expected - actual)
     unexpected = sorted(actual - expected)
     if missing:
-        errors.append(f"missing required jobs: {', '.join(missing)}")
+        incomplete.append(f"missing required jobs: {', '.join(missing)}")
     if unexpected:
         errors.append(f"unexpected jobs: {', '.join(unexpected)}")
     for job in relevant:
-        if job.get("name") in expected and job.get("conclusion") != "success":
-            errors.append(f"{job['name']} concluded {job.get('conclusion')!r}")
+        if job.get("name") in expected:
+            conclusion = job.get("conclusion")
+            if conclusion is None:
+                incomplete.append(f"{job['name']} concluded None")
+            elif conclusion != "success":
+                errors.append(f"{job['name']} concluded {conclusion!r}")
     if errors:
         raise AssuranceError("; ".join(errors))
+    if incomplete:
+        raise IncompleteAssuranceError("; ".join(incomplete))
     return {
         "status": "passed",
         "group": group_name,
@@ -153,19 +168,35 @@ def main(argv=None):
         if args.jobs_file:
             payload = json.loads(args.jobs_file.read_text(encoding="utf-8"))
             run, jobs = payload["run"], payload["jobs"]
+            verdict = validate_run(
+                manifest,
+                args.group,
+                run,
+                jobs,
+                expected_sha=args.expected_sha,
+                tested_sha=args.tested_sha,
+                expected_attempt=args.run_attempt,
+            )
         else:
             if not args.repository or not args.token or not args.run_id:
                 raise AssuranceError("repository, token and run ID are required")
-            run, jobs = fetch_run(args.repository, args.run_id, args.token)
-        verdict = validate_run(
-            manifest,
-            args.group,
-            run,
-            jobs,
-            expected_sha=args.expected_sha,
-            tested_sha=args.tested_sha,
-            expected_attempt=args.run_attempt,
-        )
+            for attempt in range(len(ASSURANCE_STATUS_RETRY_DELAYS) + 1):
+                run, jobs = fetch_run(args.repository, args.run_id, args.token)
+                try:
+                    verdict = validate_run(
+                        manifest,
+                        args.group,
+                        run,
+                        jobs,
+                        expected_sha=args.expected_sha,
+                        tested_sha=args.tested_sha,
+                        expected_attempt=args.run_attempt,
+                    )
+                    break
+                except IncompleteAssuranceError:
+                    if attempt == len(ASSURANCE_STATUS_RETRY_DELAYS):
+                        raise
+                    time.sleep(ASSURANCE_STATUS_RETRY_DELAYS[attempt])
     except (AssuranceError, OSError, ValueError, KeyError, TypeError) as error:
         print(f"assurance check failed: {error}", file=sys.stderr)
         return 1

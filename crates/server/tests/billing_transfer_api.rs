@@ -2,6 +2,8 @@
 
 use std::str::FromStr;
 
+use async_trait::async_trait;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
@@ -12,7 +14,22 @@ use uuid::Uuid;
 use sotto_server::auth::session;
 use sotto_server::config::DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS;
 use sotto_server::db;
+use sotto_server::notifications::{self, DeliveryOutcome, NoticeDelivery, NoticeSender};
 use sotto_server::state::AppState;
+
+struct AcceptingNoticeSender {
+    calls: usize,
+}
+
+#[async_trait]
+impl NoticeSender for AcceptingNoticeSender {
+    async fn send(&mut self, _delivery: NoticeDelivery) -> DeliveryOutcome {
+        self.calls += 1;
+        DeliveryOutcome::Accepted {
+            provider_message_id: "resend-transfer-invitation-test".into(),
+        }
+    }
+}
 
 async fn pool_or_skip() -> Option<PgPool> {
     if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
@@ -39,16 +56,39 @@ fn app(pool: PgPool, transfers_enabled: bool) -> Router {
         oauth_config: None,
         billing: None,
         telemetry_ingest: false,
+        contact_verification: None,
+        cloud_notice_dispatch_enabled: false,
+        resend_webhook_secret: None,
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
+        cloud_operations_metrics_token: None,
+        cloud_coverage_repair_token: None,
+        provider_refresh_ingest_enabled: false,
+        provider_refresh_worker_enabled: false,
+        provider_refresh_reconciliation_enabled: false,
+        provider_authority_revalidation_enabled: false,
+        cloud_sales_enabled: false,
+        founding_schedule_worker_enabled: false,
+        founding_price_notices_enabled: false,
+        billing_recovery_worker_enabled: false,
+        sponsored_billing_recovery_worker_enabled: false,
         organisation_deletion_operator_token: None,
         billing_transfer_operator_token: None,
         cloud_action_enforcement_enabled: false,
+        cloud_coverage_authority_enforcement_enabled: false,
+        cloud_coverage_authority_shadow_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: transfers_enabled,
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
+        cloud_retention_dry_run_enabled: false,
+        cloud_shared_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: None,
+        cloud_retention_purge_enabled: false,
+        cloud_retention_destructive_token: None,
+        cloud_retention_evidence_hmac_key: None,
+        cloud_retention_build_sha: None,
     })
 }
 
@@ -219,6 +259,16 @@ async fn authenticated_transfer_quote_consent_status_and_replay_are_server_deriv
     .execute(&pool)
     .await
     .expect("insert active personal source");
+    let now = now_epoch();
+    notifications::record_verified_email(
+        &pool,
+        &format!("transfer-api-contact-{fixture}"),
+        &owner,
+        &format!("transfer-api-owner-{fixture}@example.test"),
+        now,
+    )
+    .await
+    .expect("record verified invited payer contact");
 
     let beneficiary_token = session::issue(&pool, &beneficiary)
         .await
@@ -363,7 +413,8 @@ async fn authenticated_transfer_quote_consent_status_and_replay_are_server_deriv
     assert!(created.get("destination_payment_reference").is_none());
     let notice_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_notice_outbox \
-         WHERE recipient_user_id = $1 AND event_key = $2 AND kind = 'payer_transfer_invitation'",
+         WHERE recipient_user_id = $1 AND event_key = $2 \
+           AND kind = 'payer_transfer_invitation' AND channel = 'in_app'",
     )
     .bind(&owner)
     .bind(transfer_id)
@@ -371,6 +422,23 @@ async fn authenticated_transfer_quote_consent_status_and_replay_are_server_deriv
     .await
     .expect("count invitation notices");
     assert_eq!(notice_count, 1);
+    let mut sender = AcceptingNoticeSender { calls: 0 };
+    assert!(
+        notifications::run_once(&pool, "worker-live-transfer-invitation", &mut sender)
+            .await
+            .expect("deliver current transfer invitation")
+    );
+    assert_eq!(sender.calls, 1, "a valid invitation reaches the sender");
+    let delivered_invitation: String = sqlx::query_scalar(
+        "SELECT status FROM cloud_notice_outbox WHERE recipient_user_id=$1 AND event_key=$2 \
+         AND kind='payer_transfer_invitation' AND channel='email'",
+    )
+    .bind(&owner)
+    .bind(transfer_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load delivered invitation status");
+    assert_eq!(delivered_invitation, "accepted");
 
     let (status, replay_body) = request(
         &app,
@@ -386,7 +454,8 @@ async fn authenticated_transfer_quote_consent_status_and_replay_are_server_deriv
     assert_eq!(replay["state"], "awaiting_consent");
     let replay_notice_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_notice_outbox \
-         WHERE recipient_user_id = $1 AND event_key = $2 AND kind = 'payer_transfer_invitation'",
+         WHERE recipient_user_id = $1 AND event_key = $2 \
+           AND kind = 'payer_transfer_invitation' AND channel = 'in_app'",
     )
     .bind(&owner)
     .bind(transfer_id)

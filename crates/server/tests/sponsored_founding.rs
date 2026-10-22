@@ -45,11 +45,23 @@ fn app(pool: PgPool) -> Router {
     let state = AppState {
         deployment_mode: sotto_server::config::DeploymentMode::SelfHosted,
         telemetry_ingest: false,
+        contact_verification: None,
+        cloud_notice_dispatch_enabled: false,
+        resend_webhook_secret: None,
         cloud_action_enforcement_enabled: false,
+        cloud_coverage_authority_enforcement_enabled: false,
+        cloud_coverage_authority_shadow_enabled: false,
         machine_eligibility_enforcement_enabled: false,
         billing_transfers_enabled: false,
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
+        cloud_retention_dry_run_enabled: false,
+        cloud_shared_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: None,
+        cloud_retention_purge_enabled: false,
+        cloud_retention_destructive_token: None,
+        cloud_retention_evidence_hmac_key: None,
+        cloud_retention_build_sha: None,
         pool,
         oauth: None,
         oauth_config: None,
@@ -70,6 +82,17 @@ fn app(pool: PgPool) -> Router {
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
+        cloud_operations_metrics_token: None,
+        cloud_coverage_repair_token: None,
+        provider_refresh_ingest_enabled: false,
+        provider_refresh_worker_enabled: false,
+        provider_refresh_reconciliation_enabled: false,
+        provider_authority_revalidation_enabled: false,
+        cloud_sales_enabled: false,
+        founding_schedule_worker_enabled: false,
+        founding_price_notices_enabled: false,
+        billing_recovery_worker_enabled: false,
+        sponsored_billing_recovery_worker_enabled: false,
         organisation_deletion_operator_token: None,
         billing_transfer_operator_token: None,
     };
@@ -448,6 +471,20 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
         Some(format!("pi_founding_{fixture}").as_str())
     );
     assert_eq!(settled.2.as_deref(), Some(provider_item_id.as_str()));
+    let sponsorship_notice_recipients: Vec<String> = sqlx::query_scalar(
+        "SELECT recipient_user_id FROM cloud_notice_outbox WHERE event_key=$1 \
+         AND kind='sponsorship_change' AND channel='in_app' ORDER BY recipient_user_id",
+    )
+    .bind(&operation_id)
+    .fetch_all(&pool)
+    .await
+    .expect("load sponsorship outcome notices from paid invoice handler");
+    let mut expected_sponsorship_notice_recipients = vec![owner_id.clone(), beneficiary_id.clone()];
+    expected_sponsorship_notice_recipients.sort();
+    assert_eq!(
+        sponsorship_notice_recipients,
+        expected_sponsorship_notice_recipients
+    );
     let refunded_state: (String, Option<String>, String) = sqlx::query_as(
         "SELECT operation.state, operation.provider_payment_reference, seat.state \
          FROM billing_sponsored_operations AS operation \

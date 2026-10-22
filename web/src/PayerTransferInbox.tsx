@@ -66,6 +66,8 @@ export function PayerTransferInbox() {
   const [setupAvailable, setSetupAvailable] = useState(false);
   const [userId, setUserId] = useState<string | null>(null);
   const [transfers, setTransfers] = useState<PayerTransfer[]>([]);
+  // The list has been received at least once, so an empty one really means no requests.
+  const [listLoaded, setListLoaded] = useState(false);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -81,6 +83,7 @@ export function PayerTransferInbox() {
       const page = await fetchPayerTransfers();
       setTransfers(page.transfers);
       setNextCursor(page.nextCursor);
+      setListLoaded(true);
     } catch (e) {
       setError(message(e));
     } finally {
@@ -205,7 +208,7 @@ export function PayerTransferInbox() {
     {notice !== null && <p className="notice" role="status">{notice}</p>}
     <button disabled={loading || loadingMore || busyId !== null} onClick={() => void refresh()}>{loading ? "Refreshing transfers…" : "Refresh transfers"}</button>
     {loading && <p className="muted" role="status">Loading transfer requests…</p>}
-    {!loading && transfers.length === 0 && <p className="muted">There are no payer transfer requests for this account.</p>}
+    {!loading && listLoaded && transfers.length === 0 && <p className="muted">There are no payer transfer requests for this account.</p>}
     <ul className="items">
       {transfers.map((transfer) => {
         const incoming = transfer.participantRole === "counterparty";

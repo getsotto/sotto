@@ -322,14 +322,24 @@ async fn prepare_sponsored_destination(
     let phases = sponsored_provider_phases(pool, organization_id, catalogue, epoch_now())
         .await
         .map_err(|_| ExecutionError::Local("destination_schedule_evidence_invalid"))?;
-    let updated = provider
-        .update_sponsored_subscription(
-            organization_id,
-            &snapshot.subscription_id,
-            &phases,
-            &format!("{}:destination", transfer.provider_idempotency_key),
-        )
-        .await?;
+    let updated = crate::billing::with_sponsored_subscription_write_lock(
+        pool,
+        &snapshot.subscription_id,
+        async {
+            Ok::<_, crate::error::Error>(
+                provider
+                    .update_sponsored_subscription(
+                        organization_id,
+                        &snapshot.subscription_id,
+                        &phases,
+                        &format!("{}:destination", transfer.provider_idempotency_key),
+                    )
+                    .await,
+            )
+        },
+    )
+    .await
+    .map_err(|_| ExecutionError::Local("sponsored_schedule_write_unavailable"))??;
     validate_sponsor_boundary(
         &updated,
         transfer,
@@ -466,14 +476,24 @@ async fn adjust_source(
             let phases = sponsored_provider_phases(pool, organization_id, catalogue, epoch_now())
                 .await
                 .map_err(|_| ExecutionError::Local("source_schedule_evidence_invalid"))?;
-            let updated = provider
-                .update_sponsored_subscription(
-                    organization_id,
-                    source_subscription,
-                    &phases,
-                    &format!("{}:source", transfer.provider_idempotency_key),
-                )
-                .await?;
+            let updated = crate::billing::with_sponsored_subscription_write_lock(
+                pool,
+                source_subscription,
+                async {
+                    Ok::<_, crate::error::Error>(
+                        provider
+                            .update_sponsored_subscription(
+                                organization_id,
+                                source_subscription,
+                                &phases,
+                                &format!("{}:source", transfer.provider_idempotency_key),
+                            )
+                            .await,
+                    )
+                },
+            )
+            .await
+            .map_err(|_| ExecutionError::Local("sponsored_schedule_write_unavailable"))??;
             validate_sponsor_boundary(&updated, transfer, organization_id, source_subscription)?;
             let schedule_id = updated
                 .schedule_id

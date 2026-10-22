@@ -16,8 +16,8 @@ use tokio::time::timeout;
 
 use crate::cloud_coverage::{normalise_confirmed_intervals, ConfirmedPaidInterval, PersonCoverage};
 use crate::cloud_coverage_reconciliation::{
-    begin_collection, finish_collection, register_source, CollectionStatus, ReconciliationError,
-    SourceBinding, SourceObservation,
+    begin_collection, finish_collection, finish_collection_with_authority, register_source,
+    AuthorityReceiptInput, CollectionStatus, ReconciliationError, SourceBinding, SourceObservation,
 };
 use crate::cloud_coverage_store::PublicationOutcome;
 use crate::cloud_provider_refresh_jobs::{self, RefreshJobError};
@@ -557,6 +557,54 @@ pub async fn record_verified_event(
     }
 }
 
+/// Reopen a rejected receipt for an explicitly authenticated Stripe repair attempt.
+///
+/// Normal webhook replays must keep rejected receipts terminal. The authenticated repair path
+/// first re-reads the event from Stripe and verifies that an open diagnostic authorises another
+/// evidence check; only then may it move the exact same receipt back to pending.
+pub async fn reopen_rejected_event_for_repair(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+) -> Result<bool, ProviderAdapterError> {
+    context.validate()?;
+    event.validate()?;
+    let row = sqlx::query(
+        "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
+                provider_object_id, normalized_payload_hash, status \
+         FROM cloud_provider_event_receipts \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 FOR UPDATE",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ProviderAdapterError::EventMissing)?;
+    verify_stored_event(&row, event)?;
+    if row.try_get::<String, _>("status")? != "rejected" {
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE cloud_provider_event_receipts SET status = 'pending', rejection_code = NULL, \
+                processed_at = NULL \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 AND status = 'rejected'",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ProviderAdapterError::EventNotPending);
+    }
+    Ok(true)
+}
+
 /// Register the trusted payer, allocation and source binding for a verified provider event.
 ///
 /// The caller owns the transaction and should record the event receipt first, then call this and
@@ -763,6 +811,16 @@ pub async fn accept_provider_invalidation(
     if updated.rows_affected() != 1 {
         return Err(ProviderAdapterError::InvalidationConflict);
     }
+    sqlx::query(
+        "INSERT INTO cloud_coverage_revalidation_jobs (beneficiary_id) \
+         VALUES ($1) ON CONFLICT (beneficiary_id) DO UPDATE \
+         SET status = 'pending', next_attempt_at = now(), attempt_count = 0, \
+             lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, \
+             last_error_code = NULL, updated_at = now()",
+    )
+    .bind(&allocation.beneficiary_id)
+    .execute(&mut **tx)
+    .await?;
     ensure_event_scope(tx, context, event, &allocation.beneficiary_id).await?;
     if ingest_enabled {
         enqueue_refresh_job(tx, context, event, allocation).await?;
@@ -1158,6 +1216,27 @@ pub async fn complete_verified_event(
     preparation: &CollectionPreparation,
     collection: &VerifiedCollection,
 ) -> Result<ApplyReceipt, ProviderAdapterError> {
+    complete_verified_event_with_authority(
+        tx,
+        context,
+        event,
+        allocation,
+        preparation,
+        collection,
+        None,
+    )
+    .await
+}
+
+pub async fn complete_verified_event_with_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+    preparation: &CollectionPreparation,
+    collection: &VerifiedCollection,
+    authority: Option<&AuthorityReceiptInput>,
+) -> Result<ApplyReceipt, ProviderAdapterError> {
     context.validate()?;
     event.validate()?;
     allocation.validate()?;
@@ -1217,11 +1296,12 @@ pub async fn complete_verified_event(
     ensure_allocation(tx, context, allocation).await?;
     validate_provider_bindings(tx, context, &preparation.ticket.source_bindings).await?;
     validate_collection_sources(collection, &preparation.ticket.source_bindings)?;
-    let completed = finish_collection(
+    let completed = finish_collection_with_authority(
         tx,
         &preparation.ticket,
         &collection.aggregate_evidence_reference,
         &collection.observations,
+        authority,
     )
     .await
     .map_err(|error| match error {

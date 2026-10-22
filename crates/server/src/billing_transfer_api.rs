@@ -416,6 +416,7 @@ async fn begin_transfer(
                         kind: NoticeKind::PayerTransferInvitation,
                         channel: NoticeChannel::InApp,
                         contact_id: None,
+                        scope_id: None,
                         due_at_epoch: now,
                         content: NoticeContent {
                             title: "Payer transfer request".into(),

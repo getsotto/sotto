@@ -8,6 +8,11 @@ import type { EligibilityView } from "../api";
 import { CloudAccountPanel } from "../CloudAccountPanel";
 
 vi.mock("../api", () => ({
+  confirmCloudContactVerification: vi.fn(),
+  fetchCloudContactStatus: vi.fn(),
+  UnsupportedCloudContactError: class UnsupportedCloudContactError extends Error {},
+  revokeCloudContact: vi.fn(),
+  startCloudContactVerification: vi.fn(),
   cancelPersonalBilling: vi.fn(),
   acceptPayerTransfer: vi.fn(),
   beginPayerTransfer: vi.fn(),
@@ -74,6 +79,7 @@ describe("CloudAccountPanel", () => {
     vi.mocked(api.fetchOrgs).mockResolvedValue([]);
     vi.mocked(api.fetchMembers).mockResolvedValue([]);
     vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
+  vi.mocked(api.fetchCloudContactStatus).mockResolvedValue({ email: null, pendingExpiresAtEpoch: null, enrolmentAvailable: false });
     vi.mocked(api.fetchPersonalLifecycle).mockResolvedValue({
       state: "active", paidThroughDate: null, cancelAtPeriodEnd: false, portalUrl: null,
       foundingPriceEndEpoch: null, standardRenewalAmountPence: null, foundingTransitionStatus: null, foundingTransitionReason: null,
@@ -343,6 +349,18 @@ describe("CloudAccountPanel", () => {
 
     expect(await screen.findByRole("heading", { name: "Payment confirmation pending" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Refresh payment status" })).toBeInTheDocument();
+  });
+
+  it("warns when a pending checkout has been parked for manual review", async () => {
+    vi.mocked(api.fetchEligibility).mockResolvedValue({ ...base, state: "pending_initial_payment" });
+    vi.mocked(api.fetchPersonalOperation).mockResolvedValue({
+      operationId: "operation-1", offer: "standard_monthly", state: "manual_review", checkoutUrl: null,
+    });
+    sessionStorage.setItem("sotto_personal_operation_id", "operation-1");
+
+    render(<CloudAccountPanel />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/do not start another checkout/i);
   });
 
   it("shows durable account notices without unlocking the vault", async () => {

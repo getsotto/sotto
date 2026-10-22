@@ -5,6 +5,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
@@ -16,6 +17,9 @@ use crate::error::Error;
 use crate::org;
 
 pub const QUOTE_SECONDS: i64 = 15 * 60;
+pub const RECOVERY_LEASE_SECONDS: i64 = 5 * 60;
+pub const MAX_RECOVERY_FAILURES: i32 = 20;
+pub const MAX_PROVIDER_REPLAY_SECONDS: i64 = 23 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SponsoredSeatAction {
@@ -242,6 +246,33 @@ pub struct SponsoredOperation {
     pub provider_operation_id: Option<String>,
     pub state: String,
     pub result_code: Option<String>,
+    pub provider_request_version: Option<i16>,
+    pub provider_request: Option<serde_json::Value>,
+    pub provider_first_sent_epoch: Option<i64>,
+    pub recovery_attempt_count: i32,
+    pub recovery_lease_token: Option<String>,
+    pub recovery_manual_review_required: bool,
+    pub recovery_last_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SponsoredProviderRequest {
+    Checkout {
+        organization_id: String,
+        customer_id: Option<String>,
+        items: Vec<crate::billing::SponsoredSubscriptionItemRequest>,
+        expires_at_epoch: i64,
+        success_url: String,
+        cancel_url: String,
+    },
+    ScheduleUpdate {
+        organization_id: String,
+        subscription_id: String,
+        expected_period_start: i64,
+        expected_period_end: i64,
+        phases: Vec<crate::billing::SponsoredSubscriptionPhase>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -571,23 +602,71 @@ pub async fn record_checkout(
     customer_id: Option<&str>,
     subscription_id: Option<&str>,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
+    record_checkout_inner(
+        tx,
+        operation_id,
+        checkout_url,
+        checkout_session_id,
+        customer_id,
+        subscription_id,
+        None,
+    )
+    .await
+}
+
+pub async fn record_claimed_checkout(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    lease_token: &str,
+    checkout_url: &str,
+    checkout_session_id: &str,
+    customer_id: Option<&str>,
+    subscription_id: Option<&str>,
+) -> Result<SponsoredOperation, SponsoredBillingError> {
+    record_checkout_inner(
+        tx,
+        operation_id,
+        checkout_url,
+        checkout_session_id,
+        customer_id,
+        subscription_id,
+        Some(lease_token),
+    )
+    .await
+}
+
+async fn record_checkout_inner(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    checkout_url: &str,
+    checkout_session_id: &str,
+    customer_id: Option<&str>,
+    subscription_id: Option<&str>,
+    lease_token: Option<&str>,
+) -> Result<SponsoredOperation, SponsoredBillingError> {
     let updated = sqlx::query(
         "UPDATE billing_sponsored_operations SET state = 'checkout_created', provider_checkout_url = $2, \
-         provider_checkout_session_id = $3, provider_customer_id = $4, provider_subscription_id = $5, updated_at = now() \
-         WHERE operation_id = $1 AND state = 'pending' RETURNING operation_id",
+         provider_checkout_session_id = $3, provider_customer_id = $4, provider_subscription_id = $5, \
+         recovery_lease_token = NULL, recovery_lease_until = NULL, recovery_attempt_count = 0, \
+         recovery_last_error_code = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND state IN ('pending','unknown','checkout_created') \
+           AND ($6::TEXT IS NULL OR (recovery_lease_token = $6 AND recovery_lease_until > now())) \
+         RETURNING operation_id",
     )
     .bind(operation_id)
     .bind(checkout_url)
     .bind(checkout_session_id)
     .bind(customer_id)
     .bind(subscription_id)
+    .bind(lease_token)
     .fetch_optional(&mut **tx)
     .await?;
     if updated.is_none() {
         let current = load_operation(tx, operation_id).await?;
-        if current.state != "checkout_created"
-            || current.provider_checkout_url.as_deref() != Some(checkout_url)
+        if !matches!(current.state.as_str(), "checkout_created" | "active")
             || current.provider_checkout_session_id.as_deref() != Some(checkout_session_id)
+            || (current.provider_checkout_url.is_some()
+                && current.provider_checkout_url.as_deref() != Some(checkout_url))
         {
             return Err(SponsoredBillingError::ResultConflict);
         }
@@ -607,6 +686,229 @@ pub async fn record_checkout(
     load_operation(tx, operation_id).await
 }
 
+/// Store the exact provider request before any provider write. Existing request facts are
+/// immutable: retries must use the original offer, phase set, expiry, destinations and key.
+pub async fn persist_provider_request(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    request: &SponsoredProviderRequest,
+) -> Result<SponsoredOperation, SponsoredBillingError> {
+    let request = serde_json::to_value(request).map_err(|_| SponsoredBillingError::CorruptState)?;
+    let result = sqlx::query(
+        "UPDATE billing_sponsored_operations SET provider_request_version = 1, \
+             provider_request = $2, updated_at = now() \
+         WHERE operation_id = $1 AND provider_request IS NULL AND state = 'pending' \
+         RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .bind(&request)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if result.is_none() {
+        let current = load_operation(tx, operation_id).await?;
+        if current.provider_request_version != Some(1)
+            || current.provider_request.as_ref() != Some(&request)
+        {
+            return Err(SponsoredBillingError::ResultConflict);
+        }
+        return Ok(current);
+    }
+    load_operation(tx, operation_id).await
+}
+
+/// Claim an operation using database time. Claims do not consume the retry budget; only a
+/// failed provider attempt does. `provider_first_sent_at` starts the bounded idempotency horizon.
+pub async fn claim_recovery(
+    pool: &PgPool,
+    operation_id: &str,
+    lease_token: &str,
+) -> Result<Option<SponsoredOperation>, SponsoredBillingError> {
+    if lease_token.trim().is_empty() {
+        return Err(SponsoredBillingError::InvalidField("recovery lease token"));
+    }
+    let row = sqlx::query(
+        "UPDATE billing_sponsored_operations SET recovery_lease_token = $2, \
+             recovery_lease_until = now() + ($3 * interval '1 second'), \
+             provider_first_sent_at = COALESCE(provider_first_sent_at, now()), updated_at = now() \
+         WHERE operation_id = $1 AND state IN ('pending','unknown','checkout_created') \
+           AND NOT recovery_manual_review_required \
+           AND provider_request_version = 1 AND provider_request IS NOT NULL \
+           AND recovery_next_attempt_at <= now() \
+           AND (recovery_lease_until IS NULL OR recovery_lease_until <= now()) \
+         RETURNING *, floor(extract(epoch FROM provider_first_sent_at))::BIGINT AS provider_first_sent_epoch",
+    )
+    .bind(operation_id)
+    .bind(lease_token)
+    .bind(RECOVERY_LEASE_SECONDS)
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(operation_from_row).transpose()
+}
+
+pub async fn next_recovery_candidate(
+    pool: &PgPool,
+) -> Result<Option<String>, SponsoredBillingError> {
+    Ok(sqlx::query_scalar(
+        "SELECT operation_id FROM billing_sponsored_operations \
+         WHERE state IN ('pending','unknown','checkout_created') AND NOT recovery_manual_review_required \
+           AND provider_request_version = 1 AND provider_request IS NOT NULL \
+           AND recovery_next_attempt_at <= now() \
+           AND (recovery_lease_until IS NULL OR recovery_lease_until <= now()) \
+         ORDER BY recovery_next_attempt_at, created_at, operation_id LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Rows written before exact provider requests were persisted cannot be replayed safely. Park a
+/// small bounded batch so one legacy operation cannot starve later recovery candidates.
+pub async fn park_unprepared_legacy_operations(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<u64, SponsoredBillingError> {
+    let result = sqlx::query(
+        "WITH candidates AS ( \
+             SELECT operation_id FROM billing_sponsored_operations \
+             WHERE state IN ('pending','unknown','checkout_created') AND NOT recovery_manual_review_required \
+               AND provider_request IS NULL AND created_at < now() - interval '5 minutes' \
+             ORDER BY created_at, operation_id FOR UPDATE SKIP LOCKED LIMIT $1 \
+         ) \
+         UPDATE billing_sponsored_operations operation SET state = 'manual_review', \
+             result_code = 'request_facts_missing', recovery_manual_review_required = TRUE, \
+             recovery_last_error_code = 'request_facts_missing', updated_at = now() \
+         FROM candidates WHERE operation.operation_id = candidates.operation_id",
+    )
+    .bind(limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn record_recovery_failure(
+    pool: &PgPool,
+    operation_id: &str,
+    lease_token: &str,
+    error_code: &str,
+) -> Result<(), SponsoredBillingError> {
+    if error_code.is_empty()
+        || error_code.len() > 64
+        || !error_code
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(SponsoredBillingError::InvalidField("recovery error code"));
+    }
+    sqlx::query(
+        "UPDATE billing_sponsored_operations SET recovery_attempt_count = recovery_attempt_count + 1, \
+             recovery_manual_review_required = recovery_attempt_count + 1 >= $3, \
+             state = CASE WHEN recovery_attempt_count + 1 >= $3 THEN 'manual_review' ELSE 'unknown' END, \
+             result_code = CASE WHEN recovery_attempt_count + 1 >= $3 THEN $4 ELSE NULL END, \
+             recovery_last_error_code = $4, \
+             recovery_next_attempt_at = now() + LEAST(21600, 30 * power(2, LEAST(recovery_attempt_count, 10))) * interval '1 second', \
+             recovery_lease_token = NULL, recovery_lease_until = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND recovery_lease_token = $2 \
+           AND recovery_lease_until > now() AND state IN ('pending','unknown','checkout_created')",
+    )
+    .bind(operation_id)
+    .bind(lease_token)
+    .bind(MAX_RECOVERY_FAILURES)
+    .bind(error_code)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn park_recovery_for_review(
+    pool: &PgPool,
+    operation_id: &str,
+    lease_token: &str,
+    error_code: &str,
+) -> Result<(), SponsoredBillingError> {
+    sqlx::query(
+        "UPDATE billing_sponsored_operations SET state = 'manual_review', result_code = $3, \
+             recovery_manual_review_required = TRUE, recovery_last_error_code = $3, \
+             recovery_lease_token = NULL, recovery_lease_until = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND recovery_lease_token = $2 AND recovery_lease_until > now() \
+           AND state IN ('pending','unknown','checkout_created')",
+    )
+    .bind(operation_id)
+    .bind(lease_token)
+    .bind(error_code)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn defer_recovery(
+    pool: &PgPool,
+    operation_id: &str,
+    lease_token: &str,
+    next_attempt_epoch: i64,
+) -> Result<(), SponsoredBillingError> {
+    sqlx::query(
+        "UPDATE billing_sponsored_operations SET recovery_next_attempt_at = to_timestamp($3), \
+             recovery_lease_token = NULL, recovery_lease_until = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND recovery_lease_token = $2 AND recovery_lease_until > now() \
+           AND state IN ('pending','unknown','checkout_created')",
+    )
+    .bind(operation_id)
+    .bind(lease_token)
+    .bind(next_attempt_epoch)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn cancel_claimed_expired_checkout(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    lease_token: &str,
+) -> Result<bool, SponsoredBillingError> {
+    let current = sqlx::query(
+        "SELECT state, recovery_lease_token, recovery_lease_until > now() AS lease_valid \
+         FROM billing_sponsored_operations WHERE operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    let state: String = current.try_get("state")?;
+    let token: Option<String> = current.try_get("recovery_lease_token")?;
+    let lease_valid: Option<bool> = current.try_get("lease_valid")?;
+    if !matches!(state.as_str(), "checkout_created" | "unknown")
+        || token.as_deref() != Some(lease_token)
+        || lease_valid != Some(true)
+    {
+        return Ok(false);
+    }
+    cancel_failed_operation(tx, operation_id, "checkout_expired_unpaid").await?;
+    Ok(true)
+}
+
+pub async fn cancel_claimed_rejected_operation(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    lease_token: &str,
+    result_code: &str,
+) -> Result<bool, SponsoredBillingError> {
+    let valid_lease: Option<String> = sqlx::query_scalar(
+        "SELECT operation_id FROM billing_sponsored_operations \
+         WHERE operation_id = $1 AND recovery_lease_token = $2 \
+           AND recovery_lease_until > now() AND state IN ('pending','unknown') FOR UPDATE",
+    )
+    .bind(operation_id)
+    .bind(lease_token)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if valid_lease.is_none() {
+        return Ok(false);
+    }
+    cancel_failed_operation(tx, operation_id, result_code).await?;
+    Ok(true)
+}
+
 pub async fn record_provider_update(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: &str,
@@ -616,21 +918,74 @@ pub async fn record_provider_update(
     current_period_end: Option<i64>,
     provider_item_id: Option<&str>,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
+    record_provider_update_inner(
+        tx,
+        operation_id,
+        customer_id,
+        subscription_id,
+        schedule_id,
+        current_period_end,
+        provider_item_id,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn record_claimed_provider_update(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    lease_token: &str,
+    customer_id: Option<&str>,
+    subscription_id: &str,
+    schedule_id: Option<&str>,
+    current_period_end: Option<i64>,
+    provider_item_id: Option<&str>,
+) -> Result<SponsoredOperation, SponsoredBillingError> {
+    record_provider_update_inner(
+        tx,
+        operation_id,
+        customer_id,
+        subscription_id,
+        schedule_id,
+        current_period_end,
+        provider_item_id,
+        Some(lease_token),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_provider_update_inner(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    customer_id: Option<&str>,
+    subscription_id: &str,
+    schedule_id: Option<&str>,
+    current_period_end: Option<i64>,
+    provider_item_id: Option<&str>,
+    lease_token: Option<&str>,
+) -> Result<SponsoredOperation, SponsoredBillingError> {
     lock_operation_beneficiaries(tx, operation_id).await?;
     let updated = sqlx::query(
         "UPDATE billing_sponsored_operations SET state = 'provider_pending', \
-         provider_customer_id = $2, provider_subscription_id = $3, provider_item_id = $4, updated_at = now() \
-         WHERE operation_id = $1 AND state = 'pending' RETURNING operation_id",
+         provider_customer_id = $2, provider_subscription_id = $3, provider_item_id = $4, \
+         recovery_lease_token = NULL, recovery_lease_until = NULL, recovery_attempt_count = 0, \
+         recovery_last_error_code = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND state IN ('pending','unknown') \
+           AND ($5::TEXT IS NULL OR (recovery_lease_token = $5 AND recovery_lease_until > now())) \
+         RETURNING operation_id",
     )
     .bind(operation_id)
     .bind(customer_id)
     .bind(subscription_id)
     .bind(provider_item_id)
+    .bind(lease_token)
     .fetch_optional(&mut **tx)
     .await?;
     if updated.is_none() {
         let current = load_operation(tx, operation_id).await?;
-        if current.state != "provider_pending"
+        if !matches!(current.state.as_str(), "provider_pending" | "active")
             || current.provider_subscription_id.as_deref() != Some(subscription_id)
         {
             return Err(SponsoredBillingError::ResultConflict);
@@ -786,8 +1141,11 @@ pub async fn complete_paid_checkout(
         "UPDATE billing_sponsored_operations SET state = 'active', provider_operation_id = $2, \
          provider_payment_reference = $2, provider_customer_id = COALESCE($3, provider_customer_id), \
          provider_subscription_id = $4, provider_checkout_session_id = COALESCE($5, provider_checkout_session_id), \
-         provider_item_id = COALESCE($6, provider_item_id), result_code = 'paid', updated_at = now() \
-         WHERE operation_id = $1 AND state IN ('checkout_created','provider_pending') RETURNING operation_id",
+         provider_item_id = COALESCE($6, provider_item_id), result_code = 'paid', \
+         recovery_lease_token = NULL, recovery_lease_until = NULL, recovery_attempt_count = 0, \
+         recovery_manual_review_required = FALSE, recovery_last_error_code = NULL, \
+         updated_at = now() \
+         WHERE operation_id = $1 AND state IN ('pending','checkout_created','provider_pending','unknown','manual_review') RETURNING operation_id",
     )
     .bind(operation_id)
     .bind(&evidence.payment_reference)
@@ -888,8 +1246,10 @@ pub async fn record_founding_refund_required(
         "UPDATE billing_sponsored_operations SET state = 'failed', \
          provider_payment_reference = $2, provider_customer_id = COALESCE($3, provider_customer_id), \
          provider_subscription_id = $4, provider_checkout_session_id = COALESCE($5, provider_checkout_session_id), \
-         provider_item_id = COALESCE($6, provider_item_id), result_code = 'founding_refund_required', updated_at = now() \
-         WHERE operation_id = $1 AND state IN ('pending','checkout_created','provider_pending','unknown','failed') \
+         provider_item_id = COALESCE($6, provider_item_id), result_code = 'founding_refund_required', \
+         recovery_lease_token = NULL, recovery_lease_until = NULL, recovery_manual_review_required = FALSE, \
+         updated_at = now() \
+         WHERE operation_id = $1 AND state IN ('pending','checkout_created','provider_pending','unknown','failed','manual_review') \
            AND (provider_payment_reference IS NULL OR provider_payment_reference = $2) RETURNING operation_id",
     )
     .bind(operation_id)
@@ -953,8 +1313,9 @@ pub async fn cancel_failed_operation(
     // the same order so a late invoice and an expiry event cannot deadlock each other.
     crate::founding_allocator::release_reservation(tx, operation_id).await?;
     let updated = sqlx::query(
-        "UPDATE billing_sponsored_operations SET state = 'failed', result_code = $2, updated_at = now() \
-         WHERE operation_id = $1 AND state IN ('pending','checkout_created','provider_pending','unknown') RETURNING operation_id",
+        "UPDATE billing_sponsored_operations SET state = 'failed', result_code = $2, updated_at = now(), \
+         recovery_lease_token = NULL, recovery_lease_until = NULL, recovery_manual_review_required = FALSE \
+         WHERE operation_id = $1 AND state IN ('pending','checkout_created','provider_pending','unknown','manual_review') RETURNING operation_id",
     )
     .bind(operation_id)
     .bind(result_code)
@@ -1013,7 +1374,8 @@ pub async fn load_operation_for_actor(
     actor_user_id: &str,
 ) -> Result<Option<SponsoredOperation>, SponsoredBillingError> {
     let row = sqlx::query(
-        "SELECT * FROM billing_sponsored_operations WHERE operation_id = $1 AND actor_user_id = $2",
+        "SELECT *, floor(extract(epoch FROM provider_first_sent_at))::BIGINT AS provider_first_sent_epoch \
+         FROM billing_sponsored_operations WHERE operation_id = $1 AND actor_user_id = $2",
     )
     .bind(operation_id)
     .bind(actor_user_id)
@@ -1027,7 +1389,8 @@ async fn load_operation(
     operation_id: &str,
 ) -> Result<SponsoredOperation, SponsoredBillingError> {
     let row = sqlx::query(
-        "SELECT * FROM billing_sponsored_operations WHERE operation_id = $1 FOR UPDATE",
+        "SELECT *, floor(extract(epoch FROM provider_first_sent_at))::BIGINT AS provider_first_sent_epoch \
+         FROM billing_sponsored_operations WHERE operation_id = $1 FOR UPDATE",
     )
     .bind(operation_id)
     .fetch_one(&mut **tx)
@@ -1042,7 +1405,8 @@ async fn load_by_idempotency(
     idempotency_key: &str,
 ) -> Result<Option<SponsoredOperation>, SponsoredBillingError> {
     let row = sqlx::query(
-        "SELECT * FROM billing_sponsored_operations \
+        "SELECT *, floor(extract(epoch FROM provider_first_sent_at))::BIGINT AS provider_first_sent_epoch \
+         FROM billing_sponsored_operations \
          WHERE organization_id = $1 AND actor_user_id = $2 AND idempotency_key = $3 FOR UPDATE",
     )
     .bind(organization_id)
@@ -1079,6 +1443,13 @@ fn operation_from_row(
         provider_operation_id: row.try_get("provider_operation_id")?,
         state: row.try_get("state")?,
         result_code: row.try_get("result_code")?,
+        provider_request_version: row.try_get("provider_request_version")?,
+        provider_request: row.try_get("provider_request")?,
+        provider_first_sent_epoch: row.try_get("provider_first_sent_epoch")?,
+        recovery_attempt_count: row.try_get("recovery_attempt_count")?,
+        recovery_lease_token: row.try_get("recovery_lease_token")?,
+        recovery_manual_review_required: row.try_get("recovery_manual_review_required")?,
+        recovery_last_error_code: row.try_get("recovery_last_error_code")?,
     })
 }
 

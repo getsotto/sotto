@@ -63,6 +63,19 @@ class AssuranceTests(unittest.TestCase):
         verdict = assurance.validate_run(manifest, "codec", payload["run"], payload["jobs"])
         self.assertEqual(verdict["status"], "passed")
 
+    def test_queued_workflow_passes_only_when_required_jobs_pass(self):
+        manifest = assurance.load_manifest()
+        names = manifest["groups"]["codec"]["required_jobs"]
+        payload = fixture("codec", names)
+        payload["run"]["status"] = "queued"
+
+        verdict = assurance.validate_run(manifest, "codec", payload["run"], payload["jobs"])
+        self.assertEqual(verdict["status"], "passed")
+
+        payload["jobs"][0]["conclusion"] = None
+        with self.assertRaisesRegex(assurance.AssuranceError, "concluded None"):
+            assurance.validate_run(manifest, "codec", payload["run"], payload["jobs"])
+
     def test_duplicate_and_unexpected_jobs_fail(self):
         manifest = assurance.load_manifest()
         names = manifest["groups"]["kani"]["required_jobs"]
@@ -89,6 +102,56 @@ class AssuranceTests(unittest.TestCase):
             with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "1"}):
                 argv = ["--group", "kani", "--jobs-file", str(path), "--expected-sha", "abc123"]
                 self.assertEqual(assurance.main(argv), 0)
+
+    def test_remote_validation_retries_until_github_publishes_job_conclusions(self):
+        manifest = assurance.load_manifest()
+        names = manifest["groups"]["kani"]["required_jobs"]
+        incomplete = (fixture("kani", names)["run"], fixture("kani", names, {names[0]: None})["jobs"])
+        complete = (fixture("kani", names)["run"], fixture("kani", names)["jobs"])
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GITHUB_RUN_ID": "42",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_REPOSITORY": "getsotto/sotto",
+                    "GITHUB_TOKEN": "token",
+                },
+            ),
+            patch.object(assurance, "fetch_run", side_effect=[incomplete, complete]) as fetch,
+            patch.object(assurance.time, "sleep") as sleep,
+        ):
+            self.assertEqual(assurance.main(["--group", "kani", "--expected-sha", "abc123"]), 0)
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(assurance.ASSURANCE_STATUS_RETRY_DELAYS[0])
+
+    def test_remote_validation_fails_closed_after_bounded_incomplete_results(self):
+        manifest = assurance.load_manifest()
+        names = manifest["groups"]["kani"]["required_jobs"]
+        incomplete = (fixture("kani", names)["run"], fixture("kani", names, {names[0]: None})["jobs"])
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GITHUB_RUN_ID": "42",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_REPOSITORY": "getsotto/sotto",
+                    "GITHUB_TOKEN": "token",
+                },
+            ),
+            patch.object(
+                assurance,
+                "fetch_run",
+                side_effect=[incomplete] * (len(assurance.ASSURANCE_STATUS_RETRY_DELAYS) + 1),
+            ) as fetch,
+            patch.object(assurance.time, "sleep") as sleep,
+        ):
+            self.assertEqual(assurance.main(["--group", "kani", "--expected-sha", "abc123"]), 1)
+        self.assertEqual(fetch.call_count, len(assurance.ASSURANCE_STATUS_RETRY_DELAYS) + 1)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            list(assurance.ASSURANCE_STATUS_RETRY_DELAYS),
+        )
 
     def test_fetch_uses_latest_attempt_and_paginates(self):
         first_page = [{"name": f"job-{index}", "conclusion": "success"} for index in range(100)]

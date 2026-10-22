@@ -9,15 +9,15 @@ carries every individual observation, so the tallies can be recomputed if the ag
 here ever turns out to be wrong. A number nobody can recompute is a number nobody should
 publish, and this is a file whose whole purpose is to be believed.
 
-All but one probe is unauthenticated and reads what any visitor could read. They prove a
-component answers, not that it is healthy for a signed-in user, which is the question a
-status page asks.
+Most probes are unauthenticated and read what any visitor could read. Two optional canaries use
+ordinary human-session and machine credentials against a dedicated synthetic environment; neither
+holds a decryption key, and both report only fixed outcomes.
 
-The exception is the canary, which presents a machine token belonging to a throwaway
-project. It refuses to run with a token that still carries its private key half, so this
-job can prove that a machine can retrieve what it needs to decrypt an environment while holding
-nothing that could decrypt it. A compromise here yields ciphertext and no way to read it, and
-that is a property of what the process is given rather than of what it chooses to send.
+The machine canary refuses to run with a token that still carries its private key half, so this
+job can prove that a machine can retrieve its sealed grant and ciphertext while holding nothing
+that could decrypt it. The human canary uses a normal Sotto session for a dedicated user that can
+read only synthetic ciphertext. A compromise yields no decryption key, and that is a property of
+what the process is given rather than of what it chooses to send.
 """
 
 from __future__ import annotations
@@ -100,11 +100,16 @@ class Probe:
     method: str
     path: str
     judge: Callable[[Response], Outcome]
-    #: Environment variable holding a machine token. A probe that names one and cannot find it
-    #: reports UNCONFIGURED rather than DOWN: an instance that has not set up a canary is not
+    #: Environment variable holding an optional bearer. A probe that names one and cannot find
+    #: it reports UNCONFIGURED rather than DOWN: an instance that has not set up a canary is not
     #: having an outage, and counting it as one would drag its published figure down for a
     #: feature it never switched on.
     token_env: str | None = None
+    #: Credential validation differs for ordinary human sessions and machine tokens; the latter
+    #: may include a private key half which this process must never retain.
+    token_kind: str = "machine"
+    #: Optional environment id for a scoped human canary path. It never enters the public sample.
+    environment_id_env: str | None = None
     #: Further `(path, judge)` pairs that must also pass before the verdict above stands. The
     #: canary rests on two endpoints, because a machine needs its sealed grant and the ciphertext
     #: both, and a row that went green on half of that would be claiming something it had not
@@ -220,6 +225,30 @@ def bearer_problem(raw: str) -> str | None:
     return None
 
 
+def session_bearer_problem(raw: str) -> str | None:
+    """Validate the opaque ordinary-user session token without echoing it anywhere."""
+    value = raw.strip()
+    if not value:
+        return "is not set"
+    suffix = value.removeprefix("st_")
+    if not value.startswith("st_") or len(suffix) != 64 or any(
+        char not in "0123456789abcdef" for char in suffix
+    ):
+        return "is not a Sotto user session token"
+    return None
+
+
+def environment_id_problem(value: str) -> str | None:
+    value = value.strip()
+    if not value:
+        return "is not set"
+    if len(value) > 128 or any(
+        not (char.isascii() and (char.isalnum() or char in "-_")) for char in value
+    ):
+        return "is not a safe environment id"
+    return None
+
+
 def judge_canary(response: Response) -> Outcome:
     """Whether a machine can still get at what it needs to decrypt its environment.
 
@@ -282,20 +311,19 @@ def grant_verdict(body: str) -> Outcome:
     return Outcome(OK)
 
 
-def judge_canary_secrets(response: Response) -> Outcome:
-    """Whether the canary environment still holds a secret a machine could actually use.
+def judge_canary_secrets(response: Response, endpoint: str = "/machine/secrets") -> Outcome:
+    """Whether the canary environment still holds a usable encrypted secret.
 
-    Parsed rather than pattern matched, and that is the whole point. `/machine/secrets` returns
-    every row for the environment including soft-deleted ones, each carrying a `deleted` flag, so
-    an environment whose secrets have all been removed answers with a full-looking list holding
-    nothing usable. Testing for an empty array would call that healthy, which is the failure this
-    component exists to notice rather than an edge of it.
+    Parsed rather than pattern matched, and that is the whole point. The snapshot includes
+    soft-deleted rows, each carrying a `deleted` flag, so an environment whose secrets have all
+    been removed answers with a full-looking list holding nothing usable. Testing for an empty
+    array would call that healthy, which is the failure this component exists to notice.
 
     A usable secret is one that is not deleted and carries both its ciphertext and its wrapped
-    data key. Either of those being empty leaves a machine with a row it cannot turn into a value.
+    data key. Either being empty leaves the client with a row it cannot turn into a value.
     """
     if response.status != 200:
-        return Outcome(DOWN, f"/machine/secrets answered {response.status}")
+        return Outcome(DOWN, f"{endpoint} answered {response.status}")
     if response.truncated:
         # Unconfigured rather than down, which is the same rule the rest of this file follows: a
         # tally counts what was measured, and this is the one answer here that is not a
@@ -314,9 +342,9 @@ def judge_canary_secrets(response: Response) -> Outcome:
     try:
         payload = json.loads(response.body_prefix)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return Outcome(DOWN, "/machine/secrets answered 200 with something that is not JSON")
+        return Outcome(DOWN, f"{endpoint} answered 200 with something that is not JSON")
     if not isinstance(payload, dict) or "revision" not in payload:
-        return Outcome(DOWN, "/machine/secrets answered 200 without a snapshot")
+        return Outcome(DOWN, f"{endpoint} answered 200 without a snapshot")
     rows = payload.get("secrets")
     rows = rows if isinstance(rows, list) else []
     live = [
@@ -452,12 +480,23 @@ PROBES: list[Probe] = [
         # being used for more than being a canary. Overflow reports that rather than guessing.
         body_bytes=8192,
     ),
+    Probe(
+        id="human-sync",
+        name="Human API access",
+        description="An ordinary signed-in user can retrieve synthetic encrypted secrets",
+        method="GET",
+        path="/environments/{environment_id}/secrets",
+        judge=lambda response: judge_canary_secrets(response, endpoint="human canary"),
+        token_env="SOTTO_HUMAN_CANARY_TOKEN",
+        token_kind="session",
+        environment_id_env="SOTTO_HUMAN_CANARY_ENVIRONMENT_ID",
+        body_bytes=8192,
+    ),
 ]
 
-# Declared but not probed. Nothing is, now that the canary has a throwaway project and a
-# machine token behind it, but the mechanism stays: it is how a component says plainly that it
-# is not being watched, rather than implying by omission that everything is. A future component
-# with no probe yet belongs here rather than being left off the page.
+# Declared but not probed. The mechanism stays: it is how a component says plainly that it is not
+# being watched, rather than implying by omission that everything is. A future component with no
+# probe yet belongs here rather than being left off the page.
 UNPROBED: list[dict] = []
 
 
@@ -551,12 +590,24 @@ def observe(base_url: str, probes: list[Probe]) -> dict[str, Outcome]:
     # offered to it. `sorted` is stable, so the others keep the order they were declared in.
     for probe in sorted(probes, key=lambda p: p.token_env is not None):
         token = None
+        path = probe.path
         if probe.token_env is not None:
             if (reason := withheld(base_url, outcomes)) is not None:
                 outcomes[probe.id] = Outcome(UNCONFIGURED, reason)
                 continue
+            if probe.environment_id_env is not None:
+                environment_id = os.environ.get(probe.environment_id_env, "")
+                if (problem := environment_id_problem(environment_id)) is not None:
+                    outcomes[probe.id] = Outcome(
+                        UNCONFIGURED, f"{probe.environment_id_env} {problem}"
+                    )
+                    continue
+                path = path.format(
+                    environment_id=urllib.parse.quote(environment_id.strip(), safe="")
+                )
             raw = os.environ.get(probe.token_env, "")
-            if (problem := bearer_problem(raw)) is not None:
+            validator = session_bearer_problem if probe.token_kind == "session" else bearer_problem
+            if (problem := validator(raw)) is not None:
                 # Before any request. An instance with no canary must not have one attempted
                 # against it with an empty bearer, which the server would answer 401 and this
                 # would then publish as somebody's outage.
@@ -564,11 +615,16 @@ def observe(base_url: str, probes: list[Probe]) -> dict[str, Outcome]:
                 continue
             token = raw.strip()
         try:
-            response = fetch(base_url, probe, token=token)
+            response = fetch(base_url, probe, path=path, token=token)
         except TRANSPORT_FAILURES as e:
             # A transport failure is indistinguishable from the component being gone, which
             # is the honest reading: nobody could have used it either.
-            outcomes[probe.id] = Outcome(DOWN, f"{type(e).__name__}: {e}"[:200])
+            detail = (
+                "human canary request failed"
+                if probe.environment_id_env is not None
+                else f"{type(e).__name__}: {e}"[:200]
+            )
+            outcomes[probe.id] = Outcome(DOWN, detail)
             continue
         # Deliberately outside the handler. A bug in a verdict is not an outage, and recording
         # it as one would publish our own defect on a status page as somebody else's downtime

@@ -39,9 +39,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Push a per-arch staging tag; the merge job below combines them and applies the real tags.
-      - name: Collect the web build arguments
+      - name: Collect image build arguments
         id: buildargs
         env:
+          GITHUB_SHA: ${{ github.sha }}
           SOTTO_PUBLIC_URL: ${{ vars.SOTTO_PUBLIC_URL }}
           VITE_STATUS_URL: ${{ vars.VITE_STATUS_URL }}
           VITE_ORGANISATION_DELETION_ENABLED: ${{ vars.VITE_ORGANISATION_DELETION_ENABLED }}
@@ -64,6 +65,9 @@ jobs:
                 echo "${name}=${value}"
               fi
             done
+            if [[ "${{ matrix.image }}" == "sotto-server" ]]; then
+              echo "SOTTO_BUILD_SHA=${GITHUB_SHA}"
+            fi
             echo "BUILD_ARGS_EOF"
           } >> "$GITHUB_OUTPUT"
 

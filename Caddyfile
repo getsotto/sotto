@@ -67,8 +67,9 @@ www.{$SOTTO_DOMAIN} {
 	# /orgs, /machine/*, …) is deliberately NOT limited: it is bearer-gated and includes
 	# high-frequency CI polling that a per-IP cap could wrongly throttle when a whole team shares
 	# one office/NAT egress IP. The threshold is a generous starting point - raise it, or split
-	# into per-endpoint zones, to taste.
-	@ratelimited path /auth/github/* /shares /shares/* /community /telemetry/* /health/ready
+	# into per-endpoint zones, to taste. Contact-verification POSTs are the deliberate exception:
+	# their dedicated per-IP zone below complements account/destination limits in the application.
+	@ratelimited path /auth/github/* /shares /shares/* /community /telemetry/* /health/ready /webhooks/resend
 	handle @ratelimited {
 		rate_limit {
 			zone unauthenticated {
@@ -80,12 +81,63 @@ www.{$SOTTO_DOMAIN} {
 		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
 	}
 
+	# Verification sends are authenticated but can still be abused to generate provider traffic.
+	# Keep a dedicated per-IP ceiling in addition to the account/destination limits in Postgres.
+	@contact_verification {
+		method POST
+		path /account/contacts/verification /account/contacts/verification/confirm
+	}
+	handle @contact_verification {
+		rate_limit {
+			zone contact_verification {
+				key {remote_host}
+				events 20
+				window 1m
+			}
+		}
+		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
+	}
+
+	# Keep protected lifecycle snapshots bounded too; their database work is authenticated but
+	# aggregates may touch many durable rows on a compact host.
+	@cloud_operations_read {
+		method GET
+		path /ops/cloud/metrics /ops/cloud/coverage-rejections
+	}
+	handle @cloud_operations_read {
+		rate_limit {
+			zone cloud_operations_read {
+				key {remote_host}
+				events 30
+				window 1m
+			}
+		}
+		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
+	}
+
+	# Provider-backed diagnostic repair can make bounded Stripe reads. Keep a per-IP ceiling even
+	# though it also requires its dedicated operator credential.
+	@cloud_coverage_repair {
+		method POST
+		path /ops/cloud/coverage-rejections/*
+	}
+	handle @cloud_coverage_repair {
+		rate_limit {
+			zone cloud_coverage_repair {
+				key {remote_host}
+				events 10
+				window 1m
+			}
+		}
+		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
+	}
+
 	# The rest of the server's API (bearer-authenticated), plus the dependency-free liveness probe.
 	# Together with @ratelimited above this must cover every path the routers in
 	# `crates/server/src/lib.rs` serve - keep the two in sync. Note that `path` matches exactly, so
 	# /health does not cover /health/ready: a new sub-path needs its own entry or it falls through
 	# to the SPA below and answers a probe with HTML.
-	@api path /health /server/info /auth/me /auth/logout /account /account/* /projects /projects/* /environments/* /orgs /orgs/* /machine/* /billing/* /ops/organisation-deletion/metrics /ops/organisation-deletion/* /ops/billing/transfers/* /ops/billing/founding-price-notices
+	@api path /health /server/info /auth/me /auth/logout /account /account/* /projects /projects/* /environments/* /orgs /orgs/* /machine/* /billing/* /ops/organisation-deletion/metrics /ops/organisation-deletion/* /ops/billing/transfers/* /ops/billing/founding-price-notices /ops/cloud/metrics /ops/cloud/coverage-rejections /ops/cloud/coverage-rejections/* /ops/cloud/retention /ops/cloud/retention/* /ops/cloud/notices /ops/cloud/notices/*
 	handle @api {
 		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
 	}

@@ -3,23 +3,34 @@
 //! These tests are opt-in because they create and remove rows in a disposable Postgres database.
 
 use async_trait::async_trait;
-use sqlx::{postgres::PgConnectOptions, PgPool};
+use sqlx::{postgres::PgConnectOptions, PgPool, Row};
 use std::str::FromStr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::{timeout, Duration};
 
+use sotto_server::billing::{
+    self, BillingState, PersonalCheckoutSession, PersonalCheckoutStatus, ProviderResult,
+    SubscriptionObservation, SubscriptionProvider,
+};
 use sotto_server::billing_catalogue::BillingOffer;
 use sotto_server::billing_operations::{
-    begin_organization_operation, begin_personal_operation, load_reconciliation_candidates,
-    reconcile_operation, record_provider_result, BeginOperation, BillingOperation,
+    begin_organization_operation, begin_personal_operation, claim_reconciliation,
+    load_reconciliation_candidates, reconcile_operation, record_personal_checkout_request,
+    record_provider_result, release_reconciliation_failure, BeginOperation, BillingOperation,
     BillingOperationError, BillingOperationProvider, BillingOperationState, BillingRecoveryError,
     ProviderResolution,
 };
+use sotto_server::config::BillingPriceIds;
 use sotto_server::db;
+
+fn test_lock() -> &'static AsyncMutex<()> {
+    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| AsyncMutex::new(()))
+}
 
 async fn pool_or_skip() -> Option<PgPool> {
     if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
@@ -39,6 +50,11 @@ async fn pool_or_skip() -> Option<PgPool> {
 }
 
 async fn cleanup(pool: &PgPool, user_id: &str) {
+    sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("clean personal billing account fixture");
     sqlx::query("DELETE FROM billing_operations WHERE actor_user_id = $1")
         .bind(user_id)
         .execute(pool)
@@ -49,6 +65,108 @@ async fn cleanup(pool: &PgPool, user_id: &str) {
         .execute(pool)
         .await
         .expect("clean billing operation user fixture");
+}
+
+#[derive(Clone)]
+struct RecoveryCheckoutProvider {
+    calls: Arc<AtomicUsize>,
+    received: Arc<std::sync::Mutex<Vec<CapturedCheckoutRequest>>>,
+    status_requests: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    lose_first_response: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedCheckoutRequest {
+    price_id: String,
+    idempotency_key: String,
+    success_url: String,
+    cancel_url: String,
+    expires_at_epoch: i64,
+}
+
+#[async_trait]
+impl SubscriptionProvider for RecoveryCheckoutProvider {
+    async fn create_checkout(
+        &self,
+        _org_id: &str,
+        _customer: Option<&str>,
+        _success_url: &str,
+        _cancel_url: &str,
+    ) -> ProviderResult<String> {
+        Ok("https://checkout.example.test/mock".into())
+    }
+
+    async fn create_personal_checkout(
+        &self,
+        _user_id: &str,
+        _customer: Option<&str>,
+        price_id: &str,
+        _operation_id: &str,
+        _allocation_reference: &str,
+        idempotency_key: &str,
+        expires_at_epoch: i64,
+        success_url: &str,
+        cancel_url: &str,
+    ) -> ProviderResult<PersonalCheckoutSession> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        self.received.lock().unwrap().push(CapturedCheckoutRequest {
+            price_id: price_id.into(),
+            idempotency_key: idempotency_key.into(),
+            success_url: success_url.into(),
+            cancel_url: cancel_url.into(),
+            expires_at_epoch,
+        });
+        if self.lose_first_response && call == 0 {
+            // Stripe accepted and retained this session for the idempotency key, but the
+            // response was lost before Sotto could persist the session id.
+            return Err(sotto_server::billing::ProviderError {
+                status: None,
+                code: None,
+                kind: sotto_server::billing::ProviderErrorKind::Retryable,
+            });
+        }
+        Ok(PersonalCheckoutSession {
+            session_id: Some("cs_recovered_personal".into()),
+            checkout_url: "https://checkout.example.test/cs_recovered_personal".into(),
+        })
+    }
+
+    async fn get_personal_checkout_status(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> ProviderResult<PersonalCheckoutStatus> {
+        self.status_requests
+            .lock()
+            .unwrap()
+            .push((session_id.to_string(), operation_id.to_string()));
+        Ok(PersonalCheckoutStatus::ExpiredUnpaid)
+    }
+
+    async fn create_portal(
+        &self,
+        _customer: &str,
+        _return_url: &str,
+        _configuration_id: Option<&str>,
+    ) -> ProviderResult<String> {
+        Ok("https://billing.example.test/portal".into())
+    }
+
+    async fn get_subscription(
+        &self,
+        _subscription_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Ok(SubscriptionObservation::Missing)
+    }
+
+    async fn cancel_subscription(
+        &self,
+        _subscription_id: &str,
+        _idempotency_key: &str,
+        _org_id: &str,
+    ) -> ProviderResult<SubscriptionObservation> {
+        Ok(SubscriptionObservation::Missing)
+    }
 }
 
 async fn seed_user(pool: &PgPool, user_id: &str) {
@@ -97,6 +215,7 @@ async fn cleanup_organization(pool: &PgPool, organization_id: &str) {
 
 #[tokio::test]
 async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -164,6 +283,775 @@ async fn operation_identity_is_idempotent_and_conflicts_on_changed_request() {
     cleanup(&pool, USER_ID).await;
 }
 
+#[tokio::test]
+async fn interrupted_personal_checkout_reuses_its_operation_and_records_the_session_id() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "billing-operation-test-checkout-recovery";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+
+    let mut tx = pool.begin().await.expect("begin operation transaction");
+    let operation = match begin_personal_operation(
+        &mut tx,
+        USER_ID,
+        "checkout-recovery-key",
+        BillingOffer::StandardMonthly,
+        1,
+        4_000_000_000,
+        "https://app.sotto.test/billing",
+        "https://app.sotto.test/billing",
+    )
+    .await
+    .expect("persist personal checkout operation")
+    {
+        BeginOperation::Created(operation) => operation,
+        BeginOperation::AlreadyExists(_) => panic!("fixture operation unexpectedly existed"),
+    };
+    sotto_server::personal_billing::begin_account(
+        &mut tx,
+        USER_ID,
+        &operation.operation_id,
+        BillingOffer::StandardMonthly,
+        4_000_000_100,
+        4_000_000_000,
+    )
+    .await
+    .expect("persist the original personal account binding");
+    record_personal_checkout_request(
+        &mut tx,
+        &operation.operation_id,
+        "price_original_monthly",
+        "https://app.sotto.test/app?billing=success",
+        "https://app.sotto.test/app?billing=cancelled",
+    )
+    .await
+    .expect("persist original provider request parameters");
+    tx.commit().await.expect("commit original request");
+    sqlx::query(
+        "UPDATE billing_operations SET reconciliation_lease_until = now() - interval '1 second' \
+         WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .execute(&pool)
+    .await
+    .expect("expire caller lease for restart recovery");
+
+    let provider = RecoveryCheckoutProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+        received: Arc::new(std::sync::Mutex::new(Vec::new())),
+        status_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        lose_first_response: true,
+    };
+    let billing_state = BillingState::with_provider(
+        Arc::new(provider.clone()),
+        "whsec_test".into(),
+        "https://app.sotto.test".into(),
+    )
+    .with_price_catalogue(BillingPriceIds {
+        standard_monthly: "price_standard_monthly".into(),
+        standard_annual: "price_standard_annual".into(),
+        founding_monthly: "price_founding_monthly".into(),
+        founding_annual: "price_founding_annual".into(),
+    });
+
+    assert!(
+        billing::recover_personal_billing_operation_once(&pool, &billing_state)
+            .await
+            .expect("retry an ambiguous provider result")
+    );
+    sqlx::query(
+        "UPDATE billing_operations SET reconciliation_next_attempt_at = now() - interval '1 second' \
+         WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .execute(&pool)
+    .await
+    .expect("make the bounded retry due");
+    assert!(
+        billing::recover_personal_billing_operation_once(&pool, &billing_state)
+            .await
+            .expect("recover the provider-accepted session after response loss")
+    );
+    let recovered = sqlx::query(
+        "SELECT state, provider_checkout_session_id, provider_checkout_url, result_code \
+         FROM billing_operations WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read recovered checkout");
+    use sqlx::Row;
+    assert_eq!(
+        recovered.try_get::<String, _>("state").unwrap(),
+        "succeeded"
+    );
+    assert_eq!(
+        recovered
+            .try_get::<Option<String>, _>("provider_checkout_session_id")
+            .unwrap()
+            .as_deref(),
+        Some("cs_recovered_personal")
+    );
+    assert_eq!(
+        recovered
+            .try_get::<String, _>("result_code")
+            .unwrap()
+            .as_str(),
+        "checkout_created"
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    let original_request = CapturedCheckoutRequest {
+        price_id: "price_original_monthly".into(),
+        idempotency_key: operation.provider_idempotency_key.clone(),
+        success_url: "https://app.sotto.test/app?billing=success".into(),
+        cancel_url: "https://app.sotto.test/app?billing=cancelled".into(),
+        expires_at_epoch: 4_000_000_100,
+    };
+    assert_eq!(
+        provider.received.lock().unwrap().as_slice(),
+        &[original_request.clone(), original_request]
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM billing_personal_accounts WHERE operation_id = $1",
+        )
+        .bind(&operation.operation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read personal account"),
+        "pending",
+        "creating a Checkout session must not record payment"
+    );
+    assert!(
+        !billing::recover_personal_billing_operation_once(&pool, &billing_state)
+            .await
+            .expect("settled recovery queue is idle")
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn refund_required_checkout_is_parked_without_another_provider_request() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "billing-operation-test-refund-required-recovery";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    let mut tx = pool.begin().await.expect("begin operation transaction");
+    let operation = match begin_personal_operation(
+        &mut tx,
+        USER_ID,
+        "refund-required-recovery-key",
+        BillingOffer::StandardMonthly,
+        1,
+        4_000_000_000,
+        "https://app.sotto.test/billing",
+        "https://app.sotto.test/billing",
+    )
+    .await
+    .expect("create operation")
+    {
+        BeginOperation::Created(operation) => operation,
+        BeginOperation::AlreadyExists(_) => panic!("fixture operation unexpectedly existed"),
+    };
+    sotto_server::personal_billing::begin_account(
+        &mut tx,
+        USER_ID,
+        &operation.operation_id,
+        BillingOffer::StandardMonthly,
+        4_000_000_100,
+        4_000_000_000,
+    )
+    .await
+    .expect("persist personal account");
+    record_personal_checkout_request(
+        &mut tx,
+        &operation.operation_id,
+        "price_original_monthly",
+        "https://app.sotto.test/app?billing=success",
+        "https://app.sotto.test/app?billing=cancelled",
+    )
+    .await
+    .expect("persist provider request");
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state='refund_required', \
+         stripe_customer_id='cus_refund_required', stripe_subscription_id='sub_refund_required', \
+         payment_reference='pi_refund_required' WHERE operation_id=$1",
+    )
+    .bind(&operation.operation_id)
+    .execute(&mut *tx)
+    .await
+    .expect("record paid checkout awaiting refund");
+    tx.commit().await.expect("commit operation");
+    sqlx::query(
+        "UPDATE billing_operations SET reconciliation_lease_until = now() - interval '1 second' \
+         WHERE operation_id=$1",
+    )
+    .bind(&operation.operation_id)
+    .execute(&pool)
+    .await
+    .expect("expire creator lease");
+
+    let provider = RecoveryCheckoutProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+        received: Arc::new(std::sync::Mutex::new(Vec::new())),
+        status_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        lose_first_response: false,
+    };
+    let billing_state = BillingState::with_provider(
+        Arc::new(provider.clone()),
+        "whsec_test".into(),
+        "https://app.sotto.test".into(),
+    )
+    .with_price_catalogue(BillingPriceIds {
+        standard_monthly: "price_standard_monthly".into(),
+        standard_annual: "price_standard_annual".into(),
+        founding_monthly: "price_founding_monthly".into(),
+        founding_annual: "price_founding_annual".into(),
+    });
+
+    assert!(
+        billing::recover_personal_billing_operation_once(&pool, &billing_state)
+            .await
+            .expect("park already-paid refund case")
+    );
+    let operation_state: (String, Option<String>) =
+        sqlx::query_as("SELECT state, result_code FROM billing_operations WHERE operation_id=$1")
+            .bind(&operation.operation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read parked operation");
+    assert_eq!(operation_state.0, "manual_review");
+    assert_eq!(
+        operation_state.1.as_deref(),
+        Some("paid_checkout_requires_refund")
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.received.lock().unwrap().len(), 0);
+
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn locally_expired_personal_checkout_is_reconciled_from_legacy_checkout_url() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "billing-operation-test-expired-session-recovery";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    let mut tx = pool.begin().await.expect("begin operation transaction");
+    let operation = match begin_personal_operation(
+        &mut tx,
+        USER_ID,
+        "expired-session-recovery-key",
+        BillingOffer::StandardMonthly,
+        1,
+        4_000_000_000,
+        "https://app.sotto.test/billing",
+        "https://app.sotto.test/billing",
+    )
+    .await
+    .expect("create operation")
+    {
+        BeginOperation::Created(operation) => operation,
+        BeginOperation::AlreadyExists(_) => panic!("fixture operation unexpectedly existed"),
+    };
+    sotto_server::personal_billing::begin_account(
+        &mut tx,
+        USER_ID,
+        &operation.operation_id,
+        BillingOffer::StandardMonthly,
+        4_000_000_100,
+        4_000_000_000,
+    )
+    .await
+    .expect("persist personal account");
+    record_provider_result(
+        &mut tx,
+        &operation.operation_id,
+        BillingOperationState::Succeeded,
+        None,
+        Some("checkout_created"),
+    )
+    .await
+    .expect("persist pre-migration checkout result");
+    // Older releases stored only the Checkout URL, not an explicit session id or request facts.
+    sqlx::query("UPDATE billing_operations SET provider_checkout_url = $2 WHERE operation_id = $1")
+        .bind(&operation.operation_id)
+        .bind("https://checkout.stripe.com/c/pay/cs_legacy_expired")
+        .execute(&mut *tx)
+        .await
+        .expect("persist legacy checkout URL containing the session id");
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET pending_expires_at_epoch = \
+         extract(epoch FROM now())::bigint - 60 WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .execute(&mut *tx)
+    .await
+    .expect("expire account locally");
+    tx.commit().await.expect("commit operation");
+
+    let provider = RecoveryCheckoutProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+        received: Arc::new(std::sync::Mutex::new(Vec::new())),
+        status_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+        lose_first_response: false,
+    };
+    let billing_state = BillingState::with_provider(
+        Arc::new(provider.clone()),
+        "whsec_test".into(),
+        "https://app.sotto.test".into(),
+    );
+
+    assert!(
+        billing::recover_personal_billing_operation_once(&pool, &billing_state)
+            .await
+            .expect("reconcile provider expiry for old account")
+    );
+    let account_state: String =
+        sqlx::query_scalar("SELECT state FROM billing_personal_accounts WHERE operation_id = $1")
+            .bind(&operation.operation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read released account");
+    assert_eq!(account_state, "canceled");
+    let operation_result: (String, String, Option<String>) = sqlx::query_as(
+        "SELECT state, result_code, provider_checkout_session_id \
+         FROM billing_operations WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read expired operation");
+    assert_eq!(operation_result.0, "failed");
+    assert_eq!(operation_result.1, "checkout_expired");
+    assert_eq!(operation_result.2.as_deref(), Some("cs_legacy_expired"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        provider.status_requests.lock().unwrap().as_slice(),
+        &[("cs_legacy_expired".into(), operation.operation_id.clone())]
+    );
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn verified_paid_invoice_resolves_recovery_lease_and_manual_review() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    for (user_id, key, operation_state, lease_token) in [
+        (
+            "billing-operation-test-paid-recovery-lease",
+            "paid-recovery-lease-key",
+            "pending",
+            Some("billing-recovery:paid-race"),
+        ),
+        (
+            "billing-operation-test-paid-manual-review",
+            "paid-manual-review-key",
+            "manual_review",
+            None,
+        ),
+    ] {
+        cleanup(&pool, user_id).await;
+        seed_user(&pool, user_id).await;
+        let mut tx = pool.begin().await.expect("begin operation transaction");
+        let operation = match begin_personal_operation(
+            &mut tx,
+            user_id,
+            key,
+            BillingOffer::StandardMonthly,
+            1,
+            4_000_000_000,
+            "https://app.sotto.test/billing",
+            "https://app.sotto.test/billing",
+        )
+        .await
+        .expect("create operation")
+        {
+            BeginOperation::Created(operation) => operation,
+            BeginOperation::AlreadyExists(_) => panic!("fixture operation unexpectedly existed"),
+        };
+        sotto_server::personal_billing::begin_account(
+            &mut tx,
+            user_id,
+            &operation.operation_id,
+            BillingOffer::StandardMonthly,
+            4_000_000_100,
+            4_000_000_000,
+        )
+        .await
+        .expect("persist personal account");
+        let result_code = (operation_state == "manual_review").then_some("manual_review_required");
+        sqlx::query(
+            "UPDATE billing_operations SET state=$2, result_code=$3, \
+             reconciliation_manual_review_required=$4, reconciliation_lease_token=$5, \
+             reconciliation_lease_until=CASE WHEN $5 IS NULL THEN NULL ELSE now()+interval '5 minutes' END \
+             WHERE operation_id=$1",
+        )
+        .bind(&operation.operation_id)
+        .bind(operation_state)
+        .bind(result_code)
+        .bind(operation_state == "manual_review")
+        .bind(lease_token)
+        .execute(&mut *tx)
+        .await
+        .expect("seed payment race state");
+        tx.commit().await.expect("commit operation");
+
+        let mut paid_tx = pool
+            .begin()
+            .await
+            .expect("begin verified payment transaction");
+        let settled = sotto_server::billing_operations::record_verified_paid_invoice(
+            &mut paid_tx,
+            &operation.operation_id,
+        )
+        .await
+        .expect("verified invoice settles independently of recovery state");
+        assert_eq!(settled.state, BillingOperationState::Succeeded);
+        assert_eq!(
+            settled.result_code.as_deref(),
+            Some("source_restoration_paid")
+        );
+        paid_tx.commit().await.expect("commit verified payment");
+        let recovery_state: (bool, Option<String>) = sqlx::query_as(
+            "SELECT reconciliation_manual_review_required, reconciliation_lease_token \
+             FROM billing_operations WHERE operation_id=$1",
+        )
+        .bind(&operation.operation_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read resolved recovery state");
+        assert_eq!(recovery_state, (false, None));
+        cleanup(&pool, user_id).await;
+    }
+}
+
+#[tokio::test]
+async fn customer_retry_parks_checkout_after_provider_idempotency_window() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "billing-operation-test-checkout-window";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    let mut tx = pool.begin().await.expect("begin operation transaction");
+    let operation = match begin_personal_operation(
+        &mut tx,
+        USER_ID,
+        "checkout-window-key",
+        BillingOffer::StandardMonthly,
+        1,
+        4_000_000_000,
+        "https://app.sotto.test/billing",
+        "https://app.sotto.test/billing",
+    )
+    .await
+    .expect("create operation")
+    {
+        BeginOperation::Created(operation) => operation,
+        BeginOperation::AlreadyExists(_) => panic!("fixture operation unexpectedly existed"),
+    };
+    sotto_server::personal_billing::begin_account(
+        &mut tx,
+        USER_ID,
+        &operation.operation_id,
+        BillingOffer::StandardMonthly,
+        4_000_000_100,
+        4_000_000_000,
+    )
+    .await
+    .expect("persist personal account");
+    tx.commit().await.expect("commit operation");
+    sqlx::query(
+        "UPDATE billing_operations SET created_at = now() - interval '24 hours' \
+         WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .execute(&pool)
+    .await
+    .expect("age operation past the safe retry window");
+
+    assert!(
+        sotto_server::billing_operations::park_personal_checkout_outside_idempotency_window(
+            &pool,
+            &operation.operation_id
+        )
+        .await
+        .expect("park stale customer retry")
+    );
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM billing_operations WHERE operation_id = $1")
+            .bind(&operation.operation_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read review state");
+    assert_eq!(state, "manual_review");
+
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn signed_expiry_fences_a_late_recovery_result_before_account_reuse() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "billing-operation-test-expiry-race";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    let mut tx = pool.begin().await.expect("begin checkout transaction");
+    let operation = match begin_personal_operation(
+        &mut tx,
+        USER_ID,
+        "checkout-expiry-race-key",
+        BillingOffer::StandardMonthly,
+        1,
+        4_000_000_000,
+        "https://app.sotto.test/billing",
+        "https://app.sotto.test/billing",
+    )
+    .await
+    .expect("create checkout operation")
+    {
+        BeginOperation::Created(operation) => operation,
+        BeginOperation::AlreadyExists(_) => panic!("fixture operation unexpectedly existed"),
+    };
+    sotto_server::personal_billing::begin_account(
+        &mut tx,
+        USER_ID,
+        &operation.operation_id,
+        BillingOffer::StandardMonthly,
+        4_000_000_100,
+        4_000_000_000,
+    )
+    .await
+    .expect("persist personal account");
+    record_personal_checkout_request(
+        &mut tx,
+        &operation.operation_id,
+        "price_original_monthly",
+        "https://app.sotto.test/app?billing=success",
+        "https://app.sotto.test/app?billing=cancelled",
+    )
+    .await
+    .expect("persist exact provider request");
+    tx.commit().await.expect("commit checkout operation");
+    sqlx::query(
+        "UPDATE billing_operations SET reconciliation_lease_until = now() - interval '1 second' \
+         WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .execute(&pool)
+    .await
+    .expect("expire creator lease");
+    let worker_token = "billing-recovery:expiry-race-worker";
+    claim_reconciliation(&pool, &operation.operation_id, worker_token)
+        .await
+        .expect("claim the pending operation");
+
+    let mut expiry_tx = pool.begin().await.expect("begin signed expiry");
+    let expired = sotto_server::billing_operations::record_checkout_expired(
+        &mut expiry_tx,
+        &operation.operation_id,
+        "cs_expiry_race",
+    )
+    .await
+    .expect("apply signed provider expiry");
+    sqlx::query(
+        "UPDATE billing_personal_accounts SET state = 'canceled' \
+         WHERE operation_id = $1 AND state = 'pending'",
+    )
+    .bind(&operation.operation_id)
+    .execute(&mut *expiry_tx)
+    .await
+    .expect("release the expired personal account");
+    expiry_tx.commit().await.expect("commit signed expiry");
+    assert_eq!(expired.state, BillingOperationState::Failed);
+
+    let mut late_result_tx = pool.begin().await.expect("begin late result");
+    let late_result = sotto_server::billing_operations::record_claimed_checkout_result(
+        &mut late_result_tx,
+        &operation.operation_id,
+        worker_token,
+        "cs_expiry_race",
+        "https://checkout.example.test/cs_expiry_race",
+    )
+    .await;
+    assert!(matches!(late_result, Err(BillingRecoveryError::InProgress)));
+    late_result_tx
+        .rollback()
+        .await
+        .expect("discard stale result");
+
+    let mut reuse_tx = pool.begin().await.expect("begin new checkout");
+    let replacement = match begin_personal_operation(
+        &mut reuse_tx,
+        USER_ID,
+        "checkout-after-expiry-key",
+        BillingOffer::StandardMonthly,
+        1,
+        4_000_000_100,
+        "https://app.sotto.test/billing",
+        "https://app.sotto.test/billing",
+    )
+    .await
+    .expect("create replacement operation")
+    {
+        BeginOperation::Created(operation) => operation,
+        BeginOperation::AlreadyExists(_) => panic!("replacement operation unexpectedly existed"),
+    };
+    sotto_server::personal_billing::begin_account(
+        &mut reuse_tx,
+        USER_ID,
+        &replacement.operation_id,
+        BillingOffer::StandardMonthly,
+        4_000_000_200,
+        4_000_000_100,
+    )
+    .await
+    .expect("reuse the account after signed expiry");
+    reuse_tx
+        .commit()
+        .await
+        .expect("commit replacement checkout");
+
+    let account_operation: String =
+        sqlx::query_scalar("SELECT operation_id FROM billing_personal_accounts WHERE user_id = $1")
+            .bind(USER_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("read replacement account binding");
+    assert_eq!(account_operation, replacement.operation_id);
+    cleanup(&pool, USER_ID).await;
+}
+
+#[tokio::test]
+async fn recovery_failure_budget_counts_failures_and_parks_at_twenty() {
+    let _guard = test_lock().lock().await;
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    const USER_ID: &str = "billing-operation-test-failure-budget";
+    cleanup(&pool, USER_ID).await;
+    seed_user(&pool, USER_ID).await;
+    let mut tx = pool.begin().await.expect("begin operation transaction");
+    let operation_id = match begin_personal_operation(
+        &mut tx,
+        USER_ID,
+        "failure-budget-key",
+        BillingOffer::StandardMonthly,
+        1,
+        4_000_000_000,
+        "https://app.sotto.test/billing",
+        "https://app.sotto.test/billing",
+    )
+    .await
+    .expect("create operation")
+    {
+        BeginOperation::Created(operation) => operation.operation_id,
+        BeginOperation::AlreadyExists(_) => panic!("fixture operation unexpectedly existed"),
+    };
+    tx.commit().await.expect("commit operation identity");
+    let mut tx = pool.begin().await.expect("begin unknown-state transaction");
+    record_provider_result(
+        &mut tx,
+        &operation_id,
+        BillingOperationState::Unknown,
+        None,
+        Some("provider_timeout"),
+    )
+    .await
+    .expect("record unknown outcome");
+    tx.commit().await.expect("commit unknown outcome");
+
+    let first_claim_token = "recovery-failure-test:first";
+    claim_reconciliation(&pool, &operation_id, first_claim_token)
+        .await
+        .expect("claim for one recovery attempt");
+    let attempts: i32 = sqlx::query_scalar(
+        "SELECT reconciliation_attempt_count FROM billing_operations WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read attempts after claim");
+    assert_eq!(attempts, 0, "a lease claim is not a provider failure");
+    assert!(!release_reconciliation_failure(
+        &pool,
+        &operation_id,
+        first_claim_token,
+        "provider_outcome_uncertain",
+    )
+    .await
+    .expect("record first failure"));
+
+    for attempt in 1..20 {
+        sqlx::query(
+            "UPDATE billing_operations SET reconciliation_next_attempt_at = now() \
+             WHERE operation_id = $1",
+        )
+        .bind(&operation_id)
+        .execute(&pool)
+        .await
+        .expect("make test retry due");
+        let token = format!("recovery-failure-test:{attempt}");
+        claim_reconciliation(&pool, &operation_id, &token)
+            .await
+            .expect("claim due retry");
+        let parked = release_reconciliation_failure(
+            &pool,
+            &operation_id,
+            &token,
+            "provider_outcome_uncertain",
+        )
+        .await
+        .expect("record retry failure");
+        assert_eq!(parked, attempt == 19);
+    }
+    let final_row = sqlx::query(
+        "SELECT state, reconciliation_attempt_count, reconciliation_manual_review_required \
+         FROM billing_operations WHERE operation_id = $1",
+    )
+    .bind(&operation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read parked operation");
+    assert_eq!(
+        final_row.try_get::<String, _>("state").unwrap(),
+        "manual_review"
+    );
+    assert_eq!(
+        final_row
+            .try_get::<i32, _>("reconciliation_attempt_count")
+            .unwrap(),
+        20
+    );
+    assert!(final_row
+        .try_get::<bool, _>("reconciliation_manual_review_required")
+        .unwrap());
+    assert!(!load_reconciliation_candidates(&pool, 10)
+        .await
+        .expect("manual review is excluded from automatic work")
+        .iter()
+        .any(|operation| operation.operation_id == operation_id));
+
+    cleanup(&pool, USER_ID).await;
+}
+
 struct SuccessfulProvider {
     calls: Arc<AtomicUsize>,
     keys: Arc<std::sync::Mutex<Vec<String>>>,
@@ -212,6 +1100,7 @@ impl BillingOperationProvider for SuccessfulProvider {
 
 #[tokio::test]
 async fn unknown_provider_result_is_reconciled_after_restart() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -326,6 +1215,7 @@ async fn unknown_provider_result_is_reconciled_after_restart() {
 
 #[tokio::test]
 async fn concurrent_recovery_claims_the_provider_call_once() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -421,6 +1311,7 @@ async fn concurrent_recovery_claims_the_provider_call_once() {
 
 #[tokio::test]
 async fn organisation_operations_require_role_and_active_lifecycle() {
+    let _guard = test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
     };

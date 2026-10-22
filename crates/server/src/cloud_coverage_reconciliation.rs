@@ -77,6 +77,18 @@ pub struct CollectionTicket {
     pub completed_revision: Option<i64>,
 }
 
+/// Provider identity and freshness policy to bind to a successful complete collection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityReceiptInput {
+    pub provider_namespace: String,
+    pub provider_account_id: String,
+    pub provider_environment: String,
+    pub observed_at_epoch: i64,
+    pub fresh_until_epoch: i64,
+    pub policy_version: i32,
+    pub local_correction_digest: String,
+}
+
 /// A complete or explicitly unavailable observation for one registered source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceObservation {
@@ -660,6 +672,17 @@ pub async fn finish_collection(
     aggregate_evidence_reference: &str,
     observations: &[SourceObservation],
 ) -> Result<ReconciliationReceipt, ReconciliationError> {
+    finish_collection_with_authority(tx, ticket, aggregate_evidence_reference, observations, None)
+        .await
+}
+
+pub async fn finish_collection_with_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    ticket: &CollectionTicket,
+    aggregate_evidence_reference: &str,
+    observations: &[SourceObservation],
+    authority: Option<&AuthorityReceiptInput>,
+) -> Result<ReconciliationReceipt, ReconciliationError> {
     validate_identifier(&ticket.beneficiary_id, "beneficiary_id")?;
     validate_attempt_id(&ticket.attempt_id)?;
 
@@ -738,6 +761,9 @@ pub async fn finish_collection(
         observations,
         aggregate_evidence_reference,
     )?;
+    if authority.is_some() && !matches!(projection, CoverageProjection::Complete { .. }) {
+        return Err(ReconciliationError::OperationConflict);
+    }
     if current_attempt.as_deref() != Some(ticket.attempt_id.as_str())
         || current_generation != ticket.source_set_generation
         || current_epoch != ticket.collection_epoch
@@ -778,6 +804,52 @@ pub async fn finish_collection(
     .await?;
     if updated.rows_affected() != 1 {
         return Err(ReconciliationError::CollectionConflict);
+    }
+    if let Some(authority) = authority {
+        if authority.policy_version <= 0
+            || authority.observed_at_epoch <= 0
+            || authority.fresh_until_epoch <= authority.observed_at_epoch
+        {
+            return Err(ReconciliationError::OperationConflict);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO cloud_coverage_authority_receipts \
+             (beneficiary_id, projection_revision, attempt_id, provider_namespace, \
+              provider_account_id, provider_environment, source_set_generation, \
+              provider_invalidation_generation, policy_version, local_correction_digest, \
+              observed_at, fresh_until) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, to_timestamp($11), to_timestamp($12))",
+        )
+        .bind(&ticket.beneficiary_id)
+        .bind(publication.revision)
+        .bind(&ticket.attempt_id)
+        .bind(&authority.provider_namespace)
+        .bind(&authority.provider_account_id)
+        .bind(&authority.provider_environment)
+        .bind(ticket.source_set_generation)
+        .bind(current_invalidation_generation)
+        .bind(authority.policy_version)
+        .bind(&authority.local_correction_digest)
+        .bind(authority.observed_at_epoch)
+        .bind(authority.fresh_until_epoch)
+        .execute(&mut **tx)
+        .await?;
+        if inserted.rows_affected() != 1 {
+            return Err(ReconciliationError::CollectionConflict);
+        }
+        sqlx::query(
+            "UPDATE cloud_coverage_revalidation_jobs SET status = 'pending', \
+             next_attempt_at = to_timestamp($2) \
+                 + (($3 - $2) * (0.75 + random() * 0.1875) * interval '1 second'), \
+             attempt_count = 0, lease_owner = NULL, lease_token = NULL, \
+             lease_expires_at = NULL, last_error_code = NULL, updated_at = now() \
+             WHERE beneficiary_id = $1",
+        )
+        .bind(&ticket.beneficiary_id)
+        .bind(authority.observed_at_epoch)
+        .bind(authority.fresh_until_epoch)
+        .execute(&mut **tx)
+        .await?;
     }
     sqlx::query(
         "UPDATE cloud_coverage_coordinators SET current_attempt_id = NULL \

@@ -1748,6 +1748,21 @@ pub async fn complete_source_adjustment(
     .bind(source_adjustment_reference)
     .execute(&mut **tx)
     .await?;
+    let mut notice_organizations = Vec::new();
+    notice_organizations.extend(transfer.source_organization_id.clone());
+    notice_organizations.extend(transfer.destination_organization_id.clone());
+    crate::notifications::enqueue_payer_transfer_outcome_in_tx(
+        tx,
+        transfer_id,
+        &transfer.beneficiary_id,
+        &notice_organizations,
+        transfer.effective_from,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::notifications::NoticeError::Database(error) => TransferError::Database(error),
+        _ => TransferError::InvalidField("transfer notice"),
+    })?;
     load_transfer(tx, transfer_id).await
 }
 

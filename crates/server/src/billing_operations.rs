@@ -21,6 +21,7 @@ pub enum BillingOperationState {
     Succeeded,
     Failed,
     Unknown,
+    ManualReview,
 }
 
 impl BillingOperationState {
@@ -30,6 +31,7 @@ impl BillingOperationState {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Unknown => "unknown",
+            Self::ManualReview => "manual_review",
         }
     }
 
@@ -39,6 +41,7 @@ impl BillingOperationState {
             "succeeded" => Ok(Self::Succeeded),
             "failed" => Ok(Self::Failed),
             "unknown" => Ok(Self::Unknown),
+            "manual_review" => Ok(Self::ManualReview),
             _ => Err(BillingOperationError::CorruptState),
         }
     }
@@ -186,9 +189,22 @@ pub struct BillingOperation {
     pub quote_expires_at_epoch: i64,
     pub provider_idempotency_key: String,
     pub provider_operation_id: Option<String>,
+    pub provider_checkout_session_id: Option<String>,
+    pub provider_checkout_price_id: Option<String>,
+    pub provider_checkout_success_url: Option<String>,
+    pub provider_checkout_cancel_url: Option<String>,
     pub provider_checkout_url: Option<String>,
+    pub created_at_epoch: i64,
+    pub reconciliation_attempt_count: i32,
     pub state: BillingOperationState,
     pub result_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredPersonalCheckout {
+    pub operation_id: String,
+    pub session_id: String,
+    pub lease_token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,6 +478,176 @@ pub async fn record_provider_result(
     load_operation(tx, operation_id).await
 }
 
+/// Record a verified paid invoice as authoritative completion of a personal billing operation.
+/// Unlike a provider-call result, signed payment evidence may arrive while a recovery worker owns
+/// the lease or after the operation was parked for review. The invoice path has already verified
+/// the account, subscription, customer and payment binding before calling this function.
+pub async fn record_verified_paid_invoice(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+) -> Result<BillingOperation, BillingOperationError> {
+    let updated = sqlx::query(
+        "UPDATE billing_operations SET state = 'succeeded', result_code = 'source_restoration_paid', \
+         reconciliation_manual_review_required = FALSE, reconciliation_last_error_code = NULL, \
+         reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND (state IN ('pending','unknown','manual_review') \
+           OR (state = 'succeeded' AND result_code = 'checkout_created')) RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if updated.is_none() {
+        let existing = load_operation(tx, operation_id).await?;
+        if existing.state != BillingOperationState::Succeeded
+            || existing.result_code.as_deref() != Some("source_restoration_paid")
+        {
+            return Err(BillingOperationError::ResultConflict);
+        }
+    }
+    load_operation(tx, operation_id).await
+}
+
+/// Complete the personal Checkout creation fact under a worker lease. This records the hosted
+/// session only; invoice webhooks remain the sole authority for payment and coverage.
+pub async fn record_claimed_checkout_result(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    claim_token: &str,
+    session_id: &str,
+    checkout_url: &str,
+) -> Result<BillingOperation, BillingRecoveryError> {
+    if session_id.trim().is_empty() || checkout_url.trim().is_empty() {
+        return Err(BillingOperationError::InvalidField("checkout session").into());
+    }
+    let updated = sqlx::query(
+        "UPDATE billing_operations SET state = 'succeeded', provider_operation_id = $3, \
+         provider_checkout_session_id = $3, provider_checkout_url = $4, result_code = 'checkout_created', \
+         reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND reconciliation_lease_token = $2 \
+           AND state IN ('pending','unknown') RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .bind(claim_token)
+    .bind(session_id)
+    .bind(checkout_url)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(BillingOperationError::from)?;
+    if updated.is_none() {
+        let existing = load_operation(tx, operation_id).await?;
+        if existing.state == BillingOperationState::Succeeded
+            && existing.provider_checkout_session_id.as_deref() == Some(session_id)
+            && existing.provider_checkout_url.as_deref() == Some(checkout_url)
+            && existing.result_code.as_deref() == Some("checkout_created")
+        {
+            return Ok(existing);
+        }
+        return Err(BillingRecoveryError::InProgress);
+    }
+    Ok(load_operation(tx, operation_id).await?)
+}
+
+/// Persist the immutable provider inputs before the first Checkout request. An interrupted
+/// operation can then be replayed without consulting a changed price catalogue or base URL.
+pub async fn record_personal_checkout_request(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    price_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+) -> Result<BillingOperation, BillingOperationError> {
+    if price_id.trim().is_empty() || success_url.trim().is_empty() || cancel_url.trim().is_empty() {
+        return Err(BillingOperationError::InvalidField("checkout request"));
+    }
+    let updated = sqlx::query(
+        "UPDATE billing_operations SET provider_checkout_price_id = $2, \
+         provider_checkout_success_url = $3, provider_checkout_cancel_url = $4, updated_at = now() \
+         WHERE operation_id = $1 AND state = 'pending' \
+           AND (provider_checkout_price_id IS NULL OR provider_checkout_price_id = $2) \
+           AND (provider_checkout_success_url IS NULL OR provider_checkout_success_url = $3) \
+           AND (provider_checkout_cancel_url IS NULL OR provider_checkout_cancel_url = $4) \
+         RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .bind(price_id)
+    .bind(success_url)
+    .bind(cancel_url)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if updated.is_none() {
+        let existing = load_operation(tx, operation_id).await?;
+        if existing.provider_checkout_price_id.as_deref() != Some(price_id)
+            || existing.provider_checkout_success_url.as_deref() != Some(success_url)
+            || existing.provider_checkout_cancel_url.as_deref() != Some(cancel_url)
+        {
+            return Err(BillingOperationError::ResultConflict);
+        }
+    }
+    load_operation(tx, operation_id).await
+}
+
+/// Record Stripe's signed proof that a personal Checkout session expired before payment. This
+/// closes an interrupted create safely, including when the create worker still holds a lease.
+pub async fn record_checkout_expired(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    session_id: &str,
+) -> Result<BillingOperation, BillingOperationError> {
+    if session_id.trim().is_empty() {
+        return Err(BillingOperationError::InvalidField("checkout session"));
+    }
+    let updated = sqlx::query(
+        "UPDATE billing_operations SET state = 'failed', \
+         provider_operation_id = COALESCE(provider_operation_id, $2), \
+         provider_checkout_session_id = COALESCE(provider_checkout_session_id, $2), \
+         result_code = 'checkout_expired', reconciliation_manual_review_required = FALSE, \
+         reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND state IN ('pending','unknown','manual_review') \
+           AND (provider_operation_id IS NULL OR provider_operation_id = $2) \
+           AND (provider_checkout_session_id IS NULL OR provider_checkout_session_id = $2) \
+         RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if updated.is_none() {
+        let existing = load_operation(tx, operation_id).await?;
+        if existing.state == BillingOperationState::Succeeded
+            && existing.result_code.as_deref() == Some("checkout_created")
+            && existing
+                .provider_checkout_session_id
+                .as_deref()
+                .is_none_or(|stored| stored == session_id)
+            && existing
+                .provider_operation_id
+                .as_deref()
+                .is_none_or(|stored| stored == session_id)
+        {
+            sqlx::query(
+                "UPDATE billing_operations SET state = 'failed', result_code = 'checkout_expired', \
+                 provider_operation_id = COALESCE(provider_operation_id, $2), \
+                 provider_checkout_session_id = COALESCE(provider_checkout_session_id, $2), \
+                 reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now() \
+                 WHERE operation_id = $1 AND state = 'succeeded' \
+                   AND result_code = 'checkout_created' \
+                   AND (provider_operation_id IS NULL OR provider_operation_id = $2) \
+                   AND (provider_checkout_session_id IS NULL OR provider_checkout_session_id = $2)",
+            )
+            .bind(operation_id)
+            .bind(session_id)
+            .execute(&mut **tx)
+            .await?;
+        } else if existing.state != BillingOperationState::Failed
+            || existing.result_code.as_deref() != Some("checkout_expired")
+            || existing.provider_checkout_session_id.as_deref() != Some(session_id)
+        {
+            return Err(BillingOperationError::ResultConflict);
+        }
+    }
+    load_operation(tx, operation_id).await
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderResolution {
     Succeeded {
@@ -562,7 +748,7 @@ pub async fn reconcile_operation(
     Ok(resolved)
 }
 
-async fn claim_reconciliation(
+pub async fn claim_reconciliation(
     pool: &PgPool,
     operation_id: &str,
     claim_token: &str,
@@ -572,6 +758,7 @@ async fn claim_reconciliation(
         "UPDATE billing_operations SET reconciliation_lease_token = $2, \
          reconciliation_lease_until = now() + interval '5 minutes', updated_at = now() \
          WHERE operation_id = $1 AND state IN ('pending','unknown') \
+         AND reconciliation_next_attempt_at <= now() \
          AND (reconciliation_lease_until IS NULL OR reconciliation_lease_until < now()) \
          RETURNING operation_id",
     )
@@ -595,7 +782,43 @@ async fn claim_reconciliation(
     Err(BillingRecoveryError::InProgress)
 }
 
-async fn record_claimed_provider_result(
+/// Record one failed provider attempt, apply bounded backoff and park after a finite budget.
+/// Claims and normal waiting do not consume the failure budget.
+pub async fn release_reconciliation_failure(
+    pool: &PgPool,
+    operation_id: &str,
+    claim_token: &str,
+    error_code: &str,
+) -> Result<bool, BillingOperationError> {
+    if error_code.trim().is_empty()
+        || error_code.len() > 64
+        || !error_code
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err(BillingOperationError::InvalidField("recovery error code"));
+    }
+    let updated = sqlx::query_scalar::<_, bool>(
+        "UPDATE billing_operations SET reconciliation_attempt_count = reconciliation_attempt_count + 1, \
+         reconciliation_last_error_code = $3, \
+         reconciliation_manual_review_required = reconciliation_attempt_count + 1 >= 20, \
+         state = CASE WHEN reconciliation_attempt_count + 1 >= 20 THEN 'manual_review' ELSE 'unknown' END, \
+         result_code = CASE WHEN reconciliation_attempt_count + 1 >= 20 THEN 'manual_review_required' ELSE result_code END, \
+         reconciliation_next_attempt_at = now() + make_interval(secs => LEAST(21600, \
+           (60 * power(2, LEAST(reconciliation_attempt_count, 8)))::integer)), \
+         reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND reconciliation_lease_token = $2 AND state IN ('pending','unknown') \
+         RETURNING reconciliation_manual_review_required",
+    )
+    .bind(operation_id)
+    .bind(claim_token)
+    .bind(error_code)
+    .fetch_optional(pool)
+    .await?;
+    Ok(updated.unwrap_or(false))
+}
+
+pub(crate) async fn record_claimed_provider_result(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: &str,
     claim_token: &str,
@@ -634,6 +857,56 @@ async fn record_claimed_provider_result(
     Ok(load_operation(tx, operation_id).await?)
 }
 
+pub(crate) async fn park_reconciliation_for_review(
+    pool: &PgPool,
+    operation_id: &str,
+    claim_token: &str,
+    result_code: &str,
+) -> Result<bool, BillingOperationError> {
+    if result_code.trim().is_empty()
+        || result_code.len() > 64
+        || !result_code
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err(BillingOperationError::InvalidField("review result code"));
+    }
+    let parked = sqlx::query_scalar::<_, String>(
+        "UPDATE billing_operations SET state = 'manual_review', result_code = $3, \
+         reconciliation_manual_review_required = TRUE, reconciliation_last_error_code = $3, \
+         reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND reconciliation_lease_token = $2 \
+           AND state IN ('pending','unknown') RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .bind(claim_token)
+    .bind(result_code)
+    .fetch_optional(pool)
+    .await?;
+    Ok(parked.is_some())
+}
+
+/// Stop a customer retry from issuing a Checkout request after Stripe may have pruned the
+/// operation's idempotency key. The operation stays bound to its existing personal account for
+/// operator review; a retry never creates a new provider identity.
+pub async fn park_personal_checkout_outside_idempotency_window(
+    pool: &PgPool,
+    operation_id: &str,
+) -> Result<bool, BillingOperationError> {
+    let parked = sqlx::query_scalar::<_, String>(
+        "UPDATE billing_operations SET state = 'manual_review', result_code = 'provider_idempotency_window_elapsed', \
+         reconciliation_manual_review_required = TRUE, reconciliation_last_error_code = 'provider_idempotency_window_elapsed', \
+         reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now() \
+         WHERE operation_id = $1 AND state = 'pending' AND provider_checkout_session_id IS NULL \
+           AND provider_checkout_url IS NULL AND created_at <= now() - interval '23 hours' \
+         RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(parked.is_some())
+}
+
 fn validate_provider_result(
     state: BillingOperationState,
     result_code: Option<&str>,
@@ -666,13 +939,128 @@ pub async fn load_reconciliation_candidates(
     let rows = sqlx::query(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
-         provider_operation_id, provider_checkout_url, state, result_code FROM billing_operations \
-         WHERE state IN ('pending','unknown') ORDER BY updated_at, operation_id LIMIT $1",
+         provider_operation_id, provider_checkout_session_id, provider_checkout_price_id, \
+         provider_checkout_success_url, provider_checkout_cancel_url, provider_checkout_url, \
+         extract(epoch from created_at)::bigint AS created_at_epoch, reconciliation_attempt_count, \
+         state, result_code FROM billing_operations WHERE state IN ('pending','unknown') \
+           AND NOT reconciliation_manual_review_required AND reconciliation_next_attempt_at <= now() \
+           AND (reconciliation_lease_until IS NULL OR reconciliation_lease_until < now()) \
+         ORDER BY reconciliation_next_attempt_at, updated_at, operation_id LIMIT $1",
     )
     .bind(limit)
     .fetch_all(pool)
     .await?;
     rows.into_iter().map(operation_from_row).collect()
+}
+
+/// Load only operations whose immutable identity is still bound to a personal billing account.
+/// The personal recovery worker must not claim organisation operations or park them as corrupt.
+pub async fn load_personal_reconciliation_candidates(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<BillingOperation>, BillingOperationError> {
+    if !(1..=100).contains(&limit) {
+        return Err(BillingOperationError::InvalidField("recovery limit"));
+    }
+    let rows = sqlx::query(
+        "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
+         beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
+         provider_operation_id, provider_checkout_session_id, provider_checkout_price_id, \
+         provider_checkout_success_url, provider_checkout_cancel_url, provider_checkout_url, \
+         extract(epoch from created_at)::bigint AS created_at_epoch, reconciliation_attempt_count, \
+         state, result_code FROM billing_operations AS operation \
+         WHERE state IN ('pending','unknown') AND NOT reconciliation_manual_review_required \
+           AND reconciliation_next_attempt_at <= now() \
+           AND (reconciliation_lease_until IS NULL OR reconciliation_lease_until < now()) \
+           AND EXISTS (SELECT 1 FROM billing_personal_accounts AS account \
+                       WHERE account.operation_id = operation.operation_id) \
+         ORDER BY reconciliation_next_attempt_at, updated_at, operation_id LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(operation_from_row).collect()
+}
+
+/// Claim one locally expired pending personal account with a known Checkout session. Older
+/// rows stored only the provider Checkout URL, so the session identifier may need to be recovered
+/// from its path.
+pub async fn claim_expired_personal_checkout(
+    pool: &PgPool,
+    lease_token: &str,
+    user_id: Option<&str>,
+) -> Result<Option<ExpiredPersonalCheckout>, BillingOperationError> {
+    if lease_token.trim().is_empty() {
+        return Err(BillingOperationError::InvalidField("recovery lease token"));
+    }
+    let row = sqlx::query(
+        "WITH candidate AS (\
+           SELECT operation.operation_id, \
+                  COALESCE(\
+                    CASE WHEN left(operation.provider_checkout_session_id, 3) = 'cs_' \
+                         THEN operation.provider_checkout_session_id END, \
+                    CASE WHEN left(operation.provider_operation_id, 3) = 'cs_' \
+                         THEN operation.provider_operation_id END, \
+                    substring(operation.provider_checkout_url FROM '/(cs_[A-Za-z0-9_]+)')\
+                  ) AS session_id \
+           FROM billing_operations AS operation \
+           JOIN billing_personal_accounts AS account USING (operation_id) \
+           WHERE account.state = 'pending' \
+             AND account.pending_expires_at_epoch <= extract(epoch FROM now())::bigint \
+             AND operation.payer_id = account.user_id \
+             AND operation.beneficiary_id = account.user_id \
+             AND operation.result_code IN ('checkout_created', 'provider_idempotency_window_elapsed') \
+             AND COALESCE(\
+                   CASE WHEN left(operation.provider_checkout_session_id, 3) = 'cs_' \
+                        THEN operation.provider_checkout_session_id END, \
+                   CASE WHEN left(operation.provider_operation_id, 3) = 'cs_' \
+                        THEN operation.provider_operation_id END, \
+                   substring(operation.provider_checkout_url FROM '/(cs_[A-Za-z0-9_]+)')\
+                 ) IS NOT NULL \
+             AND ($2::text IS NULL OR account.user_id = $2) \
+             AND operation.reconciliation_next_attempt_at <= now() \
+             AND (operation.reconciliation_lease_until IS NULL OR operation.reconciliation_lease_until < now()) \
+           ORDER BY account.pending_expires_at_epoch, operation.operation_id \
+           LIMIT 1 FOR UPDATE OF operation SKIP LOCKED\
+         ) \
+         UPDATE billing_operations AS operation \
+         SET reconciliation_lease_token = $1, reconciliation_lease_until = now() + interval '5 minutes', \
+             updated_at = now() \
+         FROM candidate \
+         WHERE operation.operation_id = candidate.operation_id \
+         RETURNING operation.operation_id, candidate.session_id",
+    )
+    .bind(lease_token)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| {
+        Ok(ExpiredPersonalCheckout {
+            operation_id: row.try_get("operation_id")?,
+            session_id: row.try_get("session_id")?,
+            lease_token: lease_token.to_string(),
+        })
+    })
+    .transpose()
+}
+
+/// Release a session-status check without changing the billing operation's outcome.
+pub async fn release_expired_personal_checkout_check(
+    pool: &PgPool,
+    operation_id: &str,
+    lease_token: &str,
+) -> Result<bool, BillingOperationError> {
+    let released = sqlx::query_scalar::<_, String>(
+        "UPDATE billing_operations SET reconciliation_lease_token = NULL, \
+         reconciliation_lease_until = NULL, reconciliation_next_attempt_at = now() + interval '5 minutes', \
+         updated_at = now() WHERE operation_id = $1 AND reconciliation_lease_token = $2 \
+         RETURNING operation_id",
+    )
+    .bind(operation_id)
+    .bind(lease_token)
+    .fetch_optional(pool)
+    .await?;
+    Ok(released.is_some())
 }
 
 /// Load one operation only when it belongs to the authenticated actor. A missing row and a row
@@ -685,7 +1073,9 @@ pub async fn load_operation_for_actor(
     let row = sqlx::query(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
-         provider_operation_id, provider_checkout_url, state, result_code \
+         provider_operation_id, provider_checkout_session_id, provider_checkout_price_id, \
+         provider_checkout_success_url, provider_checkout_cancel_url, provider_checkout_url, \
+         extract(epoch from created_at)::bigint AS created_at_epoch, reconciliation_attempt_count, state, result_code \
          FROM billing_operations WHERE operation_id = $1",
     )
     .bind(operation_id)
@@ -705,7 +1095,10 @@ async fn load_operation(
     let row = sqlx::query(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
-         provider_operation_id, provider_checkout_url, state, result_code FROM billing_operations WHERE operation_id = $1",
+         provider_operation_id, provider_checkout_session_id, provider_checkout_price_id, \
+         provider_checkout_success_url, provider_checkout_cancel_url, provider_checkout_url, \
+         extract(epoch from created_at)::bigint AS created_at_epoch, reconciliation_attempt_count, \
+         state, result_code FROM billing_operations WHERE operation_id = $1",
     )
     .bind(operation_id)
     .fetch_one(&mut **tx)
@@ -720,7 +1113,10 @@ async fn load_operation_by_id(
     let row = sqlx::query(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
-         provider_operation_id, provider_checkout_url, state, result_code FROM billing_operations WHERE operation_id = $1",
+         provider_operation_id, provider_checkout_session_id, provider_checkout_price_id, \
+         provider_checkout_success_url, provider_checkout_cancel_url, provider_checkout_url, \
+         extract(epoch from created_at)::bigint AS created_at_epoch, reconciliation_attempt_count, \
+         state, result_code FROM billing_operations WHERE operation_id = $1",
     )
     .bind(operation_id)
     .fetch_one(pool)
@@ -736,7 +1132,9 @@ async fn load_by_idempotency(
     let row = sqlx::query(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
-         provider_operation_id, provider_checkout_url, state, result_code FROM billing_operations \
+         provider_operation_id, provider_checkout_session_id, provider_checkout_price_id, \
+         provider_checkout_success_url, provider_checkout_cancel_url, provider_checkout_url, \
+         extract(epoch from created_at)::bigint AS created_at_epoch, reconciliation_attempt_count, state, result_code FROM billing_operations \
          WHERE actor_user_id = $1 AND idempotency_key = $2 FOR UPDATE",
     )
     .bind(actor_user_id)
@@ -761,7 +1159,13 @@ fn operation_from_row(
         quote_expires_at_epoch: row.try_get("quote_expires_at_epoch")?,
         provider_idempotency_key: row.try_get("provider_idempotency_key")?,
         provider_operation_id: row.try_get("provider_operation_id")?,
+        provider_checkout_session_id: row.try_get("provider_checkout_session_id")?,
+        provider_checkout_price_id: row.try_get("provider_checkout_price_id")?,
+        provider_checkout_success_url: row.try_get("provider_checkout_success_url")?,
+        provider_checkout_cancel_url: row.try_get("provider_checkout_cancel_url")?,
         provider_checkout_url: row.try_get("provider_checkout_url")?,
+        created_at_epoch: row.try_get("created_at_epoch")?,
+        reconciliation_attempt_count: row.try_get("reconciliation_attempt_count")?,
         state: BillingOperationState::parse(row.try_get::<String, _>("state")?.as_str())?,
         result_code: row.try_get("result_code")?,
     })

@@ -13,6 +13,11 @@ vi.mock("../api", () => ({
   createPersonalCheckout: vi.fn(),
   createPersonalPortal: vi.fn(),
   fetchCloudExportChunk: vi.fn(),
+  confirmCloudContactVerification: vi.fn(),
+  fetchCloudContactStatus: vi.fn(),
+  revokeCloudContact: vi.fn(),
+  startCloudContactVerification: vi.fn(),
+  UnsupportedCloudContactError: class UnsupportedCloudContactError extends Error {},
   fetchCloudNotices: vi.fn(),
   fetchPayerTransferCapabilities: vi.fn(),
   fetchPayerTransfer: vi.fn(),
@@ -46,6 +51,11 @@ beforeEach(() => {
   vi.mocked(api.fetchMembers).mockResolvedValue([]);
   vi.mocked(api.fetchEligibility).mockResolvedValue(eligibility);
   vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
+  vi.mocked(api.fetchCloudContactStatus).mockResolvedValue({
+    email: null,
+    pendingExpiresAtEpoch: null,
+    enrolmentAvailable: false,
+  });
 });
 
 afterEach(() => {

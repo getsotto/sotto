@@ -6,6 +6,11 @@ import * as api from "../api";
 import { CloudAccountPanel } from "../CloudAccountPanel";
 
 vi.mock("../api", () => ({
+  confirmCloudContactVerification: vi.fn(),
+  fetchCloudContactStatus: vi.fn(),
+  UnsupportedCloudContactError: class UnsupportedCloudContactError extends Error {},
+  revokeCloudContact: vi.fn(),
+  startCloudContactVerification: vi.fn(),
   cancelPersonalBilling: vi.fn(),
   acceptPayerTransfer: vi.fn(),
   beginPayerTransfer: vi.fn(),
@@ -49,6 +54,7 @@ beforeEach(() => {
     payer: null, deploymentMode: "cloud",
   });
   vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
+  vi.mocked(api.fetchCloudContactStatus).mockResolvedValue({ email: null, pendingExpiresAtEpoch: null, enrolmentAvailable: false });
 });
 
 afterEach(() => {

@@ -293,7 +293,7 @@ async fn reconcile_award(pool: &PgPool, award_id: &str, now_epoch: i64) -> Resul
         sqlx::query(
             "UPDATE cloud_notice_outbox SET status='pending', cancelled_at=NULL, \
                  available_at=due_at, updated_at=now() \
-             WHERE recipient_user_id=$1 AND event_key=$2 AND policy_key=$3 AND channel='in_app' \
+             WHERE recipient_user_id=$1 AND event_key=$2 AND policy_key=$3 AND channel IN ('in_app','email') \
                AND status='cancelled' AND delivered_at IS NULL AND due_at=to_timestamp($4) \
                AND payload=$5::jsonb",
         )
@@ -314,6 +314,7 @@ async fn reconcile_award(pool: &PgPool, award_id: &str, now_epoch: i64) -> Resul
                 kind: NoticeKind::PriceChange,
                 channel: NoticeChannel::InApp,
                 contact_id: None,
+                scope_id: None,
                 due_at_epoch: due_at,
                 content: payload.clone(),
             },

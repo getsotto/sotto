@@ -14,6 +14,7 @@
 FROM rust:1-bookworm AS build
 WORKDIR /app
 COPY . .
+ARG SOTTO_BUILD_SHA
 RUN cargo build --release -p sotto-server
 
 FROM debian:bookworm-slim

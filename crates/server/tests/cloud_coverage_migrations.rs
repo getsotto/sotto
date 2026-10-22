@@ -942,3 +942,168 @@ async fn migration_0038_allows_named_allocations_to_share_a_provider_item() {
     assert_eq!(count, 2);
     database.cleanup().await;
 }
+
+#[tokio::test]
+async fn migration_0067_queues_registered_sources_for_authority_revalidation() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    db::migrate(&database.pool)
+        .await
+        .expect("apply all migrations");
+    let beneficiary = format!("authority-migration-{}", uuid::Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'authority-migration', $1)",
+    )
+    .bind(&beneficiary)
+    .execute(&database.pool)
+    .await
+    .expect("insert beneficiary");
+    let source = SourceBinding {
+        beneficiary_id: beneficiary.clone(),
+        source_id: format!("{beneficiary}:source"),
+        provider_namespace: "stripe".into(),
+        external_allocation_reference: format!("{beneficiary}:allocation"),
+        ownership_evidence_reference: format!("{beneficiary}:ownership"),
+    };
+    let mut tx = database.pool.begin().await.expect("begin registration");
+    register_source(&mut tx, &format!("{beneficiary}:registration"), &source)
+        .await
+        .expect("register source");
+    tx.commit().await.expect("commit registration");
+    let generation_before: i64 = sqlx::query_scalar(
+        "SELECT provider_invalidation_generation FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&beneficiary)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read pre-correction generation");
+    sqlx::query(
+        "INSERT INTO billing_correction_requests \
+         (request_id, requester_user_id, beneficiary_id, payer_kind, payment_reference, \
+          subscription_id, reason, policy_version, idempotency_key, request_hash, \
+          full_refund_requested, state, preserve_paid_term, early_termination_confirmed_at_epoch, \
+          effective_at_epoch, result_code) \
+         VALUES ($1, $2, $2, 'personal', 'pi_authority_test', 'sub_authority_test', \
+                 'billing_error', 'policy-v1', $3, 'hash-v1', TRUE, 'refunded', FALSE, \
+                 1800000000, 1800000000, 'succeeded')",
+    )
+    .bind(format!("{beneficiary}:correction"))
+    .bind(&beneficiary)
+    .bind(format!("{beneficiary}:idempotency"))
+    .execute(&database.pool)
+    .await
+    .expect("insert confirmed early termination");
+    let generation_after: i64 = sqlx::query_scalar(
+        "SELECT provider_invalidation_generation FROM cloud_coverage_coordinators WHERE beneficiary_id = $1",
+    )
+    .bind(&beneficiary)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read post-correction generation");
+    assert_eq!(generation_after, generation_before + 1);
+    let queued: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cloud_coverage_revalidation_jobs \
+         WHERE beneficiary_id = $1 AND status = 'pending' AND next_attempt_at <= now())",
+    )
+    .bind(&beneficiary)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read revalidation job");
+    assert!(
+        queued,
+        "a new source must be scheduled independently of events"
+    );
+    sqlx::query("DELETE FROM cloud_coverage_sources WHERE beneficiary_id = $1")
+        .bind(&beneficiary)
+        .execute(&database.pool)
+        .await
+        .expect("delete registered source");
+    sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id = $1")
+        .bind(&beneficiary)
+        .execute(&database.pool)
+        .await
+        .expect("delete coordinator with derived revalidation job");
+    let job_remains: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cloud_coverage_revalidation_jobs WHERE beneficiary_id = $1)",
+    )
+    .bind(&beneficiary)
+    .fetch_one(&database.pool)
+    .await
+    .expect("check coordinator cleanup");
+    assert!(
+        !job_remains,
+        "coordinator deletion cascades its derived queue row"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn migration_0071_parks_legacy_checkout_created_without_recovery_request() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    migrator_before(71)
+        .run(&database.pool)
+        .await
+        .expect("apply schema before sponsored recovery migration");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("sponsored-recovery-owner-{suffix}");
+    let beneficiary = format!("sponsored-recovery-beneficiary-{suffix}");
+    let organisation = format!("sponsored-recovery-organisation-{suffix}");
+    let operation = format!("sponsored-recovery-operation-{suffix}");
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES \
+         ($1, 'sponsored-recovery-migration', $1), ($2, 'sponsored-recovery-migration', $2)",
+    )
+    .bind(&owner)
+    .bind(&beneficiary)
+    .execute(&database.pool)
+    .await
+    .expect("insert sponsored recovery users");
+    sqlx::query(
+        "INSERT INTO organizations (id, enc_name, created_by) \
+         VALUES ($1, decode('6f7267', 'hex'), $2)",
+    )
+    .bind(&organisation)
+    .bind(&owner)
+    .execute(&database.pool)
+    .await
+    .expect("insert sponsored recovery organisation");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_operations \
+         (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action, \
+          beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from, \
+          provider_idempotency_key, provider_checkout_url, provider_checkout_session_id, state) \
+         VALUES ($1, $2, $3, $4, 'legacy-hash', 'add', $5, 'standard_monthly', 1, \
+                 1800000000, 1700000000, $6, 'https://checkout.stripe.test/session', \
+                 'cs_legacy_checkout_created', 'checkout_created')",
+    )
+    .bind(&operation)
+    .bind(&organisation)
+    .bind(&owner)
+    .bind(format!("legacy-idempotency-{suffix}"))
+    .bind(&beneficiary)
+    .bind(format!("legacy-provider-idempotency-{suffix}"))
+    .execute(&database.pool)
+    .await
+    .expect("insert pre-recovery checkout operation");
+
+    db::migrate(&database.pool)
+        .await
+        .expect("apply sponsored recovery migration");
+    let row: (String, Option<String>, bool) = sqlx::query_as(
+        "SELECT state, recovery_last_error_code, recovery_manual_review_required \
+         FROM billing_sponsored_operations WHERE operation_id = $1",
+    )
+    .bind(&operation)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read migrated legacy operation");
+    assert_eq!(row.0, "manual_review");
+    assert_eq!(row.1.as_deref(), Some("request_facts_missing"));
+    assert!(row.2);
+
+    database.cleanup().await;
+}

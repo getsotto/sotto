@@ -117,6 +117,44 @@ describe("payer transfer journeys", () => {
     expect(screen.queryByRole("button", { name: "Load older transfers" })).not.toBeInTheDocument();
   });
 
+  it("does not claim an empty inbox when the first list request fails", async () => {
+    vi.mocked(api.fetchPayerTransfers)
+      .mockRejectedValueOnce(new Error("server error (503)"))
+      .mockRejectedValueOnce(new Error("server error (503)"))
+      .mockResolvedValueOnce({ transfers: [], nextCursor: null })
+      .mockResolvedValueOnce({ transfers: [transfer()], nextCursor: null });
+    render(<PayerTransferInbox />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("The transfer service is temporarily unavailable");
+    const refreshButton = screen.getByRole("button", { name: "Refresh transfers" });
+    expect(refreshButton).toBeEnabled();
+    expect(screen.queryByText("There are no payer transfer requests for this account.")).not.toBeInTheDocument();
+
+    fireEvent.click(refreshButton);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.queryByText("There are no payer transfer requests for this account.")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh transfers" }));
+    expect(await screen.findByText("There are no payer transfer requests for this account.")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh transfers" }));
+    expect(await screen.findByText("Incoming request")).toBeInTheDocument();
+    expect(screen.queryByText("There are no payer transfer requests for this account.")).not.toBeInTheDocument();
+  });
+
+  it("keeps loaded requests visible when a later refresh fails", async () => {
+    vi.mocked(api.fetchPayerTransfers)
+      .mockResolvedValueOnce({ transfers: [transfer()], nextCursor: null })
+      .mockRejectedValueOnce(new Error("server error (503)"));
+    render(<PayerTransferInbox />);
+    expect(await screen.findByText("Incoming request")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh transfers" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("The transfer service is temporarily unavailable");
+    expect(screen.getByText("Incoming request")).toBeInTheDocument();
+    expect(screen.queryByText("There are no payer transfer requests for this account.")).not.toBeInTheDocument();
+  });
+
   it("shows invitations as expired once their renewal boundary has passed", async () => {
     vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
       transfers: [transfer({ effectiveFrom: 1 })],

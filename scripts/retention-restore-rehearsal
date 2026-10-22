@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""Verify a restored scratch database, replay retention tombstones twice, and sign the result.
+
+The dump must already be restored into a dedicated local scratch database. This command never
+connects to the live deployment and emits only fingerprints, counts and the signed request body.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import secrets
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def load_script(module_name: str, filename: str):
+    loader = importlib.machinery.SourceFileLoader(module_name, str(ROOT / "scripts" / filename))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+replay = load_script("retention_replay", "replay-retention-journal")
+restore_check = load_script("retention_restore_check", "check-restore")
+
+
+def local_scratch_database(url: str) -> None:
+    parts = urllib.parse.urlsplit(url)
+    database = parts.path.lstrip("/")
+    if parts.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError("scratch database must be on localhost")
+    if not database.startswith("retention_restore_"):
+        raise ValueError("scratch database name must start with retention_restore_")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_restored_database(database_url: str, migrations: list[str]) -> None:
+    applied, tables, counts = restore_check.inspect(restore_check.Database(database_url))
+    problems = (
+        restore_check.check_migrations(applied, migrations)
+        + restore_check.check_tables(tables)
+        + restore_check.check_not_empty(counts)
+    )
+    if problems:
+        raise ValueError("restored database failed structural checks: " + "; ".join(problems))
+
+
+def evidence_payload(evidence: dict) -> bytes:
+    fields = [
+        "sotto-cloud-retention-restore-v1",
+        evidence["evidence_id"],
+        evidence["release_sha"],
+        evidence["backup_fingerprint"],
+        evidence["sidecar_sha256"],
+        str(evidence["journal_entry_count"]),
+        str(evidence["replay_entry_count"]),
+        str(evidence["first_replay_deleted_count"]),
+        str(evidence["second_replay_deleted_count"]),
+        str(evidence["incarnation_guard_verified"]).lower(),
+    ]
+    return "\n".join(f"{len(field)}:{field}" for field in fields).encode("ascii")
+
+
+def sign_evidence(evidence: dict, key: bytes) -> dict:
+    signed = dict(evidence)
+    signed["signature"] = hmac.new(key, evidence_payload(evidence), hashlib.sha256).hexdigest()
+    return signed
+
+
+def verify_incarnation_guards(database_url: str) -> None:
+    """Exercise every resource identity guard against newer rows in the scratch restore."""
+    env = replay.connection_env(database_url)
+    owner = subprocess.run(
+        ["psql", "-At", "-v", "ON_ERROR_STOP=1", "-c", "SELECT id FROM users ORDER BY id LIMIT 1"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+    if not owner or "\n" in owner:
+        raise ValueError("scratch restore has no usable account for the identity-guard check")
+
+    owner_sql = "'" + owner.replace("'", "''") + "'"
+    suffix = secrets.token_hex(12)
+    project_id = f"retention_guard_project_{suffix}"
+    environment_id = f"retention_guard_environment_{suffix}"
+    token_id = f"retention_guard_token_{suffix}"
+    seed = f"""\
+BEGIN;
+INSERT INTO projects(id,owner_id,enc_name) VALUES ('{project_id}', {owner_sql}, decode('01','hex'));
+INSERT INTO environments(id,project_id,enc_name,revision) VALUES ('{environment_id}', '{project_id}', decode('02','hex'), 9);
+INSERT INTO environment_grants(env_id,user_id,enc_vault_key) VALUES ('{environment_id}', {owner_sql}, decode('03','hex'));
+INSERT INTO machine_tokens(id,env_id,name,token_hash,public_key,enc_vault_key,created_by,expires_at,beneficiary_id,beneficiary_status)
+VALUES ('{token_id}', '{environment_id}', 'retention-guard', decode('{suffix}', 'hex'), decode('04','hex'), decode('05','hex'), {owner_sql}, now()+interval '7 days', {owner_sql}, 'verified');
+COMMIT;
+"""
+    subprocess.run(
+        ["psql", "-v", "ON_ERROR_STOP=1"],
+        input=seed,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    identity_row = subprocess.run(
+        [
+            "psql",
+            "-At",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-c",
+            "SELECT (extract(epoch FROM created_at)*1000000)::bigint FROM environments WHERE id='{}'".format(
+                environment_id
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    ).stdout.strip()
+    try:
+        environment_created = int(identity_row)
+    except (ValueError, TypeError) as error:
+        raise ValueError("scratch identity-guard rows could not be inspected") from error
+
+    entries = []
+    for index, (kind, resource_id, created, revision) in enumerate(
+        (
+            ("project", project_id, 1, None),
+            ("environment", environment_id, environment_created, 8),
+            ("grant", json.dumps([environment_id, owner], separators=(",", ":")), 1, None),
+            ("machine_token", json.dumps([token_id, environment_id], separators=(",", ":")), 1, None),
+        ),
+        1,
+    ):
+        entries.append(
+            replay.Entry(
+                f"journal:canary-{index}",
+                kind,
+                resource_id,
+                "personal",
+                owner,
+                created,
+                revision,
+            )
+        )
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False) as sidecar:
+        canary_path = Path(sidecar.name)
+        os.chmod(canary_path, 0o600)
+        for entry in entries:
+            json.dump(
+                {
+                    "format_version": 2,
+                    "journal_id": entry.journal_id,
+                    "job_id": "retention-guard-canary",
+                    "resource_kind": entry.resource_kind,
+                    "resource_id": entry.resource_id,
+                    "ownership_kind": entry.ownership_kind,
+                    "expected_owner_id": entry.expected_owner_id,
+                    "expected_created_at": entry.expected_created_at,
+                    "expected_revision": entry.expected_revision,
+                    "action": "deleted",
+                    "tombstone": {},
+                    "recorded_at": "2026-10-21T00:00:00Z",
+                },
+                sidecar,
+            )
+            sidecar.write("\n")
+    try:
+        parsed = replay.parse_journal(str(canary_path))
+        count, deleted = replay.replay(database_url, parsed)
+        if count != 4 or deleted != 0:
+            raise ValueError("a recreated canary row was deleted by a stale tombstone")
+        present = subprocess.run(
+            [
+                "psql",
+                "-At",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "SELECT (SELECT count(*) FROM projects WHERE id='{}') + "
+                "(SELECT count(*) FROM environments WHERE id='{}') + "
+                "(SELECT count(*) FROM environment_grants WHERE env_id='{}') + "
+                "(SELECT count(*) FROM machine_tokens WHERE id='{}')".format(
+                    project_id, environment_id, environment_id, token_id
+                ),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        ).stdout.strip()
+        if present != "4":
+            raise ValueError("a recreated canary row did not survive the stale tombstone")
+    finally:
+        canary_path.unlink(missing_ok=True)
+        cleanup = f"""\
+DELETE FROM machine_tokens WHERE id='{token_id}';
+DELETE FROM environment_grants WHERE env_id='{environment_id}';
+DELETE FROM environments WHERE id='{environment_id}';
+DELETE FROM projects WHERE id='{project_id}';
+"""
+        subprocess.run(
+            ["psql", "-v", "ON_ERROR_STOP=1"],
+            input=cleanup,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+
+def write_private_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def run(args: argparse.Namespace) -> dict:
+    if not args.operator or len(args.operator) > 80 or any(ord(char) < 32 for char in args.operator):
+        raise ValueError("operator label must contain 1 to 80 printable characters")
+    database_url = os.environ.get("SOTTO_RETENTION_REHEARSAL_DATABASE_URL", "")
+    if not database_url:
+        raise ValueError("SOTTO_RETENTION_REHEARSAL_DATABASE_URL must name the local scratch database")
+    local_scratch_database(database_url)
+
+    backup = Path(args.backup)
+    journal = Path(args.journal)
+    key_path = Path(args.evidence_key_file)
+    for path, label in ((backup, "backup"), (journal, "journal"), (key_path, "evidence key")):
+        if not path.is_file():
+            raise ValueError(f"{label} file is unavailable")
+    key_stat = key_path.stat()
+    if stat.S_IMODE(key_stat.st_mode) & 0o077:
+        raise ValueError("evidence key file must not be accessible by group or other users")
+    key = key_path.read_bytes()
+    if len(key) < 32:
+        raise ValueError("evidence key must contain at least 32 bytes")
+
+    current_sha = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    dirty_tree = subprocess.run(
+        ["git", "-C", str(ROOT), "status", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if dirty_tree:
+        raise ValueError("source tree must be clean before signing restore evidence")
+    if not SHA_RE.fullmatch(current_sha) or args.release_sha != current_sha:
+        raise ValueError("release SHA must match the full commit checked out in this source tree")
+
+    subprocess.run(
+        ["pg_restore", "--list", str(backup)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    entries = replay.parse_journal(str(journal))
+    migrations = restore_check.repository_migrations(str(ROOT / "crates/server/migrations"))
+    validate_restored_database(database_url, migrations)
+
+    replay_count, first_deleted = replay.replay(database_url, entries)
+    if replay_count != len(entries) or first_deleted > replay_count:
+        raise ValueError("first tombstone replay returned inconsistent counts")
+    second_count, second_deleted = replay.replay(database_url, entries)
+    if second_count != replay_count or second_deleted != 0:
+        raise ValueError("second tombstone replay was not an idempotent no-op")
+    verify_incarnation_guards(database_url)
+    validate_restored_database(database_url, migrations)
+
+    evidence = {
+        "evidence_id": f"restore-evidence:{secrets.token_hex(16)}",
+        "release_sha": current_sha,
+        "backup_fingerprint": sha256_file(backup),
+        "sidecar_sha256": sha256_file(journal),
+        "journal_entry_count": len(entries),
+        "replay_entry_count": replay_count,
+        "first_replay_deleted_count": first_deleted,
+        "second_replay_deleted_count": second_deleted,
+        "incarnation_guard_verified": True,
+    }
+    return {
+        "operator": args.operator,
+        "evidence": sign_evidence(evidence, key),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backup", required=True, help="the exact custom-format dump restored to scratch")
+    parser.add_argument("--journal", required=True, help="matching retention tombstone sidecar")
+    parser.add_argument("--evidence-key-file", required=True, help="0600 file containing the evidence HMAC key")
+    parser.add_argument("--release-sha", required=True, help="full commit SHA of this source tree and server build")
+    parser.add_argument("--operator", required=True, help="audited operator label")
+    parser.add_argument("--output", required=True, help="private JSON request body for evidence registration")
+    args = parser.parse_args()
+    try:
+        result = run(args)
+        write_private_json(Path(args.output), result)
+    except subprocess.CalledProcessError:
+        print("retention restore rehearsal failed: a required local restore/replay command failed", file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as error:
+        print(f"retention restore rehearsal failed: {error}", file=sys.stderr)
+        return 1
+    evidence = result["evidence"]
+    print(
+        "retention restore rehearsal passed: "
+        f"journal entries={evidence['journal_entry_count']}; "
+        f"first deletions={evidence['first_replay_deleted_count']}; second deletions=0"
+    )
+    print(f"signed evidence request written with mode 0600: {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
