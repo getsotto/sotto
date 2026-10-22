@@ -378,6 +378,142 @@ fn task_ls_fails_when_manifest_is_invalid_without_partial_output_or_source_echo(
     assert!(!data.exists());
 }
 
+#[test]
+fn task_ls_json_emits_valid_structured_metadata_in_deterministic_order() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    let data = temp.path().join("sotto-data");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("sotto.toml"),
+        "project_id = \"11111111-1111-1111-1111-111111111111\"\nproject = \"example\"\nenvironment = \"dev\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("sotto.tasks.toml"),
+        r#"version = 1
+
+[[task]]
+name = "zeta"
+description = "Zeta task with \"escaped\" quotes and \\path"
+executable = "missing-binary-xyz"
+environments = ["stage", "prod"]
+
+[[task]]
+name = "alpha"
+description = "Alpha task with unicode: 🚀"
+executable = "cargo"
+args = ["test"]
+environments = ["dev"]
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+        .args(["task", "ls", "--json"])
+        .current_dir(&project)
+        .env("SOTTO_DATA_DIR", &data)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let arr = parsed.as_array().expect("output must be a JSON array");
+    assert_eq!(arr.len(), 2);
+
+    assert_eq!(arr[0]["name"], "alpha");
+    assert_eq!(arr[0]["description"], "Alpha task with unicode: 🚀");
+    assert_eq!(arr[0]["environments"], serde_json::json!(["dev"]));
+
+    assert_eq!(arr[1]["name"], "zeta");
+    assert_eq!(
+        arr[1]["description"],
+        "Zeta task with \"escaped\" quotes and \\path"
+    );
+    assert_eq!(arr[1]["environments"], serde_json::json!(["stage", "prod"]));
+
+    assert!(
+        !data.exists(),
+        "task ls --json must not initialise local secret state"
+    );
+}
+
+#[test]
+fn task_ls_json_works_from_nested_directory() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    let data = temp.path().join("sotto-data");
+    let nested = project.join("deep/sub/dir");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(
+        project.join("sotto.toml"),
+        "project_id = \"11111111-1111-1111-1111-111111111111\"\nproject = \"example\"\nenvironment = \"dev\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("sotto.tasks.toml"),
+        r#"version = 1
+
+[[task]]
+name = "build"
+description = "Build application"
+executable = "cargo"
+environments = ["dev"]
+"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+        .args(["task", "ls", "--json"])
+        .current_dir(&nested)
+        .env("SOTTO_DATA_DIR", &data)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed[0]["name"], "build");
+    assert!(!data.exists());
+}
+
+#[test]
+fn task_ls_json_fails_when_manifest_is_invalid_without_partial_output() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    let data = temp.path().join("sotto-data");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(
+        project.join("sotto.toml"),
+        "project_id = \"11111111-1111-1111-1111-111111111111\"\nproject = \"example\"\nenvironment = \"dev\"\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("sotto.tasks.toml"),
+        "version = 1\n\n[[task]]\nname = \"valid_prefix\"\nmalformed = true\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sotto"))
+        .args(["task", "ls", "--json"])
+        .current_dir(&project)
+        .env("SOTTO_DATA_DIR", &data)
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "no partial JSON on invalid manifest"
+    );
+    assert!(!data.exists());
+}
+
 #[cfg(unix)]
 mod interactive_approval_tests {
     use super::*;
