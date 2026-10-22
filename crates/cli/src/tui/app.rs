@@ -1,8 +1,10 @@
 //! TUI application state management for the interactive Sotto dashboard.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use ratatui::layout::Rect;
 use zeroize::Zeroizing;
 
 use crate::commands::{App, SecretHistoryItem};
@@ -25,6 +27,16 @@ pub enum SecretModalMode {
 pub enum SecretModalField {
     Name,
     Value,
+}
+
+/// Where the secret list was last drawn, so a mouse click can be mapped back to a row.
+///
+/// `area` is the list's inner area (inside its border) and `offset` is the index of the first
+/// visible entry, as the renderer scrolled it to keep the selection in view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SecretListView {
+    pub area: Rect,
+    pub offset: usize,
 }
 
 /// Outcome of a transient footer notice.
@@ -94,6 +106,8 @@ pub struct TuiApp<'a> {
     pub secrets: Vec<SecretItem>,
     pub filtered_indices: Vec<usize>,
     pub selected_filtered_index: usize,
+    /// Written by the renderer on every frame; read by the mouse handler.
+    pub secret_list_view: Cell<SecretListView>,
     pub search_query: String,
     pub search_mode: bool,
     pub revealed: bool,
@@ -153,6 +167,7 @@ impl<'a> TuiApp<'a> {
             secrets: Vec::new(),
             filtered_indices: Vec::new(),
             selected_filtered_index: 0,
+            secret_list_view: Cell::new(SecretListView::default()),
             search_query: String::new(),
             search_mode: false,
             revealed: false,
@@ -229,6 +244,25 @@ impl<'a> TuiApp<'a> {
             && self.selected_filtered_index + 1 < self.filtered_indices.len()
         {
             self.selected_filtered_index += 1;
+            self.reset_secret_view();
+        }
+    }
+
+    /// Select the secret drawn at a terminal cell, if the cell is on a secret row.
+    ///
+    /// Clicks outside the list, on its border, or below the last entry change nothing.
+    pub fn select_secret_at(&mut self, column: u16, row: u16) {
+        let view = self.secret_list_view.get();
+        let inside = column >= view.area.x
+            && column < view.area.x.saturating_add(view.area.width)
+            && row >= view.area.y
+            && row < view.area.y.saturating_add(view.area.height);
+        if !inside {
+            return;
+        }
+        let index = view.offset + usize::from(row - view.area.y);
+        if index < self.filtered_indices.len() && index != self.selected_filtered_index {
+            self.selected_filtered_index = index;
             self.reset_secret_view();
         }
     }
