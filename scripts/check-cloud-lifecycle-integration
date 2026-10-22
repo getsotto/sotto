@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""Run the deterministic Cloud lifecycle integration cases against local disposable Postgres."""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass
+import importlib.util
+from importlib.machinery import SourceFileLoader
+import os
+import re
+from pathlib import Path
+import secrets
+import subprocess
+import sys
+from typing import Iterator
+from urllib.parse import unquote, urlsplit
+
+ROOT = Path(__file__).resolve().parents[1]
+RUNNER_LOADER = SourceFileLoader(
+    "cloud_coverage_race_runner", str(ROOT / "scripts/check-cloud-coverage-races")
+)
+RUNNER_SPEC = importlib.util.spec_from_loader(RUNNER_LOADER.name, RUNNER_LOADER)
+RUNNER = importlib.util.module_from_spec(RUNNER_SPEC)
+sys.modules[RUNNER_LOADER.name] = RUNNER
+RUNNER_LOADER.exec_module(RUNNER)
+
+# These route, worker and webhook tests use controlled providers and fixture-owned database rows.
+# The real Stripe, email and managed-restore cases remain in the separate operator rehearsal.
+SCENARIOS = (
+    ("personal paid checkout", "billing", "personal_paid_checkout_webhook_records_provider_term"),
+    ("personal cancellation", "billing", "personal_cancellation_persists_intent_before_acknowledging_provider_acceptance"),
+    ("personal renewal notices", "billing", "personal_renewal_notices_follow_signed_failure_and_matching_paid_invoice"),
+    ("personal invoice coverage queue", "billing", "personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_coverage"),
+    ("personal failure repair window", "billing", "signed_failed_renewal_is_persisted_before_the_repair_scan_window"),
+    ("personal schedule transition", "founding_schedule", "founding_schedule_retargets_and_cancellation_wins_provider_races"),
+    ("founding capacity concurrency", "founding_allocator", "final_live_reservation_can_settle_and_concurrent_claims_cannot_exceed_capacity"),
+    ("delayed founding payment", "founding_allocator", "timely_checkout_completion_keeps_delayed_founding_payment_reserved"),
+    ("founding ownership transfer", "founding_allocator", "founding_award_preserves_person_and_anniversary_across_payer_transfer"),
+    ("sponsored seat settlement", "sponsored_billing", "named_seat_operation_is_idempotent_and_activates_after_paid_result"),
+    ("sponsored schedule recovery", "sponsored_billing", "schedule_recovery_reads_back_the_exact_saved_update_before_replaying"),
+    ("sponsored removal recovery", "sponsored_billing", "unknown_removal_recovery_replays_when_stripe_still_has_both_seats"),
+    ("sponsored founding settlement", "sponsored_founding", "verified_sponsored_invoice_awards_founder_before_activating_the_seat"),
+    ("sponsored invoice fan-out", "cloud_provider_sponsored_invoice", "paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary"),
+    ("transfer consent API", "billing_transfer_api", "authenticated_transfer_quote_consent_status_and_replay_are_server_derived"),
+    ("payer transfer execution", "billing_transfers", "transfer_is_idempotent_and_moves_founding_payer_after_paid_destination"),
+    ("source restoration", "billing_transfers", "source_restoration_keeps_beneficiary_fenced_until_provider_confirmation"),
+    ("ambiguous checkout recovery", "billing_operations", "unknown_provider_result_is_reconciled_after_restart"),
+    ("verified billing recovery", "billing_operations", "verified_paid_invoice_resolves_recovery_lease_and_manual_review"),
+    ("refund and cancellation", "billing_refunds", "correction_replays_preserve_terms_until_confirmed_refund_and_early_end"),
+    ("ambiguous refund recovery", "billing_refunds", "ambiguous_refund_create_parks_before_provider_idempotency_expires"),
+    ("human export", "export", "export_manifest_and_chunks_preserve_opaque_history"),
+    ("partial organisation export", "export", "export_excludes_unshared_organisation_environments_without_blocking_exit"),
+    ("retention dry run", "retention", "dry_run_is_idempotent_and_generic_worker_cannot_purge"),
+    ("personal retention lifecycle", "cloud_retention_lifecycle", "personal_retention_purge_requires_signed_review_and_preserves_the_user"),
+    ("shared retention lifecycle", "cloud_retention_lifecycle", "shared_retention_waits_for_every_admin_and_snapshots_the_full_shared_scope"),
+    ("verified notice delivery", "notifications", "verified_contact_catches_up_current_notices_and_provider_delivery_is_deduplicated"),
+)
+
+
+def check_manifest(discovered: dict[str, set[str]]) -> None:
+    missing = [
+        f"{target}::{test_name} ({label})"
+        for label, target, test_name in SCENARIOS
+        if test_name not in discovered.get(target, set())
+    ]
+    if missing:
+        raise RuntimeError("lifecycle test discovery failed: " + ", ".join(missing))
+
+
+def validate_acceptance_database(env: dict[str, str]) -> None:
+    RUNNER.validate_database(env)
+    database = urlsplit(env["DATABASE_URL"]).path.lstrip("/")
+    if not database.endswith("_lifecycle_acceptance"):
+        raise ValueError(
+            "lifecycle integration tests require a disposable database whose name ends "
+            "with _lifecycle_acceptance"
+        )
+
+
+@dataclass(frozen=True)
+class PostgresConnection:
+    host: str
+    port: str | None
+    username: str | None
+    password: str | None
+
+
+def postgres_connection(database_url: str) -> PostgresConnection:
+    parsed = urlsplit(database_url)
+    return PostgresConnection(
+        host=parsed.hostname or "localhost",
+        port=str(parsed.port) if parsed.port is not None else None,
+        username=unquote(parsed.username) if parsed.username else None,
+        password=unquote(parsed.password) if parsed.password else None,
+    )
+
+
+def postgres_cli_env(env: dict[str, str], connection: PostgresConnection) -> dict[str, str]:
+    cli_env = env.copy()
+    cli_env["PGHOST"] = connection.host
+    cli_env["PGPORT"] = connection.port or "5432"
+    if connection.username is not None:
+        cli_env["PGUSER"] = connection.username
+    if connection.password is not None:
+        cli_env["PGPASSWORD"] = connection.password
+    return cli_env
+
+
+def run_database_utility(command: list[str], env: dict[str, str]) -> str:
+    try:
+        completed = subprocess.run(
+            command,
+            env=env,
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"could not run {command[0]} for lifecycle database") from error
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(f"{command[0]} failed for lifecycle database: {detail}")
+    return completed.stdout
+
+
+def cleanup_scenario_databases(cli_env: dict[str, str], prefix: str) -> None:
+    if not re.fullmatch(r"lc_[0-9a-f]{16}", prefix):
+        raise RuntimeError("lifecycle test database prefix is invalid")
+    marker = f"{prefix}_upgrade_"
+    listed = run_database_utility(
+        [
+            "psql", "--no-psqlrc", "--no-align", "--tuples-only", "--dbname=postgres",
+            "--command=SELECT datname FROM pg_database "
+            f"WHERE left(datname, {len(marker)}) = '{marker}' ORDER BY datname",
+        ],
+        cli_env,
+    )
+    names = [line.strip() for line in listed.splitlines() if line.strip()]
+    for name in names:
+        suffix = name.removeprefix(marker)
+        if not name.startswith(marker) or not re.fullmatch(r"[0-9a-f]{32}", suffix):
+            raise RuntimeError("Postgres returned a database outside the lifecycle test prefix")
+        run_database_utility(
+            ["dropdb", "--maintenance-db=postgres", "--if-exists", "--force", name],
+            cli_env,
+        )
+
+
+def cleanup_acceptance_databases(
+    cli_env: dict[str, str], run_env: dict[str, str], parent_name: str
+) -> None:
+    errors = []
+    try:
+        cleanup_scenario_databases(cli_env, run_env["SOTTO_TEST_DATABASE_PREFIX"])
+    except Exception as error:
+        errors.append(f"nested lifecycle database cleanup failed: {error}")
+    try:
+        run_database_utility(
+            ["dropdb", "--maintenance-db=postgres", "--if-exists", "--force", parent_name],
+            cli_env,
+        )
+    except Exception as error:
+        errors.append(f"acceptance database cleanup failed: {error}")
+    if errors:
+        raise RuntimeError("; ".join(errors))
+
+
+@contextmanager
+def disposable_acceptance_database(env: dict[str, str]) -> Iterator[dict[str, str]]:
+    """Create a unique local database and drop it after this run, including on failure."""
+    validate_acceptance_database(env)
+    base_url = urlsplit(env["DATABASE_URL"])
+    connection = postgres_connection(env["DATABASE_URL"])
+    cli_env = postgres_cli_env(env, connection)
+    suffix = secrets.token_hex(12)
+    database_name = f"sotto_lifecycle_acceptance_{suffix}"
+    if len(database_name) > 63 or not re.fullmatch(r"[a-z0-9_]+", database_name):
+        raise RuntimeError("generated lifecycle database name is invalid")
+    run_database_utility(["createdb", "--maintenance-db=postgres", database_name], cli_env)
+    run_env = env.copy()
+    run_env["DATABASE_URL"] = base_url._replace(path=f"/{database_name}").geturl()
+    run_env["SOTTO_TEST_DATABASE_PREFIX"] = f"lc_{suffix[:16]}"
+    try:
+        yield run_env
+    except BaseException as test_error:
+        try:
+            cleanup_acceptance_databases(cli_env, run_env, database_name)
+        except Exception as cleanup_error:  # preserve the test failure and disclose cleanup failure
+            raise RuntimeError(
+                f"lifecycle test failed ({test_error}); cleanup also failed ({cleanup_error})"
+            ) from test_error
+        raise
+    else:
+        cleanup_acceptance_databases(cli_env, run_env, database_name)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--list", action="store_true", help="verify the exact test manifest without executing tests")
+    args = parser.parse_args(argv)
+    if args.timeout < 1:
+        parser.error("timeout must be positive")
+
+    env = os.environ.copy()
+    try:
+        if not args.list:
+            validate_acceptance_database(env)
+        targets = {target for _, target, _ in SCENARIOS}
+        discovered = {target: RUNNER.discover(target, env, args.timeout) for target in targets}
+        check_manifest(discovered)
+
+        if args.list:
+            for label, target, test_name in SCENARIOS:
+                print(f"{label}: {target}::{test_name}")
+            print(f"discovered all {len(SCENARIOS)} lifecycle integration tests; none were executed")
+            return 0
+
+        with disposable_acceptance_database(env) as test_env:
+            for label, target, test_name in SCENARIOS:
+                scenario = f"{target}::{test_name} ({label})"
+                result = RUNNER.run(
+                    [
+                        "cargo", "test", "-p", "sotto-server", "--test", target, test_name,
+                        "--", "--exact", "--test-threads=1",
+                    ],
+                    test_env,
+                    args.timeout,
+                    label=scenario,
+                )
+                RUNNER.assert_tests_selected(result.stdout, scenario)
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"Cloud lifecycle integration checks failed: {error}", file=sys.stderr)
+        return 1
+
+    print(f"Cloud lifecycle integration checks passed: {len(SCENARIOS)} selected database tests")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

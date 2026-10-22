@@ -252,4 +252,74 @@ describe("CloudContactSettings", () => {
     )).toBeInTheDocument();
     expect(screen.queryByText(/provider-message|@example\.test/)).not.toBeInTheDocument();
   });
+
+  async function emailForm(address: string) {
+    const input = await screen.findByLabelText("Email address");
+    fireEvent.change(input, { target: { value: address } });
+    const form = input.closest("form");
+    expect(form).not.toBeNull();
+    return form as HTMLFormElement;
+  }
+
+  it("sends the verification link when the email form is submitted, as Enter does", async () => {
+    render(<CloudContactSettings />);
+    fireEvent.submit(await emailForm("person@example.test"));
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "If this address can be used, a verification message will arrive shortly.",
+    );
+    expect(api.startCloudContactVerification).toHaveBeenCalledOnce();
+    expect(api.startCloudContactVerification).toHaveBeenCalledWith("person@example.test", expect.any(String));
+  });
+
+  it("sends one request while a verification request is in flight", async () => {
+    let finish!: () => void;
+    vi.mocked(api.startCloudContactVerification).mockReturnValue(new Promise<void>((resolve) => {
+      finish = resolve;
+    }));
+    render(<CloudContactSettings />);
+    const form = await emailForm("person@example.test");
+
+    fireEvent.submit(form);
+    await waitFor(() => expect(screen.getByLabelText("Email address")).toBeDisabled());
+    fireEvent.submit(form);
+    fireEvent.click(screen.getByRole("button", { name: "Send verification link" }));
+
+    expect(api.startCloudContactVerification).toHaveBeenCalledOnce();
+    finish();
+    expect(await screen.findByRole("status")).toHaveTextContent("a verification message will arrive shortly");
+  });
+
+  it("does not submit an empty address", async () => {
+    render(<CloudContactSettings />);
+    fireEvent.submit(await emailForm("   "));
+
+    expect(screen.getByRole("button", { name: "Send verification link" })).toBeDisabled();
+    expect(api.startCloudContactVerification).not.toHaveBeenCalled();
+  });
+
+  it("resends through the same form while a verification request is pending, and leaves removal alone", async () => {
+    vi.mocked(api.fetchCloudContactStatus).mockResolvedValue({
+      email: {
+        contactId: "contact-verified",
+        maskedDestination: "p***@example.test",
+        verifiedAtEpoch: 1_800_000_000,
+      },
+      latestDelivery: null,
+      pendingExpiresAtEpoch: 1_900_000_000,
+      enrolmentAvailable: true,
+    });
+    render(<CloudContactSettings />);
+    const form = await emailForm("next@example.test");
+
+    expect(screen.getByRole("button", { name: "Resend verification link" })).toHaveAttribute("type", "submit");
+    expect(screen.getByRole("button", { name: "Remove verified email" })).not.toHaveAttribute("type", "submit");
+    fireEvent.submit(form);
+
+    await waitFor(() => expect(api.startCloudContactVerification).toHaveBeenCalledWith(
+      "next@example.test",
+      expect.any(String),
+    ));
+    expect(api.revokeCloudContact).not.toHaveBeenCalled();
+  });
 });

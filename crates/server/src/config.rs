@@ -57,6 +57,8 @@ pub const MAX_ORGANISATION_DELETION_RETENTION_DAYS: i64 = 365;
 const ORGANISATION_DELETION_RETENTION_ENV: &str = "SOTTO_ORGANISATION_DELETION_RETENTION_DAYS";
 const ORGANISATION_DELETION_WORKER_ENV: &str = "SOTTO_ORGANISATION_DELETION_WORKER_ENABLED";
 const ORGANISATION_DELETION_METRICS_TOKEN_ENV: &str = "SOTTO_ORGANISATION_DELETION_METRICS_TOKEN";
+const CLOUD_OPERATIONS_METRICS_TOKEN_ENV: &str = "SOTTO_CLOUD_OPERATIONS_METRICS_TOKEN";
+const CLOUD_COVERAGE_REPAIR_TOKEN_ENV: &str = "SOTTO_CLOUD_COVERAGE_REPAIR_TOKEN";
 const ORGANISATION_DELETION_OPERATOR_TOKEN_ENV: &str = "SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN";
 const PROVIDER_REFRESH_INGEST_ENV: &str = "SOTTO_PROVIDER_REFRESH_INGEST_ENABLED";
 const PROVIDER_REFRESH_WORKER_ENV: &str = "SOTTO_PROVIDER_REFRESH_WORKER_ENABLED";
@@ -113,6 +115,10 @@ pub struct Config {
     pub organisation_deletion_worker_enabled: bool,
     /// Bearer token for the protected organisation-deletion metrics exporter.
     pub organisation_deletion_metrics_token: Option<String>,
+    /// Dedicated bearer credential for protected, aggregate Cloud lifecycle diagnostics.
+    pub cloud_operations_metrics_token: Option<String>,
+    /// Separate write credential for supported provider-backed coverage repair.
+    pub cloud_coverage_repair_token: Option<String>,
     /// Bearer token for the protected operator-observation endpoint.
     pub organisation_deletion_operator_token: Option<String>,
     /// Whether verified provider changes may enqueue durable refresh work.
@@ -458,6 +464,19 @@ impl Config {
             env_nonempty(ORGANISATION_DELETION_METRICS_TOKEN_ENV);
         let organisation_deletion_operator_token =
             env_nonempty(ORGANISATION_DELETION_OPERATOR_TOKEN_ENV);
+        let cloud_operations_metrics_token = env_nonempty(CLOUD_OPERATIONS_METRICS_TOKEN_ENV);
+        let cloud_coverage_repair_token = env_nonempty(CLOUD_COVERAGE_REPAIR_TOKEN_ENV);
+        validate_cloud_operations_tokens(
+            cloud_operations_metrics_token.as_deref(),
+            cloud_coverage_repair_token.as_deref(),
+            [
+                organisation_deletion_metrics_token.as_deref(),
+                organisation_deletion_operator_token.as_deref(),
+                billing_transfer_operator_token.as_deref(),
+                cloud_retention_operator_token.as_deref(),
+                cloud_retention_destructive_token.as_deref(),
+            ],
+        )?;
         let provider_refresh_ingest_enabled =
             feature_flag_is_enabled(std::env::var(PROVIDER_REFRESH_INGEST_ENV).ok().as_deref());
         let provider_refresh_worker_enabled =
@@ -550,6 +569,8 @@ impl Config {
             organisation_deletion_retention_days,
             organisation_deletion_worker_enabled,
             organisation_deletion_metrics_token,
+            cloud_operations_metrics_token,
+            cloud_coverage_repair_token,
             organisation_deletion_operator_token,
             provider_refresh_ingest_enabled,
             provider_refresh_worker_enabled,
@@ -581,6 +602,36 @@ impl Config {
             resend_webhook_secret,
         })
     }
+}
+
+fn validate_cloud_operations_tokens<'a>(
+    metrics: Option<&'a str>,
+    repair: Option<&'a str>,
+    existing_write_tokens: [Option<&'a str>; 5],
+) -> Result<()> {
+    if metrics.is_some() && metrics == repair {
+        return Err(Error::Config(
+            "Cloud operations metrics and coverage repair tokens must be different".into(),
+        ));
+    }
+    for new_token in [metrics, repair].into_iter().flatten() {
+        if new_token.len() < 32 {
+            return Err(Error::Config(
+                "Cloud operations metrics and coverage repair tokens must contain at least 32 characters".into(),
+            ));
+        }
+        if existing_write_tokens
+            .into_iter()
+            .flatten()
+            .any(|existing| existing == new_token)
+        {
+            return Err(Error::Config(
+                "Cloud operations tokens must not be reused for an existing operator capability"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_founding_schedule_worker_configuration(
@@ -1248,10 +1299,10 @@ mod tests {
         telemetry_ping_enabled, validate_billing_recovery_configuration,
         validate_billing_transfer_execution_configuration,
         validate_billing_transfer_operator_configuration, validate_billing_transfers_configuration,
-        validate_cloud_retention_configuration, validate_cloud_retention_purge_configuration,
-        validate_cloud_sales_configuration, validate_contact_verification_configuration,
-        validate_coverage_authority_configuration, validate_deployment_billing_boundary,
-        validate_founding_price_notices_configuration,
+        validate_cloud_operations_tokens, validate_cloud_retention_configuration,
+        validate_cloud_retention_purge_configuration, validate_cloud_sales_configuration,
+        validate_contact_verification_configuration, validate_coverage_authority_configuration,
+        validate_deployment_billing_boundary, validate_founding_price_notices_configuration,
         validate_founding_schedule_worker_configuration, validate_notice_dispatch_configuration,
         validate_provider_refresh_configuration, validate_sponsored_billing_recovery_configuration,
         BillingConfig, BillingPriceIds, ContactVerificationConfig, DeploymentMode,
@@ -2097,5 +2148,29 @@ mod tests {
         assert!(!feature_flag_is_enabled(Some("true")));
         assert!(!feature_flag_is_enabled(Some(" 1 ")));
         assert!(feature_flag_is_enabled(Some("1")));
+    }
+
+    #[test]
+    fn cloud_diagnostic_credentials_cannot_share_existing_operator_tokens() {
+        let metrics = "m".repeat(32);
+        let repair = "r".repeat(32);
+        let shared = "s".repeat(32);
+        assert!(validate_cloud_operations_tokens(Some(&metrics), Some(&repair), [None; 5]).is_ok());
+        assert!(
+            validate_cloud_operations_tokens(Some(&metrics), Some(&metrics), [None; 5]).is_err()
+        );
+        assert!(validate_cloud_operations_tokens(Some("short"), None, [None; 5]).is_err());
+        assert!(validate_cloud_operations_tokens(
+            Some(&shared),
+            None,
+            [None, Some(&shared), None, None, None]
+        )
+        .is_err());
+        assert!(validate_cloud_operations_tokens(
+            None,
+            Some(&shared),
+            [None, None, None, Some(&shared), None]
+        )
+        .is_err());
     }
 }

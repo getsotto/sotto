@@ -133,6 +133,17 @@ fn app_with_billing_mode(
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
+        cloud_operations_metrics_token: None,
+        cloud_coverage_repair_token: None,
+        provider_refresh_ingest_enabled: false,
+        provider_refresh_worker_enabled: false,
+        provider_refresh_reconciliation_enabled: false,
+        provider_authority_revalidation_enabled: false,
+        cloud_sales_enabled: false,
+        founding_schedule_worker_enabled: false,
+        founding_price_notices_enabled: false,
+        billing_recovery_worker_enabled: false,
+        sponsored_billing_recovery_worker_enabled: false,
         organisation_deletion_operator_token: None,
         billing_transfer_operator_token: None,
     };
@@ -364,6 +375,17 @@ fn app_with_provider(pool: PgPool, provider: Arc<dyn SubscriptionProvider>) -> R
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
+        cloud_operations_metrics_token: None,
+        cloud_coverage_repair_token: None,
+        provider_refresh_ingest_enabled: false,
+        provider_refresh_worker_enabled: false,
+        provider_refresh_reconciliation_enabled: false,
+        provider_authority_revalidation_enabled: false,
+        cloud_sales_enabled: false,
+        founding_schedule_worker_enabled: false,
+        founding_price_notices_enabled: false,
+        billing_recovery_worker_enabled: false,
+        sponsored_billing_recovery_worker_enabled: false,
         organisation_deletion_operator_token: None,
         billing_transfer_operator_token: None,
     };
@@ -2392,6 +2414,19 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
     .await
     .expect("no coverage receipt for unsupported settlement");
     assert_eq!(credited_coverage_rows, 0);
+    let credited_diagnostics: (i64, String, String) = sqlx::query_as(
+        "SELECT count(*)::bigint, min(coverage_kind), min(reason_code) \
+         FROM cloud_coverage_rejection_incidents WHERE event_id = $1 \
+           AND provider_account_id = 'acct_coverage_test' AND provider_environment = 'test'",
+    )
+    .bind(&credited_event_id)
+    .fetch_one(&pool)
+    .await
+    .expect("persisted paid-but-uncovered diagnostic");
+    assert_eq!(
+        credited_diagnostics,
+        (1, "personal".into(), "invoice_evidence_unsupported".into())
+    );
     let paid_through_after_credit: i64 = sqlx::query_scalar(
         "SELECT paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
     )

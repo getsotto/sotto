@@ -346,6 +346,8 @@ enum EnvCommand {
 
 #[derive(Subcommand)]
 enum TaskCommand {
+    /// List declared tasks from the current project's manifest.
+    Ls,
     /// Validate `sotto.tasks.toml` without opening the local secret store.
     Validate,
     /// Approve one declared task for one environment after reviewing its full command.
@@ -481,18 +483,31 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Task declaration validation needs only the project config and task file. Handle it before
-    // opening local state or the keychain, so validation cannot prompt or initialise secret data.
-    if let Some(Command::Task {
-        command: TaskCommand::Validate,
-    }) = &cli.command
-    {
-        let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
-        let (_, manifest) = sotto_cli::agent_tasks::TaskManifest::discover(&cwd)?;
-        let count = manifest.tasks().len();
-        let noun = if count == 1 { "task" } else { "tasks" };
-        println!("valid: {count} {noun}");
-        return Ok(());
+    // Task declaration listing and validation need only the project config and task file. Handle
+    // them before opening local state or the keychain, so they cannot prompt or initialise secret data.
+    if let Some(Command::Task { command }) = &cli.command {
+        match command {
+            TaskCommand::Ls => {
+                let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+                let (_, manifest) = sotto_cli::agent_tasks::TaskManifest::discover(&cwd)?;
+                let mut tasks = manifest.tasks().to_vec();
+                tasks.sort_by(|a, b| a.name().cmp(b.name()));
+                for task in &tasks {
+                    println!("{}: {}", task.name(), task.description());
+                    println!("  environments: {}", task.environments().join(", "));
+                }
+                return Ok(());
+            }
+            TaskCommand::Validate => {
+                let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+                let (_, manifest) = sotto_cli::agent_tasks::TaskManifest::discover(&cwd)?;
+                let count = manifest.tasks().len();
+                let noun = if count == 1 { "task" } else { "tasks" };
+                println!("valid: {count} {noun}");
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 
     // Task approvals are a separate local capability. These commands use only the project
@@ -523,7 +538,7 @@ fn run() -> Result<()> {
                     )
                 })?;
             }
-            TaskCommand::Validate => {}
+            TaskCommand::Ls | TaskCommand::Validate => {}
         }
     }
 
@@ -764,7 +779,8 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Task { command } => match command {
-            TaskCommand::Validate
+            TaskCommand::Ls
+            | TaskCommand::Validate
             | TaskCommand::Approve { .. }
             | TaskCommand::Approvals
             | TaskCommand::Revoke { .. } => {
