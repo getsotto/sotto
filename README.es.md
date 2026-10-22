@@ -331,15 +331,16 @@ de máquina que creó en la organización, nombrando cada uno para que puedas vo
 rotación protege lo que se escriba después. Los valores que el miembro ya vio siguen expuestos, así
 que cámbialos en su origen.
 
-#### Plan de la organización
+#### Derechos antiguos de la organización
 
 `sotto org plan <org-id>` lee la vista de derechos actual del servidor configurado para esa
 organización. Debes haber iniciado sesión (`sotto login`); el cofre local no necesita estar
-desbloqueado. Muestra el nivel asignado, el nivel efectivo (el que aplica los límites ahora), el
-fin de la prueba cuando la organización tiene uno, y o bien límites de miembros y proyectos de
-organización o `limits: none (Team)`.
+desbloqueado. Muestra los niveles asignado y efectivo, la fecha de prueba guardada y los límites
+aplicables, como `limits: none (Team)`. Estos campos mantienen la compatibilidad con registros y despliegues antiguos de planes
+por organización; no describen los precios actuales de Cloud por persona ni una nueva prueba de
+Cloud.
 
-Salida ilustrativa en Sotto Cloud para una organización gratuita cuya prueba ha terminado:
+Salida ilustrativa de un registro antiguo de plan de organización:
 
 ```text
 tier:      free
@@ -358,8 +359,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-Estos ejemplos son ilustrativos; las organizaciones reales pueden mostrar niveles, pruebas y
-límites distintos.
+Estos ejemplos muestran campos de compatibilidad guardados, no las ofertas actuales de Cloud. Los
+despliegues reales pueden mostrar otros niveles, fechas de prueba y límites guardados.
 
 #### Registro de auditoría de la organización
 
@@ -377,10 +378,10 @@ primero con los eventos más recientes; el valor predeterminado es de 100 evento
 actividad y metadatos, no una forma de recuperar valores secretos; no ofrece paginación ni un archivo
 histórico completo.
 
-En Sotto Cloud, la organización necesita una suscripción Team efectiva, incluido un periodo de
-prueba Team activo. Las implementaciones autoalojadas omiten esta comprobación del plan, pero quien
-ejecute el comando debe conservar el rol de propietario o administrador. Si no hay eventos, el
-comando no muestra filas y termina correctamente.
+Este comando conserva el control de acceso antiguo basado en el plan Team de la organización. Las
+implementaciones autoalojadas omiten esta comprobación del plan, pero quien ejecute el comando debe
+conservar el rol de propietario o administrador. Si no hay eventos, el comando no muestra filas y
+termina correctamente.
 
 ### Tokens de máquina y CI
 

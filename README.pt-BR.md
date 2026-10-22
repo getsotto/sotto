@@ -330,15 +330,16 @@ de máquina que ele criou na organização, citando cada um para que você possa
 protege o que for escrito depois. Valores que o membro já viu continuam expostos, então troque-os na
 origem.
 
-#### Plano da organização
+#### Direitos antigos da organização
 
 `sotto org plan <org-id>` lê a visão atual de direitos do servidor configurado para essa
 organização. É preciso estar autenticado (`sotto login`); o cofre local não precisa estar
-desbloqueado. Ele mostra o nível atribuído, o nível efetivo (cujos limites se aplicam agora), o
-fim do trial quando a organização tem um, e ou limites de membros e projetos da organização ou
-`limits: none (Team)`.
+desbloqueado. Ele mostra os níveis atribuído e efetivo, a data de trial armazenada e os limites
+aplicáveis, como `limits: none (Team)`. Esses campos mantêm a compatibilidade com registros e implantações antigas de planos
+por organização; eles não descrevem os preços atuais do Cloud por pessoa nem uma nova oferta de
+trial do Cloud.
 
-Saída ilustrativa no Sotto Cloud para uma organização gratuita cujo trial terminou:
+Saída ilustrativa de um registro antigo de plano da organização:
 
 ```text
 tier:      free
@@ -357,8 +358,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-Esses exemplos são ilustrativos; organizações reais podem mostrar níveis, trials e limites
-diferentes.
+Esses exemplos mostram campos de compatibilidade armazenados, não as ofertas atuais do Cloud.
+Implantações reais podem mostrar outros níveis, datas de trial e limites armazenados.
 
 #### Log de auditoria da organização
 
@@ -376,10 +377,10 @@ com os campos opcionais `target=...`, `env=...` e `(detail)`. É uma visão limi
 metadados, não uma forma de recuperar valores secretos; não há paginação nem um arquivo histórico
 completo.
 
-No Sotto Cloud, a organização precisa de uma habilitação Team efetiva, incluindo um período de teste
-Team ativo. Implantações auto-hospedadas ignoram essa verificação do plano, mas quem chama o comando
-ainda precisa ter o papel de proprietário ou administrador. Se não houver eventos, o comando não
-imprime linhas e termina com sucesso.
+Este comando mantém a antiga verificação de acesso baseada no plano Team da organização.
+Implantações auto-hospedadas ignoram essa verificação do plano, mas quem chama o comando ainda
+precisa ter o papel de proprietário ou administrador. Se não houver eventos, o comando não imprime
+linhas e termina com sucesso.
 
 ### Tokens de máquina e CI
 

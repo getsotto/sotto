@@ -332,15 +332,16 @@ widerruft die Maschinen-Token, die es in der Organisation erstellt hat; jedes wi
 damit du es neu erstellen kannst. Die Rotation schützt, was danach geschrieben wird. Werte, die das
 Mitglied bereits gesehen hat, bleiben offengelegt; ändere sie daher an ihrer Quelle.
 
-#### Plan der Organisation
+#### Ältere Organisationsberechtigungen
 
 `sotto org plan <org-id>` liest die aktuelle Berechtigungsansicht des konfigurierten Servers für
 diese Organisation. Du musst angemeldet sein (`sotto login`); der lokale Tresor muss nicht
-entsperrt sein. Es zeigt die zugewiesene Stufe, die wirksame Stufe (deren Limits jetzt gelten), das
-Trial-Ende, sofern die Organisation eines hat, sowie entweder Mitglieder- und
-Organisationsprojekt-Limits oder `limits: none (Team)`.
+entsperrt sein. Es zeigt die zugewiesene und wirksame Stufe, das gespeicherte Trial-Ende und die
+geltenden Limits wie `limits: none (Team)`. Diese Felder erhalten die Kompatibilität mit älteren Organisationsplan-Datensätzen
+und Deployments; sie beschreiben weder die aktuellen personenbezogenen Cloud-Preise noch ein neues
+Cloud-Trial-Angebot.
 
-Illustrative Ausgabe in Sotto Cloud für eine kostenlose Organisation nach Ende ihres Trials:
+Illustrative Ausgabe aus einem älteren Organisationsplan-Datensatz:
 
 ```text
 tier:      free
@@ -359,8 +360,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-Diese Beispiele sind illustrativ; echte Organisationen können andere Stufen, Trials und Limits
-zeigen.
+Diese Beispiele zeigen gespeicherte Kompatibilitätsfelder, keine aktuellen Cloud-Angebote. Reale
+Deployments können andere gespeicherte Stufen, Trial-Daten und Limits anzeigen.
 
 #### Organisations-Auditprotokoll
 
@@ -378,10 +379,10 @@ und der Server begrenzt `--limit` auf 1-500. Der Befehl zeigt pro Ereignis eine 
 eine begrenzte Aktivitäts-/Metadatenansicht, nicht um eine Möglichkeit, Secret-Werte abzurufen; eine
 Seitennavigation oder ein vollständiges historisches Archiv gibt es nicht.
 
-In Sotto Cloud benötigt die Organisation eine wirksame Team-Berechtigung, einschließlich eines
-aktiven Team-Testzeitraums. Selbst gehostete Deployments überspringen diese Planprüfung, aber der
-Aufrufer braucht weiterhin die Rolle als Inhaber oder Administrator. Wenn keine Ereignisse vorhanden
-sind, gibt der Befehl keine Zeilen aus und wird erfolgreich beendet.
+Dieser Befehl behält die ältere Zugriffsprüfung anhand der Team-Berechtigung der Organisation bei.
+Selbst gehostete Deployments überspringen diese Planprüfung, aber der Aufrufer braucht weiterhin die
+Rolle als Inhaber oder Administrator. Wenn keine Ereignisse vorhanden sind, gibt der Befehl keine
+Zeilen aus und wird erfolgreich beendet.
 
 ### Maschinen-Token und CI
 

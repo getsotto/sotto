@@ -337,15 +337,16 @@ tokens machine qu'il a créés dans l'organisation, en les nommant pour que vous
 La rotation protège ce qui est écrit ensuite. Les valeurs que le membre a déjà vues restent exposées :
 changez-les à leur source.
 
-#### Forfait de l'organisation
+#### Anciens forfaits d'organisation
 
 `sotto org plan <org-id>` lit la vue d'entitlements actuelle du serveur configuré pour cette
 organisation. Vous devez être connecté (`sotto login`) ; le coffre local n'a pas besoin d'être
-déverrouillé. Il affiche le niveau assigné, le niveau effectif (celui dont les limites s'appliquent
-maintenant), la fin de l'essai lorsque l'organisation en a une, et soit des limites de membres et
-de projets d'organisation, soit `limits: none (Team)`.
+déverrouillé. Il affiche le niveau assigné, le niveau effectif, la fin d'essai enregistrée et les
+limites applicables, comme `limits: none (Team)`. Ces champs préservent la compatibilité avec les anciens enregistrements et
+déploiements à forfait d'organisation ; ils ne décrivent ni les tarifs Cloud actuels par personne ni
+une nouvelle offre d'essai Cloud.
 
-Sortie illustrative sur Sotto Cloud pour une organisation gratuite dont l'essai est terminé :
+Sortie illustrative d'un ancien enregistrement de forfait d'organisation :
 
 ```text
 tier:      free
@@ -364,8 +365,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-Ces exemples sont illustratifs ; les organisations réelles peuvent afficher des niveaux, essais et
-limites différents.
+Ces exemples montrent des champs de compatibilité enregistrés, pas les offres Cloud actuelles. Les
+déploiements réels peuvent présenter d'autres niveaux, dates d'essai et limites enregistrés.
 
 #### Journal d’audit de l’organisation
 
@@ -384,10 +385,10 @@ au format `timestamp  action  actor`, avec éventuellement les champs `target=..
 `(detail)`. Il s’agit d’une vue limitée de l’activité et des métadonnées, pas d’un moyen de récupérer
 des valeurs secrètes ; elle ne fournit ni pagination ni archive historique complète.
 
-Sur Sotto Cloud, l’organisation doit disposer du niveau Team effectif, y compris pendant un essai
-Team actif. Les déploiements auto-hébergés ignorent ce contrôle de forfait, mais l’appelant doit
-toujours avoir le rôle de propriétaire ou d’administrateur. S’il n’y a aucun événement, la commande
-n’affiche aucune ligne et se termine avec succès.
+Cette commande conserve le contrôle d'accès historique par forfait Team d'organisation. Les
+déploiements auto-hébergés ignorent ce contrôle de forfait, mais l’appelant doit toujours avoir le
+rôle de propriétaire ou d’administrateur. S’il n’y a aucun événement, la commande n’affiche aucune
+ligne et se termine avec succès.
 
 ### Tokens machine et CI
 

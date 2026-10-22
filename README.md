@@ -326,15 +326,16 @@ tokens they created in the organisation, naming each so you can recreate it. Rot
 is written afterwards. Values the member has already seen stay exposed, so change them at their
 source.
 
-#### Organisation plan
+#### Legacy organisation entitlements
 
 `sotto org plan <org-id>` reads the configured server's current entitlement view for that
 organisation. You must be logged in (`sotto login`); the local vault does not need to be unlocked.
-It prints the assigned tier, the effective tier (the tier whose limits apply now), the trial end
-when the organisation has one, and either member and organisation-project limits or
-`limits: none (Team)`.
+It prints the assigned tier, effective tier, stored trial end, and either member and
+organisation-project limits or `limits: none (Team)`. These fields preserve compatibility with
+existing organisation-tier records and deployments; they do not describe current Sotto Cloud
+person-based pricing or a new Cloud trial offer.
 
-Illustrative output on Sotto Cloud for a free organisation whose trial has ended:
+Illustrative output from a legacy organisation-tier record:
 
 ```text
 tier:      free
@@ -343,8 +344,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    3 members, 1 org project(s)
 ```
 
-A self-hosted server applies no plan limits, so it always reports the effective tier as `team`,
-whatever tier and trial end the organisation has stored:
+A self-hosted server applies no plan limits, so it reports the effective tier as `team`, whatever
+tier and trial end the organisation has stored:
 
 ```text
 tier:      free
@@ -353,7 +354,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-These examples are illustrative; real organisations may show different tiers, trials, and limits.
+These examples show stored compatibility fields, not current Cloud offers. Real deployments may
+show different stored tiers, trial dates, and limits.
 
 #### Organisation audit log
 
@@ -370,9 +372,9 @@ event as `timestamp  action  actor`, with optional `target=...`, `env=...`, and 
 is a bounded activity/metadata view, not a way to retrieve secret values, and it does not provide
 pagination or a complete historical archive.
 
-On Sotto Cloud, the organisation needs effective Team entitlement, including an active Team trial.
-Self-hosted deployments skip this plan gate, but the caller still needs the owner/admin role. If no
-events are available, the command prints no rows and exits successfully.
+This command retains the legacy organisation Team-entitlement gate. Self-hosted deployments skip
+that plan gate, but the caller still needs the owner/admin role. If no events are available, the
+command prints no rows and exits successfully.
 
 ### Machine tokens and CI
 
