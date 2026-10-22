@@ -187,6 +187,13 @@ fresh restore rehearsal and approval. The destructive operator label is audit te
 authenticated individual; use the credentials only through the protected operator channel and do
 not place them in logs or support messages.
 
+Cloud lifecycle observability has its own optional credentials. See
+[`cloud-operations.md`](cloud-operations.md) for the generic protected routes and
+their separation from liveness, readiness, customer retrieval, payment-to-access acceptance and
+destructive retention. Leave the metrics and coverage-repair credentials blank until the scraper
+and private operator procedure are configured; never reuse the retention, billing-review or purge
+credentials.
+
 The signed request is produced offline from the matching backup and sidecar after restoring them
 to a dedicated local database. Name that database `retention_restore_<name>`, export its URL as
 `SOTTO_RETENTION_REHEARSAL_DATABASE_URL` (never pass it as a command-line argument), and materialise
@@ -833,8 +840,9 @@ somewhere else before they age out is the whole of what that takes.
 
 Set the repository variable `SOTTO_PUBLIC_URL` to the deployment to watch. Without it the job
 skips rather than probing a default, so a fork cannot point it at somebody else's deployment.
-Set `SOTTO_CANARY_TOKEN` as well if you want the secret-sync row measured rather than reported
-unconfigured; the probe table above says how.
+Set `SOTTO_CANARY_TOKEN` and `SOTTO_HUMAN_CANARY_TOKEN` plus the variable
+`SOTTO_HUMAN_CANARY_ENVIRONMENT_ID` if you want both authenticated retrieval rows measured rather
+than reported unconfigured; the probe table and setup notes below explain their boundaries.
 
 **In a fork, one line has to change as well.** The job carries
 `if: github.repository == 'getsotto/sotto'`, so a fork of this repository collects nothing and
@@ -866,16 +874,17 @@ record that is meant to be permanent:
   Before that the path falls through to the single-page app, and the API row records real
   downtime for a deployment that is working.
 
-Four of the five probes are unauthenticated and ask only what a visitor could ask. The fifth
-presents a machine token, and is described after the table:
+Four of the six probes are unauthenticated and ask only what a visitor could ask. The other two
+use ordinary authentication against a synthetic environment:
 
-| Component   | Probe                                          | Healthy answer                   |
-| ----------- | ---------------------------------------------- | -------------------------------- |
-| API         | `GET /health/ready`                            | `200` with the body `ok`         |
-| Web app     | `GET /`                                        | `200` and an HTML content type   |
-| Sign in     | `GET /auth/github/login` with a loopback callback | a redirect to `github.com`    |
-| Billing     | `POST /billing/webhook` with no signature      | `401`                            |
-| Secret sync | `GET /machine/grant` and `GET /machine/secrets` | a usable grant and a usable secret |
+| Component        | Probe                                               | Healthy answer                                |
+| ---------------- | --------------------------------------------------- | --------------------------------------------- |
+| API              | `GET /health/ready`                                 | `200` with the body `ok`                      |
+| Web app          | `GET /`                                             | `200` and an HTML content type                |
+| Sign in          | `GET /auth/github/login` with a loopback callback   | a redirect to `github.com`                    |
+| Billing          | `POST /billing/webhook` with no signature           | `401`                                         |
+| Secret sync       | `GET /machine/grant` and `GET /machine/secrets`     | a usable grant and a usable secret            |
+| Human API access  | `GET /environments/{id}/secrets` with a user session | a usable synthetic encrypted secret snapshot |
 
 Two of those distinguish "not configured" from "broken", because they are not the same thing
 and only one of them belongs in an uptime figure. A `503` from sign-in or billing means the
@@ -888,10 +897,10 @@ The billing probe deliberately sends an unsigned payload and requires a `401`. A
 would mean signature verification is not happening, so that case is recorded as down rather
 than as a passing request.
 
-Secret sync is the one probe that authenticates, because the question it asks cannot be asked
-from outside: can a machine still get hold of what it needs to decrypt an environment? Every
-other probe reads a public surface, and a deployment can serve all of them perfectly while the
-grant that makes a CI run work has gone.
+The two retrieval probes authenticate because these questions cannot be asked from outside: can a
+machine still get its sealed grant and ciphertext, and can an ordinary signed-in user still read
+an environment they are authorised to access? A deployment can serve every public surface
+perfectly while either authenticated path is broken.
 
 It needs a throwaway project holding junk secrets and a machine token scoped to one of its
 environments. A personal project is enough; an organisation is only needed for sharing, and a
@@ -907,7 +916,7 @@ sotto token create --name status-canary --expires-in-days 365   # prints a SOTTO
 gh secret set SOTTO_CANARY_TOKEN --body 'smt_...'   # the part BEFORE the dot, nothing after it
 ```
 
-The canary token expires like any other, a year at most, and an expired token is refused exactly
+The machine canary token expires like any other, a year at most, and an expired token is refused exactly
 as a revoked one is. The probe cannot tell the two apart, so a lapsed canary token is recorded as
 secret sync being down. `sotto token ls`, run in the canary project, shows its end date; replace
 it before then, and put that date somewhere you will see it, because this job never alerts.
@@ -920,7 +929,7 @@ and decrypt the canary. Refusing is what makes "the collector cannot decrypt" a 
 it holds rather than a promise about what it does. If the whole token is stored, the row reports
 unconfigured and says so.
 
-Without the secret the row reports unconfigured and the other four probes are unaffected, which
+Without the machine secret the row reports unconfigured and the other five probes are unaffected, which
 is what a self-hoster with no canary should see: an unconfigured component is not an outage and
 is left out of the tally.
 
@@ -937,6 +946,14 @@ grown, not the deployment having failed, and it has no business in the published
 not to have. The credential is also withheld from a target that has not answered for itself:
 unauthenticated probes run first, and if the configured URL is not `https`, or every one of them
 was redirected elsewhere, no token is sent at all.
+
+The human row uses a normal Sotto user session, not a special canary header or bypass. Keep its
+account dedicated to the canary, with access only to one throwaway project containing junk
+secrets. Configure the session bearer in the repository secret `SOTTO_HUMAN_CANARY_TOKEN` and
+the environment id in `SOTTO_HUMAN_CANARY_ENVIRONMENT_ID`. User sessions expire after 30 days, so
+rotate this secret through the ordinary sign-in flow before expiry. Do not use a staff account or
+an account with customer or organisation access. With either setting absent, the human row reports
+unconfigured and no authenticated request is made.
 
 The job records and never alerts. A component being down leaves the workflow green, because
 paging belongs to an external monitor that survives this repository being unreachable, and a

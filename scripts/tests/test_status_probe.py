@@ -309,6 +309,13 @@ class MachineToken(unittest.TestCase):
         for wrong in ("", "   ", "hunter2", "st_session_token", "MT1-onlythekey"):
             self.assertIsNotNone(probe.bearer_problem(wrong), wrong)
 
+    def test_human_canary_requires_a_standard_opaque_session_token(self):
+        self.assertIsNone(probe.session_bearer_problem("st_" + "a" * 64))
+        self.assertIsNotNone(probe.session_bearer_problem("st_short"))
+        self.assertIsNotNone(probe.session_bearer_problem("smt_machine"))
+        self.assertIsNotNone(probe.session_bearer_problem("st_" + "A" * 64))
+        self.assertIsNotNone(probe.environment_id_problem("../../env"))
+
 
 def secret_row(**overrides):
     row = {
@@ -471,7 +478,7 @@ class CanaryObservation(unittest.TestCase):
 
         def capture(_base, _p, path=None, token=None):
             seen.append(token)
-            if path is None:
+            if path is None or path == _p.path:
                 return response(200, body=grant_body())
             return response(200, body=snapshot_body())
 
@@ -518,7 +525,7 @@ class CanaryObservation(unittest.TestCase):
             order.append(p.id)
             if p.id != "sync":
                 return response(200, body="ok\n")
-            if path is None:
+            if path is None or path == p.path:
                 return response(200, body=grant_body())
             return response(200, body=snapshot_body())
 
@@ -554,6 +561,7 @@ class CanaryObservation(unittest.TestCase):
             with unittest.mock.patch.object(probe, "fetch", explode):
                 outcomes = probe.observe("https://example.invalid", [self.canary()])
         self.assertEqual(outcomes["sync"].state, probe.UNCONFIGURED)
+
 
     def test_an_unconfigured_canary_does_not_disable_the_misdirection_refusal(self):
         # The refusal asks whether every probe was misdirected. An unconfigured component can be
@@ -643,7 +651,7 @@ class CanaryObservation(unittest.TestCase):
         # The grant alone is half the question. A machine that can read its sealed vault key but
         # cannot list any ciphertext has nothing to decrypt, and a green row would say otherwise.
         def by_path(_base, _probe, path=None, token=None):
-            if path is None:
+            if path is None or path == _probe.path:
                 return response(200, body=grant_body())
             return response(500)
 
@@ -657,7 +665,7 @@ class CanaryObservation(unittest.TestCase):
         # Both endpoints answer 200 and the grant is perfect. Only the companion's own verdict
         # separates this from working, which is why companions carry one.
         def emptied(_base, _probe, path=None, token=None):
-            if path is None:
+            if path is None or path == _probe.path:
                 return response(200, body=grant_body())
             return response(200, body=snapshot_body([]))
 
@@ -669,7 +677,7 @@ class CanaryObservation(unittest.TestCase):
 
     def test_both_answering_is_the_only_way_through(self):
         def both_fine(_base, _probe, path=None, token=None):
-            if path is None:
+            if path is None or path == _probe.path:
                 return response(200, body=grant_body())
             return response(200, body=snapshot_body())
 
@@ -689,6 +697,85 @@ class CanaryObservation(unittest.TestCase):
             with unittest.mock.patch.object(probe, "fetch", refuse):
                 outcomes = probe.observe("https://example.invalid", [self.canary()])
         self.assertNotIn("smt_verysecret", outcomes["sync"].detail or "")
+
+
+class HumanCanaryObservation(unittest.TestCase):
+    def canary(self):
+        return next(p for p in probe.PROBES if p.id == "human-sync")
+
+    def test_user_session_reads_only_the_configured_synthetic_environment(self):
+        seen = []
+
+        def capture(_base, _p, path=None, token=None):
+            seen.append((path, token))
+            return response(200, body=snapshot_body())
+
+        session = "st_" + "a" * 64
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "SOTTO_HUMAN_CANARY_TOKEN": f" {session} ",
+                "SOTTO_HUMAN_CANARY_ENVIRONMENT_ID": "canary_env-1",
+            },
+        ):
+            with unittest.mock.patch.object(probe, "fetch", capture):
+                outcomes = probe.observe("https://example.test", [self.canary()])
+        self.assertEqual(outcomes["human-sync"].state, probe.OK)
+        self.assertEqual(seen, [("/environments/canary_env-1/secrets", session)])
+        self.assertNotIn(session, probe.sample_lines(outcomes, NOW)[0])
+        self.assertNotIn("canary_env-1", probe.sample_lines(outcomes, NOW)[0])
+
+    def test_missing_or_unsafe_identity_never_sends_a_session(self):
+        def explode(*_args, **_kwargs):
+            raise AssertionError("an incomplete canary must not make a request")
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "SOTTO_HUMAN_CANARY_TOKEN": "st_" + "a" * 64,
+                "SOTTO_HUMAN_CANARY_ENVIRONMENT_ID": "../../private",
+            },
+        ):
+            with unittest.mock.patch.object(probe, "fetch", explode):
+                outcomes = probe.observe("https://example.test", [self.canary()])
+        self.assertEqual(outcomes["human-sync"].state, probe.UNCONFIGURED)
+        self.assertIn("safe environment id", outcomes["human-sync"].detail)
+
+    def test_misdirected_target_never_receives_the_user_session(self):
+        def sent(_base, _p, path=None, token=None):
+            if token is not None:
+                raise AssertionError("a user session reached an unconfirmed host")
+            return response(301, {"location": "https://www.example.com/"})
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "SOTTO_HUMAN_CANARY_TOKEN": "st_" + "a" * 64,
+                "SOTTO_HUMAN_CANARY_ENVIRONMENT_ID": "canary-env",
+            },
+        ):
+            with unittest.mock.patch.object(probe, "fetch", sent):
+                outcomes = probe.observe("https://example.com", list(probe.PROBES))
+        self.assertEqual(outcomes["human-sync"].state, probe.UNCONFIGURED)
+        self.assertIn("misdirected", outcomes["human-sync"].detail)
+
+    def test_transport_details_never_publish_the_environment_id(self):
+        environment_id = "private-canary-environment"
+
+        def fail(_base, _p, path=None, token=None):
+            raise OSError(f"connection failed for {path}")
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "SOTTO_HUMAN_CANARY_TOKEN": "st_" + "a" * 64,
+                "SOTTO_HUMAN_CANARY_ENVIRONMENT_ID": environment_id,
+            },
+        ):
+            with unittest.mock.patch.object(probe, "fetch", fail):
+                outcomes = probe.observe("https://example.test", [self.canary()])
+        self.assertEqual(outcomes["human-sync"].state, probe.DOWN)
+        self.assertNotIn(environment_id, outcomes["human-sync"].detail)
 
 
 class Observation(unittest.TestCase):
@@ -786,7 +873,7 @@ class Summary(unittest.TestCase):
     def test_a_first_round_records_every_component(self):
         summary = probe.merge(probe.empty_summary(), {"api": probe.Outcome(probe.OK)}, NOW)
         ids = [c["id"] for c in summary["components"]]
-        self.assertEqual(ids, ["api", "web", "signin", "billing", "sync"])
+        self.assertEqual(ids, ["api", "web", "signin", "billing", "sync", "human-sync"])
         self.assertEqual(summary["generated_at"], "2026-09-08T12:00:00Z")
 
     def test_tallies_accumulate_across_rounds(self):

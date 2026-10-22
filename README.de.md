@@ -254,6 +254,45 @@ in der ersten Umgebung) oder `>` (nur in der zweiten). Ohne `--confirm` ist die 
 Eine bestätigte Kopie fügt Geheimnisse hinzu und aktualisiert sie, lässt aber Schlüssel unverändert,
 die nur in der Zielumgebung vorhanden sind.
 
+### Eine dotenv-Datei importieren
+
+`sotto import` liest eine dotenv-Datei und setzt jede Zuweisung in einer Umgebung, wobei jeder Wert lokal
+verschlüsselt wird. Es schreibt in die aktive Umgebung, sofern Sie mit `--env` keine andere nennen:
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+Ein Import wird mit dem Vorhandenen zusammengeführt. Angenommen, `staging` enthält bereits `API_URL` und
+`REGION`, und `.env.staging` enthält:
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+Nach dem Import in `staging`:
+
+- `API_URL` übernimmt den Wert aus der Datei, weil ein vorhandener Name aktualisiert wird.
+- `FEATURE_FLAG` wird hinzugefügt, weil ein neuer Name angelegt wird.
+- `REGION` bleibt erhalten, weil ein Name, der in der Datei fehlt, nie entfernt wird.
+
+Der Import schreibt nur in Ihren lokalen Speicher. Laden Sie das Ergebnis nach `sotto login` in einem separaten Schritt hoch:
+
+```sh
+sotto push --env staging
+```
+
+Die dotenv-Datei wird nur gelesen: Der Import ändert, verbraucht oder löscht sie nicht, schützen oder
+löschen Sie sie also selbst, wenn sie echte Werte enthält. Eine Datei, die sich nicht parsen lässt, ändert
+nichts, aber ein Fehler beim Schreiben macht bereits gespeicherte Zuweisungen nicht rückgängig; prüfen Sie
+nach einem unterbrochenen Import daher `sotto ls --env staging`.
+
+Um einen früheren Wert zurückzuholen, siehe [Eine frühere Secret-Version wiederherstellen](#eine-frühere-secret-version-wiederherstellen).
+Dieser Verlauf stammt vom Server und hilft daher nur bei Werten, die Sie bereits hochgeladen hatten. Führen Sie
+`sotto import --help` aus, um die Regeln für Anführungszeichen und literale Werte nachzulesen, statt sie hier zu wiederholen.
+
 ### Ein Secret teilen
 
 `sotto share` verschlüsselt ein Secret in einen Einmal-Link. Der Schlüssel steht im Link hinter dem
@@ -332,15 +371,16 @@ widerruft die Maschinen-Token, die es in der Organisation erstellt hat; jedes wi
 damit du es neu erstellen kannst. Die Rotation schützt, was danach geschrieben wird. Werte, die das
 Mitglied bereits gesehen hat, bleiben offengelegt; ändere sie daher an ihrer Quelle.
 
-#### Plan der Organisation
+#### Ältere Organisationsberechtigungen
 
 `sotto org plan <org-id>` liest die aktuelle Berechtigungsansicht des konfigurierten Servers für
 diese Organisation. Du musst angemeldet sein (`sotto login`); der lokale Tresor muss nicht
-entsperrt sein. Es zeigt die zugewiesene Stufe, die wirksame Stufe (deren Limits jetzt gelten), das
-Trial-Ende, sofern die Organisation eines hat, sowie entweder Mitglieder- und
-Organisationsprojekt-Limits oder `limits: none (Team)`.
+entsperrt sein. Es zeigt die zugewiesene und wirksame Stufe, das gespeicherte Trial-Ende und die
+geltenden Limits wie `limits: none (Team)`. Diese Felder erhalten die Kompatibilität mit älteren Organisationsplan-Datensätzen
+und Deployments; sie beschreiben weder die aktuellen personenbezogenen Cloud-Preise noch ein neues
+Cloud-Trial-Angebot.
 
-Illustrative Ausgabe in Sotto Cloud für eine kostenlose Organisation nach Ende ihres Trials:
+Illustrative Ausgabe aus einem älteren Organisationsplan-Datensatz:
 
 ```text
 tier:      free
@@ -359,8 +399,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-Diese Beispiele sind illustrativ; echte Organisationen können andere Stufen, Trials und Limits
-zeigen.
+Diese Beispiele zeigen gespeicherte Kompatibilitätsfelder, keine aktuellen Cloud-Angebote. Reale
+Deployments können andere gespeicherte Stufen, Trial-Daten und Limits anzeigen.
 
 #### Organisations-Auditprotokoll
 
@@ -378,10 +418,10 @@ und der Server begrenzt `--limit` auf 1-500. Der Befehl zeigt pro Ereignis eine 
 eine begrenzte Aktivitäts-/Metadatenansicht, nicht um eine Möglichkeit, Secret-Werte abzurufen; eine
 Seitennavigation oder ein vollständiges historisches Archiv gibt es nicht.
 
-In Sotto Cloud benötigt die Organisation eine wirksame Team-Berechtigung, einschließlich eines
-aktiven Team-Testzeitraums. Selbst gehostete Deployments überspringen diese Planprüfung, aber der
-Aufrufer braucht weiterhin die Rolle als Inhaber oder Administrator. Wenn keine Ereignisse vorhanden
-sind, gibt der Befehl keine Zeilen aus und wird erfolgreich beendet.
+Dieser Befehl behält die ältere Zugriffsprüfung anhand der Team-Berechtigung der Organisation bei.
+Selbst gehostete Deployments überspringen diese Planprüfung, aber der Aufrufer braucht weiterhin die
+Rolle als Inhaber oder Administrator. Wenn keine Ereignisse vorhanden sind, gibt der Befehl keine
+Zeilen aus und wird erfolgreich beendet.
 
 ### Maschinen-Token und CI
 

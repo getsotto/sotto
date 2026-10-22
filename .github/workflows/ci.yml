@@ -401,7 +401,7 @@ jobs:
     if: always()
     needs: [test, core-platform, readme-i18n, action-consumer, wasm, web, server, funnel-e2e, supply-chain]
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Validate required CI jobs

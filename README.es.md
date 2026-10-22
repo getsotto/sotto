@@ -254,6 +254,45 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 entorno) o `>` (solo en el segundo). Sin `--confirm`, la copia es una simulación. Una copia confirmada
 añade y actualiza secretos, pero deja intactas las claves que solo existen en el destino.
 
+### Importar un archivo dotenv
+
+`sotto import` lee un archivo dotenv y asigna cada variable en un entorno, cifrando cada valor en local.
+Escribe en el entorno activo, salvo que indiques otro con `--env`:
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+Una importación se fusiona con lo que ya existe. Supón que `staging` ya contiene `API_URL` y `REGION`,
+y que `.env.staging` contiene:
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+Tras importarlo en `staging`:
+
+- `API_URL` toma el valor del archivo, porque un nombre existente se actualiza.
+- `FEATURE_FLAG` se añade, porque se crea un nombre nuevo.
+- `REGION` se conserva, porque un nombre que falta en el archivo nunca se elimina.
+
+La importación escribe solo en tu almacén local. Tras `sotto login`, sube el resultado en un paso aparte:
+
+```sh
+sotto push --env staging
+```
+
+El archivo dotenv solo se lee: la importación no lo modifica, no lo consume ni lo elimina, así que
+protégelo o bórralo tú si contiene valores reales. Un archivo que no se puede analizar no cambia nada,
+pero un fallo durante la escritura no deshace las asignaciones ya guardadas, así que revisa
+`sotto ls --env staging` después de una importación interrumpida.
+
+Para recuperar un valor anterior, consulta [Restaurar una versión anterior de un secreto](#restaurar-una-versión-anterior-de-un-secreto).
+Ese historial procede del servidor, así que solo sirve para valores que ya habías subido. Ejecuta
+`sotto import --help` para ver las reglas de comillas y de valores literales en lugar de repetirlas aquí.
+
 ### Compartir un secreto
 
 `sotto share` cifra un secreto en un enlace de un solo uso. La clave va después del `#` del enlace,
@@ -331,15 +370,16 @@ de máquina que creó en la organización, nombrando cada uno para que puedas vo
 rotación protege lo que se escriba después. Los valores que el miembro ya vio siguen expuestos, así
 que cámbialos en su origen.
 
-#### Plan de la organización
+#### Derechos antiguos de la organización
 
 `sotto org plan <org-id>` lee la vista de derechos actual del servidor configurado para esa
 organización. Debes haber iniciado sesión (`sotto login`); el cofre local no necesita estar
-desbloqueado. Muestra el nivel asignado, el nivel efectivo (el que aplica los límites ahora), el
-fin de la prueba cuando la organización tiene uno, y o bien límites de miembros y proyectos de
-organización o `limits: none (Team)`.
+desbloqueado. Muestra los niveles asignado y efectivo, la fecha de prueba guardada y los límites
+aplicables, como `limits: none (Team)`. Estos campos mantienen la compatibilidad con registros y despliegues antiguos de planes
+por organización; no describen los precios actuales de Cloud por persona ni una nueva prueba de
+Cloud.
 
-Salida ilustrativa en Sotto Cloud para una organización gratuita cuya prueba ha terminado:
+Salida ilustrativa de un registro antiguo de plan de organización:
 
 ```text
 tier:      free
@@ -358,8 +398,8 @@ trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-Estos ejemplos son ilustrativos; las organizaciones reales pueden mostrar niveles, pruebas y
-límites distintos.
+Estos ejemplos muestran campos de compatibilidad guardados, no las ofertas actuales de Cloud. Los
+despliegues reales pueden mostrar otros niveles, fechas de prueba y límites guardados.
 
 #### Registro de auditoría de la organización
 
@@ -377,10 +417,10 @@ primero con los eventos más recientes; el valor predeterminado es de 100 evento
 actividad y metadatos, no una forma de recuperar valores secretos; no ofrece paginación ni un archivo
 histórico completo.
 
-En Sotto Cloud, la organización necesita una suscripción Team efectiva, incluido un periodo de
-prueba Team activo. Las implementaciones autoalojadas omiten esta comprobación del plan, pero quien
-ejecute el comando debe conservar el rol de propietario o administrador. Si no hay eventos, el
-comando no muestra filas y termina correctamente.
+Este comando conserva el control de acceso antiguo basado en el plan Team de la organización. Las
+implementaciones autoalojadas omiten esta comprobación del plan, pero quien ejecute el comando debe
+conservar el rol de propietario o administrador. Si no hay eventos, el comando no muestra filas y
+termina correctamente.
 
 ### Tokens de máquina y CI
 
