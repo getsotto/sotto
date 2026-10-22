@@ -299,6 +299,31 @@ sotto shares revoke <token>  # the token is the part of the link between /s/ and
 
 `sotto shares ls` zeigt nie das Chiffrat oder den Schlüssel im Link.
 
+Achte auf den Plural: `sotto share` erstellt einen Link, `sotto shares` verwaltet die Links, die du
+erstellt hast. Beide sprechen mit dem konfigurierten Server und brauchen daher `sotto login`; der
+lokale Tresor muss nicht entsperrt sein. Eine Auflistung sieht so aus (synthetisches Token,
+Beispielwerte):
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Übergib die erste Spalte an `sotto shares revoke`. Das ist das öffentliche Token, nicht der ganze
+Link: Bei `https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...` übergibst du nur
+`3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` und nie etwas nach dem `#`. Die Auflistung liest nur Metadaten. Sie öffnet
+keinen Link, verbraucht keinen Aufruf und kann dir keinen Link wiederherstellen, weil der Schlüssel
+nach dem `#` den Server nie erreicht hat.
+
+`sotto shares ls --json` gibt ein Objekt statt eines reinen Arrays aus: `active_free_count` und
+`links`, wobei jeder Link `token`, `share_class`, `max_views`, `view_count`, `expires_at`,
+`revoked_at` und `created_at` enthält. Der Server liefert nur deine 100 neuesten Links, das ist also
+keine vollständige Historie.
+
+Widerrufen verhindert künftige Abrufe über den Link. Ein bereits erfolgter Abruf lässt sich nicht
+rückgängig machen: Wenn der Empfänger das Secret schon angezeigt haben könnte, ändere es an der
+Quelle.
+
 ### Im Team arbeiten
 
 Teams teilen Umgebungen über eine Organisation. Jedes Mitglied erhält eine eigene versiegelte Kopie

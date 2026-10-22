@@ -304,6 +304,30 @@ sotto shares revoke <token>  # the token is the part of the link between /s/ and
 
 `sotto shares ls` n'affiche jamais le texte chiffré ni la clé du lien.
 
+Attention au pluriel : `sotto share` crée un lien, et `sotto shares` gère les liens que vous avez
+créés. Les deux dialoguent avec le serveur configuré et nécessitent donc `sotto login` ; le coffre
+local n'a pas besoin d'être déverrouillé. Une liste ressemble à ceci (jeton fictif, valeurs
+d'exemple) :
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Passez la première colonne à `sotto shares revoke`. C'est le jeton public, pas le lien complet :
+pour `https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...`, passez seulement
+`3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` et jamais ce qui suit le `#`. La liste ne lit que des métadonnées. Elle
+n'ouvre aucun lien, ne consomme aucune vue et ne peut pas reconstituer un lien, car la clé située
+après le `#` n'a jamais atteint le serveur.
+
+`sotto shares ls --json` affiche un objet et non un simple tableau : `active_free_count` et `links`,
+où chaque lien contient `token`, `share_class`, `max_views`, `view_count`, `expires_at`,
+`revoked_at` et `created_at`. Le serveur ne renvoie que vos 100 liens les plus récents : ce n'est
+donc pas un historique complet.
+
+La révocation empêche les récupérations futures via le lien. Elle ne peut pas annuler une
+récupération déjà effectuée : si le destinataire a pu révéler le secret, changez-le à la source.
+
 ### Travailler en équipe
 
 Les équipes partagent des environnements au sein d'une organisation. Chaque membre reçoit sa propre

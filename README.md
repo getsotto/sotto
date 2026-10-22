@@ -293,6 +293,28 @@ sotto shares revoke <token>  # the token is the part of the link between /s/ and
 
 `sotto shares ls` never shows the ciphertext or the key in the link.
 
+Note the plural: `sotto share` creates a link, and `sotto shares` manages the links you created.
+Both talk to the configured server, so they need `sotto login`; the local vault does not need to be
+unlocked. A listing looks like this (synthetic token, illustrative values):
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Pass the first column to `sotto shares revoke`. It is the public token, not the whole link: for
+`https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...`, pass only `3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` and never anything after
+the `#`. Listing reads metadata only. It does not open a link or use up a view, and it cannot
+rebuild a link for you, because the key after the `#` never reached the server.
+
+`sotto shares ls --json` prints an object rather than a bare array: `active_free_count` and `links`,
+where each link has `token`, `share_class`, `max_views`, `view_count`, `expires_at`, `revoked_at`
+and `created_at`. The server returns only your 100 most recent links, so this is not a complete
+history.
+
+Revoking stops future retrievals through the link. It cannot undo a retrieval that has already
+happened, so if the recipient may already have revealed the secret, change it at its source.
+
 ### Work with a team
 
 Teams share environments through an organisation. Each member receives their own sealed copy of an

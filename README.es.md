@@ -298,6 +298,28 @@ sotto shares revoke <token>  # the token is the part of the link between /s/ and
 
 `sotto shares ls` nunca muestra el texto cifrado ni la clave del enlace.
 
+Fíjate en el plural: `sotto share` crea un enlace y `sotto shares` gestiona los enlaces que has
+creado. Ambos hablan con el servidor configurado, así que necesitan `sotto login`; no hace falta
+desbloquear el almacén local. Un listado tiene este aspecto (token sintético, valores de ejemplo):
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Pasa la primera columna a `sotto shares revoke`. Es el token público, no el enlace completo: para
+`https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...`, pasa solo `3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` y nunca nada de
+lo que va después de `#`. El listado solo lee metadatos. No abre ningún enlace ni gasta una vista, y
+no puede reconstruir un enlace, porque la clave que va después de `#` nunca llegó al servidor.
+
+`sotto shares ls --json` imprime un objeto y no un array: `active_free_count` y `links`, donde cada
+enlace tiene `token`, `share_class`, `max_views`, `view_count`, `expires_at`, `revoked_at` y
+`created_at`. El servidor devuelve solo tus 100 enlaces más recientes, así que no es un historial
+completo.
+
+Revocar impide futuras recuperaciones a través del enlace. No puede deshacer una recuperación que
+ya ocurrió, así que si el destinatario pudo haber revelado el secreto, cámbialo en su origen.
+
 ### Trabajo en equipo
 
 Los equipos comparten entornos mediante una organización. Cada miembro recibe su propia copia
