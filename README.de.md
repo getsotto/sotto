@@ -254,6 +254,45 @@ in der ersten Umgebung) oder `>` (nur in der zweiten). Ohne `--confirm` ist die 
 Eine bestätigte Kopie fügt Geheimnisse hinzu und aktualisiert sie, lässt aber Schlüssel unverändert,
 die nur in der Zielumgebung vorhanden sind.
 
+### Eine dotenv-Datei importieren
+
+`sotto import` liest eine dotenv-Datei und setzt jede Zuweisung in einer Umgebung, wobei jeder Wert lokal
+verschlüsselt wird. Es schreibt in die aktive Umgebung, sofern Sie mit `--env` keine andere nennen:
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+Ein Import wird mit dem Vorhandenen zusammengeführt. Angenommen, `staging` enthält bereits `API_URL` und
+`REGION`, und `.env.staging` enthält:
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+Nach dem Import in `staging`:
+
+- `API_URL` übernimmt den Wert aus der Datei, weil ein vorhandener Name aktualisiert wird.
+- `FEATURE_FLAG` wird hinzugefügt, weil ein neuer Name angelegt wird.
+- `REGION` bleibt erhalten, weil ein Name, der in der Datei fehlt, nie entfernt wird.
+
+Der Import schreibt nur in Ihren lokalen Speicher. Laden Sie das Ergebnis nach `sotto login` in einem separaten Schritt hoch:
+
+```sh
+sotto push --env staging
+```
+
+Die dotenv-Datei wird nur gelesen: Der Import ändert, verbraucht oder löscht sie nicht, schützen oder
+löschen Sie sie also selbst, wenn sie echte Werte enthält. Eine Datei, die sich nicht parsen lässt, ändert
+nichts, aber ein Fehler beim Schreiben macht bereits gespeicherte Zuweisungen nicht rückgängig; prüfen Sie
+nach einem unterbrochenen Import daher `sotto ls --env staging`.
+
+Um einen früheren Wert zurückzuholen, siehe [Eine frühere Secret-Version wiederherstellen](#eine-frühere-secret-version-wiederherstellen).
+Dieser Verlauf stammt vom Server und hilft daher nur bei Werten, die Sie bereits hochgeladen hatten. Führen Sie
+`sotto import --help` aus, um die Regeln für Anführungszeichen und literale Werte nachzulesen, statt sie hier zu wiederholen.
+
 ### Ein Secret teilen
 
 `sotto share` verschlüsselt ein Secret in einen Einmal-Link. Der Schlüssel steht im Link hinter dem

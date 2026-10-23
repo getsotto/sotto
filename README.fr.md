@@ -259,6 +259,45 @@ le premier environnement) ou `>` (seulement dans le second). Sans `--confirm`, l
 simulation. Une copie confirmée ajoute et met à jour les secrets, mais laisse intactes les clés
 présentes uniquement dans la destination.
 
+### Importer un fichier dotenv
+
+`sotto import` lit un fichier dotenv et définit chaque affectation dans un environnement, en chiffrant
+chaque valeur en local. Il écrit dans l'environnement actif, sauf si vous en nommez un autre avec `--env` :
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+Un import fusionne avec l'existant. Supposons que `staging` contienne déjà `API_URL` et `REGION`,
+et que `.env.staging` contienne :
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+Après l'avoir importé dans `staging` :
+
+- `API_URL` prend la valeur du fichier, car un nom existant est mis à jour.
+- `FEATURE_FLAG` est ajouté, car un nouveau nom est créé.
+- `REGION` est conservé, car un nom absent du fichier n'est jamais supprimé.
+
+L'import n'écrit que dans votre magasin local. Après `sotto login`, envoyez le résultat lors d'une étape distincte :
+
+```sh
+sotto push --env staging
+```
+
+Le fichier dotenv est seulement lu : l'import ne le modifie pas, ne le consomme pas et ne le supprime pas,
+donc protégez-le ou supprimez-le vous-même s'il contient de vraies valeurs. Un fichier qui ne s'analyse pas
+ne change rien, mais un échec pendant l'écriture n'annule pas les affectations déjà enregistrées ;
+vérifiez donc `sotto ls --env staging` après un import interrompu.
+
+Pour retrouver une valeur antérieure, voir [Restaurer une ancienne version d'un secret](#restaurer-une-ancienne-version-dun-secret).
+Cet historique provient du serveur : il ne sert donc que pour des valeurs déjà envoyées. Exécutez
+`sotto import --help` pour les règles de guillemets et de valeurs littérales plutôt que de les répéter ici.
+
 ### Partager un secret
 
 `sotto share` chiffre un secret dans un lien à usage unique. La clé se trouve après le `#` du lien,

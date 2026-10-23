@@ -253,6 +253,45 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 ambiente) ou `>` (só no segundo). Sem `--confirm`, a cópia é uma simulação. Uma cópia confirmada
 adiciona e atualiza segredos, mas mantém intactas as chaves que existem apenas no destino.
 
+### Importar um arquivo dotenv
+
+`sotto import` lê um arquivo dotenv e define cada atribuição em um ambiente, criptografando cada valor
+localmente. Ele grava no ambiente ativo, a menos que você indique outro com `--env`:
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+Uma importação é mesclada ao que já existe. Suponha que `staging` já tenha `API_URL` e `REGION`, e que
+`.env.staging` contenha:
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+Depois de importá-lo em `staging`:
+
+- `API_URL` recebe o valor do arquivo, porque um nome existente é atualizado.
+- `FEATURE_FLAG` é adicionado, porque um novo nome é criado.
+- `REGION` é mantido, porque um nome ausente do arquivo nunca é removido.
+
+A importação grava apenas no seu armazenamento local. Depois de `sotto login`, envie o resultado em uma etapa separada:
+
+```sh
+sotto push --env staging
+```
+
+O arquivo dotenv é apenas lido: a importação não o altera, não o consome nem o apaga, então proteja-o ou
+apague-o você mesmo se ele tiver valores reais. Um arquivo que não pode ser analisado não altera nada, mas
+uma falha durante a gravação não desfaz as atribuições já armazenadas; por isso, confira
+`sotto ls --env staging` após uma importação interrompida.
+
+Para recuperar um valor anterior, veja [Restaurar uma versão anterior de um segredo](#restaurar-uma-versão-anterior-de-um-segredo).
+Esse histórico vem do servidor, então só ajuda com valores que você já havia enviado. Execute
+`sotto import --help` para ver as regras de aspas e de valores literais em vez de repeti-las aqui.
+
 ### Compartilhar um segredo
 
 `sotto share` criptografa um segredo em um link de uso único. A chave fica depois do `#` no link,

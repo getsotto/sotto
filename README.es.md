@@ -254,6 +254,45 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 entorno) o `>` (solo en el segundo). Sin `--confirm`, la copia es una simulación. Una copia confirmada
 añade y actualiza secretos, pero deja intactas las claves que solo existen en el destino.
 
+### Importar un archivo dotenv
+
+`sotto import` lee un archivo dotenv y asigna cada variable en un entorno, cifrando cada valor en local.
+Escribe en el entorno activo, salvo que indiques otro con `--env`:
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+Una importación se fusiona con lo que ya existe. Supón que `staging` ya contiene `API_URL` y `REGION`,
+y que `.env.staging` contiene:
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+Tras importarlo en `staging`:
+
+- `API_URL` toma el valor del archivo, porque un nombre existente se actualiza.
+- `FEATURE_FLAG` se añade, porque se crea un nombre nuevo.
+- `REGION` se conserva, porque un nombre que falta en el archivo nunca se elimina.
+
+La importación escribe solo en tu almacén local. Tras `sotto login`, sube el resultado en un paso aparte:
+
+```sh
+sotto push --env staging
+```
+
+El archivo dotenv solo se lee: la importación no lo modifica, no lo consume ni lo elimina, así que
+protégelo o bórralo tú si contiene valores reales. Un archivo que no se puede analizar no cambia nada,
+pero un fallo durante la escritura no deshace las asignaciones ya guardadas, así que revisa
+`sotto ls --env staging` después de una importación interrumpida.
+
+Para recuperar un valor anterior, consulta [Restaurar una versión anterior de un secreto](#restaurar-una-versión-anterior-de-un-secreto).
+Ese historial procede del servidor, así que solo sirve para valores que ya habías subido. Ejecuta
+`sotto import --help` para ver las reglas de comillas y de valores literales en lugar de repetirlas aquí.
+
 ### Compartir un secreto
 
 `sotto share` cifra un secreto en un enlace de un solo uso. La clave va después del `#` del enlace,

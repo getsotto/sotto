@@ -38,7 +38,25 @@ impl DisposableDatabase {
             .connect_with(base.clone().database("postgres"))
             .await
             .expect("connect to postgres maintenance database");
-        let name = format!("sotto_upgrade_{}", Uuid::new_v4().simple());
+        let suffix = Uuid::new_v4().simple().to_string();
+        let name = match std::env::var("SOTTO_TEST_DATABASE_PREFIX") {
+            Ok(prefix) => {
+                assert!(
+                    !prefix.is_empty()
+                        && prefix.len() <= 19
+                        && prefix.bytes().all(|byte| byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || byte == b'_'),
+                    "invalid SOTTO_TEST_DATABASE_PREFIX"
+                );
+                format!("{prefix}_upgrade_{suffix}")
+            }
+            Err(_) => format!("sotto_upgrade_{suffix}"),
+        };
+        assert!(
+            name.len() <= 63,
+            "disposable migration database name is too long"
+        );
         sqlx::query(&format!("CREATE DATABASE \"{name}\""))
             .execute(&admin)
             .await

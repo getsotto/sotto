@@ -3,8 +3,9 @@
 # compile Rust/WASM from source (a 1 GB free-tier VM can host Sotto).
 #
 # Runs on release tags (published as :vX.Y.Z and :latest) and manually via workflow_dispatch
-# (published as :latest from the chosen ref). Each architecture builds NATIVELY (GitHub's arm64
-# runners) - no QEMU emulation, which would make the Rust release build take hours - then a
+# (published as a run-unique candidate tag bound to the selected source SHA). Manual candidate
+# builds never move :latest or create a CLI release. Each architecture builds NATIVELY (GitHub's
+# arm64 runners) - no QEMU emulation, which would make the Rust release build take hours - then a
 # multi-arch manifest stitches the two together.
 
 name: images
@@ -94,16 +95,46 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push manifests
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_REF: ${{ github.ref }}
+          SOURCE_REF_NAME: ${{ github.ref_name }}
+          SOURCE_SHA: ${{ github.sha }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
+
+          case "$EVENT_NAME" in
+            push)
+              case "$SOURCE_REF" in
+                refs/tags/v*)
+                  candidate_tag="$SOURCE_REF_NAME"
+                  publish_latest=true
+                  ;;
+                *)
+                  echo "image release requires a v* tag, got $SOURCE_REF" >&2
+                  exit 1
+                  ;;
+              esac
+              ;;
+            workflow_dispatch)
+              candidate_tag="candidate-${SOURCE_SHA:0:12}-${WORKFLOW_RUN_ID}"
+              publish_latest=false
+              ;;
+            *)
+              echo "unsupported image build event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
           for image in sotto-server sotto-web; do
             base="ghcr.io/${{ github.repository_owner }}/$image"
-            tags=(-t "$base:latest")
-            case "${{ github.ref }}" in
-              refs/tags/v*) tags+=(-t "$base:${{ github.ref_name }}") ;;
-            esac
+            tags=(-t "$base:$candidate_tag")
+            if [[ "$publish_latest" == true ]]; then
+              tags+=(-t "$base:latest")
+            fi
             docker buildx imagetools create "${tags[@]}" \
               "$base:stage-${{ github.run_id }}-amd64" \
               "$base:stage-${{ github.run_id }}-arm64"
-            docker buildx imagetools inspect "$base:latest"
+            docker buildx imagetools inspect "$base:$candidate_tag"
           done

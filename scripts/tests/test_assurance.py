@@ -125,6 +125,28 @@ class AssuranceTests(unittest.TestCase):
         self.assertEqual(fetch.call_count, 2)
         sleep.assert_called_once_with(assurance.ASSURANCE_STATUS_RETRY_DELAYS[0])
 
+    def test_remote_validation_retries_when_github_temporarily_omits_a_job(self):
+        manifest = assurance.load_manifest()
+        names = manifest["groups"]["kani"]["required_jobs"]
+        missing = (fixture("kani", names)["run"], [])
+        complete = (fixture("kani", names)["run"], fixture("kani", names)["jobs"])
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GITHUB_RUN_ID": "42",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_REPOSITORY": "getsotto/sotto",
+                    "GITHUB_TOKEN": "token",
+                },
+            ),
+            patch.object(assurance, "fetch_run", side_effect=[missing, complete]) as fetch,
+            patch.object(assurance.time, "sleep") as sleep,
+        ):
+            self.assertEqual(assurance.main(["--group", "kani", "--expected-sha", "abc123"]), 0)
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(assurance.ASSURANCE_STATUS_RETRY_DELAYS[0])
+
     def test_remote_validation_fails_closed_after_bounded_incomplete_results(self):
         manifest = assurance.load_manifest()
         names = manifest["groups"]["kani"]["required_jobs"]
@@ -189,6 +211,8 @@ class AssuranceTests(unittest.TestCase):
                 result = assurance._get_json("https://api.github.com/example", "token")
         self.assertEqual(result, {"ok": True})
         self.assertEqual(open_url.call_count, 2)
+        request = open_url.call_args_list[0].args[0]
+        self.assertEqual(request.get_header("Cache-control"), "no-cache")
         sleep.assert_called_once_with(1)
 
     def test_get_json_does_not_retry_permanent_client_errors(self):

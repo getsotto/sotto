@@ -14,7 +14,10 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / ".ci" / "assurance-checks.json"
 API_RETRY_DELAYS = (1, 2, 4)
-ASSURANCE_STATUS_RETRY_DELAYS = (1, 2, 4, 8)
+# Job conclusions can take longer to appear in the Actions API than the
+# completion job's `needs` dependency. Wait up to 255 seconds for that
+# eventual-consistency window, then fail closed if results are still missing.
+ASSURANCE_STATUS_RETRY_DELAYS = (1, 2, 4, 8, 16, 32, 64, 128)
 RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 
@@ -104,7 +107,14 @@ def validate_run(manifest, group_name, run, jobs, *, expected_sha=None, tested_s
 
 
 def _get_json(url, token):
-    request = Request(url, headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"})
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Cache-Control": "no-cache",
+        },
+    )
     for attempt in range(len(API_RETRY_DELAYS) + 1):
         try:
             with urlopen(request, timeout=30) as response:

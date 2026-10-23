@@ -251,6 +251,45 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 environment) or `>` (only in the second). Without `--confirm`, copying is a dry-run. A confirmed
 copy adds and updates secrets but leaves keys that exist only in the destination untouched.
 
+### Import a dotenv file
+
+`sotto import` reads a dotenv file and sets each assignment in one environment, encrypting every
+value locally. It writes to the active environment unless you name another with `--env`:
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+An import merges into what is already there. Suppose `staging` already holds `API_URL` and `REGION`,
+and `.env.staging` contains:
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+After importing it into `staging`:
+
+- `API_URL` takes the value from the file, because an existing name is updated.
+- `FEATURE_FLAG` is added, because a new name is created.
+- `REGION` is kept, because a name that is missing from the file is never removed.
+
+Import writes to your local store only. After `sotto login`, upload the result as a separate step:
+
+```sh
+sotto push --env staging
+```
+
+The dotenv file is only read: import does not change, consume or delete it, so protect or remove it
+yourself if it holds real values. A file that does not parse changes nothing, but a failure while
+writing does not undo the assignments already stored, so check `sotto ls --env staging` after an
+interrupted import.
+
+To get an earlier value back, see [Restore an earlier secret version](#restore-an-earlier-secret-version).
+That history comes from the server, so it only helps for values you had already pushed. Run
+`sotto import --help` for the quoting and literal-value rules instead of repeating them here.
+
 ### Share a secret
 
 `sotto share` encrypts one secret into a one-time link. The key sits after the `#` in the link,
