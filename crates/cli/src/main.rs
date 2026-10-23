@@ -341,6 +341,9 @@ enum EnvCommand {
         /// Actually apply the copy (otherwise only the plan is printed).
         #[arg(long)]
         confirm: bool,
+        /// Output the copy plan as one JSON object.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -967,10 +970,15 @@ fn run() -> Result<()> {
                 ensure_unlocked(&store, &keychain)?;
                 env_diff(&app, &config, &left, &right, reveal)
             }
-            EnvCommand::Copy { src, dst, confirm } => {
+            EnvCommand::Copy {
+                src,
+                dst,
+                confirm,
+                json,
+            } => {
                 let config = effective_config(&cwd, cli.env.as_deref())?;
                 ensure_unlocked(&store, &keychain)?;
-                env_copy(&app, &config, &src, &dst, confirm)
+                env_copy(&app, &config, &src, &dst, confirm, json)
             }
         },
         Command::Completions { .. } => unreachable!("completions are handled before store init"),
@@ -2215,8 +2223,27 @@ fn env_diff(app: &App, config: &Config, left: &str, right: &str, reveal: bool) -
 }
 
 /// Render (and with --confirm, apply) an environment copy plan.
-fn env_copy(app: &App, config: &Config, src: &str, dst: &str, confirm: bool) -> Result<()> {
+fn env_copy(
+    app: &App,
+    config: &Config,
+    src: &str,
+    dst: &str,
+    confirm: bool,
+    json: bool,
+) -> Result<()> {
     let plan = app.env_copy(config, src, dst, confirm)?;
+    if json {
+        let value = serde_json::json!({
+            "source": src,
+            "destination": dst,
+            "applied": confirm,
+            "create": plan.create,
+            "update": plan.update,
+            "unchanged": plan.unchanged,
+        });
+        println!("{}", to_json(&value)?);
+        return Ok(());
+    }
     for name in &plan.create {
         println!("create {name}");
     }
@@ -3270,6 +3297,20 @@ mod tests {
             panic!("expected EnvCommand::Ls");
         };
         assert!(!json);
+    }
+
+    #[test]
+    fn env_copy_json_parser_parses_flag() {
+        let cli = Cli::try_parse_from(["sotto", "env", "copy", "dev", "staging", "--json"])
+            .expect("sotto env copy --json should parse");
+        let Some(Command::Env {
+            command: EnvCommand::Copy { json, confirm, .. },
+        }) = cli.command
+        else {
+            panic!("expected EnvCommand::Copy");
+        };
+        assert!(json);
+        assert!(!confirm);
     }
 
     #[test]
