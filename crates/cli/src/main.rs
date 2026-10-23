@@ -347,7 +347,11 @@ enum EnvCommand {
 #[derive(Subcommand)]
 enum TaskCommand {
     /// List declared tasks from the current project's manifest.
-    Ls,
+    Ls {
+        /// Emit task metadata as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate `sotto.tasks.toml` without opening the local secret store.
     Validate,
     /// Approve one declared task for one environment after reviewing its full command.
@@ -487,14 +491,33 @@ fn run() -> Result<()> {
     // them before opening local state or the keychain, so they cannot prompt or initialise secret data.
     if let Some(Command::Task { command }) = &cli.command {
         match command {
-            TaskCommand::Ls => {
+            TaskCommand::Ls { json } => {
                 let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
                 let (_, manifest) = sotto_cli::agent_tasks::TaskManifest::discover(&cwd)?;
                 let mut tasks = manifest.tasks().to_vec();
                 tasks.sort_by(|a, b| a.name().cmp(b.name()));
-                for task in &tasks {
-                    println!("{}: {}", task.name(), task.description());
-                    println!("  environments: {}", task.environments().join(", "));
+                if *json {
+                    #[derive(serde::Serialize)]
+                    struct TaskJson<'a> {
+                        name: &'a str,
+                        description: &'a str,
+                        environments: &'a [String],
+                    }
+
+                    let payload: Vec<TaskJson> = tasks
+                        .iter()
+                        .map(|task| TaskJson {
+                            name: task.name(),
+                            description: task.description(),
+                            environments: task.environments(),
+                        })
+                        .collect();
+                    println!("{}", to_json(&payload)?);
+                } else {
+                    for task in &tasks {
+                        println!("{}: {}", task.name(), task.description());
+                        println!("  environments: {}", task.environments().join(", "));
+                    }
                 }
                 return Ok(());
             }
@@ -538,7 +561,7 @@ fn run() -> Result<()> {
                     )
                 })?;
             }
-            TaskCommand::Ls | TaskCommand::Validate => {}
+            TaskCommand::Ls { .. } | TaskCommand::Validate => {}
         }
     }
 
@@ -779,7 +802,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Task { command } => match command {
-            TaskCommand::Ls
+            TaskCommand::Ls { .. }
             | TaskCommand::Validate
             | TaskCommand::Approve { .. }
             | TaskCommand::Approvals

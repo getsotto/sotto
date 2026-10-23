@@ -61,6 +61,24 @@ List declared tasks in the project:
 sotto task ls
 ```
 
+Pass `--json` to write declared task metadata as a structured JSON array for editor integrations and tooling:
+
+```sh
+sotto task ls --json
+```
+
+The output emits an array of task objects containing `name`, `description` and `environments`:
+
+```json
+[
+  {
+    "name": "test",
+    "description": "Run the test suite",
+    "environments": ["dev", "staging"]
+  }
+]
+```
+
 ## Approve and run from the CLI
 
 Approval is a local, interactive action. Sotto displays the project identity, resolved executable,
