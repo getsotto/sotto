@@ -351,11 +351,27 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prin
 sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
 
-El miembro ejecuta el comando impreso en su propia copia del proyecto:
+Después, el miembro ejecuta el comando impreso. Esto no es lo mismo que **Otro dispositivo**, que restaura tu propia cuenta en una segunda máquina.
+El miembro usa su propia cuenta en el mismo servidor: ejecuta `sotto login` y `sotto unlock` y
+después el comando impreso en un directorio que todavía no tiene `sotto.toml`:
 
 ```sh
+mkdir acme-api && cd acme-api
 sotto clone <project-id> <env-id> --org <org-id>
 ```
+
+Ser miembro de la organización y tener acceso a un entorno son pasos distintos. `sotto org invite`
+convierte a alguien en miembro; `sotto grant <user-id>` le da un entorno. Si ya no tienes el ID de
+usuario, `sotto org members <org-id>` lo muestra. `sotto clone` no concede nada por sí solo: obtiene
+el grant que el miembro ya tiene, descarga ese entorno y escribe `sotto.toml`. Sin grant se detiene
+con `you have not been granted this environment (ask an admin to share it)`, y un administrador
+tiene que ejecutar `sotto grant` para esa persona. No entregues nunca tu Emergency Kit a un
+compañero; desbloquea tu cuenta, no la suya.
+
+Conserva `--org` del comando impreso, porque guarda la organización propietaria para que los push
+posteriores coincidan con el servidor. `--as <environment-name>` y `--name <project-label>` solo
+fijan etiquetas locales: por defecto el entorno conserva su nombre real y el proyecto se llama
+`shared`.
 
 Para ver quién tiene acceso, eliminar a alguien o rotar tú mismo la clave de un entorno:
 
