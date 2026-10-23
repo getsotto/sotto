@@ -183,11 +183,45 @@ describe("payer transfer journeys", () => {
 
       await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
       expect(screen.getAllByRole("button", { name: "Accept transfer request" })).toHaveLength(1);
-      expect(screen.getByText(/expired at the renewal boundary/i)).toBeInTheDocument();
+      // The response deadline passed 99 seconds before renewal, so the copy must not blame renewal.
+      expect(screen.getByText(/expired because its response deadline passed/i)).toBeInTheDocument();
+      expect(screen.queryByText(/expired at the renewal boundary/i)).not.toBeInTheDocument();
       expect(api.fetchPayerTransfers).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("expires an open invitation at the renewal boundary when renewal comes first", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(2_000_000_000_000);
+    try {
+      vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
+        transfers: [transfer({ consentExpiresAtEpoch: 2_000_000_600, effectiveFrom: 2_000_000_001 })],
+        nextCursor: null,
+      });
+      render(<PayerTransferInbox />);
+      await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+      expect(screen.getByRole("button", { name: "Accept transfer request" })).toBeInTheDocument();
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+      expect(screen.queryByRole("button", { name: "Accept transfer request" })).not.toBeInTheDocument();
+      expect(screen.getByText(/expired at the renewal boundary/i)).toBeInTheDocument();
+      expect(screen.queryByText(/response deadline passed/i)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows invitations loaded after their response deadline as expired without blaming renewal", async () => {
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
+      transfers: [transfer({ consentExpiresAtEpoch: 1, effectiveFrom: 2 })],
+      nextCursor: null,
+    });
+    render(<PayerTransferInbox />);
+    expect(await screen.findByText(/expired because its response deadline passed/i)).toBeInTheDocument();
+    expect(screen.queryByText(/expired at the renewal boundary/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Accept transfer request" })).not.toBeInTheDocument();
   });
 
   it("keeps personal payer invitations unaccepted until setup is available", async () => {
