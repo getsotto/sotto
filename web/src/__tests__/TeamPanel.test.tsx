@@ -173,6 +173,54 @@ describe("TeamPanel organisation loading", () => {
   });
 });
 
+describe("TeamPanel optional sponsored-seat discovery", () => {
+  beforeEach(() => {
+    resetMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), role: "admin" }]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([member("member-a")]);
+    vi.mocked(api.fetchEntitlements).mockResolvedValue({
+      ...freePlan, tier: "team", effectiveTier: "team",
+    });
+    vi.mocked(api.fetchAudit).mockResolvedValue([]);
+  });
+
+  it.each(["unavailable", "empty"] as const)(
+    "keeps members, invitations and audit usable when sponsored seats are %s",
+    async (outcome) => {
+      if (outcome === "unavailable") {
+        vi.mocked(api.fetchSponsoredSeats).mockRejectedValueOnce(new Error("synthetic seat failure"));
+      }
+      render(
+        <TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+      expect(await screen.findByRole("heading", { name: "Audit log" })).toBeInTheDocument();
+
+      expect(screen.getByText("member-a")).toBeInTheDocument();
+      expect(screen.getByText("No events yet.")).toBeInTheDocument();
+      const invite = screen.getByRole("textbox", { name: "Invite by email" });
+      expect(invite).toBeEnabled();
+      fireEvent.change(invite, { target: { value: "teammate@example.com" } });
+      expect(invite).toHaveValue("teammate@example.com");
+      expect(screen.getByRole("button", { name: "Invite" })).toBeEnabled();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(api.fetchSponsoredSeats).toHaveBeenCalledExactlyOnceWith("org-a");
+      expect(api.fetchAudit).toHaveBeenCalledExactlyOnceWith("org-a");
+      expect(api.fetchSponsoredQuote).not.toHaveBeenCalled();
+      expect(api.createSponsoredCheckout).not.toHaveBeenCalled();
+      expect(api.inviteMember).not.toHaveBeenCalled();
+
+      if (outcome === "unavailable") {
+        expect(screen.queryByRole("heading", { name: "Sponsored Cloud seats" })).not.toBeInTheDocument();
+        expect(screen.queryByText("No sponsored seats are active.")).not.toBeInTheDocument();
+      } else {
+        expect(screen.getByRole("heading", { name: "Sponsored Cloud seats" })).toBeInTheDocument();
+        expect(screen.getByText("No sponsored seats are active.")).toBeInTheDocument();
+      }
+    },
+  );
+});
+
 describe("TeamPanel organisation names", () => {
   const master = new Uint8Array([1]);
   const encPrivateKeys = new Uint8Array([2]);
