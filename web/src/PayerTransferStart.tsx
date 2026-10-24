@@ -88,10 +88,14 @@ export function PersonalTransferStart() {
   const [quote, setQuote] = useState<PayerTransferQuote | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [membersError, setMembersError] = useState<string | null>(null);
+  const [membersLoading, setMembersLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const idempotencyKey = useRef<string | null>(null);
+  const membersInFlight = useRef(false);
+  const formBusy = busy || membersLoading;
   const loadInFlight = useRef(false);
   const mounted = useRef(true);
 
@@ -144,17 +148,30 @@ export function PersonalTransferStart() {
   }, []);
 
   async function chooseOrganisation(orgId: string) {
+    if (membersInFlight.current) return;
     setDestinationOrgId(orgId);
     setCounterpartyId("");
     setMembers([]);
     setQuote(null);
     setError(null);
+    setMembersError(null);
     if (orgId === "") return;
-    setBusy(true);
+    await loadMembers(orgId);
+  }
+
+  async function loadMembers(orgId: string) {
+    if (orgId === "" || membersInFlight.current) return;
+    membersInFlight.current = true;
+    setMembersLoading(true);
+    setMembersError(null);
     try {
       setMembers(await fetchMembers(orgId));
-    } catch (e) { setError(message(e)); }
-    finally { setBusy(false); }
+    } catch (e) {
+      setMembersError(message(e));
+    } finally {
+      membersInFlight.current = false;
+      setMembersLoading(false);
+    }
   }
 
   async function requestQuote() {
@@ -206,21 +223,25 @@ export function PersonalTransferStart() {
       {loading && <p className="muted" role="status">Loading organisations…</p>}
     </> : loading ? <p className="muted" role="status">Loading organisations…</p> : <>
       <label>Organisation
-        <select value={destinationOrgId} onChange={(event) => void chooseOrganisation(event.target.value)} disabled={busy}>
+        <select value={destinationOrgId} onChange={(event) => void chooseOrganisation(event.target.value)} disabled={formBusy}>
           <option value="">Choose an organisation you belong to</option>
           {orgs.map((org) => <option key={org.id} value={org.id}>{org.id} · {org.role}</option>)}
         </select>
       </label>
-      {destinationOrgId !== "" && <CounterpartySelect members={members} value={counterpartyId} onChange={(value) => { setCounterpartyId(value); setQuote(null); }} exclude={userId} disabled={busy} />}
+      {destinationOrgId !== "" && <CounterpartySelect members={members} value={counterpartyId} onChange={(value) => { setCounterpartyId(value); setQuote(null); }} exclude={userId} disabled={formBusy} />}
+      {membersError !== null && <p role="alert">{membersError}</p>}
+      {(membersError !== null || membersLoading) && <button disabled={formBusy} onClick={() => void loadMembers(destinationOrgId)}>
+        {membersLoading ? "Loading administrators…" : "Retry loading administrators"}
+      </button>}
       {error !== null && <p role="alert">{error}</p>}
       {notice !== null && <p className="notice" role="status">{notice}</p>}
       {quote === null
-        ? <button disabled={busy || destinationOrgId === "" || counterpartyId === ""} onClick={() => void requestQuote()}>{busy ? "Loading transfer quote…" : "Review payer transfer"}</button>
+        ? <button disabled={formBusy || destinationOrgId === "" || counterpartyId === ""} onClick={() => void requestQuote()}>{busy ? "Loading transfer quote…" : "Review payer transfer"}</button>
         : <div className="notice" role="status">
           <p>At renewal on {date(quote.effectiveFrom)}, {quote.destinationKind === "sponsor" ? "the organisation" : "you"} would pay {money(quote.amountPence)} per {quote.interval}. No mid-term credit is due.</p>
           {quote.founding && <p className="muted">The server has included the founding price applicable at this renewal.</p>}
-          <button disabled={busy} onClick={() => void createInvitation()}>{busy ? "Sending request…" : "Send request for acceptance"}</button>{" "}
-          <button disabled={busy} onClick={() => { setQuote(null); idempotencyKey.current = null; }}>Cancel</button>
+          <button disabled={formBusy} onClick={() => void createInvitation()}>{busy ? "Sending request…" : "Send request for acceptance"}</button>{" "}
+          <button disabled={formBusy} onClick={() => { setQuote(null); idempotencyKey.current = null; }}>Cancel</button>
         </div>}
     </>}
   </section>;
