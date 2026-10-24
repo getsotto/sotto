@@ -14,6 +14,7 @@ vi.mock("../api", () => ({
 
 vi.mock("../vault", () => ({
   deriveMasterKey: vi.fn(),
+  verifyAccountKeys: vi.fn(),
 }));
 
 vi.mock("../VaultView", () => ({
@@ -258,6 +259,61 @@ describe("VaultApp unlock retries", () => {
       storedAccount.salt,
     );
     expect(await screen.findByText("vault-view")).toBeInTheDocument();
+  });
+});
+
+describe("VaultApp unlock verification", () => {
+  const GENERIC = "Couldn't unlock - check your master password and secret key.";
+
+  async function submitUnlock(password = "pw", secretKey = "SK1-test") {
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    vi.mocked(api.fetchAccount).mockResolvedValue(account());
+    render(<VaultApp />);
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Master password"), { target: { value: password } });
+    fireEvent.change(screen.getByLabelText("Secret key (SK1-…)"), { target: { value: secretKey } });
+    fireEvent.click(screen.getByRole("button", { name: "Unlock" }));
+  }
+
+  it("checks the derived key against the account key material before showing the vault", async () => {
+    const master = new Uint8Array([7, 7, 7]);
+    vi.mocked(vaultCrypto.deriveMasterKey).mockResolvedValue(master);
+
+    await submitUnlock();
+
+    expect(await screen.findByText("vault-view")).toBeInTheDocument();
+    expect(vaultCrypto.verifyAccountKeys).toHaveBeenCalledExactlyOnceWith(master, account().encPrivateKeys);
+    expect(master).toEqual(new Uint8Array([7, 7, 7]));
+  });
+
+  it.each([
+    ["a wrong password or secret key", "aead: authentication failed"],
+    ["damaged account key material", "envelope: malformed"],
+  ])("stays locked and wipes the derived key on %s", async (_, detail) => {
+    const master = new Uint8Array([7, 7, 7]);
+    vi.mocked(vaultCrypto.deriveMasterKey).mockResolvedValue(master);
+    vi.mocked(vaultCrypto.verifyAccountKeys).mockImplementation(() => {
+      throw new Error(detail);
+    });
+
+    await submitUnlock("wrong password");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(GENERIC);
+    expect(screen.getByRole("alert")).not.toHaveTextContent(detail);
+    expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
+    expect(screen.getByText("Unlock your vault")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Unlock" })).toBeEnabled();
+    expect(master).toEqual(new Uint8Array([0, 0, 0]));
+  });
+
+  it("does not try to verify when the secret key can't even be decoded", async () => {
+    vi.mocked(vaultCrypto.deriveMasterKey).mockRejectedValue(new Error("format: bad prefix"));
+
+    await submitUnlock("pw", "not-a-key");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(GENERIC);
+    expect(vaultCrypto.verifyAccountKeys).not.toHaveBeenCalled();
+    expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
   });
 });
 

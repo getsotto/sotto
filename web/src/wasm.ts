@@ -20,6 +20,7 @@ import init, {
   vault_grant_key,
   vault_open_grant,
   vault_rewrap_data_key,
+  vault_verify_account,
 } from "./wasm/sotto_wasm.js";
 import wasmUrl from "./wasm/sotto_wasm_bg.wasm?url";
 
@@ -58,4 +59,5 @@ export {
   vault_grant_key,
   vault_open_grant,
   vault_rewrap_data_key,
+  vault_verify_account,
 };
