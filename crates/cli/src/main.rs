@@ -431,8 +431,8 @@ enum OrgCommand {
     /// Show the org audit log, newest first (admins/owners).
     Audit {
         org_id: String,
-        /// Maximum events to show (server caps at 500).
-        #[arg(long)]
+        /// Maximum events to show (must be positive; server caps at 500).
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
         limit: Option<i64>,
     },
 }
@@ -3563,5 +3563,76 @@ mod tests {
                 command: EnvCommand::Use { name: None }
             })
         ));
+    }
+
+    #[test]
+    fn org_audit_limit_validation() {
+        let cli = Cli::try_parse_from(["sotto", "org", "audit", "example-org"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Org {
+                command: OrgCommand::Audit { limit: None, .. }
+            })
+        ));
+
+        let cli =
+            Cli::try_parse_from(["sotto", "org", "audit", "example-org", "--limit", "1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Org {
+                command: OrgCommand::Audit { limit: Some(1), .. }
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "org", "audit", "example-org", "--limit", "500"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Org {
+                command: OrgCommand::Audit {
+                    limit: Some(500),
+                    ..
+                }
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "org", "audit", "example-org", "--limit", "501"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Org {
+                command: OrgCommand::Audit {
+                    limit: Some(501),
+                    ..
+                }
+            })
+        ));
+
+        let err_zero =
+            match Cli::try_parse_from(["sotto", "org", "audit", "example-org", "--limit", "0"]) {
+                Ok(_) => panic!("limit 0 should fail"),
+                Err(e) => e,
+            };
+        assert!(err_zero.to_string().contains("1"));
+
+        let err_neg =
+            match Cli::try_parse_from(["sotto", "org", "audit", "example-org", "--limit=-1"]) {
+                Ok(_) => panic!("negative limit should fail"),
+                Err(e) => e,
+            };
+        assert!(err_neg.to_string().contains("1"));
+    }
+
+    #[test]
+    fn org_audit_help_states_limit_must_be_positive_and_capped() {
+        let mut cmd = Cli::command();
+        let audit = cmd
+            .find_subcommand_mut("org")
+            .unwrap()
+            .find_subcommand_mut("audit")
+            .unwrap();
+        let help = audit.render_help().to_string();
+        assert!(help.contains("must be positive"));
+        assert!(help.contains("500"));
     }
 }
