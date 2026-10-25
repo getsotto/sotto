@@ -308,6 +308,16 @@ impl StripeReadClient {
         if api_key.trim().is_empty() {
             return Err(StripeReadError::InvalidConfig("Stripe API key"));
         }
+        let key_livemode = if api_key.starts_with("sk_live_") || api_key.starts_with("rk_live_") {
+            Some(true)
+        } else if api_key.starts_with("sk_test_") || api_key.starts_with("rk_test_") {
+            Some(false)
+        } else {
+            None
+        };
+        if key_livemode != Some(matches!(config.environment, ProviderEnvironment::Live)) {
+            return Err(StripeReadError::InvalidConfig("Stripe API key environment"));
+        }
         let limits = limits.validate()?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -367,15 +377,13 @@ impl StripeReadClient {
         if id != self.account_id {
             return Err(StripeReadError::AccountMismatch);
         }
-        let livemode = value
-            .get("livemode")
-            .and_then(Value::as_bool)
-            .ok_or(StripeReadError::MalformedResponse("account.livemode"))?;
-        if livemode != matches!(self.environment, ProviderEnvironment::Live) {
-            return Err(StripeReadError::ContextMismatch);
-        }
         session.account_verified = true;
-        Ok(StripeAccountResource { id, livemode })
+        // Stripe's Account object has no `livemode` field. The key prefix is the authoritative
+        // mode signal; `build` rejects a key whose mode differs from the configured environment.
+        Ok(StripeAccountResource {
+            id,
+            livemode: matches!(self.environment, ProviderEnvironment::Live),
+        })
     }
 
     pub async fn subscription(
@@ -405,7 +413,12 @@ impl StripeReadClient {
         self.ensure_account(session).await?;
         validate_identifier(invoice_id)?;
         let path = format!("v1/invoices/{invoice_id}");
-        let value = self.request_json(session, Method::GET, &path, &[]).await?;
+        // Stripe marks amount_paid_off_stripe as includable rather than returning it by
+        // default. We require it to distinguish Stripe settlements from off-Stripe payment.
+        let query = [("expand[]".to_owned(), "amount_paid_off_stripe".to_owned())];
+        let value = self
+            .request_json(session, Method::GET, &path, &query)
+            .await?;
         let resource = parse_invoice(&value)?;
         if resource.id != invoice_id {
             return Err(StripeReadError::ContextMismatch);
@@ -2184,7 +2197,11 @@ fn invoice_headers_match(left: &StripeInvoiceResource, right: &StripeInvoiceReso
         && left.amount_due == right.amount_due
         && left.amount_remaining == right.amount_remaining
         && left.amount_overpaid == right.amount_overpaid
-        && left.amount_paid_off_stripe == right.amount_paid_off_stripe
+        // Stripe omits this includable value from invoice list summaries unless expanded. The
+        // detail read requests it and the access decision validates that value, so a missing
+        // summary value is unknown rather than evidence that the invoice changed.
+        && (left.amount_paid_off_stripe.is_none()
+            || left.amount_paid_off_stripe == right.amount_paid_off_stripe)
         && left.allocation_reference == right.allocation_reference
         && left.livemode == right.livemode
 }

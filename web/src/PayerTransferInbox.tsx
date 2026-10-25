@@ -72,6 +72,7 @@ export function PayerTransferInbox() {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<"accept" | "withdraw" | "setup" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [expiryTick, setExpiryTick] = useState(0);
@@ -170,6 +171,7 @@ export function PayerTransferInbox() {
 
   async function act(transfer: PayerTransfer, action: "accept" | "withdraw" | "setup") {
     setBusyId(transfer.transferId);
+    setBusyAction(action);
     setError(null);
     setNotice(null);
     try {
@@ -196,6 +198,7 @@ export function PayerTransferInbox() {
       }
     } finally {
       setBusyId(null);
+      setBusyAction(null);
     }
   }
 
@@ -230,8 +233,8 @@ export function PayerTransferInbox() {
           {actionable && incoming && transfer.destinationKind === "personal" && !setupAvailable
             && <p className="muted">Personal payment setup is not available on this server yet. The request has not been accepted.</p>}
           {actionable && incoming && <>
-            {(transfer.destinationKind !== "personal" || setupAvailable) && <button disabled={busyId !== null} onClick={() => void act(transfer, "accept")}>{busyId === transfer.transferId ? "Accepting…" : "Accept transfer request"}</button>}{" "}
-            <button disabled={busyId !== null} onClick={() => void act(transfer, "withdraw")}>Decline request</button>
+            {(transfer.destinationKind !== "personal" || setupAvailable) && <button disabled={busyId !== null} onClick={() => void act(transfer, "accept")}>{busyId === transfer.transferId && busyAction === "accept" ? "Accepting…" : "Accept transfer request"}</button>}{" "}
+            <button disabled={busyId !== null} onClick={() => void act(transfer, "withdraw")}>{busyId === transfer.transferId && busyAction === "withdraw" ? "Declining…" : "Decline request"}</button>
           </>}
           {actionable && !incoming && <button disabled={busyId !== null} onClick={() => void act(transfer, "withdraw")}>Withdraw request</button>}
           {setupRequired && <button disabled={busyId !== null} onClick={() => void act(transfer, "setup")}>Set up payment method</button>}

@@ -11,7 +11,7 @@ account and these values:
 | Variable | Meaning |
 | --- | --- |
 | `SOTTO_RUN_STRIPE_SANDBOX_TESTS` | Must be `1` to opt in. |
-| `STRIPE_SANDBOX_READ_KEY` | Restricted `rk_test_` key with read access only. |
+| `STRIPE_SANDBOX_READ_KEY` | Restricted `rk_test_` key with read-only access to Accounts, Subscriptions and Invoices (including invoice payments). |
 | `STRIPE_SANDBOX_ACCOUNT_ID` | Account returned by `GET /v1/account`. |
 | `STRIPE_SANDBOX_CUSTOMER_ID` | Customer attached to the fixture subscription. |
 | `STRIPE_SANDBOX_SUBSCRIPTION_ID` | Subscription used for the history read. |
@@ -22,7 +22,9 @@ account and these values:
 | `STRIPE_SANDBOX_REPORT` | Optional path for the sanitised JSON report. |
 
 The fixture must contain at least one paid and one non-paid invoice for the configured customer and
-subscription. The test fails on an unresolved invoice shape, account or mode mismatch, unsupported
+subscription. The Account endpoint is checked for the configured account ID; live/test mode comes
+from the key prefix because Stripe's Account object has no `livemode` field. The test fails on an
+unresolved invoice shape, account or mode mismatch, unsupported
 subscription status, missing required variable, or a provider read/budget error. It never creates,
 updates, refunds, cancels or deletes a Stripe resource.
 

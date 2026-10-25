@@ -2802,7 +2802,7 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
     paid_detail["lines"] =
         serde_json::json!({"object":"list", "data":[paid_line], "has_more":false});
     let (origin, stripe_task) = stripe_mock_server(HashMap::from([
-        ("/v1/account".into(), serde_json::json!({"id":account_id, "object":"account", "livemode":false})),
+        ("/v1/account".into(), serde_json::json!({"id":account_id, "object":"account"})),
         (format!("/v1/subscriptions/{subscription_id}"), serde_json::json!({"id":subscription_id, "customer":customer_id, "status":"active", "livemode":false})),
         ("/v1/invoices".into(), serde_json::json!({"object":"list", "data":[listed_paid, open_invoice], "has_more":false})),
         (format!("/v1/invoices/{paid_id}"), paid_detail),

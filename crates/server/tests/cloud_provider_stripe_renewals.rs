@@ -286,7 +286,7 @@ async fn sponsored_failure_read_ignores_a_late_event_for_a_closed_invoice() {
     let server = mock_server(HashMap::from([
         (
             "/v1/account".into(),
-            vec![json!({"id":"acct_test_renewal","object":"account","livemode":false})],
+            vec![json!({"id":"acct_test_renewal","object":"account"})],
         ),
         (
             "/v1/invoices/in_sponsored_closed".into(),
@@ -339,8 +339,8 @@ async fn sponsored_failure_read_ignores_a_late_event_for_a_closed_invoice() {
         server.requests.lock().unwrap().as_slice(),
         [
             "GET /v1/account",
-            "GET /v1/invoices/in_sponsored_closed",
-            "GET /v1/invoices/in_sponsored_missing_status"
+            "GET /v1/invoices/in_sponsored_closed?expand%5B%5D=amount_paid_off_stripe",
+            "GET /v1/invoices/in_sponsored_missing_status?expand%5B%5D=amount_paid_off_stripe"
         ]
     );
 }
@@ -365,7 +365,7 @@ async fn history_with_line(line: Value) -> StripePersonalInvoiceHistory {
     let mut responses = HashMap::new();
     responses.insert(
         "/v1/account".into(),
-        vec![json!({"id":"acct_test_renewal","object":"account","livemode":false})],
+        vec![json!({"id":"acct_test_renewal","object":"account"})],
     );
     responses.insert(
         "/v1/subscriptions/sub_renewal".into(),
@@ -438,7 +438,7 @@ async fn history_with_current_invoice(line: Value) -> StripePersonalInvoiceHisto
     let mut responses = HashMap::new();
     responses.insert(
         "/v1/account".into(),
-        vec![json!({"id":"acct_test_renewal","object":"account","livemode":false})],
+        vec![json!({"id":"acct_test_renewal","object":"account"})],
     );
     responses.insert(
         "/v1/subscriptions/sub_renewal".into(),
@@ -1540,13 +1540,13 @@ async fn current_paid_invoice_supersedes_historical_failure_and_preserves_cancel
         vec![
             "GET /v1/account",
             "GET /v1/subscriptions/sub_renewal",
-            "GET /v1/invoices/in_failed",
+            "GET /v1/invoices/in_failed?expand%5B%5D=amount_paid_off_stripe",
             "GET /v1/invoices/in_failed/lines?limit=100",
             "GET /v1/invoice_payments?invoice=in_failed&limit=100",
             "GET /v1/refunds?payment_intent=pi_current&limit=100",
             "GET /v1/disputes?payment_intent=pi_current&limit=100",
             "GET /v1/credit_notes?invoice=in_failed&limit=100",
-            "GET /v1/invoices/in_failed",
+            "GET /v1/invoices/in_failed?expand%5B%5D=amount_paid_off_stripe",
             "GET /v1/subscriptions/sub_renewal",
         ]
     );
@@ -2517,7 +2517,7 @@ async fn open_to_paid_header_transition_returns_changed_fields_without_retrying(
         server
             .requests()
             .iter()
-            .filter(|request| request.as_str() == "GET /v1/invoices/in_failed")
+            .filter(|request| request.starts_with("GET /v1/invoices/in_failed?expand%5B%5D="))
             .count(),
         2
     );
