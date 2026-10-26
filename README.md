@@ -661,6 +661,26 @@ Point the CLI at your server once; later commands reuse it:
 sotto login --server https://sotto.example.com
 ```
 
+On a fresh CLI configuration, the web link used by `sotto share` also uses this
+server URL. If your API and web app have different origins, `--server` still
+selects the sync/API server, while `--web` sets the web-app base URL for
+generated share links:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+The CLI saves the web URL separately. A later login with `--server` alone
+preserves the previous `--web` setting, even when you switch servers. To return
+to same-origin share links, set both URLs explicitly:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+The `--web` flag does not redirect API requests or configure server-side
+cookies, CORS, OAuth, CSP or the web build.
+
 ## Architecture
 
 ```text

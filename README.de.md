@@ -679,6 +679,26 @@ Richte die CLI einmal auf deinen Server aus; spätere Befehle verwenden ihn weit
 sotto login --server https://sotto.example.com
 ```
 
+Bei einer frischen CLI-Konfiguration verwendet auch der von `sotto share`
+erzeugte Weblink diese Server-URL. Haben API und Web-App verschiedene Origins,
+wählt `--server` weiterhin den Sync/API-Server, während `--web` die Basis-URL
+der Web-App für Freigabelinks festlegt:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+Die CLI speichert die Web-URL separat. Eine spätere Anmeldung nur mit
+`--server` behält die bisherige `--web`-Einstellung bei, auch beim
+Serverwechsel. Für Freigabelinks mit gemeinsamem Origin beide URLs explizit setzen:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+Die Option `--web` leitet keine API-Anfragen um und konfiguriert weder
+serverseitige Cookies, CORS, OAuth und CSP noch den Build der Web-App.
+
 ## Architektur
 
 ```text
