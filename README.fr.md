@@ -747,6 +747,27 @@ Faites pointer la CLI vers votre serveur une fois ; les commandes suivantes le r
 sotto login --server https://sotto.example.com
 ```
 
+Sur une nouvelle configuration de la CLI, le lien web produit par
+`sotto share` utilise aussi l'URL du serveur. Si l'API et l'application web
+ont des origines différentes, `--server` désigne toujours le serveur de
+synchronisation/API et `--web` fixe l'URL de base de l'application web pour
+les liens de partage :
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+La CLI enregistre l'URL web séparément. Une connexion ultérieure avec seulement
+`--server` conserve l'ancien réglage `--web`, même si vous changez de serveur.
+Pour revenir aux liens sur la même origine, définissez explicitement les deux URL :
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+L'option `--web` ne redirige pas les requêtes API et ne configure pas les
+cookies, CORS, OAuth, CSP ni la compilation de l'application web côté serveur.
+
 ## Architecture
 
 ```text
