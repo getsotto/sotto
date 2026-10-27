@@ -610,6 +610,9 @@ The JSON form is useful for scripts. Its top-level shape is:
 
 The example is synthetic; `actions` and the optional dates come from the returned account state, and older servers can return null for either endpoint. `sotto cloud status` only reports status and may print a billing URL. It does not start a purchase or change eligibility. For local vault and environment diagnostics, use `sotto status`; that view is separate from the server and account information above.
 
+To move personal billing to an organisation from the Sotto Cloud account page, see the
+[billing transfer guide](CLOUD-BILLING-TRANSFER.md).
+
 ### Output themes
 
 The CLI ships five built-in themes: `nord` (the default), `sordino`, `terminal`, `monochrome`,
