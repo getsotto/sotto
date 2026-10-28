@@ -45,6 +45,13 @@ test("real personal Checkout reuses the runner-owned test-clock Customer", async
         quote_version: number;
         quote_expires_at_epoch: number;
       };
+      if (quote.offer !== offer) {
+        return {
+          status: 409,
+          body: `requested ${offer}, server quoted ${quote.offer}`,
+          quote_offer: quote.offer,
+        };
+      }
       const response = await fetch("/billing/personal/checkout", {
         method: "POST",
         credentials: "include",
@@ -65,6 +72,7 @@ test("real personal Checkout reuses the runner-owned test-clock Customer", async
       return {
         status: response.status,
         body: response.ok ? await response.json() : await response.text(),
+        quote_offer: quote.offer,
       };
     },
     {
@@ -75,6 +83,7 @@ test("real personal Checkout reuses the runner-owned test-clock Customer", async
     },
   );
   expect(checkout.status, String(checkout.body)).toBe(200);
+  expect(checkout.quote_offer).toBe(offer);
   const result = checkout.body as { checkout_url?: string | null };
   expect(result.checkout_url).toMatch(/^https:\/\/checkout\.stripe\.com\//);
 
