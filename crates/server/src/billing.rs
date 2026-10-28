@@ -936,7 +936,7 @@ impl SubscriptionProvider for StripeBilling {
             || !valid_stripe_id(customer_id, "cus_")
             || !valid_stripe_id(clock_id, "clock_")
             || !valid_run_id(run_id)
-            || !valid_run_id(user_id)
+            || !valid_e2e_customer_user_id(user_id)
         {
             return Err(ProviderError::malformed_response());
         }
@@ -10079,6 +10079,11 @@ fn valid_run_id(value: &str) -> bool {
 }
 
 #[cfg(feature = "e2e-stripe-test-clock")]
+fn valid_e2e_customer_user_id(value: &str) -> bool {
+    !value.trim().is_empty() && value.chars().count() <= 500 && !value.chars().any(char::is_control)
+}
+
+#[cfg(feature = "e2e-stripe-test-clock")]
 fn e2e_test_clock_customer_matches(
     customer: &serde_json::Value,
     customer_id: &str,
@@ -10112,11 +10117,13 @@ fn billing_offer_matches_price(
 
 #[cfg(all(test, feature = "e2e-stripe-test-clock"))]
 mod e2e_stripe_test_clock_tests {
-    use super::{e2e_test_clock_customer_matches, valid_run_id, valid_stripe_id};
+    use super::{
+        e2e_test_clock_customer_matches, valid_e2e_customer_user_id, valid_run_id, valid_stripe_id,
+    };
     use serde_json::json;
 
     const RUN_ID: &str = "7e57d004-2b97-4e7f-9f47-68d9f5d9e3c1";
-    const USER_ID: &str = "e4a7bc0d-7f4b-4f2b-93aa-9d4086cbd11e";
+    const USER_ID: &str = "e2e-e2e-invitee";
 
     fn customer() -> serde_json::Value {
         json!({
@@ -10204,6 +10211,13 @@ mod e2e_stripe_test_clock_tests {
         assert!(valid_run_id(RUN_ID));
         assert!(!valid_run_id("../customers"));
         assert!(valid_run_id("e4a7bc0d-7f4b-4f2b-93aa-9d4086cbd11e"));
+        assert!(valid_e2e_customer_user_id("e2e-e2e-invitee"));
+        assert!(valid_e2e_customer_user_id(
+            "e4a7bc0d-7f4b-4f2b-93aa-9d4086cbd11e"
+        ));
+        assert!(!valid_e2e_customer_user_id(" \t"));
+        assert!(!valid_e2e_customer_user_id("user\nwith-control"));
+        assert!(!valid_e2e_customer_user_id(&"x".repeat(501)));
     }
 
     #[tokio::test]
