@@ -9,6 +9,8 @@ const binding = {
   clockId: process.env.STRIPE_TEST_CLOCK_ID,
   runId: process.env.STRIPE_TEST_CLOCK_RUN_ID,
 };
+const offer = process.env.SOTTO_E2E_TEST_CLOCK_OFFER ?? "standard_monthly";
+const loginCode = process.env.SOTTO_E2E_TEST_CLOCK_LOGIN_CODE ?? fixture.owner_login_code;
 
 const configured = Object.values(binding).every((value) => value && value.length > 0);
 
@@ -29,12 +31,12 @@ test("real personal Checkout reuses the runner-owned test-clock Customer", async
 
   await page.goto("/app");
   await expect(page.getByRole("button", { name: "Log in with GitHub" })).toBeVisible();
-  await loginAs(page, fixture.owner_login_code);
+  await loginAs(page, loginCode);
 
   const checkout = await page.evaluate(
-    async ({ customerId, clockId, runId, idempotencyKey, returnUrl }) => {
+    async ({ customerId, clockId, runId, idempotencyKey, returnUrl, offer }) => {
       const quoteResponse = await fetch(
-        "/billing/personal/quote?offer=standard_monthly",
+        `/billing/personal/quote?offer=${encodeURIComponent(offer)}`,
         { credentials: "include" },
       );
       if (!quoteResponse.ok) return { status: quoteResponse.status, body: await quoteResponse.text() };
@@ -67,6 +69,7 @@ test("real personal Checkout reuses the runner-owned test-clock Customer", async
     },
     {
       ...binding,
+      offer,
       idempotencyKey: randomUUID(),
       returnUrl: new URL("/cloud", page.url()).origin,
     },

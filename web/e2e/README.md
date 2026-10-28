@@ -139,4 +139,7 @@ Subscription read/write access. The server verifies the Customer's test mode, cl
 metadata, refuses a Customer that already has a subscription, claims it to one mock identity, and
 then uses the normal personal or first sponsored Checkout and webhook path. Normal server builds
 ignore the test-only field and never use it. The test is skipped unless all run identifiers are
-supplied, so a skipped browser case is not lifecycle evidence.
+supplied, so a skipped browser case is not lifecycle evidence. To exercise another personal offer
+or a fresh mock account, set `SOTTO_E2E_TEST_CLOCK_OFFER` and
+`SOTTO_E2E_TEST_CLOCK_LOGIN_CODE`; they default to `standard_monthly` and the seeded owner
+identity respectively. Prepare a separate test-clock Customer for each account and run.
