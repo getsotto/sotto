@@ -242,7 +242,8 @@ sotto run --env staging -- npm test
 sotto ls --env staging
 ```
 
-`--env` ne s'applique qu'à cette commande ; `sotto env use` modifie l'environnement par défaut.
+`--env` ne s'applique qu'à cette commande ; `sotto env use` modifie l'environnement par défaut enregistré
+dans le `sotto.toml` du projet (voir [Configuration du projet](#configuration-du-projet)).
 
 Listez les environnements, changez celui par défaut, comparez-en deux ou prévisualisez une copie entre eux :
 
@@ -258,6 +259,56 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 le premier environnement) ou `>` (seulement dans le second). Sans `--confirm`, la copie est une
 simulation. Une copie confirmée ajoute et met à jour les secrets, mais laisse intactes les clés
 présentes uniquement dans la destination.
+
+### Configuration du projet
+
+`sotto init` et `sotto clone` écrivent un `sotto.toml` dans le répertoire courant. Il associe ce
+répertoire à un projet local et à un environnement par défaut. Cet exemple illustratif utilise des
+identifiants fictifs :
+
+```toml
+project_id = "11111111-1111-1111-1111-111111111111"
+project = "acme-api"
+environment = "dev"
+org_id = "22222222-2222-2222-2222-222222222222"
+```
+
+- `project_id` (obligatoire) : l'identifiant stable du projet.
+- `project` (obligatoire) : le nom lisible du projet.
+- `environment` (obligatoire) : l'environnement par défaut des commandes lancées sous ce répertoire.
+- `org_id` (facultatif) : l'organisation propriétaire du projet. Omettez-le pour un projet personnel.
+
+Le fichier contient des métadonnées de projet, pas de valeurs secrètes, et il est fait pour être
+commité. Ce n'est pas un coffre et il ne donne accès à aucun secret : un collègue qui le récupère a
+toujours besoin de sa propre autorisation. Écrire un fichier avec des identifiants inventés ne crée pas
+de projet. Lancez `sotto init` pour en créer un, ou suivez [Travailler en équipe](#travailler-en-équipe)
+pour cloner un environnement partagé.
+
+Les commandes cherchent `sotto.toml` dans le répertoire courant, puis dans chaque répertoire parent, et
+utilisent le plus proche, comme `git` avec `.git`. Dans un projet imbriqué, le fichier intérieur l'emporte :
+
+```text
+monorepo/
+├── sotto.toml            # project "platform"
+├── tools/                # commands here use "platform"
+└── services/
+    └── billing/
+        ├── sotto.toml    # project "billing"
+        └── src/          # commands here use "billing"
+```
+
+Si le `sotto.toml` le plus proche est invalide ou illisible, la commande échoue avec une erreur qui
+nomme ce fichier. Elle ne se rabat pas sur un projet parent.
+
+`sotto env use staging` enregistre `staging` comme `environment` dans le `sotto.toml` trouvé ; il
+s'applique donc aussi aux commandes suivantes. Un `--env staging` par commande lit cet environnement
+pour une seule commande et laisse le fichier inchangé. Voir [Environnements](#environnements).
+
+`sotto.toml` appartient à un répertoire de projet. Séparément, le répertoire de données de Sotto
+contient le `config.toml` global, avec des réglages propres à la machine comme le serveur enregistré
+par `sotto login` et votre thème, ainsi que le `store.db` chiffré qui contient votre coffre. Aucun des
+deux n'a sa place dans un dépôt. Voir [Variables d'environnement](#variables-denvironnement) pour
+`SOTTO_DATA_DIR`, et [Thèmes de sortie](#thèmes-de-sortie) pour l'emplacement par défaut de chaque plateforme.
 
 ### Importer un fichier dotenv
 
@@ -552,6 +603,7 @@ Sans `sotto.toml` ni identité locale :
 ```
 
 L'absence de `sotto.toml` signifie qu'aucun projet n'est sélectionné. Un fichier invalide ou illisible provoque une erreur.
+Voir [Configuration du projet](#configuration-du-projet) pour les champs du fichier et la façon dont il est trouvé.
 
 ### Verrouiller, déverrouiller et se déconnecter
 
