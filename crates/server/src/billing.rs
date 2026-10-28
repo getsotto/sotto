@@ -6925,8 +6925,8 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                             &customer_id,
                             subscription_id,
                             &prepared.payment_reference,
-                            prepared.period_start,
-                            prepared.period_end,
+                            seat.period_start,
+                            seat.period_end,
                         )
                         .await?;
                     }
@@ -8682,6 +8682,8 @@ struct PreparedSponsoredInvoiceSeat {
     registered_offer: BillingOffer,
     provider_item_id: String,
     price_id: String,
+    period_start: i64,
+    period_end: i64,
     desired_effective_until: Option<i64>,
     ending_evidence_reference: String,
     allocation: VerifiedAllocation,
@@ -8693,8 +8695,6 @@ struct PreparedSponsoredInvoiceCoverage {
     organization_id: String,
     invoice_id: String,
     payment_reference: String,
-    period_start: i64,
-    period_end: i64,
     seats: Vec<PreparedSponsoredInvoiceSeat>,
 }
 
@@ -8825,8 +8825,6 @@ async fn prepare_sponsored_invoice_coverage(
         }
     };
     let payment_reference = settlement.payment_intent_id().to_owned();
-    let period_start = settlement.period_start();
-    let period_end = settlement.period_end();
     let event = sponsored_verified_event(event, raw_event, &subscription_id, &invoice_id)?;
     let seats = sqlx::query(
         "SELECT seat.seat_id, seat.beneficiary_id, seat.offer, award.offer AS founding_offer, \
@@ -9020,6 +9018,8 @@ async fn prepare_sponsored_invoice_coverage(
                 registered_offer: stored_offer,
                 provider_item_id: line.provider_item_id().to_owned(),
                 price_id: line.price_id().to_owned(),
+                period_start: line.period_start(),
+                period_end: line.period_end(),
                 desired_effective_until,
                 ending_evidence_reference,
                 allocation,
@@ -9073,8 +9073,6 @@ async fn prepare_sponsored_invoice_coverage(
             organization_id,
             invoice_id,
             payment_reference,
-            period_start,
-            period_end,
             seats: prepared_seats,
         },
     )))

@@ -731,8 +731,11 @@ pub fn compose_sponsored_coverage_with_renewal_failures(
                 },
             ));
         }
-        if line.period_start() != settlement.period_start()
-            || line.period_end() != settlement.period_end()
+        // A subscription can contain monthly and annual items. Stripe gives each invoice
+        // line its own paid term, so comparing every line to the invoice-wide envelope would
+        // reject valid mixed-interval invoices (and withhold coverage for all seats on them).
+        if line.period_start() < settlement.period_start()
+            || line.period_end() > settlement.period_end()
         {
             return Ok(SponsoredCoverageResult::NeedsEvidence(
                 SponsoredNeedsEvidence::MissingAllocationHistory {
@@ -1151,6 +1154,136 @@ mod tests {
         assert_eq!(coverages[0].beneficiary_id, "user_1");
         assert_eq!(coverages[0].paid_intervals.len(), 1);
         assert_eq!(candidate.source_observations().len(), 2);
+    }
+
+    #[test]
+    fn mixed_interval_invoice_uses_each_line_paid_term() {
+        let manifest = SponsoredAllocationManifest::new(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "cus_1",
+            "sub_1",
+            vec![
+                allocation(
+                    "monthly",
+                    "user_monthly",
+                    "item_monthly",
+                    "price_standard_month",
+                    0,
+                    None,
+                ),
+                allocation(
+                    "monthly_2",
+                    "user_monthly_2",
+                    "item_monthly",
+                    "price_standard_month",
+                    0,
+                    None,
+                ),
+                allocation(
+                    "annual",
+                    "user_annual",
+                    "item_annual",
+                    "price_standard_year",
+                    0,
+                    None,
+                ),
+            ],
+        )
+        .unwrap();
+        let settlement = SponsoredInvoiceSettlement::new(
+            "in_mixed",
+            "cus_1",
+            "sub_1",
+            100,
+            465,
+            "gbp",
+            3_351,
+            3_351,
+            "pi_mixed",
+            "evt_mixed",
+            vec![
+                SponsoredInvoiceLine::new(
+                    "il_monthly",
+                    "item_monthly",
+                    "price_standard_month",
+                    100,
+                    130,
+                    2,
+                    false,
+                )
+                .unwrap(),
+                SponsoredInvoiceLine::new(
+                    "il_annual",
+                    "item_annual",
+                    "price_standard_year",
+                    100,
+                    465,
+                    1,
+                    false,
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        let result = compose_sponsored_coverage(&config(), &manifest, &settlement).unwrap();
+        let SponsoredCoverageResult::Candidate(candidate) = result else {
+            panic!("expected candidate")
+        };
+        assert_eq!(candidate.beneficiaries().len(), 3);
+        let monthly = candidate
+            .beneficiaries()
+            .iter()
+            .find(|beneficiary| beneficiary.beneficiary_id() == "user_monthly")
+            .unwrap()
+            .paid_terms()[0]
+            .interval();
+        assert_eq!((monthly.starts_at, monthly.paid_until), (100, 130));
+        let annual = candidate
+            .beneficiaries()
+            .iter()
+            .find(|beneficiary| beneficiary.beneficiary_id() == "user_annual")
+            .unwrap()
+            .paid_terms()[0]
+            .interval();
+        assert_eq!((annual.starts_at, annual.paid_until), (100, 465));
+    }
+
+    #[test]
+    fn invoice_line_outside_the_invoice_period_envelope_needs_evidence() {
+        let manifest = SponsoredAllocationManifest::new(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "cus_1",
+            "sub_1",
+            vec![allocation(
+                "a_1",
+                "user_1",
+                "item_1",
+                "price_standard_month",
+                0,
+                None,
+            )],
+        )
+        .unwrap();
+        let settlement = settlement(vec![SponsoredInvoiceLine::new(
+            "il_outside_envelope",
+            "item_1",
+            "price_standard_month",
+            99,
+            200,
+            1,
+            false,
+        )
+        .unwrap()]);
+
+        assert!(matches!(
+            compose_sponsored_coverage(&config(), &manifest, &settlement).unwrap(),
+            SponsoredCoverageResult::NeedsEvidence(
+                SponsoredNeedsEvidence::MissingAllocationHistory { .. }
+            )
+        ));
     }
 
     #[test]
