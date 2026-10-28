@@ -494,9 +494,14 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     let invoice_id = format!("in_sponsored_{fixture}");
     let payment_id = format!("pi_sponsored_{fixture}");
     let line = |line_id: String, item_id: String, price_id: String, quantity: u64| {
+        let unit_amount = if price_id.contains("founding") {
+            199
+        } else {
+            299
+        };
         serde_json::json!({
             "id":line_id, "object":"line_item", "invoice":invoice_id,
-            "quantity":quantity, "livemode":false,
+            "quantity":quantity, "amount":unit_amount * quantity as i64, "livemode":false,
             "parent":{"type":"subscription_item_details","subscription_item_details":{
                 "subscription":subscription_id, "subscription_item":item_id, "proration":false
             }},
@@ -521,7 +526,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     });
     let personal_line = serde_json::json!({
         "id":format!("il_personal_{fixture}"), "object":"line_item", "invoice":personal_invoice_id,
-        "quantity":1, "livemode":false,
+        "quantity":1, "amount":299, "livemode":false,
         "parent":{"type":"subscription_item_details","subscription_item_details":{
             "subscription":personal_subscription, "subscription_item":personal_item, "proration":false
         }},
@@ -543,7 +548,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     let previous_sponsor_invoice_id = format!("in_previous_sponsor_{fixture}");
     let previous_sponsor_line = serde_json::json!({
         "id":format!("il_previous_sponsor_{fixture}"), "object":"line_item",
-        "invoice":previous_sponsor_invoice_id, "quantity":1, "livemode":false,
+        "invoice":previous_sponsor_invoice_id, "quantity":1, "amount":299, "livemode":false,
         "parent":{"type":"subscription_item_details","subscription_item_details":{
             "subscription":previous_sponsor_subscription,
             "subscription_item":previous_sponsor_item, "proration":false

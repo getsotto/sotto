@@ -11898,8 +11898,8 @@ async fn sponsored_invoice_paid(
         }
     }
     let line_terms = sponsored_invoice_line_terms(object);
-    let operations: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
-        "SELECT operation_id, offer, effective_from, provider_item_id \
+    let operations: Vec<(String, String, i64, Option<String>, String)> = sqlx::query_as(
+        "SELECT operation_id, offer, effective_from, provider_item_id, action \
          FROM billing_sponsored_operations \
          WHERE organization_id = $1 \
            AND state = 'provider_pending' AND provider_subscription_id = $2 \
@@ -11911,7 +11911,7 @@ async fn sponsored_invoice_paid(
     .bind(period_end)
     .fetch_all(&mut **tx)
     .await?;
-    for (operation_id, offer, effective_from, recorded_item_id) in operations {
+    for (operation_id, offer, effective_from, recorded_item_id, action) in operations {
         let offer = billing_offer(&offer)?;
         // A shared subscription can have the same price on multiple lines. Only settle this
         // operation when one invoice line identifies both its item and the term that began at
@@ -11922,6 +11922,7 @@ async fn sponsored_invoice_paid(
             catalogue.id_for(offer),
             effective_from,
             recorded_item_id.as_deref(),
+            action != "remove",
         ) else {
             continue;
         };
@@ -12193,7 +12194,9 @@ fn sponsored_invoice_items(object: &serde_json::Value) -> Vec<(String, String, i
         .collect()
 }
 
-fn sponsored_invoice_line_terms(object: &serde_json::Value) -> Vec<(String, String, i64, i64)> {
+fn sponsored_invoice_line_terms(
+    object: &serde_json::Value,
+) -> Vec<(String, String, i64, i64, i64, bool)> {
     object["lines"]["data"]
         .as_array()
         .into_iter()
@@ -12208,12 +12211,18 @@ fn sponsored_invoice_line_terms(object: &serde_json::Value) -> Vec<(String, Stri
                 .or_else(|| line["parent"]["subscription_item_details"]["price"].as_str())?;
             let period_start = line["period"]["start"].as_i64()?;
             let period_end = line["period"]["end"].as_i64()?;
+            let amount = line["amount"].as_i64()?;
+            let proration = line["parent"]["subscription_item_details"]["proration"]
+                .as_bool()
+                .or_else(|| line["proration"].as_bool())?;
             (period_start >= 0 && period_end > period_start).then(|| {
                 (
                     item_id.to_string(),
                     price_id.to_string(),
                     period_start,
                     period_end,
+                    amount,
+                    proration,
                 )
             })
         })
@@ -12221,20 +12230,23 @@ fn sponsored_invoice_line_terms(object: &serde_json::Value) -> Vec<(String, Stri
 }
 
 fn sponsored_invoice_line_item_for_operation(
-    line_terms: &[(String, String, i64, i64)],
+    line_terms: &[(String, String, i64, i64, i64, bool)],
     expected_price_id: &str,
     effective_from: i64,
     recorded_item_id: Option<&str>,
+    require_positive_amount: bool,
 ) -> Option<String> {
-    let mut matches = line_terms
-        .iter()
-        .filter(|(item_id, price_id, period_start, period_end)| {
+    let mut matches = line_terms.iter().filter(
+        |(item_id, price_id, period_start, period_end, amount, proration)| {
             price_id == expected_price_id
-                && effective_from <= *period_start
                 && effective_from < *period_end
+                && (!require_positive_amount || *amount > 0)
+                && (effective_from <= *period_start
+                    || (*proration && *period_start <= effective_from))
                 && recorded_item_id.is_none_or(|recorded_item_id| recorded_item_id == item_id)
-        });
-    let (item_id, _, _, _) = matches.next()?;
+        },
+    );
+    let (item_id, _, _, _, _, _) = matches.next()?;
     matches.next().is_none().then(|| item_id.clone())
 }
 
@@ -16096,10 +16108,12 @@ mod tests {
         let invoice = serde_json::json!({
             "lines": {"data": [{
                 "parent": {"subscription_item_details": {
-                    "subscription_item": "si-sponsored"
+                    "subscription_item": "si-sponsored",
+                    "proration": false
                 }},
                 "pricing": {"price_details": {"price": "price-sponsored"}},
                 "quantity": 3,
+                "amount": 897,
                 "period": {"start": 100, "end": 200}
             }]}
         });
@@ -16109,27 +16123,107 @@ mod tests {
         );
         assert_eq!(
             sponsored_invoice_line_terms(&invoice),
-            vec![("si-sponsored".into(), "price-sponsored".into(), 100, 200)]
+            vec![(
+                "si-sponsored".into(),
+                "price-sponsored".into(),
+                100,
+                200,
+                897,
+                false
+            )]
         );
     }
 
     #[test]
     fn sponsored_invoice_operation_matches_its_own_line_term_not_invoice_max_end() {
         let lines = vec![
-            ("si_month".into(), "price_month".into(), 100, 130),
-            ("si_year".into(), "price_year".into(), 100, 465),
+            (
+                "si_month".into(),
+                "price_month".into(),
+                100,
+                130,
+                299,
+                false,
+            ),
+            (
+                "si_year".into(),
+                "price_year".into(),
+                100,
+                465,
+                2_999,
+                false,
+            ),
         ];
         assert_eq!(
-            sponsored_invoice_line_item_for_operation(&lines, "price_month", 100, None).as_deref(),
+            sponsored_invoice_line_item_for_operation(&lines, "price_month", 100, None, true)
+                .as_deref(),
             Some("si_month")
         );
         assert_eq!(
-            sponsored_invoice_line_item_for_operation(&lines, "price_month", 130, None),
+            sponsored_invoice_line_item_for_operation(&lines, "price_month", 130, None, true),
+            None
+        );
+        let next_lines = vec![(
+            "si_month_next".into(),
+            "price_month".into(),
+            130,
+            160,
+            299,
+            false,
+        )];
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(&next_lines, "price_month", 130, None, true),
+            Some("si_month_next".into())
+        );
+        let prorated_lines = vec![(
+            "si_year_prorated".into(),
+            "price_year".into(),
+            100,
+            465,
+            1_835,
+            true,
+        )];
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(
+                &prorated_lines,
+                "price_year",
+                130,
+                None,
+                true
+            ),
+            Some("si_year_prorated".into())
+        );
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(
+                &lines,
+                "price_month",
+                100,
+                Some("si_year"),
+                true
+            ),
+            None
+        );
+        let credit_line = vec![(
+            "si_month_credit".into(),
+            "price_month".into(),
+            100,
+            130,
+            -299,
+            true,
+        )];
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(&credit_line, "price_month", 100, None, true),
             None
         );
         assert_eq!(
-            sponsored_invoice_line_item_for_operation(&lines, "price_month", 100, Some("si_year")),
-            None
+            sponsored_invoice_line_item_for_operation(
+                &credit_line,
+                "price_month",
+                100,
+                None,
+                false
+            ),
+            Some("si_month_credit".into())
         );
     }
 
