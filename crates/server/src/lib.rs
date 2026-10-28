@@ -36,6 +36,7 @@ pub mod billing_transfer_ops;
 pub mod billing_transfer_worker;
 #[doc(hidden)]
 pub mod billing_transfers;
+pub mod clock;
 #[doc(hidden)]
 pub mod cloud_action_policy;
 pub mod cloud_coverage;

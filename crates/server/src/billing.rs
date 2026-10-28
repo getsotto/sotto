@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
@@ -3580,10 +3580,7 @@ async fn select_founding_aware_offer(
 }
 
 fn billing_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs() as i64
+    crate::clock::business_epoch_seconds()
 }
 
 fn personal_billing_error(error: personal_billing::PersonalBillingError) -> Error {
@@ -6786,10 +6783,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         .get("Stripe-Signature")
         .and_then(|v| v.to_str().ok())
         .ok_or(Error::Unauthorized)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = crate::clock::wall_epoch_seconds();
     if !verify_signature(&billing.webhook_secret, signature, &body, now) {
         return Err(Error::Unauthorized);
     }

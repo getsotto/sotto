@@ -4,8 +4,6 @@
 //! before making a Stripe request, then record a provider result using the same operation id. An
 //! unknown result remains reconcilable and can never be retried under a fresh financial identity.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -1172,10 +1170,7 @@ fn operation_from_row(
 }
 
 fn current_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs() as i64
+    crate::clock::business_epoch_seconds()
 }
 
 fn request_hash(

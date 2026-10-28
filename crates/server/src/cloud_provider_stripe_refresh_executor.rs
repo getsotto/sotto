@@ -111,10 +111,7 @@ impl StripeRefreshExecutor {
         let collection = apply_confirmed_early_terminations(collection, &details)?;
 
         let mut complete = self.pool.begin().await.map_err(|_| "refresh_database")?;
-        let now_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "refresh_clock")?
-            .as_secs() as i64;
+        let now_epoch = crate::clock::business_epoch_seconds();
         let authority = self.authority_max_age_seconds.map(|seconds| {
             crate::cloud_coverage_reconciliation::AuthorityReceiptInput {
                 provider_namespace: context.namespace.clone(),
@@ -340,10 +337,7 @@ impl StripeRefreshExecutor {
             .collect_mixed(&context, None, &ticket, &details)
             .await?;
         let collection = apply_confirmed_early_terminations(collection, &details)?;
-        let observed_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "revalidation_clock")?
-            .as_secs() as i64;
+        let observed_at = crate::clock::business_epoch_seconds();
         let fresh_until = observed_at
             .checked_add(
                 self.authority_max_age_seconds

@@ -1820,10 +1820,7 @@ fn classify_provider_failure(error: &ProviderError) -> TransferExecutionFailure 
 }
 
 fn epoch_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_secs() as i64)
-        .unwrap_or(0)
+    crate::clock::business_epoch_seconds()
 }
 
 fn sponsor_source_adjustment_is_before_boundary(now: i64, boundary: i64) -> bool {
