@@ -32,6 +32,15 @@ test("real personal Checkout reuses the runner-owned test-clock Customer", async
   await page.goto("/app");
   await expect(page.getByRole("button", { name: "Log in with GitHub" })).toBeVisible();
   await loginAs(page, loginCode);
+  await expect
+    .poll(
+      () =>
+        page.evaluate(async () =>
+          (await fetch("/auth/me", { credentials: "include" })).status,
+        ),
+      { intervals: [250, 500, 1_000], timeout: 10_000 },
+    )
+    .toBe(200);
 
   const checkout = await page.evaluate(
     async ({ customerId, clockId, runId, idempotencyKey, returnUrl, offer }) => {
