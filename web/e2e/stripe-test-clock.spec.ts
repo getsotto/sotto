@@ -76,6 +76,16 @@ test("real personal Checkout reuses the runner-owned test-clock Customer", async
   expect(result.checkout_url).toMatch(/^https:\/\/checkout\.stripe\.com\//);
 
   await page.goto(result.checkout_url!);
+  const cardOption = page.getByText("Card", { exact: true }).first();
+  await expect(cardOption).toBeVisible();
+  const cardOptionBox = await cardOption.boundingBox();
+  expect(cardOptionBox).not.toBeNull();
+  // Stripe Checkout's accordion cover intercepts normal locator clicks on its hidden radio.
+  // Clicking the visible label's measured position selects Card without depending on internals.
+  await page.mouse.click(
+    cardOptionBox!.x + cardOptionBox!.width / 2,
+    cardOptionBox!.y + cardOptionBox!.height / 2,
+  );
   await expect(
     page.locator('input[name="cardNumber"], input[autocomplete="cc-number"]').first(),
   ).toBeVisible({ timeout: 60_000 });
