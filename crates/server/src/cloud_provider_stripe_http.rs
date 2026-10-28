@@ -861,7 +861,7 @@ impl StripeReadClient {
                 StripeReadError::Observation(StripeContractError::UnsupportedQuantity),
             )? as u64;
             normalized_lines.push(
-                SponsoredInvoiceLine::new(
+                SponsoredInvoiceLine::new_with_amount(
                     line.id,
                     line.subscription_item_id
                         .ok_or(StripeReadError::MalformedResponse("line.subscription_item"))?,
@@ -872,6 +872,8 @@ impl StripeReadClient {
                     line.period_end
                         .ok_or(StripeReadError::MalformedResponse("line.period.end"))?,
                     quantity,
+                    line.amount
+                        .ok_or(StripeReadError::MalformedResponse("line.amount"))?,
                     line.proration
                         .ok_or(StripeReadError::MalformedResponse("line.proration"))?,
                 )
@@ -2605,6 +2607,7 @@ fn subscription_diff_fields(
 pub struct StripeInvoiceLineResource {
     pub id: String,
     pub quantity: Option<i64>,
+    pub amount: Option<i64>,
     pub subscription_id: Option<String>,
     pub subscription_item_id: Option<String>,
     pub legacy_subscription_id: Option<String>,
@@ -3172,6 +3175,7 @@ fn parse_invoice_line(value: &Value) -> Result<StripeInvoiceLineResource, Stripe
     Ok(StripeInvoiceLineResource {
         id: required_id(value, "invoice line.id")?,
         quantity: optional_i64(value.get("quantity"), "line.quantity")?,
+        amount: optional_i64(value.get("amount"), "line.amount")?,
         subscription_id,
         subscription_item_id,
         legacy_subscription_id,

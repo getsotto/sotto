@@ -371,6 +371,7 @@ fn personal_line(id: &str) -> Value {
     json!({
         "id":id,
         "quantity":1,
+        "amount":299,
         "livemode":false,
         "parent":{
             "type":"subscription_item_details",
@@ -743,6 +744,62 @@ async fn assembles_a_grouped_sponsored_invoice_without_using_the_personal_reader
     assert_eq!(settlement.lines().len(), 1);
     assert_eq!(settlement.lines()[0].quantity(), 2);
     assert_eq!(settlement.lines()[0].provider_item_id(), "si_sponsor");
+}
+
+#[tokio::test]
+async fn sponsored_invoice_retains_positive_proration_line_amount_and_paid_period() {
+    let mut invoice = paid_invoice();
+    invoice["amount_paid"] = json!(1_835);
+    invoice["amount_due"] = json!(1_835);
+    let mut payment = paid_payment();
+    payment["amount_paid"] = json!(1_835);
+    payment["amount_requested"] = json!(1_835);
+    let mut line = sponsored_line("il_prorated_annual", "in_1");
+    line["amount"] = json!(1_835);
+    line["period"] = json!({"start": 100, "end": 465});
+    line["pricing"]["price_details"]["price"] = json!("price_year");
+    line["parent"]["subscription_item_details"]["proration"] = json!(true);
+
+    let server = mock_server(observation_responses(invoice, line, payment)).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    let settlement = client
+        .sponsored_invoice_settlement(&mut session, "in_1", "cus_1", "sub_1", &sponsored_config())
+        .await
+        .unwrap();
+
+    assert_eq!(settlement.lines()[0].amount(), 1_835);
+    assert!(settlement.lines()[0].proration());
+    assert_eq!(
+        (
+            settlement.lines()[0].period_start(),
+            settlement.lines()[0].period_end()
+        ),
+        (100, 465)
+    );
+}
+
+#[tokio::test]
+async fn sponsored_invoice_requires_a_line_amount_for_paid_evidence() {
+    let mut line = sponsored_line("il_missing_amount", "in_1");
+    line.as_object_mut().unwrap().remove("amount");
+    let server = mock_server(observation_responses(paid_invoice(), line, paid_payment())).await;
+    let client =
+        StripeReadClient::for_test(API_KEY, &config(), server.origin.clone(), limits()).unwrap();
+    let mut session = client.session();
+    assert!(matches!(
+        client
+            .sponsored_invoice_settlement(
+                &mut session,
+                "in_1",
+                "cus_1",
+                "sub_1",
+                &sponsored_config()
+            )
+            .await,
+        Err(StripeReadError::MalformedResponse("line.amount"))
+    ));
 }
 
 #[tokio::test]

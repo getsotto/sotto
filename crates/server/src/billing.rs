@@ -11897,8 +11897,10 @@ async fn sponsored_invoice_paid(
             .map_err(Error::from)?;
         }
     }
-    let operations: Vec<(String, String)> = sqlx::query_as(
-        "SELECT operation_id, offer FROM billing_sponsored_operations \
+    let line_terms = sponsored_invoice_line_terms(object);
+    let operations: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT operation_id, offer, effective_from, provider_item_id \
+         FROM billing_sponsored_operations \
          WHERE organization_id = $1 \
            AND state = 'provider_pending' AND provider_subscription_id = $2 \
            AND effective_from < $3 \
@@ -11909,15 +11911,21 @@ async fn sponsored_invoice_paid(
     .bind(period_end)
     .fetch_all(&mut **tx)
     .await?;
-    for (operation_id, offer) in operations {
+    for (operation_id, offer, effective_from, recorded_item_id) in operations {
         let offer = billing_offer(&offer)?;
-        let provider_item_id = line_items
-            .iter()
-            .find(|(_, price_id, _)| price_id == catalogue.id_for(offer))
-            .map(|(item_id, _, _)| item_id.clone());
-        if provider_item_id.is_none() {
+        // A shared subscription can have the same price on multiple lines. Only settle this
+        // operation when one invoice line identifies both its item and the term that began at
+        // (or after) the operation's effective boundary. Invoice-wide max period_end is not
+        // enough: a long annual line must not settle a monthly operation early.
+        let Some(provider_item_id) = sponsored_invoice_line_item_for_operation(
+            &line_terms,
+            catalogue.id_for(offer),
+            effective_from,
+            recorded_item_id.as_deref(),
+        ) else {
             continue;
-        }
+        };
+        let provider_item_id = Some(provider_item_id);
         let evidence = sponsored_billing::SponsoredProviderEvidence {
             customer_id: customer_id.clone(),
             subscription_id: subscription_id.to_string(),
@@ -12183,6 +12191,51 @@ fn sponsored_invoice_items(object: &serde_json::Value) -> Vec<(String, String, i
             Some((item_id.to_string(), price_id.to_string(), quantity))
         })
         .collect()
+}
+
+fn sponsored_invoice_line_terms(object: &serde_json::Value) -> Vec<(String, String, i64, i64)> {
+    object["lines"]["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|line| {
+            let item_id = line["subscription_item"].as_str().or_else(|| {
+                line["parent"]["subscription_item_details"]["subscription_item"].as_str()
+            })?;
+            let price_id = line["price"]["id"]
+                .as_str()
+                .or_else(|| line["pricing"]["price_details"]["price"].as_str())
+                .or_else(|| line["parent"]["subscription_item_details"]["price"].as_str())?;
+            let period_start = line["period"]["start"].as_i64()?;
+            let period_end = line["period"]["end"].as_i64()?;
+            (period_start >= 0 && period_end > period_start).then(|| {
+                (
+                    item_id.to_string(),
+                    price_id.to_string(),
+                    period_start,
+                    period_end,
+                )
+            })
+        })
+        .collect()
+}
+
+fn sponsored_invoice_line_item_for_operation(
+    line_terms: &[(String, String, i64, i64)],
+    expected_price_id: &str,
+    effective_from: i64,
+    recorded_item_id: Option<&str>,
+) -> Option<String> {
+    let mut matches = line_terms
+        .iter()
+        .filter(|(item_id, price_id, period_start, period_end)| {
+            price_id == expected_price_id
+                && effective_from <= *period_start
+                && effective_from < *period_end
+                && recorded_item_id.is_none_or(|recorded_item_id| recorded_item_id == item_id)
+        });
+    let (item_id, _, _, _) = matches.next()?;
+    matches.next().is_none().then(|| item_id.clone())
 }
 
 /// The subscription ended for good: back to the free tier (existing data stays readable - the
@@ -16046,12 +16099,37 @@ mod tests {
                     "subscription_item": "si-sponsored"
                 }},
                 "pricing": {"price_details": {"price": "price-sponsored"}},
-                "quantity": 3
+                "quantity": 3,
+                "period": {"start": 100, "end": 200}
             }]}
         });
         assert_eq!(
             sponsored_invoice_items(&invoice),
             vec![("si-sponsored".into(), "price-sponsored".into(), 3)]
+        );
+        assert_eq!(
+            sponsored_invoice_line_terms(&invoice),
+            vec![("si-sponsored".into(), "price-sponsored".into(), 100, 200)]
+        );
+    }
+
+    #[test]
+    fn sponsored_invoice_operation_matches_its_own_line_term_not_invoice_max_end() {
+        let lines = vec![
+            ("si_month".into(), "price_month".into(), 100, 130),
+            ("si_year".into(), "price_year".into(), 100, 465),
+        ];
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(&lines, "price_month", 100, None).as_deref(),
+            Some("si_month")
+        );
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(&lines, "price_month", 130, None),
+            None
+        );
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(&lines, "price_month", 100, Some("si_year")),
+            None
         );
     }
 
@@ -16061,6 +16139,7 @@ mod tests {
             crate::cloud_provider_stripe_http::StripeInvoiceLineResource {
                 id: "il_test".into(),
                 quantity: Some(1),
+                amount: Some(299),
                 subscription_id: Some("sub_test".into()),
                 subscription_item_id: Some(item.into()),
                 legacy_subscription_id: None,

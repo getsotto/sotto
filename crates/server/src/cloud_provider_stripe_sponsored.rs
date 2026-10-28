@@ -344,6 +344,7 @@ pub struct SponsoredInvoiceLine {
     period_start: i64,
     period_end: i64,
     quantity: u64,
+    amount: i64,
     proration: bool,
 }
 
@@ -358,6 +359,29 @@ impl SponsoredInvoiceLine {
         quantity: u64,
         proration: bool,
     ) -> Result<Self, SponsoredCoverageError> {
+        Self::new_with_amount(
+            line_id,
+            provider_item_id,
+            price_id,
+            period_start,
+            period_end,
+            quantity,
+            1,
+            proration,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_amount(
+        line_id: impl Into<String>,
+        provider_item_id: impl Into<String>,
+        price_id: impl Into<String>,
+        period_start: i64,
+        period_end: i64,
+        quantity: u64,
+        amount: i64,
+        proration: bool,
+    ) -> Result<Self, SponsoredCoverageError> {
         let line = Self {
             line_id: line_id.into(),
             provider_item_id: provider_item_id.into(),
@@ -365,6 +389,7 @@ impl SponsoredInvoiceLine {
             period_start,
             period_end,
             quantity,
+            amount,
             proration,
         };
         if line.line_id.trim().is_empty()
@@ -401,6 +426,10 @@ impl SponsoredInvoiceLine {
 
     pub const fn quantity(&self) -> u64 {
         self.quantity
+    }
+
+    pub const fn amount(&self) -> i64 {
+        self.amount
     }
 
     pub const fn proration(&self) -> bool {
@@ -662,7 +691,7 @@ pub enum SponsoredNeedsEvidence {
         expected: u64,
         observed: u64,
     },
-    UnsupportedProration {
+    NonPositiveLineAmount {
         line_id: String,
     },
 }
@@ -685,8 +714,9 @@ pub enum SponsoredCoverageError {
 ///
 /// The manifest is treated as a dated, named allocation history.  Every point in every paid line
 /// must have exactly the line quantity of named allocations.  A line with an unknown price,
-/// missing history, a quantity mismatch, or proration is returned as `NeedsEvidence`; it is never
-/// converted into an optimistic partial projection.
+/// missing history, a quantity mismatch, or a non-positive line amount is returned as
+/// `NeedsEvidence`; it is never converted into an optimistic partial projection. Positive
+/// prorations are valid when Stripe supplies a concrete paid period for that line.
 pub fn compose_sponsored_coverage(
     config: &SponsoredStripeCoverageConfig,
     manifest: &SponsoredAllocationManifest,
@@ -724,9 +754,9 @@ pub fn compose_sponsored_coverage_with_renewal_failures(
                 },
             ));
         };
-        if line.proration() {
+        if line.amount() <= 0 {
             return Ok(SponsoredCoverageResult::NeedsEvidence(
-                SponsoredNeedsEvidence::UnsupportedProration {
+                SponsoredNeedsEvidence::NonPositiveLineAmount {
                     line_id: line.line_id().to_owned(),
                 },
             ));
@@ -1213,14 +1243,15 @@ mod tests {
                     false,
                 )
                 .unwrap(),
-                SponsoredInvoiceLine::new(
+                SponsoredInvoiceLine::new_with_amount(
                     "il_annual",
                     "item_annual",
                     "price_standard_year",
                     100,
                     465,
                     1,
-                    false,
+                    1_835,
+                    true,
                 )
                 .unwrap(),
             ],
@@ -1494,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn proration_is_needs_evidence_and_does_not_inflate_quantity() {
+    fn positive_proration_uses_its_paid_period_without_inflating_quantity() {
         let manifest = SponsoredAllocationManifest::new(
             "acct_test",
             ProviderEnvironment::Test,
@@ -1510,20 +1541,55 @@ mod tests {
             )],
         )
         .unwrap();
-        let line = SponsoredInvoiceLine::new(
+        let line = SponsoredInvoiceLine::new_with_amount(
             "il_proration",
             "item_1",
             "price_standard_month",
             100,
             200,
             1,
+            100,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            compose_sponsored_coverage(&config(), &manifest, &settlement(vec![line])).unwrap(),
+            SponsoredCoverageResult::Candidate(_)
+        ));
+    }
+
+    #[test]
+    fn non_positive_proration_is_needs_evidence() {
+        let manifest = SponsoredAllocationManifest::new(
+            "acct_test",
+            ProviderEnvironment::Test,
+            "cus_1",
+            "sub_1",
+            vec![allocation(
+                "a_1",
+                "user_1",
+                "item_1",
+                "price_standard_month",
+                0,
+                None,
+            )],
+        )
+        .unwrap();
+        let line = SponsoredInvoiceLine::new_with_amount(
+            "il_credit",
+            "item_1",
+            "price_standard_month",
+            100,
+            200,
+            1,
+            -100,
             true,
         )
         .unwrap();
         assert!(matches!(
             compose_sponsored_coverage(&config(), &manifest, &settlement(vec![line])).unwrap(),
             SponsoredCoverageResult::NeedsEvidence(
-                SponsoredNeedsEvidence::UnsupportedProration { .. }
+                SponsoredNeedsEvidence::NonPositiveLineAmount { .. }
             )
         ));
     }
