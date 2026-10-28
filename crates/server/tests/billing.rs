@@ -1270,7 +1270,7 @@ async fn personal_paid_checkout_webhook_records_provider_term() {
 }
 
 #[tokio::test]
-async fn personal_renewal_notice_accepts_legacy_subscription_and_resolves_on_matching_payment() {
+async fn personal_renewal_notices_follow_signed_failure_and_matching_paid_invoice() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
