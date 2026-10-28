@@ -29,7 +29,7 @@ test("real personal Checkout reuses the runner-owned test-clock Customer", async
 
   await page.goto("/app");
   await expect(page.getByRole("button", { name: "Log in with GitHub" })).toBeVisible();
-  await loginAs(page, fixture.invitee_login_code);
+  await loginAs(page, fixture.owner_login_code);
 
   const checkout = await page.evaluate(
     async ({ customerId, clockId, runId, idempotencyKey, returnUrl }) => {
@@ -115,12 +115,15 @@ test("real personal Checkout reuses the runner-owned test-clock Customer", async
     .poll(
       async () =>
         page.evaluate(async () => {
-          const response = await fetch("/account/eligibility", { credentials: "include" });
+          const response = await fetch("/billing/personal/lifecycle", { credentials: "include" });
           if (!response.ok) return `http ${response.status}`;
-          const body = (await response.json()) as { state?: string };
-          return body.state ?? "missing";
+          const body = (await response.json()) as {
+            state?: string;
+            paid_through_date?: string | null;
+          };
+          return `${body.state ?? "missing"}:${body.paid_through_date ?? "missing"}`;
         }),
       { intervals: [2_000], timeout: 60_000 },
     )
-    .toBe("paid");
+    .toMatch(/^active:\d{4}-\d{2}-\d{2}$/);
 });
