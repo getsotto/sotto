@@ -1270,7 +1270,7 @@ async fn personal_paid_checkout_webhook_records_provider_term() {
 }
 
 #[tokio::test]
-async fn personal_renewal_notices_follow_signed_failure_and_matching_paid_invoice() {
+async fn personal_renewal_notice_accepts_legacy_subscription_and_resolves_on_matching_payment() {
     let Some(pool) = pool_or_skip().await else {
         return;
     };
@@ -1363,13 +1363,40 @@ async fn personal_renewal_notices_follow_signed_failure_and_matching_paid_invoic
         }
     };
 
-    let failed_payload = make_failure(&first_failure_event, 100, &invoice_id, paid_through);
+    // Older Stripe invoice snapshots expose the subscription at the top level. Keep this
+    // fallback covered through the signed webhook path, including the notice and its later
+    // resolution by the matching paid invoice.
+    let mut legacy_failure: serde_json::Value = serde_json::from_str(&make_failure(
+        &first_failure_event,
+        100,
+        &invoice_id,
+        paid_through,
+    ))
+    .expect("build the legacy renewal failure event");
+    let legacy_invoice = legacy_failure["data"]["object"]
+        .as_object_mut()
+        .expect("invoice object");
+    legacy_invoice.remove("parent");
+    legacy_invoice.insert("subscription".into(), serde_json::json!(subscription_id));
+    let failed_payload = legacy_failure.to_string();
     let invalid_signature = stripe_signature("different body");
     assert_eq!(
         post_webhook(&app, &failed_payload, Some(&invalid_signature)).await,
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(send(failed_payload).await, StatusCode::OK);
+    let notice_after_legacy_failure: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM cloud_notice_outbox \
+         WHERE recipient_user_id=$1 AND kind='failed_renewal'",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count notices after the legacy invoice shape");
+    assert_eq!(
+        notice_after_legacy_failure, 1,
+        "the legacy top-level subscription must bind the failed invoice to its account"
+    );
     // Stripe can emit more than one failure event for the same invoice. The customer sees one
     // notice with the original deadline, even though the delivery ids differ.
     let retry_payload = make_failure(&retry_failure_event, 101, &invoice_id, paid_through);
