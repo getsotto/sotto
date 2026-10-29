@@ -134,8 +134,10 @@ advanced without replacing or modifying billing evidence in Postgres. Build with
 `e2e-mock-oauth,e2e-stripe-test-clock` (the latter refuses builds without mock OAuth), set
 `SOTTO_E2E_TEST_CLOCK_CHECKOUT_ENABLED=1`, and provide
 `STRIPE_TEST_CLOCK_CUSTOMER_ID`, `STRIPE_TEST_CLOCK_ID` and `STRIPE_TEST_CLOCK_RUN_ID` from the
-private lifecycle-run manifest. Use only a restricted `rk_test_` key with Customer and
-Subscription read/write access. The server verifies the Customer's test mode, clock and run
+private lifecycle-run manifest. Configure hosted sales with `SOTTO_CLOUD_SALES_ENABLED=1`, the
+four hosted `STRIPE_*_PRICE_ID` values, and `STRIPE_CLOUD_PORTAL_CONFIGURATION_ID`. Use only a
+restricted `rk_test_` key with the Customer and Subscription read/write access required by the
+server. The server verifies the Customer's test mode, clock and run
 metadata, refuses a Customer that already has a subscription, claims it to one mock identity, and
 then uses the normal personal or first sponsored Checkout and webhook path. Normal server builds
 ignore the test-only field and never use it. The test is skipped unless all run identifiers are
