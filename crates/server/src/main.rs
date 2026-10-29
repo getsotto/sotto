@@ -43,8 +43,13 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    sotto_server::clock::validate_configuration().map_err(Error::Config)?;
     #[cfg(feature = "e2e-stripe-test-clock")]
     eprintln!("warning: built with `e2e-stripe-test-clock`; test-clock checkout binding requires SOTTO_E2E_TEST_CLOCK_CHECKOUT_ENABLED=1 and an rk_test_ key");
+    #[cfg(feature = "e2e-test-clock")]
+    eprintln!(
+        "warning: built with `e2e-test-clock` - business time can be overridden. Never deploy this build."
+    );
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
     db::migrate(&pool).await?;

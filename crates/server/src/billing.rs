@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
@@ -3580,10 +3580,7 @@ async fn select_founding_aware_offer(
 }
 
 fn billing_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs() as i64
+    crate::clock::business_epoch_seconds()
 }
 
 fn personal_billing_error(error: personal_billing::PersonalBillingError) -> Error {
@@ -3698,6 +3695,11 @@ async fn personal_quote(
 /// verified paid webhook handled below.
 const SAFE_CHECKOUT_IDEMPOTENCY_WINDOW_SECONDS: i64 = 23 * 60 * 60;
 
+#[cfg(feature = "e2e-test-clock")]
+fn test_checkout_customer_matches(configured: Option<&str>, stored: Option<&str>) -> bool {
+    configured.is_none_or(|customer_id| Some(customer_id) == stored)
+}
+
 async fn personal_checkout(
     State(state): State<AppState>,
     user: AuthUser,
@@ -3730,6 +3732,8 @@ async fn personal_checkout(
     validate_personal_catalogue(billing, catalogue).await?;
     let price_id = catalogue.id_for(offer).to_string();
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
+    #[cfg(feature = "e2e-test-clock")]
+    let test_clock_customer_id = crate::clock::test_clock_customer_id();
     billing_operations::validate_return_url(&billing.return_url, &request.return_url)
         .map_err(Error::from)?;
     #[cfg(feature = "e2e-stripe-test-clock")]
@@ -3800,6 +3804,24 @@ async fn personal_checkout(
             )
             .await
             .map_err(personal_billing_error)?;
+            #[cfg(feature = "e2e-test-clock")]
+            if let Some(customer_id) = test_clock_customer_id.as_deref() {
+                let result = sqlx::query(
+                    "UPDATE billing_personal_accounts SET stripe_customer_id = $2, updated_at = now() \
+                     WHERE user_id = $1 AND operation_id = $3 AND state = 'pending' \
+                       AND (stripe_customer_id IS NULL OR stripe_customer_id = $2)",
+                )
+                .bind(&user.user_id)
+                .bind(customer_id)
+                .bind(&operation.operation_id)
+                .execute(&mut *tx)
+                .await?;
+                if result.rows_affected() != 1 {
+                    return Err(Error::Conflict(
+                        "billing operation is bound to a different test customer".into(),
+                    ));
+                }
+            }
             let operation = billing_operations::record_personal_checkout_request(
                 &mut tx,
                 &operation.operation_id,
@@ -3928,6 +3950,12 @@ async fn personal_checkout(
     .bind(&operation.operation_id)
     .fetch_one(&state.pool)
     .await?;
+    #[cfg(feature = "e2e-test-clock")]
+    if !test_checkout_customer_matches(test_clock_customer_id.as_deref(), customer_id.as_deref()) {
+        return Err(Error::Conflict(
+            "billing operation is bound to a different test customer".into(),
+        ));
+    }
     let stored_price_id = operation
         .provider_checkout_price_id
         .as_deref()
@@ -6786,10 +6814,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         .get("Stripe-Signature")
         .and_then(|v| v.to_str().ok())
         .ok_or(Error::Unauthorized)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = crate::clock::wall_epoch_seconds();
     if !verify_signature(&billing.webhook_secret, signature, &body, now) {
         return Err(Error::Unauthorized);
     }
@@ -13110,6 +13135,22 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "e2e-test-clock")]
+    #[test]
+    fn test_clock_checkout_replays_only_with_its_original_customer() {
+        assert!(test_checkout_customer_matches(None, None));
+        assert!(test_checkout_customer_matches(None, Some("cus_existing")));
+        assert!(test_checkout_customer_matches(
+            Some("cus_original"),
+            Some("cus_original")
+        ));
+        assert!(!test_checkout_customer_matches(
+            Some("cus_original"),
+            Some("cus_different")
+        ));
+        assert!(!test_checkout_customer_matches(Some("cus_original"), None));
+    }
     use axum::response::IntoResponse;
     use std::collections::HashSet;
     use std::str::FromStr;
