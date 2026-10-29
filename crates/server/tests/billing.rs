@@ -178,11 +178,15 @@ async fn stripe_mock_handler(
     State(responses): State<StripeMockResponses>,
     request: Request<Body>,
 ) -> Response<Body> {
-    let mut value = responses
-        .0
-        .lock()
-        .unwrap()
-        .get(request.uri().path())
+    let request_uri = request.uri();
+    let exact_route = request_uri
+        .query()
+        .map(|query| format!("{}?{query}", request_uri.path()));
+    let routes = responses.0.lock().unwrap();
+    let mut value = exact_route
+        .as_deref()
+        .and_then(|route| routes.get(route))
+        .or_else(|| routes.get(request_uri.path()))
         .cloned()
         .unwrap_or_else(|| serde_json::json!({"error":"not found"}));
     let status = value
@@ -208,6 +212,13 @@ async fn stripe_mock_handler(
 async fn stripe_mock_server(
     responses: HashMap<String, serde_json::Value>,
 ) -> (Url, tokio::task::JoinHandle<()>) {
+    let (origin, task, _) = stripe_mock_server_with_state(responses).await;
+    (origin, task)
+}
+
+async fn stripe_mock_server_with_state(
+    responses: HashMap<String, serde_json::Value>,
+) -> (Url, tokio::task::JoinHandle<()>, StripeMockResponses) {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
@@ -215,9 +226,13 @@ async fn stripe_mock_server(
     let state = StripeMockResponses(Arc::new(Mutex::new(responses)));
     let router = Router::new()
         .fallback(any(stripe_mock_handler))
-        .with_state(state);
+        .with_state(state.clone());
     let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    (Url::parse(&format!("http://{address}/")).unwrap(), task)
+    (
+        Url::parse(&format!("http://{address}/")).unwrap(),
+        task,
+        state,
+    )
 }
 
 struct TestProvider {
@@ -2138,12 +2153,16 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         .as_secs() as i64;
     let period_start = now.saturating_sub(3_600);
     let period_end = now + 2_592_000;
+    let customer_id = format!("cus_coverage_person_{fixture}");
+    let subscription_id = format!("sub_coverage_person_{fixture}");
+    let initial_item_id = format!("si_coverage_person_{fixture}");
+    let transition_item_id = format!("si_coverage_transition_{fixture}");
     let invoice_id = format!("in_coverage_{fixture}");
     let invoice = serde_json::json!({
         "id": invoice_id,
-        "customer": "cus_coverage_person",
+        "customer": customer_id,
         "parent": {"type":"subscription_details", "subscription_details": {
-            "subscription":"sub_coverage_person",
+            "subscription":subscription_id,
             "metadata": {
                 "sotto_allocation_reference": allocation_reference,
                 "personal_user_id": user_id,
@@ -2157,7 +2176,7 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         "lines":{"data":[{
             "id":"il_coverage_person", "quantity":1, "livemode":false,
             "parent":{"type":"subscription_item_details", "subscription_item_details": {
-                "subscription":"sub_coverage_person", "subscription_item":"si_coverage_person"
+                "subscription":subscription_id, "subscription_item":initial_item_id
             }},
             "pricing":{"type":"price_details", "price_details":{"price":"price_coverage_month"}},
             "metadata":{"sotto_allocation_reference":allocation_reference},
@@ -2166,10 +2185,29 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
     });
     let line = invoice["lines"]["data"][0].clone();
     let payment = serde_json::json!({
-        "id":"inpay_coverage_person", "object":"invoice_payment", "invoice":invoice_id,
+        "id":format!("inpay_coverage_person_{fixture}"), "object":"invoice_payment", "invoice":invoice_id,
         "status":"paid", "amount_paid":299, "amount_requested":299, "currency":"gbp",
         "livemode":false,
-        "payment":{"type":"payment_intent", "payment_intent":"pi_coverage_person"}
+        "payment":{"type":"payment_intent", "payment_intent":format!("pi_coverage_person_{fixture}")}
+    });
+    let next_invoice_id = format!("in_coverage_transition_{fixture}");
+    let next_period_end = period_end + 2_592_000;
+    let mut next_invoice = invoice.clone();
+    next_invoice["id"] = serde_json::json!(next_invoice_id);
+    next_invoice["amount_paid"] = serde_json::json!(299);
+    next_invoice["amount_due"] = serde_json::json!(299);
+    next_invoice["lines"]["data"][0]["id"] = serde_json::json!("il_coverage_transition");
+    next_invoice["lines"]["data"][0]["parent"]["subscription_item_details"]["subscription_item"] =
+        serde_json::json!(transition_item_id);
+    next_invoice["lines"]["data"][0]["pricing"]["price_details"]["price"] =
+        serde_json::json!("price_coverage_month");
+    next_invoice["lines"]["data"][0]["period"]["start"] = serde_json::json!(period_end);
+    next_invoice["lines"]["data"][0]["period"]["end"] = serde_json::json!(next_period_end);
+    let next_payment = serde_json::json!({
+        "id":format!("inpay_coverage_transition_{fixture}"), "object":"invoice_payment", "invoice":next_invoice_id,
+        "status":"paid", "amount_paid":299, "amount_requested":299, "currency":"gbp",
+        "livemode":false,
+        "payment":{"type":"payment_intent", "payment_intent":format!("pi_coverage_transition_{fixture}")}
     });
     let listed_invoice = invoice.clone();
     let mut malformed_invoice = invoice.clone();
@@ -2177,14 +2215,14 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         .as_object_mut()
         .expect("invoice object")
         .remove("id");
-    let (origin, stripe_task) = stripe_mock_server(HashMap::from([
+    let (origin, stripe_task, stripe_mock) = stripe_mock_server_with_state(HashMap::from([
         (
             "/v1/account".into(),
             serde_json::json!({"id":"acct_coverage_test","livemode":false}),
         ),
         (
-            "/v1/subscriptions/sub_coverage_person".into(),
-            serde_json::json!({"id":"sub_coverage_person","customer":"cus_coverage_person","status":"active","livemode":false}),
+            format!("/v1/subscriptions/{subscription_id}"),
+            serde_json::json!({"id":subscription_id,"customer":customer_id,"status":"active","livemode":false}),
         ),
         (
             "/v1/invoices".into(),
@@ -2206,6 +2244,15 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         (
             "/v1/invoice_payments".into(),
             serde_json::json!({"object":"list","data":[payment],"has_more":false}),
+        ),
+        (
+            format!("/v1/invoice_payments?invoice={next_invoice_id}&limit=100"),
+            serde_json::json!({"object":"list","data":[next_payment],"has_more":false}),
+        ),
+        (format!("/v1/invoices/{next_invoice_id}"), next_invoice.clone()),
+        (
+            format!("/v1/invoices/{next_invoice_id}/lines"),
+            serde_json::json!({"object":"list","data":next_invoice["lines"]["data"],"has_more":false}),
         ),
         (
             "/v1/credit_notes".into(),
@@ -2282,8 +2329,8 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         "api_version":STRIPE_API_VERSION, "type":"checkout.session.completed", "livemode":false,
         "data":{"object":{
             "client_reference_id":format!("personal:{operation_id}"), "payment_status":"paid",
-            "customer":"cus_coverage_person", "subscription":"sub_coverage_person",
-            "payment_intent":"pi_coverage_person"
+            "customer":customer_id, "subscription":subscription_id,
+            "payment_intent":format!("pi_coverage_person_{fixture}")
         }}
     })
     .to_string();
@@ -2500,13 +2547,13 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
     .fetch_one(&pool)
     .await
     .expect("paid invoice settlement");
-    assert_eq!(stored_payment, "pi_coverage_person");
+    assert_eq!(stored_payment, format!("pi_coverage_person_{fixture}"));
 
     let mut executor =
         sotto_server::cloud_provider_stripe_personal_refresh::PersonalStripeRefreshExecutor::new(
             pool.clone(),
-            stripe,
-            coverage,
+            stripe.clone(),
+            coverage.clone(),
         );
     let worker_outcome = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -2533,6 +2580,65 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
         ),
         sotto_server::cloud_action_policy::ShadowDecision::Allowed
     );
+
+    // A scheduled price transition may replace Stripe's subscription item while preserving the
+    // paid subscription and Sotto allocation. A contiguous, detailed paid invoice is the proof
+    // that lets the allocation advance to the replacement item.
+    stripe_mock.0.lock().unwrap().insert(
+        "/v1/invoices".into(),
+        serde_json::json!({"object":"list","data":[next_invoice.clone(), listed_invoice],"has_more":false}),
+    );
+    let mut next_event_invoice = next_invoice.clone();
+    next_event_invoice
+        .as_object_mut()
+        .expect("invoice object")
+        .remove("amount_paid_off_stripe");
+    let next_event_id = format!("evt_coverage_transition_{fixture}");
+    let next_event = serde_json::json!({
+        "id":next_event_id, "created":now + 7,
+        "api_version":STRIPE_API_VERSION, "type":"invoice.paid", "livemode":false,
+        "data":{"object":next_event_invoice}
+    })
+    .to_string();
+    assert_eq!(
+        post_webhook(&app, &next_event, Some(&stripe_signature(&next_event))).await,
+        StatusCode::OK
+    );
+    let current_item: String = sqlx::query_scalar(
+        "SELECT provider_item_id FROM cloud_provider_allocations WHERE external_allocation_reference = $1",
+    )
+    .bind(&allocation_reference)
+    .fetch_one(&pool)
+    .await
+    .expect("advanced personal provider item binding");
+    assert_eq!(current_item, transition_item_id);
+    let next_paid_through: i64 = sqlx::query_scalar(
+        "SELECT paid_through_epoch FROM billing_personal_accounts WHERE user_id = $1",
+    )
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("second paid term advances billing");
+    assert_eq!(next_paid_through, next_period_end);
+    let mut transition_executor =
+        sotto_server::cloud_provider_stripe_personal_refresh::PersonalStripeRefreshExecutor::new(
+            pool.clone(),
+            stripe,
+            coverage,
+        );
+    assert_eq!(
+        sotto_server::cloud_provider_refresh_worker::run_once(
+            &pool,
+            &format!("coverage-transition-worker-{fixture}"),
+            &mut transition_executor,
+        )
+        .await
+        .expect("personal transition refresh"),
+        sotto_server::cloud_provider_refresh_worker::RefreshWorkerOutcome::Completed
+    );
+    let (transition_status, transition_view) = get_eligibility(&app, &token).await;
+    assert_eq!(transition_status, StatusCode::OK);
+    assert_eq!(transition_view["state"], "paid");
 
     // A processed redelivery must be acknowledged from its durable receipt without depending
     // on the current Stripe binding or making another provider read.
@@ -2615,13 +2721,19 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
 
     // Remove the queue-owned and provider rows first; the beneficiary/source FKs deliberately
     // prevent ordinary user deletion while evidence exists.
-    sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = $1")
-        .bind(format!("evt_coverage_invoice_{fixture}"))
+    sqlx::query("DELETE FROM cloud_provider_invalidation_associations WHERE event_id = ANY($1)")
+        .bind(vec![
+            format!("evt_coverage_invoice_{fixture}"),
+            format!("evt_coverage_transition_{fixture}"),
+        ])
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
-        .bind(format!("evt_coverage_invoice_{fixture}"))
+    sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = ANY($1)")
+        .bind(vec![
+            format!("evt_coverage_invoice_{fixture}"),
+            format!("evt_coverage_transition_{fixture}"),
+        ])
         .execute(&pool)
         .await
         .unwrap();
@@ -2650,13 +2762,15 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
             .await
             .unwrap();
     }
-    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_kind = 'personal' AND provider_customer_id = 'cus_coverage_person'")
+    sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_kind = 'personal' AND provider_customer_id = $1")
+        .bind(&customer_id)
         .execute(&pool)
         .await
         .unwrap();
     sqlx::query("DELETE FROM stripe_subscription_watermarks WHERE event_id = ANY($1)")
         .bind(vec![
             format!("evt_coverage_invoice_{fixture}"),
+            format!("evt_coverage_transition_{fixture}"),
             format!("evt_coverage_checkout_{fixture}"),
             format!("evt_coverage_legacy_invoice_{fixture}"),
         ])
@@ -2666,6 +2780,7 @@ async fn personal_invoice_first_delivery_waits_for_checkout_binding_then_queues_
     sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = ANY($1)")
         .bind(vec![
             format!("evt_coverage_invoice_{fixture}"),
+            format!("evt_coverage_transition_{fixture}"),
             format!("evt_coverage_checkout_{fixture}"),
             format!("evt_coverage_legacy_invoice_{fixture}"),
         ])
@@ -2730,6 +2845,7 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
     let event_id = format!("evt_renewal_{fixture}");
     let update_event_id = format!("evt_zz_subscription_updated_{fixture}");
     let invoice_id = format!("in_failed_{fixture}");
+    let transitioned_item_id = format!("si_renewal_transition_{fixture}");
     seed_user(&pool, &user_id).await;
     let operation_id =
         seed_personal_account(&pool, &user_id, &format!("renewal-failure-{fixture}")).await;
@@ -2813,7 +2929,7 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
     let failed_line = serde_json::json!({
         "id":format!("il_failed_{fixture}"), "invoice":invoice_id, "quantity":1, "livemode":false,
         "parent":{"type":"subscription_item_details", "subscription_item_details":{
-            "subscription":subscription_id, "subscription_item":"si_renewal", "proration":false
+            "subscription":subscription_id, "subscription_item":transitioned_item_id, "proration":false
         }},
         "pricing":{"type":"price_details", "price_details":{"price":"price_renewal_month"}},
         "period":{"start":172_800, "end":259_200}
@@ -2925,6 +3041,14 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
     .await
     .expect("query directly accepted failure evidence");
     assert_eq!(accepted, 1);
+    let current_allocation_item: String = sqlx::query_scalar(
+        "SELECT provider_item_id FROM cloud_provider_allocations WHERE allocation_id = $1",
+    )
+    .bind(&allocation_id)
+    .fetch_one(&pool)
+    .await
+    .expect("failure evidence advances the item binding");
+    assert_eq!(current_allocation_item, transitioned_item_id);
     let failure_notice_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM cloud_notice_outbox WHERE recipient_user_id=$1 AND kind='failed_renewal'",
     )
@@ -2967,6 +3091,31 @@ async fn signed_failed_renewal_is_persisted_before_the_repair_scan_window() {
     .await
     .expect("query replayed failure evidence");
     assert_eq!(replayed, 1);
+
+    // Renewal evidence retains the item that billed its own invoice. A later Stripe phase can
+    // replace the live item again without invalidating the older, already verified failure row.
+    let later_item_id = format!("si_later_phase_{fixture}");
+    sqlx::query(
+        "UPDATE cloud_provider_allocations SET provider_item_id = $2 WHERE allocation_id = $1",
+    )
+    .bind(&allocation_id)
+    .bind(&later_item_id)
+    .execute(&pool)
+    .await
+    .expect("simulate a later provider item transition");
+    let mut later_allocation = allocation.clone();
+    later_allocation.provider_item_id = later_item_id;
+    let loaded_failures =
+        sotto_server::cloud_provider_stripe_renewal_store::load_personal_renewal_failures(
+            &pool,
+            &context,
+            &later_allocation,
+            Default::default(),
+        )
+        .await
+        .expect("historical failure evidence survives item replacement");
+    assert_eq!(loaded_failures.len(), 1);
+    assert_eq!(loaded_failures[0].provider_item_id(), transitioned_item_id);
 
     sqlx::query("DELETE FROM cloud_provider_stripe_renewal_failures WHERE event_id = $1")
         .bind(&event_id)

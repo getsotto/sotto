@@ -1342,6 +1342,14 @@ impl StripeReadClient {
         {
             return Err(StripeReadError::ContextMismatch);
         }
+        let failure_binding = StripeAllocationBinding::new(
+            binding.allocation_reference(),
+            binding.customer_id(),
+            binding.subscription_id(),
+            failure.provider_item_id(),
+            crate::cloud_provider::PayerKind::Personal,
+        )
+        .map_err(StripeReadError::Observation)?;
         let first_subscription = self
             .subscription(session, binding.subscription_id(), binding.customer_id())
             .await?;
@@ -1359,7 +1367,7 @@ impl StripeReadClient {
         }
         let cancellation = cancellation_facts(&first_subscription)?;
         let first_invoice = self.invoice(session, failure.invoice_id()).await?;
-        validate_current_invoice(&first_invoice, binding)?;
+        validate_current_invoice(&first_invoice, &failure_binding)?;
         if let Err(error) = validate_current_invoice_cycle(&first_invoice) {
             match error {
                 CurrentInvoiceCycleError::Malformed(field) => {
@@ -1373,7 +1381,13 @@ impl StripeReadClient {
             }
         }
         let lines = self.invoice_lines(session, &first_invoice.id).await?;
-        validate_current_line(&lines, failure, binding, &self.coverage, self.environment)?;
+        validate_current_line(
+            &lines,
+            failure,
+            &failure_binding,
+            &self.coverage,
+            self.environment,
+        )?;
 
         let state = match first_invoice.status.as_deref() {
             Some("paid") => {
@@ -1386,7 +1400,7 @@ impl StripeReadClient {
                     .personal_invoice_correction_evidence_from_invoice_and_lines(
                         session,
                         first_invoice.clone(),
-                        binding,
+                        &failure_binding,
                         lines,
                     )
                     .await?;
@@ -1479,8 +1493,35 @@ impl StripeReadClient {
         invoice: StripeInvoiceResource,
         binding: &StripeAllocationBinding,
     ) -> Result<StripePersonalInvoiceCorrectionEvidence, StripeReadError> {
+        let lines = self.invoice_lines(session, &invoice.id).await?;
+        if lines.len() != 1 {
+            return Err(StripeReadError::Observation(
+                StripeContractError::UnsupportedQuantity,
+            ));
+        }
+        let line = &lines[0];
+        if line.subscription_id.as_deref() != Some(binding.subscription_id()) {
+            return Err(StripeReadError::ContextMismatch);
+        }
+        let item_id = line
+            .subscription_item_id
+            .as_deref()
+            .ok_or(StripeReadError::MalformedResponse("line.subscription_item"))?;
+        let invoice_binding = StripeAllocationBinding::new(
+            binding.allocation_reference(),
+            binding.customer_id(),
+            binding.subscription_id(),
+            item_id,
+            crate::cloud_provider::PayerKind::Personal,
+        )
+        .map_err(StripeReadError::Observation)?;
         let observation = self
-            .personal_invoice_observation_from_invoice(session, invoice, binding)
+            .personal_invoice_observation_from_invoice_and_lines(
+                session,
+                invoice,
+                &invoice_binding,
+                lines,
+            )
             .await?;
         self.personal_invoice_correction_evidence_from_observation(session, observation)
             .await

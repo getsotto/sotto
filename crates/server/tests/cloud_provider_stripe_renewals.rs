@@ -569,6 +569,41 @@ async fn loopback_history_signed_failure_current_open_composes_personal_candidat
 }
 
 #[tokio::test]
+async fn renewal_links_paid_predecessor_across_a_stripe_item_replacement() {
+    let history = history_with_current_invoice(paid_line()).await;
+    let mut payload = signed_failure();
+    payload["data"]["object"]["lines"]["data"][0]["parent"]["subscription_item_details"]
+        ["subscription_item"] = json!("si_after_schedule_transition");
+    let next_binding = StripeAllocationBinding::new(
+        "alloc_renewal",
+        "cus_renewal",
+        "sub_renewal",
+        "si_after_schedule_transition",
+        PayerKind::Personal,
+    )
+    .unwrap();
+    let (raw, signature) = signed(&payload, NOW);
+    let StripeRenewalFailureResult::Linked(failure) = decode_personal_renewal_failure(
+        &raw,
+        &signature,
+        SECRET,
+        NOW,
+        &config(),
+        &next_binding,
+        &history,
+    )
+    .unwrap() else {
+        panic!("expected a paid predecessor from the earlier item");
+    };
+    assert_eq!(failure.provider_item_id(), "si_after_schedule_transition");
+    assert_eq!(failure.predecessor_invoice_id(), "in_paid");
+    assert_eq!(
+        failure.predecessor_period_end(),
+        failure.renewal_period_start()
+    );
+}
+
+#[tokio::test]
 async fn verified_retry_events_merge_without_changing_candidate_identity() {
     let history = history_with_current_invoice(paid_line()).await;
     let first_payload = signed_failure();
