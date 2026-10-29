@@ -2479,13 +2479,6 @@ async fn each_binding_component_is_checked_before_any_resource_read() {
             "sub_other",
             "si_renewal",
         ),
-        (
-            "provider item",
-            "alloc_renewal",
-            "cus_renewal",
-            "sub_renewal",
-            "si_other",
-        ),
     ];
     for (field, allocation, customer, subscription, item) in cases {
         let (client, mut session, server) = current_client("paid", None).await;
@@ -2546,6 +2539,38 @@ async fn each_binding_component_is_checked_before_any_resource_read() {
             .iter()
             .all(|request| !request.contains("/v1/invoice_payments")));
     }
+}
+
+#[tokio::test]
+async fn renewal_observation_accepts_historical_item_after_subscription_item_replacement() {
+    let failure = linked_failure().await;
+    let current_binding = StripeAllocationBinding::new(
+        "alloc_renewal",
+        "cus_renewal",
+        "sub_renewal",
+        "si_after_schedule_transition",
+        PayerKind::Personal,
+    )
+    .unwrap();
+    assert_ne!(
+        failure.provider_item_id(),
+        current_binding.provider_item_id()
+    );
+
+    let (client, mut session, server) = current_client("open", None).await;
+    let StripeRenewalObservationResult::Observed(observation) = client
+        .personal_renewal_observation(&mut session, &current_binding, &failure)
+        .await
+        .unwrap()
+    else {
+        panic!("expected the historical failed invoice to be observed");
+    };
+
+    assert!(matches!(
+        observation.state(),
+        StripeRenewalCurrentState::Open
+    ));
+    assert!(!server.requests().is_empty());
 }
 
 #[tokio::test]
