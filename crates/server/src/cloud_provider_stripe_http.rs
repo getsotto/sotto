@@ -1337,7 +1337,6 @@ impl StripeReadClient {
             || failure.allocation_reference() != binding.allocation_reference()
             || failure.customer_id() != binding.customer_id()
             || failure.subscription_id() != binding.subscription_id()
-            || failure.provider_item_id() != binding.provider_item_id()
             || binding.payer_kind() != crate::cloud_provider::PayerKind::Personal
         {
             return Err(StripeReadError::ContextMismatch);
