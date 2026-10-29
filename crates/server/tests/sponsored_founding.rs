@@ -383,8 +383,13 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
                 "subscription_item": provider_item_id,
                 "price": { "id": "price_founding_monthly" },
                 "quantity": 2,
-                "period": { "start": now - 60, "end": period_end },
-                "parent": { "type": "subscription_item_details" }
+                "amount": 398,
+                "period": { "start": now - 30, "end": period_end },
+                "parent": { "type": "subscription_item_details", "subscription_item_details": {
+                    "subscription": subscription_id,
+                    "subscription_item": provider_item_id,
+                    "proration": false
+                }}
             }]},
             "parent": { "type": "subscription_details", "subscription_details": { "subscription": subscription_id } }
         }}

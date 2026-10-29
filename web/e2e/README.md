@@ -126,3 +126,22 @@ npm run e2e -- --config=playwright.stripe.config.ts
 The smoke config never enables `e2e-mock-billing`. The only mocked part is GitHub OAuth, so the
 browser can authenticate without a GitHub credential while the billing path remains real. A failed
 run is advisory and does not block ordinary pull requests or merges.
+
+## Real Stripe test-clock Checkout
+
+The test-clock variant adds an E2E-only customer binding so repeated billing periods can be
+advanced without replacing or modifying billing evidence in Postgres. Build with
+`e2e-mock-oauth,e2e-stripe-test-clock` (the latter refuses builds without mock OAuth), set
+`SOTTO_E2E_TEST_CLOCK_CHECKOUT_ENABLED=1`, and provide
+`STRIPE_TEST_CLOCK_CUSTOMER_ID`, `STRIPE_TEST_CLOCK_ID` and `STRIPE_TEST_CLOCK_RUN_ID` from the
+private lifecycle-run manifest. Configure hosted sales with `SOTTO_CLOUD_SALES_ENABLED=1`, the
+four hosted `STRIPE_*_PRICE_ID` values, and `STRIPE_CLOUD_PORTAL_CONFIGURATION_ID`. Use only a
+restricted `rk_test_` key with the Customer and Subscription read/write access required by the
+server. The server verifies the Customer's test mode, clock and run
+metadata, refuses a Customer that already has a subscription, claims it to one mock identity, and
+then uses the normal personal or first sponsored Checkout and webhook path. Normal server builds
+ignore the test-only field and never use it. The test is skipped unless all run identifiers are
+supplied, so a skipped browser case is not lifecycle evidence. To exercise another personal offer
+or a fresh mock account, set `SOTTO_E2E_TEST_CLOCK_OFFER` and
+`SOTTO_E2E_TEST_CLOCK_LOGIN_CODE`; they default to `standard_monthly` and the seeded owner
+identity respectively. Prepare a separate test-clock Customer for each account and run.

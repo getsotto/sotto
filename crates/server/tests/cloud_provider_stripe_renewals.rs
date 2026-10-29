@@ -751,6 +751,37 @@ async fn links_failure_to_exact_paid_predecessor_and_keeps_event_identity_separa
 }
 
 #[tokio::test]
+async fn signed_failure_reads_allocation_reference_from_subscription_parent_metadata() {
+    let history = history().await;
+    let mut failure = signed_failure();
+    let allocation_reference = failure["data"]["object"]["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("sotto_allocation_reference")
+        .unwrap();
+    failure["data"]["object"]["parent"]["subscription_details"]["metadata"] =
+        json!({"sotto_allocation_reference": allocation_reference});
+
+    let (raw, signature) = signed(&failure, NOW);
+    let result = decode_personal_renewal_failure(
+        &raw,
+        &signature,
+        SECRET,
+        NOW,
+        &config(),
+        &binding(),
+        &history,
+    )
+    .unwrap();
+
+    let StripeRenewalFailureResult::Linked(evidence) = result else {
+        panic!("expected linked failure");
+    };
+    assert_eq!(evidence.predecessor_invoice_id(), "in_paid");
+    assert_eq!(evidence.invoice_id(), "in_failed");
+}
+
+#[tokio::test]
 async fn signed_failure_rejects_nonzero_off_stripe_amount_when_present() {
     let history = history().await;
     let mut failure = signed_failure();
