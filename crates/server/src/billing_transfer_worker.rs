@@ -644,6 +644,7 @@ async fn retire_transfer_source(
         &source_id,
         provider_end_reference,
         transfer.effective_from,
+        epoch_now(),
     )
     .await
     .map_err(|_| ExecutionError::Local("source_coverage_retire_failed"))?;
