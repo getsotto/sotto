@@ -392,6 +392,7 @@ jobs:
         run: |
           npm ci
           npm run build
+          npm run build:wasm:node
 
       - name: Install Playwright's chromium browser
         working-directory: web
