@@ -80,7 +80,15 @@ fn decode_with(
     value: &Value,
     settlement: &StripePaymentSettlement,
 ) -> Result<sotto_server::cloud_provider_stripe::StripeCoverageEvidence, StripeContractError> {
-    let (payload, signature) = signed_payload(value, NOW);
+    // The low-level decoder can consume the includable field when supplied. Production webhook
+    // handling gets it from a separately authenticated, expanded invoice detail read.
+    let mut value = value.clone();
+    value["data"]["object"]
+        .as_object_mut()
+        .expect("invoice object")
+        .entry("amount_paid_off_stripe")
+        .or_insert(json!(0));
+    let (payload, signature) = signed_payload(&value, NOW);
     decode_paid_invoice(
         &payload,
         &signature,
@@ -90,6 +98,23 @@ fn decode_with(
         &binding(),
         settlement,
     )
+}
+
+#[test]
+fn normal_webhook_snapshot_needs_the_expanded_invoice_amount() {
+    let (payload, signature) = signed_payload(&fixture(), NOW);
+    assert!(matches!(
+        decode_paid_invoice(
+            &payload,
+            &signature,
+            SECRET,
+            NOW,
+            &config(),
+            &binding(),
+            &settlement(),
+        ),
+        Err(StripeContractError::MissingField("amount_paid_off_stripe"))
+    ));
 }
 
 #[test]
@@ -172,6 +197,7 @@ fn founding_prices_are_recognised_and_line_metadata_is_authoritative() {
         "sotto_allocation_reference": "allocation_contract_person"
     });
     payload["data"]["object"]["metadata"] = json!({});
+    payload["data"]["object"]["amount_paid_off_stripe"] = json!(0);
     let (raw, signature) = signed_payload(&payload, NOW);
     let evidence = decode_paid_invoice(
         &raw,

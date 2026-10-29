@@ -59,6 +59,12 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # enabled in release.yml or the production Dockerfile, so this code does not exist in any binary
 # a user runs. See docs/adr/0001-continuous-deploy-during-launch-waves.md.
 e2e-mock-oauth = []
+# Allows a real-Stripe browser rehearsal to bind a runner-owned test-clock customer to one mock
+# OAuth identity. Must never be used with the local billing adapter or without mock OAuth.
+e2e-stripe-test-clock = []
+# Overrides business time from SOTTO_E2E_CLOCK_EPOCH for isolated Stripe Test Clock rehearsals.
+# Off by default and never enabled in release or production builds.
+e2e-test-clock = []
 # Uses a local checkout page instead of Stripe so the browser gate does not need secrets or
 # depend on an external provider. Off by default - never enabled in release.yml or production.
 e2e-mock-billing = []

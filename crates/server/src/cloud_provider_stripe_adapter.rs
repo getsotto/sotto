@@ -306,7 +306,6 @@ fn active_failure_for_term<'a>(
             failure.allocation_reference() == allocation.allocation_reference()
                 && failure.customer_id() == allocation.customer_id()
                 && failure.subscription_id() == allocation.subscription_id()
-                && failure.provider_item_id() == allocation.provider_item_id()
                 && failure.predecessor_invoice_id() == term.invoice_id()
         })
         .collect::<Vec<_>>();

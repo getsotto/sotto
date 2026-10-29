@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+"""Prepare and clean up a private, test-mode Stripe lifecycle run.
+
+This bootstrap creates only one test clock and one empty customer. It does not run lifecycle
+scenarios, create subscriptions, or produce acceptance evidence.
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
+import hashlib
+import importlib.util
+from importlib.machinery import SourceFileLoader
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
+import sys
+import tempfile
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+from uuid import UUID
+
+ROOT = Path(__file__).resolve().parents[1]
+MAX_RESPONSE_BYTES = 1_048_576
+REQUEST_TIMEOUT_SECONDS = 15
+RESUME_HORIZON_SECONDS = 20 * 60 * 60
+INITIAL_CLOCK_SAFETY_LAG_SECONDS = 120
+RESOURCE_RECOVERY_PAGE_LIMIT = 5
+MANIFEST_SCHEMA = "sotto-stripe-cloud-lifecycle-run-v2"
+
+
+class RunError(RuntimeError):
+    """Fixed diagnostic code that does not include provider responses or secrets."""
+
+
+class RejectStripeRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise HTTPError(req.full_url, code, "redirect_not_permitted", headers, fp)
+
+
+def load_preflight():
+    path = ROOT / "scripts/stripe-cloud-lifecycle-preflight"
+    loader = SourceFileLoader("stripe_cloud_lifecycle_preflight", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None or spec.loader is None:
+        raise RunError("preflight_module_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+PREFLIGHT = load_preflight()
+
+
+def fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def require_absolute_private_run_dir(value: str | Path, *, create: bool) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or path.is_symlink():
+        raise RunError("run_directory_path_invalid")
+    try:
+        resolved = path.resolve(strict=False)
+        if resolved == ROOT or ROOT in resolved.parents:
+            raise RunError("run_directory_must_be_outside_repository")
+        if create and not path.exists():
+            path.mkdir(mode=0o700, parents=False)
+        details = path.stat()
+    except RunError:
+        raise
+    except OSError as error:
+        raise RunError("run_directory_unavailable") from error
+    if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid():
+        raise RunError("run_directory_owner_or_type_invalid")
+    if stat.S_IMODE(details.st_mode) & 0o077:
+        raise RunError("run_directory_permissions_invalid")
+    return path
+
+
+def private_atomic_json(path: Path, value: dict) -> None:
+    if path.is_symlink() or path.parent.is_symlink():
+        raise RunError("manifest_path_invalid")
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".run-manifest-", dir=path.parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(value, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    except RunError:
+        raise
+    except OSError as error:
+        raise RunError("manifest_write_failed") from error
+
+
+@contextmanager
+def lock_run(path: Path):
+    lock_path = path / ".run.lock"
+    if lock_path.is_symlink():
+        raise RunError("run_lock_path_invalid")
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        os.fchmod(descriptor, 0o600)
+        details = os.fstat(descriptor)
+        if details.st_uid != os.getuid() or not stat.S_ISREG(details.st_mode):
+            os.close(descriptor)
+            raise RunError("run_lock_owner_or_type_invalid")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        os.close(descriptor)
+        raise RunError("run_already_locked") from error
+    except OSError as error:
+        if "descriptor" in locals():
+            os.close(descriptor)
+        raise RunError("run_lock_unavailable") from error
+    try:
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def read_manifest(path: Path) -> dict:
+    manifest_path = path / "run.json"
+    if manifest_path.is_symlink():
+        raise RunError("manifest_path_invalid")
+    try:
+        details = manifest_path.stat()
+        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid():
+            raise RunError("manifest_owner_or_type_invalid")
+        if stat.S_IMODE(details.st_mode) & 0o077:
+            raise RunError("manifest_permissions_invalid")
+        if details.st_size > 64 * 1024:
+            raise RunError("manifest_too_large")
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except RunError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RunError("manifest_unavailable_or_invalid") from error
+    if not isinstance(value, dict) or set(value) != {
+        "schema", "run_id", "started_at_epoch", "started_at", "app_sha", "api_version",
+        "account_fingerprint", "frozen_time", "status", "clock", "customer",
+    }:
+        raise RunError("manifest_shape_invalid")
+    if value["schema"] != MANIFEST_SCHEMA or not isinstance(value["run_id"], str):
+        raise RunError("manifest_identity_invalid")
+    try:
+        parsed_id = UUID(value["run_id"])
+    except ValueError as error:
+        raise RunError("manifest_identity_invalid") from error
+    if str(parsed_id) != value["run_id"]:
+        raise RunError("manifest_identity_invalid")
+    if not isinstance(value["api_version"], str) or value["api_version"] != PREFLIGHT.server_api_version():
+        raise RunError("manifest_api_version_changed")
+    if not isinstance(value["app_sha"], str) or not re.fullmatch(r"[0-9a-f]{40}", value["app_sha"]):
+        raise RunError("manifest_candidate_invalid")
+    if not isinstance(value["account_fingerprint"], str) or not re.fullmatch(
+        r"[0-9a-f]{16}", value["account_fingerprint"],
+    ):
+        raise RunError("manifest_account_invalid")
+    if (
+        not isinstance(value["started_at"], str)
+        or type(value["started_at_epoch"]) is not int
+        or type(value["frozen_time"]) is not int
+    ):
+        raise RunError("manifest_time_invalid")
+    try:
+        parsed_started_at = datetime.fromisoformat(value["started_at"].replace("Z", "+00:00"))
+        if parsed_started_at.tzinfo is None:
+            raise ValueError("timezone required")
+        if int(parsed_started_at.timestamp()) != value["started_at_epoch"]:
+            raise ValueError("timestamp fields differ")
+    except (ValueError, AttributeError) as error:
+        raise RunError("manifest_time_invalid") from error
+    if (
+        value["started_at_epoch"] < 946684800
+        or value["started_at_epoch"] > int(time.time()) + 60
+        or value["frozen_time"] < 946684800
+        or value["frozen_time"] > value["started_at_epoch"] - INITIAL_CLOCK_SAFETY_LAG_SECONDS
+    ):
+        raise RunError("manifest_time_invalid")
+    if not isinstance(value["status"], str) or value["status"] not in {
+        "preparing", "prepared", "cleaned", "cleanup_incomplete",
+    }:
+        raise RunError("manifest_status_invalid")
+    for name, prefix in (("clock", "clock_"), ("customer", "cus_")):
+        resource = value[name]
+        if not isinstance(resource, dict) or set(resource) != {
+            "id", "created", "deleted", "create_attempted",
+        }:
+            raise RunError("manifest_resource_invalid")
+        if resource["id"] is not None and (
+            not isinstance(resource["id"], str)
+            or not re.fullmatch(re.escape(prefix) + r"[A-Za-z0-9]+", resource["id"])
+        ):
+            raise RunError("manifest_resource_invalid")
+        if type(resource["deleted"]) is not bool:
+            raise RunError("manifest_resource_invalid")
+        if type(resource["created"]) is not bool:
+            raise RunError("manifest_resource_invalid")
+        if type(resource["create_attempted"]) is not bool:
+            raise RunError("manifest_resource_invalid")
+        if resource["id"] is None and (resource["created"] or resource["deleted"]):
+            raise RunError("manifest_resource_invalid")
+        if resource["id"] is not None and not resource["created"]:
+            raise RunError("manifest_resource_invalid")
+        if resource["deleted"] and not resource["created"]:
+            raise RunError("manifest_resource_invalid")
+        if resource["id"] is not None and resource["create_attempted"]:
+            raise RunError("manifest_resource_invalid")
+    if value["status"] == "prepared" and any(
+        value[name]["id"] is None
+        or not value[name]["created"]
+        or value[name]["deleted"]
+        or value[name]["create_attempted"]
+        for name in ("clock", "customer")
+    ):
+        raise RunError("manifest_status_resource_mismatch")
+    if value["status"] == "cleaned" and any(
+        resource["create_attempted"]
+        or (resource["id"] is not None and not resource["deleted"])
+        for resource in (value["clock"], value["customer"])
+    ):
+        raise RunError("manifest_status_resource_mismatch")
+    return value
+
+
+class StripeClient:
+    def __init__(self, api_key: str, account_id: str):
+        if not api_key.startswith("rk_test_") or len(api_key) > 512 or any(ch.isspace() for ch in api_key):
+            raise RunError("restricted_test_key_required")
+        if not re.fullmatch(r"acct_[A-Za-z0-9]+", account_id):
+            raise RunError("sandbox_account_id_invalid")
+        self._api_key = api_key
+        self._account_id = account_id
+        self._opener = build_opener(RejectStripeRedirects())
+        self._requests = 0
+        self._started = time.monotonic()
+
+    def request(self, method: str, path: str, fields: dict[str, object] | None = None, *, idempotency_key: str | None = None) -> dict:
+        allowed = {
+            ("GET", "/v1/account"),
+            ("POST", "/v1/test_helpers/test_clocks"),
+            ("GET", "/v1/test_helpers/test_clocks"),
+            ("GET", re.compile(r"/v1/test_helpers/test_clocks/clock_[A-Za-z0-9]+")),
+            ("DELETE", re.compile(r"/v1/test_helpers/test_clocks/clock_[A-Za-z0-9]+")),
+            ("POST", "/v1/customers"),
+            ("GET", "/v1/customers"),
+            ("GET", re.compile(r"/v1/customers/cus_[A-Za-z0-9]+")),
+            ("GET", re.compile(r"/v1/customers/cus_[A-Za-z0-9]+/payment_methods")),
+            ("GET", re.compile(r"/v1/customers/cus_[A-Za-z0-9]+/sources")),
+            ("DELETE", re.compile(r"/v1/customers/cus_[A-Za-z0-9]+")),
+            ("GET", "/v1/subscriptions"),
+        }
+        if not any(verb == method and (path == route if isinstance(route, str) else route.fullmatch(path)) for verb, route in allowed):
+            raise RunError("stripe_endpoint_not_allowed")
+        if self._requests >= 32 or time.monotonic() - self._started > 300:
+            raise RunError("stripe_run_bounds_exceeded")
+        self._requests += 1
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Stripe-Version": PREFLIGHT.server_api_version(),
+            "Accept": "application/json",
+            "User-Agent": "sotto-cloud-lifecycle-run/1",
+        }
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
+        body = None
+        url = "https://api.stripe.com" + path
+        if fields is not None:
+            if method == "GET":
+                url += "?" + urlencode(fields)
+            else:
+                body = urlencode(fields).encode("ascii")
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+        request = Request(url, data=body, headers=headers, method=method)
+        try:
+            with self._opener.open(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                raw = response.read(MAX_RESPONSE_BYTES + 1)
+        except HTTPError as error:
+            # A gateway timeout can arrive after Stripe accepted the write. Keep
+            # the operation recoverable with its original idempotency key.
+            uncertain = error.code >= 500 or error.code in {408, 409}
+            not_found = error.code == 404
+            error.close()
+            if uncertain:
+                code = "stripe_request_uncertain"
+            elif not_found:
+                code = "stripe_resource_not_found"
+            else:
+                code = "stripe_request_rejected"
+            raise RunError(code) from error
+        except (URLError, TimeoutError, OSError) as error:
+            raise RunError("stripe_request_unavailable") from error
+        if len(raw) > MAX_RESPONSE_BYTES:
+            raise RunError("stripe_response_too_large")
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RunError("stripe_response_invalid") from error
+        if not isinstance(value, dict):
+            raise RunError("stripe_response_invalid")
+        if method == "GET" and path == "/v1/account":
+            if value.get("id") != self._account_id:
+                raise RunError("sandbox_account_identity_mismatch")
+        elif (
+            method == "GET"
+            and re.fullmatch(r"/v1/customers/cus_[A-Za-z0-9]+", path)
+            and value.get("deleted") is True
+        ):
+            expected_id = path.rsplit("/", maxsplit=1)[-1]
+            if value.get("id") != expected_id or value.get("object") != "customer":
+                raise RunError("stripe_deleted_customer_response_invalid")
+        elif method == "GET" and (
+            path in {"/v1/subscriptions", "/v1/customers", "/v1/test_helpers/test_clocks"}
+            or re.fullmatch(r"/v1/customers/cus_[A-Za-z0-9]+/(?:payment_methods|sources)", path)
+        ):
+            if value.get("object") != "list" or not isinstance(value.get("data"), list):
+                raise RunError("stripe_list_response_invalid")
+        elif method != "DELETE" and value.get("livemode") is not False:
+            raise RunError("stripe_resource_not_test_mode")
+        if method == "GET" and path == "/v1/subscriptions" and (
+            value.get("object") != "list" or not isinstance(value.get("data"), list)
+        ):
+            raise RunError("stripe_subscription_response_invalid")
+        return value
+
+
+def key_and_identity() -> tuple[str, str]:
+    def required(name: str) -> str:
+        value = os.environ.get(name, "").strip()
+        if not value:
+            raise RunError(f"required_configuration_missing:{name}")
+        return value
+
+    key = PREFLIGHT.read_restricted_key(required("STRIPE_CLOUD_LIFECYCLE_KEY_FILE"))
+    return key, required("STRIPE_CLOUD_LIFECYCLE_ACCOUNT_ID")
+
+
+def key_and_config() -> tuple[str, dict[str, str], str, str]:
+    key, account_id = key_and_identity()
+    def required(name: str) -> str:
+        value = os.environ.get(name, "").strip()
+        if not value:
+            raise RunError(f"required_configuration_missing:{name}")
+        return value
+
+    prices = {
+        offer: required(env_name)
+        for offer, (env_name, _amount, _interval) in PREFLIGHT.OFFERS.items()
+    }
+    return key, prices, account_id, required("SOTTO_CANDIDATE_SHA")
+
+
+def make_run(path: Path, frozen_time: int, client: StripeClient, prices: dict[str, str], account_id: str, app_sha: str) -> dict:
+    now = int(time.time())
+    if frozen_time < 946684800 or frozen_time > now - INITIAL_CLOCK_SAFETY_LAG_SECONDS:
+        raise RunError("test_clock_frozen_time_out_of_range")
+    PREFLIGHT.run_preflight(account_id, prices, client._api_key, app_sha=app_sha)
+    run_id = str(UUID(bytes=secrets.token_bytes(16), version=4))
+    manifest = {
+        "schema": MANIFEST_SCHEMA,
+        "run_id": run_id,
+        "started_at_epoch": now,
+        "started_at": datetime.fromtimestamp(now, timezone.utc).isoformat().replace("+00:00", "Z"),
+        "app_sha": app_sha,
+        "api_version": PREFLIGHT.server_api_version(),
+        "account_fingerprint": fingerprint(account_id),
+        "frozen_time": frozen_time,
+        "status": "preparing",
+        "clock": {
+            "id": None, "created": False, "deleted": False, "create_attempted": False,
+        },
+        "customer": {
+            "id": None, "created": False, "deleted": False, "create_attempted": False,
+        },
+    }
+    private_atomic_json(path / "run.json", manifest)
+    return resume_run(path, manifest, client)
+
+
+def resume_run(path: Path, manifest: dict, client: StripeClient) -> dict:
+    uncertain_create_cleanup = (
+        manifest["status"] == "cleanup_incomplete"
+        and any(
+            resource["id"] is None and resource["create_attempted"] and not resource["deleted"]
+            for resource in (manifest["clock"], manifest["customer"])
+        )
+        and all(not resource["deleted"] for resource in (manifest["clock"], manifest["customer"]))
+    )
+    if (
+        manifest["status"] not in {"preparing", "prepared"}
+        and not uncertain_create_cleanup
+    ):
+        raise RunError("run_is_not_resumable")
+    unresolved_create = any(
+        resource["id"] is None and not resource["deleted"]
+        for resource in (manifest["clock"], manifest["customer"])
+    )
+    if unresolved_create and int(time.time()) - manifest["started_at_epoch"] > RESUME_HORIZON_SECONDS:
+        raise RunError("resume_idempotency_horizon_exceeded")
+    run_id = manifest["run_id"]
+    clock_name = f"sotto-lifecycle-{run_id}"
+    if manifest["clock"]["id"] is None:
+        if manifest["frozen_time"] > int(time.time()) - INITIAL_CLOCK_SAFETY_LAG_SECONDS:
+            raise RunError("test_clock_frozen_time_too_recent")
+        manifest["clock"]["create_attempted"] = True
+        private_atomic_json(path / "run.json", manifest)
+        try:
+            clock = client.request(
+                "POST", "/v1/test_helpers/test_clocks",
+                {"frozen_time": manifest["frozen_time"], "name": clock_name},
+                idempotency_key=f"sotto-lifecycle:{run_id}:clock",
+            )
+        except RunError as error:
+            if str(error) in {"stripe_request_rejected", "stripe_resource_not_found"}:
+                manifest["clock"]["create_attempted"] = False
+                private_atomic_json(path / "run.json", manifest)
+            raise
+        if (
+            not isinstance(clock.get("id"), str)
+            or not re.fullmatch(r"clock_[A-Za-z0-9]+", clock["id"])
+            or clock.get("object") != "test_helpers.test_clock"
+            or clock.get("name") != clock_name
+            or clock.get("status") != "ready"
+            or clock.get("frozen_time") != manifest["frozen_time"]
+        ):
+            raise RunError("test_clock_response_mismatch")
+        manifest["clock"] = {
+            "id": clock["id"], "created": True, "deleted": False,
+            "create_attempted": False,
+        }
+        private_atomic_json(path / "run.json", manifest)
+
+    # A saved ID proves what was created, not that it is still present. Check the
+    # clock before using it to create or resume its customer, and again on every
+    # resume of an existing prepared run.
+    clock = client.request("GET", f"/v1/test_helpers/test_clocks/{manifest['clock']['id']}")
+    if (
+        clock.get("id") != manifest["clock"]["id"]
+        or clock.get("object") != "test_helpers.test_clock"
+        or clock.get("name") != clock_name
+        or clock.get("status") != "ready"
+        or type(clock.get("frozen_time")) is not int
+        or clock["frozen_time"] < manifest["frozen_time"]
+    ):
+        raise RunError("test_clock_response_mismatch")
+
+    if manifest["customer"]["id"] is None:
+        manifest["customer"]["create_attempted"] = True
+        private_atomic_json(path / "run.json", manifest)
+        try:
+            customer = client.request(
+                "POST", "/v1/customers",
+                {
+                    "name": f"Sotto lifecycle {run_id}",
+                    "test_clock": manifest["clock"]["id"],
+                    "metadata[sotto_lifecycle_run_id]": run_id,
+                },
+                idempotency_key=f"sotto-lifecycle:{run_id}:customer",
+            )
+        except RunError as error:
+            if str(error) in {"stripe_request_rejected", "stripe_resource_not_found"}:
+                manifest["customer"]["create_attempted"] = False
+                private_atomic_json(path / "run.json", manifest)
+            raise
+        if (
+            not isinstance(customer.get("id"), str)
+            or not re.fullmatch(r"cus_[A-Za-z0-9]+", customer["id"])
+            or customer.get("object") != "customer"
+            or customer.get("test_clock") != manifest["clock"]["id"]
+            or not isinstance(customer.get("metadata"), dict)
+            or customer["metadata"].get("sotto_lifecycle_run_id") != run_id
+        ):
+            raise RunError("customer_response_mismatch")
+        manifest["customer"] = {
+            "id": customer["id"], "created": True, "deleted": False,
+            "create_attempted": False,
+        }
+        private_atomic_json(path / "run.json", manifest)
+
+    customer = client.request("GET", f"/v1/customers/{manifest['customer']['id']}")
+    if (
+        customer.get("id") != manifest["customer"]["id"]
+        or customer.get("object") != "customer"
+        or customer.get("deleted") is True
+        or customer.get("test_clock") != manifest["clock"]["id"]
+        or not isinstance(customer.get("metadata"), dict)
+        or customer["metadata"].get("sotto_lifecycle_run_id") != run_id
+    ):
+        raise RunError("customer_response_mismatch")
+    manifest["status"] = "prepared"
+    private_atomic_json(path / "run.json", manifest)
+    return manifest
+
+
+def cleanup_run(path: Path, manifest: dict, client: StripeClient) -> dict:
+    if manifest["status"] != "cleaned":
+        manifest["status"] = "cleanup_incomplete"
+        private_atomic_json(path / "run.json", manifest)
+    run_id = manifest["run_id"]
+    clock_name = f"sotto-lifecycle-{run_id}"
+    if (
+        manifest["clock"]["id"] is None
+        and manifest["clock"]["create_attempted"]
+        and not manifest["clock"]["deleted"]
+    ):
+        clock = find_run_clock(client, clock_name)
+        if clock is not None:
+            manifest["clock"] = {
+                "id": clock["id"], "created": True, "deleted": False,
+                "create_attempted": False,
+            }
+            private_atomic_json(path / "run.json", manifest)
+
+    if (
+        manifest["customer"]["id"] is None
+        and manifest["customer"]["create_attempted"]
+        and not manifest["customer"]["deleted"]
+    ):
+        clock_id = manifest["clock"]["id"]
+        if clock_id is not None and not manifest["clock"]["deleted"]:
+            customer = find_run_customer(client, clock_id, run_id)
+            if customer is not None:
+                manifest["customer"] = {
+                    "id": customer["id"], "created": True, "deleted": False,
+                    "create_attempted": False,
+                }
+                private_atomic_json(path / "run.json", manifest)
+
+    for resource in (manifest["clock"], manifest["customer"]):
+        if resource["create_attempted"] and resource["id"] is None:
+            manifest["status"] = "cleanup_incomplete"
+            private_atomic_json(path / "run.json", manifest)
+            raise RunError("run_resource_create_unresolved")
+
+    customer_id = manifest["customer"]["id"]
+    if customer_id is not None and not manifest["customer"]["deleted"]:
+        customer = client.request("GET", f"/v1/customers/{customer_id}")
+        if customer.get("id") != customer_id:
+            raise RunError("customer_cleanup_ownership_mismatch")
+        if customer.get("deleted") is not True:
+            if (
+                customer.get("test_clock") != manifest["clock"]["id"]
+                or not isinstance(customer.get("metadata"), dict)
+                or customer["metadata"].get("sotto_lifecycle_run_id") != run_id
+            ):
+                raise RunError("customer_cleanup_ownership_mismatch")
+            for child_path in (
+                f"/v1/customers/{customer_id}/payment_methods",
+                f"/v1/customers/{customer_id}/sources",
+            ):
+                child_page = client.request("GET", child_path, {"limit": 1})
+                child_rows = child_page.get("data")
+                if (
+                    not isinstance(child_rows, list)
+                    or type(child_page.get("has_more")) is not bool
+                ):
+                    raise RunError("customer_child_list_response_invalid")
+                if child_rows or child_page["has_more"]:
+                    raise RunError("customer_has_saved_payment_instruments")
+            subscription_page = client.request(
+                "GET", "/v1/subscriptions",
+                {"customer": customer_id, "status": "all", "limit": 1},
+            )
+            subscription_rows = subscription_page.get("data")
+            if (
+                not isinstance(subscription_rows, list)
+                or subscription_page.get("has_more") is not False
+                or subscription_rows
+            ):
+                raise RunError("customer_has_unmanaged_subscriptions")
+            deleted = client.request("DELETE", f"/v1/customers/{customer_id}")
+            if deleted.get("id") != customer_id or deleted.get("deleted") is not True:
+                raise RunError("customer_cleanup_unconfirmed")
+        manifest["customer"]["deleted"] = True
+        private_atomic_json(path / "run.json", manifest)
+
+    clock_id = manifest["clock"]["id"]
+    if clock_id is not None and not manifest["clock"]["deleted"]:
+        try:
+            clock = client.request("GET", f"/v1/test_helpers/test_clocks/{clock_id}")
+        except RunError as error:
+            if str(error) != "stripe_resource_not_found":
+                raise
+            clock = find_run_clock(client, clock_name)
+            if clock is not None and clock.get("id") != clock_id:
+                raise RunError("test_clock_cleanup_ownership_or_state_mismatch") from error
+        if clock is None:
+            manifest["clock"]["deleted"] = True
+            private_atomic_json(path / "run.json", manifest)
+        else:
+            if (
+                clock.get("id") != clock_id
+                or clock.get("name") != clock_name
+                or clock.get("status") != "ready"
+            ):
+                raise RunError("test_clock_cleanup_ownership_or_state_mismatch")
+            deleted = client.request("DELETE", f"/v1/test_helpers/test_clocks/{clock_id}")
+            if deleted.get("id") != clock_id or deleted.get("deleted") is not True:
+                raise RunError("test_clock_cleanup_unconfirmed")
+            manifest["clock"]["deleted"] = True
+            private_atomic_json(path / "run.json", manifest)
+    manifest["status"] = "cleaned" if all(
+        item["id"] is None or item["deleted"] for item in (manifest["customer"], manifest["clock"])
+    ) else "cleanup_incomplete"
+    private_atomic_json(path / "run.json", manifest)
+    return manifest
+
+
+def find_run_clock(client: StripeClient, clock_name: str) -> dict | None:
+    matches = []
+    cursor = None
+    for _ in range(RESOURCE_RECOVERY_PAGE_LIMIT):
+        fields: dict[str, object] = {"limit": 100}
+        if cursor is not None:
+            fields["starting_after"] = cursor
+        page = client.request("GET", "/v1/test_helpers/test_clocks", fields)
+        rows = page.get("data")
+        if page.get("object") != "list" or not isinstance(rows, list):
+            raise RunError("test_clock_list_response_invalid")
+        for row in rows:
+            if (
+                not isinstance(row, dict)
+                or row.get("object") != "test_helpers.test_clock"
+                or row.get("livemode") is not False
+                or not isinstance(row.get("id"), str)
+                or not re.fullmatch(r"clock_[A-Za-z0-9]+", row["id"])
+                or not isinstance(row.get("name"), (str, type(None)))
+            ):
+                raise RunError("test_clock_list_row_invalid")
+            if row["name"] == clock_name:
+                matches.append(row)
+        has_more = page.get("has_more")
+        if type(has_more) is not bool:
+            raise RunError("test_clock_list_response_invalid")
+        if not has_more:
+            break
+        if not rows or not isinstance(rows[-1].get("id"), str):
+            raise RunError("test_clock_list_cursor_invalid")
+        cursor = rows[-1]["id"]
+    else:
+        raise RunError("test_clock_list_bound_exceeded")
+    if len(matches) > 1:
+        raise RunError("test_clock_run_id_ambiguous")
+    return matches[0] if matches else None
+
+
+def find_run_customer(client: StripeClient, clock_id: str, run_id: str) -> dict | None:
+    matches = []
+    cursor = None
+    for _ in range(RESOURCE_RECOVERY_PAGE_LIMIT):
+        fields: dict[str, object] = {"test_clock": clock_id, "limit": 100}
+        if cursor is not None:
+            fields["starting_after"] = cursor
+        page = client.request("GET", "/v1/customers", fields)
+        rows = page.get("data")
+        if page.get("object") != "list" or not isinstance(rows, list):
+            raise RunError("customer_list_response_invalid")
+        for row in rows:
+            if (
+                not isinstance(row, dict)
+                or row.get("object") != "customer"
+                or row.get("livemode") is not False
+                or not isinstance(row.get("id"), str)
+                or not re.fullmatch(r"cus_[A-Za-z0-9]+", row["id"])
+                or row.get("test_clock") != clock_id
+                or not isinstance(row.get("metadata"), dict)
+            ):
+                raise RunError("customer_list_row_invalid")
+            if row["metadata"].get("sotto_lifecycle_run_id") == run_id:
+                matches.append(row)
+        has_more = page.get("has_more")
+        if type(has_more) is not bool:
+            raise RunError("customer_list_response_invalid")
+        if not has_more:
+            break
+        if not rows or not isinstance(rows[-1].get("id"), str):
+            raise RunError("customer_list_cursor_invalid")
+        cursor = rows[-1]["id"]
+    else:
+        raise RunError("customer_list_bound_exceeded")
+    if len(matches) > 1:
+        raise RunError("customer_run_id_ambiguous")
+    return matches[0] if matches else None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    prepare = subparsers.add_parser("prepare", help="create a test clock and empty customer")
+    prepare.add_argument("--run-dir", required=True, help="new owner-only directory outside the repository")
+    prepare.add_argument("--frozen-time", required=True, type=int, help="initial test-clock Unix timestamp")
+    resume = subparsers.add_parser(
+        "resume",
+        help="resume an incomplete prepare or settle an uncertain create within the idempotency horizon",
+    )
+    resume.add_argument("--run-dir", required=True)
+    cleanup = subparsers.add_parser(
+        "cleanup",
+        help="remove run-owned resources after checking subscriptions and saved payment instruments",
+    )
+    cleanup.add_argument("--run-dir", required=True)
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "prepare":
+            path = require_absolute_private_run_dir(args.run_dir, create=True)
+            with lock_run(path):
+                if any(child.name != ".run.lock" for child in path.iterdir()):
+                    raise RunError("run_directory_not_empty")
+                key, prices, account_id, app_sha = key_and_config()
+                client = StripeClient(key, account_id)
+                manifest = make_run(path, args.frozen_time, client, prices, account_id, app_sha)
+        elif args.command == "resume":
+            path = require_absolute_private_run_dir(args.run_dir, create=False)
+            with lock_run(path):
+                manifest = read_manifest(path)
+                key, account_id = key_and_identity()
+                if fingerprint(account_id) != manifest["account_fingerprint"]:
+                    raise RunError("sandbox_account_identity_mismatch")
+                client = StripeClient(key, account_id)
+                client.request("GET", "/v1/account")
+                manifest = resume_run(path, manifest, client)
+        else:
+            path = require_absolute_private_run_dir(args.run_dir, create=False)
+            with lock_run(path):
+                manifest = read_manifest(path)
+                key, account_id = key_and_identity()
+                if fingerprint(account_id) != manifest["account_fingerprint"]:
+                    raise RunError("sandbox_account_identity_mismatch")
+                client = StripeClient(key, account_id)
+                client.request("GET", "/v1/account")
+                manifest = cleanup_run(path, manifest, client)
+    except (OSError, ValueError, PREFLIGHT.PreflightError, RunError) as error:
+        code = str(error) if isinstance(error, (RunError, PREFLIGHT.PreflightError)) else "configuration_invalid"
+        print(f"Stripe lifecycle run failed: {code}", file=sys.stderr)
+        return 1
+    print(f"Stripe lifecycle run {manifest['status']}: {manifest['run_id']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

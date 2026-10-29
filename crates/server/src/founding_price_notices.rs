@@ -539,10 +539,7 @@ fn event_key(award_id: &str, transition_epoch: i64) -> String {
 }
 
 fn epoch_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
-        .unwrap_or(1)
+    crate::clock::business_epoch_seconds()
 }
 
 #[derive(Debug, Serialize)]

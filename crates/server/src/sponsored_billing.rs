@@ -3,8 +3,6 @@
 //! Every operation names an existing beneficiary. Organisation authority is checked while the
 //! organisation row is locked, and provider calls happen only after that transaction commits.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -368,10 +366,7 @@ impl From<SponsoredBillingError> for Error {
 }
 
 pub fn current_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs() as i64
+    crate::clock::business_epoch_seconds()
 }
 
 pub fn request_hash(

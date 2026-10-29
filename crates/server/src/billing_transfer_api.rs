@@ -5,8 +5,6 @@
 //! A distinct counterparty must accept an invitation. One person may start a transfer directly
 //! only when the server verifies that they have authority for both payer sides.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -726,10 +724,7 @@ fn validate_idempotency_key(value: &str) -> Result<()> {
 }
 
 fn current_epoch() -> Result<i64> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .map_err(|_| Error::Internal("system clock before unix epoch".into()))
+    Ok(crate::clock::business_epoch_seconds())
 }
 
 #[cfg(test)]

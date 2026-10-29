@@ -1679,6 +1679,69 @@ async fn ensure_allocation(
     }
 }
 
+/// Advance a personal allocation's provider item binding after paid-invoice or renewal-failure
+/// evidence has been verified. A provider may replace a subscription item when a scheduled phase
+/// changes its price; the durable allocation remains the same because its owner, subscription
+/// and allocation reference are unchanged.
+pub(crate) async fn rebind_personal_allocation_item(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+    previous_item_id: &str,
+) -> Result<(), ProviderAdapterError> {
+    if allocation.payer_kind != PayerKind::Personal
+        || allocation.provider_item_id == previous_item_id
+    {
+        return Err(ProviderAdapterError::ProviderContextMismatch);
+    }
+    let updated = sqlx::query(
+        "UPDATE cloud_provider_allocations AS allocation \
+         SET provider_item_id = $1 \
+         FROM cloud_provider_payers AS payer \
+         WHERE allocation.allocation_id = $2 AND allocation.payer_id = $3 \
+           AND allocation.payer_kind = 'personal' AND allocation.beneficiary_id = $4 \
+           AND allocation.provider_namespace = $5 AND allocation.provider_account_id = $6 \
+           AND allocation.provider_environment = $7 \
+           AND allocation.provider_subscription_id = $8 \
+           AND allocation.provider_item_id = $9 \
+           AND allocation.external_allocation_reference = $10 \
+           AND allocation.coverage_source_id = $11 AND allocation.effective_from = $12 \
+           AND allocation.effective_until IS NOT DISTINCT FROM $13 \
+           AND allocation.state = $14 \
+           AND allocation.ownership_evidence_reference = $15 \
+           AND payer.payer_id = allocation.payer_id \
+           AND payer.provider_namespace = $5 AND payer.provider_account_id = $6 \
+           AND payer.provider_environment = $7 AND payer.provider_customer_id = $16 \
+           AND payer.payer_kind = 'personal'",
+    )
+    .bind(&allocation.provider_item_id)
+    .bind(&allocation.allocation_id)
+    .bind(&allocation.payer_id)
+    .bind(&allocation.beneficiary_id)
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&allocation.subscription_id)
+    .bind(previous_item_id)
+    .bind(&allocation.external_allocation_reference)
+    .bind(&allocation.source_id)
+    .bind(allocation.effective_from)
+    .bind(allocation.effective_until)
+    .bind(allocation.state.as_str())
+    .bind(&allocation.ownership_evidence_reference)
+    .bind(&allocation.provider_customer_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(map_provider_database_error)?;
+    if updated.rows_affected() == 1 {
+        return Ok(());
+    }
+
+    // A duplicate delivery may race with the first event that advanced this binding. Accept only
+    // the exact already-applied new binding; never move the allocation back to an older item.
+    validate_registered_allocation(tx, context, allocation).await
+}
+
 fn map_provider_database_error(error: sqlx::Error) -> ProviderAdapterError {
     let code = match &error {
         sqlx::Error::Database(database) => database.code().map(|code| code.into_owned()),

@@ -13,7 +13,7 @@
       "amount_paid": 299,
       "amount_due": 299,
       "amount_overpaid": 0,
-      "amount_paid_off_stripe": 0,
+      "starting_balance": 0,
       "metadata": {
         "sotto_allocation_reference": "allocation_contract_person",
         "irrelevant_customer_note": "fixture only"
