@@ -1381,7 +1381,7 @@ async fn resend_webhook(
         header("svix-timestamp")?,
         header("svix-signature")?,
         &body,
-        epoch_now(),
+        crate::clock::wall_epoch_seconds(),
     )
     .map_err(|_| Error::Unauthorized)?;
     let event: ResendWebhookEvent = serde_json::from_slice(&body)
