@@ -9,10 +9,13 @@ const USE_TEST_CLOCK_CHECKOUT = process.env.SOTTO_E2E_TEST_CLOCK_CHECKOUT_ENABLE
 const SERVER_FEATURES = USE_TEST_CLOCK_CHECKOUT
   ? "e2e-mock-oauth,e2e-stripe-test-clock"
   : "e2e-mock-oauth";
+const TEST_MATCH = USE_TEST_CLOCK_CHECKOUT
+  ? /stripe(?:-test-clock)?\.spec\.ts/
+  : /stripe\.spec\.ts/;
 
 export default defineConfig({
   testDir: "./e2e",
-  testMatch: /stripe(?:-test-clock)?\.spec\.ts/,
+  testMatch: TEST_MATCH,
   timeout: 120_000,
   fullyParallel: false,
   forbidOnly: true,
