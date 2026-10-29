@@ -2983,16 +2983,6 @@ async fn sponsored_checkout(
                 "test-clock checkout binding is disabled".into(),
             ));
         }
-        billing
-            .provider
-            .claim_e2e_test_clock_customer(
-                &binding.customer_id,
-                &binding.clock_id,
-                &binding.run_id,
-                &user.user_id,
-            )
-            .await
-            .map_err(ProviderError::into_error)?;
     }
     let now = sponsored_billing::current_epoch();
     let mut tx = state.pool.begin().await?;
@@ -3150,6 +3140,21 @@ async fn sponsored_checkout(
         .await?;
     }
 
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    if let Some(binding) = e2e_test_clock_customer.as_ref() {
+        // `begin_operation` has already checked the actor's organisation authority. Claiming
+        // earlier would let an unauthorised caller bind the runner Customer before rejection.
+        billing
+            .provider
+            .claim_e2e_test_clock_customer(
+                &binding.customer_id,
+                &binding.clock_id,
+                &binding.run_id,
+                &user.user_id,
+            )
+            .await
+            .map_err(ProviderError::into_error)?;
+    }
     tx.commit().await?;
 
     #[cfg(feature = "e2e-stripe-test-clock")]
@@ -3738,16 +3743,6 @@ async fn personal_checkout(
                 "test-clock checkout binding is disabled".into(),
             ));
         }
-        billing
-            .provider
-            .claim_e2e_test_clock_customer(
-                &binding.customer_id,
-                &binding.clock_id,
-                &binding.run_id,
-                &user.user_id,
-            )
-            .await
-            .map_err(ProviderError::into_error)?;
         Some(binding.customer_id.clone())
     } else {
         None
@@ -3945,6 +3940,21 @@ async fn personal_checkout(
         .provider_checkout_cancel_url
         .as_deref()
         .ok_or_else(|| Error::Conflict("billing operation needs recovery review".into()))?;
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    if let Some(binding) = request.test_clock_customer.as_ref() {
+        // The caller's quote and pending billing operation are validated before this provider
+        // metadata write, so a rejected checkout cannot claim the runner Customer.
+        billing
+            .provider
+            .claim_e2e_test_clock_customer(
+                &binding.customer_id,
+                &binding.clock_id,
+                &binding.run_id,
+                &user.user_id,
+            )
+            .await
+            .map_err(ProviderError::into_error)?;
+    }
     let checkout = billing
         .provider
         .create_personal_checkout(
