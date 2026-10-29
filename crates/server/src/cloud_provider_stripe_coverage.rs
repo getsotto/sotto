@@ -235,6 +235,7 @@ pub fn compose_personal_coverage(
         if failure.renewal_id() != observation.renewal_id()
             || failure.event_id() != observation.event_id()
             || failure.invoice_id() != observation.invoice_id()
+            || failure.provider_item_id() != observation.provider_item_id()
             || failure.renewal_period_start() != observation.period_start()
             || failure.renewal_period_end() != observation.period_end()
         {
@@ -463,11 +464,9 @@ fn check_term_context(
             field: "subscription",
         });
     }
-    if term.provider_item_id() != binding.provider_item_id() {
-        return Err(StripeCoverageCompositionError::ContextMismatch {
-            field: "provider item",
-        });
-    }
+    // The term was validated against its own invoice item when history was read. Stripe can
+    // replace the subscription item at a paid boundary, so an older valid term need not match the
+    // allocation's current item binding.
     Ok(())
 }
 
@@ -484,6 +483,8 @@ fn check_failure_context(
             field: "environment",
         });
     }
+    // Provider items are invoice-specific. The failure and its observation are matched together
+    // below; neither should be compared with the allocation's current item after a replacement.
     for (actual, expected, field) in [
         (
             failure.allocation_reference(),
@@ -495,11 +496,6 @@ fn check_failure_context(
             failure.subscription_id(),
             binding.subscription_id(),
             "subscription",
-        ),
-        (
-            failure.provider_item_id(),
-            binding.provider_item_id(),
-            "provider item",
         ),
     ] {
         if actual != expected {
@@ -533,11 +529,6 @@ fn check_observation_context(
             observation.subscription_id(),
             binding.subscription_id(),
             "subscription",
-        ),
-        (
-            observation.provider_item_id(),
-            binding.provider_item_id(),
-            "provider item",
         ),
     ] {
         if actual != expected {
