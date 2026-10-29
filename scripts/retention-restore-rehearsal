@@ -61,7 +61,7 @@ def validate_restored_database(database_url: str, migrations: list[str]) -> None
     applied, tables, counts = restore_check.inspect(restore_check.Database(database_url))
     problems = (
         restore_check.check_migrations(applied, migrations)
-        + restore_check.check_tables(tables)
+        + restore_check.check_tables(tables, applied)
         + restore_check.check_not_empty(counts)
     )
     if problems:

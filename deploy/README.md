@@ -301,7 +301,10 @@ deletion journal. The sidecar is deliberately separate from the dump: a dump tak
 purge must not resurrect ciphertext when it is restored. It contains resource identifiers and
 ownership checks, never ciphertext or secret values, and is validated before upload by
 [`replay-retention-journal`](../scripts/replay-retention-journal). Keep both objects under the
-same bucket lifecycle policy; a dump without its sidecar is not a restorable backup.
+same bucket lifecycle policy. A backup whose schema includes migration 50 or later needs a
+sidecar at least as recent as the dump. Older backups predate the journal table and can only be
+restored with an empty journal; the restore drill checks that schema boundary before allowing
+that case.
 
 | `SOTTO_BACKUP_BUCKET` | Uploads with | Works for |
 |---|---|---|
@@ -649,8 +652,10 @@ this uploads only this repository's source, which is public.
 What it asserts, which is the rehearsal of 2026-08-31 written down:
 
 - `pg_restore` completes with no errors;
-- a retention sidecar exists and passes strict JSON-lines validation;
-- every deletion in that sidecar is replayed against the restored database with its ownership,
+- a retention sidecar for schema at migration 50 or later exists and passes strict JSON-lines
+  validation; an older schema is accepted without a sidecar only after the drill verifies it
+  predates the retention journal, then replays an empty journal;
+- every deletion in a sidecar is replayed against the restored database with its ownership,
   creation-time and revision guards, so purged rows cannot reappear;
 - every migration the dump recorded is marked successful, and none is a version this checkout
   does not carry. A deployment **behind** the branch passes: production is often a release or

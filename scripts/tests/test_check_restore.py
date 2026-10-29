@@ -62,11 +62,25 @@ class Tables(unittest.TestCase):
         # Named because organisation deletion is the one thing in Sotto that cannot be undone
         # from inside the product, so this backup is the only thing behind it.
         present = ["users", "organizations", "audit_events"]
-        problems = restore.check_tables(present)
+        problems = restore.check_tables(present, [("21", "t")])
         self.assertIn("organization_deletions", problems[0])
 
     def test_a_complete_schema_passes(self):
-        self.assertEqual(restore.check_tables(list(restore.MUST_EXIST)), [])
+        self.assertEqual(restore.check_tables(list(restore.MUST_EXIST), [("22", "t")]), [])
+
+    def test_pre_retention_backup_does_not_require_a_future_table(self):
+        present = list(restore.MUST_EXIST)
+        self.assertEqual(restore.check_tables(present, [("22", "t")]), [])
+
+    def test_retention_backup_requires_its_journal_table(self):
+        present = list(restore.MUST_EXIST)
+        problems = restore.check_tables(present, [("50", "t")])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("cloud_retention_tombstone_journal", problems[0])
+
+    def test_retention_backup_with_journal_passes(self):
+        present = list(restore.MUST_EXIST) + ["cloud_retention_tombstone_journal"]
+        self.assertEqual(restore.check_tables(present, [("50", "t")]), [])
 
 
 class Emptiness(unittest.TestCase):

@@ -34,8 +34,12 @@ MUST_EXIST = (
     "organization_deletions",
     "organization_deletion_metric_counters",
     "audit_events",
-    "cloud_retention_tombstone_journal",
 )
+
+# A pre-retention backup cannot contain a tombstone journal: the table and its writer were
+# introduced together in migration 50. Requiring it on older backups makes the first restore
+# after an upgrade fail before the migration runner gets a chance to bring the schema forward.
+MUST_EXIST_BY_MIGRATION = {"cloud_retention_tombstone_journal": 50}
 
 MIGRATIONS_TABLE = "_sqlx_migrations"
 
@@ -118,8 +122,14 @@ def check_migrations(applied: list[tuple[str, str]], repository: list[str]) -> l
     return problems
 
 
-def check_tables(present: list[str]) -> list[str]:
-    missing = [table for table in MUST_EXIST if table not in present]
+def check_tables(present: list[str], applied: list[tuple[str, str]]) -> list[str]:
+    versions = [int(version) for version, success in applied if success in ("t", "true", "1")]
+    latest = max(versions, default=0)
+    required = list(MUST_EXIST)
+    required.extend(
+        table for table, introduced in MUST_EXIST_BY_MIGRATION.items() if latest >= introduced
+    )
+    missing = [table for table in required if table not in present]
     if missing:
         return [f"tables missing from the restored database: {', '.join(missing)}"]
     return []
@@ -164,7 +174,9 @@ def main() -> int:
         print(f"rows in {table}: {count}")
 
     problems = (
-        check_migrations(applied, repository) + check_tables(tables) + check_not_empty(counts)
+        check_migrations(applied, repository)
+        + check_tables(tables, applied)
+        + check_not_empty(counts)
     )
     for problem in problems:
         print(f"FAIL: {problem}", file=sys.stderr)
