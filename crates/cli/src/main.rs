@@ -2677,6 +2677,7 @@ mod tests {
         machine_token_list_json, org_members_json, set_confirmation, Cli, CloudCommand, Command,
         EnvCommand, OrgCommand, SharesCommand, ThemeCommand, TokenCommand,
     };
+    use super::{exec_or_replace, run_with_entries, Error};
 
     #[test]
     fn dotenv_import_parse_error_includes_path_and_writes_nothing() {
@@ -3592,5 +3593,91 @@ mod tests {
                 command: EnvCommand::Use { name: None }
             })
         ));
+    }
+
+    /// The child fixtures for [`run_helper`]: `sh` on Unix, `cmd` on Windows. The subject
+    /// of these tests is the exit status crossing the `run` boundary, so the child only
+    /// has to exit with a known code.
+    #[cfg(unix)]
+    fn exit_fixture(code: i32) -> (String, Vec<String>) {
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), format!("exit {code}")],
+        )
+    }
+
+    #[cfg(windows)]
+    fn exit_fixture(code: i32) -> (String, Vec<String>) {
+        (
+            "cmd".to_string(),
+            vec!["/C".to_string(), format!("exit {code}")],
+        )
+    }
+
+    /// Runs one helper pass in its own process and returns that process's exit status.
+    ///
+    /// The helper cannot run in the harness: on Unix `exec_or_replace` replaces the
+    /// process, which would end the test run, and on Windows it calls `process::exit`.
+    /// The wait is bounded so a regression cannot hang the suite, and the `--exact`
+    /// filter names the helper below, so renaming that function moves this string too.
+    fn run_helper(mode: &str) -> std::process::ExitStatus {
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "tests::child_exit_status_helper", "--ignored"])
+            .env("SOTTO_TEST_CHILD_MODE", mode)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the helper process");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait for the helper") {
+                return status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the helper process did not finish inside its 30 second bound");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Child-process mode of the exit-status tests: hand this process over to the real
+    /// `sotto run` execution boundary, so the status the parent observes is the child's.
+    #[test]
+    #[ignore = "helper process for the exit-status tests; re-executed, never run directly"]
+    fn child_exit_status_helper() {
+        let mode = std::env::var("SOTTO_TEST_CHILD_MODE").expect("helper mode");
+        let code = mode.parse::<i32>().expect("helper mode is an exit code");
+        let (program, args) = exit_fixture(code);
+        let mut argv = vec![program];
+        argv.extend(args);
+
+        // Success never returns here: the process becomes the child on Unix, and exits
+        // with the child's status on Windows.
+        let error = run_with_entries(Vec::new(), argv)
+            .expect_err("the execution boundary must not return on success");
+        panic!("the execution boundary returned instead of running the child: {error}");
+    }
+
+    #[test]
+    fn child_exit_status_zero_crosses_the_run_boundary() {
+        let status = run_helper("0");
+        assert_eq!(status.code(), Some(0), "status: {status:?}");
+    }
+
+    #[test]
+    fn child_exit_status_nonzero_crosses_the_run_boundary() {
+        let status = run_helper("42");
+        assert_eq!(status.code(), Some(42), "status: {status:?}");
+    }
+
+    #[test]
+    fn launch_failure_is_an_io_error_and_sotto_exit_code_five() {
+        let program = "sotto-test-command-that-does-not-exist";
+        let error = exec_or_replace(std::process::Command::new(program), program)
+            .expect_err("launching a nonexistent program must fail");
+        assert!(matches!(error, Error::Io(_)), "{error}");
+        assert_eq!(error.exit_code(), 5);
     }
 }
