@@ -17,14 +17,14 @@ use crate::cloud_coverage_reconciliation::{
     SourceBinding,
 };
 use crate::cloud_provider::{
-    collect_provider_history, prepare_verified_event, AllocationState, PayerKind, ProviderContext,
-    VerifiedAllocation, VerifiedCollection,
+    prepare_verified_event, AllocationState, PayerKind, ProviderContext, VerifiedAllocation,
+    VerifiedCollection,
 };
 use crate::cloud_provider_refresh_inputs::RefreshJobInputs;
 use crate::cloud_provider_refresh_worker::{RefreshExecutionError, RefreshJobExecutor};
 use crate::cloud_provider_stripe::StripeCoverageConfig;
 use crate::cloud_provider_stripe_adapter::{
-    prepared_source, StripeHistoryClient, StripePreparedCollection,
+    collect_stripe_history, prepared_source, StripeHistoryClient, StripePreparedCollection,
 };
 use crate::cloud_provider_stripe_http::StripeReadClient;
 use crate::cloud_provider_stripe_sponsored::SponsoredStripeCoverageConfig;
@@ -207,14 +207,10 @@ impl StripeRefreshExecutor {
             }
             let mut client = StripeHistoryClient::new(self.stripe.clone(), prepared)
                 .with_renewal_failures(renewal_failures);
-            let collection = collect_provider_history(
-                &mut client,
-                context,
-                &personal_ticket.source_bindings,
-                Default::default(),
-            )
-            .await
-            .map_err(|_| "refresh_personal_evidence")?;
+            let collection =
+                collect_stripe_history(&mut client, context, &personal_ticket.source_bindings)
+                    .await
+                    .map_err(|_| "refresh_personal_evidence")?;
             add_observations(&mut observations, &mut evidence_references, collection)?;
         }
 
