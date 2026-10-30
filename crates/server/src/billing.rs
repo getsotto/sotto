@@ -1642,14 +1642,7 @@ impl SubscriptionProvider for StripeBilling {
             ("phases[0][start_date]".into(), current_start.to_string()),
             ("phases[0][end_date]".into(), current_end.to_string()),
         ];
-        if self.automatic_tax_enabled {
-            for phase_index in 1..=normalized.len() {
-                form.push((
-                    format!("phases[{phase_index}][automatic_tax][enabled]"),
-                    "true".into(),
-                ));
-            }
-        }
+        append_sponsored_phase_tax_fields(&mut form, normalized.len(), self.automatic_tax_enabled);
         for (index, item) in current.items.iter().enumerate() {
             form.push((
                 format!("phases[0][items][{index}][price]"),
@@ -6136,6 +6129,21 @@ fn append_checkout_tax_fields(
     form.push(("billing_address_collection".into(), "auto".into()));
     if existing_customer {
         form.push(("customer_update[address]".into(), "auto".into()));
+    }
+}
+
+fn append_sponsored_phase_tax_fields(
+    form: &mut Vec<(String, String)>,
+    future_phase_count: usize,
+    automatic_tax_enabled: bool,
+) {
+    if automatic_tax_enabled {
+        for phase_index in 1..=future_phase_count {
+            form.push((
+                format!("phases[{phase_index}][automatic_tax][enabled]"),
+                "true".into(),
+            ));
+        }
     }
 }
 
@@ -15730,6 +15738,28 @@ mod tests {
             true,
         )
         .is_ok());
+        assert!(require_checkout_tax_state(
+            &serde_json::json!({
+                "automatic_tax": {
+                    "enabled": false,
+                    "disabled_reason": "requires_location_inputs"
+                }
+            }),
+            true,
+        )
+        .is_ok());
+        for disabled_reason in ["tax_not_active", "unsupported_location"] {
+            assert!(require_checkout_tax_state(
+                &serde_json::json!({
+                    "automatic_tax": {
+                        "enabled": false,
+                        "disabled_reason": disabled_reason
+                    }
+                }),
+                true,
+            )
+            .is_err());
+        }
     }
 
     #[cfg(feature = "e2e-mock-billing")]
@@ -16311,7 +16341,26 @@ mod tests {
                 .map(String::as_str),
             Some("transfer:abc")
         );
+        assert_eq!(
+            fields.get("billing_address_collection").map(String::as_str),
+            Some("required")
+        );
+        assert_eq!(
+            fields.get("customer_update[address]").map(String::as_str),
+            Some("auto")
+        );
         assert!(!fields.keys().any(|key| key == "payment_method_types"));
+
+        let untaxed_fields = transfer_setup_checkout_form(
+            "transfer:abc",
+            "cus_beneficiary",
+            "https://app.example.test/success",
+            "https://app.example.test/cancel",
+            false,
+        );
+        assert!(!untaxed_fields.iter().any(
+            |(key, _)| key == "billing_address_collection" || key == "customer_update[address]"
+        ));
     }
 
     #[test]
@@ -16571,6 +16620,24 @@ mod tests {
         )
         .is_ok());
         taxed_schedule["default_settings"]["automatic_tax"]["enabled"] = serde_json::json!(false);
+        taxed_schedule["default_settings"]["automatic_tax"]["disabled_reason"] =
+            serde_json::json!("requires_location_inputs");
+        assert!(transfer_schedule_from_object(
+            &taxed_schedule,
+            "transfer:abc",
+            "cus_transfer",
+            "pm_saved",
+            "user-1",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            true,
+        )
+        .is_ok());
+        taxed_schedule["default_settings"]["automatic_tax"]["enabled"] = serde_json::json!(false);
+        taxed_schedule["default_settings"]["automatic_tax"]["disabled_reason"] =
+            serde_json::json!("tax_not_active");
         assert!(transfer_schedule_from_object(
             &taxed_schedule,
             "transfer:abc",
@@ -16617,6 +16684,23 @@ mod tests {
             false,
         )
         .is_err());
+    }
+
+    #[test]
+    fn sponsored_schedule_update_sets_tax_on_every_future_phase_only_when_enabled() {
+        let mut enabled = Vec::new();
+        append_sponsored_phase_tax_fields(&mut enabled, 2, true);
+        assert_eq!(
+            enabled,
+            [
+                ("phases[1][automatic_tax][enabled]".into(), "true".into()),
+                ("phases[2][automatic_tax][enabled]".into(), "true".into()),
+            ]
+        );
+
+        let mut disabled = Vec::new();
+        append_sponsored_phase_tax_fields(&mut disabled, 2, false);
+        assert!(disabled.is_empty());
     }
 
     #[test]
