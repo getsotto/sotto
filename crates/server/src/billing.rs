@@ -6397,6 +6397,7 @@ fn personal_transfer_schedule_form(
     form
 }
 
+#[allow(clippy::too_many_arguments)]
 fn personal_source_restoration_form(
     transfer_id: &str,
     beneficiary_id: &str,
