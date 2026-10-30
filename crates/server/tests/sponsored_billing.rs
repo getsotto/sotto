@@ -295,6 +295,7 @@ impl AppliedScheduleProvider {
             default_payment_method_id: None,
             subscription_id: self.subscription_id.clone(),
             status: sotto_server::billing::SubscriptionStatus::Active,
+            automatic_tax_enabled: false,
             cancel_at_period_end: false,
             cancel_at: None,
             current_period_start: Some(self.period_start),

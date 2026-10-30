@@ -2010,6 +2010,7 @@ mod tests {
             default_payment_method_id: None,
             subscription_id: subscription_id.into(),
             status: SubscriptionStatus::Active,
+            automatic_tax_enabled: false,
             cancel_at_period_end: false,
             cancel_at: None,
             current_period_start: Some(200),

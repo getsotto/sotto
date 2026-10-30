@@ -282,6 +282,7 @@ pub struct SponsoredSubscriptionSnapshot {
     pub default_payment_method_id: Option<String>,
     pub subscription_id: String,
     pub status: SubscriptionStatus,
+    pub automatic_tax_enabled: bool,
     pub cancel_at_period_end: bool,
     pub cancel_at: Option<i64>,
     pub current_period_start: Option<i64>,
@@ -1565,8 +1566,9 @@ impl SubscriptionProvider for StripeBilling {
         let schedule_id = if let Some(schedule_id) = current.schedule_id.clone() {
             schedule_id
         } else {
-            let schedule = stripe_post_with_idempotency(
+            let schedule = stripe_post_with_idempotency_at(
                 &self.api_key,
+                &self.api_origin,
                 "subscription_schedules",
                 &[("from_subscription".into(), subscription_id.into())],
                 &format!("{idempotency_key}-schedule"),
@@ -1642,7 +1644,11 @@ impl SubscriptionProvider for StripeBilling {
             ("phases[0][start_date]".into(), current_start.to_string()),
             ("phases[0][end_date]".into(), current_end.to_string()),
         ];
-        append_sponsored_phase_tax_fields(&mut form, normalized.len(), self.automatic_tax_enabled);
+        append_sponsored_phase_tax_fields(
+            &mut form,
+            normalized.len(),
+            current.automatic_tax_enabled,
+        );
         for (index, item) in current.items.iter().enumerate() {
             form.push((
                 format!("phases[0][items][{index}][price]"),
@@ -1673,8 +1679,9 @@ impl SubscriptionProvider for StripeBilling {
                 ));
             }
         }
-        stripe_post_with_idempotency(
+        stripe_post_with_idempotency_at(
             &self.api_key,
+            &self.api_origin,
             &format!("subscription_schedules/{schedule_id}"),
             &form,
             &schedule_update_idempotency_key(idempotency_key, &normalized),
@@ -1686,12 +1693,13 @@ impl SubscriptionProvider for StripeBilling {
             &format!("subscription_schedules/{schedule_id}"),
         )
         .await?;
-        if !stripe_schedule_contains_phases(
+        if !stripe_schedule_contains_phases_with_tax(
             &schedule,
             current_start,
             current_end,
             &current.items,
             &normalized,
+            current.automatic_tax_enabled,
         ) {
             return Err(ProviderError::malformed_response());
         }
@@ -6137,13 +6145,11 @@ fn append_sponsored_phase_tax_fields(
     future_phase_count: usize,
     automatic_tax_enabled: bool,
 ) {
-    if automatic_tax_enabled {
-        for phase_index in 1..=future_phase_count {
-            form.push((
-                format!("phases[{phase_index}][automatic_tax][enabled]"),
-                "true".into(),
-            ));
-        }
+    for phase_index in 0..=future_phase_count {
+        form.push((
+            format!("phases[{phase_index}][automatic_tax][enabled]"),
+            automatic_tax_enabled.to_string(),
+        ));
     }
 }
 
@@ -6247,6 +6253,37 @@ fn stripe_schedule_contains_phases(
                 .map(|phase| phase.start_at_epoch);
             stripe_schedule_phase_matches(current_phases[index + 1], expected, next_start)
         })
+}
+
+fn stripe_schedule_contains_phases_with_tax(
+    schedule: &serde_json::Value,
+    current_start: i64,
+    current_end: i64,
+    current_items: &[SponsoredSubscriptionItem],
+    expected_phases: &[SponsoredSubscriptionPhase],
+    expected_automatic_tax_enabled: bool,
+) -> bool {
+    if !stripe_schedule_contains_phases(
+        schedule,
+        current_start,
+        current_end,
+        current_items,
+        expected_phases,
+    ) {
+        return false;
+    }
+    schedule["phases"].as_array().is_some_and(|phases| {
+        phases
+            .iter()
+            .filter(|phase| {
+                phase["end_date"]
+                    .as_i64()
+                    .is_some_and(|end| end > current_start)
+            })
+            .all(|phase| {
+                phase["automatic_tax"]["enabled"].as_bool() == Some(expected_automatic_tax_enabled)
+            })
+    })
 }
 
 fn transfer_setup_checkout_form(
@@ -6828,6 +6865,9 @@ fn sponsored_subscription_snapshot(
     let cancel_at_period_end = object["cancel_at_period_end"]
         .as_bool()
         .ok_or_else(ProviderError::malformed_response)?;
+    let automatic_tax_enabled = object["automatic_tax"]["enabled"]
+        .as_bool()
+        .ok_or_else(ProviderError::malformed_response)?;
     let cancel_at = match object.get("cancel_at") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(
@@ -6866,6 +6906,7 @@ fn sponsored_subscription_snapshot(
         default_payment_method_id: stripe_reference(&object["default_payment_method"]),
         subscription_id: base.id,
         status: base.status,
+        automatic_tax_enabled,
         cancel_at_period_end,
         cancel_at,
         current_period_start: subscription_period_start(object),
@@ -13551,6 +13592,7 @@ mod tests {
                 "object": "subscription",
                 "customer": "cus_recovery_http",
                 "status": "active",
+                "automatic_tax": {"enabled": false},
                 "cancel_at_period_end": false,
                 "cancel_at": null,
                 "default_payment_method": "pm_recovery_http",
@@ -13575,6 +13617,94 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("serve sponsored schedule verification mock");
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    #[derive(Clone)]
+    struct SponsoredTaxScheduleHttpState {
+        requests: Arc<Mutex<Vec<(String, String, String)>>>,
+    }
+
+    async fn sponsored_tax_schedule_http_mock(
+        State(state): State<SponsoredTaxScheduleHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let method = request.method().to_string();
+        let path = request.uri().path().to_owned();
+        let body = axum::body::to_bytes(request.into_body(), 16 * 1024)
+            .await
+            .expect("small schedule update body");
+        let body = String::from_utf8(body.to_vec()).expect("form body is UTF-8");
+        state
+            .requests
+            .lock()
+            .expect("tax schedule request lock")
+            .push((method.clone(), path.clone(), body));
+
+        let response = match (method.as_str(), path.as_str()) {
+            ("GET", "/v1/subscriptions/sub_tax_preserved") => serde_json::json!({
+                "id":"sub_tax_preserved", "object":"subscription", "customer":"cus_tax",
+                "status":"active", "automatic_tax":{"enabled":true},
+                "cancel_at_period_end":false, "cancel_at":null,
+                "schedule":"sched_tax_preserved",
+                "items":{"data":[{
+                    "id":"si_tax_current", "price":{"id":"price_current"}, "quantity":1,
+                    "current_period_start":1600000000_i64, "current_period_end":1700000000_i64
+                }]}
+            }),
+            ("GET", "/v1/subscription_schedules/sched_tax_preserved") => serde_json::json!({
+                "id":"sched_tax_preserved", "subscription":"sub_tax_preserved",
+                "end_behavior":"release",
+                "phases":[
+                    {
+                        "start_date":1600000000_i64, "end_date":1700000000_i64,
+                        "automatic_tax":{"enabled":true},
+                        "items":[{"price":"price_current", "quantity":1}]
+                    },
+                    {
+                        "start_date":1700000000_i64, "end_date":1800000000_i64,
+                        "automatic_tax":{"enabled":true},
+                        "items":[{"price":"price_next", "quantity":2}]
+                    }
+                ]
+            }),
+            ("POST", "/v1/subscription_schedules/sched_tax_preserved") => {
+                serde_json::json!({"id":"sched_tax_preserved"})
+            }
+            _ => {
+                return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::NOT_FOUND)
+                    .body(axum::body::Body::from("{}"))
+                    .expect("mock response")
+            }
+        };
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(response.to_string()))
+            .expect("mock response")
+    }
+
+    async fn sponsored_tax_schedule_http_server() -> (
+        String,
+        Arc<Mutex<Vec<(String, String, String)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind sponsored tax schedule mock");
+        let address = listener.local_addr().expect("mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(axum::routing::any(sponsored_tax_schedule_http_mock))
+            .with_state(SponsoredTaxScheduleHttpState {
+                requests: requests.clone(),
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve sponsored tax schedule mock");
         });
         (format!("http://{address}"), requests, server)
     }
@@ -13629,6 +13759,7 @@ mod tests {
                 "object":"search_result", "data":[{
                     "id":"sub_restored", "object":"subscription", "customer":"cus_original",
                     "status":"incomplete", "default_payment_method":"pm_saved",
+                    "automatic_tax":{"enabled":false},
                     "cancel_at_period_end":false, "cancel_at":null,
                     "metadata":{
                         "personal_user_id":"user_restore", "operation_id":"transfer:one:source-restoration",
@@ -13642,6 +13773,7 @@ mod tests {
             }),
             ("GET", "/v1/subscriptions/sub_scheduled") => serde_json::json!({
                 "id":"sub_scheduled", "customer":"cus_test", "status":"active",
+                "automatic_tax":{"enabled":false},
                 "cancel_at_period_end":false,
                 "cancel_at":if schedule_updated.contains("sched_test") { Some(1707776000) } else { None::<i64> },
                 "schedule":"sched_test", "items":{"data":[{
@@ -13676,6 +13808,7 @@ mod tests {
             }),
             ("GET", "/v1/subscriptions/sub_transition") => serde_json::json!({
                 "id":"sub_transition", "customer":"cus_test", "status":"active",
+                "automatic_tax":{"enabled":false},
                 "cancel_at_period_end":false, "cancel_at":null,
                 "schedule":"sched_transition", "items":{"data":[{
                     "id":"si_transition", "price":{"id":"price_founding_monthly"}, "quantity":1,
@@ -13719,6 +13852,7 @@ mod tests {
             }),
             ("GET", "/v1/subscriptions/sub_unscheduled") => serde_json::json!({
                 "id":"sub_unscheduled", "customer":"cus_test", "status":"active",
+                "automatic_tax":{"enabled":false},
                 "cancel_at_period_end":false, "cancel_at":null,
                 "items":{"data":[{
                     "id":"si_test", "price":{"id":"price_standard_monthly"}, "quantity":1,
@@ -13727,6 +13861,7 @@ mod tests {
             }),
             ("GET", "/v1/subscriptions/sub_boundary_direct") => serde_json::json!({
                 "id":"sub_boundary_direct", "customer":"cus_test", "status":"active",
+                "automatic_tax":{"enabled":false},
                 "cancel_at_period_end":false,
                 "cancel_at":if boundary_cancelled { Some(1707776000) } else { None::<i64> },
                 "items":{"data":[{
@@ -16314,6 +16449,63 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn sponsored_seat_change_preserves_stripe_tax_state_on_current_and_future_phases() {
+        let (origin, requests, server) = sponsored_tax_schedule_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_legacy_unused".into(),
+            // A server rollout must not silently switch an existing subscription's tax mode.
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+        let updated = provider
+            .update_sponsored_subscription(
+                "org_tax",
+                "sub_tax_preserved",
+                &[SponsoredSubscriptionPhase {
+                    start_at_epoch: 1_700_000_000,
+                    end_at_epoch: None,
+                    items: vec![SponsoredSubscriptionItemRequest {
+                        provider_price_id: "price_next".into(),
+                        quantity: 2,
+                    }],
+                }],
+                "tax-preservation-request",
+            )
+            .await
+            .expect("seat update preserves the tax setting read from Stripe");
+
+        assert!(updated.automatic_tax_enabled);
+        let requests = requests.lock().expect("tax schedule request lock");
+        let update = requests
+            .iter()
+            .find(|(method, path, _)| {
+                method == "POST" && path == "/v1/subscription_schedules/sched_tax_preserved"
+            })
+            .expect("schedule update request");
+        let fields: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(update.2.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+        assert_eq!(
+            fields
+                .get("phases[0][automatic_tax][enabled]")
+                .map(String::as_str),
+            Some("true"),
+            "the current phase keeps the tax setting already on the subscription"
+        );
+        assert_eq!(
+            fields
+                .get("phases[1][automatic_tax][enabled]")
+                .map(String::as_str),
+            Some("true"),
+            "the future seat phase keeps the same tax setting"
+        );
+        drop(requests);
+        server.abort();
+    }
+
     #[test]
     fn transfer_setup_checkout_is_off_session_and_bound_to_transfer() {
         let form = transfer_setup_checkout_form(
@@ -16687,12 +16879,13 @@ mod tests {
     }
 
     #[test]
-    fn sponsored_schedule_update_sets_tax_on_every_future_phase_only_when_enabled() {
+    fn sponsored_schedule_update_sets_the_provider_tax_state_on_every_phase() {
         let mut enabled = Vec::new();
         append_sponsored_phase_tax_fields(&mut enabled, 2, true);
         assert_eq!(
             enabled,
             [
+                ("phases[0][automatic_tax][enabled]".into(), "true".into()),
                 ("phases[1][automatic_tax][enabled]".into(), "true".into()),
                 ("phases[2][automatic_tax][enabled]".into(), "true".into()),
             ]
@@ -16700,7 +16893,14 @@ mod tests {
 
         let mut disabled = Vec::new();
         append_sponsored_phase_tax_fields(&mut disabled, 2, false);
-        assert!(disabled.is_empty());
+        assert_eq!(
+            disabled,
+            [
+                ("phases[0][automatic_tax][enabled]".into(), "false".into()),
+                ("phases[1][automatic_tax][enabled]".into(), "false".into()),
+                ("phases[2][automatic_tax][enabled]".into(), "false".into()),
+            ]
+        );
     }
 
     #[test]
@@ -16999,6 +17199,7 @@ mod tests {
             "customer": "cus-sponsored",
             "default_payment_method": "pm_saved",
             "status": "active",
+            "automatic_tax": {"enabled": true},
             "cancel_at_period_end": false,
             "cancel_at": null,
             "current_period_start": 1,
@@ -17021,6 +17222,7 @@ mod tests {
             Some("pm_saved")
         );
         assert!(!snapshot.cancel_at_period_end);
+        assert!(snapshot.automatic_tax_enabled);
         assert_eq!(snapshot.cancel_at, None);
 
         let mut scheduled_cancellation = subscription.clone();
