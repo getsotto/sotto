@@ -203,6 +203,7 @@ Either way the server only ever stores ciphertext - the web vault at `/app` on t
 decrypts in your browser, with keys that never leave your devices.
 
 To browse secrets interactively, see the [dashboard guide](#interactive-dashboard).
+To store a whole file as one secret, see [File-backed secrets](#file-backed-secrets).
 
 ## Agent workflows
 
@@ -289,6 +290,40 @@ interrupted import.
 To get an earlier value back, see [Restore an earlier secret version](#restore-an-earlier-secret-version).
 That history comes from the server, so it only helps for values you had already pushed. Run
 `sotto import --help` for the quoting and literal-value rules instead of repeating them here.
+
+### File-backed secrets
+
+A secret value is bytes, not only text, so you can keep a whole file (a certificate, a key file or
+a small binary) as one secret. You need an initialised project and an unlocked local vault. This
+POSIX-shell example uses a synthetic file and checks the round-trip byte for byte without printing
+the value:
+
+```sh
+printf 'synthetic-demo-bytes\001\377\n' > example-input.bin   # a made-up file, not a real secret
+sotto set EXAMPLE_FILE --stdin < example-input.bin
+sotto get EXAMPLE_FILE > example-output.bin                   # redirected, so nothing is printed
+cmp example-input.bin example-output.bin && echo "round-trip OK"
+rm example-input.bin example-output.bin
+```
+
+`--stdin` reads until end of file and keeps every byte: nothing is trimmed, including a trailing
+newline. The whole input becomes one secret value; it is not parsed as dotenv, so use
+[`sotto import`](#import-a-dotenv-file) for a file of assignments. When the output of `sotto get` is
+redirected or piped, it writes the stored bytes exactly and does not add a newline. The output file
+holds plaintext, so delete it when you are done and never commit it, even as a test fixture.
+
+Only `set --stdin` and redirected `get` handle arbitrary bytes. Commands that treat secrets as text
+need valid UTF-8:
+
+- `sotto run` and plaintext `sotto export`, in every `--format`, read every entry in the selected
+  environment. One value that is not valid UTF-8 stops the whole command with an error; the value is
+  not skipped and is not converted to Base64.
+- `sotto get NAME --copy` also needs valid UTF-8. Use redirected `get` to retrieve arbitrary bytes.
+
+Keep binary values in a separate environment if you also inject that environment with `sotto run`.
+This plaintext file retrieval is not a backup: for an encrypted copy of your account, use the
+encrypted export on the Sotto Cloud account page at `/cloud`, and see
+[Restore an earlier secret version](#restore-an-earlier-secret-version) for history.
 
 ### Remove a secret
 
