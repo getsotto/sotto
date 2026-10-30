@@ -53,6 +53,7 @@ export default defineConfig({
         SOTTO_PUBLIC_URL: `http://127.0.0.1:${SERVER_PORT}`,
         SOTTO_DEPLOYMENT_MODE: "cloud",
         SOTTO_CLOUD_SALES_ENABLED: "1",
+        SOTTO_CLOUD_AUTOMATIC_TAX_ENABLED: "1",
         SOTTO_WEB_ORIGIN: `http://127.0.0.1:${WEB_PORT}`,
         GITHUB_CLIENT_ID: "e2e-mock",
         GITHUB_CLIENT_SECRET: "e2e-mock",

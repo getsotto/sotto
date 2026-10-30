@@ -56,8 +56,10 @@ New hosted purchases have a separate default-off switch, `SOTTO_CLOUD_SALES_ENAB
 off pauses new quotes and checkout sessions while existing billing portals, cancellation, refund
 handling, and verified webhook settlement remain available. Enabling it requires Cloud mode, all
 Stripe credentials, the complete four-price hosted catalogue, and a safe Customer Portal
-configuration. It does not authorise a launch by itself. Operator procedures and deployment
-controls are maintained separately from the public deployment guide.
+configuration. It also requires `SOTTO_CLOUD_AUTOMATIC_TAX_ENABLED=1`; configure Stripe Tax
+registrations and review the product tax classification before enabling that setting. It does not
+authorise a launch by itself. Operator procedures and deployment controls are maintained separately
+from the public deployment guide.
 
 Hosted catalogue variables are `STRIPE_STANDARD_MONTHLY_PRICE_ID`,
 `STRIPE_STANDARD_ANNUAL_PRICE_ID`, `STRIPE_FOUNDING_MONTHLY_PRICE_ID`, and

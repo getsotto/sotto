@@ -77,6 +77,7 @@ fn app(pool: PgPool) -> Router {
             }),
             cloud_portal_configuration_id: Some("bpc_test".into()),
             cloud_sales_enabled: true,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.sotto.test".into(),
         })),
         organisation_deletion_enabled: false,
