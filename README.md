@@ -724,6 +724,8 @@ pushed. Pushing now cannot recover older values that were never synced. For an u
 version, follow the CLI's suggestion to run `sotto pull` and try again; pulling does not
 guarantee that a version can be decrypted with the available keys.
 
+For shell scripts and CI, see the [CLI scripting and exit-status reference](CLI-SCRIPTING.md).
+
 ### Environment variables
 
 The CLI reads these variables:

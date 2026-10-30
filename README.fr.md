@@ -755,6 +755,8 @@ Un envoi maintenant ne récupère pas les anciennes valeurs jamais synchronisée
 illisible, suivez la suggestion de la CLI : lancez `sotto pull` et réessayez ; cette opération ne
 garantit pas que les clés disponibles permettent de déchiffrer la version.
 
+Pour les scripts shell et la CI, consultez la [référence des scripts et des codes de sortie de la CLI](CLI-SCRIPTING.md).
+
 ### Variables d'environnement
 
 La CLI lit ces variables :

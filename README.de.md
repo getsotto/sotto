@@ -754,6 +754,8 @@ Ein jetziger Push kann ältere, nie synchronisierte Werte nicht wiederherstellen
 unlesbaren Version empfiehlt die CLI, `sotto pull` auszuführen und es erneut zu versuchen;
 ein Pull garantiert nicht, dass die verfügbaren Schlüssel diese Version entschlüsseln können.
 
+Für Shell-Skripte und CI siehe die [Referenz zu CLI-Skripten und Exit-Status](CLI-SCRIPTING.md).
+
 ### Umgebungsvariablen
 
 Die CLI liest diese Variablen:

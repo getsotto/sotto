@@ -742,6 +742,8 @@ Un envío ahora no recupera valores antiguos que nunca se sincronizaron. Para un
 ilegible, sigue la sugerencia de la CLI: ejecuta `sotto pull` e inténtalo de nuevo;
 esto no garantiza que las claves disponibles permitan descifrar esa versión.
 
+Para scripts de shell y CI, consulta la [referencia de scripting y códigos de salida de la CLI](CLI-SCRIPTING.md).
+
 ### Variables de entorno
 
 La CLI lee estas variables:
