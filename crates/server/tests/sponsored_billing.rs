@@ -114,6 +114,7 @@ impl SubscriptionProvider for LostResponseProvider {
         _expires_at_epoch: i64,
         _success_url: &str,
         _cancel_url: &str,
+        _automatic_tax_enabled: bool,
     ) -> ProviderResult<SponsoredCheckoutSession> {
         let accepted = SponsoredCheckoutSession {
             session_id: self.session_id.clone(),
@@ -411,6 +412,7 @@ async fn create_recovery_fixture(
                 provider_price_id: "price_recovery_test".into(),
                 quantity: 1,
             }],
+            automatic_tax_enabled: false,
             expires_at_epoch: now + 3_600,
             success_url: "https://example.test/success".into(),
             cancel_url: "https://example.test/cancel".into(),
@@ -817,6 +819,7 @@ async fn sponsored_recovery_replays_immutable_request_under_a_fenced_lease() {
             provider_price_id: "price_saved".into(),
             quantity: 1,
         }],
+        automatic_tax_enabled: false,
         expires_at_epoch: 1_700_003_600,
         success_url: "https://example.test/success".into(),
         cancel_url: "https://example.test/cancel".into(),

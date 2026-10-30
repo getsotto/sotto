@@ -181,6 +181,7 @@ async fn create_transfer_payment_method_setup(
             &session_key,
             &success_url,
             &cancel_url,
+            billing.cloud_automatic_tax_enabled(),
         )
         .await
         .map_err(crate::billing::ProviderError::into_error)?;

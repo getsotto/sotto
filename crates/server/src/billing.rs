@@ -404,6 +404,7 @@ pub trait SubscriptionProvider: Send + Sync {
         _idempotency_key: &str,
         _success_url: &str,
         _cancel_url: &str,
+        _collect_billing_address: bool,
     ) -> ProviderResult<TransferSetupSession> {
         Err(ProviderError::unsupported("transfer_setup_session_create"))
     }
@@ -509,6 +510,7 @@ pub trait SubscriptionProvider: Send + Sync {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
+        _automatic_tax_enabled: bool,
     ) -> ProviderResult<PersonalCheckoutSession> {
         let _ = (
             price_id,
@@ -569,6 +571,7 @@ pub trait SubscriptionProvider: Send + Sync {
         _expires_at_epoch: i64,
         _success_url: &str,
         _cancel_url: &str,
+        _automatic_tax_enabled: bool,
     ) -> ProviderResult<SponsoredCheckoutSession> {
         Err(ProviderError::unsupported("sponsored_checkout"))
     }
@@ -773,6 +776,7 @@ pub struct BillingState {
     return_url: String,
     price_catalogue: Option<BillingPriceIds>,
     cloud_sales_enabled: bool,
+    cloud_automatic_tax_enabled: bool,
     founding_schedule_worker_enabled: bool,
     cloud_portal_configuration_id: Option<String>,
     personal_coverage: Option<PersonalCoverageRuntime>,
@@ -797,6 +801,10 @@ impl BillingState {
 
     pub fn cloud_sales_enabled(&self) -> bool {
         self.cloud_sales_enabled
+    }
+
+    pub fn cloud_automatic_tax_enabled(&self) -> bool {
+        self.cloud_automatic_tax_enabled
     }
 
     pub fn return_url(&self) -> &str {
@@ -839,6 +847,7 @@ impl BillingState {
             price_catalogue: config.price_catalogue,
             cloud_portal_configuration_id: config.cloud_portal_configuration_id,
             cloud_sales_enabled: config.cloud_sales_enabled,
+            cloud_automatic_tax_enabled: config.cloud_automatic_tax_enabled,
             founding_schedule_worker_enabled: false,
             personal_coverage: None,
         }
@@ -896,6 +905,7 @@ impl BillingState {
             return_url,
             price_catalogue: None,
             cloud_sales_enabled,
+            cloud_automatic_tax_enabled: false,
             founding_schedule_worker_enabled: true,
             cloud_portal_configuration_id: cloud_sales_enabled.then(|| "bpc_test".into()),
             personal_coverage: None,
@@ -910,6 +920,7 @@ impl BillingState {
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
             cloud_sales_enabled: config.cloud_sales_enabled,
+            cloud_automatic_tax_enabled: config.cloud_automatic_tax_enabled,
             founding_schedule_worker_enabled: false,
             cloud_portal_configuration_id: config.cloud_portal_configuration_id,
             personal_coverage: None,
@@ -1032,11 +1043,18 @@ impl SubscriptionProvider for StripeBilling {
         idempotency_key: &str,
         success_url: &str,
         cancel_url: &str,
+        collect_billing_address: bool,
     ) -> ProviderResult<TransferSetupSession> {
         if transfer_id.trim().is_empty() || customer_id.trim().is_empty() {
             return Err(ProviderError::malformed_response());
         }
-        let form = transfer_setup_checkout_form(transfer_id, customer_id, success_url, cancel_url);
+        let form = transfer_setup_checkout_form(
+            transfer_id,
+            customer_id,
+            success_url,
+            cancel_url,
+            collect_billing_address,
+        );
         let value = stripe_post_with_idempotency_at(
             &self.api_key,
             &self.api_origin,
@@ -1286,7 +1304,8 @@ impl SubscriptionProvider for StripeBilling {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(ProviderError::malformed_response)?;
         let snapshot = sponsored_subscription_snapshot(object, subscription_id)?;
-        if snapshot.customer_id.as_deref() != Some(customer_id)
+        if !automatic_tax_state_matches(object, self.automatic_tax_enabled)
+            || snapshot.customer_id.as_deref() != Some(customer_id)
             || snapshot.default_payment_method_id.as_deref() != Some(payment_method_id)
             || snapshot.items.len() != 1
             || snapshot.items[0].provider_price_id != price_id
@@ -1348,6 +1367,7 @@ impl SubscriptionProvider for StripeBilling {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
+        automatic_tax_enabled: bool,
     ) -> ProviderResult<PersonalCheckoutSession> {
         if price_id.is_empty() {
             return Err(ProviderError::malformed_response());
@@ -1379,7 +1399,7 @@ impl SubscriptionProvider for StripeBilling {
         if let Some(customer) = customer {
             form.push(("customer".to_string(), customer.to_string()));
         }
-        append_checkout_tax_fields(&mut form, customer.is_some(), self.automatic_tax_enabled);
+        append_checkout_tax_fields(&mut form, customer.is_some(), automatic_tax_enabled);
         let session = stripe_post_with_idempotency(
             &self.api_key,
             "checkout/sessions",
@@ -1387,7 +1407,7 @@ impl SubscriptionProvider for StripeBilling {
             idempotency_key,
         )
         .await?;
-        require_checkout_tax_state(&session, self.automatic_tax_enabled)?;
+        require_checkout_tax_state(&session, automatic_tax_enabled)?;
         let session_id = session["id"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -1447,6 +1467,7 @@ impl SubscriptionProvider for StripeBilling {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
+        automatic_tax_enabled: bool,
     ) -> ProviderResult<SponsoredCheckoutSession> {
         if items.is_empty()
             || items
@@ -1486,7 +1507,7 @@ impl SubscriptionProvider for StripeBilling {
         if let Some(customer) = customer {
             form.push(("customer".to_string(), customer.to_string()));
         }
-        append_checkout_tax_fields(&mut form, customer.is_some(), self.automatic_tax_enabled);
+        append_checkout_tax_fields(&mut form, customer.is_some(), automatic_tax_enabled);
         let session = stripe_post_with_idempotency_at(
             &self.api_key,
             &self.api_origin,
@@ -1495,7 +1516,7 @@ impl SubscriptionProvider for StripeBilling {
             idempotency_key,
         )
         .await?;
-        require_checkout_tax_state(&session, self.automatic_tax_enabled)?;
+        require_checkout_tax_state(&session, automatic_tax_enabled)?;
         let session_id = session["id"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -1621,6 +1642,14 @@ impl SubscriptionProvider for StripeBilling {
             ("phases[0][start_date]".into(), current_start.to_string()),
             ("phases[0][end_date]".into(), current_end.to_string()),
         ];
+        if self.automatic_tax_enabled {
+            for phase_index in 1..=normalized.len() {
+                form.push((
+                    format!("phases[{phase_index}][automatic_tax][enabled]"),
+                    "true".into(),
+                ));
+            }
+        }
         for (index, item) in current.items.iter().enumerate() {
             form.push((
                 format!("phases[0][items][{index}][price]"),
@@ -3235,6 +3264,7 @@ async fn sponsored_checkout(
                 customer_id: checkout_customer_id,
                 items: sponsored_provider_items(&state.pool, &org_id, catalogue, &operation)
                     .await?,
+                automatic_tax_enabled: billing.cloud_automatic_tax_enabled(),
                 expires_at_epoch: personal_checkout_expiry(
                     operation.quote_expires_at_epoch,
                     sponsored_billing::current_epoch(),
@@ -3840,6 +3870,7 @@ async fn personal_checkout(
                 &price_id,
                 &success_url,
                 &cancel_url,
+                billing.cloud_automatic_tax_enabled(),
             )
             .await
             .map_err(Error::from)?;
@@ -4007,6 +4038,9 @@ async fn personal_checkout(
             checkout_expires_at_epoch,
             stored_success_url,
             stored_cancel_url,
+            operation
+                .provider_checkout_automatic_tax_enabled
+                .unwrap_or(false),
         )
         .await
         .map_err(ProviderError::into_error)?;
@@ -4183,6 +4217,9 @@ pub async fn recover_personal_billing_operation_once(
             expires_at_epoch,
             success_url,
             cancel_url,
+            operation
+                .provider_checkout_automatic_tax_enabled
+                .unwrap_or(false),
         )
         .await;
     match result {
@@ -4353,6 +4390,7 @@ pub async fn recover_sponsored_billing_operation_by_id(
             organization_id,
             customer_id,
             items,
+            automatic_tax_enabled,
             expires_at_epoch,
             success_url,
             cancel_url,
@@ -4448,6 +4486,7 @@ pub async fn recover_sponsored_billing_operation_by_id(
                     expires_at_epoch,
                     &success_url,
                     &cancel_url,
+                    automatic_tax_enabled,
                 )
                 .await
             {
@@ -6101,7 +6140,22 @@ fn append_checkout_tax_fields(
 }
 
 fn automatic_tax_state_matches(object: &serde_json::Value, enabled: bool) -> bool {
-    !enabled || object["automatic_tax"]["enabled"].as_bool() == Some(true)
+    automatic_tax_object_matches(&object["automatic_tax"], enabled)
+}
+
+fn automatic_tax_object_matches(automatic_tax: &serde_json::Value, enabled: bool) -> bool {
+    if !enabled || automatic_tax["enabled"].as_bool() == Some(true) {
+        return true;
+    }
+    if automatic_tax["enabled"].as_bool() == Some(false)
+        && automatic_tax["disabled_reason"].as_str() == Some("requires_location_inputs")
+    {
+        eprintln!(
+            "warning: Stripe disabled automatic tax because customer location inputs are required"
+        );
+        return true;
+    }
+    false
 }
 
 fn require_checkout_tax_state(
@@ -6192,8 +6246,9 @@ fn transfer_setup_checkout_form(
     customer_id: &str,
     success_url: &str,
     cancel_url: &str,
+    collect_billing_address: bool,
 ) -> Vec<(String, String)> {
-    vec![
+    let mut form = vec![
         ("mode".into(), "setup".into()),
         ("customer".into(), customer_id.into()),
         (
@@ -6208,7 +6263,12 @@ fn transfer_setup_checkout_form(
         ("setup_intent_data[usage]".into(), "off_session".into()),
         ("success_url".into(), success_url.into()),
         ("cancel_url".into(), cancel_url.into()),
-    ]
+    ];
+    if collect_billing_address {
+        form.push(("billing_address_collection".into(), "required".into()));
+        form.push(("customer_update[address]".into(), "auto".into()));
+    }
+    form
 }
 
 fn transfer_setup_session_from_object(
@@ -6474,8 +6534,10 @@ fn transfer_schedule_from_object(
         || phase["proration_behavior"].as_str() != Some("none")
         || phase_payment_method.as_deref() != Some(payment_method_id)
         || default_payment_method.as_deref() != Some(payment_method_id)
-        || (automatic_tax_enabled
-            && object["default_settings"]["automatic_tax"]["enabled"].as_bool() != Some(true))
+        || !automatic_tax_object_matches(
+            &object["default_settings"]["automatic_tax"],
+            automatic_tax_enabled,
+        )
         || object["metadata"]["sotto_transfer_id"].as_str() != Some(transfer_id)
         || object["metadata"]["personal_user_id"].as_str() != Some(beneficiary_id)
         || object["metadata"]["operation_id"].as_str() != Some(operation_id.as_str())
@@ -16053,6 +16115,7 @@ mod tests {
                 1_800_000_000,
                 "https://app.example.test/success",
                 "https://app.example.test/cancel",
+                true,
             )
             .await;
         assert!(
@@ -16076,6 +16139,7 @@ mod tests {
                 1_800_000_000,
                 "https://app.example.test/success",
                 "https://app.example.test/cancel",
+                true,
             )
             .await
             .expect("same request succeeds after an ambiguous provider response");
@@ -16227,6 +16291,7 @@ mod tests {
             "cus_beneficiary",
             "https://app.example.test/success",
             "https://app.example.test/cancel",
+            true,
         );
         let fields = form
             .into_iter()

@@ -107,6 +107,7 @@ impl SubscriptionProvider for RecoveryCheckoutProvider {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
+        _automatic_tax_enabled: bool,
     ) -> ProviderResult<PersonalCheckoutSession> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         self.received.lock().unwrap().push(CapturedCheckoutRequest {
@@ -326,6 +327,7 @@ async fn interrupted_personal_checkout_reuses_its_operation_and_records_the_sess
         "price_original_monthly",
         "https://app.sotto.test/app?billing=success",
         "https://app.sotto.test/app?billing=cancelled",
+        false,
     )
     .await
     .expect("persist original provider request parameters");
@@ -477,6 +479,7 @@ async fn refund_required_checkout_is_parked_without_another_provider_request() {
         "price_original_monthly",
         "https://app.sotto.test/app?billing=success",
         "https://app.sotto.test/app?billing=cancelled",
+        false,
     )
     .await
     .expect("persist provider request");
@@ -846,6 +849,7 @@ async fn signed_expiry_fences_a_late_recovery_result_before_account_reuse() {
         "price_original_monthly",
         "https://app.sotto.test/app?billing=success",
         "https://app.sotto.test/app?billing=cancelled",
+        false,
     )
     .await
     .expect("persist exact provider request");
