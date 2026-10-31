@@ -256,10 +256,15 @@ change entitlements; an approved cohort and notice decision is required before a
 git pull    # picks up compose/runbook changes
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml restart caddy
 ```
 
 Migrations are forward-only and applied on boot. Check the release notes for anything flagged as
 a compatibility break before upgrading past a minor version.
+
+Restarting Caddy after the server is recreated makes it resolve the server's new container address.
+Without this, the proxy can keep sending API and webhook requests to the previous address and return
+502 responses until Caddy restarts.
 
 **Renamed settings are the one thing `git pull` cannot fix for you.** Your `.env` is deliberately
 untracked, so a variable renamed upstream leaves the old name sitting in your file where nothing
