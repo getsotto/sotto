@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { fetchAccount, logout, me } from "./api";
 import { startLogin } from "./login";
 import { Shell } from "./Shell";
-import { deriveMasterKey } from "./vault";
+import { deriveMasterKey, verifyAccountKeys } from "./vault";
 import { VaultView } from "./VaultView";
 
 type Phase =
@@ -119,6 +119,7 @@ export function VaultApp() {
       return (
         <UnlockForm
           salt={phase.salt}
+          encPrivateKeys={phase.encPrivateKeys}
           onUnlock={(master) =>
             setPhase({ kind: "unlocked", master, encPrivateKeys: phase.encPrivateKeys })
           }
@@ -138,10 +139,12 @@ export function VaultApp() {
 
 function UnlockForm({
   salt,
+  encPrivateKeys,
   onUnlock,
   onLogout,
 }: {
   salt: Uint8Array;
+  encPrivateKeys: Uint8Array;
   onUnlock: (master: Uint8Array) => void;
   onLogout: () => void;
 }) {
@@ -153,9 +156,15 @@ function UnlockForm({
   async function unlock() {
     setBusy(true);
     setError(null);
+    let master: Uint8Array | null = null;
     try {
-      onUnlock(await deriveMasterKey(password, secretKey, salt));
+      master = await deriveMasterKey(password, secretKey, salt);
+      // Any password and secret key derive *some* key; only opening the account's sealed private
+      // keys proves they were the right ones, so check that before showing the vault.
+      verifyAccountKeys(master, encPrivateKeys);
+      onUnlock(master);
     } catch {
+      master?.fill(0);
       setError("Couldn't unlock - check your master password and secret key.");
       setBusy(false);
     }
