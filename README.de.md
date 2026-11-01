@@ -206,6 +206,7 @@ Server weiter. In jedem Fall speichert der Server nur Chiffrat: Der Web-Tresor u
 demselben Server entschlüsselt in deinem Browser, mit Schlüsseln, die deine Geräte nie verlassen.
 
 Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
+Um eine ganze Datei als ein Secret zu speichern, siehe [Dateibasierte Secrets](#dateibasierte-secrets).
 
 ## Agent-Workflows
 
@@ -292,6 +293,42 @@ nach einem unterbrochenen Import daher `sotto ls --env staging`.
 Um einen früheren Wert zurückzuholen, siehe [Eine frühere Secret-Version wiederherstellen](#eine-frühere-secret-version-wiederherstellen).
 Dieser Verlauf stammt vom Server und hilft daher nur bei Werten, die Sie bereits hochgeladen hatten. Führen Sie
 `sotto import --help` aus, um die Regeln für Anführungszeichen und literale Werte nachzulesen, statt sie hier zu wiederholen.
+
+### Dateibasierte Secrets
+
+Ein Secret-Wert besteht aus Bytes, nicht nur aus Text. Du kannst also eine ganze Datei (ein
+Zertifikat, eine Schlüsseldatei oder eine kleine Binärdatei) als ein Secret speichern. Du brauchst
+ein initialisiertes Projekt und einen entsperrten lokalen Tresor. Dieses POSIX-Shell-Beispiel nutzt
+eine synthetische Datei und prüft den Hin- und Rückweg Byte für Byte, ohne den Wert auszugeben:
+
+```sh
+printf 'synthetic-demo-bytes\001\377\n' > example-input.bin   # a made-up file, not a real secret
+sotto set EXAMPLE_FILE --stdin < example-input.bin
+sotto get EXAMPLE_FILE > example-output.bin                   # redirected, so nothing is printed
+cmp example-input.bin example-output.bin && echo "round-trip OK"
+rm example-input.bin example-output.bin
+```
+
+`--stdin` liest bis zum Dateiende und behält jedes Byte: Nichts wird abgeschnitten, auch kein
+abschließender Zeilenumbruch. Die gesamte Eingabe wird ein einziger Secret-Wert; sie wird nicht als
+dotenv gelesen, nutze also [`sotto import`](#eine-dotenv-datei-importieren) für eine Datei mit
+Zuweisungen. Wenn die Ausgabe von `sotto get` umgeleitet oder per Pipe weitergegeben wird, schreibt
+es genau die gespeicherten Bytes und hängt keinen Zeilenumbruch an. Die Ausgabedatei enthält
+Klartext, also lösche sie danach und committe sie nie, auch nicht als Test-Fixture.
+
+Nur `set --stdin` und umgeleitetes `get` verarbeiten beliebige Bytes. Befehle, die Secrets als Text
+behandeln, brauchen gültiges UTF-8:
+
+- `sotto run` und Klartext-`sotto export` lesen in jedem `--format` alle Einträge der gewählten
+  Umgebung. Ein einziger Wert, der kein gültiges UTF-8 ist, bricht den ganzen Befehl mit einem
+  Fehler ab; der Wert wird weder übersprungen noch in Base64 umgewandelt.
+- `sotto get NAME --copy` braucht ebenfalls gültiges UTF-8. Nutze umgeleitetes `get`, um beliebige
+  Bytes abzurufen.
+
+Lege Binärwerte in eine eigene Umgebung, wenn du diese Umgebung auch mit `sotto run` einspeist.
+Dieser Abruf als Klartextdatei ist kein Backup: Für eine verschlüsselte Kopie deines Kontos nutze
+den verschlüsselten Export auf der Sotto-Cloud-Kontoseite unter `/cloud`, und für den Verlauf siehe
+[Eine frühere Secret-Version wiederherstellen](#eine-frühere-secret-version-wiederherstellen).
 
 ### Ein Secret entfernen
 
