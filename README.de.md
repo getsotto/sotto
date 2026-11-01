@@ -77,6 +77,8 @@ beschriebener Befehl existiert in deiner installierten Version daher möglicherw
 In [COMPATIBILITY.md](COMPATIBILITY.md) findest du die Versionsanforderungen der Integrationen,
 die angegebenen Plattformen und die derzeit verfügbaren Testergebnisse.
 
+Für eine bestimmte Version oder einen anderen Installationsordner siehe die [Installationsoptionen und Beispiele (Englisch)](INSTALLING.md).
+
 ### Homebrew (Vorschau)
 
 Der [Sotto-Tap](https://github.com/getsotto/homebrew-tap) bietet einen weiteren
