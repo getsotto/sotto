@@ -295,4 +295,330 @@ describe("RecipientPage", () => {
     expect(screen.getByRole("button", { name: "Copy secret" })).toBeEnabled();
     expect(api.fetchShare).toHaveBeenCalledTimes(1);
   });
+
+  it("reveals after correcting the passphrase without fetching again", async () => {
+    const encBlob = new Uint8Array([2]);
+    const salt = new Uint8Array(16).fill(3);
+    const wrongKey = new Uint8Array(32).fill(4);
+    const correctKey = new Uint8Array(32).fill(5);
+
+    vi.mocked(api.fetchShare).mockResolvedValue({
+      encBlob,
+      passphraseSalt: salt,
+    });
+
+    vi.mocked(wasm.share_passphrase_key).mockImplementation(
+        (_fragmentKey, passphraseBytes) => {
+          const passphrase = new TextDecoder().decode(passphraseBytes);
+          return passphrase === "correct-passphrase" ? correctKey : wrongKey;
+        },
+    );
+
+    vi.mocked(wasm.share_open).mockImplementation((key) => {
+      if (key !== correctKey) {
+        throw new Error("decryption failed");
+      }
+      return new TextEncoder().encode(secret);
+    });
+
+    render(<RecipientPage token="share-token" />);
+
+    const input = screen.getByLabelText(
+        "Passphrase (only if the sender set one)",
+    );
+
+    // First attempt fetches the payload but cannot decrypt it.
+    fireEvent.change(input, {
+      target: { value: "wrong-passphrase" },
+    });
+    fireEvent.click(
+        screen.getByRole("button", { name: "Reveal secret" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+        "decryption failed",
+    );
+    expect(api.fetchShare).toHaveBeenCalledExactlyOnceWith("share-token");
+    expect(
+        screen.queryByRole("textbox", { name: "Shared secret" }),
+    ).not.toBeInTheDocument();
+
+    // Correcting the passphrase should decrypt the cached payload.
+    fireEvent.change(input, {
+      target: { value: "correct-passphrase" },
+    });
+    fireEvent.click(
+        screen.getByRole("button", { name: "Reveal secret" }),
+    );
+
+    expect(
+        await screen.findByRole("textbox", { name: "Shared secret" }),
+    ).toHaveValue(secret);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(wasm.share_open).toHaveBeenLastCalledWith(correctKey, encBlob);
+    expect(api.fetchShare).toHaveBeenCalledExactlyOnceWith("share-token");
+  });
+
+  it("reveals after supplying a missing passphrase without fetching again", async () => {
+    const encBlob = new Uint8Array([2]);
+    const salt = new Uint8Array(16).fill(3);
+    const correctKey = new Uint8Array(32).fill(5);
+
+    vi.mocked(api.fetchShare).mockResolvedValue({
+      encBlob,
+      passphraseSalt: salt,
+    });
+    vi.mocked(wasm.share_passphrase_key).mockReturnValue(correctKey);
+
+    render(<RecipientPage token="share-token" />);
+
+    // First attempt has no passphrase.
+    fireEvent.click(
+        screen.getByRole("button", { name: "Reveal secret" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+        "this link requires a passphrase",
+    );
+    expect(api.fetchShare).toHaveBeenCalledExactlyOnceWith("share-token");
+    expect(wasm.share_passphrase_key).not.toHaveBeenCalled();
+    expect(wasm.share_open).not.toHaveBeenCalled();
+
+    // Supplying the passphrase should use the cached payload.
+    fireEvent.change(
+        screen.getByLabelText("Passphrase (only if the sender set one)"),
+        { target: { value: "correct-passphrase" } },
+    );
+    fireEvent.click(
+        screen.getByRole("button", { name: "Reveal secret" }),
+    );
+
+    expect(
+        await screen.findByRole("textbox", { name: "Shared secret" }),
+    ).toHaveValue(secret);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    expect(wasm.share_passphrase_key).toHaveBeenCalledExactlyOnceWith(
+        new Uint8Array(32),
+        new TextEncoder().encode("correct-passphrase"),
+        salt,
+    );
+    expect(wasm.share_open).toHaveBeenCalledExactlyOnceWith(
+        correctKey,
+        encBlob,
+    );
+    expect(api.fetchShare).toHaveBeenCalledExactlyOnceWith("share-token");
+  });
+
+  it.each(["wasm", "fetch"] as const)(
+      "prevents overlapping submissions while waiting for %s",
+      async (phase) => {
+        const pending = deferred();
+        const payload = {
+          encBlob: new Uint8Array([2]),
+          passphraseSalt: null,
+        };
+
+        if (phase === "wasm") {
+          vi.mocked(wasm.loadWasm).mockReturnValue(pending.promise);
+        } else {
+          vi.mocked(api.fetchShare).mockImplementation(async () => {
+            await pending.promise;
+            return payload;
+          });
+        }
+
+        render(
+            <StrictMode>
+              <RecipientPage token="share-token" />
+            </StrictMode>,
+        );
+
+        const form = screen
+            .getByRole("button", { name: "Reveal secret" })
+            .closest("form")!;
+
+        // Submit twice before React can render a disabled button.
+        act(() => {
+          fireEvent.submit(form);
+          fireEvent.submit(form);
+        });
+
+        await act(async () => {});
+
+        expect(wasm.loadWasm).toHaveBeenCalledTimes(1);
+        expect(api.fetchShare).toHaveBeenCalledTimes(
+            phase === "wasm" ? 0 : 1,
+        );
+        expect(
+            screen.getByRole("button", { name: "Revealing…" }),
+        ).toBeDisabled();
+
+        await act(async () => pending.resolve());
+
+        expect(
+            await screen.findByRole("textbox", { name: "Shared secret" }),
+        ).toHaveValue(secret);
+        expect(api.fetchShare).toHaveBeenCalledExactlyOnceWith(
+            "share-token",
+        );
+      },
+  );
+
+  it("discards the cached payload and passphrase when the token changes", async () => {
+    const firstBlob = new Uint8Array([10]);
+    const secondBlob = new Uint8Array([20]);
+
+    vi.mocked(api.fetchShare)
+        .mockResolvedValueOnce({
+          encBlob: firstBlob,
+          passphraseSalt: new Uint8Array(16).fill(3),
+        })
+        .mockResolvedValueOnce({
+          encBlob: secondBlob,
+          passphraseSalt: null,
+        });
+
+    vi.mocked(wasm.share_passphrase_key).mockReturnValue(
+        new Uint8Array(32).fill(4),
+    );
+
+    vi.mocked(wasm.share_open)
+        .mockImplementationOnce(() => {
+          throw new Error("decryption failed");
+        })
+        .mockReturnValueOnce(new TextEncoder().encode(secret));
+
+    const { rerender } = render(
+        <RecipientPage token="first-token" />,
+    );
+
+    fireEvent.change(
+        screen.getByLabelText("Passphrase (only if the sender set one)"),
+        { target: { value: "first-link-passphrase" } },
+    );
+    fireEvent.click(
+        screen.getByRole("button", { name: "Reveal secret" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+        "decryption failed",
+    );
+
+    rerender(<RecipientPage token="second-token" />);
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(
+        screen.getByLabelText("Passphrase (only if the sender set one)"),
+    ).toHaveValue("");
+
+    // Changing tokens must not automatically claim another view.
+    expect(api.fetchShare).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(
+        screen.getByRole("button", { name: "Reveal secret" }),
+    );
+
+    expect(
+        await screen.findByRole("textbox", { name: "Shared secret" }),
+    ).toHaveValue(secret);
+
+    expect(api.fetchShare).toHaveBeenCalledTimes(2);
+    expect(api.fetchShare).toHaveBeenNthCalledWith(1, "first-token");
+    expect(api.fetchShare).toHaveBeenNthCalledWith(2, "second-token");
+    expect(wasm.share_open).toHaveBeenLastCalledWith(
+        new Uint8Array(32),
+        secondBlob,
+    );
+  });
+
+  it.each(["resolve", "reject"] as const)(
+      "ignores a previous token's request when it finishes with %s",
+      async (outcome) => {
+        let resolveFirst!: (share: api.Share) => void;
+        let rejectFirst!: (error: Error) => void;
+
+        const firstResponse = new Promise<api.Share>((resolve, reject) => {
+          resolveFirst = resolve;
+          rejectFirst = reject;
+        });
+
+        const secondBlob = new Uint8Array([20]);
+
+        vi.mocked(api.fetchShare)
+            .mockReturnValueOnce(firstResponse)
+            .mockResolvedValueOnce({
+              encBlob: secondBlob,
+              passphraseSalt: null,
+            });
+
+        const { rerender } = render(
+            <RecipientPage token="first-token" />,
+        );
+
+        fireEvent.click(
+            screen.getByRole("button", { name: "Reveal secret" }),
+        );
+        await act(async () => {});
+
+        expect(api.fetchShare).toHaveBeenCalledExactlyOnceWith(
+            "first-token",
+        );
+
+        rerender(<RecipientPage token="second-token" />);
+        fireEvent.click(
+            screen.getByRole("button", { name: "Reveal secret" }),
+        );
+
+        expect(
+            await screen.findByRole("textbox", { name: "Shared secret" }),
+        ).toHaveValue(secret);
+
+        await act(async () => {
+          if (outcome === "resolve") {
+            resolveFirst({
+              encBlob: new Uint8Array([10]),
+              passphraseSalt: null,
+            });
+          } else {
+            rejectFirst(new Error("old request failed"));
+          }
+        });
+
+        expect(
+            screen.getByRole("textbox", { name: "Shared secret" }),
+        ).toHaveValue(secret);
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+        // Only the second link's payload should reach decryption.
+        expect(wasm.share_open).toHaveBeenCalledExactlyOnceWith(
+            new Uint8Array(32),
+            secondBlob,
+        );
+        expect(api.fetchShare).toHaveBeenCalledTimes(2);
+      },
+  );
+
+  it("does not claim a view after leaving during WASM loading", async () => {
+    const loading = deferred();
+    vi.mocked(wasm.loadWasm).mockReturnValue(loading.promise);
+
+    const { unmount } = render(
+        <RecipientPage token="share-token" />,
+    );
+
+    fireEvent.click(
+        screen.getByRole("button", { name: "Reveal secret" }),
+    );
+
+    expect(wasm.loadWasm).toHaveBeenCalledTimes(1);
+    expect(api.fetchShare).not.toHaveBeenCalled();
+
+    unmount();
+
+    await act(async () => loading.resolve());
+
+    expect(api.fetchShare).not.toHaveBeenCalled();
+    expect(wasm.share_open).not.toHaveBeenCalled();
+  });
 });

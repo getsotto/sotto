@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import { fetchShare, ShareUnavailable } from "./api";
+import { fetchShare, ShareUnavailable, type Share } from "./api";
 import { urlSafeB64ToBytes } from "./base64";
 import { Shell } from "./Shell";
 import { loadWasm, share_open, share_passphrase_key } from "./wasm";
@@ -12,11 +12,28 @@ type State =
   | { kind: "error"; message: string };
 
 export function RecipientPage({ token }: { token: string }) {
+  // Changing tokens creates a fresh session with no cached payload.
+  return <RecipientSession key={token} token={token} />;
+}
+
+function RecipientSession({ token }: { token: string }) {
   const [state, setState] = useState<State>({ kind: "idle" });
   const [passphrase, setPassphrase] = useState("");
   const [copyStatus, setCopyStatus] = useState<"idle" | "copying" | "copied" | "failed">("idle");
   const copyingRef = useRef(false);
   const revealedHeadingRef = useRef<HTMLHeadingElement>(null);
+  const revealingRef = useRef(false);
+  const shareRef = useRef<Share | null>(null);
+  const activeRef = useRef(true);
+
+  useEffect(() => {
+    activeRef.current = true;
+
+    return () => {
+      activeRef.current = false;
+      shareRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     if (state.kind === "revealed") {
@@ -26,6 +43,11 @@ export function RecipientPage({ token }: { token: string }) {
 
   // Runs once per click. The fetch burns a view, so it must not run on mount or a prefetch.
   async function reveal() {
+    if (!activeRef.current || revealingRef.current) {
+      return;
+    }
+
+    revealingRef.current = true;
     setState({ kind: "revealing" });
     try {
       const fragment = window.location.hash.slice(1);
@@ -35,7 +57,24 @@ export function RecipientPage({ token }: { token: string }) {
       const fragmentKey = urlSafeB64ToBytes(fragment);
 
       await loadWasm();
-      const share = await fetchShare(token); // burns the view
+
+      if (!activeRef.current) {
+        return;
+      }
+
+      let share = shareRef.current;
+
+      if (share === null) {
+        share = await fetchShare(token);
+
+        // Ignore a response belonging to an abandoned session.
+        if (!activeRef.current) {
+          return;
+        }
+
+        // Keep the payload even if validation or decryption fails.
+        shareRef.current = share;
+      }
 
       let aeadKey: Uint8Array;
       if (share.passphraseSalt !== null) {
@@ -54,11 +93,16 @@ export function RecipientPage({ token }: { token: string }) {
       const plaintext = share_open(aeadKey, share.encBlob);
       setState({ kind: "revealed", secret: new TextDecoder().decode(plaintext) });
     } catch (e) {
+      if (!activeRef.current) {
+        return;
+      }
       const message =
         e instanceof ShareUnavailable
           ? e.message
           : `Couldn't reveal the secret: ${e instanceof Error ? e.message : String(e)}`;
       setState({ kind: "error", message });
+    } finally {
+      revealingRef.current = false;
     }
   }
 
