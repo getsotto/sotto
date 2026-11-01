@@ -51,8 +51,17 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # The CLI integration tests share the macOS OS keychain service, so parallel
+      # processes can overwrite each other's test keys. Keep them serial on macOS.
       # A tag can point anywhere; never ship untested code. (DB-gated tests skip without Postgres.)
-      - name: Test before shipping
+      - name: Test before shipping (macOS)
+        if: startsWith(matrix.os, 'macos-')
+        env:
+          RUST_TEST_THREADS: "1"
+        run: cargo test --workspace
+
+      - name: Test before shipping (other platforms)
+        if: ${{ !startsWith(matrix.os, 'macos-') }}
         run: cargo test --workspace
 
       - name: Build
