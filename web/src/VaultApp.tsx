@@ -147,12 +147,14 @@ function UnlockForm({
 }) {
   const [password, setPassword] = useState("");
   const [secretKey, setSecretKey] = useState("");
+  const [secretKeyVisible, setSecretKeyVisible] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function unlock() {
     setBusy(true);
     setError(null);
+    setSecretKeyVisible(false);
     try {
       onUnlock(await deriveMasterKey(password, secretKey, salt));
     } catch {
@@ -178,10 +180,27 @@ function UnlockForm({
           Master password
           <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
         </label>
-        <label>
-          Secret key (SK1-…)
-          <input type="password" value={secretKey} onChange={(e) => setSecretKey(e.target.value)} />
-        </label>
+        <div className="secret-key-field">
+          <label htmlFor="unlock-secret-key">Secret key (SK1-…)</label>
+          <div className="secret-key-controls">
+            <input
+              id="unlock-secret-key"
+              className="secret-key"
+              type={secretKeyVisible ? "text" : "password"}
+              value={secretKey}
+              onChange={(e) => setSecretKey(e.target.value)}
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              className="ghost sm"
+              disabled={busy}
+              onClick={() => setSecretKeyVisible((visible) => !visible)}
+            >
+              {secretKeyVisible ? "Hide secret key" : "Show secret key"}
+            </button>
+          </div>
+        </div>
         <button className="primary" type="submit" disabled={busy}>
           {busy ? "Deriving key…" : "Unlock"}
         </button>

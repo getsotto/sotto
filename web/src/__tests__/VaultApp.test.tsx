@@ -210,6 +210,102 @@ describe("VaultApp startup transitions", () => {
   });
 });
 
+describe("VaultApp secret key visibility", () => {
+  async function showUnlockForm() {
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    vi.mocked(api.fetchAccount).mockResolvedValue(account());
+    render(<VaultApp />);
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+  }
+
+  it("masks the secret key by default and round-trips show/hide without changing the value", async () => {
+    await showUnlockForm();
+
+    const secretKey = screen.getByLabelText("Secret key (SK1-…)");
+    expect(secretKey).toHaveAttribute("type", "password");
+    expect(screen.getByRole("button", { name: "Show secret key" })).toHaveAttribute(
+      "type",
+      "button",
+    );
+
+    fireEvent.change(secretKey, { target: { value: "SK1-visible-check" } });
+    fireEvent.click(screen.getByRole("button", { name: "Show secret key" }));
+
+    expect(secretKey).toHaveAttribute("type", "text");
+    expect(secretKey).toHaveValue("SK1-visible-check");
+    expect(screen.getByRole("button", { name: "Hide secret key" })).toBeInTheDocument();
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide secret key" }));
+
+    expect(secretKey).toHaveAttribute("type", "password");
+    expect(secretKey).toHaveValue("SK1-visible-check");
+    expect(screen.getByRole("button", { name: "Show secret key" })).toBeInTheDocument();
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+  });
+
+  it("does not submit the unlock form when the visibility control is activated", async () => {
+    await showUnlockForm();
+
+    fireEvent.change(screen.getByLabelText("Master password"), {
+      target: { value: "master password" },
+    });
+    fireEvent.change(screen.getByLabelText("Secret key (SK1-…)"), {
+      target: { value: "SK1-test" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Show secret key" }));
+
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+    expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Secret key (SK1-…)")).toHaveAttribute("type", "text");
+  });
+
+  it("masks the secret key when unlock starts and keeps it masked after a failed attempt", async () => {
+    const storedAccount = account();
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    vi.mocked(api.fetchAccount).mockResolvedValue(storedAccount);
+    const firstDerivation = deferred<Uint8Array>();
+    vi.mocked(vaultCrypto.deriveMasterKey).mockReturnValueOnce(firstDerivation.promise);
+
+    render(<VaultApp />);
+
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Master password"), {
+      target: { value: "wrong password" },
+    });
+    fireEvent.change(screen.getByLabelText("Secret key (SK1-…)"), {
+      target: { value: "SK1-test" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Show secret key" }));
+    expect(screen.getByLabelText("Secret key (SK1-…)")).toHaveAttribute("type", "text");
+
+    fireEvent.click(screen.getByRole("button", { name: "Unlock" }));
+
+    expect(screen.getByLabelText("Secret key (SK1-…)")).toHaveAttribute("type", "password");
+    expect(screen.getByLabelText("Secret key (SK1-…)")).toHaveValue("SK1-test");
+    expect(screen.getByRole("button", { name: "Show secret key" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Deriving key…" })).toBeDisabled();
+
+    await act(async () => {
+      firstDerivation.reject(new Error("internal derivation detail"));
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Couldn't unlock - check your master password and secret key.",
+    );
+    expect(screen.getByLabelText("Secret key (SK1-…)")).toHaveAttribute("type", "password");
+    expect(screen.getByLabelText("Secret key (SK1-…)")).toHaveValue("SK1-test");
+    expect(screen.getByRole("button", { name: "Show secret key" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Unlock" })).toBeEnabled();
+    expect(vaultCrypto.deriveMasterKey).toHaveBeenCalledTimes(1);
+    expect(vaultCrypto.deriveMasterKey).toHaveBeenCalledWith(
+      "wrong password",
+      "SK1-test",
+      storedAccount.salt,
+    );
+  });
+});
+
 describe("VaultApp unlock retries", () => {
   it("recovers from a derivation failure using the latest form values", async () => {
     vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
