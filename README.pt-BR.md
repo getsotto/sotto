@@ -738,6 +738,8 @@ Enviar agora não recupera valores antigos que nunca foram sincronizados. Para u
 ilegível, siga a sugestão da CLI: execute `sotto pull` e tente novamente; isso não garante
 que as chaves disponíveis permitam descriptografar essa versão.
 
+Para scripts de shell e CI, consulte a [referência de scripts e códigos de saída da CLI](CLI-SCRIPTING.md).
+
 ### Variáveis de ambiente
 
 A CLI lê estas variáveis:
