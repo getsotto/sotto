@@ -676,6 +676,9 @@ Le format JSON est pratique pour les scripts. Sa structure de premier niveau est
 
 L'exemple est synthétique ; `actions` et les dates facultatives proviennent de l'état renvoyé du compte, et les serveurs anciens peuvent renvoyer null pour l'un ou l'autre endpoint. `sotto cloud status` ne fait que signaler l'état et peut afficher une URL de facturation. Il ne lance pas d'achat et ne modifie pas l'éligibilité. Pour diagnostiquer le coffre local et les environnements, utilisez `sotto status` ; cette vue est distincte des informations du serveur et du compte ci-dessus.
 
+Pour transférer la facturation personnelle à une organisation depuis la page de compte Sotto Cloud,
+consultez le [guide du transfert de facturation](CLOUD-BILLING-TRANSFER.md).
+
 ### Thèmes de sortie
 
 La CLI fournit cinq thèmes intégrés : `nord` (par défaut), `sordino`, `terminal`, `monochrome`
