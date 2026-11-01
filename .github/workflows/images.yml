@@ -47,6 +47,7 @@ jobs:
           SOTTO_PUBLIC_URL: ${{ vars.SOTTO_PUBLIC_URL }}
           VITE_STATUS_URL: ${{ vars.VITE_STATUS_URL }}
           VITE_ORGANISATION_DELETION_ENABLED: ${{ vars.VITE_ORGANISATION_DELETION_ENABLED }}
+          VITE_CLOUD_PRICING_VISIBLE: ${{ vars.VITE_CLOUD_PRICING_VISIBLE }}
         run: |
           set -euo pipefail
           # deploy/Dockerfile.web has declared these since the deletion flag needed the first
@@ -60,7 +61,7 @@ jobs:
           # variable makes the question moot rather than betting on the answer.
           {
             echo "args<<BUILD_ARGS_EOF"
-            for name in SOTTO_PUBLIC_URL VITE_STATUS_URL VITE_ORGANISATION_DELETION_ENABLED; do
+            for name in SOTTO_PUBLIC_URL VITE_STATUS_URL VITE_ORGANISATION_DELETION_ENABLED VITE_CLOUD_PRICING_VISIBLE; do
               value="${!name}"
               if [ -n "$value" ]; then
                 echo "${name}=${value}"
