@@ -9,7 +9,7 @@ Last checked: 1 November 2026.
 
 ## CLI release baseline
 
-The latest published CLI is [v0.10.0](https://github.com/getsotto/sotto/releases/tag/v0.10.0),
+The latest published CLI is [v0.10.1](https://github.com/getsotto/sotto/releases/tag/v0.10.1),
 published on 1 November 2026. It includes `sotto mcp`, merged in
 [PR #624](https://github.com/getsotto/sotto/pull/624). A command present on `main` should not
 be assumed to exist in an installed release.
