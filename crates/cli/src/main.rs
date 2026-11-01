@@ -434,8 +434,8 @@ enum OrgCommand {
     /// Show the org audit log, newest first (admins/owners).
     Audit {
         org_id: String,
-        /// Maximum events to show (server caps at 500).
-        #[arg(long)]
+        /// Maximum events to show (positive; server caps at 500).
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
         limit: Option<i64>,
     },
 }
@@ -3337,6 +3337,43 @@ mod tests {
         };
         assert_eq!(org_id, "org-1");
         assert!(!json);
+    }
+
+    #[test]
+    fn org_audit_limit_parses_positive_values_and_rejects_non_positive_values() {
+        for value in [1, 500, 501] {
+            let text = value.to_string();
+            let cli = Cli::try_parse_from(["sotto", "org", "audit", "org-1", "--limit", &text])
+                .expect("positive audit limit should parse");
+            assert!(matches!(
+                cli.command,
+                Some(Command::Org {
+                    command: OrgCommand::Audit {
+                        limit: Some(parsed),
+                        ..
+                    }
+                }) if parsed == value
+            ));
+        }
+
+        let cli = Cli::try_parse_from(["sotto", "org", "audit", "org-1"])
+            .expect("omitted audit limit should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Org {
+                command: OrgCommand::Audit { limit: None, .. }
+            })
+        ));
+
+        for option in ["--limit=0", "--limit=-1"] {
+            let error = match Cli::try_parse_from(["sotto", "org", "audit", "org-1", option]) {
+                Ok(_) => panic!("accepted {option}"),
+                Err(error) => error,
+            };
+            let message = error.to_string();
+            assert!(message.contains("--limit"), "{option}: {message}");
+            assert!(message.contains("1.."), "{option}: {message}");
+        }
     }
 
     #[test]
