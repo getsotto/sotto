@@ -207,6 +207,28 @@ demselben Server entschlüsselt in deinem Browser, mit Schlüsseln, die deine Ge
 
 Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
 
+Wenn sich der Browser nicht öffnet oder die Anmeldung abläuft, siehe [Anmeldeprobleme beheben](#anmeldeprobleme-beheben).
+
+### Anmeldeprobleme beheben
+
+`sotto login` startet auf einem freien Port einen kurzlebigen Listener auf `127.0.0.1` (der
+Loopback-Adresse), öffnet deinen Browser zur Anmeldung und wartet, bis der Browser zu diesem Listener
+zurückkehrt.
+
+- **Der Browser öffnet sich nicht.** Öffne die URL, die dieser `sotto login`-Lauf nach
+  „If it doesn't open, visit:“ ausgegeben hat, in einem Browser auf demselben Rechner. Lass den
+  Befehl weiterlaufen, denn er wartet auf den Abschluss der Anmeldung.
+- **Nutze denselben Rechner.** Der Browser muss den Listener auf der Loopback-Adresse erreichen
+  können. Die URL auf einem anderen Rechner oder auf einem Smartphone zu öffnen, schließt den normalen
+  Ablauf nicht ab. Eine entfernte SSH- oder Container-Sitzung funktioniert nicht zwingend wie ein
+  lokaler Desktop; melde dich daher nach Möglichkeit von einem lokalen Terminal aus an.
+- **Das Warten läuft ab.** Der Befehl wartet fünf Minuten auf die Rückkehr des Browsers. Danach führe
+  `sotto login` erneut aus und verwende die neu ausgegebene URL. Jeder Versuch startet einen neuen
+  Listener mit neuem Zustand, sodass eine alte URL oder ein alter Callback-Link nicht funktioniert.
+
+Mache den Loopback-Listener nicht öffentlich zugänglich. Um dich an deinem eigenen Server anzumelden,
+gib dasselbe `--server <url>` wie zuvor an; siehe [Selbst hosten](#selbst-hosten).
+
 ## Agent-Workflows
 
 Lokale Coding-Agenten können projektdefinierte Aufgaben über den lokalen MCP-Server von Sotto finden und ausführen. Die [Anleitung für Agent-Aufgaben](AGENT-WORKFLOWS.md) erklärt Einrichtung, Freigaben und Sicherheitsgrenzen.

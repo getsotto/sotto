@@ -208,6 +208,28 @@ servidor que elegiste. En cualquier caso el servidor solo almacena texto cifrado
 
 Para explorar los secretos de forma interactiva, consulta la [guía del panel](#panel-interactivo).
 
+Si el navegador no se abre o el inicio de sesión caduca, consulta [Solución de problemas al iniciar sesión](#solución-de-problemas-al-iniciar-sesión).
+
+### Solución de problemas al iniciar sesión
+
+`sotto login` inicia un receptor de corta duración en `127.0.0.1` (la dirección de bucle local) en un
+puerto disponible, abre tu navegador para iniciar sesión y espera a que el navegador vuelva a ese
+receptor.
+
+- **El navegador no se abre.** Abre, en un navegador de la misma máquina, la URL que esa ejecución de
+  `sotto login` imprimió tras "If it doesn't open, visit:". Deja el comando en ejecución, porque está
+  esperando a que termine el inicio de sesión.
+- **Usa la misma máquina.** El navegador debe poder llegar al receptor en la dirección de bucle local.
+  Abrir la URL en otra máquina o en un teléfono no completa el flujo normal. No se garantiza que una
+  sesión remota por SSH o en un contenedor funcione como un escritorio local, así que inicia sesión
+  desde un terminal local siempre que puedas.
+- **La espera caduca.** El comando espera cinco minutos a que el navegador vuelva. Pasado ese tiempo,
+  ejecuta `sotto login` de nuevo y usa la URL recién impresa. Cada intento inicia un receptor nuevo con
+  un estado nuevo, así que una URL o un enlace de callback antiguos no funcionarán.
+
+No expongas públicamente el receptor de bucle local. Para iniciar sesión en tu propio servidor, indica
+el mismo `--server <url>` que antes; consulta [Autoalojamiento](#autoalojamiento).
+
 ## Flujos de trabajo con agentes
 
 Los agentes de código locales pueden descubrir y ejecutar tareas declaradas por el proyecto mediante el servidor MCP local de Sotto. Consulta la [guía de tareas para agentes](AGENT-WORKFLOWS.md) para ver la configuración, las aprobaciones y los límites de seguridad.
