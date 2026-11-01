@@ -24,6 +24,18 @@ function date(epoch: number): string {
   return new Date(epoch * 1000).toLocaleDateString("en-GB");
 }
 
+function deadline(epoch: number): string {
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "UTC",
+    timeZoneName: "short",
+  }).format(new Date(epoch * 1000));
+}
+
 function pounds(pence: number): string {
   return new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(pence / 100);
 }
@@ -227,7 +239,7 @@ export function PayerTransferInbox() {
           <strong>{incoming ? "Incoming request" : "Outgoing request"}</strong>
           <span className="meta">{payer(transfer.sourceKind, transfer.sourceOrganizationId)} → {payer(transfer.destinationKind, transfer.destinationOrganizationId)}</span>
           <p>{pounds(transfer.amountPence)} per {transfer.interval}; renewal {date(transfer.effectiveFrom)}.</p>
-          {actionable && <p className="muted">Respond by {date(Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom))}.</p>}
+          {actionable && <p className="muted">Respond by {deadline(Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom))}.</p>}
           <p className="muted">{stateCopy(transfer.state, invitationExpired)}</p>
           {transfer.state === "unknown" && <p className="muted">Contact Sotto support before making another billing change.</p>}
           {actionable && incoming && transfer.destinationKind === "personal" && !setupAvailable
