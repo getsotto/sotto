@@ -11,6 +11,12 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing version tag to build and publish
+        required: true
+        type: string
 
 permissions:
   # Publish the GitHub release.
@@ -25,9 +31,9 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
           - target: aarch64-unknown-linux-gnu
@@ -37,6 +43,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.release_tag || github.ref_name }}
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: stable
@@ -54,6 +62,8 @@ jobs:
         # bash everywhere, including windows-latest (Git Bash) - one script, not a second dialect
         # for the Windows leg.
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           case "${{ matrix.target }}" in
@@ -61,7 +71,7 @@ jobs:
           *) EXT="" ;;
           esac
           BIN="target/${{ matrix.target }}/release/sotto$EXT"
-          STAGE=sotto-${{ github.ref_name }}-${{ matrix.target }}
+          STAGE="sotto-${RELEASE_TAG}-${{ matrix.target }}"
           mkdir -p "$STAGE/completions"
           cp "$BIN" "$STAGE/"
           cp LICENSE THREAT-MODEL.md SECURITY.md "$STAGE/"
@@ -88,6 +98,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.release_tag || github.ref_name }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -110,14 +122,18 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must have the form vX.Y.Z" >&2
+            exit 1
+          fi
           notes_file="release-notes/${version}.md"
           test -f "$notes_file"
-          gh release create "${{ github.ref_name }}" \
+          gh release create "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
-            --title "sotto ${{ github.ref_name }}" \
+            --title "sotto $RELEASE_TAG" \
             --notes-file "$notes_file" \
             sotto-*.tar.gz sotto-*.zip SHA256SUMS ./*.sigstore.json
