@@ -235,7 +235,8 @@ sotto run --env staging -- npm test
 sotto ls --env staging
 ```
 
-`--env` lasts for that command only; `sotto env use` changes the default.
+`--env` lasts for that command only; `sotto env use` changes the default saved in the project's
+`sotto.toml` (see [Project configuration](#project-configuration)).
 
 List environments, switch the default, compare two, or preview a copy between them:
 
@@ -250,6 +251,55 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 `env diff` marks each key `=` (same value), `!` (different values), `<` (only in the first
 environment) or `>` (only in the second). Without `--confirm`, copying is a dry-run. A confirmed
 copy adds and updates secrets but leaves keys that exist only in the destination untouched.
+
+### Project configuration
+
+`sotto init` and `sotto clone` write a `sotto.toml` in the current directory. It binds that
+directory to a local project and a default environment. This illustrative example uses made-up
+identifiers:
+
+```toml
+project_id = "11111111-1111-1111-1111-111111111111"
+project = "acme-api"
+environment = "dev"
+org_id = "22222222-2222-2222-2222-222222222222"
+```
+
+- `project_id` (required): the project's stable id.
+- `project` (required): the project's human-readable name.
+- `environment` (required): the default environment for commands run under this directory.
+- `org_id` (optional): the organisation that owns the project. Leave it out for a personal project.
+
+The file holds project metadata, not secret values, and is meant to be committed. It is not a
+vault and does not grant access to any secrets: a teammate who checks it out still needs their own
+grant. Writing a file with invented ids does not create a project. Run `sotto init` to create one,
+or follow [Work with a team](#work-with-a-team) to clone a shared environment.
+
+Commands look for `sotto.toml` in the current directory, then in each parent directory, and use
+the nearest one they find, as `git` does with `.git`. In a nested project, the inner file wins:
+
+```text
+monorepo/
+├── sotto.toml            # project "platform"
+├── tools/                # commands here use "platform"
+└── services/
+    └── billing/
+        ├── sotto.toml    # project "billing"
+        └── src/          # commands here use "billing"
+```
+
+If the nearest `sotto.toml` is malformed or unreadable, the command fails with an error naming
+that file. It does not fall back to a parent project.
+
+`sotto env use staging` saves `staging` as the `environment` in the discovered `sotto.toml`, so it
+applies to later commands too. A per-command `--env staging` reads that environment for one command
+and leaves the file unchanged. See [Environments](#environments).
+
+`sotto.toml` belongs to a project directory. Separately, the Sotto data directory holds the global
+`config.toml`, with machine-wide settings such as the server saved by `sotto login` and your
+theme, and the encrypted `store.db` that holds your vault. Neither belongs in a repository. See
+[Environment variables](#environment-variables) for `SOTTO_DATA_DIR`, and
+[Output themes](#output-themes) for each platform's default location.
 
 ### Import a dotenv file
 
@@ -569,6 +619,7 @@ Without a `sotto.toml` or local identity:
 ```
 
 An absent `sotto.toml` means no project is selected. A malformed or unreadable file is an error.
+See [Project configuration](#project-configuration) for the file's fields and how it is found.
 
 ### Lock, unlock and log out
 
