@@ -259,7 +259,10 @@ enum Command {
         )]
         args: Vec<String>,
     },
-    /// Print the environment's secrets in a chosen format (plaintext).
+    /// Export local plaintext secrets or download an encrypted Cloud bundle.
+    #[command(
+        after_help = "Examples:\n  sotto export --format dotenv > .env\n  sotto export --cloud ./example-export.json\n\nOrdinary export prints plaintext values from the active environment. --cloud downloads an encrypted account export from the configured server. It does not copy the current environment as plaintext. Cloud export requires login and server export eligibility. It does not require the local vault to be unlocked."
+    )]
     Export {
         /// Output format.
         #[arg(long, value_enum, default_value_t = ExportFormat::Dotenv)]
@@ -271,13 +274,16 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         cloud: Option<PathBuf>,
     },
-    /// Import secrets from a .env file into the active environment.
+    /// Import .env secrets or restore an encrypted Cloud bundle.
     #[command(after_help = r#"Examples:
   sotto import .env
+  sotto import --cloud ./example-export.json
+
+Cloud import reads the local encrypted bundle without server login. It requires the original Secret Key and master password. The bundle does not replace either. Cloud import refuses a local store that already has an identity. Use --cloud for an encrypted bundle. Ordinary dotenv import does not accept it.
 
 Values are imported literally: $OTHER and ${OTHER} are not expanded, and an inline # is part of the value; whole lines beginning with # are comments. Unquoted surrounding whitespace is trimmed, while matching quotes preserve spaces inside the value. Single-quoted values are literal. Double-quoted values decode \n, \r, \t, \\, and \". Physical multiline values are unsupported; use a double-quoted \n escape to store a newline."#)]
     Import {
-        /// Path to the .env file.
+        /// Path to a .env file or encrypted Cloud bundle.
         file: PathBuf,
         /// Restore an encrypted Cloud exit bundle instead of importing dotenv values.
         #[arg(long)]
@@ -2768,6 +2774,48 @@ mod tests {
             "Single-quoted values are literal",
             "Physical multiline values are unsupported",
             "Double-quoted values decode",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
+
+    #[test]
+    fn export_help_distinguishes_plaintext_and_cloud_bundles() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("export")
+            .expect("export subcommand should exist")
+            .render_long_help()
+            .to_string();
+
+        for expected in [
+            "sotto export --format dotenv > .env",
+            "sotto export --cloud ./example-export.json",
+            "prints plaintext values from the active environment",
+            "encrypted account export from the configured server",
+            "requires login and server export eligibility",
+            "does not require the local vault to be unlocked",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
+
+    #[test]
+    fn import_help_explains_cloud_restore_requirements() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("import")
+            .expect("import subcommand should exist")
+            .render_long_help()
+            .to_string();
+
+        for expected in [
+            "sotto import --cloud ./example-export.json",
+            "local encrypted bundle without server login",
+            "original Secret Key and master password",
+            "The bundle does not replace either",
+            "refuses a local store that already has an identity",
+            "Ordinary dotenv import does not accept it",
         ] {
             assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
         }
