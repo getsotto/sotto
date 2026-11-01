@@ -8,6 +8,35 @@ const __dirname = path.dirname(__filename);
 const brandDir = __dirname;
 const publicDir = path.resolve(__dirname, '../public');
 
+function encodePngIco(images) {
+  const header = Buffer.alloc(6);
+  header.writeUInt16LE(0, 0);
+  header.writeUInt16LE(1, 2);
+  header.writeUInt16LE(images.length, 4);
+
+  const entries = [];
+  let dataOffset = header.length + images.length * 16;
+  for (const { size, data } of images) {
+    const entry = Buffer.alloc(16);
+    entry.writeUInt8(size === 256 ? 0 : size, 0);
+    entry.writeUInt8(size === 256 ? 0 : size, 1);
+    entry.writeUInt8(0, 2);
+    entry.writeUInt8(0, 3);
+    entry.writeUInt16LE(1, 4);
+    entry.writeUInt16LE(32, 6);
+    entry.writeUInt32LE(data.length, 8);
+    entry.writeUInt32LE(dataOffset, 12);
+    entries.push(entry);
+    dataOffset += data.length;
+  }
+
+  return Buffer.concat([
+    header,
+    ...entries,
+    ...images.map(({ data }) => data),
+  ]);
+}
+
 // --- SVG DEFINITIONS ---
 
 /**
@@ -304,6 +333,13 @@ async function generateAll() {
     fs.writeFileSync(path.join(publicDir, target.name), buffer);
     console.log(`✓ Generated ${target.name} (${target.size}x${target.size})`);
   }
+
+  const faviconIco = encodePngIco([16, 32, 48].map((size) => ({
+    size,
+    data: fs.readFileSync(path.join(publicDir, `favicon-${size}.png`)),
+  })));
+  fs.writeFileSync(path.join(publicDir, 'favicon.ico'), faviconIco);
+  console.log('✓ Generated favicon.ico (16x16, 32x32, 48x48)');
 
   // Generate Brand Preview Showcase Card in web/brand/
   const showcaseHtml = `<!DOCTYPE html>
