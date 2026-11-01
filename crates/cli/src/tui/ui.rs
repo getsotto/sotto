@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::tui::app::{StatusKind, StatusNotice, TuiApp};
+use crate::tui::app::{SecretListView, StatusKind, StatusNotice, TuiApp};
 use crate::tui::theme::{to_ratatui_color, TuiStyles};
 
 /// Render the complete TUI dashboard frame.
@@ -178,10 +178,15 @@ fn draw_left_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
             .collect()
     };
 
+    let list_inner = list_block.inner(left_chunks[1]);
     let list = List::new(items).block(list_block);
     let mut list_state = ListState::default()
         .with_selected((!app.filtered_indices.is_empty()).then_some(app.selected_filtered_index));
     f.render_stateful_widget(list, left_chunks[1], &mut list_state);
+    app.secret_list_view.set(SecretListView {
+        area: list_inner,
+        offset: list_state.offset(),
+    });
 }
 
 fn draw_right_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
