@@ -229,6 +229,67 @@ describe("CloudContactSettings", () => {
     await waitFor(() => expect(api.revokeCloudContact).toHaveBeenCalledOnce());
   });
 
+  describe("disabled enrolment", () => {
+    const disabledStatus: api.CloudContactStatus = { ...emptyStatus, enrolmentAvailable: false };
+
+    function expectEnrolmentUnavailable() {
+      expect(screen.getByText("Email contact setup is not enabled on this instance.")).toBeInTheDocument();
+      expect(screen.queryByLabelText("Email address")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^(Send|Resend) verification link$/ })).not.toBeInTheDocument();
+      expect(screen.queryByText("Email contact settings require a newer Sotto server version.")).not.toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(api.startCloudContactVerification).not.toHaveBeenCalled();
+      expect(api.confirmCloudContactVerification).not.toHaveBeenCalled();
+    }
+
+    it("shows an empty contact without offering setup or removal", async () => {
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValue(disabledStatus);
+
+      render(<CloudContactSettings />);
+
+      expect(await screen.findByText("No verified email contact is set.")).toBeInTheDocument();
+      expectEnrolmentUnavailable();
+      expect(screen.queryByRole("button", { name: "Remove verified email" })).not.toBeInTheDocument();
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledOnce();
+      expect(api.revokeCloudContact).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { pending: "without a pending request", pendingExpiresAtEpoch: null },
+      { pending: "with a pending request", pendingExpiresAtEpoch: 1_900_000_000 },
+    ])("keeps an existing contact removable $pending and setup disabled after removal", async ({ pendingExpiresAtEpoch }) => {
+      vi.mocked(api.fetchCloudContactStatus)
+        .mockResolvedValueOnce({
+          ...disabledStatus,
+          email: {
+            contactId: "contact-1",
+            maskedDestination: "p***@example.test",
+            verifiedAtEpoch: 1_800_000_000,
+          },
+          pendingExpiresAtEpoch,
+        })
+        .mockResolvedValue(disabledStatus);
+      vi.mocked(api.revokeCloudContact).mockResolvedValue(undefined);
+
+      render(<CloudContactSettings />);
+
+      expect(await screen.findByText("p***@example.test")).toBeInTheDocument();
+      expectEnrolmentUnavailable();
+      const remove = screen.getByRole("button", { name: "Remove verified email" });
+      expect(remove).toBeEnabled();
+      expect(api.revokeCloudContact).not.toHaveBeenCalled();
+      fireEvent.click(remove);
+
+      expect(await screen.findByText("No verified email contact is set.")).toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Lifecycle email contact removed.");
+      expect(screen.queryByText("p***@example.test")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Remove verified email" })).not.toBeInTheDocument();
+      expectEnrolmentUnavailable();
+      expect(api.revokeCloudContact).toHaveBeenCalledOnce();
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it("explains that older servers do not support contact settings", async () => {
     vi.mocked(api.fetchCloudContactStatus).mockRejectedValue(new api.UnsupportedCloudContactError());
     render(<CloudContactSettings />);
