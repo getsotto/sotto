@@ -75,6 +75,8 @@ version supports.
 See [COMPATIBILITY.md](COMPATIBILITY.md) for integration version requirements, platform claims,
 and the evidence currently available for them.
 
+To choose a release or install folder, see [installer options and examples](INSTALLING.md).
+
 ### Homebrew (preview)
 
 The [Sotto tap](https://github.com/getsotto/homebrew-tap) provides another
