@@ -11,9 +11,9 @@ use sotto_server::cloud_coverage_reconciliation::SourceObservation;
 use sotto_server::cloud_provider::{
     accept_provider_invalidation, complete_verified_event, prepare_verified_event,
     record_verified_event, register_verified_allocation, reject_verified_event,
-    replay_verified_event, AllocationState, ApplyDisposition, EventDisposition,
-    InvalidationDisposition, PayerKind, ProviderContext, ProviderEnvironment, RejectionDisposition,
-    VerifiedAllocation, VerifiedCollection, VerifiedProviderEvent,
+    reopen_rejected_event_for_repair, replay_verified_event, AllocationState, ApplyDisposition,
+    EventDisposition, InvalidationDisposition, PayerKind, ProviderContext, ProviderEnvironment,
+    RejectionDisposition, VerifiedAllocation, VerifiedCollection, VerifiedProviderEvent,
 };
 use sotto_server::cloud_provider_refresh_jobs::{claim_due, complete, fail};
 use sotto_server::db;
@@ -165,6 +165,28 @@ async fn verified_event_receipts_are_idempotent_and_conflicts_are_rejected() {
         RejectionDisposition::AlreadyRejected
     );
     reject_replay.commit().await.unwrap();
+
+    let mut ordinary_replay = pool.begin().await.unwrap();
+    assert!(matches!(
+        record_verified_event(&mut ordinary_replay, &context, &rejected_event).await,
+        Err(sotto_server::cloud_provider::ProviderAdapterError::EventNotPending)
+    ));
+    ordinary_replay.rollback().await.unwrap();
+    let mut authenticated_repair = pool.begin().await.unwrap();
+    assert!(
+        reopen_rejected_event_for_repair(&mut authenticated_repair, &context, &rejected_event)
+            .await
+            .unwrap()
+    );
+    authenticated_repair.commit().await.unwrap();
+    let mut record_repaired = pool.begin().await.unwrap();
+    assert_eq!(
+        record_verified_event(&mut record_repaired, &context, &rejected_event)
+            .await
+            .unwrap(),
+        EventDisposition::Pending
+    );
+    record_repaired.commit().await.unwrap();
 
     sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = $1")
         .bind(&original.event_id)

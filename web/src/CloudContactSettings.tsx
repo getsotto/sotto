@@ -129,7 +129,13 @@ export function CloudContactSettings() {
           {deliveryMessage(status.latestDelivery.state)}
         </p>}
         {status.pendingExpiresAtEpoch !== null && <p className="muted">A verification request is pending. You can request another link if it expires.</p>}
-        {status.enrolmentAvailable ? <>
+        {status.enrolmentAvailable ? <form
+          noValidate
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!busy && email.trim() !== "") void start();
+          }}
+        >
           <label htmlFor="lifecycle-email">Email address</label>{" "}
           <input
             id="lifecycle-email"
@@ -140,10 +146,10 @@ export function CloudContactSettings() {
             onChange={(event) => { requestKey.current = null; setEmail(event.target.value); }}
             disabled={busy}
           />{" "}
-          <button type="button" disabled={busy || email.trim() === ""} onClick={() => void start()}>
+          <button type="submit" disabled={busy || email.trim() === ""}>
             {status.pendingExpiresAtEpoch === null ? "Send verification link" : "Resend verification link"}
           </button>
-        </> : <p className="muted">Email contact setup is not enabled on this instance.</p>}
+        </form> : <p className="muted">Email contact setup is not enabled on this instance.</p>}
         {status.email !== null && <button type="button" disabled={busy} onClick={() => void revoke()}>
           Remove verified email
         </button>}

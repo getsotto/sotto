@@ -56,7 +56,12 @@ fn app(pool: PgPool) -> Router {
         billing_transfer_execution_enabled: false,
         billing_transfer_setup_enabled: false,
         cloud_retention_dry_run_enabled: false,
+        cloud_shared_retention_dry_run_enabled: false,
         cloud_retention_operator_token: None,
+        cloud_retention_purge_enabled: false,
+        cloud_retention_destructive_token: None,
+        cloud_retention_evidence_hmac_key: None,
+        cloud_retention_build_sha: None,
         pool,
         oauth: None,
         oauth_config: None,
@@ -72,11 +77,23 @@ fn app(pool: PgPool) -> Router {
             }),
             cloud_portal_configuration_id: Some("bpc_test".into()),
             cloud_sales_enabled: true,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.sotto.test".into(),
         })),
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
+        cloud_operations_metrics_token: None,
+        cloud_coverage_repair_token: None,
+        provider_refresh_ingest_enabled: false,
+        provider_refresh_worker_enabled: false,
+        provider_refresh_reconciliation_enabled: false,
+        provider_authority_revalidation_enabled: false,
+        cloud_sales_enabled: false,
+        founding_schedule_worker_enabled: false,
+        founding_price_notices_enabled: false,
+        billing_recovery_worker_enabled: false,
+        sponsored_billing_recovery_worker_enabled: false,
         organisation_deletion_operator_token: None,
         billing_transfer_operator_token: None,
     };
@@ -367,8 +384,13 @@ async fn verified_sponsored_invoice_awards_founder_before_activating_the_seat() 
                 "subscription_item": provider_item_id,
                 "price": { "id": "price_founding_monthly" },
                 "quantity": 2,
-                "period": { "start": now - 60, "end": period_end },
-                "parent": { "type": "subscription_item_details" }
+                "amount": 398,
+                "period": { "start": now - 30, "end": period_end },
+                "parent": { "type": "subscription_item_details", "subscription_item_details": {
+                    "subscription": subscription_id,
+                    "subscription_item": provider_item_id,
+                    "proration": false
+                }}
             }]},
             "parent": { "type": "subscription_details", "subscription_details": { "subscription": subscription_id } }
         }}

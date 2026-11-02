@@ -56,8 +56,10 @@ New hosted purchases have a separate default-off switch, `SOTTO_CLOUD_SALES_ENAB
 off pauses new quotes and checkout sessions while existing billing portals, cancellation, refund
 handling, and verified webhook settlement remain available. Enabling it requires Cloud mode, all
 Stripe credentials, the complete four-price hosted catalogue, and a safe Customer Portal
-configuration. It does not authorise a launch by itself. Operator procedures and deployment
-controls are maintained separately from the public deployment guide.
+configuration. It also requires `SOTTO_CLOUD_AUTOMATIC_TAX_ENABLED=1`; configure Stripe Tax
+registrations and review the product tax classification before enabling that setting. It does not
+authorise a launch by itself. Operator procedures and deployment controls are maintained separately
+from the public deployment guide.
 
 Hosted catalogue variables are `STRIPE_STANDARD_MONTHLY_PRICE_ID`,
 `STRIPE_STANDARD_ANNUAL_PRICE_ID`, `STRIPE_FOUNDING_MONTHLY_PRICE_ID`, and
@@ -154,13 +156,69 @@ after the person's existing export deadline. It never deletes resources, writes 
 tombstones, or enables the retention purge path. Keep it off until a current-candidate backup and
 tombstone restore has been verified and the customer-notice evidence has been reviewed.
 
+Shared organisation expiry review has a separate default-off switch:
+`SOTTO_CLOUD_SHARED_RETENTION_DRY_RUN_ENABLED=1`. It scans organisations whose current owners and
+admins have all lost Cloud eligibility, queues an in-app export notice for each, and starts the
+30-day shared-data export window no earlier than when those notices are first queued. The worker
+snapshots shared scope and performs validation-only dry runs; it cannot purge shared data. Keep this
+switch off until the shared-scope evidence, customer notices, backup and tombstone restore have been
+reviewed. Enabling personal expiry review does not enable the shared scanner.
+
 The protected `/ops/cloud/retention` inspection and action routes are mounted only when
 `SOTTO_CLOUD_RETENTION_OPERATOR_TOKEN` is configured. Use a dedicated value of at least 32
 characters; do not reuse a billing, deployment, or metrics token. The surface returns fixed reason
 codes, counts, deadlines, and opaque job fingerprints. `hold`, `cancel`, and `retry_dry_run` never
 enable purge; an operator-supplied label is audit text, not an authenticated identity. A successful
-dry run is review evidence, not permission to delete data. This slice deliberately has no purge
-route or purge-worker switch.
+dry run is review evidence, not permission to delete data. The purge route and worker have a
+separate default-off gate: `SOTTO_CLOUD_RETENTION_PURGE_ENABLED=1`. They also require a distinct
+destructive operator token, a separate evidence HMAC key, and the exact running build SHA. The
+server binary embeds its build SHA, and startup rejects a runtime SHA that differs from that
+compiled identity. Published images embed the GitHub commit that built them. For a source build,
+set `SOTTO_BUILD_SHA` to the checked-out commit before building and set
+`SOTTO_CLOUD_RETENTION_BUILD_SHA` to the same value at runtime. A source build without embedded
+identity cannot mount or run purge controls. The server refuses incomplete configuration and
+non-Cloud deployment mode. Keep this switch off
+until the current retention policy, customer notices, exact candidate scope, backup and tombstone
+restore rehearsal have all been independently reviewed. Enabling it does not delete anything by
+itself: a reviewer must register signed restore evidence, inspect the opaque scope fingerprint,
+and approve the exact dry-run candidate. An `operator_hold` can be lifted only by explicitly
+approving the current scope with fresh restore evidence. Before each bounded batch the worker
+rechecks the live approval, scope, eligibility, notice and restore-evidence journal count. A
+successful batch adds tombstones, invalidates that approval, and holds the remaining work for a
+fresh restore rehearsal and approval. The destructive operator label is audit text, not an
+authenticated individual; use the credentials only through the protected operator channel and do
+not place them in logs or support messages.
+
+Cloud lifecycle observability has its own optional credentials. See
+[`cloud-operations.md`](cloud-operations.md) for the generic protected routes and
+their separation from liveness, readiness, customer retrieval, payment-to-access acceptance and
+destructive retention. Leave the metrics and coverage-repair credentials blank until the scraper
+and private operator procedure are configured; never reuse the retention, billing-review or purge
+credentials.
+
+The signed request is produced offline from the matching backup and sidecar after restoring them
+to a dedicated local database. Name that database `retention_restore_<name>`, export its URL as
+`SOTTO_RETENTION_REHEARSAL_DATABASE_URL` (never pass it as a command-line argument), and materialise
+the evidence HMAC key from the secret store in a file readable only by the operator. From the exact
+release checkout, run:
+
+```sh
+scripts/retention-restore-rehearsal \
+  --backup ./sotto-<stamp>.dump \
+  --journal ./sotto-<stamp>.tombstones.jsonl \
+  --evidence-key-file ./retention-evidence.key \
+  --release-sha "$(git rev-parse HEAD)" \
+  --operator "<operator label>" \
+  --output ./restore-evidence-request.json
+```
+
+The command requires a local scratch database and key file mode `0600`; it validates the restored
+schema before and after replay, runs the matching sidecar twice, checks that the second replay is a
+no-op, and tests stale-incarnation guards against temporary rows in the scratch database. It writes
+the exact JSON body for `/ops/cloud/retention/purge/restore-evidence` with mode `0600`. Review and
+submit that body through the protected operator channel. The script does not contact the live
+service or register evidence itself; the evidence key must match the running build's configured
+key, and the release SHA must match that build.
 
 On a 1 GB host, give the kernel some headroom before the first start:
 
@@ -198,10 +256,15 @@ change entitlements; an approved cohort and notice decision is required before a
 git pull    # picks up compose/runbook changes
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml restart caddy
 ```
 
 Migrations are forward-only and applied on boot. Check the release notes for anything flagged as
 a compatibility break before upgrading past a minor version.
+
+Restarting Caddy after the server is recreated makes it resolve the server's new container address.
+Without this, the proxy can keep sending API and webhook requests to the previous address and return
+502 responses until Caddy restarts.
 
 **Renamed settings are the one thing `git pull` cannot fix for you.** Your `.env` is deliberately
 untracked, so a variable renamed upstream leaves the old name sitting in your file where nothing
@@ -245,7 +308,10 @@ deletion journal. The sidecar is deliberately separate from the dump: a dump tak
 purge must not resurrect ciphertext when it is restored. It contains resource identifiers and
 ownership checks, never ciphertext or secret values, and is validated before upload by
 [`replay-retention-journal`](../scripts/replay-retention-journal). Keep both objects under the
-same bucket lifecycle policy; a dump without its sidecar is not a restorable backup.
+same bucket lifecycle policy. A backup whose schema includes migration 50 or later needs a
+sidecar at least as recent as the dump. Older backups predate the journal table and can only be
+restored with an empty journal; the restore drill checks that schema boundary before allowing
+that case.
 
 | `SOTTO_BACKUP_BUCKET` | Uploads with | Works for |
 |---|---|---|
@@ -593,8 +659,10 @@ this uploads only this repository's source, which is public.
 What it asserts, which is the rehearsal of 2026-08-31 written down:
 
 - `pg_restore` completes with no errors;
-- a retention sidecar exists and passes strict JSON-lines validation;
-- every deletion in that sidecar is replayed against the restored database with its ownership,
+- a retention sidecar for schema at migration 50 or later exists and passes strict JSON-lines
+  validation; an older schema is accepted without a sidecar only after the drill verifies it
+  predates the retention journal, then replays an empty journal;
+- every deletion in a sidecar is replayed against the restored database with its ownership,
   creation-time and revision guards, so purged rows cannot reappear;
 - every migration the dump recorded is marked successful, and none is a version this checkout
   does not carry. A deployment **behind** the branch passes: production is often a release or
@@ -784,8 +852,9 @@ somewhere else before they age out is the whole of what that takes.
 
 Set the repository variable `SOTTO_PUBLIC_URL` to the deployment to watch. Without it the job
 skips rather than probing a default, so a fork cannot point it at somebody else's deployment.
-Set `SOTTO_CANARY_TOKEN` as well if you want the secret-sync row measured rather than reported
-unconfigured; the probe table above says how.
+Set `SOTTO_CANARY_TOKEN` and `SOTTO_HUMAN_CANARY_TOKEN` plus the variable
+`SOTTO_HUMAN_CANARY_ENVIRONMENT_ID` if you want both authenticated retrieval rows measured rather
+than reported unconfigured; the probe table and setup notes below explain their boundaries.
 
 **In a fork, one line has to change as well.** The job carries
 `if: github.repository == 'getsotto/sotto'`, so a fork of this repository collects nothing and
@@ -817,16 +886,17 @@ record that is meant to be permanent:
   Before that the path falls through to the single-page app, and the API row records real
   downtime for a deployment that is working.
 
-Four of the five probes are unauthenticated and ask only what a visitor could ask. The fifth
-presents a machine token, and is described after the table:
+Four of the six probes are unauthenticated and ask only what a visitor could ask. The other two
+use ordinary authentication against a synthetic environment:
 
-| Component   | Probe                                          | Healthy answer                   |
-| ----------- | ---------------------------------------------- | -------------------------------- |
-| API         | `GET /health/ready`                            | `200` with the body `ok`         |
-| Web app     | `GET /`                                        | `200` and an HTML content type   |
-| Sign in     | `GET /auth/github/login` with a loopback callback | a redirect to `github.com`    |
-| Billing     | `POST /billing/webhook` with no signature      | `401`                            |
-| Secret sync | `GET /machine/grant` and `GET /machine/secrets` | a usable grant and a usable secret |
+| Component        | Probe                                               | Healthy answer                                |
+| ---------------- | --------------------------------------------------- | --------------------------------------------- |
+| API              | `GET /health/ready`                                 | `200` with the body `ok`                      |
+| Web app          | `GET /`                                             | `200` and an HTML content type                |
+| Sign in          | `GET /auth/github/login` with a loopback callback   | a redirect to `github.com`                    |
+| Billing          | `POST /billing/webhook` with no signature           | `401`                                         |
+| Secret sync       | `GET /machine/grant` and `GET /machine/secrets`     | a usable grant and a usable secret            |
+| Human API access  | `GET /environments/{id}/secrets` with a user session | a usable synthetic encrypted secret snapshot |
 
 Two of those distinguish "not configured" from "broken", because they are not the same thing
 and only one of them belongs in an uptime figure. A `503` from sign-in or billing means the
@@ -839,10 +909,10 @@ The billing probe deliberately sends an unsigned payload and requires a `401`. A
 would mean signature verification is not happening, so that case is recorded as down rather
 than as a passing request.
 
-Secret sync is the one probe that authenticates, because the question it asks cannot be asked
-from outside: can a machine still get hold of what it needs to decrypt an environment? Every
-other probe reads a public surface, and a deployment can serve all of them perfectly while the
-grant that makes a CI run work has gone.
+The two retrieval probes authenticate because these questions cannot be asked from outside: can a
+machine still get its sealed grant and ciphertext, and can an ordinary signed-in user still read
+an environment they are authorised to access? A deployment can serve every public surface
+perfectly while either authenticated path is broken.
 
 It needs a throwaway project holding junk secrets and a machine token scoped to one of its
 environments. A personal project is enough; an organisation is only needed for sharing, and a
@@ -858,7 +928,7 @@ sotto token create --name status-canary --expires-in-days 365   # prints a SOTTO
 gh secret set SOTTO_CANARY_TOKEN --body 'smt_...'   # the part BEFORE the dot, nothing after it
 ```
 
-The canary token expires like any other, a year at most, and an expired token is refused exactly
+The machine canary token expires like any other, a year at most, and an expired token is refused exactly
 as a revoked one is. The probe cannot tell the two apart, so a lapsed canary token is recorded as
 secret sync being down. `sotto token ls`, run in the canary project, shows its end date; replace
 it before then, and put that date somewhere you will see it, because this job never alerts.
@@ -871,7 +941,7 @@ and decrypt the canary. Refusing is what makes "the collector cannot decrypt" a 
 it holds rather than a promise about what it does. If the whole token is stored, the row reports
 unconfigured and says so.
 
-Without the secret the row reports unconfigured and the other four probes are unaffected, which
+Without the machine secret the row reports unconfigured and the other five probes are unaffected, which
 is what a self-hoster with no canary should see: an unconfigured component is not an outage and
 is left out of the tally.
 
@@ -888,6 +958,14 @@ grown, not the deployment having failed, and it has no business in the published
 not to have. The credential is also withheld from a target that has not answered for itself:
 unauthenticated probes run first, and if the configured URL is not `https`, or every one of them
 was redirected elsewhere, no token is sent at all.
+
+The human row uses a normal Sotto user session, not a special canary header or bypass. Keep its
+account dedicated to the canary, with access only to one throwaway project containing junk
+secrets. Configure the session bearer in the repository secret `SOTTO_HUMAN_CANARY_TOKEN` and
+the environment id in `SOTTO_HUMAN_CANARY_ENVIRONMENT_ID`. User sessions expire after 30 days, so
+rotate this secret through the ordinary sign-in flow before expiry. Do not use a staff account or
+an account with customer or organisation access. With either setting absent, the human row reports
+unconfigured and no authenticated request is made.
 
 The job records and never alerts. A component being down leaves the workflow green, because
 paging belongs to an external monitor that survives this repository being unreachable, and a

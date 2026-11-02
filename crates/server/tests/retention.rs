@@ -100,11 +100,13 @@ fn intent(job_id: &str, user_id: &str) -> RetentionIntent {
         notice_event_key: format!("notice:export-expiry:{user_id}"),
         notice_evidence_epoch: Some(1),
         expected_coverage_revision: None,
+        expected_scope_generation: None,
+        eligibility_loss_epoch: None,
     }
 }
 
 #[tokio::test]
-async fn dry_run_is_idempotent_and_purge_deletes_only_the_explicit_personal_scope() {
+async fn dry_run_is_idempotent_and_generic_worker_cannot_purge() {
     let _guard = retention_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
@@ -166,14 +168,14 @@ async fn dry_run_is_idempotent_and_purge_deletes_only_the_explicit_personal_scop
         .await
         .expect("run retention dry run")
         .expect("dry run should claim a job");
-    assert_eq!(dry_run.state, RetentionState::DryRun);
-    assert_eq!(dry_run.processed_items, 1);
+    assert_eq!(dry_run.state, RetentionState::Held);
+    assert_eq!(dry_run.processed_items, 0);
     assert!(
         retention::run_once(&pool, "retention-test-dry-run-again", RetentionMode::DryRun)
             .await
             .expect("repeat retention dry run")
             .is_none(),
-        "a completed dry run is not claimed again until an operator retries it"
+        "a held dry run is not claimed again until an operator retries it"
     );
     let project_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id=$1)")
@@ -183,46 +185,32 @@ async fn dry_run_is_idempotent_and_purge_deletes_only_the_explicit_personal_scop
             .expect("check dry-run project");
     assert!(project_exists);
 
-    retention::enable_purge(&pool, JOB_ID)
-        .await
-        .expect("enable explicit purge");
     assert!(
         retention::run_once(&pool, "retention-test-wrong-mode", RetentionMode::DryRun)
             .await
             .expect("wrong-mode dry run must be ignored")
             .is_none()
     );
-    let purge = retention::run_once(&pool, "retention-test-purger", RetentionMode::Purge)
-        .await
-        .expect("run bounded purge")
-        .expect("purge should claim a job");
-    assert_eq!(purge.state, RetentionState::Completed);
-    let row = sqlx::query(
-        "SELECT state, action FROM cloud_retention_scope_items i \
-         JOIN cloud_retention_receipts r USING (job_id, resource_kind, resource_id) \
-         WHERE i.job_id=$1 AND i.resource_id=$2",
-    )
-    .bind(JOB_ID)
-    .bind(PROJECT_ID)
-    .fetch_one(&pool)
-    .await
-    .expect("load purge receipt");
-    assert_eq!(row.get::<String, _>("state"), "deleted");
-    assert_eq!(row.get::<String, _>("action"), "deleted");
-    let journal = sqlx::query(
-        "SELECT resource_kind, resource_id, ownership_kind, expected_owner_id, expected_created_at \
-         FROM cloud_retention_tombstone_journal WHERE job_id=$1 AND resource_id=$2",
-    )
-    .bind(JOB_ID)
-    .bind(PROJECT_ID)
-    .fetch_one(&pool)
-    .await
-    .expect("load retention tombstone journal");
-    assert_eq!(journal.get::<String, _>("resource_kind"), "project");
-    assert_eq!(journal.get::<String, _>("resource_id"), PROJECT_ID);
-    assert_eq!(journal.get::<String, _>("ownership_kind"), "personal");
-    assert_eq!(journal.get::<String, _>("expected_owner_id"), USER_ID);
-    assert!(journal.get::<i64, _>("expected_created_at") > 0);
+    assert!(matches!(
+        retention::run_once(&pool, "retention-test-purger", RetentionMode::Purge).await,
+        Err(retention::RetentionError::Held(
+            "purge execution requires the configured approved-retention worker"
+        ))
+    ));
+    assert!(
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM projects WHERE id=$1)")
+            .bind(PROJECT_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("check generic worker did not delete project")
+    );
+    let receipt_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM cloud_retention_receipts WHERE job_id=$1")
+            .bind(JOB_ID)
+            .fetch_one(&pool)
+            .await
+            .expect("count purge receipts");
+    assert_eq!(receipt_count, 0);
     cleanup(&pool, JOB_ID, USER_ID, PROJECT_ID).await;
 }
 
@@ -338,7 +326,7 @@ async fn shared_scope_holds_and_cancellation_stops_due_work() {
     retention::mark_ready(&pool, SHARED_JOB)
         .await
         .expect("mark shared job ready");
-    retention::run_once(
+    let shared_dry_run = retention::run_once(
         &pool,
         "retention-test-shared-dry-run",
         RetentionMode::DryRun,
@@ -346,14 +334,13 @@ async fn shared_scope_holds_and_cancellation_stops_due_work() {
     .await
     .expect("run shared dry run")
     .expect("shared dry run should claim a job");
-    retention::enable_purge(&pool, SHARED_JOB)
-        .await
-        .expect("enable shared purge attempt");
-    let held = retention::run_once(&pool, "retention-test-shared", RetentionMode::Purge)
-        .await
-        .expect("run shared purge")
-        .expect("shared job should be claimed");
-    assert_eq!(held.state, RetentionState::Held);
+    assert_eq!(shared_dry_run.state, RetentionState::Held);
+    assert!(matches!(
+        retention::run_once(&pool, "retention-test-shared-purger", RetentionMode::Purge).await,
+        Err(retention::RetentionError::Held(
+            "purge execution requires the configured approved-retention worker"
+        ))
+    ));
     let project_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id=$1)")
             .bind(PROJECT_ID)
@@ -383,7 +370,7 @@ async fn shared_scope_holds_and_cancellation_stops_due_work() {
         .await
         .unwrap());
     assert!(
-        retention::run_once(&pool, "retention-test-cancel", RetentionMode::Purge)
+        retention::run_once(&pool, "retention-test-cancel", RetentionMode::DryRun)
             .await
             .expect("cancelled job must not run")
             .is_none()
@@ -393,7 +380,7 @@ async fn shared_scope_holds_and_cancellation_stops_due_work() {
 }
 
 #[tokio::test]
-async fn recreated_project_is_held_instead_of_being_purged() {
+async fn generic_worker_cannot_purge_even_a_recreated_project() {
     let _guard = retention_test_lock().lock().await;
     let Some(pool) = pool_or_skip().await else {
         return;
@@ -432,10 +419,6 @@ async fn recreated_project_is_held_instead_of_being_purged() {
     .await
     .expect("run recreated dry run")
     .expect("recreated dry run should claim a job");
-    retention::enable_purge(&pool, JOB_ID)
-        .await
-        .expect("enable recreated project purge");
-
     sqlx::query("DELETE FROM projects WHERE id=$1")
         .bind(PROJECT_ID)
         .execute(&pool)
@@ -448,24 +431,12 @@ async fn recreated_project_is_held_instead_of_being_purged() {
         .await
         .expect("recreate project with the same id");
 
-    let result = retention::run_once(&pool, "retention-test-recreated", RetentionMode::Purge)
-        .await
-        .expect("run recreated project purge")
-        .expect("recreated job should be claimed");
-    assert_eq!(result.state, RetentionState::Held);
-    let row = sqlx::query(
-        "SELECT state, hold_code FROM cloud_retention_scope_items WHERE job_id=$1 AND resource_id=$2",
-    )
-    .bind(JOB_ID)
-    .bind(PROJECT_ID)
-    .fetch_one(&pool)
-    .await
-    .expect("load recreated project hold");
-    assert_eq!(row.get::<String, _>("state"), "held");
-    assert_eq!(
-        row.get::<String, _>("hold_code"),
-        "resource_identity_changed"
-    );
+    assert!(matches!(
+        retention::run_once(&pool, "retention-test-recreated", RetentionMode::Purge).await,
+        Err(retention::RetentionError::Held(
+            "purge execution requires the configured approved-retention worker"
+        ))
+    ));
     let project_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id=$1)")
             .bind(PROJECT_ID)
