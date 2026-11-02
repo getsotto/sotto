@@ -104,6 +104,97 @@ describe("payer transfer journeys", () => {
     expect(view.container).toBeEmptyDOMElement();
   });
 
+  it("shows an error and offers retry when capability discovery fails, then loads transfers on success", async () => {
+    vi.mocked(api.fetchPayerTransferCapabilities)
+      .mockRejectedValueOnce(new Error("server error (503)"))
+      .mockResolvedValueOnce({ available: true, setupAvailable: true });
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
+      transfers: [transfer()],
+      nextCursor: null,
+    });
+
+    render(<PayerTransferInbox />);
+
+    expect(await screen.findByRole("heading", { name: "Payer transfers" })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("The transfer service is temporarily unavailable. Try again shortly.");
+    const retry = screen.getByRole("button", { name: "Retry" });
+    expect(retry).toBeEnabled();
+    expect(api.fetchPayerTransfers).not.toHaveBeenCalled();
+
+    fireEvent.click(retry);
+
+    expect(await screen.findByRole("button", { name: "Refresh transfers" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    expect(api.fetchPayerTransfers).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Incoming request")).toBeInTheDocument();
+  });
+
+  it("keeps recovery available after repeated capability discovery failures without starting transfers", async () => {
+    vi.mocked(api.fetchPayerTransferCapabilities)
+      .mockRejectedValueOnce(new Error("Synthetic network error"))
+      .mockRejectedValueOnce(new Error("server error (500)"));
+
+    render(<PayerTransferInbox />);
+
+    expect(await screen.findByRole("heading", { name: "Payer transfers" })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("The transfer service is temporarily unavailable. Try again shortly.");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("The transfer service is temporarily unavailable. Try again shortly.");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    expect(api.fetchPayerTransfers).not.toHaveBeenCalled();
+    expect(api.acceptPayerTransfer).not.toHaveBeenCalled();
+    expect(api.withdrawPayerTransfer).not.toHaveBeenCalled();
+  });
+
+  it("prevents overlapping capability discovery retries while a retry is pending", async () => {
+    const retry = deferred<api.PayerTransferCapabilities>();
+    vi.mocked(api.fetchPayerTransferCapabilities)
+      .mockRejectedValueOnce(new Error("Synthetic network error"))
+      .mockReturnValueOnce(retry.promise);
+
+    render(<PayerTransferInbox />);
+
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    const retryBtn = screen.getByRole("button", { name: "Retry" });
+    fireEvent.click(retryBtn);
+
+    const retrying = screen.getByRole("button", { name: "Retrying…" });
+    expect(retrying).toBeDisabled();
+    expect(retrying).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Checking transfer availability…")).toBeInTheDocument();
+
+    // Secondary click should be ignored
+    fireEvent.click(retrying);
+    expect(api.fetchPayerTransferCapabilities).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      retry.resolve({ available: true, setupAvailable: true });
+    });
+
+    expect(await screen.findByRole("button", { name: "Refresh transfers" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("hides the inbox when discovery retry reports transfers unavailable", async () => {
+    vi.mocked(api.fetchPayerTransferCapabilities)
+      .mockRejectedValueOnce(new Error("Synthetic network error"))
+      .mockResolvedValueOnce({ available: false, setupAvailable: false });
+
+    const view = render(<PayerTransferInbox />);
+
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => {
+      expect(view.container).toBeEmptyDOMElement();
+    });
+    expect(api.fetchPayerTransfers).not.toHaveBeenCalled();
+  });
+
 
   it("shows Declining while a decline request is in progress", async () => {
     let resolveDecline!: (value: api.PayerTransfer) => void;

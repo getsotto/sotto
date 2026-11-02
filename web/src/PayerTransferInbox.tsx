@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   acceptPayerTransfer,
@@ -18,6 +18,14 @@ function message(error: unknown): string {
   if (status === "404") return "This transfer is no longer available. Refresh the list for its latest state.";
   if (status === "409") return "The transfer terms have changed or the invitation has expired. Request a fresh transfer.";
   return "The transfer service is temporarily unavailable. Refresh and try again.";
+}
+
+function discoveryMessage(error: unknown): string {
+  if (!(error instanceof Error)) return "Transfer service availability could not be checked. Try again shortly.";
+  const status = /server error \((\d+)\)/.exec(error.message)?.[1];
+  if (status === "403") return "You do not have authority to check payer transfers for this account.";
+  if (status === "404") return "Payer transfers are not available on this server.";
+  return "The transfer service is temporarily unavailable. Try again shortly.";
 }
 
 function date(epoch: number): string {
@@ -76,6 +84,39 @@ export function PayerTransferInbox() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [expiryTick, setExpiryTick] = useState(0);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+  const [discoveryLoading, setDiscoveryLoading] = useState(true);
+  const discoveryInFlight = useRef(false);
+  const mounted = useRef(true);
+
+  async function discover() {
+    if (discoveryInFlight.current) return;
+    discoveryInFlight.current = true;
+    setDiscoveryLoading(true);
+    try {
+      const [capabilities, account] = await Promise.all([fetchPayerTransferCapabilities(), me()]);
+      if (!mounted.current) return;
+      setAvailable(capabilities.available);
+      setSetupAvailable(capabilities.setupAvailable);
+      setUserId(account?.userId ?? null);
+      setDiscoveryError(null);
+      if (capabilities.available) {
+        void refresh();
+      } else {
+        setLoading(false);
+      }
+    } catch (e) {
+      if (!mounted.current) return;
+      setAvailable(false);
+      setDiscoveryError(discoveryMessage(e));
+      setLoading(false);
+    } finally {
+      if (mounted.current) {
+        setDiscoveryLoading(false);
+      }
+      discoveryInFlight.current = false;
+    }
+  }
 
   async function refresh() {
     setLoading(true);
@@ -111,21 +152,11 @@ export function PayerTransferInbox() {
   }
 
   useEffect(() => {
-    let current = true;
-    void Promise.all([fetchPayerTransferCapabilities(), me()])
-      .then(([capabilities, account]) => {
-        if (!current) return;
-        setAvailable(capabilities.available);
-        setSetupAvailable(capabilities.setupAvailable);
-        setUserId(account?.userId ?? null);
-        if (capabilities.available) void refresh();
-        else setLoading(false);
-      })
-      .catch(() => {
-        // Older servers and temporary discovery failures keep the existing account page usable.
-        if (current) setLoading(false);
-      });
-    return () => { current = false; };
+    mounted.current = true;
+    void discover();
+    return () => {
+      mounted.current = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -200,6 +231,16 @@ export function PayerTransferInbox() {
       setBusyId(null);
       setBusyAction(null);
     }
+  }
+
+  if (discoveryError !== null && !available) {
+    return <section aria-labelledby="transfer-inbox-heading">
+      <h2 id="transfer-inbox-heading">Payer transfers</h2>
+      <p className="muted">Transfers take effect at renewal. The current payer remains responsible through the paid term; no mid-term credit is issued.</p>
+      <p role="alert">{discoveryError}</p>
+      <button type="button" disabled={discoveryLoading} aria-busy={discoveryLoading ? "true" : undefined} onClick={() => void discover()}>{discoveryLoading ? "Retrying…" : "Retry"}</button>
+      {discoveryLoading && <p className="muted" role="status">Checking transfer availability…</p>}
+    </section>;
   }
 
   if (!available) return null;
