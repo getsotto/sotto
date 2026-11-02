@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import * as api from "../api";
@@ -112,4 +112,122 @@ it("keeps loaded requests and the cursor when an older page fails, then recovers
   expect(api.acceptPayerTransfer).not.toHaveBeenCalled();
   expect(api.withdrawPayerTransfer).not.toHaveBeenCalled();
   expect(api.createPayerTransferPaymentSetup).not.toHaveBeenCalled();
+});
+
+it("does not overwrite a newer list or cursor when an older refresh succeeds later", async () => {
+  const initial = deferred<Page>();
+  const older = deferred<Page>();
+  const newer = deferred<Page>();
+  vi.mocked(api.fetchPayerTransfers)
+    .mockReturnValueOnce(initial.promise)
+    .mockReturnValueOnce(older.promise)
+    .mockReturnValueOnce(newer.promise);
+
+  render(<PayerTransferInbox />);
+  await act(async () => {
+    initial.resolve({ transfers: [], nextCursor: null });
+  });
+  expect(await screen.findByText(NO_REQUESTS)).toBeInTheDocument();
+
+  // Dispatch two updates (e.g. from rapid transfers or initiation forms)
+  window.dispatchEvent(new CustomEvent("sotto:payer-transfer-updated"));
+  window.dispatchEvent(new CustomEvent("sotto:payer-transfer-updated"));
+
+  expect(api.fetchPayerTransfers).toHaveBeenCalledTimes(3);
+
+  // The newer request completes first with an incoming request
+  const incoming = transfer({ transferId: "transfer-newer", participantRole: "counterparty" });
+  await act(async () => {
+    newer.resolve({ transfers: [incoming], nextCursor: "cursor-newer" });
+  });
+
+  expect(await screen.findByText("Incoming request")).toBeInTheDocument();
+  expect(screen.queryByText(NO_REQUESTS)).not.toBeInTheDocument();
+
+  // The older request completes later with an empty list and older cursor
+  await act(async () => {
+    older.resolve({ transfers: [], nextCursor: "cursor-older" });
+  });
+
+  // Verify that the newer transfer and state remain intact
+  expect(screen.getByText("Incoming request")).toBeInTheDocument();
+  expect(screen.queryByText(NO_REQUESTS)).not.toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("does not report an error or overwrite a newer list when an older refresh fails later", async () => {
+  const initial = deferred<Page>();
+  const older = deferred<Page>();
+  const newer = deferred<Page>();
+  vi.mocked(api.fetchPayerTransfers)
+    .mockReturnValueOnce(initial.promise)
+    .mockReturnValueOnce(older.promise)
+    .mockReturnValueOnce(newer.promise);
+
+  render(<PayerTransferInbox />);
+  await act(async () => {
+    initial.resolve({ transfers: [], nextCursor: null });
+  });
+  expect(await screen.findByText(NO_REQUESTS)).toBeInTheDocument();
+
+  window.dispatchEvent(new CustomEvent("sotto:payer-transfer-updated"));
+  window.dispatchEvent(new CustomEvent("sotto:payer-transfer-updated"));
+
+  expect(api.fetchPayerTransfers).toHaveBeenCalledTimes(3);
+
+  const incoming = transfer({ transferId: "transfer-newer", participantRole: "counterparty" });
+  await act(async () => {
+    newer.resolve({ transfers: [incoming], nextCursor: null });
+  });
+
+  expect(await screen.findByText("Incoming request")).toBeInTheDocument();
+
+  // The older request fails later
+  await act(async () => {
+    older.reject(new Error("server error (503)"));
+  });
+
+  // Verify no error is displayed and newer data remains visible
+  expect(screen.getByText("Incoming request")).toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("does not clear the loading state when an older refresh completes while a newer refresh is pending", async () => {
+  const initial = deferred<Page>();
+  const older = deferred<Page>();
+  const newer = deferred<Page>();
+  vi.mocked(api.fetchPayerTransfers)
+    .mockReturnValueOnce(initial.promise)
+    .mockReturnValueOnce(older.promise)
+    .mockReturnValueOnce(newer.promise);
+
+  render(<PayerTransferInbox />);
+  await act(async () => {
+    initial.resolve({ transfers: [], nextCursor: null });
+  });
+  expect(await screen.findByText(NO_REQUESTS)).toBeInTheDocument();
+
+  window.dispatchEvent(new CustomEvent("sotto:payer-transfer-updated"));
+  window.dispatchEvent(new CustomEvent("sotto:payer-transfer-updated"));
+
+  expect(api.fetchPayerTransfers).toHaveBeenCalledTimes(3);
+
+  // Older completes while newer is still in flight
+  await act(async () => {
+    older.resolve({ transfers: [], nextCursor: null });
+  });
+
+  // Loading state remains active for the newer in-flight request
+  expect(screen.getByText("Loading transfer requests…")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Refreshing transfers…" })).toBeDisabled();
+
+  // Newer finally completes
+  const incoming = transfer({ transferId: "transfer-newer" });
+  await act(async () => {
+    newer.resolve({ transfers: [incoming], nextCursor: null });
+  });
+
+  expect(await screen.findByText("Incoming request")).toBeInTheDocument();
+  expect(screen.queryByText("Loading transfer requests…")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Refresh transfers" })).toBeEnabled();
 });

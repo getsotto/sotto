@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   acceptPayerTransfer,
@@ -76,34 +76,45 @@ export function PayerTransferInbox() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [expiryTick, setExpiryTick] = useState(0);
+  const refreshGeneration = useRef(0);
 
   async function refresh() {
+    const generation = ++refreshGeneration.current;
+    const isCurrent = () => generation === refreshGeneration.current;
     setLoading(true);
     setError(null);
     try {
       const page = await fetchPayerTransfers();
+      if (!isCurrent()) return;
       setTransfers(page.transfers);
       setNextCursor(page.nextCursor);
       setListLoaded(true);
     } catch (e) {
+      if (!isCurrent()) return;
       setError(message(e));
     } finally {
-      setLoading(false);
+      if (isCurrent()) {
+        setLoading(false);
+      }
     }
   }
 
   async function loadMore() {
     if (nextCursor === null || loadingMore) return;
+    const generation = refreshGeneration.current;
+    const isCurrent = () => generation === refreshGeneration.current;
     setLoadingMore(true);
     setError(null);
     try {
       const page = await fetchPayerTransfers(nextCursor);
+      if (!isCurrent()) return;
       setTransfers((current) => {
         const known = new Set(current.map((transfer) => transfer.transferId));
         return [...current, ...page.transfers.filter((transfer) => !known.has(transfer.transferId))];
       });
       setNextCursor(page.nextCursor);
     } catch (e) {
+      if (!isCurrent()) return;
       setError(message(e));
     } finally {
       setLoadingMore(false);
