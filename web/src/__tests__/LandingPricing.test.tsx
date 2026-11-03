@@ -32,8 +32,11 @@ describe("Cloud pricing visibility", () => {
         expect(browserPricing).toHaveTextContent("£1.99");
         expect(browserPricing).not.toHaveTextContent("Team");
       } else {
-        expect(browserPricing).toHaveTextContent("Team");
-        expect(browserPricing).toHaveTextContent("£15");
+        expect(browserPricing).toHaveTextContent("Local and self-hosted");
+        expect(browserPricing).toHaveTextContent("current billing options are shown after sign-in");
+        expect(browserPricing).not.toHaveTextContent("free forever");
+        expect(browserPricing).not.toHaveTextContent("14-day Team trial");
+        expect(browserPricing).not.toHaveTextContent("£15");
         expect(browserPricing).not.toHaveTextContent("Sotto Cloud");
       }
     },

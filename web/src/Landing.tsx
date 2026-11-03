@@ -122,7 +122,7 @@ export function Landing({
 
       <section id="pricing">
         <h2>Pricing</h2>
-        {cloudPricingVisible ? <CloudPricing /> : <LegacyPricing />}
+        {cloudPricingVisible ? <CloudPricing /> : <CloudPricingNotPublished />}
       </section>
 
       <CommunitySection />
@@ -168,38 +168,25 @@ sotto share DATABASE_URL     # one-time link for a single secret`}</code>
   );
 }
 
-function LegacyPricing() {
+function CloudPricingNotPublished() {
   return (
     <>
       <div className="plans">
         <div className="plan">
-          <h3>Free</h3>
-          <p className="price">£0</p>
+          <h3>Local and self-hosted</h3>
+          <p className="price">Free</p>
           <ul>
-            <li>Personal projects: unlimited, free forever</li>
-            <li>Organisations with up to 3 members and 1 shared project</li>
-            <li>One-time, burn-after-reading share links</li>
-            <li>Every new org starts a 14-day Team trial</li>
-          </ul>
-        </div>
-        <div className="plan">
-          <h3>Team</h3>
-          <p className="price">
-            £15<span className="per"> / month per organisation</span>
-          </p>
-          <ul>
-            <li>Unlimited members</li>
-            <li>Unlimited shared projects</li>
-            <li>Audit log</li>
-            <li>Flat: the price doesn&rsquo;t scale with team size</li>
+            <li>Open-source Sotto, running on your devices or your own server</li>
+            <li>Keep control of hosting and operating costs</li>
+            <li>Share links remain free for recipients</li>
           </ul>
         </div>
       </div>
       <p className="muted">
-        Or run it yourself: the <a href={`${REPO}/blob/main/deploy/README.md`}>server is
-          self-hostable</a> and Apache-2.0. Self-hosted organisations use the same plan limits by
-        default: up to 3 members and 1 shared project on Free. Operators can assign tiers manually;
-        see the deployment runbook.
+        Cloud availability and current billing options are shown after sign-in.{" "}
+        <a href="/cloud">Check your Cloud account</a>. New personal hosted access starts after
+        payment is confirmed. Or run it yourself: the <a href={`${REPO}/blob/main/deploy/README.md`}>server is
+          self-hostable</a> and Apache-2.0.
       </p>
     </>
   );

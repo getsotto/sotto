@@ -12,6 +12,13 @@ permissions:
   actions: read
   contents: read
 
+# A new push to a pull request cancels the run it supersedes. Only pull request runs share a group;
+# every other event is keyed by its own run id, so runs on main, scheduled runs and manual runs
+# never cancel or queue behind one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -28,7 +35,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        # The server job runs the server and CLI suites against Postgres, so running them here as
+        # well only repeated them with the database tests skipped. Clippy above still compiles
+        # every target of every crate.
+        run: cargo test --workspace --exclude sotto-server --exclude sotto-cli
 
   core-platform:
     name: Core codec (${{ matrix.os }})
@@ -67,7 +77,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       # Keep the consumer check on the newest published CLI release; update this after each release.
-      SOTTO_TEST_VERSION: v0.4.0
+      SOTTO_TEST_VERSION: v0.10.1
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Exercise the moving major tag after the release workflow validates it.
@@ -237,9 +247,12 @@ jobs:
       - name: Server + end-to-end tests (with Postgres)
         run: cargo test -p sotto-server -p sotto-cli
       - name: Server authorisation and transaction assurance
+        # Select the same packages as the step above. The CLI enables reqwest's blocking feature,
+        # so naming the server alone resolves different features and recompiles the server just
+        # to run this one target.
         run: |
           set -euo pipefail
-          cargo test -p sotto-server --test authorisation_transactions -- --test-threads=1 --nocapture 2>&1 | tee server-assurance.log
+          cargo test -p sotto-server -p sotto-cli --test authorisation_transactions -- --test-threads=1 --nocapture 2>&1 | tee server-assurance.log
           grep -Eq '^SERVER_ASSURANCE_DONE 7$' server-assurance.log
       - name: Restore checker meets a real database
         # Its assertions are unit tested, but its queries are not: left alone they would only
@@ -272,6 +285,55 @@ jobs:
               exit 1
             fi
           fi
+
+  cloud-scenarios:
+    # These used to run at the end of the coverage job. Coverage never measured them, and that job
+    # caches only its instrumented build, so running them there meant a full cold compile on every
+    # pull request. Here they run alongside the rest of CI against a cached build.
+    name: cloud database scenarios
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sotto
+          POSTGRES_PASSWORD: sotto
+          POSTGRES_DB: sotto
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U sotto"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://sotto:sotto@localhost:5432/sotto
+      SOTTO_RUN_DB_TESTS: "1"
+      SOTTO_TELEMETRY: "off"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the server test binaries
+        # Both runners give every cargo command a fixed timeout, starting with test discovery.
+        # Compiling inside that window would turn a slow build into a reported scenario failure,
+        # so the build happens first and the timeouts measure only the tests.
+        run: cargo test -p sotto-server --no-run
+      - name: Cloud coverage race repetitions
+        run: scripts/check-cloud-coverage-races
+      - name: Install PostgreSQL client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends postgresql-client
+      - name: Integrated Cloud lifecycle database scenarios
+        run: |
+          DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto_lifecycle_acceptance \
+            scripts/check-cloud-lifecycle-integration
 
   funnel-e2e:
     name: funnel regression suite (Launch gate 4)
@@ -399,9 +461,9 @@ jobs:
   assurance-complete:
     name: ci assurance complete
     if: always()
-    needs: [test, core-platform, readme-i18n, action-consumer, wasm, web, server, funnel-e2e, supply-chain]
+    needs: [test, core-platform, readme-i18n, action-consumer, wasm, web, server, cloud-scenarios, funnel-e2e, supply-chain]
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Validate required CI jobs

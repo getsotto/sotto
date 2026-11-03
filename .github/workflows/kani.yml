@@ -10,6 +10,13 @@ permissions:
   actions: read
   contents: read
 
+# A new push to a pull request cancels the run it supersedes. Only pull request runs share a group;
+# every other event is keyed by its own run id, so runs on main, scheduled runs and manual runs
+# never cancel or queue behind one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   core:
     name: core parser proofs
@@ -54,7 +61,7 @@ jobs:
     if: always()
     needs: [core]
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Validate required Kani jobs

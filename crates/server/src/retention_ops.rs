@@ -1,4 +1,4 @@
-//! Protected, redacted inspection and non-destructive controls for personal expiry dry runs.
+//! Protected, redacted inspection, operator review, and separately gated retention controls.
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
@@ -22,6 +22,179 @@ pub fn router() -> Router<AppState> {
         .route("/ops/cloud/retention", get(list_jobs))
         .route("/ops/cloud/retention/inventory", get(list_inventory))
         .route("/ops/cloud/retention/{fingerprint}", post(apply_action))
+}
+
+/// Separate destructive credentials protect restore attestations and purge approval. These
+/// endpoints are mounted only when the purge switch and all required secrets are configured.
+pub fn purge_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/ops/cloud/retention/purge/restore-evidence",
+            post(register_restore_evidence),
+        )
+        .route(
+            "/ops/cloud/retention/purge/{fingerprint}/review",
+            get(review_purge_scope),
+        )
+        .route(
+            "/ops/cloud/retention/purge/{fingerprint}/approve",
+            post(approve_purge),
+        )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreEvidenceRequest {
+    operator: String,
+    evidence: retention::RestoreEvidenceAttestation,
+}
+
+async fn register_restore_evidence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: std::result::Result<Json<RestoreEvidenceRequest>, JsonRejection>,
+) -> Result<Response> {
+    require_destructive_operator(&state, &headers)?;
+    let Json(body) = body.map_err(|_| Error::BadRequest("invalid restore evidence".into()))?;
+    validate_operator(&body.operator)?;
+    let key = state
+        .cloud_retention_evidence_hmac_key
+        .as_deref()
+        .ok_or_else(|| {
+            Error::NotConfigured("Cloud retention restore evidence is disabled".into())
+        })?;
+    let release_sha = state.cloud_retention_build_sha.as_deref().ok_or_else(|| {
+        Error::NotConfigured("Cloud retention release identity is unavailable".into())
+    })?;
+    let inserted = retention::register_restore_evidence(
+        &state.pool,
+        &body.evidence,
+        key.as_bytes(),
+        release_sha,
+        &body.operator,
+    )
+    .await
+    .map_err(map_retention_error)?;
+    no_store(Json(serde_json::json!({ "recorded": inserted })))
+}
+
+#[derive(Debug, Serialize)]
+struct PurgeReviewResponse {
+    scope_fingerprint: String,
+    item_count: i64,
+    state: &'static str,
+    deadline_epoch: i64,
+}
+
+async fn review_purge_scope(
+    State(state): State<AppState>,
+    Path(fingerprint): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response> {
+    require_destructive_operator(&state, &headers)?;
+    if !is_fingerprint(&fingerprint) {
+        return Err(Error::BadRequest(
+            "retention job reference is invalid".into(),
+        ));
+    }
+    let row = sqlx::query(
+        "SELECT job.job_id,job.state,extract(epoch FROM job.deadline_at)::bigint AS deadline_epoch, \
+                count(item.resource_id) AS item_count \
+         FROM cloud_retention_jobs job LEFT JOIN cloud_retention_scope_items item USING(job_id) \
+         WHERE job.operator_fingerprint=$1 AND job.scope_kind IN ('personal','shared_organisation') \
+         GROUP BY job.job_id",
+    )
+    .bind(&fingerprint)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| Error::NotFound("retention job not found".into()))?;
+    let job_id: String = row.try_get("job_id")?;
+    let scope_fingerprint = retention::review_scope_fingerprint(&state.pool, &job_id)
+        .await
+        .map_err(map_retention_error)?;
+    let response = PurgeReviewResponse {
+        scope_fingerprint,
+        item_count: row.try_get("item_count")?,
+        state: safe_state(&row.try_get::<String, _>("state")?),
+        deadline_epoch: row.try_get("deadline_epoch")?,
+    };
+    no_store(Json(response))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovePurgeRequest {
+    operator: String,
+    scope_fingerprint: String,
+    evidence_id: String,
+}
+
+async fn approve_purge(
+    State(state): State<AppState>,
+    Path(fingerprint): Path<String>,
+    headers: HeaderMap,
+    body: std::result::Result<Json<ApprovePurgeRequest>, JsonRejection>,
+) -> Result<Response> {
+    require_destructive_operator(&state, &headers)?;
+    if !is_fingerprint(&fingerprint) {
+        return Err(Error::BadRequest(
+            "retention job reference is invalid".into(),
+        ));
+    }
+    let Json(body) = body.map_err(|_| Error::BadRequest("invalid purge approval".into()))?;
+    validate_operator(&body.operator)?;
+    let job_id: Option<String> = sqlx::query_scalar(
+        "SELECT job_id FROM cloud_retention_jobs WHERE operator_fingerprint=$1 \
+         AND scope_kind IN ('personal','shared_organisation')",
+    )
+    .bind(&fingerprint)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some(job_id) = job_id else {
+        return Err(Error::NotFound("retention job not found".into()));
+    };
+    let release_sha = state.cloud_retention_build_sha.as_deref().ok_or_else(|| {
+        Error::NotConfigured("Cloud retention release identity is unavailable".into())
+    })?;
+    let stored_fingerprint = retention::approve_purge(
+        &state.pool,
+        &job_id,
+        &body.scope_fingerprint,
+        &body.evidence_id,
+        &body.operator,
+        release_sha,
+    )
+    .await
+    .map_err(map_retention_error)?;
+    no_store(Json(
+        serde_json::json!({ "approved": true, "scope_fingerprint": stored_fingerprint }),
+    ))
+}
+
+fn require_destructive_operator(state: &AppState, headers: &HeaderMap) -> Result<()> {
+    if !state.cloud_retention_purge_enabled {
+        return Err(Error::NotConfigured(
+            "Cloud retention purge is disabled".into(),
+        ));
+    }
+    let expected = state
+        .cloud_retention_destructive_token
+        .as_deref()
+        .ok_or_else(|| {
+            Error::NotConfigured("Cloud retention destructive controls are disabled".into())
+        })?;
+    let provided = bearer_token(headers).ok_or(Error::Unauthorized)?;
+    if !token_matches(expected, provided) {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
+}
+
+fn validate_operator(operator: &str) -> Result<()> {
+    if operator.trim().is_empty() || operator.len() > 80 || operator.chars().any(char::is_control) {
+        return Err(Error::BadRequest("operator label is invalid".into()));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -178,7 +351,10 @@ struct JobSummary {
     dry_run_completed_at_epoch: Option<i64>,
     planned_items: i64,
     dry_run_items: i64,
+    deleted_items: i64,
     held_items: i64,
+    purge_enabled: bool,
+    purge_approval: &'static str,
     hold_reason: Option<&'static str>,
 }
 
@@ -209,7 +385,7 @@ async fn list_jobs(
     }
     let state_rows = sqlx::query(
         "SELECT state, count(*) AS count FROM cloud_retention_jobs \
-         WHERE scope_kind='personal' GROUP BY state ORDER BY state",
+         WHERE scope_kind IN ('personal','shared_organisation','orphan_organisation') GROUP BY state ORDER BY state",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -226,11 +402,11 @@ async fn list_jobs(
     let hold_rows = sqlx::query(
         "SELECT reason, sum(count) AS count FROM ( \
            SELECT hold_code AS reason, count(*) AS count FROM cloud_retention_jobs \
-             WHERE scope_kind='personal' AND hold_code IS NOT NULL GROUP BY hold_code \
+             WHERE scope_kind IN ('personal','shared_organisation','orphan_organisation') AND hold_code IS NOT NULL GROUP BY hold_code \
            UNION ALL \
            SELECT item.hold_code AS reason, count(*) AS count \
              FROM cloud_retention_scope_items item JOIN cloud_retention_jobs job USING(job_id) \
-             WHERE job.scope_kind='personal' AND item.state='held' AND item.hold_code IS NOT NULL \
+             WHERE job.scope_kind IN ('personal','shared_organisation','orphan_organisation') AND item.state='held' AND item.hold_code IS NOT NULL \
              GROUP BY item.hold_code \
          ) holds GROUP BY reason ORDER BY reason",
     )
@@ -247,15 +423,18 @@ async fn list_jobs(
         })
         .collect();
     let mut rows = sqlx::query(
-        "SELECT j.operator_fingerprint, j.state, \
+        "SELECT j.operator_fingerprint, j.state,j.purge_enabled, \
+                (SELECT approval.state FROM cloud_retention_purge_approvals approval \
+                 WHERE approval.job_id=j.job_id ORDER BY approval.approved_at DESC LIMIT 1) AS purge_approval, \
                 extract(epoch from j.deadline_at)::bigint AS deadline_epoch, \
                 extract(epoch from j.dry_run_completed_at)::bigint AS dry_run_completed_at_epoch, \
                 j.hold_code, \
                 count(*) FILTER (WHERE i.state='planned') AS planned_items, \
                 count(*) FILTER (WHERE i.state='dry_run') AS dry_run_items, \
+                count(*) FILTER (WHERE i.state='deleted') AS deleted_items, \
                 count(*) FILTER (WHERE i.state='held') AS held_items \
          FROM cloud_retention_jobs j LEFT JOIN cloud_retention_scope_items i USING(job_id) \
-         WHERE j.scope_kind='personal' AND ($1::text IS NULL OR j.operator_fingerprint COLLATE \"C\" > $1 COLLATE \"C\") \
+         WHERE j.scope_kind IN ('personal','shared_organisation','orphan_organisation') AND ($1::text IS NULL OR j.operator_fingerprint COLLATE \"C\" > $1 COLLATE \"C\") \
          GROUP BY j.job_id ORDER BY j.operator_fingerprint COLLATE \"C\" LIMIT $2",
     )
     .bind(query.after.as_deref())
@@ -276,7 +455,10 @@ async fn list_jobs(
                 dry_run_completed_at_epoch: row.try_get("dry_run_completed_at_epoch")?,
                 planned_items: row.try_get("planned_items")?,
                 dry_run_items: row.try_get("dry_run_items")?,
+                deleted_items: row.try_get("deleted_items")?,
                 held_items: row.try_get("held_items")?,
+                purge_enabled: row.try_get("purge_enabled")?,
+                purge_approval: safe_approval(&row.try_get::<Option<String>, _>("purge_approval")?),
                 hold_reason: row
                     .try_get::<Option<String>, _>("hold_code")?
                     .as_deref()
@@ -338,7 +520,7 @@ async fn apply_action(
     };
     let job_id: Option<String> = sqlx::query_scalar(
         "SELECT job_id FROM cloud_retention_jobs \
-         WHERE operator_fingerprint=$1 AND scope_kind='personal'",
+         WHERE operator_fingerprint=$1 AND scope_kind IN ('personal','shared_organisation','orphan_organisation')",
     )
     .bind(&fingerprint)
     .fetch_optional(&state.pool)
@@ -419,9 +601,43 @@ fn safe_reason(value: &str) -> &'static str {
         "resource_missing" => "resource_missing",
         "resource_identity_changed" => "resource_identity_changed",
         "unsupported_scope" => "unsupported_scope",
+        "owner_admin_still_eligible" => "owner_admin_still_eligible",
+        "owner_admin_eligibility_unproven" => "owner_admin_eligibility_unproven",
+        "owner_admin_population_exceeds_bound" => "owner_admin_population_exceeds_bound",
+        "owner_admin_missing" => "owner_admin_missing",
+        "orphan_without_owner_admin" => "orphan_without_owner_admin",
+        "no_verified_owner_contact" => "no_verified_owner_contact",
+        "notice_evidence_incomplete" => "notice_evidence_incomplete",
+        "notice_window_elapsed" => "notice_window_elapsed",
+        "organisation_deletion_active" => "organisation_deletion_active",
+        "ownership_transition_pending" => "ownership_transition_pending",
+        "organisation_missing" => "organisation_missing",
+        "organisation_not_active" => "organisation_not_active",
+        "scope_generation_missing" => "scope_generation_missing",
+        "scope_generation_changed" => "scope_generation_changed",
+        "eligibility_boundary_changed" => "eligibility_boundary_changed",
+        "unsupported_resource_kind" => "unsupported_resource_kind",
         "scope_owner_missing" => "scope_owner_missing",
         "episode_superseded" => "episode_superseded",
+        "restore_evidence_stale" => "restore_evidence_stale",
+        "purge_approval_missing" => "purge_approval_missing",
+        "purge_release_identity_changed" => "purge_release_identity_changed",
+        "purge_journal_changed" => "purge_journal_changed",
+        "purge_policy_changed" => "purge_policy_changed",
+        "retention_scope_owner_missing" => "retention_scope_owner_missing",
+        "free_share_promise_after_deadline" => "free_share_promise_after_deadline",
         _ => "other",
+    }
+}
+
+fn safe_approval(value: &Option<String>) -> &'static str {
+    match value.as_deref() {
+        Some("active") => "active",
+        Some("stale") => "stale",
+        Some("revoked") => "revoked",
+        Some("completed") => "completed",
+        None => "none",
+        _ => "unknown",
     }
 }
 
