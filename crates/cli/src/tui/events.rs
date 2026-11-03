@@ -123,6 +123,12 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
     }
 
     if app.search_mode {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+            app.search_query.clear();
+            app.apply_filter();
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Esc => {
                 app.search_query.clear();
@@ -397,10 +403,80 @@ mod tests {
             assert!(app.selected_secret().is_some());
         });
     }
+    #[test]
+    fn ctrl_u_clears_search_and_keeps_search_mode() {
+        with_search_app(|app| {
+            search_for(app, "api");
 
+            assert_eq!(app.search_query, "api");
+            assert_eq!(filtered_names(app), vec!["API_KEY"]);
+
+            handle_key_event(
+                app,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            )
+            .unwrap();
+
+            assert_eq!(app.search_query, "");
+            assert!(app.search_mode);
+            assert_eq!(
+                filtered_names(app),
+                vec!["API_KEY", "DATABASE_URL", "DATA_DIR"]
+            );
+
+            handle_key_event(app, key(KeyCode::Char('d'))).unwrap();
+
+            assert_eq!(app.search_query, "d");
+            assert!(app.search_mode);
+            assert_eq!(filtered_names(app), vec!["DATABASE_URL", "DATA_DIR"]);
+        });
+    }
+    #[test]
+    fn ctrl_u_restores_list_after_no_match_search() {
+        with_search_app(|app| {
+            search_for(app, "does-not-exist");
+
+            assert!(filtered_names(app).is_empty());
+
+            handle_key_event(
+                app,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            )
+            .unwrap();
+
+            assert_eq!(app.search_query, "");
+            assert!(app.search_mode);
+            assert_eq!(
+                filtered_names(app),
+                vec!["API_KEY", "DATABASE_URL", "DATA_DIR"]
+            );
+        });
+    }
+    #[test]
+    fn ctrl_u_with_empty_query_keeps_search_mode() {
+        with_search_app(|app| {
+            search_for(app, "");
+
+            assert_eq!(app.search_query, "");
+            assert!(app.search_mode);
+
+            handle_key_event(
+                app,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            )
+            .unwrap();
+
+            assert_eq!(app.search_query, "");
+            assert!(app.search_mode);
+            assert_eq!(
+                filtered_names(app),
+                vec!["API_KEY", "DATABASE_URL", "DATA_DIR"]
+            );
+        });
+    }
     #[test]
     fn search_shortcuts_are_query_text() {
-        for character in ['q', 'c', 'r', 't', '?'] {
+        for character in ['q', 'c', 'r', 't', 'u', '?'] {
             with_search_app(|app| {
                 search_for(app, &character.to_string());
                 assert_eq!(app.search_query, character.to_string());
