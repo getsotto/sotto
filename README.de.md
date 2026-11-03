@@ -154,7 +154,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -172,7 +172,7 @@ Matrix-, Windows- und Reusable-Workflow-Beispiele.
 
 Lust auf eine lauffähige Demo? [**sotto-example**](https://github.com/getsotto/sotto-example)
 zeigt lokale Secret-Injektion mit einem Python-GIF und kopierbaren Schritten, plus winzige Beispiele
-in JavaScript, TypeScript, Java, C#, PHP, Go und C++. Kein Konto erforderlich; die Anleitungen decken
+in JavaScript, TypeScript, Java, C#, PHP, Go, Rust und C++. Kein Konto erforderlich; die Anleitungen decken
 macOS, Linux und Windows ab.
 
 ```sh
@@ -293,6 +293,37 @@ Um einen früheren Wert zurückzuholen, siehe [Eine frühere Secret-Version wied
 Dieser Verlauf stammt vom Server und hilft daher nur bei Werten, die Sie bereits hochgeladen hatten. Führen Sie
 `sotto import --help` aus, um die Regeln für Anführungszeichen und literale Werte nachzulesen, statt sie hier zu wiederholen.
 
+### Ein Secret entfernen
+
+Um ein veraltetes Secret aus `staging` zu entfernen, ohne die Standardumgebung zu ändern:
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` entfernt das Secret aus der gewählten Umgebung im lokalen Tresor.
+`sotto push` synchronisiert die Entfernung nach `sotto login` mit dem Server.
+Führe `sotto pull` für dieselbe Umgebung auf einem anderen Gerät aus, um die
+Entfernung zu übernehmen. Der letzte Befehl gehört auf das andere Gerät.
+
+Im interaktiven Terminal öffnet `sotto rm` ohne Namen die Secret-Auswahl.
+Danach wird eine Bestätigung abgefragt, wobei Nein voreingestellt ist;
+Abbrechen oder Ablehnen lässt das Secret unverändert. `--yes` (oder `-y`)
+überspringt nur die Bestätigung, nicht die Auswahl bei fehlendem Namen oder
+eine erforderliche Entsperrabfrage.
+
+Interaktive Abfragen erfordern Terminals für stdin, stdout und stderr, einen
+`TERM`-Wert ungleich »dumb« und eine inaktive `CI`-Umgebung. Ohne interaktives
+Terminal ist ein Name erforderlich; das benannte Secret wird auch ohne `--yes`
+ohne Bestätigungsfrage entfernt.
+
+Entfernte Secrets erscheinen nicht mehr in normalen Abfragen oder Listen;
+der Versionsverlauf bleibt jedoch erhalten. Das ist keine sichere Löschung und
+widerruft keine Zugangsdaten beim externen Anbieter. Zur Wiederherstellung
+dienen `sotto history` und `sotto rollback`.
+
 ### Ein Secret teilen
 
 `sotto share` verschlüsselt ein Secret in einen Einmal-Link. Der Schlüssel steht im Link hinter dem
@@ -338,6 +369,31 @@ sotto shares revoke <token>  # the token is the part of the link between /s/ and
 
 `sotto shares ls` zeigt nie das Chiffrat oder den Schlüssel im Link.
 
+Achte auf den Plural: `sotto share` erstellt einen Link, `sotto shares` verwaltet die Links, die du
+erstellt hast. Beide sprechen mit dem konfigurierten Server und brauchen daher `sotto login`; der
+lokale Tresor muss nicht entsperrt sein. Eine Auflistung sieht so aus (synthetisches Token,
+Beispielwerte):
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Übergib die erste Spalte an `sotto shares revoke`. Das ist das öffentliche Token, nicht der ganze
+Link: Bei `https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...` übergibst du nur
+`3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` und nie etwas nach dem `#`. Die Auflistung liest nur Metadaten. Sie öffnet
+keinen Link, verbraucht keinen Aufruf und kann dir keinen Link wiederherstellen, weil der Schlüssel
+nach dem `#` den Server nie erreicht hat.
+
+`sotto shares ls --json` gibt ein Objekt statt eines reinen Arrays aus: `active_free_count` und
+`links`, wobei jeder Link `token`, `share_class`, `max_views`, `view_count`, `expires_at`,
+`revoked_at` und `created_at` enthält. Der Server liefert nur deine 100 neuesten Links, das ist also
+keine vollständige Historie.
+
+Widerrufen verhindert künftige Abrufe über den Link. Ein bereits erfolgter Abruf lässt sich nicht
+rückgängig machen: Wenn der Empfänger das Secret schon angezeigt haben könnte, ändere es an der
+Quelle.
+
 ### Im Team arbeiten
 
 Teams teilen Umgebungen über eine Organisation. Jedes Mitglied erhält eine eigene versiegelte Kopie
@@ -352,11 +408,29 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prin
 sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
 
-Das Mitglied führt den ausgegebenen Befehl in seiner eigenen Arbeitskopie aus:
+Danach führt das Mitglied den ausgegebenen Befehl aus. Das ist etwas anderes als **Ein weiteres Gerät**, wo du dein eigenes Konto auf einem zweiten Rechner
+wiederherstellst. Das Mitglied nutzt sein eigenes Konto auf demselben Server: Es führt `sotto login`
+und `sotto unlock` aus und dann den ausgegebenen Befehl in einem Verzeichnis, das noch keine
+`sotto.toml` enthält:
 
 ```sh
+mkdir acme-api && cd acme-api
 sotto clone <project-id> <env-id> --org <org-id>
 ```
+
+Mitgliedschaft in der Organisation und Zugriff auf eine Umgebung sind getrennte Schritte.
+`sotto org invite` macht jemanden zum Mitglied, `sotto grant <user-id>` gibt ihm eine Umgebung. Wenn
+du die Benutzer-ID nicht mehr hast, zeigt sie `sotto org members <org-id>` an. `sotto clone` gewährt
+selbst keinen Zugriff: Es holt den vorhandenen Grant des Mitglieds, lädt diese Umgebung und schreibt
+`sotto.toml`. Ohne Grant bricht es mit
+`you have not been granted this environment (ask an admin to share it)` ab, und ein Admin muss für
+das Mitglied `sotto grant` ausführen. Gib dein Emergency Kit nie an Teammitglieder weiter; es
+entsperrt dein Konto, nicht ihres.
+
+Behalte `--org` aus dem ausgegebenen Befehl bei, denn es speichert die besitzende Organisation, damit
+spätere Pushes zum Server passen. `--as <environment-name>` und `--name <project-label>` setzen nur
+lokale Bezeichnungen: Standardmäßig behält die Umgebung ihren echten Namen und das Projekt heißt
+`shared`.
 
 Um zu sehen, wer Zugriff hat, jemanden zu entfernen oder den Schlüssel einer Umgebung selbst zu rotieren:
 
@@ -517,6 +591,43 @@ Ohne `sotto.toml` und ohne lokale Identität:
 ```
 
 Fehlt `sotto.toml`, ist kein Projekt ausgewählt. Eine fehlerhafte oder unlesbare Datei führt zu einem Fehler.
+
+### Sperren, entsperren und abmelden
+
+Bei einer bereits initialisierten lokalen Identität kannst du den Tresor sperren,
+seinen Status prüfen und ihn bei Bedarf wieder entsperren:
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` löscht die zwischengespeicherte lokale Hauptschlüssel-Sitzung, die
+nachfolgende CLI-Befehle verwenden. Deine Identität, der verschlüsselte Tresor und
+die gespeicherte Anmeldung am Synchronisierungsserver bleiben erhalten.
+`sotto unlock` verwendet dein Hauptpasswort, wenn keine gültige Sitzung im Cache
+vorliegt. Befehle, die lokale Daten entschlüsseln müssen, fordern bei Bedarf
+ebenfalls zum Entsperren auf. Die Statusfelder erklärt
+[Lokalen Status prüfen](#lokalen-status-prüfen).
+
+Die lokale Sitzung gilt 12 Stunden ab dem Zwischenspeichern des Schlüssels, nicht
+ab deiner letzten Aktivität. Der Ablauf wird beim Lesen des Schlüssels aus dem
+Cache geprüft. `sotto unlock` verlängert diese Dauer nicht, wenn der Tresor bereits
+entsperrt ist. Weder Sperren noch Ablauf löschen Klartext, den laufende Anwendungen
+bereits enthalten.
+
+Um auch die gespeicherte CLI-Anmeldung am Synchronisierungsserver zu löschen,
+führe beide Befehle aus:
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` entfernt das gespeicherte Server-Sitzungstoken der CLI, unabhängig
+vom lokalen Entsperr-Cache. Browser-Sitzungen und andere Geräte werden dadurch
+nicht abgemeldet.
 
 ### Cloud-Status
 

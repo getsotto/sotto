@@ -6197,6 +6197,7 @@ async fn retired_source_leaves_new_snapshots_but_historical_replay_intact() {
             &old_source.source_id,
             "schedule:premature",
             ended_at + 10_000,
+            ended_at,
         )
         .await,
         Err(ReconciliationError::InvalidSource(_))
@@ -6212,6 +6213,7 @@ async fn retired_source_leaves_new_snapshots_but_historical_replay_intact() {
         &fixture.beneficiary_id,
         &old_source.source_id,
         "schedule:transfer",
+        ended_at,
         ended_at,
     )
     .await
@@ -6233,6 +6235,7 @@ async fn retired_source_leaves_new_snapshots_but_historical_replay_intact() {
         &fixture.beneficiary_id,
         &old_source.source_id,
         "schedule:transfer",
+        ended_at,
         ended_at,
     )
     .await
