@@ -13,7 +13,13 @@ unlock, TeamPanel, and Stripe checkout, exercised in a real browser.
 - The seed fixture example built, from the repo root: `cargo build -p sotto-cli --example e2e_seed`
   (the server binary doesn't need a separate manual build - see below).
 - The web app's production bundle built (`npm run build`, from `web/`).
+- Node-targeted crypto fixtures built (`npm run build:wasm:node`, from `web/`).
 - Playwright's browser binaries: `npx playwright install --with-deps chromium` (once).
+
+`recipient.spec.ts` covers share request counts with a mocked API and real WASM
+decryption, plus a protected one-view link against the isolated server. Run just
+these checks with `npm run e2e -- recipient.spec.ts` after the same setup below.
+
 
 Then, from `web/`:
 
