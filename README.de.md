@@ -674,6 +674,9 @@ Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht 
 
 Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
 
+Wie du die persönliche Abrechnung auf der Sotto-Cloud-Kontoseite an eine Organisation übergibst,
+steht in der [Anleitung zur Abrechnungsübertragung](CLOUD-BILLING-TRANSFER.md).
+
 ### Ausgabe-Themes
 
 Die CLI enthält fünf integrierte Themes: `nord` (die Standardeinstellung), `sordino`,
