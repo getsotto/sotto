@@ -70,6 +70,16 @@ function member(userId: string, role: string): api.Member {
   return { userId, role, publicKey: null };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 beforeEach(() => {
   vi.resetAllMocks();
   vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: true, setupAvailable: true });
@@ -93,6 +103,116 @@ describe("payer transfer journeys", () => {
     await waitFor(() => expect(api.fetchPayerTransferCapabilities).toHaveBeenCalled());
     expect(view.container).toBeEmptyDOMElement();
   });
+
+
+  it("shows Declining while a decline request is in progress", async () => {
+    let resolveDecline!: (value: api.PayerTransfer) => void;
+
+    vi.mocked(api.withdrawPayerTransfer).mockReturnValue(
+      new Promise((resolve) => {
+        resolveDecline = resolve;
+      }),
+    );
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
+      transfers: [transfer()],
+      nextCursor: null,
+    });
+    render(<PayerTransferInbox />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Decline request" }),
+    );
+    expect(api.withdrawPayerTransfer).toHaveBeenCalledWith("transfer-1");
+    expect(
+      screen.getByRole("button", { name: "Declining…" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Accepting…" }),
+    ).not.toBeInTheDocument();
+    await act(async () => {
+      resolveDecline(
+        transfer({
+          state: "failed",
+          resultCode: "consent_withdrawn",
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Declining…" }),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  
+  it("clears the decline label after a failed request and successful recovery refresh", async () => {
+    let rejectDecline!: (error: Error) => void;
+
+    vi.mocked(api.withdrawPayerTransfer).mockReturnValue(
+      new Promise((_, reject) => {
+        rejectDecline = reject;
+      }),
+    );
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
+      transfers: [transfer()],
+      nextCursor: null,
+    });
+    vi.mocked(api.fetchPayerTransfer).mockResolvedValue(
+      transfer({ state: "awaiting_consent" }),
+    );
+    render(<PayerTransferInbox />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Decline request" }),
+    );
+    expect(
+      screen.getByRole("button", { name: "Declining…" }),
+    ).toBeInTheDocument();
+    await act(async () => {
+      rejectDecline(new Error("server error (503)"));
+    });
+    await waitFor(() => {
+      expect(api.fetchPayerTransfer).toHaveBeenCalledWith("transfer-1");
+      expect(screen.getByRole("button", { name: "Accept transfer request" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Decline request" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Declining…" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Accepting…" })).not.toBeInTheDocument();
+    });
+    expect(api.acceptPayerTransfer).not.toHaveBeenCalled();
+  });
+
+
+  it("shows Accepting while an acceptance request is in progress", async () => {
+    let resolveAccept!: (value: api.PayerTransfer) => void;
+
+    vi.mocked(api.acceptPayerTransfer).mockReturnValue(
+      new Promise((resolve) => {
+        resolveAccept = resolve;
+      }),
+    );
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
+      transfers: [transfer()],
+      nextCursor: null,
+    });
+    render(<PayerTransferInbox />);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Accept transfer request" }),
+    );
+    expect(api.acceptPayerTransfer).toHaveBeenCalledWith("transfer-1");
+    expect(
+      screen.getByRole("button", { name: "Accepting…" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Declining…" }),
+    ).not.toBeInTheDocument();
+    await act(async () => {
+      resolveAccept(transfer({ state: "pending" }));
+    });
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Accepting…" }),
+      ).not.toBeInTheDocument();
+    });
+  });
+
 
   it("lets the named counterparty accept an incoming invitation without claiming it is complete", async () => {
     vi.mocked(api.fetchPayerTransfers)
@@ -217,6 +337,248 @@ describe("payer transfer journeys", () => {
     }));
     await waitFor(() => expect(api.beginPayerTransfer).toHaveBeenCalledWith({ quote, idempotencyKey: expect.any(String) }));
     expect(await screen.findByText(/The other payer must accept it/)).toBeInTheDocument();
+  });
+
+  it("shows a recoverable error when the initial organisation lookup fails", async () => {
+    vi.mocked(api.fetchOrgs).mockRejectedValue(new Error("Synthetic network error"));
+    render(<PersonalTransferStart />);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/organisations could not be loaded/i);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    expect(screen.queryByLabelText("Organisation")).not.toBeInTheDocument();
+    expect(api.quotePayerTransfer).not.toHaveBeenCalled();
+    expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+  });
+
+  it("reloads initial data in place after a successful retry", async () => {
+    const firstOrgs = deferred<api.Org[]>();
+    vi.mocked(api.fetchOrgs).mockReturnValueOnce(firstOrgs.promise);
+    render(<PersonalTransferStart />);
+    await waitFor(() => expect(api.fetchPayerTransferCapabilities).toHaveBeenCalled());
+    await act(async () => { firstOrgs.reject(new Error("Synthetic network error")); });
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+
+    const retryOrgs = deferred<api.Org[]>();
+    vi.mocked(api.fetchOrgs).mockReturnValueOnce(retryOrgs.promise);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    const retrying = await screen.findByRole("button", { name: "Retrying…" });
+    expect(retrying).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent(/Loading organisations/i);
+    expect(api.quotePayerTransfer).not.toHaveBeenCalled();
+    expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+
+    fireEvent.click(retrying);
+    expect(api.fetchOrgs).toHaveBeenCalledTimes(2);
+
+    await act(async () => { retryOrgs.resolve([org("org-b", "member")]); });
+    expect(await screen.findByLabelText("Organisation")).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /org-b/ })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.quotePayerTransfer).not.toHaveBeenCalled();
+    expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+  });
+
+  it("keeps the personal transfer section recoverable after a repeated organisation failure", async () => {
+    vi.mocked(api.fetchOrgs)
+      .mockRejectedValueOnce(new Error("Synthetic network error"))
+      .mockRejectedValueOnce(new Error("Synthetic network error"));
+    render(<PersonalTransferStart />);
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/organisations could not be loaded/i);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    expect(screen.queryByLabelText("Organisation")).not.toBeInTheDocument();
+  });
+
+  it("still hides personal transfer start when the server reports transfers unavailable", async () => {
+    vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: false, setupAvailable: false });
+    const view = render(<PersonalTransferStart />);
+    await waitFor(() => expect(api.fetchPayerTransferCapabilities).toHaveBeenCalled());
+    expect(view.container).toBeEmptyDOMElement();
+    expect(api.fetchOrgs).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  });
+
+  it("retries administrator loading for the selected organisation without starting a transfer", async () => {
+    vi.mocked(api.fetchMembers).mockRejectedValueOnce(new Error("server error (503)"));
+    render(<PersonalTransferStart />);
+
+    const organisation = await screen.findByLabelText("Organisation");
+    fireEvent.change(organisation, { target: { value: "org-b" } });
+    expect(await screen.findByRole("alert")).toHaveTextContent("The transfer service is temporarily unavailable. Try again shortly.");
+    expect(organisation).toHaveValue("org-b");
+    expect(screen.getByLabelText("Other payer administrator")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Review payer transfer" })).toBeDisabled();
+    expect(api.fetchMembers).toHaveBeenCalledExactlyOnceWith("org-b");
+    expect(api.quotePayerTransfer).not.toHaveBeenCalled();
+    expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading administrators" }));
+
+    expect(await screen.findByRole("option", { name: "admin-2 · owner" })).toBeInTheDocument();
+    expect(api.fetchMembers).toHaveBeenCalledTimes(2);
+    expect(api.fetchMembers).toHaveBeenLastCalledWith("org-b");
+    expect(organisation).toHaveValue("org-b");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry loading administrators" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Review payer transfer" })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Other payer administrator"), { target: { value: "admin-2" } });
+    expect(screen.getByRole("button", { name: "Review payer transfer" })).toBeEnabled();
+    expect(api.quotePayerTransfer).not.toHaveBeenCalled();
+    expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+  });
+
+  it("keeps administrator retry single-flight and clears the old error while loading", async () => {
+    const first = deferred<api.Member[]>();
+    const retry = deferred<api.Member[]>();
+    vi.mocked(api.fetchMembers)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(retry.promise);
+    render(<PersonalTransferStart />);
+    const organisation = await screen.findByLabelText("Organisation");
+    fireEvent.change(organisation, { target: { value: "org-b" } });
+    expect(screen.getByRole("button", { name: "Loading administrators…" })).toBeDisabled();
+    expect(organisation).toBeDisabled();
+    expect(screen.getByLabelText("Other payer administrator")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Review payer transfer" })).toBeDisabled();
+
+    await act(async () => first.reject(new Error("server error (503)")));
+    const retryButton = screen.getByRole("button", { name: "Retry loading administrators" });
+    expect(retryButton).toBeEnabled();
+    act(() => {
+      fireEvent.click(retryButton);
+      fireEvent.click(retryButton);
+    });
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    const loading = screen.getByRole("button", { name: "Loading administrators…" });
+    expect(loading).toBeDisabled();
+    expect(organisation).toBeDisabled();
+    expect(organisation).toHaveValue("org-b");
+    expect(screen.getByLabelText("Other payer administrator")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Review payer transfer" })).toBeDisabled();
+    fireEvent.click(loading);
+    expect(api.fetchMembers).toHaveBeenCalledTimes(2);
+    expect(api.fetchMembers).toHaveBeenLastCalledWith("org-b");
+
+    await act(async () => retry.resolve([member("admin-2", "owner")]));
+    expect(screen.getByRole("option", { name: "admin-2 · owner" })).toBeInTheDocument();
+    expect(organisation).toBeEnabled();
+    expect(screen.getByLabelText("Other payer administrator")).toBeEnabled();
+    expect(screen.queryByRole("button", { name: "Loading administrators…" })).not.toBeInTheDocument();
+    expect(api.quotePayerTransfer).not.toHaveBeenCalled();
+    expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+  });
+
+  it("restores retry after another administrator failure and can recover on the next attempt", async () => {
+    const first = deferred<api.Member[]>();
+    const retry = deferred<api.Member[]>();
+    vi.mocked(api.fetchMembers)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(retry.promise);
+    render(<PersonalTransferStart />);
+    const organisation = await screen.findByLabelText("Organisation");
+    fireEvent.change(organisation, { target: { value: "org-b" } });
+    await act(async () => first.reject(new Error("server error (503)")));
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading administrators" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await act(async () => retry.reject(new Error("server error (403)")));
+    expect(screen.getByRole("alert")).toHaveTextContent("You do not have authority for this payer change.");
+    expect(screen.getByRole("button", { name: "Retry loading administrators" })).toBeEnabled();
+    expect(organisation).toHaveValue("org-b");
+    expect(organisation).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Review payer transfer" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry loading administrators" }));
+    expect(await screen.findByRole("option", { name: "admin-2 · owner" })).toBeInTheDocument();
+    expect(api.fetchMembers).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(api.fetchMembers).mock.calls).toEqual([["org-b"], ["org-b"], ["org-b"]]);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry loading administrators" })).not.toBeInTheDocument();
+    expect(api.quotePayerTransfer).not.toHaveBeenCalled();
+    expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+  });
+
+  it.each(["initial load", "retry"] as const)("treats an empty administrator %s as successful", async (phase) => {
+    const request = deferred<api.Member[]>();
+    if (phase === "retry") {
+      vi.mocked(api.fetchMembers).mockRejectedValueOnce(new Error("server error (503)"));
+    }
+    vi.mocked(api.fetchMembers).mockReturnValueOnce(request.promise);
+    render(<PersonalTransferStart />);
+    const organisation = await screen.findByLabelText("Organisation");
+    fireEvent.change(organisation, { target: { value: "org-b" } });
+    if (phase === "retry") {
+      fireEvent.click(await screen.findByRole("button", { name: "Retry loading administrators" }));
+    }
+    await act(async () => request.resolve([]));
+
+    expect(organisation).toHaveValue("org-b");
+    expect(organisation).toBeEnabled();
+    expect(screen.getByLabelText("Other payer administrator")).toHaveDisplayValue("Choose an organisation owner or admin");
+    expect(screen.queryByRole("option", { name: "admin-2 · owner" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry loading administrators" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Loading administrators…" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Review payer transfer" })).toBeDisabled();
+    expect(api.fetchMembers).toHaveBeenCalledTimes(phase === "retry" ? 2 : 1);
+    expect(api.quotePayerTransfer).not.toHaveBeenCalled();
+    expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+  });
+
+  it.each(["org-a", ""])("clears failed administrator recovery when selecting %j", async (nextOrganisation) => {
+    const next = deferred<api.Member[]>();
+    vi.mocked(api.fetchMembers)
+      .mockRejectedValueOnce(new Error("server error (503)"))
+      .mockReturnValueOnce(next.promise);
+    render(<PersonalTransferStart />);
+    const organisation = await screen.findByLabelText("Organisation");
+    fireEvent.change(organisation, { target: { value: "org-b" } });
+    expect(await screen.findByRole("button", { name: "Retry loading administrators" })).toBeEnabled();
+
+    fireEvent.change(organisation, { target: { value: nextOrganisation } });
+    expect(organisation).toHaveValue(nextOrganisation);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry loading administrators" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Review payer transfer" })).toBeDisabled();
+    if (nextOrganisation === "") {
+      expect(api.fetchMembers).toHaveBeenCalledTimes(1);
+      expect(screen.queryByLabelText("Other payer administrator")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Loading administrators…" })).not.toBeInTheDocument();
+    } else {
+      expect(api.fetchMembers).toHaveBeenCalledTimes(2);
+      expect(api.fetchMembers).toHaveBeenLastCalledWith("org-a");
+      expect(screen.getByRole("button", { name: "Loading administrators…" })).toBeDisabled();
+      await act(async () => next.resolve([member("admin-a", "admin")]));
+      expect(screen.getByRole("option", { name: "admin-a · admin" })).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(organisation).toBeEnabled();
+    }
+    expect(api.quotePayerTransfer).not.toHaveBeenCalled();
+    expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+  });
+
+  it.each(["quote", "submission"] as const)("does not offer administrator retry after a %s error", async (failure) => {
+    const operation = failure === "quote" ? api.quotePayerTransfer : api.beginPayerTransfer;
+    vi.mocked(operation).mockRejectedValueOnce(new Error("server error (503)"));
+    render(<PersonalTransferStart />);
+    const organisation = await screen.findByLabelText("Organisation");
+    fireEvent.change(organisation, { target: { value: "org-b" } });
+    await screen.findByRole("option", { name: "admin-2 · owner" });
+    fireEvent.change(screen.getByLabelText("Other payer administrator"), { target: { value: "admin-2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review payer transfer" }));
+    if (failure === "submission") {
+      await screen.findByText(/At renewal on/);
+      fireEvent.click(screen.getByRole("button", { name: "Send request for acceptance" }));
+    }
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("The transfer service is temporarily unavailable. Try again shortly.");
+    expect(screen.queryByRole("button", { name: "Retry loading administrators" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Loading administrators…" })).not.toBeInTheDocument();
+    expect(organisation).toHaveValue("org-b");
+    expect(screen.getByLabelText("Other payer administrator")).toHaveValue("admin-2");
+    expect(api.fetchMembers).toHaveBeenCalledExactlyOnceWith("org-b");
+    expect(screen.getByRole("button", { name: failure === "quote" ? "Review payer transfer" : "Send request for acceptance" })).toBeEnabled();
   });
 
   it("does not claim a second payer must accept when the caller can authorise both sides", async () => {

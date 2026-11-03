@@ -53,6 +53,7 @@ impl CancellationWorkerProvider {
             default_payment_method_id: None,
             subscription_id: subscription_id.into(),
             status: SubscriptionStatus::Active,
+            automatic_tax_enabled: false,
             cancel_at_period_end,
             cancel_at: None,
             current_period_start: Some(1_700_000_000),
