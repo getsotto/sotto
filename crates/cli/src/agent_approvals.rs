@@ -15,6 +15,24 @@ use crate::error::{Error, Result};
 const DIRECTORY: &str = "task-approvals";
 const DATABASE: &str = "approvals.db";
 const SCHEMA_VERSION: i64 = 1;
+const OPEN_LOCK_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+];
+
+enum SchemaInitialisationError {
+    Sqlite(rusqlite::Error),
+    UnsupportedVersion,
+}
+
+impl From<rusqlite::Error> for SchemaInitialisationError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sqlite(error)
+    }
+}
 
 /// Encode the canonical project root without losing non-UTF-8 filesystem bytes.
 pub fn project_root_key(path: &Path) -> String {
@@ -79,34 +97,15 @@ impl ApprovalStore {
 
         let mut connection = Connection::open(&path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: i64 =
-            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        match version {
-            0 => {
-                transaction.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS approvals (
-                        project_id TEXT NOT NULL CHECK (length(project_id) > 0),
-                        project_root TEXT NOT NULL CHECK (length(project_root) > 0),
-                        task_name TEXT NOT NULL CHECK (length(task_name) > 0),
-                        environment TEXT NOT NULL CHECK (length(environment) > 0),
-                        fingerprint TEXT NOT NULL CHECK (
-                            length(fingerprint) = 64 AND fingerprint NOT GLOB '*[^0-9a-f]*'
-                        ),
-                        created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                        PRIMARY KEY (project_id, project_root, task_name, environment)
-                    );
-                    PRAGMA user_version = 1;",
-                )?;
-            }
-            SCHEMA_VERSION => {}
-            _ => {
+        match initialise_schema_with_retry(&mut connection) {
+            Ok(()) => {}
+            Err(SchemaInitialisationError::Sqlite(error)) => return Err(error.into()),
+            Err(SchemaInitialisationError::UnsupportedVersion) => {
                 return Err(Error::Store(
                     "unsupported task approval data version".into(),
                 ))
             }
         }
-        transaction.commit()?;
 
         Ok(Self { connection })
     }
@@ -207,6 +206,62 @@ impl ApprovalStore {
         )?;
         Ok(deleted != 0)
     }
+}
+
+fn initialise_schema_with_retry(
+    connection: &mut Connection,
+) -> std::result::Result<(), SchemaInitialisationError> {
+    for delay in OPEN_LOCK_RETRY_DELAYS {
+        match initialise_schema(connection) {
+            Ok(()) => return Ok(()),
+            Err(SchemaInitialisationError::Sqlite(error)) if is_database_lock_error(&error) => {
+                std::thread::sleep(delay);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    initialise_schema(connection)
+}
+
+fn initialise_schema(
+    connection: &mut Connection,
+) -> std::result::Result<(), SchemaInitialisationError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    match version {
+        0 => {
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS approvals (
+                        project_id TEXT NOT NULL CHECK (length(project_id) > 0),
+                        project_root TEXT NOT NULL CHECK (length(project_root) > 0),
+                        task_name TEXT NOT NULL CHECK (length(task_name) > 0),
+                        environment TEXT NOT NULL CHECK (length(environment) > 0),
+                        fingerprint TEXT NOT NULL CHECK (
+                            length(fingerprint) = 64 AND fingerprint NOT GLOB '*[^0-9a-f]*'
+                        ),
+                        created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                        PRIMARY KEY (project_id, project_root, task_name, environment)
+                    );
+                    PRAGMA user_version = 1;",
+            )?;
+        }
+        SCHEMA_VERSION => {}
+        _ => return Err(SchemaInitialisationError::UnsupportedVersion),
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn is_database_lock_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 fn validate_scope(

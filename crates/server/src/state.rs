@@ -38,6 +38,19 @@ pub struct AppState {
     pub organisation_deletion_retention_days: i64,
     /// Bearer token for the protected organisation-deletion metrics exporter.
     pub organisation_deletion_metrics_token: Option<String>,
+    /// Dedicated bearer credential for protected, aggregate Cloud lifecycle diagnostics.
+    pub cloud_operations_metrics_token: Option<String>,
+    /// Separate write credential for provider-backed Cloud coverage repair.
+    pub cloud_coverage_repair_token: Option<String>,
+    pub provider_refresh_ingest_enabled: bool,
+    pub provider_refresh_worker_enabled: bool,
+    pub provider_refresh_reconciliation_enabled: bool,
+    pub provider_authority_revalidation_enabled: bool,
+    pub cloud_sales_enabled: bool,
+    pub founding_schedule_worker_enabled: bool,
+    pub founding_price_notices_enabled: bool,
+    pub billing_recovery_worker_enabled: bool,
+    pub sponsored_billing_recovery_worker_enabled: bool,
     /// Bearer token for the protected operator-observation endpoint.
     pub organisation_deletion_operator_token: Option<String>,
     /// Dedicated bearer token for protected payer-transfer manual review controls.
@@ -58,6 +71,16 @@ pub struct AppState {
     pub billing_transfer_setup_enabled: bool,
     /// Whether the dormant Cloud retention candidate and dry-run worker is started.
     pub cloud_retention_dry_run_enabled: bool,
+    /// Whether the shared organisation retention scanner and dry-run worker is started.
+    pub cloud_shared_retention_dry_run_enabled: bool,
     /// Dedicated bearer token for Cloud retention operator routes.
     pub cloud_retention_operator_token: Option<String>,
+    /// Whether a separately approved, bounded Cloud retention purge worker is active.
+    pub cloud_retention_purge_enabled: bool,
+    /// Destructive credential, independent from protected inspection controls.
+    pub cloud_retention_destructive_token: Option<String>,
+    /// HMAC key used to verify the protected restore evidence attestation.
+    pub cloud_retention_evidence_hmac_key: Option<String>,
+    /// Release identity bound to verified restore evidence.
+    pub cloud_retention_build_sha: Option<String>,
 }

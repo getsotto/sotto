@@ -29,6 +29,11 @@ use sotto_server::db;
 use sotto_server::error::{Error, Result};
 use sotto_server::state::AppState;
 
+#[cfg(all(feature = "e2e-stripe-test-clock", not(feature = "e2e-mock-oauth")))]
+compile_error!("e2e-stripe-test-clock requires e2e-mock-oauth");
+#[cfg(all(feature = "e2e-stripe-test-clock", feature = "e2e-mock-billing"))]
+compile_error!("e2e-stripe-test-clock cannot be combined with e2e-mock-billing");
+
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -38,6 +43,13 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
+    sotto_server::clock::validate_configuration().map_err(Error::Config)?;
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    eprintln!("warning: built with `e2e-stripe-test-clock`; test-clock checkout binding requires SOTTO_E2E_TEST_CLOCK_CHECKOUT_ENABLED=1 and an rk_test_ key");
+    #[cfg(feature = "e2e-test-clock")]
+    eprintln!(
+        "warning: built with `e2e-test-clock` - business time can be overridden. Never deploy this build."
+    );
     let config = Config::from_env()?;
     let pool = db::connect(&config.database_url).await?;
     db::migrate(&pool).await?;
@@ -247,6 +259,17 @@ async fn run() -> Result<()> {
         organisation_deletion_enabled: config.organisation_deletion_worker_enabled,
         organisation_deletion_retention_days: config.organisation_deletion_retention_days,
         organisation_deletion_metrics_token: config.organisation_deletion_metrics_token,
+        cloud_operations_metrics_token: config.cloud_operations_metrics_token,
+        cloud_coverage_repair_token: config.cloud_coverage_repair_token,
+        provider_refresh_ingest_enabled: config.provider_refresh_ingest_enabled,
+        provider_refresh_worker_enabled: config.provider_refresh_worker_enabled,
+        provider_refresh_reconciliation_enabled: config.provider_refresh_reconciliation_enabled,
+        provider_authority_revalidation_enabled: config.provider_authority_revalidation_enabled,
+        cloud_sales_enabled: config.cloud_sales_enabled,
+        founding_schedule_worker_enabled: config.founding_schedule_worker_enabled,
+        founding_price_notices_enabled: config.founding_price_notices_enabled,
+        billing_recovery_worker_enabled: config.billing_recovery_worker_enabled,
+        sponsored_billing_recovery_worker_enabled: config.sponsored_billing_recovery_worker_enabled,
         organisation_deletion_operator_token: config.organisation_deletion_operator_token,
         billing_transfer_operator_token: config.billing_transfer_operator_token,
         cloud_action_enforcement_enabled: config.cloud_action_enforcement_enabled,
@@ -258,7 +281,12 @@ async fn run() -> Result<()> {
         billing_transfer_execution_enabled: config.billing_transfer_execution_enabled,
         billing_transfer_setup_enabled: config.billing_transfer_setup_enabled,
         cloud_retention_dry_run_enabled: config.cloud_retention_dry_run_enabled,
+        cloud_shared_retention_dry_run_enabled: config.cloud_shared_retention_dry_run_enabled,
         cloud_retention_operator_token: config.cloud_retention_operator_token.clone(),
+        cloud_retention_purge_enabled: config.cloud_retention_purge_enabled,
+        cloud_retention_destructive_token: config.cloud_retention_destructive_token.clone(),
+        cloud_retention_evidence_hmac_key: config.cloud_retention_evidence_hmac_key.clone(),
+        cloud_retention_build_sha: config.cloud_retention_build_sha.clone(),
     };
 
     println!("deployment mode: {}", config.deployment_mode.as_str());
@@ -334,6 +362,10 @@ async fn run() -> Result<()> {
         "Cloud personal retention dry run: {}",
         config.cloud_retention_dry_run_enabled
     );
+    println!(
+        "Cloud shared organisation retention dry run: {}",
+        config.cloud_shared_retention_dry_run_enabled
+    );
 
     // Default-on telemetry must never be a surprise: say so at boot, with the off switch.
     if config.telemetry.ping_enabled && !config.telemetry.ingest_enabled {
@@ -359,7 +391,7 @@ async fn run() -> Result<()> {
         })?;
         sotto_server::sponsored_billing_recovery_executor::spawn(pool.clone(), billing);
     }
-    if config.cloud_retention_dry_run_enabled {
+    if config.cloud_retention_dry_run_enabled || config.cloud_shared_retention_dry_run_enabled {
         sotto_server::cloud_retention_lifecycle::spawn(state.clone());
     }
     if config.founding_schedule_worker_enabled {

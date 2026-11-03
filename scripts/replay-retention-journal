@@ -20,8 +20,9 @@ import urllib.parse
 from dataclasses import dataclass
 
 MAX_LINE_BYTES = 16 * 1024
-FORMAT_VERSION = 1
-RESOURCE_KINDS = {"project", "environment", "share"}
+FORMAT_VERSION = 2
+LEGACY_RESOURCE_KINDS = {"project", "environment", "share"}
+RESOURCE_KINDS = LEGACY_RESOURCE_KINDS | {"grant", "machine_token"}
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ class Entry:
     journal_id: str
     resource_kind: str
     resource_id: str
+    ownership_kind: str
     expected_owner_id: str
     expected_created_at: int
     expected_revision: int | None
@@ -85,16 +87,39 @@ def parse_journal(path: str) -> list[Entry]:
             owner = value["expected_owner_id"]
             created_at = value["expected_created_at"]
             revision = value["expected_revision"]
-            if value["format_version"] != FORMAT_VERSION:
+            version = value["format_version"]
+            if not isinstance(version, int) or isinstance(version, bool) or version not in (1, FORMAT_VERSION):
                 raise ValueError(f"journal line {line_number} has an unsupported format version")
             if not all(isinstance(item, str) and item and "\n" not in item for item in (journal_id, resource_kind, resource_id)):
                 raise ValueError(f"journal line {line_number} has an invalid identity")
             if journal_id in seen_journal_ids:
                 raise ValueError(f"journal line {line_number} repeats journal_id")
-            if resource_kind not in RESOURCE_KINDS:
+            if not isinstance(resource_kind, str) or resource_kind not in (
+                LEGACY_RESOURCE_KINDS if version == 1 else RESOURCE_KINDS
+            ):
                 raise ValueError(f"journal line {line_number} has an unsupported resource kind")
-            if value["ownership_kind"] != "personal" or not isinstance(owner, str) or not owner:
-                raise ValueError(f"journal line {line_number} is not a personal tombstone")
+            ownership_kind = value["ownership_kind"]
+            allowed_ownership = {"personal"} if version == 1 else {"personal", "shared"}
+            if (
+                not isinstance(ownership_kind, str)
+                or ownership_kind not in allowed_ownership
+                or not isinstance(owner, str)
+                or not owner
+            ):
+                raise ValueError(f"journal line {line_number} has an unsupported ownership kind")
+            if resource_kind == "share" and ownership_kind != "personal":
+                raise ValueError(f"journal line {line_number} has an invalid share owner")
+            if resource_kind in {"grant", "machine_token"}:
+                try:
+                    composite_id = json.loads(resource_id)
+                except json.JSONDecodeError as error:
+                    raise ValueError(f"journal line {line_number} has an invalid composite identity") from error
+                if (
+                    not isinstance(composite_id, list)
+                    or len(composite_id) != 2
+                    or any(not isinstance(part, str) or not part for part in composite_id)
+                ):
+                    raise ValueError(f"journal line {line_number} has an invalid composite identity")
             if not isinstance(created_at, int) or isinstance(created_at, bool) or created_at <= 0:
                 raise ValueError(f"journal line {line_number} has an invalid creation time")
             if revision is not None and (not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0):
@@ -106,7 +131,9 @@ def parse_journal(path: str) -> list[Entry]:
                 raise ValueError(f"journal line {line_number} repeats a tombstone identity")
             seen_journal_ids.add(journal_id)
             seen_tombstones.add(identity)
-            entries.append(Entry(journal_id, resource_kind, resource_id, owner, created_at, revision))
+            entries.append(
+                Entry(journal_id, resource_kind, resource_id, ownership_kind, owner, created_at, revision)
+            )
     return entries
 
 
@@ -118,6 +145,7 @@ def copy_csv(entries: list[Entry]) -> str:
             (
                 entry.resource_kind,
                 entry.resource_id,
+                entry.ownership_kind,
                 entry.expected_owner_id,
                 entry.expected_created_at,
                 "" if entry.expected_revision is None else entry.expected_revision,
@@ -132,32 +160,54 @@ BEGIN;
 CREATE TEMP TABLE retention_replay (
     resource_kind text NOT NULL,
     resource_id text NOT NULL,
+    ownership_kind text NOT NULL,
     owner_id text NOT NULL,
     expected_created_at bigint NOT NULL,
     expected_revision bigint
 );
 COPY retention_replay FROM STDIN WITH (FORMAT csv);
 {rows}\\.
+DELETE FROM environment_grants g
+USING retention_replay r, environments e, projects p
+WHERE r.resource_kind = 'grant'
+  AND g.env_id = (r.resource_id::jsonb ->> 0)
+  AND g.user_id = (r.resource_id::jsonb ->> 1)
+  AND e.id = g.env_id
+  AND p.id = e.project_id
+  AND (extract(epoch FROM g.created_at) * 1000000)::bigint = r.expected_created_at
+  AND ((r.ownership_kind = 'personal' AND p.owner_id = r.owner_id AND p.org_id IS NULL)
+       OR (r.ownership_kind = 'shared' AND p.org_id = r.owner_id));
+DELETE FROM machine_tokens m
+USING retention_replay r, environments e, projects p
+WHERE r.resource_kind = 'machine_token'
+  AND m.id = (r.resource_id::jsonb ->> 0)
+  AND m.env_id = (r.resource_id::jsonb ->> 1)
+  AND e.id = m.env_id
+  AND p.id = e.project_id
+  AND (extract(epoch FROM m.created_at) * 1000000)::bigint = r.expected_created_at
+  AND ((r.ownership_kind = 'personal' AND p.owner_id = r.owner_id AND p.org_id IS NULL)
+       OR (r.ownership_kind = 'shared' AND p.org_id = r.owner_id));
 DELETE FROM environments e
 USING retention_replay r, projects p
 WHERE r.resource_kind = 'environment'
   AND e.id = r.resource_id
   AND e.project_id = p.id
-  AND p.owner_id = r.owner_id
-  AND p.org_id IS NULL
+  AND ((r.ownership_kind = 'personal' AND p.owner_id = r.owner_id AND p.org_id IS NULL)
+       OR (r.ownership_kind = 'shared' AND p.org_id = r.owner_id))
   AND (extract(epoch FROM e.created_at) * 1000000)::bigint = r.expected_created_at
   AND (r.expected_revision IS NULL OR e.revision = r.expected_revision);
 DELETE FROM projects p
 USING retention_replay r
 WHERE r.resource_kind = 'project'
   AND p.id = r.resource_id
-  AND p.owner_id = r.owner_id
-  AND p.org_id IS NULL
+  AND ((r.ownership_kind = 'personal' AND p.owner_id = r.owner_id AND p.org_id IS NULL)
+       OR (r.ownership_kind = 'shared' AND p.org_id = r.owner_id))
   AND (extract(epoch FROM p.created_at) * 1000000)::bigint = r.expected_created_at;
 DELETE FROM share_links s
 USING retention_replay r
 WHERE r.resource_kind = 'share'
   AND s.id = r.resource_id
+  AND r.ownership_kind = 'personal'
   AND s.created_by = r.owner_id
   AND (extract(epoch FROM s.created_at) * 1000000)::bigint = r.expected_created_at;
 SELECT count(*) FROM retention_replay;

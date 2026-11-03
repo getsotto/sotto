@@ -90,6 +90,12 @@ jobs:
           # could pair it with the ciphertext just fetched. Refusing is what makes "this job
           # cannot decrypt the canary" true rather than merely intended.
           SOTTO_CANARY_TOKEN: ${{ secrets.SOTTO_CANARY_TOKEN }}
+          # Optional ordinary-user session for a dedicated canary account which can read only
+          # synthetic ciphertext. This is a regular st_ session bearer, not a bypass credential;
+          # never pair it with any user's real project or crypto material.
+          SOTTO_HUMAN_CANARY_TOKEN: ${{ secrets.SOTTO_HUMAN_CANARY_TOKEN }}
+          # Synthetic environment id is configuration, not published status data.
+          SOTTO_HUMAN_CANARY_ENVIRONMENT_ID: ${{ vars.SOTTO_HUMAN_CANARY_ENVIRONMENT_ID }}
         run: |
           set -euo pipefail
           if [ -z "$BASE_URL" ]; then

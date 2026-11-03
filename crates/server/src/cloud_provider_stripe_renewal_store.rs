@@ -380,7 +380,6 @@ fn stored_evidence(
         && row.try_get::<String, _>("allocation_account_id")? == context.account_id
         && row.try_get::<String, _>("allocation_environment")? == context.environment.as_str()
         && row.try_get::<String, _>("allocation_subscription_id")? == allocation.subscription_id
-        && row.try_get::<String, _>("allocation_item_id")? == allocation.provider_item_id
         && row.try_get::<String, _>("allocation_reference_durable")?
             == allocation.external_allocation_reference
         && row.try_get::<String, _>("allocation_source_durable")? == allocation.source_id
@@ -418,7 +417,6 @@ fn stored_evidence(
         || evidence.allocation_reference() != allocation.external_allocation_reference
         || evidence.customer_id() != allocation.provider_customer_id
         || evidence.subscription_id() != allocation.subscription_id
-        || evidence.provider_item_id() != allocation.provider_item_id
         || !association_matches
         || !allocation_matches
         || !payer_matches
@@ -645,7 +643,6 @@ fn validate_evidence_context(
         || evidence.environment() != context.environment
         || allocation.provider_customer_id != evidence.customer_id()
         || allocation.subscription_id != evidence.subscription_id()
-        || allocation.provider_item_id != evidence.provider_item_id()
         || allocation.external_allocation_reference != evidence.allocation_reference()
     {
         return Err(ProviderAdapterError::ProviderContextMismatch);

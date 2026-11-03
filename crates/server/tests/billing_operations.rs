@@ -82,6 +82,7 @@ struct CapturedCheckoutRequest {
     success_url: String,
     cancel_url: String,
     expires_at_epoch: i64,
+    automatic_tax_enabled: bool,
 }
 
 #[async_trait]
@@ -107,6 +108,7 @@ impl SubscriptionProvider for RecoveryCheckoutProvider {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
+        automatic_tax_enabled: bool,
     ) -> ProviderResult<PersonalCheckoutSession> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         self.received.lock().unwrap().push(CapturedCheckoutRequest {
@@ -115,6 +117,7 @@ impl SubscriptionProvider for RecoveryCheckoutProvider {
             success_url: success_url.into(),
             cancel_url: cancel_url.into(),
             expires_at_epoch,
+            automatic_tax_enabled,
         });
         if self.lose_first_response && call == 0 {
             // Stripe accepted and retained this session for the idempotency key, but the
@@ -326,10 +329,32 @@ async fn interrupted_personal_checkout_reuses_its_operation_and_records_the_sess
         "price_original_monthly",
         "https://app.sotto.test/app?billing=success",
         "https://app.sotto.test/app?billing=cancelled",
+        true,
     )
     .await
     .expect("persist original provider request parameters");
     tx.commit().await.expect("commit original request");
+
+    let mut conflicting_tx = pool
+        .begin()
+        .await
+        .expect("begin conflicting request transaction");
+    assert!(matches!(
+        record_personal_checkout_request(
+            &mut conflicting_tx,
+            &operation.operation_id,
+            "price_original_monthly",
+            "https://app.sotto.test/app?billing=success",
+            "https://app.sotto.test/app?billing=cancelled",
+            false,
+        )
+        .await,
+        Err(BillingOperationError::ResultConflict)
+    ));
+    conflicting_tx
+        .rollback()
+        .await
+        .expect("rollback conflicting request");
     sqlx::query(
         "UPDATE billing_operations SET reconciliation_lease_until = now() - interval '1 second' \
          WHERE operation_id = $1",
@@ -361,6 +386,10 @@ async fn interrupted_personal_checkout_reuses_its_operation_and_records_the_sess
         billing::recover_personal_billing_operation_once(&pool, &billing_state)
             .await
             .expect("retry an ambiguous provider result")
+    );
+    assert!(
+        !billing_state.cloud_automatic_tax_enabled(),
+        "the current config represents the flag being switched off after the original request"
     );
     sqlx::query(
         "UPDATE billing_operations SET reconciliation_next_attempt_at = now() - interval '1 second' \
@@ -409,11 +438,18 @@ async fn interrupted_personal_checkout_reuses_its_operation_and_records_the_sess
         success_url: "https://app.sotto.test/app?billing=success".into(),
         cancel_url: "https://app.sotto.test/app?billing=cancelled".into(),
         expires_at_epoch: 4_000_000_100,
+        automatic_tax_enabled: true,
     };
     assert_eq!(
         provider.received.lock().unwrap().as_slice(),
         &[original_request.clone(), original_request]
     );
+    assert!(provider
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| request.automatic_tax_enabled));
     assert_eq!(
         sqlx::query_scalar::<_, String>(
             "SELECT state FROM billing_personal_accounts WHERE operation_id = $1",
@@ -477,6 +513,7 @@ async fn refund_required_checkout_is_parked_without_another_provider_request() {
         "price_original_monthly",
         "https://app.sotto.test/app?billing=success",
         "https://app.sotto.test/app?billing=cancelled",
+        false,
     )
     .await
     .expect("persist provider request");
@@ -846,6 +883,7 @@ async fn signed_expiry_fences_a_late_recovery_result_before_account_reuse() {
         "price_original_monthly",
         "https://app.sotto.test/app?billing=success",
         "https://app.sotto.test/app?billing=cancelled",
+        false,
     )
     .await
     .expect("persist exact provider request");
