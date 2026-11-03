@@ -229,6 +229,80 @@ describe("CloudContactSettings", () => {
     await waitFor(() => expect(api.revokeCloudContact).toHaveBeenCalledOnce());
   });
 
+  describe("retrying a failed status load", () => {
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      let reject!: (reason: unknown) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    }
+
+    async function renderFailedLoad() {
+      vi.mocked(api.fetchCloudContactStatus).mockRejectedValueOnce(new Error("initial failure"));
+      render(<CloudContactSettings />);
+      await screen.findByText("Contact settings could not be loaded.");
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(1);
+    }
+
+    it("shows a pending retry and ignores repeated activation", async () => {
+      await renderFailedLoad();
+      const pending = deferred<api.CloudContactStatus>();
+      vi.mocked(api.fetchCloudContactStatus).mockReturnValueOnce(pending.promise);
+
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      const retrying = await screen.findByRole("button", { name: "Retrying…" });
+      expect(retrying).toBeDisabled();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+      fireEvent.click(retrying);
+      fireEvent.click(retrying);
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(2);
+
+      pending.resolve(emptyStatus);
+      expect(await screen.findByLabelText("Email address")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Retry/ })).not.toBeInTheDocument();
+      expect(screen.queryByText("Contact settings could not be loaded.")).not.toBeInTheDocument();
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(2);
+    });
+
+    it("shows the retry error and re-enables Retry after another failure", async () => {
+      await renderFailedLoad();
+      const pending = deferred<api.CloudContactStatus>();
+      vi.mocked(api.fetchCloudContactStatus).mockReturnValueOnce(pending.promise);
+
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await screen.findByRole("button", { name: "Retrying…" });
+      pending.reject(new Error("still unavailable"));
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("still unavailable");
+      const retry = screen.getByRole("button", { name: "Retry" });
+      expect(retry).toBeEnabled();
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(2);
+
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce(emptyStatus);
+      fireEvent.click(retry);
+
+      expect(await screen.findByLabelText("Email address")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(3);
+    });
+
+    it("does not start verification, confirmation or removal while retrying", async () => {
+      await renderFailedLoad();
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce(emptyStatus);
+
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await screen.findByLabelText("Email address");
+
+      expect(api.startCloudContactVerification).not.toHaveBeenCalled();
+      expect(api.confirmCloudContactVerification).not.toHaveBeenCalled();
+      expect(api.revokeCloudContact).not.toHaveBeenCalled();
+    });
+  });
+
   it("explains that older servers do not support contact settings", async () => {
     vi.mocked(api.fetchCloudContactStatus).mockRejectedValue(new api.UnsupportedCloudContactError());
     render(<CloudContactSettings />);
