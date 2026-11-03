@@ -609,9 +609,7 @@ fn map_retention_error(error: RetentionError) -> Error {
 }
 
 fn epoch_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64)
+    crate::clock::business_epoch_seconds()
 }
 
 /// Start the default-off retention workers. Dry runs are non-destructive; purge uses a separate

@@ -12,9 +12,10 @@ use sha2::{Digest, Sha256};
 use sotto_server::billing::STRIPE_API_VERSION;
 use sotto_server::cloud_provider::{PayerKind, ProviderEnvironment};
 use sotto_server::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
+use sotto_server::cloud_provider_stripe_corrections::StripeCorrectionUnresolved;
 use sotto_server::cloud_provider_stripe_http::{
-    StripePersonalInvoiceHistoryEntry, StripePersonalInvoiceHistoryResult, StripeReadClient,
-    StripeReadLimits,
+    StripePersonalInvoiceHistoryEntry, StripePersonalInvoiceHistoryResult,
+    StripePersonalInvoiceHistoryUnresolved, StripeReadClient, StripeReadLimits,
 };
 
 const RUN_SANDBOX_TESTS: &str = "SOTTO_RUN_STRIPE_SANDBOX_TESTS";
@@ -43,6 +44,62 @@ fn limits() -> StripeReadLimits {
         max_retries: 2,
         max_retry_after: std::time::Duration::from_secs(30),
     }
+}
+
+fn history_reason_codes(reasons: &[StripePersonalInvoiceHistoryUnresolved]) -> Vec<&'static str> {
+    let mut codes = Vec::new();
+    for reason in reasons {
+        match reason {
+            StripePersonalInvoiceHistoryUnresolved::InvoiceMissingCustomer { .. } => {
+                codes.push("invoice_missing_customer");
+            }
+            StripePersonalInvoiceHistoryUnresolved::InvoiceMissingSubscriptionParent { .. } => {
+                codes.push("invoice_missing_subscription_parent");
+            }
+            StripePersonalInvoiceHistoryUnresolved::InvoiceUnknownSubscriptionParent { .. } => {
+                codes.push("invoice_unknown_subscription_parent");
+            }
+            StripePersonalInvoiceHistoryUnresolved::InvoiceMissingStatus { .. } => {
+                codes.push("invoice_missing_status");
+            }
+            StripePersonalInvoiceHistoryUnresolved::InvoiceUnknownStatus { .. } => {
+                codes.push("invoice_unknown_status");
+            }
+            StripePersonalInvoiceHistoryUnresolved::InvoiceCorrections { evidence, .. } => {
+                for correction in evidence.reasons() {
+                    codes.push(match correction {
+                        StripeCorrectionUnresolved::RefundMissingPaymentIntent { .. } => {
+                            "refund_missing_payment_intent"
+                        }
+                        StripeCorrectionUnresolved::RefundMissingStatus { .. } => {
+                            "refund_missing_status"
+                        }
+                        StripeCorrectionUnresolved::RefundUnknownStatus { .. } => {
+                            "refund_unknown_status"
+                        }
+                        StripeCorrectionUnresolved::DisputeMissingPaymentIntent { .. } => {
+                            "dispute_missing_payment_intent"
+                        }
+                        StripeCorrectionUnresolved::DisputeUnknownStatus { .. } => {
+                            "dispute_unknown_status"
+                        }
+                        StripeCorrectionUnresolved::CreditNoteUnknownStatus { .. } => {
+                            "credit_note_unknown_status"
+                        }
+                        StripeCorrectionUnresolved::CreditNoteUnknownType { .. } => {
+                            "credit_note_unknown_type"
+                        }
+                    });
+                }
+            }
+            StripePersonalInvoiceHistoryUnresolved::InvoiceChangedDuringRead { .. } => {
+                codes.push("invoice_changed_during_read");
+            }
+        }
+    }
+    codes.sort_unstable();
+    codes.dedup();
+    codes
 }
 
 #[tokio::test]
@@ -128,15 +185,22 @@ async fn reads_the_configured_stripe_test_contract_without_mutation() {
         "sandbox returned an unsupported subscription status"
     );
 
-    let history = client
+    let history = match client
         .personal_invoice_history(&mut session, &binding)
         .await
-        .expect("read configured Stripe invoice history");
+    {
+        Ok(history) => history,
+        Err(error) => panic!(
+            "read configured Stripe invoice history: {error}; permission scope: {:?}",
+            session.last_permission_scope()
+        ),
+    };
     let history = match history {
         StripePersonalInvoiceHistoryResult::Observed(history) => history,
         StripePersonalInvoiceHistoryResult::NeedsEvidence(needs) => panic!(
-            "sandbox invoice history needs evidence for {} invoice(s)",
-            needs.reasons().len()
+            "sandbox invoice history needs evidence for {} invoice(s); reason codes: {:?}",
+            needs.reasons().len(),
+            history_reason_codes(needs.reasons())
         ),
     };
     let paid = history

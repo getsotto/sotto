@@ -56,8 +56,10 @@ New hosted purchases have a separate default-off switch, `SOTTO_CLOUD_SALES_ENAB
 off pauses new quotes and checkout sessions while existing billing portals, cancellation, refund
 handling, and verified webhook settlement remain available. Enabling it requires Cloud mode, all
 Stripe credentials, the complete four-price hosted catalogue, and a safe Customer Portal
-configuration. It does not authorise a launch by itself. Operator procedures and deployment
-controls are maintained separately from the public deployment guide.
+configuration. It also requires `SOTTO_CLOUD_AUTOMATIC_TAX_ENABLED=1`; configure Stripe Tax
+registrations and review the product tax classification before enabling that setting. It does not
+authorise a launch by itself. Operator procedures and deployment controls are maintained separately
+from the public deployment guide.
 
 Hosted catalogue variables are `STRIPE_STANDARD_MONTHLY_PRICE_ID`,
 `STRIPE_STANDARD_ANNUAL_PRICE_ID`, `STRIPE_FOUNDING_MONTHLY_PRICE_ID`, and
@@ -254,10 +256,15 @@ change entitlements; an approved cohort and notice decision is required before a
 git pull    # picks up compose/runbook changes
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml restart caddy
 ```
 
 Migrations are forward-only and applied on boot. Check the release notes for anything flagged as
 a compatibility break before upgrading past a minor version.
+
+Restarting Caddy after the server is recreated makes it resolve the server's new container address.
+Without this, the proxy can keep sending API and webhook requests to the previous address and return
+502 responses until Caddy restarts.
 
 **Renamed settings are the one thing `git pull` cannot fix for you.** Your `.env` is deliberately
 untracked, so a variable renamed upstream leaves the old name sitting in your file where nothing
@@ -301,7 +308,10 @@ deletion journal. The sidecar is deliberately separate from the dump: a dump tak
 purge must not resurrect ciphertext when it is restored. It contains resource identifiers and
 ownership checks, never ciphertext or secret values, and is validated before upload by
 [`replay-retention-journal`](../scripts/replay-retention-journal). Keep both objects under the
-same bucket lifecycle policy; a dump without its sidecar is not a restorable backup.
+same bucket lifecycle policy. A backup whose schema includes migration 50 or later needs a
+sidecar at least as recent as the dump. Older backups predate the journal table and can only be
+restored with an empty journal; the restore drill checks that schema boundary before allowing
+that case.
 
 | `SOTTO_BACKUP_BUCKET` | Uploads with | Works for |
 |---|---|---|
@@ -649,8 +659,10 @@ this uploads only this repository's source, which is public.
 What it asserts, which is the rehearsal of 2026-08-31 written down:
 
 - `pg_restore` completes with no errors;
-- a retention sidecar exists and passes strict JSON-lines validation;
-- every deletion in that sidecar is replayed against the restored database with its ownership,
+- a retention sidecar for schema at migration 50 or later exists and passes strict JSON-lines
+  validation; an older schema is accepted without a sidecar only after the drill verifies it
+  predates the retention journal, then replays an empty journal;
+- every deletion in a sidecar is replayed against the restored database with its ownership,
   creation-time and revision guards, so purged rows cannot reappear;
 - every migration the dump recorded is marked successful, and none is a version this checkout
   does not carry. A deployment **behind** the branch passes: production is often a release or
