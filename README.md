@@ -204,6 +204,27 @@ decrypts in your browser, with keys that never leave your devices.
 
 To browse secrets interactively, see the [dashboard guide](#interactive-dashboard).
 
+If the browser does not open or sign-in times out, see [Troubleshooting login](#troubleshooting-login).
+
+### Troubleshooting login
+
+`sotto login` starts a short-lived listener on `127.0.0.1` (the loopback address) on an available
+port, opens your browser to sign in, and waits for the browser to return to that listener.
+
+- **The browser does not open.** Open the URL that this `sotto login` run printed after
+  "If it doesn't open, visit:" in a browser on the same machine. Leave the command running, because
+  it is waiting for the sign-in to finish.
+- **Use the same machine.** The browser must be able to reach the listener on the loopback address.
+  Opening the URL on a different machine or a phone does not complete the normal flow. A remote SSH
+  or container session is not guaranteed to work like a local desktop session, so log in from a
+  local terminal where you can.
+- **The wait times out.** The command waits five minutes for the browser to return. After that, run
+  `sotto login` again and use the newly printed URL. Each attempt starts a fresh listener with fresh
+  state, so an old URL or callback link will not work.
+
+Do not expose the loopback listener publicly. To sign in to your own server, pass the same
+`--server <url>` as before; see [Self-hosting](#self-hosting).
+
 ## Agent workflows
 
 Local coding agents can discover and run project-declared tasks through Sotto's local MCP server.
