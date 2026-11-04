@@ -678,6 +678,9 @@ L'exemple est synthétique ; `actions` et les dates facultatives proviennent de 
 
 Pour ajouter ou supprimer une adresse pour les notifications Cloud, consultez le [guide des contacts par e-mail (en anglais)](CLOUD-EMAIL.md).
 
+Pour transférer la facturation personnelle à une organisation depuis la page de compte Sotto Cloud,
+consultez le [guide du transfert de facturation](CLOUD-BILLING-TRANSFER.md).
+
 ### Thèmes de sortie
 
 La CLI fournit cinq thèmes intégrés : `nord` (par défaut), `sordino`, `terminal`, `monochrome`

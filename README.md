@@ -649,6 +649,9 @@ The example is synthetic; `actions` and the optional dates come from the returne
 
 To add or remove an email contact for Cloud notices, see the [email contact guide](CLOUD-EMAIL.md).
 
+To move personal billing to an organisation from the Sotto Cloud account page, see the
+[billing transfer guide](CLOUD-BILLING-TRANSFER.md).
+
 ### Output themes
 
 The CLI ships five built-in themes: `nord` (the default), `sordino`, `terminal`, `monochrome`,

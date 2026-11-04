@@ -676,6 +676,9 @@ Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus
 
 Zum Hinzufügen oder Entfernen einer E-Mail-Adresse für Cloud-Mitteilungen siehe die [Anleitung für E-Mail-Kontakte (Englisch)](CLOUD-EMAIL.md).
 
+Wie du die persönliche Abrechnung auf der Sotto-Cloud-Kontoseite an eine Organisation übergibst,
+steht in der [Anleitung zur Abrechnungsübertragung](CLOUD-BILLING-TRANSFER.md).
+
 ### Ausgabe-Themes
 
 Die CLI enthält fünf integrierte Themes: `nord` (die Standardeinstellung), `sordino`,

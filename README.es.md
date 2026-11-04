@@ -665,6 +665,9 @@ El ejemplo es sintético; `actions` y las fechas opcionales proceden del estado 
 
 Para añadir o quitar una dirección de correo para los avisos de Cloud, consulta la [guía de contactos de correo (en inglés)](CLOUD-EMAIL.md).
 
+Para trasladar la facturación personal a una organización desde la página de cuenta de Sotto Cloud,
+consulta la [guía de traslado de facturación](CLOUD-BILLING-TRANSFER.md).
+
 ### Temas de salida
 
 La CLI incluye cinco temas integrados: `nord` (el predeterminado), `sordino`, `terminal`,

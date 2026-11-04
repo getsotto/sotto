@@ -662,6 +662,9 @@ O exemplo é sintético; `actions` e as datas opcionais vêm do estado retornado
 
 Para adicionar ou remover um endereço de e-mail para avisos do Cloud, consulte o [guia de contatos de e-mail (em inglês)](CLOUD-EMAIL.md).
 
+Para mover a cobrança pessoal para uma organização a partir da página de conta do Sotto Cloud,
+consulte o [guia de transferência de cobrança](CLOUD-BILLING-TRANSFER.md).
+
 ### Temas de saída
 
 A CLI traz cinco temas integrados: `nord` (o padrão), `sordino`, `terminal`, `monochrome` e
