@@ -1,8 +1,6 @@
 name: Greet first-time contributors
 
 on:
-  issues:
-    types: [opened]
   # pull_request_target, not pull_request: fork PRs get a read-only token under
   # pull_request, so posting the greeting would 403. Safe: this job only posts a
   # comment and never runs PR code - the checkout below resolves the base
@@ -23,16 +21,6 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          ISSUE_MESSAGE: |
-            Thanks for opening your first issue in Sotto, and welcome.
-
-            A quick note on where things belong:
-
-            - A bug report or a feature idea? You are in the right place - the issue templates will guide you on what to include.
-            - A question that is not a bug? Please ask in [Discussions](https://github.com/getsotto/sotto/discussions) instead.
-            - Something security sensitive? Please report it privately per [SECURITY.md](https://github.com/getsotto/sotto/blob/main/SECURITY.md), never as a public issue.
-
-            The full contributor guide is in [CONTRIBUTING.md](https://github.com/getsotto/sotto/blob/main/CONTRIBUTING.md).
           PR_MESSAGE: |
             Thanks for your first pull request to Sotto, and welcome.
 
@@ -49,6 +37,5 @@ jobs:
               github,
               context,
               core,
-              issueMessage: process.env.ISSUE_MESSAGE,
               prMessage: process.env.PR_MESSAGE,
             });

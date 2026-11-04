@@ -249,14 +249,24 @@ async fn process_job(
                 sponsored_provider_phases(pool, &job.payer_id, catalogue, current_period_end)
                     .await
                     .map_err(|_| local_error("local_evidence_invalid"))?;
-            let updated = provider
-                .update_sponsored_subscription(
-                    &job.payer_id,
-                    &job.subscription_id,
-                    &phases,
-                    &job.idempotency_key,
-                )
-                .await?;
+            let updated = crate::billing::with_sponsored_subscription_write_lock(
+                pool,
+                &job.subscription_id,
+                async {
+                    Ok::<_, crate::error::Error>(
+                        provider
+                            .update_sponsored_subscription(
+                                &job.payer_id,
+                                &job.subscription_id,
+                                &phases,
+                                &job.idempotency_key,
+                            )
+                            .await,
+                    )
+                },
+            )
+            .await
+            .map_err(|_| local_error("sponsored_schedule_write_unavailable"))??;
             updated
                 .schedule_id
                 .ok_or_else(|| local_error("local_evidence_invalid"))
@@ -438,6 +448,7 @@ mod tests {
                 default_payment_method_id: None,
                 subscription_id: "sub".into(),
                 status: crate::billing::SubscriptionStatus::Active,
+                automatic_tax_enabled: false,
                 cancel_at_period_end: false,
                 cancel_at: None,
                 current_period_start: Some(start),

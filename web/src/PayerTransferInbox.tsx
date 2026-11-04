@@ -32,11 +32,15 @@ function payer(kind: string, organizationId: string | null): string {
   return kind === "personal" ? "personal billing" : `organisation ${organizationId ?? "billing"}`;
 }
 
-function stateCopy(state: string, expiredInvitation = false): string {
+// Which deadline closed an open invitation: the response deadline or the renewal boundary, whichever came first.
+type InvitationExpiry = "response_deadline" | "renewal";
+
+function stateCopy(state: string, invitationExpiry: InvitationExpiry | null = null): string {
   switch (state) {
-    case "awaiting_consent": return expiredInvitation
-      ? "This invitation expired at the renewal boundary. Ask the initiator to start a new request."
-      : "Waiting for the other payer to respond.";
+    case "awaiting_consent":
+      if (invitationExpiry === "renewal") return "This invitation expired at the renewal boundary. Ask the initiator to start a new request.";
+      if (invitationExpiry === "response_deadline") return "This invitation expired because its response deadline passed. Ask the initiator to start a new request.";
+      return "Waiting for the other payer to respond.";
     case "pending": return "Accepted. The billing change is being prepared; it is not complete yet.";
     case "destination_prepared": return "The change is being prepared for the renewal date.";
     case "destination_paid":
@@ -72,6 +76,7 @@ export function PayerTransferInbox() {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<"accept" | "withdraw" | "setup" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [expiryTick, setExpiryTick] = useState(0);
@@ -170,6 +175,7 @@ export function PayerTransferInbox() {
 
   async function act(transfer: PayerTransfer, action: "accept" | "withdraw" | "setup") {
     setBusyId(transfer.transferId);
+    setBusyAction(action);
     setError(null);
     setNotice(null);
     try {
@@ -196,6 +202,7 @@ export function PayerTransferInbox() {
       }
     } finally {
       setBusyId(null);
+      setBusyAction(null);
     }
   }
 
@@ -214,6 +221,8 @@ export function PayerTransferInbox() {
         const incoming = transfer.participantRole === "counterparty";
         const invitationExpired = transfer.state === "awaiting_consent"
           && Math.floor(Date.now() / 1000) >= Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom);
+        const invitationExpiry: InvitationExpiry | null = !invitationExpired ? null
+          : transfer.consentExpiresAtEpoch < transfer.effectiveFrom ? "response_deadline" : "renewal";
         const actionable = transfer.state === "awaiting_consent" && !invitationExpired;
         const setupRequired = transfer.state === "pending"
           && transfer.destinationKind === "personal"
@@ -225,13 +234,13 @@ export function PayerTransferInbox() {
           <span className="meta">{payer(transfer.sourceKind, transfer.sourceOrganizationId)} → {payer(transfer.destinationKind, transfer.destinationOrganizationId)}</span>
           <p>{pounds(transfer.amountPence)} per {transfer.interval}; renewal {date(transfer.effectiveFrom)}.</p>
           {actionable && <p className="muted">Respond by {date(Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom))}.</p>}
-          <p className="muted">{stateCopy(transfer.state, invitationExpired)}</p>
+          <p className="muted">{stateCopy(transfer.state, invitationExpiry)}</p>
           {transfer.state === "unknown" && <p className="muted">Contact Sotto support before making another billing change.</p>}
           {actionable && incoming && transfer.destinationKind === "personal" && !setupAvailable
             && <p className="muted">Personal payment setup is not available on this server yet. The request has not been accepted.</p>}
           {actionable && incoming && <>
-            {(transfer.destinationKind !== "personal" || setupAvailable) && <button disabled={busyId !== null} onClick={() => void act(transfer, "accept")}>{busyId === transfer.transferId ? "Accepting…" : "Accept transfer request"}</button>}{" "}
-            <button disabled={busyId !== null} onClick={() => void act(transfer, "withdraw")}>Decline request</button>
+            {(transfer.destinationKind !== "personal" || setupAvailable) && <button disabled={busyId !== null} onClick={() => void act(transfer, "accept")}>{busyId === transfer.transferId && busyAction === "accept" ? "Accepting…" : "Accept transfer request"}</button>}{" "}
+            <button disabled={busyId !== null} onClick={() => void act(transfer, "withdraw")}>{busyId === transfer.transferId && busyAction === "withdraw" ? "Declining…" : "Decline request"}</button>
           </>}
           {actionable && !incoming && <button disabled={busyId !== null} onClick={() => void act(transfer, "withdraw")}>Withdraw request</button>}
           {setupRequired && <button disabled={busyId !== null} onClick={() => void act(transfer, "setup")}>Set up payment method</button>}

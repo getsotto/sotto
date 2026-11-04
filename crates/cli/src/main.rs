@@ -181,12 +181,15 @@ enum Command {
         json: bool,
     },
     /// Set a secret. Reads the value from a hidden prompt unless --value/--stdin is given.
+    #[command(
+        after_help = "Input modes:\n  Without --value or --stdin, enter the value at the hidden prompt.\n  --stdin reads until EOF and preserves every byte, including line endings and trailing newlines. It does not trim or interpolate input. A redirected file becomes one complete secret value, not a dotenv import.\n  --value and --stdin cannot be combined. Real credentials passed with --value may appear in shell history and process arguments.\n\nBefore piping input:\n  Initialise the local store and project, and unlock the local identity first. --stdin replaces only the value prompt; it does not bypass these requirements or grant write access through a machine token.\n\nExamples (POSIX shell):\n  sotto set DATABASE_URL\n  sotto set PRIVATE_KEY --stdin < ./example-key.txt\n  printf '%s' 'example-value' | sotto set EXAMPLE --stdin\n\nThe pipeline uses a synthetic value. printf avoids the extra newline commonly added by echo. Do not put real credentials in an inline shell example: they can still enter shell history."
+    )]
     Set {
         name: String,
-        /// Provide the value inline (warning: visible in shell history).
+        /// Provide the value inline (warning: visible in shell history and process arguments).
         #[arg(long, conflicts_with = "stdin")]
         value: Option<String>,
-        /// Read the value from standard input.
+        /// Read the complete value from standard input until EOF, without trimming.
         #[arg(long)]
         stdin: bool,
     },
@@ -346,6 +349,8 @@ enum EnvCommand {
 
 #[derive(Subcommand)]
 enum TaskCommand {
+    /// List declared tasks from the current project's manifest.
+    Ls,
     /// Validate `sotto.tasks.toml` without opening the local secret store.
     Validate,
     /// Approve one declared task for one environment after reviewing its full command.
@@ -481,18 +486,31 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Task declaration validation needs only the project config and task file. Handle it before
-    // opening local state or the keychain, so validation cannot prompt or initialise secret data.
-    if let Some(Command::Task {
-        command: TaskCommand::Validate,
-    }) = &cli.command
-    {
-        let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
-        let (_, manifest) = sotto_cli::agent_tasks::TaskManifest::discover(&cwd)?;
-        let count = manifest.tasks().len();
-        let noun = if count == 1 { "task" } else { "tasks" };
-        println!("valid: {count} {noun}");
-        return Ok(());
+    // Task declaration listing and validation need only the project config and task file. Handle
+    // them before opening local state or the keychain, so they cannot prompt or initialise secret data.
+    if let Some(Command::Task { command }) = &cli.command {
+        match command {
+            TaskCommand::Ls => {
+                let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+                let (_, manifest) = sotto_cli::agent_tasks::TaskManifest::discover(&cwd)?;
+                let mut tasks = manifest.tasks().to_vec();
+                tasks.sort_by(|a, b| a.name().cmp(b.name()));
+                for task in &tasks {
+                    println!("{}: {}", task.name(), task.description());
+                    println!("  environments: {}", task.environments().join(", "));
+                }
+                return Ok(());
+            }
+            TaskCommand::Validate => {
+                let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+                let (_, manifest) = sotto_cli::agent_tasks::TaskManifest::discover(&cwd)?;
+                let count = manifest.tasks().len();
+                let noun = if count == 1 { "task" } else { "tasks" };
+                println!("valid: {count} {noun}");
+                return Ok(());
+            }
+            _ => {}
+        }
     }
 
     // Task approvals are a separate local capability. These commands use only the project
@@ -523,7 +541,7 @@ fn run() -> Result<()> {
                     )
                 })?;
             }
-            TaskCommand::Validate => {}
+            TaskCommand::Ls | TaskCommand::Validate => {}
         }
     }
 
@@ -764,7 +782,8 @@ fn run() -> Result<()> {
             Ok(())
         }
         Command::Task { command } => match command {
-            TaskCommand::Validate
+            TaskCommand::Ls
+            | TaskCommand::Validate
             | TaskCommand::Approve { .. }
             | TaskCommand::Approvals
             | TaskCommand::Revoke { .. } => {
@@ -2704,6 +2723,32 @@ mod tests {
         assert!(help.contains("sotto run --env staging -- npm test"));
         assert!(help.contains("sotto run -- python -c \"print('hello')\""));
         assert!(help.contains("Sotto options go before --"));
+    }
+
+    #[test]
+    fn set_help_explains_prompt_and_stdin_input() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("set")
+            .expect("set subcommand should exist")
+            .render_long_help()
+            .to_string();
+
+        for expected in [
+            "sotto set DATABASE_URL",
+            "sotto set PRIVATE_KEY --stdin < ./example-key.txt",
+            "printf '%s' 'example-value' | sotto set EXAMPLE --stdin",
+            "reads until EOF",
+            "trailing newlines",
+            "does not trim or interpolate",
+            "not a dotenv import",
+            "--value and --stdin cannot be combined",
+            "shell history and process arguments",
+            "unlock the local identity first",
+            "synthetic value",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
     }
 
     #[test]

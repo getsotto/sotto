@@ -1037,3 +1037,73 @@ async fn migration_0067_queues_registered_sources_for_authority_revalidation() {
     );
     database.cleanup().await;
 }
+
+#[tokio::test]
+async fn migration_0071_parks_legacy_checkout_created_without_recovery_request() {
+    let Some(database) = DisposableDatabase::create().await else {
+        return;
+    };
+    migrator_before(71)
+        .run(&database.pool)
+        .await
+        .expect("apply schema before sponsored recovery migration");
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let owner = format!("sponsored-recovery-owner-{suffix}");
+    let beneficiary = format!("sponsored-recovery-beneficiary-{suffix}");
+    let organisation = format!("sponsored-recovery-organisation-{suffix}");
+    let operation = format!("sponsored-recovery-operation-{suffix}");
+    sqlx::query(
+        "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES \
+         ($1, 'sponsored-recovery-migration', $1), ($2, 'sponsored-recovery-migration', $2)",
+    )
+    .bind(&owner)
+    .bind(&beneficiary)
+    .execute(&database.pool)
+    .await
+    .expect("insert sponsored recovery users");
+    sqlx::query(
+        "INSERT INTO organizations (id, enc_name, created_by) \
+         VALUES ($1, decode('6f7267', 'hex'), $2)",
+    )
+    .bind(&organisation)
+    .bind(&owner)
+    .execute(&database.pool)
+    .await
+    .expect("insert sponsored recovery organisation");
+    sqlx::query(
+        "INSERT INTO billing_sponsored_operations \
+         (operation_id, organization_id, actor_user_id, idempotency_key, request_hash, action, \
+          beneficiary_id, offer, quote_version, quote_expires_at_epoch, effective_from, \
+          provider_idempotency_key, provider_checkout_url, provider_checkout_session_id, state) \
+         VALUES ($1, $2, $3, $4, 'legacy-hash', 'add', $5, 'standard_monthly', 1, \
+                 1800000000, 1700000000, $6, 'https://checkout.stripe.test/session', \
+                 'cs_legacy_checkout_created', 'checkout_created')",
+    )
+    .bind(&operation)
+    .bind(&organisation)
+    .bind(&owner)
+    .bind(format!("legacy-idempotency-{suffix}"))
+    .bind(&beneficiary)
+    .bind(format!("legacy-provider-idempotency-{suffix}"))
+    .execute(&database.pool)
+    .await
+    .expect("insert pre-recovery checkout operation");
+
+    db::migrate(&database.pool)
+        .await
+        .expect("apply sponsored recovery migration");
+    let row: (String, Option<String>, bool) = sqlx::query_as(
+        "SELECT state, recovery_last_error_code, recovery_manual_review_required \
+         FROM billing_sponsored_operations WHERE operation_id = $1",
+    )
+    .bind(&operation)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read migrated legacy operation");
+    assert_eq!(row.0, "manual_review");
+    assert_eq!(row.1.as_deref(), Some("request_facts_missing"));
+    assert!(row.2);
+
+    database.cleanup().await;
+}

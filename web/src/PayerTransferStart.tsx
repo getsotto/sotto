@@ -70,6 +70,14 @@ function CounterpartySelect({
   </label>;
 }
 
+function loadMessage(error: unknown): string {
+  if (!(error instanceof Error)) return "Your organisations could not be loaded. Try again shortly.";
+  const status = /server error \((\d+)\)/.exec(error.message)?.[1];
+  if (status === "403") return "You do not have authority to list organisations for this account.";
+  if (status === "404") return "Organisation lookup is not available on this server.";
+  return "Your organisations could not be loaded. Try again shortly.";
+}
+
 export function PersonalTransferStart() {
   const [available, setAvailable] = useState(false);
   const [userId, setUserId] = useState("");
@@ -80,36 +88,90 @@ export function PersonalTransferStart() {
   const [quote, setQuote] = useState<PayerTransferQuote | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [membersError, setMembersError] = useState<string | null>(null);
+  const [membersLoading, setMembersLoading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const idempotencyKey = useRef<string | null>(null);
+  const membersInFlight = useRef(false);
+  const formBusy = busy || membersLoading;
+  const loadInFlight = useRef(false);
+  const mounted = useRef(true);
+
+  async function loadInitial() {
+    if (loadInFlight.current) return;
+    loadInFlight.current = true;
+    setLoading(true);
+    try {
+      const [capabilities, account] = await Promise.all([fetchPayerTransferCapabilities(), me()]);
+      if (!mounted.current) return;
+      const nextAvailable = capabilities.available;
+      const nextUserId = account?.userId ?? "";
+      setAvailable(nextAvailable);
+      setUserId(nextUserId);
+      if (!nextAvailable || nextUserId === "") {
+        setOrgs([]);
+        setLoadError(null);
+        return;
+      }
+      // A personal beneficiary can ask their existing organisation to take over billing even
+      // when they are an ordinary member; the organisation administrator is the counterparty.
+      try {
+        const organisations = await fetchOrgs();
+        if (!mounted.current) return;
+        setOrgs(organisations);
+        setLoadError(null);
+      } catch (e) {
+        if (!mounted.current) return;
+        setOrgs([]);
+        setLoadError(loadMessage(e));
+      }
+    } catch {
+      // Capability or account discovery failed: keep the section hidden like unsupported servers.
+      if (mounted.current) {
+        setAvailable(false);
+        setUserId("");
+        setOrgs([]);
+        setLoadError(null);
+      }
+    } finally {
+      if (mounted.current) setLoading(false);
+      loadInFlight.current = false;
+    }
+  }
 
   useEffect(() => {
-    let current = true;
-    void Promise.all([fetchPayerTransferCapabilities(), me(), fetchOrgs()])
-      .then(([capabilities, account, organisations]) => {
-        if (!current) return;
-        setAvailable(capabilities.available);
-        setUserId(account?.userId ?? "");
-        // A personal beneficiary can ask their existing organisation to take over billing even
-        // when they are an ordinary member; the organisation administrator is the counterparty.
-        setOrgs(organisations);
-      })
-      .catch(() => { if (current) setAvailable(false); });
-    return () => { current = false; };
+    mounted.current = true;
+    void loadInitial();
+    return () => { mounted.current = false; };
   }, []);
 
   async function chooseOrganisation(orgId: string) {
+    if (membersInFlight.current) return;
     setDestinationOrgId(orgId);
     setCounterpartyId("");
     setMembers([]);
     setQuote(null);
     setError(null);
+    setMembersError(null);
     if (orgId === "") return;
-    setBusy(true);
+    await loadMembers(orgId);
+  }
+
+  async function loadMembers(orgId: string) {
+    if (orgId === "" || membersInFlight.current) return;
+    membersInFlight.current = true;
+    setMembersLoading(true);
+    setMembersError(null);
     try {
       setMembers(await fetchMembers(orgId));
-    } catch (e) { setError(message(e)); }
-    finally { setBusy(false); }
+    } catch (e) {
+      setMembersError(message(e));
+    } finally {
+      membersInFlight.current = false;
+      setMembersLoading(false);
+    }
   }
 
   async function requestQuote() {
@@ -155,23 +217,33 @@ export function PersonalTransferStart() {
   return <section aria-labelledby="personal-transfer-heading">
     <h2 id="personal-transfer-heading">Change who pays</h2>
     <p className="muted">Move billing to an organisation at your next renewal. The current payer remains responsible through the paid term, with no mid-term credit.</p>
-    <label>Organisation
-      <select value={destinationOrgId} onChange={(event) => void chooseOrganisation(event.target.value)} disabled={busy}>
-        <option value="">Choose an organisation you belong to</option>
-        {orgs.map((org) => <option key={org.id} value={org.id}>{org.id} · {org.role}</option>)}
-      </select>
-    </label>
-    {destinationOrgId !== "" && <CounterpartySelect members={members} value={counterpartyId} onChange={(value) => { setCounterpartyId(value); setQuote(null); }} exclude={userId} disabled={busy} />}
-    {error !== null && <p role="alert">{error}</p>}
-    {notice !== null && <p className="notice" role="status">{notice}</p>}
-    {quote === null
-      ? <button disabled={busy || destinationOrgId === "" || counterpartyId === ""} onClick={() => void requestQuote()}>{busy ? "Loading transfer quote…" : "Review payer transfer"}</button>
-      : <div className="notice" role="status">
-        <p>At renewal on {date(quote.effectiveFrom)}, {quote.destinationKind === "sponsor" ? "the organisation" : "you"} would pay {money(quote.amountPence)} per {quote.interval}. No mid-term credit is due.</p>
-        {quote.founding && <p className="muted">The server has included the founding price applicable at this renewal.</p>}
-        <button disabled={busy} onClick={() => void createInvitation()}>{busy ? "Sending request…" : "Send request for acceptance"}</button>{" "}
-        <button disabled={busy} onClick={() => { setQuote(null); idempotencyKey.current = null; }}>Cancel</button>
-      </div>}
+    {loadError !== null ? <>
+      <p role="alert">{loadError}</p>
+      <button type="button" disabled={loading} aria-busy={loading ? "true" : undefined} onClick={() => void loadInitial()}>{loading ? "Retrying…" : "Retry"}</button>
+      {loading && <p className="muted" role="status">Loading organisations…</p>}
+    </> : loading ? <p className="muted" role="status">Loading organisations…</p> : <>
+      <label>Organisation
+        <select value={destinationOrgId} onChange={(event) => void chooseOrganisation(event.target.value)} disabled={formBusy}>
+          <option value="">Choose an organisation you belong to</option>
+          {orgs.map((org) => <option key={org.id} value={org.id}>{org.id} · {org.role}</option>)}
+        </select>
+      </label>
+      {destinationOrgId !== "" && <CounterpartySelect members={members} value={counterpartyId} onChange={(value) => { setCounterpartyId(value); setQuote(null); }} exclude={userId} disabled={formBusy} />}
+      {membersError !== null && <p role="alert">{membersError}</p>}
+      {(membersError !== null || membersLoading) && <button disabled={formBusy} onClick={() => void loadMembers(destinationOrgId)}>
+        {membersLoading ? "Loading administrators…" : "Retry loading administrators"}
+      </button>}
+      {error !== null && <p role="alert">{error}</p>}
+      {notice !== null && <p className="notice" role="status">{notice}</p>}
+      {quote === null
+        ? <button disabled={formBusy || destinationOrgId === "" || counterpartyId === ""} onClick={() => void requestQuote()}>{busy ? "Loading transfer quote…" : "Review payer transfer"}</button>
+        : <div className="notice" role="status">
+          <p>At renewal on {date(quote.effectiveFrom)}, {quote.destinationKind === "sponsor" ? "the organisation" : "you"} would pay {money(quote.amountPence)} per {quote.interval}. No mid-term credit is due.</p>
+          {quote.founding && <p className="muted">The server has included the founding price applicable at this renewal.</p>}
+          <button disabled={formBusy} onClick={() => void createInvitation()}>{busy ? "Sending request…" : "Send request for acceptance"}</button>{" "}
+          <button disabled={formBusy} onClick={() => { setQuote(null); idempotencyKey.current = null; }}>Cancel</button>
+        </div>}
+    </>}
   </section>;
 }
 

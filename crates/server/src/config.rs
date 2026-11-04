@@ -57,6 +57,8 @@ pub const MAX_ORGANISATION_DELETION_RETENTION_DAYS: i64 = 365;
 const ORGANISATION_DELETION_RETENTION_ENV: &str = "SOTTO_ORGANISATION_DELETION_RETENTION_DAYS";
 const ORGANISATION_DELETION_WORKER_ENV: &str = "SOTTO_ORGANISATION_DELETION_WORKER_ENABLED";
 const ORGANISATION_DELETION_METRICS_TOKEN_ENV: &str = "SOTTO_ORGANISATION_DELETION_METRICS_TOKEN";
+const CLOUD_OPERATIONS_METRICS_TOKEN_ENV: &str = "SOTTO_CLOUD_OPERATIONS_METRICS_TOKEN";
+const CLOUD_COVERAGE_REPAIR_TOKEN_ENV: &str = "SOTTO_CLOUD_COVERAGE_REPAIR_TOKEN";
 const ORGANISATION_DELETION_OPERATOR_TOKEN_ENV: &str = "SOTTO_ORGANISATION_DELETION_OPERATOR_TOKEN";
 const PROVIDER_REFRESH_INGEST_ENV: &str = "SOTTO_PROVIDER_REFRESH_INGEST_ENABLED";
 const PROVIDER_REFRESH_WORKER_ENV: &str = "SOTTO_PROVIDER_REFRESH_WORKER_ENABLED";
@@ -68,6 +70,7 @@ const CLOUD_COVERAGE_AUTHORITY_MAX_AGE_ENV: &str = "SOTTO_CLOUD_COVERAGE_AUTHORI
 const CLOUD_ACTION_ENFORCEMENT_ENV: &str = "SOTTO_CLOUD_ACTION_ENFORCEMENT";
 const MACHINE_ELIGIBILITY_ENFORCEMENT_ENV: &str = "SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT";
 const CLOUD_SALES_ENV: &str = "SOTTO_CLOUD_SALES_ENABLED";
+const CLOUD_AUTOMATIC_TAX_ENV: &str = "SOTTO_CLOUD_AUTOMATIC_TAX_ENABLED";
 const FOUNDING_SCHEDULE_WORKER_ENV: &str = "SOTTO_FOUNDING_SCHEDULE_WORKER_ENABLED";
 const FOUNDING_PRICE_NOTICES_ENV: &str = "SOTTO_FOUNDING_PRICE_NOTICES_ENABLED";
 const FOUNDING_SCHEDULE_PREFLIGHT_ENV: &str = "SOTTO_FOUNDING_SCHEDULE_PREFLIGHT_VERIFIED";
@@ -76,12 +79,19 @@ const BILLING_TRANSFER_EXECUTION_ENV: &str = "SOTTO_BILLING_TRANSFER_EXECUTION_E
 const BILLING_TRANSFER_SETUP_ENV: &str = "SOTTO_BILLING_TRANSFER_SETUP_ENABLED";
 const BILLING_TRANSFER_OPERATOR_TOKEN_ENV: &str = "SOTTO_BILLING_TRANSFER_OPERATOR_TOKEN";
 const CLOUD_RETENTION_DRY_RUN_ENV: &str = "SOTTO_CLOUD_RETENTION_DRY_RUN_ENABLED";
+const CLOUD_SHARED_RETENTION_DRY_RUN_ENV: &str = "SOTTO_CLOUD_SHARED_RETENTION_DRY_RUN_ENABLED";
 const CLOUD_RETENTION_OPERATOR_TOKEN_ENV: &str = "SOTTO_CLOUD_RETENTION_OPERATOR_TOKEN";
+const CLOUD_RETENTION_PURGE_ENV: &str = "SOTTO_CLOUD_RETENTION_PURGE_ENABLED";
+const CLOUD_RETENTION_DESTRUCTIVE_TOKEN_ENV: &str = "SOTTO_CLOUD_RETENTION_DESTRUCTIVE_TOKEN";
+const CLOUD_RETENTION_EVIDENCE_KEY_ENV: &str = "SOTTO_CLOUD_RETENTION_EVIDENCE_HMAC_KEY";
+const CLOUD_RETENTION_BUILD_SHA_ENV: &str = "SOTTO_CLOUD_RETENTION_BUILD_SHA";
 const CLOUD_CONTACT_ENROLMENT_ENV: &str = "SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED";
 const CLOUD_CONTACT_EMAIL_SEND_ENV: &str = "SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED";
 const CLOUD_CONTACT_EMAIL_FROM_ENV: &str = "SOTTO_CLOUD_CONTACT_EMAIL_FROM";
 const CLOUD_NOTICE_DISPATCH_ENV: &str = "SOTTO_CLOUD_NOTICE_DISPATCH_ENABLED";
 const BILLING_RECOVERY_WORKER_ENV: &str = "SOTTO_BILLING_RECOVERY_WORKER_ENABLED";
+const SPONSORED_BILLING_RECOVERY_WORKER_ENV: &str =
+    "SOTTO_SPONSORED_BILLING_RECOVERY_WORKER_ENABLED";
 const RESEND_WEBHOOK_SECRET_ENV: &str = "RESEND_WEBHOOK_SECRET";
 
 #[derive(Debug, Clone)]
@@ -106,6 +116,10 @@ pub struct Config {
     pub organisation_deletion_worker_enabled: bool,
     /// Bearer token for the protected organisation-deletion metrics exporter.
     pub organisation_deletion_metrics_token: Option<String>,
+    /// Dedicated bearer credential for protected, aggregate Cloud lifecycle diagnostics.
+    pub cloud_operations_metrics_token: Option<String>,
+    /// Separate write credential for supported provider-backed coverage repair.
+    pub cloud_coverage_repair_token: Option<String>,
     /// Bearer token for the protected operator-observation endpoint.
     pub organisation_deletion_operator_token: Option<String>,
     /// Whether verified provider changes may enqueue durable refresh work.
@@ -144,14 +158,26 @@ pub struct Config {
     pub billing_transfer_operator_token: Option<String>,
     /// Whether personal Cloud expiry candidates are reconciled and dry-run. Defaults off.
     pub cloud_retention_dry_run_enabled: bool,
+    /// Whether shared organisation Cloud retention candidates are reconciled and dry-run. Defaults off.
+    pub cloud_shared_retention_dry_run_enabled: bool,
     /// Dedicated bearer token for protected Cloud retention inspection and non-destructive actions.
     pub cloud_retention_operator_token: Option<String>,
+    /// Whether the independently gated, reviewed Cloud retention purge worker starts. Defaults off.
+    pub cloud_retention_purge_enabled: bool,
+    /// Separate bearer token for destructive retention approval and review-evidence routes.
+    pub cloud_retention_destructive_token: Option<String>,
+    /// HMAC key used by the protected restore-evidence attestation path.
+    pub cloud_retention_evidence_hmac_key: Option<String>,
+    /// Exact release commit identity bound into restore evidence before any purge can be approved.
+    pub cloud_retention_build_sha: Option<String>,
     /// Contact-enrolment and verification-email settings. Both switches default off.
     pub contact_verification: ContactVerificationConfig,
     /// Whether the separate lifecycle-notice dispatcher starts. Defaults off.
     pub cloud_notice_dispatch_enabled: bool,
     /// Whether the bounded hosted billing recovery worker starts. Defaults off.
     pub billing_recovery_worker_enabled: bool,
+    /// Whether bounded sponsored-operation recovery runs. Defaults off independently of personal recovery.
+    pub sponsored_billing_recovery_worker_enabled: bool,
     /// Resend signing secret used to authenticate delivery feedback.
     pub resend_webhook_secret: Option<String>,
 }
@@ -199,6 +225,8 @@ pub struct BillingConfig {
     pub cloud_portal_configuration_id: Option<String>,
     /// Explicit purchase gate. Management, cancellation, refunds, and webhooks do not use it.
     pub cloud_sales_enabled: bool,
+    /// Ask Stripe Tax to calculate tax for hosted Cloud subscription purchases.
+    pub cloud_automatic_tax_enabled: bool,
     /// Where Stripe-hosted pages send the browser back to (the web app origin).
     pub return_url: String,
 }
@@ -250,6 +278,8 @@ impl Config {
         let deployment_mode = DeploymentMode::from_env_result(std::env::var(DeploymentMode::ENV))?;
         let cloud_sales_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_SALES_ENV).ok().as_deref());
+        let cloud_automatic_tax_enabled =
+            feature_flag_is_enabled(std::env::var(CLOUD_AUTOMATIC_TAX_ENV).ok().as_deref());
         let founding_schedule_worker_enabled =
             feature_flag_is_enabled(std::env::var(FOUNDING_SCHEDULE_WORKER_ENV).ok().as_deref());
         let founding_price_notices_enabled =
@@ -266,7 +296,17 @@ impl Config {
         let billing_transfer_operator_token = env_nonempty(BILLING_TRANSFER_OPERATOR_TOKEN_ENV);
         let cloud_retention_dry_run_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_RETENTION_DRY_RUN_ENV).ok().as_deref());
+        let cloud_shared_retention_dry_run_enabled = feature_flag_is_enabled(
+            std::env::var(CLOUD_SHARED_RETENTION_DRY_RUN_ENV)
+                .ok()
+                .as_deref(),
+        );
         let cloud_retention_operator_token = env_nonempty(CLOUD_RETENTION_OPERATOR_TOKEN_ENV);
+        let cloud_retention_purge_enabled =
+            feature_flag_is_enabled(std::env::var(CLOUD_RETENTION_PURGE_ENV).ok().as_deref());
+        let cloud_retention_destructive_token = env_nonempty(CLOUD_RETENTION_DESTRUCTIVE_TOKEN_ENV);
+        let cloud_retention_evidence_hmac_key = env_nonempty(CLOUD_RETENTION_EVIDENCE_KEY_ENV);
+        let cloud_retention_build_sha = env_nonempty(CLOUD_RETENTION_BUILD_SHA_ENV);
         let founding_schedule_preflight_verified = feature_flag_is_enabled(
             std::env::var(FOUNDING_SCHEDULE_PREFLIGHT_ENV)
                 .ok()
@@ -296,6 +336,11 @@ impl Config {
             feature_flag_is_enabled(std::env::var(CLOUD_NOTICE_DISPATCH_ENV).ok().as_deref());
         let billing_recovery_worker_enabled =
             feature_flag_is_enabled(std::env::var(BILLING_RECOVERY_WORKER_ENV).ok().as_deref());
+        let sponsored_billing_recovery_worker_enabled = feature_flag_is_enabled(
+            std::env::var(SPONSORED_BILLING_RECOVERY_WORKER_ENV)
+                .ok()
+                .as_deref(),
+        );
         let resend_webhook_secret = env_nonempty(RESEND_WEBHOOK_SECRET_ENV);
         let contact_verification = ContactVerificationConfig {
             enrolment_enabled: contact_enrolment_enabled,
@@ -348,6 +393,7 @@ impl Config {
                         "STRIPE_CLOUD_PORTAL_CONFIGURATION_ID",
                     ),
                     cloud_sales_enabled,
+                    cloud_automatic_tax_enabled,
                     return_url: billing_return_url(&public_base_url, web_origin.as_deref()),
                 }),
                 _ => None,
@@ -396,6 +442,9 @@ impl Config {
                 .as_ref()
                 .and_then(|value| value.cloud_portal_configuration_id.as_deref())
                 .is_some(),
+            billing
+                .as_ref()
+                .is_some_and(|value| value.cloud_automatic_tax_enabled),
         )?;
         validate_billing_transfers_configuration(
             billing_transfers_enabled,
@@ -424,6 +473,19 @@ impl Config {
             env_nonempty(ORGANISATION_DELETION_METRICS_TOKEN_ENV);
         let organisation_deletion_operator_token =
             env_nonempty(ORGANISATION_DELETION_OPERATOR_TOKEN_ENV);
+        let cloud_operations_metrics_token = env_nonempty(CLOUD_OPERATIONS_METRICS_TOKEN_ENV);
+        let cloud_coverage_repair_token = env_nonempty(CLOUD_COVERAGE_REPAIR_TOKEN_ENV);
+        validate_cloud_operations_tokens(
+            cloud_operations_metrics_token.as_deref(),
+            cloud_coverage_repair_token.as_deref(),
+            [
+                organisation_deletion_metrics_token.as_deref(),
+                organisation_deletion_operator_token.as_deref(),
+                billing_transfer_operator_token.as_deref(),
+                cloud_retention_operator_token.as_deref(),
+                cloud_retention_destructive_token.as_deref(),
+            ],
+        )?;
         let provider_refresh_ingest_enabled =
             feature_flag_is_enabled(std::env::var(PROVIDER_REFRESH_INGEST_ENV).ok().as_deref());
         let provider_refresh_worker_enabled =
@@ -478,10 +540,24 @@ impl Config {
             deployment_mode,
             billing.as_ref(),
         )?;
+        validate_sponsored_billing_recovery_configuration(
+            sponsored_billing_recovery_worker_enabled,
+            deployment_mode,
+            billing.as_ref(),
+        )?;
         validate_cloud_retention_configuration(
-            cloud_retention_dry_run_enabled,
+            cloud_retention_dry_run_enabled || cloud_shared_retention_dry_run_enabled,
             cloud_retention_operator_token.as_deref(),
             deployment_mode,
+        )?;
+        validate_cloud_retention_purge_configuration(
+            cloud_retention_purge_enabled,
+            cloud_retention_operator_token.as_deref(),
+            cloud_retention_destructive_token.as_deref(),
+            cloud_retention_evidence_hmac_key.as_deref(),
+            cloud_retention_build_sha.as_deref(),
+            deployment_mode,
+            option_env!("SOTTO_COMPILED_BUILD_SHA"),
         )?;
         let cloud_action_enforcement_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_ACTION_ENFORCEMENT_ENV).ok().as_deref());
@@ -502,6 +578,8 @@ impl Config {
             organisation_deletion_retention_days,
             organisation_deletion_worker_enabled,
             organisation_deletion_metrics_token,
+            cloud_operations_metrics_token,
+            cloud_coverage_repair_token,
             organisation_deletion_operator_token,
             provider_refresh_ingest_enabled,
             provider_refresh_worker_enabled,
@@ -520,13 +598,49 @@ impl Config {
             billing_transfer_setup_enabled,
             billing_transfer_operator_token,
             cloud_retention_dry_run_enabled,
+            cloud_shared_retention_dry_run_enabled,
             cloud_retention_operator_token,
+            cloud_retention_purge_enabled,
+            cloud_retention_destructive_token,
+            cloud_retention_evidence_hmac_key,
+            cloud_retention_build_sha,
             contact_verification,
             cloud_notice_dispatch_enabled,
             billing_recovery_worker_enabled,
+            sponsored_billing_recovery_worker_enabled,
             resend_webhook_secret,
         })
     }
+}
+
+fn validate_cloud_operations_tokens<'a>(
+    metrics: Option<&'a str>,
+    repair: Option<&'a str>,
+    existing_write_tokens: [Option<&'a str>; 5],
+) -> Result<()> {
+    if metrics.is_some() && metrics == repair {
+        return Err(Error::Config(
+            "Cloud operations metrics and coverage repair tokens must be different".into(),
+        ));
+    }
+    for new_token in [metrics, repair].into_iter().flatten() {
+        if new_token.len() < 32 {
+            return Err(Error::Config(
+                "Cloud operations metrics and coverage repair tokens must contain at least 32 characters".into(),
+            ));
+        }
+        if existing_write_tokens
+            .into_iter()
+            .flatten()
+            .any(|existing| existing == new_token)
+        {
+            return Err(Error::Config(
+                "Cloud operations tokens must not be reused for an existing operator capability"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_founding_schedule_worker_configuration(
@@ -552,6 +666,27 @@ fn validate_founding_schedule_worker_configuration(
     if billing.cloud_portal_configuration_id.is_none() {
         return Err(Error::Config(
             "founding schedule worker requires STRIPE_CLOUD_PORTAL_CONFIGURATION_ID".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sponsored_billing_recovery_configuration(
+    enabled: bool,
+    deployment_mode: DeploymentMode,
+    billing: Option<&BillingConfig>,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+    if deployment_mode != DeploymentMode::Cloud
+        || billing
+            .and_then(|config| config.price_catalogue.as_ref())
+            .is_none()
+    {
+        return Err(Error::Config(
+            "sponsored billing recovery requires Cloud mode and the hosted Stripe price catalogue"
+                .into(),
         ));
     }
     Ok(())
@@ -824,15 +959,17 @@ fn validate_cloud_sales_configuration(
     billing_configured: bool,
     hosted_catalogue_configured: bool,
     safe_portal_configuration_configured: bool,
+    automatic_tax_enabled: bool,
 ) -> Result<()> {
     if enabled
         && (deployment_mode != DeploymentMode::Cloud
             || !billing_configured
             || !hosted_catalogue_configured
-            || !safe_portal_configuration_configured)
+            || !safe_portal_configuration_configured
+            || !automatic_tax_enabled)
     {
         return Err(Error::Config(format!(
-            "{CLOUD_SALES_ENV}=1 requires SOTTO_DEPLOYMENT_MODE=cloud, complete Stripe credentials, all four hosted price ids, and STRIPE_CLOUD_PORTAL_CONFIGURATION_ID"
+            "{CLOUD_SALES_ENV}=1 requires SOTTO_DEPLOYMENT_MODE=cloud, complete Stripe credentials, all four hosted price ids, STRIPE_CLOUD_PORTAL_CONFIGURATION_ID, and {CLOUD_AUTOMATIC_TAX_ENV}=1"
         )));
     }
     Ok(())
@@ -849,9 +986,12 @@ fn validate_billing_transfers_configuration(
     let billing = billing.ok_or_else(|| {
         Error::Config("payer transfer routes require configured Cloud Stripe billing".into())
     })?;
-    if deployment_mode != DeploymentMode::Cloud || billing.price_catalogue.is_none() {
+    if deployment_mode != DeploymentMode::Cloud
+        || billing.price_catalogue.is_none()
+        || !billing.cloud_automatic_tax_enabled
+    {
         return Err(Error::Config(
-            "payer transfer routes require cloud mode and all four hosted Stripe prices".into(),
+            "payer transfer routes require cloud mode, all four hosted Stripe prices, and Stripe Tax enabled".into(),
         ));
     }
     Ok(())
@@ -900,9 +1040,12 @@ fn validate_billing_transfer_execution_configuration(
     let billing = billing.ok_or_else(|| {
         Error::Config("payer transfer execution requires configured Cloud Stripe billing".into())
     })?;
-    if deployment_mode != DeploymentMode::Cloud || billing.price_catalogue.is_none() {
+    if deployment_mode != DeploymentMode::Cloud
+        || billing.price_catalogue.is_none()
+        || !billing.cloud_automatic_tax_enabled
+    {
         return Err(Error::Config(
-            "payer transfer execution requires cloud mode and all four hosted Stripe prices".into(),
+            "payer transfer execution requires cloud mode, all four hosted Stripe prices, and Stripe Tax enabled".into(),
         ));
     }
     // API intake can be disabled independently while an already-started provider operation is
@@ -957,6 +1100,73 @@ fn validate_cloud_retention_configuration(
                 "SOTTO_CLOUD_RETENTION_OPERATOR_TOKEN must contain at least 32 characters".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_cloud_retention_purge_configuration(
+    purge_enabled: bool,
+    operator_token: Option<&str>,
+    destructive_token: Option<&str>,
+    evidence_hmac_key: Option<&str>,
+    build_sha: Option<&str>,
+    deployment_mode: DeploymentMode,
+    compiled_build_sha: Option<&str>,
+) -> Result<()> {
+    let any_purge_setting = purge_enabled
+        || destructive_token.is_some()
+        || evidence_hmac_key.is_some()
+        || build_sha.is_some();
+    if any_purge_setting && deployment_mode != DeploymentMode::Cloud {
+        return Err(Error::Config(
+            "Cloud retention purge controls require SOTTO_DEPLOYMENT_MODE=cloud".into(),
+        ));
+    }
+    if let Some(token) = destructive_token {
+        if token.len() < 32 {
+            return Err(Error::Config(
+                "SOTTO_CLOUD_RETENTION_DESTRUCTIVE_TOKEN must contain at least 32 characters"
+                    .into(),
+            ));
+        }
+        if operator_token.is_some_and(|operator| operator == token) {
+            return Err(Error::Config(
+                "Cloud retention destructive and inspection tokens must be different".into(),
+            ));
+        }
+    }
+    if let Some(key) = evidence_hmac_key {
+        if key.len() < 32 {
+            return Err(Error::Config(
+                "SOTTO_CLOUD_RETENTION_EVIDENCE_HMAC_KEY must contain at least 32 bytes".into(),
+            ));
+        }
+    }
+    if let Some(sha) = build_sha {
+        if !matches!(sha.len(), 40 | 64)
+            || !sha
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Error::Config(
+                "SOTTO_CLOUD_RETENTION_BUILD_SHA must be a lowercase commit SHA".into(),
+            ));
+        }
+        if compiled_build_sha != Some(sha) {
+            return Err(Error::Config(
+                "SOTTO_CLOUD_RETENTION_BUILD_SHA must match the commit SHA embedded in this server build".into(),
+            ));
+        }
+    }
+    if purge_enabled
+        && (operator_token.is_none()
+            || destructive_token.is_none()
+            || evidence_hmac_key.is_none()
+            || build_sha.is_none())
+    {
+        return Err(Error::Config(
+            "Cloud retention purge requires separate operator tokens, restore evidence signing, and the exact build SHA".into(),
+        ));
     }
     Ok(())
 }
@@ -1106,14 +1316,15 @@ mod tests {
         telemetry_ping_enabled, validate_billing_recovery_configuration,
         validate_billing_transfer_execution_configuration,
         validate_billing_transfer_operator_configuration, validate_billing_transfers_configuration,
-        validate_cloud_retention_configuration, validate_cloud_sales_configuration,
+        validate_cloud_operations_tokens, validate_cloud_retention_configuration,
+        validate_cloud_retention_purge_configuration, validate_cloud_sales_configuration,
         validate_contact_verification_configuration, validate_coverage_authority_configuration,
         validate_deployment_billing_boundary, validate_founding_price_notices_configuration,
         validate_founding_schedule_worker_configuration, validate_notice_dispatch_configuration,
-        validate_provider_refresh_configuration, BillingConfig, BillingPriceIds,
-        ContactVerificationConfig, DeploymentMode, DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
-        MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS, MAX_ORGANISATION_DELETION_RETENTION_DAYS,
-        MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
+        validate_provider_refresh_configuration, validate_sponsored_billing_recovery_configuration,
+        BillingConfig, BillingPriceIds, ContactVerificationConfig, DeploymentMode,
+        DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS, MAX_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
+        MAX_ORGANISATION_DELETION_RETENTION_DAYS, MIN_COVERAGE_AUTHORITY_MAX_AGE_SECONDS,
     };
 
     #[test]
@@ -1276,6 +1487,7 @@ mod tests {
             price_catalogue: None,
             cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.example.test".into(),
         };
         assert!(validate_provider_refresh_configuration(
@@ -1404,8 +1616,17 @@ mod tests {
             }),
             cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: true,
             return_url: "https://app.example.test".into(),
         };
+        let mut without_tax = billing.clone();
+        without_tax.cloud_automatic_tax_enabled = false;
+        assert!(validate_billing_transfers_configuration(
+            true,
+            DeploymentMode::Cloud,
+            Some(&without_tax),
+        )
+        .is_err());
         assert!(validate_billing_transfers_configuration(
             true,
             DeploymentMode::Cloud,
@@ -1436,6 +1657,7 @@ mod tests {
             }),
             cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.example.test".into(),
         };
         assert!(validate_billing_recovery_configuration(
@@ -1502,6 +1724,7 @@ mod tests {
                 }),
                 cloud_portal_configuration_id: None,
                 cloud_sales_enabled: false,
+                cloud_automatic_tax_enabled: true,
                 return_url: "https://app.example.test".into(),
             }),
         )
@@ -1535,6 +1758,7 @@ mod tests {
             price_catalogue: None,
             cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.example.test".into(),
         };
         assert!(validate_billing_transfer_operator_configuration(
@@ -1573,10 +1797,97 @@ mod tests {
     }
 
     #[test]
+    fn cloud_retention_purge_requires_separate_credentials_and_exact_build_identity() {
+        let inspect = "i".repeat(32);
+        let destructive = "d".repeat(32);
+        let signing_key = "s".repeat(32);
+        let sha = "a".repeat(40);
+        assert!(validate_cloud_retention_purge_configuration(
+            false,
+            None,
+            None,
+            None,
+            None,
+            DeploymentMode::SelfHosted,
+            None,
+        )
+        .is_ok());
+        assert!(validate_cloud_retention_purge_configuration(
+            true,
+            Some(&inspect),
+            Some(&destructive),
+            Some(&signing_key),
+            Some(&sha),
+            DeploymentMode::Cloud,
+            Some(&sha),
+        )
+        .is_ok());
+        assert!(validate_cloud_retention_purge_configuration(
+            true,
+            Some(&inspect),
+            Some(&inspect),
+            Some(&signing_key),
+            Some(&sha),
+            DeploymentMode::Cloud,
+            Some(&sha),
+        )
+        .is_err());
+        assert!(validate_cloud_retention_purge_configuration(
+            true,
+            Some(&inspect),
+            Some(&destructive),
+            Some(&signing_key),
+            Some(&sha),
+            DeploymentMode::Cloud,
+            Some(&"b".repeat(40)),
+        )
+        .is_err());
+        assert!(validate_cloud_retention_purge_configuration(
+            true,
+            Some(&inspect),
+            Some(&destructive),
+            Some(&signing_key),
+            Some(&sha),
+            DeploymentMode::Cloud,
+            None,
+        )
+        .is_err());
+        assert!(validate_cloud_retention_purge_configuration(
+            true,
+            Some(&inspect),
+            Some(&destructive),
+            None,
+            Some(&sha),
+            DeploymentMode::Cloud,
+            Some(&sha),
+        )
+        .is_err());
+        assert!(validate_cloud_retention_purge_configuration(
+            true,
+            Some(&inspect),
+            Some(&destructive),
+            Some(&signing_key),
+            Some("not-a-commit"),
+            DeploymentMode::Cloud,
+            Some(&sha),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn build_sha_is_embedded_from_the_build_argument() {
+        let expected = std::env::var("SOTTO_BUILD_SHA")
+            .ok()
+            .filter(|value| !value.is_empty());
+        assert_eq!(option_env!("SOTTO_COMPILED_BUILD_SHA"), expected.as_deref());
+    }
+
+    #[test]
     fn cloud_sales_requires_cloud_billing_and_all_hosted_prices() {
         assert!(validate_cloud_sales_configuration(
             false,
             DeploymentMode::SelfHosted,
+            false,
             false,
             false,
             false,
@@ -1587,25 +1898,55 @@ mod tests {
             DeploymentMode::SelfHosted,
             true,
             true,
+            true,
+            true,
+        )
+        .is_err());
+        assert!(validate_cloud_sales_configuration(
+            true,
+            DeploymentMode::Cloud,
+            false,
+            true,
+            true,
             true
         )
         .is_err());
-        assert!(
-            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, false, true, true)
-                .is_err()
-        );
-        assert!(
-            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, false, true)
-                .is_err()
-        );
-        assert!(
-            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, true, false)
-                .is_err()
-        );
-        assert!(
-            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, true, true)
-                .is_ok()
-        );
+        assert!(validate_cloud_sales_configuration(
+            true,
+            DeploymentMode::Cloud,
+            true,
+            false,
+            true,
+            true
+        )
+        .is_err());
+        assert!(validate_cloud_sales_configuration(
+            true,
+            DeploymentMode::Cloud,
+            true,
+            true,
+            false,
+            true
+        )
+        .is_err());
+        assert!(validate_cloud_sales_configuration(
+            true,
+            DeploymentMode::Cloud,
+            true,
+            true,
+            true,
+            false
+        )
+        .is_err());
+        assert!(validate_cloud_sales_configuration(
+            true,
+            DeploymentMode::Cloud,
+            true,
+            true,
+            true,
+            true
+        )
+        .is_ok());
         assert!(is_portal_configuration_id("bpc_123"));
         assert!(!is_portal_configuration_id("cus_123"));
         assert!(!is_portal_configuration_id("bpc_"));
@@ -1623,6 +1964,7 @@ mod tests {
             price_catalogue: None,
             cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.example.test".into(),
         };
         assert!(
@@ -1651,6 +1993,51 @@ mod tests {
         assert!(
             validate_founding_schedule_worker_configuration(true, true, Some(&complete)).is_ok()
         );
+    }
+
+    #[test]
+    fn sponsored_billing_recovery_is_opt_in_and_requires_cloud_catalogue() {
+        assert!(validate_sponsored_billing_recovery_configuration(
+            false,
+            DeploymentMode::SelfHosted,
+            None
+        )
+        .is_ok());
+        assert!(validate_sponsored_billing_recovery_configuration(
+            true,
+            DeploymentMode::SelfHosted,
+            None
+        )
+        .is_err());
+        let billing = BillingConfig {
+            api_key: "rk_test_secret".into(),
+            webhook_secret: "whsec_test".into(),
+            price_id: "price_legacy".into(),
+            price_catalogue: Some(BillingPriceIds {
+                standard_monthly: "price_standard_month".into(),
+                standard_annual: "price_standard_year".into(),
+                founding_monthly: "price_founding_month".into(),
+                founding_annual: "price_founding_year".into(),
+            }),
+            cloud_portal_configuration_id: None,
+            cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
+            return_url: "https://app.example.test".into(),
+        };
+        assert!(validate_sponsored_billing_recovery_configuration(
+            true,
+            DeploymentMode::Cloud,
+            Some(&billing)
+        )
+        .is_ok());
+        let mut no_catalogue = billing;
+        no_catalogue.price_catalogue = None;
+        assert!(validate_sponsored_billing_recovery_configuration(
+            true,
+            DeploymentMode::Cloud,
+            Some(&no_catalogue)
+        )
+        .is_err());
     }
 
     #[test]
@@ -1683,6 +2070,7 @@ mod tests {
             }),
             cloud_portal_configuration_id: Some("bpc_test".into()),
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.example.test".into(),
         };
         assert!(validate_founding_price_notices_configuration(
@@ -1824,5 +2212,29 @@ mod tests {
         assert!(!feature_flag_is_enabled(Some("true")));
         assert!(!feature_flag_is_enabled(Some(" 1 ")));
         assert!(feature_flag_is_enabled(Some("1")));
+    }
+
+    #[test]
+    fn cloud_diagnostic_credentials_cannot_share_existing_operator_tokens() {
+        let metrics = "m".repeat(32);
+        let repair = "r".repeat(32);
+        let shared = "s".repeat(32);
+        assert!(validate_cloud_operations_tokens(Some(&metrics), Some(&repair), [None; 5]).is_ok());
+        assert!(
+            validate_cloud_operations_tokens(Some(&metrics), Some(&metrics), [None; 5]).is_err()
+        );
+        assert!(validate_cloud_operations_tokens(Some("short"), None, [None; 5]).is_err());
+        assert!(validate_cloud_operations_tokens(
+            Some(&shared),
+            None,
+            [None, Some(&shared), None, None, None]
+        )
+        .is_err());
+        assert!(validate_cloud_operations_tokens(
+            None,
+            Some(&shared),
+            [None, None, None, Some(&shared), None]
+        )
+        .is_err());
     }
 }
