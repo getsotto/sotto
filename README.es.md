@@ -191,6 +191,24 @@ plano, por lo que necesita `--reveal` en un terminal, igual que `sotto get`; `--
 contenido se protege el nuevo valor, mientras que los gestores del portapapeles, la suspensión o la
 terminación del proceso auxiliar pueden conservar una copia.
 
+`sotto run` inicia el comando con tu entorno actual más los secretos del entorno seleccionado. Un
+secreto reemplaza a una variable heredada con el mismo nombre, y las variables sin relación se
+conservan. Cuando ocurre, Sotto escribe `warning: overriding inherited environment variable NAME` en
+stderr, nunca el valor. Solo el comando y sus descendientes ven los secretos; el entorno de tu shell
+no cambia después. Para usar otro entorno, pon `--env` antes de `--` (consulta
+[Entornos](#entornos); [Importar un archivo dotenv](#importar-un-archivo-dotenv) explica cómo llenarlo).
+
+Sotto ejecuta el programa directamente, por lo que no expande variables ni interpreta tuberías ni
+redirecciones en sus argumentos. Tu propio shell sigue procesando su sintaxis antes de que arranque
+Sotto: `sotto run -- echo "$EXAMPLE"` muestra el valor de `EXAMPLE` en el shell padre, no el
+inyectado. Para expandir una variable dentro del proceso hijo, ejecuta un shell como comando y pon el
+script entre comillas simples (shells POSIX). En este ejemplo ficticio, supón que `EXAMPLE` está
+guardado en Sotto con el valor `demo-only`:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
 Hasta aquí todo se queda en tu máquina. Para sincronizar otro dispositivo, trabajar en equipo o usar
 CI, inicia sesión en un servidor:
 
