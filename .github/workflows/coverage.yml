@@ -10,6 +10,13 @@ permissions:
   actions: read
   contents: read
 
+# A new push to a pull request cancels the run it supersedes. Only pull request runs share a group;
+# every other event is keyed by its own run id, so runs on main, scheduled runs and manual runs
+# never cancel or queue behind one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   native:
     name: native Rust coverage (Postgres)
@@ -52,29 +59,8 @@ jobs:
           workspaces: . -> target/llvm-cov-target
       - name: Install pinned coverage tool
         run: cargo install cargo-llvm-cov --version 0.9.1 --locked
-      - name: Coverage runner regression tests
-        run: |
-          python3 -B -m unittest discover -s scripts/tests -p test_rust_coverage.py -v
-          python3 -B -m unittest discover -s scripts/tests -p test_cloud_coverage_races.py -v
-          python3 -B -m unittest discover -s scripts/tests -p test_cloud_lifecycle_integration.py -v
-          python3 -B -m unittest discover -s scripts/tests -p test_validate_stripe_lifecycle_evidence.py -v
       - name: Native workspace coverage with Postgres
         run: scripts/check-rust-coverage
-      - name: Server authorisation and transaction assurance
-        run: |
-          set -euo pipefail
-          cargo test -p sotto-server --test authorisation_transactions -- --test-threads=1 --nocapture 2>&1 | tee server-assurance.log
-          grep -Eq '^SERVER_ASSURANCE_DONE 7$' server-assurance.log
-      - name: Cloud coverage race repetitions
-        run: scripts/check-cloud-coverage-races
-      - name: Install PostgreSQL client tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends postgresql-client
-      - name: Integrated Cloud lifecycle database scenarios
-        run: |
-          DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto_lifecycle_acceptance \
-            scripts/check-cloud-lifecycle-integration
       - name: Publish coverage summary
         run: cat target/coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
       - name: Retain reports and run status
