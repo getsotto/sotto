@@ -402,14 +402,15 @@ pub async fn retire_source(
     source_id: &str,
     provider_end_reference: &str,
     effective_until_epoch: i64,
+    now_epoch: i64,
 ) -> Result<RetirementReceipt, ReconciliationError> {
     validate_operation_id(operation_id)?;
     validate_identifier(beneficiary_id, "beneficiary_id")?;
     validate_identifier(source_id, "source_id")?;
     validate_identifier(provider_end_reference, "provider_end_reference")?;
-    if effective_until_epoch <= 0 {
+    if effective_until_epoch <= 0 || now_epoch <= 0 {
         return Err(ReconciliationError::InvalidSource(
-            "retirement boundary must be positive".into(),
+            "retirement boundary and current time must be positive".into(),
         ));
     }
     let coordinator = sqlx::query(
@@ -473,11 +474,11 @@ pub async fn retire_source(
     if operation_exists {
         return Err(ReconciliationError::RegistrationConflict);
     }
-    let boundary_elapsed: bool =
-        sqlx::query_scalar("SELECT $1 <= EXTRACT(EPOCH FROM now())::BIGINT")
-            .bind(effective_until_epoch)
-            .fetch_one(&mut **tx)
-            .await?;
+    let boundary_elapsed: bool = sqlx::query_scalar("SELECT $1 <= $2")
+        .bind(effective_until_epoch)
+        .bind(now_epoch)
+        .fetch_one(&mut **tx)
+        .await?;
     if !boundary_elapsed {
         return Err(ReconciliationError::InvalidSource(
             "source cannot be retired before its paid interval ends".into(),

@@ -27,6 +27,8 @@ Paired grant or rotation races, personal and rotation revision contenders, owner
 late audit-failure rollback injection, token and rotation ordering, and both machine read endpoints
 remain outstanding and must not be inferred from the cases above.
 
-The required CI and coverage jobs invoke this test target explicitly. This suite does not claim
+The required CI server job invokes this test target explicitly and checks the completion line. The
+coverage job still executes it as part of its workspace run, so its paths remain measured, but does
+not repeat the explicit invocation. This suite does not claim
 cryptographic correctness, client or WebAssembly behaviour, hostile-workflow isolation, or release
 gating.

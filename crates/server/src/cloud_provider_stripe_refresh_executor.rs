@@ -17,14 +17,14 @@ use crate::cloud_coverage_reconciliation::{
     SourceBinding,
 };
 use crate::cloud_provider::{
-    collect_provider_history, prepare_verified_event, AllocationState, PayerKind, ProviderContext,
-    VerifiedAllocation, VerifiedCollection,
+    prepare_verified_event, AllocationState, PayerKind, ProviderContext, VerifiedAllocation,
+    VerifiedCollection,
 };
 use crate::cloud_provider_refresh_inputs::RefreshJobInputs;
 use crate::cloud_provider_refresh_worker::{RefreshExecutionError, RefreshJobExecutor};
 use crate::cloud_provider_stripe::StripeCoverageConfig;
 use crate::cloud_provider_stripe_adapter::{
-    prepared_source, StripeHistoryClient, StripePreparedCollection,
+    collect_stripe_history, prepared_source, StripeHistoryClient, StripePreparedCollection,
 };
 use crate::cloud_provider_stripe_http::StripeReadClient;
 use crate::cloud_provider_stripe_sponsored::SponsoredStripeCoverageConfig;
@@ -111,10 +111,7 @@ impl StripeRefreshExecutor {
         let collection = apply_confirmed_early_terminations(collection, &details)?;
 
         let mut complete = self.pool.begin().await.map_err(|_| "refresh_database")?;
-        let now_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "refresh_clock")?
-            .as_secs() as i64;
+        let now_epoch = crate::clock::business_epoch_seconds();
         let authority = self.authority_max_age_seconds.map(|seconds| {
             crate::cloud_coverage_reconciliation::AuthorityReceiptInput {
                 provider_namespace: context.namespace.clone(),
@@ -210,14 +207,10 @@ impl StripeRefreshExecutor {
             }
             let mut client = StripeHistoryClient::new(self.stripe.clone(), prepared)
                 .with_renewal_failures(renewal_failures);
-            let collection = collect_provider_history(
-                &mut client,
-                context,
-                &personal_ticket.source_bindings,
-                Default::default(),
-            )
-            .await
-            .map_err(|_| "refresh_personal_evidence")?;
+            let collection =
+                collect_stripe_history(&mut client, context, &personal_ticket.source_bindings)
+                    .await
+                    .map_err(|_| "refresh_personal_evidence")?;
             add_observations(&mut observations, &mut evidence_references, collection)?;
         }
 
@@ -340,10 +333,7 @@ impl StripeRefreshExecutor {
             .collect_mixed(&context, None, &ticket, &details)
             .await?;
         let collection = apply_confirmed_early_terminations(collection, &details)?;
-        let observed_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "revalidation_clock")?
-            .as_secs() as i64;
+        let observed_at = crate::clock::business_epoch_seconds();
         let fresh_until = observed_at
             .checked_add(
                 self.authority_max_age_seconds
