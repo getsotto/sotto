@@ -536,6 +536,8 @@ project's default. Press `r` to reveal or conceal the selected value, `c` to cop
 clipboard, and `q` to quit. `Esc` closes the current search or dialog; from the main view, it
 clears an active search or quits.
 
+Press `h` to [browse and restore local secret history](LOCAL-HISTORY.md) (English guide).
+
 Press `t` to browse themes with a live preview. Use the arrow keys to preview each theme, then
 press `Enter` to save your choice or `Esc` to cancel. The [theme precedence rules](#output-themes)
 explain how command and environment overrides affect the saved preference.
