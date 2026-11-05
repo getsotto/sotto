@@ -335,9 +335,46 @@ mod tests {
     fn search_for(app: &mut TuiApp, query: &str) {
         handle_key_event(app, key(KeyCode::Char('/'))).unwrap();
         assert!(app.search_mode);
-        for character in query.chars() {
+        type_chars(app, query);
+    }
+
+    fn type_chars(app: &mut TuiApp, text: &str) {
+        for character in text.chars() {
             handle_key_event(app, key(KeyCode::Char(character))).unwrap();
         }
+    }
+
+    fn with_unlocked_dashboard(
+        seed: &[(&str, &[u8])],
+        check: impl FnOnce(&crate::commands::App<'_>, &mut TuiApp<'_>),
+    ) {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let keychain = crate::keychain::MemoryKeychain::default();
+        crate::session::init(
+            &store,
+            &keychain,
+            b"pw",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master = crate::session::current_master_key(&keychain)
+            .unwrap()
+            .unwrap();
+        let keypair = crate::session::account_keypair(&store, &master).unwrap();
+        let project = crate::vault::Vault::create_project(&store, &keypair, "acme").unwrap();
+        let config = crate::config::Config {
+            project_id: project.id,
+            project: "acme".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let theme = crate::theme::Theme::default();
+        let app = crate::commands::App::new(&store, &keychain);
+        for (name, value) in seed {
+            app.set(&config, name, value).unwrap();
+        }
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        check(&app, &mut tui_app);
     }
 
     fn filtered_names<'a>(app: &'a TuiApp) -> Vec<&'a str> {
@@ -908,10 +945,17 @@ mod tests {
         assert!(!tui_app.secret_modal_masked);
 
         // Enter commits
+        let created_value = tui_app.secret_modal_value.as_bytes().to_vec();
         handle_key_event(&mut tui_app, key(KeyCode::Enter)).unwrap();
         assert!(!tui_app.show_secret_modal);
         assert_eq!(tui_app.secrets.len(), 1);
         assert_eq!(tui_app.secrets[0].name, "TOKEN");
+        assert_eq!(tui_app.secrets[0].version, 1);
+        assert_eq!(app.get(&tui_app.config, "TOKEN").unwrap(), created_value);
+        assert_eq!(
+            app.secret_history(&tui_app.config, "TOKEN").unwrap().len(),
+            1
+        );
 
         // 'e' opens edit modal on selected secret
         handle_key_event(&mut tui_app, key(KeyCode::Char('e'))).unwrap();
@@ -922,9 +966,154 @@ mod tests {
         );
         assert_eq!(tui_app.secret_modal_name, "TOKEN");
 
-        // Esc cancels edit modal
+        // Esc cancels an unchanged edit dialogue
         handle_key_event(&mut tui_app, key(KeyCode::Esc)).unwrap();
         assert!(!tui_app.show_secret_modal);
+
+        // Editing the value and pressing Enter still saves and adds a version.
+        handle_key_event(&mut tui_app, key(KeyCode::Char('e'))).unwrap();
+        handle_key_event(&mut tui_app, key(KeyCode::Char('x'))).unwrap();
+        let updated_value = tui_app.secret_modal_value.as_bytes().to_vec();
+        handle_key_event(&mut tui_app, key(KeyCode::Enter)).unwrap();
+        assert!(!tui_app.show_secret_modal);
+        assert_eq!(app.get(&tui_app.config, "TOKEN").unwrap(), updated_value);
+        assert_eq!(tui_app.secrets[0].version, 2);
+        assert_eq!(
+            app.secret_history(&tui_app.config, "TOKEN").unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn cancelling_new_secret_draft_leaves_vault_unchanged() {
+        with_unlocked_dashboard(&[("KEEP_ME", b"keep-value")], |app, tui_app| {
+            handle_key_event(tui_app, key(KeyCode::Char('n'))).unwrap();
+            assert!(tui_app.show_secret_modal);
+            assert_eq!(
+                tui_app.secret_modal_mode,
+                crate::tui::app::SecretModalMode::New
+            );
+
+            type_chars(tui_app, "DRAFT_TOKEN");
+            handle_key_event(tui_app, key(KeyCode::Tab)).unwrap();
+            type_chars(tui_app, "discarded-draft");
+            assert_eq!(tui_app.secret_modal_name, "DRAFT_TOKEN");
+            assert_eq!(tui_app.secret_modal_value.as_str(), "discarded-draft");
+
+            handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+            assert!(!tui_app.show_secret_modal);
+            assert!(tui_app.running);
+
+            assert_eq!(app.list(&tui_app.config).unwrap(), ["KEEP_ME"]);
+            assert_eq!(app.get(&tui_app.config, "KEEP_ME").unwrap(), b"keep-value");
+            assert!(matches!(
+                app.get(&tui_app.config, "DRAFT_TOKEN"),
+                Err(crate::error::Error::NotFound(_))
+            ));
+            assert_eq!(
+                app.secret_history(&tui_app.config, "KEEP_ME")
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(tui_app.secrets.len(), 1);
+            assert_eq!(tui_app.secrets[0].name, "KEEP_ME");
+            assert_eq!(tui_app.secrets[0].version, 1);
+        });
+    }
+
+    #[test]
+    fn cancelling_edit_secret_draft_leaves_value_and_history_unchanged() {
+        with_unlocked_dashboard(
+            &[("EXISTING", b"v1-value"), ("EXISTING", b"v2-value")],
+            |app, tui_app| {
+                assert_eq!(tui_app.secrets[0].version, 2);
+
+                handle_key_event(tui_app, key(KeyCode::Char('e'))).unwrap();
+                assert!(tui_app.show_secret_modal);
+                assert_eq!(
+                    tui_app.secret_modal_mode,
+                    crate::tui::app::SecretModalMode::Edit
+                );
+                assert_eq!(tui_app.secret_modal_value.as_str(), "v2-value");
+
+                type_chars(tui_app, "-discarded");
+                assert_eq!(tui_app.secret_modal_value.as_str(), "v2-value-discarded");
+
+                handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+                assert!(!tui_app.show_secret_modal);
+                assert!(tui_app.running);
+
+                // Persistence is checked through the store, not only the cached list.
+                assert_eq!(app.get(&tui_app.config, "EXISTING").unwrap(), b"v2-value");
+                let history = app.secret_history(&tui_app.config, "EXISTING").unwrap();
+                assert_eq!(history.len(), 2);
+                assert_eq!(history[0].version, 2);
+                assert_eq!(history[0].value.as_deref(), Some(b"v2-value".as_slice()));
+                assert_eq!(history[1].version, 1);
+                assert_eq!(history[1].value.as_deref(), Some(b"v1-value".as_slice()));
+                assert_eq!(app.list_items(&tui_app.config).unwrap()[0].version, 2);
+                assert_eq!(tui_app.secrets[0].version, 2);
+            },
+        );
+    }
+
+    #[test]
+    fn reopening_secret_modal_after_cancel_loads_original_masked_fields() {
+        with_unlocked_dashboard(&[("EXISTING", b"stored-value")], |app, tui_app| {
+            handle_key_event(tui_app, key(KeyCode::Char('n'))).unwrap();
+            type_chars(tui_app, "DRAFT_TOKEN");
+            handle_key_event(tui_app, key(KeyCode::Tab)).unwrap();
+            type_chars(tui_app, "discarded-draft");
+            handle_key_event(
+                tui_app,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            )
+            .unwrap();
+            assert!(!tui_app.secret_modal_masked);
+            handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+
+            handle_key_event(tui_app, key(KeyCode::Char('n'))).unwrap();
+            assert!(tui_app.show_secret_modal);
+            assert_eq!(
+                tui_app.secret_modal_mode,
+                crate::tui::app::SecretModalMode::New
+            );
+            assert_eq!(tui_app.secret_modal_name, "");
+            assert_eq!(tui_app.secret_modal_value.as_str(), "");
+            assert!(tui_app.secret_modal_masked);
+            handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+
+            handle_key_event(tui_app, key(KeyCode::Char('e'))).unwrap();
+            type_chars(tui_app, "-discarded");
+            handle_key_event(
+                tui_app,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            )
+            .unwrap();
+            assert!(!tui_app.secret_modal_masked);
+            handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+
+            handle_key_event(tui_app, key(KeyCode::Char('e'))).unwrap();
+            assert!(tui_app.show_secret_modal);
+            assert_eq!(
+                tui_app.secret_modal_mode,
+                crate::tui::app::SecretModalMode::Edit
+            );
+            assert_eq!(tui_app.secret_modal_name, "EXISTING");
+            assert_eq!(tui_app.secret_modal_value.as_str(), "stored-value");
+            assert!(tui_app.secret_modal_masked);
+            assert_eq!(
+                app.get(&tui_app.config, "EXISTING").unwrap(),
+                b"stored-value"
+            );
+            assert_eq!(
+                app.secret_history(&tui_app.config, "EXISTING")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        });
     }
 
     #[test]
