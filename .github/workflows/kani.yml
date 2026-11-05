@@ -10,6 +10,13 @@ permissions:
   actions: read
   contents: read
 
+# A new push to a pull request cancels the run it supersedes. Only pull request runs share a group;
+# every other event is keyed by its own run id, so runs on main, scheduled runs and manual runs
+# never cancel or queue behind one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   core:
     name: core parser proofs

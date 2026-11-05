@@ -14,48 +14,102 @@
 #   4. Install the cron entry.
 #
 # The dump is validated with `pg_restore --list` BEFORE upload, so a truncated or corrupt
-# archive fails the run loudly (cron surfaces it) instead of silently shipping garbage.
+# archive fails the run with a non-zero exit instead of silently shipping garbage.
+#
+# Every line this prints is timestamped, and every run ends in exactly one of `backup ok` or
+# `backup FAILED while <step>`. Cron appends all of it to one log that is only ever read after the
+# freshness alarm has fired, by which time the question is which night failed and at what. Bare
+# tool errors with no date answer neither.
 set -eu
 cd "$(dirname "$0")"
 
-BUCKET="${SOTTO_BACKUP_BUCKET:-$(sed -n 's/^SOTTO_BACKUP_BUCKET=//p' .env 2>/dev/null)}"
+log() {
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"
+}
+
+STEP="reading configuration"
+DUMP=""
+JOURNAL=""
+finish() {
+    status=$?
+    # Never leave a dump of the vault database in /tmp, on any exit path.
+    for file in "$DUMP" "$JOURNAL"; do
+        if [ -n "$file" ]; then rm -f "$file"; fi
+    done
+    if [ "$status" -ne 0 ]; then
+        log "backup FAILED while $STEP (exit $status)" >&2
+    fi
+}
+trap finish EXIT
+# Route signals through exit so the EXIT trap reports them like any other failure.
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+log "backup started"
+
+# A missing .env is the unset case below, not a failure here: without `|| true`, set -e would end
+# the run on sed's exit status before the error that explains it.
+BUCKET="${SOTTO_BACKUP_BUCKET:-$(sed -n 's/^SOTTO_BACKUP_BUCKET=//p' .env 2>/dev/null || true)}"
 if [ -z "$BUCKET" ]; then
-    echo "error: SOTTO_BACKUP_BUCKET is not set - add it to deploy/.env (e.g. gs://sotto-backups)" >&2
+    log "error: SOTTO_BACKUP_BUCKET is not set - add it to deploy/.env (e.g. gs://sotto-backups)" >&2
     exit 1
 fi
 # Reject an unusable destination now, before the (comparatively expensive) dump.
 case "$BUCKET" in
-    gs://* | s3://* | *:*) ;;
+    gs://*) UPLOADER=gsutil ;;
+    s3://*) UPLOADER=aws ;;
+    *:*) UPLOADER=rclone ;;
     *)
-        echo "error: SOTTO_BACKUP_BUCKET must be gs://…, s3://…, or an rclone remote:path" >&2
+        log "error: SOTTO_BACKUP_BUCKET must be gs://…, s3://…, or an rclone remote:path" >&2
         exit 1
         ;;
 esac
 
+# Cron runs with a PATH of little more than /usr/bin:/bin, so a tool installed under /snap/bin,
+# /usr/local/bin or a home directory works by hand and is missing every night. Find that out
+# before the dump, and say so in words, rather than as `not found` after it.
+STEP="checking tools"
+for tool in docker python3 "$UPLOADER"; do
+    if ! command -v "$tool" > /dev/null 2>&1; then
+        log "error: $tool is not on PATH ($PATH). Cron does not read your shell profile; set PATH at the top of the crontab." >&2
+        exit 127
+    fi
+done
+
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DUMP="$(mktemp /tmp/sotto-pgdump.XXXXXX)"
 JOURNAL="$(mktemp /tmp/sotto-retention-journal.XXXXXX)"
-trap 'rm -f "$DUMP" "$JOURNAL"' EXIT INT TERM
 
 # Custom-format dump (compressed, pg_restore-able) taken inside the postgres container, so no
 # Postgres client tools are needed on the host.
+STEP="dumping the database"
 docker compose -f docker-compose.prod.yml exec -T postgres pg_dump -U sotto -Fc sotto > "$DUMP"
 
 # A valid archive can list its contents; an empty or truncated file cannot.
+STEP="verifying the dump"
 docker compose -f docker-compose.prod.yml exec -T postgres pg_restore --list < "$DUMP" > /dev/null
 
 # Retention deletions are kept in a cumulative sidecar. A dump can predate a purge, so restoring
 # only the database bytes would resurrect the deleted ciphertext. Validate the sidecar before it
 # leaves the host; the validator prints a count and never prints resource identifiers.
+STEP="exporting the retention journal"
 ../scripts/export-retention-journal "$JOURNAL"
+STEP="validating the retention journal"
 ../scripts/replay-retention-journal --validate-only --journal "$JOURNAL"
 
 DEST="$BUCKET/sotto-$STAMP.dump"
 JOURNAL_DEST="$BUCKET/sotto-$STAMP.tombstones.jsonl"
-case "$BUCKET" in
-    gs://*) gsutil -q cp "$DUMP" "$DEST" && gsutil -q cp "$JOURNAL" "$JOURNAL_DEST" ;;
-    s3://*) aws s3 cp --only-show-errors "$DUMP" "$DEST" && aws s3 cp --only-show-errors "$JOURNAL" "$JOURNAL_DEST" ;;
-    *) rclone copyto "$DUMP" "$DEST" && rclone copyto "$JOURNAL" "$JOURNAL_DEST" ;;
-esac
-echo "backup ok: $DEST ($(wc -c < "$DUMP" | tr -d ' ') bytes)"
-echo "retention journal ok: $JOURNAL_DEST ($(wc -c < "$JOURNAL" | tr -d ' ') bytes)"
+upload() {
+    case "$UPLOADER" in
+        gsutil) gsutil -q cp "$1" "$2" ;;
+        aws) aws s3 cp --only-show-errors "$1" "$2" ;;
+        rclone) rclone copyto "$1" "$2" ;;
+    esac
+}
+STEP="uploading the dump to $DEST"
+upload "$DUMP" "$DEST"
+STEP="uploading the retention journal to $JOURNAL_DEST"
+upload "$JOURNAL" "$JOURNAL_DEST"
+
+log "backup ok: $DEST ($(wc -c < "$DUMP" | tr -d ' ') bytes)"
+log "retention journal ok: $JOURNAL_DEST ($(wc -c < "$JOURNAL" | tr -d ' ') bytes)"

@@ -56,8 +56,10 @@ New hosted purchases have a separate default-off switch, `SOTTO_CLOUD_SALES_ENAB
 off pauses new quotes and checkout sessions while existing billing portals, cancellation, refund
 handling, and verified webhook settlement remain available. Enabling it requires Cloud mode, all
 Stripe credentials, the complete four-price hosted catalogue, and a safe Customer Portal
-configuration. It does not authorise a launch by itself. Operator procedures and deployment
-controls are maintained separately from the public deployment guide.
+configuration. It also requires `SOTTO_CLOUD_AUTOMATIC_TAX_ENABLED=1`; configure Stripe Tax
+registrations and review the product tax classification before enabling that setting. It does not
+authorise a launch by itself. Operator procedures and deployment controls are maintained separately
+from the public deployment guide.
 
 Hosted catalogue variables are `STRIPE_STANDARD_MONTHLY_PRICE_ID`,
 `STRIPE_STANDARD_ANNUAL_PRICE_ID`, `STRIPE_FOUNDING_MONTHLY_PRICE_ID`, and
@@ -254,10 +256,15 @@ change entitlements; an approved cohort and notice decision is required before a
 git pull    # picks up compose/runbook changes
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml restart caddy
 ```
 
 Migrations are forward-only and applied on boot. Check the release notes for anything flagged as
 a compatibility break before upgrading past a minor version.
+
+Restarting Caddy after the server is recreated makes it resolve the server's new container address.
+Without this, the proxy can keep sending API and webhook requests to the previous address and return
+502 responses until Caddy restarts.
 
 **Renamed settings are the one thing `git pull` cannot fix for you.** Your `.env` is deliberately
 untracked, so a variable renamed upstream leaves the old name sitting in your file where nothing
@@ -301,7 +308,10 @@ deletion journal. The sidecar is deliberately separate from the dump: a dump tak
 purge must not resurrect ciphertext when it is restored. It contains resource identifiers and
 ownership checks, never ciphertext or secret values, and is validated before upload by
 [`replay-retention-journal`](../scripts/replay-retention-journal). Keep both objects under the
-same bucket lifecycle policy; a dump without its sidecar is not a restorable backup.
+same bucket lifecycle policy. A backup whose schema includes migration 50 or later needs a
+sidecar at least as recent as the dump. Older backups predate the journal table and can only be
+restored with an empty journal; the restore drill checks that schema boundary before allowing
+that case.
 
 | `SOTTO_BACKUP_BUCKET` | Uploads with | Works for |
 |---|---|---|
@@ -361,8 +371,17 @@ One-time setup, any provider:
 
    ```sh
    crontab -e     # add:
+   # PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin
    # 17 2 * * * cd $HOME/sotto/deploy && ./backup.sh >> $HOME/sotto-backup.log 2>&1
    ```
+
+   Cron does not read your shell profile, so its `PATH` is little more than `/usr/bin:/bin`. A
+   `gsutil`, `aws` or `rclone` installed anywhere else works when you run the script by hand and is
+   missing every night. Set `PATH` in the crontab to include wherever `command -v gsutil` (or your
+   uploader) points. The script checks for its tools before dumping and names any that are missing.
+
+   Every run logs a UTC-timestamped `backup started` and then exactly one of `backup ok: <object>`
+   or `backup FAILED while <step> (exit <status>)`, so the log shows which night failed and where.
 
 5. **Watch that it keeps running.** Cron reports to nobody, and a bucket that has stopped
    receiving objects looks exactly like a bucket nobody has checked. Installing step 4 and
@@ -435,6 +454,27 @@ One-time setup, any provider:
    A non-zero exit is the alarm. On AWS the federated equivalent of the grant above is registering
    GitHub's OIDC issuer as an identity provider and giving the role a trust policy conditioned on
    the repository, with `s3:ListBucket` and nothing else.
+
+6. **When the alarm fires** (a `Backups are stale` issue labelled `backup-alert`), work on the
+   host:
+
+   ```sh
+   crontab -l | grep backup.sh                 # is the entry still installed?
+   grep -E 'backup (started|ok|FAILED)' $HOME/sotto-backup.log | tail -n 6
+   journalctl -u cron --since "2 days ago"     # did cron start it? (/var/log/syslog without journald)
+   ```
+
+   - No `backup started` line for the missed night means cron never ran the script: the entry is
+     gone, the host was down at that time, or cron itself is stopped.
+   - A `backup FAILED while <step>` line names the step that failed. Read the tool output just above
+     it for the reason.
+   - A `backup ok` line for a night whose object is missing from the bucket should no longer occur.
+     Versions before this log line was added could print `ok` after a failed dump upload, so do not
+     trust an older `ok` line.
+
+   Once the cause is fixed, take a backup by hand (`./backup.sh`) rather than waiting a night, then
+   run the `Backup freshness` workflow manually. It closes the issue when it sees a fresh backup;
+   do not close it by hand, because that hides the alarm without checking anything.
 
 **Restore** (into a running instance; drops and recreates objects from the dump). Fetch the
 dump on your own machine, never the host - the append-only posture means the host cannot read
@@ -649,8 +689,10 @@ this uploads only this repository's source, which is public.
 What it asserts, which is the rehearsal of 2026-08-31 written down:
 
 - `pg_restore` completes with no errors;
-- a retention sidecar exists and passes strict JSON-lines validation;
-- every deletion in that sidecar is replayed against the restored database with its ownership,
+- a retention sidecar for schema at migration 50 or later exists and passes strict JSON-lines
+  validation; an older schema is accepted without a sidecar only after the drill verifies it
+  predates the retention journal, then replays an empty journal;
+- every deletion in a sidecar is replayed against the restored database with its ownership,
   creation-time and revision guards, so purged rows cannot reappear;
 - every migration the dump recorded is marked successful, and none is a version this checkout
   does not carry. A deployment **behind** the branch passes: production is often a release or
