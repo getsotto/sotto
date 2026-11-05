@@ -132,7 +132,7 @@ jobs:
           echo "Newest backup: ${newest} (${age_hours}h old, threshold ${MAX_AGE_HOURS}h)"
 
           if [ "$age_hours" -ge "$MAX_AGE_HOURS" ]; then
-            echo "reason=The newest backup is ${age_hours} hours old, past the ${MAX_AGE_HOURS} hour threshold. The most recent upload was ${newest}. Check the cron entry on the host and the tail of \$HOME/sotto-backup.log." >> "$GITHUB_OUTPUT"
+            echo "reason=The newest backup is ${age_hours} hours old, past the ${MAX_AGE_HOURS} hour threshold. The most recent upload was ${newest}. On the host, check the cron entry and the last \`backup started\`, \`backup ok\` and \`backup FAILED\` lines in \$HOME/sotto-backup.log; deploy/README.md section Backups, step 6, has the triage." >> "$GITHUB_OUTPUT"
             echo "healthy=false" >> "$GITHUB_OUTPUT"
           else
             echo "healthy=true" >> "$GITHUB_OUTPUT"

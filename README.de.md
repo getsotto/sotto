@@ -154,7 +154,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -674,6 +674,9 @@ Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht 
 
 Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
 
+Wie du die persönliche Abrechnung auf der Sotto-Cloud-Kontoseite an eine Organisation übergibst,
+steht in der [Anleitung zur Abrechnungsübertragung](CLOUD-BILLING-TRANSFER.md).
+
 ### Ausgabe-Themes
 
 Die CLI enthält fünf integrierte Themes: `nord` (die Standardeinstellung), `sordino`,
@@ -791,6 +794,26 @@ Richte die CLI einmal auf deinen Server aus; spätere Befehle verwenden ihn weit
 ```sh
 sotto login --server https://sotto.example.com
 ```
+
+Bei einer frischen CLI-Konfiguration verwendet auch der von `sotto share`
+erzeugte Weblink diese Server-URL. Haben API und Web-App verschiedene Origins,
+wählt `--server` weiterhin den Sync/API-Server, während `--web` die Basis-URL
+der Web-App für Freigabelinks festlegt:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+Die CLI speichert die Web-URL separat. Eine spätere Anmeldung nur mit
+`--server` behält die bisherige `--web`-Einstellung bei, auch beim
+Serverwechsel. Für Freigabelinks mit gemeinsamem Origin beide URLs explizit setzen:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+Die Option `--web` leitet keine API-Anfragen um und konfiguriert weder
+serverseitige Cookies, CORS, OAuth und CSP noch den Build der Web-App.
 
 ## Architektur
 

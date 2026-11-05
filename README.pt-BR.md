@@ -154,7 +154,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -660,6 +660,9 @@ O formato JSON é útil para scripts. Sua estrutura de nível superior é:
 
 O exemplo é sintético; `actions` e as datas opcionais vêm do estado retornado da conta, e servidores antigos podem retornar null para qualquer um dos dois endpoints. `sotto cloud status` apenas informa o status e pode mostrar uma URL de cobrança. Ele não inicia uma compra nem altera a elegibilidade. Para diagnósticos do cofre local e dos ambientes, use `sotto status`; essa visão é separada das informações do servidor e da conta acima.
 
+Para mover a cobrança pessoal para uma organização a partir da página de conta do Sotto Cloud,
+consulte o [guia de transferência de cobrança](CLOUD-BILLING-TRANSFER.md).
+
 ### Temas de saída
 
 A CLI traz cinco temas integrados: `nord` (o padrão), `sordino`, `terminal`, `monochrome` e
@@ -773,6 +776,26 @@ Aponte a CLI para o seu servidor uma vez; os comandos seguintes o reutilizam:
 ```sh
 sotto login --server https://sotto.example.com
 ```
+
+Em uma configuração nova da CLI, o link web gerado por `sotto share` também
+usa a URL desse servidor. Se a API e o aplicativo web tiverem origens diferentes,
+`--server` continua selecionando o servidor de sincronização/API, enquanto
+`--web` define a URL base do aplicativo web para links de compartilhamento:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+A CLI salva a URL web separadamente. Um login posterior apenas com `--server`
+preserva a configuração anterior de `--web`, mesmo ao trocar de servidor.
+Para voltar aos links na mesma origem, defina as duas URLs explicitamente:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+A opção `--web` não redireciona requisições de API nem configura cookies,
+CORS, OAuth, CSP ou o build do aplicativo web no servidor.
 
 ## Arquitetura
 

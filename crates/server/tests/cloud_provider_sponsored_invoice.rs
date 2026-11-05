@@ -710,6 +710,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         price_catalogue: Some(catalogue),
         cloud_portal_configuration_id: None,
         cloud_sales_enabled: false,
+        cloud_automatic_tax_enabled: false,
         return_url: "https://app.sotto.test".into(),
     })
     .with_personal_coverage(coverage.clone(), stripe, true);

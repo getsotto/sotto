@@ -35,8 +35,10 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEFAULT_TOTAL_BYTES: usize = 16 * 1024 * 1024;
-const DEFAULT_MAX_PAGES: usize = 64;
 const DEFAULT_MAX_REQUESTS: usize = 256;
+// A history session may issue several list pages for every paid invoice. Every page consumes
+// at least one request attempt, so keep this bound aligned with the stricter total request cap.
+const DEFAULT_MAX_PAGES: usize = DEFAULT_MAX_REQUESTS;
 const DEFAULT_MAX_RECORDS: usize = 10_000;
 const DEFAULT_MAX_RETRIES: usize = 2;
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -3577,7 +3579,14 @@ fn map_request_error(error: reqwest::Error) -> StripeReadError {
 
 #[cfg(test)]
 mod invoice_summary_tests {
-    use super::{parse_invoice, safe_permission_scope};
+    use super::{parse_invoice, safe_permission_scope, StripeReadLimits};
+
+    #[test]
+    fn default_page_budget_does_not_preempt_the_request_budget() {
+        let limits = StripeReadLimits::default();
+
+        assert_eq!(limits.max_pages, limits.max_requests);
+    }
 
     #[test]
     fn permission_scope_diagnostics_never_include_resource_identifiers() {

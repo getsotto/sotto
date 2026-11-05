@@ -152,7 +152,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -647,6 +647,9 @@ The JSON form is useful for scripts. Its top-level shape is:
 
 The example is synthetic; `actions` and the optional dates come from the returned account state, and older servers can return null for either endpoint. `sotto cloud status` only reports status and may print a billing URL. It does not start a purchase or change eligibility. For local vault and environment diagnostics, use `sotto status`; that view is separate from the server and account information above.
 
+To move personal billing to an organisation from the Sotto Cloud account page, see the
+[billing transfer guide](CLOUD-BILLING-TRANSFER.md).
+
 ### Output themes
 
 The CLI ships five built-in themes: `nord` (the default), `sordino`, `terminal`, `monochrome`,
@@ -759,6 +762,26 @@ Point the CLI at your server once; later commands reuse it:
 ```sh
 sotto login --server https://sotto.example.com
 ```
+
+On a fresh CLI configuration, the web link used by `sotto share` also uses this
+server URL. If your API and web app have different origins, `--server` still
+selects the sync/API server, while `--web` sets the web-app base URL for
+generated share links:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+The CLI saves the web URL separately. A later login with `--server` alone
+preserves the previous `--web` setting, even when you switch servers. To return
+to same-origin share links, set both URLs explicitly:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+The `--web` flag does not redirect API requests or configure server-side
+cookies, CORS, OAuth, CSP or the web build.
 
 ## Architecture
 

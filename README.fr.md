@@ -156,7 +156,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -676,6 +676,9 @@ Le format JSON est pratique pour les scripts. Sa structure de premier niveau est
 
 L'exemple est synthétique ; `actions` et les dates facultatives proviennent de l'état renvoyé du compte, et les serveurs anciens peuvent renvoyer null pour l'un ou l'autre endpoint. `sotto cloud status` ne fait que signaler l'état et peut afficher une URL de facturation. Il ne lance pas d'achat et ne modifie pas l'éligibilité. Pour diagnostiquer le coffre local et les environnements, utilisez `sotto status` ; cette vue est distincte des informations du serveur et du compte ci-dessus.
 
+Pour transférer la facturation personnelle à une organisation depuis la page de compte Sotto Cloud,
+consultez le [guide du transfert de facturation](CLOUD-BILLING-TRANSFER.md).
+
 ### Thèmes de sortie
 
 La CLI fournit cinq thèmes intégrés : `nord` (par défaut), `sordino`, `terminal`, `monochrome`
@@ -790,6 +793,27 @@ Faites pointer la CLI vers votre serveur une fois ; les commandes suivantes le r
 ```sh
 sotto login --server https://sotto.example.com
 ```
+
+Sur une nouvelle configuration de la CLI, le lien web produit par
+`sotto share` utilise aussi l'URL du serveur. Si l'API et l'application web
+ont des origines différentes, `--server` désigne toujours le serveur de
+synchronisation/API et `--web` fixe l'URL de base de l'application web pour
+les liens de partage :
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+La CLI enregistre l'URL web séparément. Une connexion ultérieure avec seulement
+`--server` conserve l'ancien réglage `--web`, même si vous changez de serveur.
+Pour revenir aux liens sur la même origine, définissez explicitement les deux URL :
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+L'option `--web` ne redirige pas les requêtes API et ne configure pas les
+cookies, CORS, OAuth, CSP ni la compilation de l'application web côté serveur.
 
 ## Architecture
 

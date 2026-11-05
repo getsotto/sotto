@@ -9,8 +9,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::cloud_provider::{
-    collect_provider_history, complete_verified_event, prepare_verified_event, PayerKind,
-    ProviderAdapterError,
+    complete_verified_event, prepare_verified_event, PayerKind, ProviderAdapterError,
 };
 use crate::cloud_provider_refresh_inputs::RefreshJobInputs;
 use crate::cloud_provider_refresh_worker::{self, RefreshExecutionError, RefreshJobExecutor};
@@ -18,7 +17,7 @@ use crate::cloud_provider_stripe::{
     StripeAllocationBinding, StripeCoverageConfig, STRIPE_NAMESPACE,
 };
 use crate::cloud_provider_stripe_adapter::{
-    prepared_source, StripeHistoryClient, StripePreparedCollection,
+    collect_stripe_history, prepared_source, StripeHistoryClient, StripePreparedCollection,
 };
 use crate::cloud_provider_stripe_http::{StripeReadClient, StripeReadError};
 
@@ -130,11 +129,10 @@ impl PersonalStripeRefreshExecutor {
             StripePreparedCollection::from_ticket(&self.coverage, &preparation.ticket, sources)
                 .map_err(|_| PersonalRefreshError::Adapter)?;
         let mut history_client = StripeHistoryClient::new(self.stripe.clone(), prepared);
-        let collection = collect_provider_history(
+        let collection = collect_stripe_history(
             &mut history_client,
             context,
             &preparation.ticket.source_bindings,
-            Default::default(),
         )
         .await
         .map_err(|_| PersonalRefreshError::Adapter)?;

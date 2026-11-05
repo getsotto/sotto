@@ -70,6 +70,7 @@ const CLOUD_COVERAGE_AUTHORITY_MAX_AGE_ENV: &str = "SOTTO_CLOUD_COVERAGE_AUTHORI
 const CLOUD_ACTION_ENFORCEMENT_ENV: &str = "SOTTO_CLOUD_ACTION_ENFORCEMENT";
 const MACHINE_ELIGIBILITY_ENFORCEMENT_ENV: &str = "SOTTO_MACHINE_ELIGIBILITY_ENFORCEMENT";
 const CLOUD_SALES_ENV: &str = "SOTTO_CLOUD_SALES_ENABLED";
+const CLOUD_AUTOMATIC_TAX_ENV: &str = "SOTTO_CLOUD_AUTOMATIC_TAX_ENABLED";
 const FOUNDING_SCHEDULE_WORKER_ENV: &str = "SOTTO_FOUNDING_SCHEDULE_WORKER_ENABLED";
 const FOUNDING_PRICE_NOTICES_ENV: &str = "SOTTO_FOUNDING_PRICE_NOTICES_ENABLED";
 const FOUNDING_SCHEDULE_PREFLIGHT_ENV: &str = "SOTTO_FOUNDING_SCHEDULE_PREFLIGHT_VERIFIED";
@@ -224,6 +225,8 @@ pub struct BillingConfig {
     pub cloud_portal_configuration_id: Option<String>,
     /// Explicit purchase gate. Management, cancellation, refunds, and webhooks do not use it.
     pub cloud_sales_enabled: bool,
+    /// Ask Stripe Tax to calculate tax for hosted Cloud subscription purchases.
+    pub cloud_automatic_tax_enabled: bool,
     /// Where Stripe-hosted pages send the browser back to (the web app origin).
     pub return_url: String,
 }
@@ -275,6 +278,8 @@ impl Config {
         let deployment_mode = DeploymentMode::from_env_result(std::env::var(DeploymentMode::ENV))?;
         let cloud_sales_enabled =
             feature_flag_is_enabled(std::env::var(CLOUD_SALES_ENV).ok().as_deref());
+        let cloud_automatic_tax_enabled =
+            feature_flag_is_enabled(std::env::var(CLOUD_AUTOMATIC_TAX_ENV).ok().as_deref());
         let founding_schedule_worker_enabled =
             feature_flag_is_enabled(std::env::var(FOUNDING_SCHEDULE_WORKER_ENV).ok().as_deref());
         let founding_price_notices_enabled =
@@ -388,6 +393,7 @@ impl Config {
                         "STRIPE_CLOUD_PORTAL_CONFIGURATION_ID",
                     ),
                     cloud_sales_enabled,
+                    cloud_automatic_tax_enabled,
                     return_url: billing_return_url(&public_base_url, web_origin.as_deref()),
                 }),
                 _ => None,
@@ -436,6 +442,9 @@ impl Config {
                 .as_ref()
                 .and_then(|value| value.cloud_portal_configuration_id.as_deref())
                 .is_some(),
+            billing
+                .as_ref()
+                .is_some_and(|value| value.cloud_automatic_tax_enabled),
         )?;
         validate_billing_transfers_configuration(
             billing_transfers_enabled,
@@ -950,15 +959,17 @@ fn validate_cloud_sales_configuration(
     billing_configured: bool,
     hosted_catalogue_configured: bool,
     safe_portal_configuration_configured: bool,
+    automatic_tax_enabled: bool,
 ) -> Result<()> {
     if enabled
         && (deployment_mode != DeploymentMode::Cloud
             || !billing_configured
             || !hosted_catalogue_configured
-            || !safe_portal_configuration_configured)
+            || !safe_portal_configuration_configured
+            || !automatic_tax_enabled)
     {
         return Err(Error::Config(format!(
-            "{CLOUD_SALES_ENV}=1 requires SOTTO_DEPLOYMENT_MODE=cloud, complete Stripe credentials, all four hosted price ids, and STRIPE_CLOUD_PORTAL_CONFIGURATION_ID"
+            "{CLOUD_SALES_ENV}=1 requires SOTTO_DEPLOYMENT_MODE=cloud, complete Stripe credentials, all four hosted price ids, STRIPE_CLOUD_PORTAL_CONFIGURATION_ID, and {CLOUD_AUTOMATIC_TAX_ENV}=1"
         )));
     }
     Ok(())
@@ -975,9 +986,12 @@ fn validate_billing_transfers_configuration(
     let billing = billing.ok_or_else(|| {
         Error::Config("payer transfer routes require configured Cloud Stripe billing".into())
     })?;
-    if deployment_mode != DeploymentMode::Cloud || billing.price_catalogue.is_none() {
+    if deployment_mode != DeploymentMode::Cloud
+        || billing.price_catalogue.is_none()
+        || !billing.cloud_automatic_tax_enabled
+    {
         return Err(Error::Config(
-            "payer transfer routes require cloud mode and all four hosted Stripe prices".into(),
+            "payer transfer routes require cloud mode, all four hosted Stripe prices, and Stripe Tax enabled".into(),
         ));
     }
     Ok(())
@@ -1026,9 +1040,12 @@ fn validate_billing_transfer_execution_configuration(
     let billing = billing.ok_or_else(|| {
         Error::Config("payer transfer execution requires configured Cloud Stripe billing".into())
     })?;
-    if deployment_mode != DeploymentMode::Cloud || billing.price_catalogue.is_none() {
+    if deployment_mode != DeploymentMode::Cloud
+        || billing.price_catalogue.is_none()
+        || !billing.cloud_automatic_tax_enabled
+    {
         return Err(Error::Config(
-            "payer transfer execution requires cloud mode and all four hosted Stripe prices".into(),
+            "payer transfer execution requires cloud mode, all four hosted Stripe prices, and Stripe Tax enabled".into(),
         ));
     }
     // API intake can be disabled independently while an already-started provider operation is
@@ -1470,6 +1487,7 @@ mod tests {
             price_catalogue: None,
             cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.example.test".into(),
         };
         assert!(validate_provider_refresh_configuration(
@@ -1598,8 +1616,17 @@ mod tests {
             }),
             cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: true,
             return_url: "https://app.example.test".into(),
         };
+        let mut without_tax = billing.clone();
+        without_tax.cloud_automatic_tax_enabled = false;
+        assert!(validate_billing_transfers_configuration(
+            true,
+            DeploymentMode::Cloud,
+            Some(&without_tax),
+        )
+        .is_err());
         assert!(validate_billing_transfers_configuration(
             true,
             DeploymentMode::Cloud,
@@ -1630,6 +1657,7 @@ mod tests {
             }),
             cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.example.test".into(),
         };
         assert!(validate_billing_recovery_configuration(
@@ -1696,6 +1724,7 @@ mod tests {
                 }),
                 cloud_portal_configuration_id: None,
                 cloud_sales_enabled: false,
+                cloud_automatic_tax_enabled: true,
                 return_url: "https://app.example.test".into(),
             }),
         )
@@ -1729,6 +1758,7 @@ mod tests {
             price_catalogue: None,
             cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.example.test".into(),
         };
         assert!(validate_billing_transfer_operator_configuration(
@@ -1860,6 +1890,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .is_ok());
         assert!(validate_cloud_sales_configuration(
@@ -1867,25 +1898,55 @@ mod tests {
             DeploymentMode::SelfHosted,
             true,
             true,
+            true,
+            true,
+        )
+        .is_err());
+        assert!(validate_cloud_sales_configuration(
+            true,
+            DeploymentMode::Cloud,
+            false,
+            true,
+            true,
             true
         )
         .is_err());
-        assert!(
-            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, false, true, true)
-                .is_err()
-        );
-        assert!(
-            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, false, true)
-                .is_err()
-        );
-        assert!(
-            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, true, false)
-                .is_err()
-        );
-        assert!(
-            validate_cloud_sales_configuration(true, DeploymentMode::Cloud, true, true, true)
-                .is_ok()
-        );
+        assert!(validate_cloud_sales_configuration(
+            true,
+            DeploymentMode::Cloud,
+            true,
+            false,
+            true,
+            true
+        )
+        .is_err());
+        assert!(validate_cloud_sales_configuration(
+            true,
+            DeploymentMode::Cloud,
+            true,
+            true,
+            false,
+            true
+        )
+        .is_err());
+        assert!(validate_cloud_sales_configuration(
+            true,
+            DeploymentMode::Cloud,
+            true,
+            true,
+            true,
+            false
+        )
+        .is_err());
+        assert!(validate_cloud_sales_configuration(
+            true,
+            DeploymentMode::Cloud,
+            true,
+            true,
+            true,
+            true
+        )
+        .is_ok());
         assert!(is_portal_configuration_id("bpc_123"));
         assert!(!is_portal_configuration_id("cus_123"));
         assert!(!is_portal_configuration_id("bpc_"));
@@ -1903,6 +1964,7 @@ mod tests {
             price_catalogue: None,
             cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.example.test".into(),
         };
         assert!(
@@ -1959,6 +2021,7 @@ mod tests {
             }),
             cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.example.test".into(),
         };
         assert!(validate_sponsored_billing_recovery_configuration(
@@ -2007,6 +2070,7 @@ mod tests {
             }),
             cloud_portal_configuration_id: Some("bpc_test".into()),
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.example.test".into(),
         };
         assert!(validate_founding_price_notices_configuration(

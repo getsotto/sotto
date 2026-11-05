@@ -191,6 +191,7 @@ pub struct BillingOperation {
     pub provider_checkout_price_id: Option<String>,
     pub provider_checkout_success_url: Option<String>,
     pub provider_checkout_cancel_url: Option<String>,
+    pub provider_checkout_automatic_tax_enabled: Option<bool>,
     pub provider_checkout_url: Option<String>,
     pub created_at_epoch: i64,
     pub reconciliation_attempt_count: i32,
@@ -553,23 +554,27 @@ pub async fn record_personal_checkout_request(
     price_id: &str,
     success_url: &str,
     cancel_url: &str,
+    automatic_tax_enabled: bool,
 ) -> Result<BillingOperation, BillingOperationError> {
     if price_id.trim().is_empty() || success_url.trim().is_empty() || cancel_url.trim().is_empty() {
         return Err(BillingOperationError::InvalidField("checkout request"));
     }
     let updated = sqlx::query(
         "UPDATE billing_operations SET provider_checkout_price_id = $2, \
-         provider_checkout_success_url = $3, provider_checkout_cancel_url = $4, updated_at = now() \
+         provider_checkout_success_url = $3, provider_checkout_cancel_url = $4, \
+         provider_checkout_automatic_tax_enabled = $5, updated_at = now() \
          WHERE operation_id = $1 AND state = 'pending' \
            AND (provider_checkout_price_id IS NULL OR provider_checkout_price_id = $2) \
            AND (provider_checkout_success_url IS NULL OR provider_checkout_success_url = $3) \
            AND (provider_checkout_cancel_url IS NULL OR provider_checkout_cancel_url = $4) \
+           AND (provider_checkout_automatic_tax_enabled IS NULL OR provider_checkout_automatic_tax_enabled = $5) \
          RETURNING operation_id",
     )
     .bind(operation_id)
     .bind(price_id)
     .bind(success_url)
     .bind(cancel_url)
+    .bind(automatic_tax_enabled)
     .fetch_optional(&mut **tx)
     .await?;
     if updated.is_none() {
@@ -577,6 +582,7 @@ pub async fn record_personal_checkout_request(
         if existing.provider_checkout_price_id.as_deref() != Some(price_id)
             || existing.provider_checkout_success_url.as_deref() != Some(success_url)
             || existing.provider_checkout_cancel_url.as_deref() != Some(cancel_url)
+            || existing.provider_checkout_automatic_tax_enabled != Some(automatic_tax_enabled)
         {
             return Err(BillingOperationError::ResultConflict);
         }
@@ -938,7 +944,8 @@ pub async fn load_reconciliation_candidates(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
          provider_operation_id, provider_checkout_session_id, provider_checkout_price_id, \
-         provider_checkout_success_url, provider_checkout_cancel_url, provider_checkout_url, \
+         provider_checkout_success_url, provider_checkout_cancel_url, \
+         provider_checkout_automatic_tax_enabled, provider_checkout_url, \
          extract(epoch from created_at)::bigint AS created_at_epoch, reconciliation_attempt_count, \
          state, result_code FROM billing_operations WHERE state IN ('pending','unknown') \
            AND NOT reconciliation_manual_review_required AND reconciliation_next_attempt_at <= now() \
@@ -964,7 +971,8 @@ pub async fn load_personal_reconciliation_candidates(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
          provider_operation_id, provider_checkout_session_id, provider_checkout_price_id, \
-         provider_checkout_success_url, provider_checkout_cancel_url, provider_checkout_url, \
+         provider_checkout_success_url, provider_checkout_cancel_url, \
+         provider_checkout_automatic_tax_enabled, provider_checkout_url, \
          extract(epoch from created_at)::bigint AS created_at_epoch, reconciliation_attempt_count, \
          state, result_code FROM billing_operations AS operation \
          WHERE state IN ('pending','unknown') AND NOT reconciliation_manual_review_required \
@@ -1072,7 +1080,8 @@ pub async fn load_operation_for_actor(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
          provider_operation_id, provider_checkout_session_id, provider_checkout_price_id, \
-         provider_checkout_success_url, provider_checkout_cancel_url, provider_checkout_url, \
+         provider_checkout_success_url, provider_checkout_cancel_url, \
+         provider_checkout_automatic_tax_enabled, provider_checkout_url, \
          extract(epoch from created_at)::bigint AS created_at_epoch, reconciliation_attempt_count, state, result_code \
          FROM billing_operations WHERE operation_id = $1",
     )
@@ -1094,7 +1103,8 @@ async fn load_operation(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
          provider_operation_id, provider_checkout_session_id, provider_checkout_price_id, \
-         provider_checkout_success_url, provider_checkout_cancel_url, provider_checkout_url, \
+         provider_checkout_success_url, provider_checkout_cancel_url, \
+         provider_checkout_automatic_tax_enabled, provider_checkout_url, \
          extract(epoch from created_at)::bigint AS created_at_epoch, reconciliation_attempt_count, \
          state, result_code FROM billing_operations WHERE operation_id = $1",
     )
@@ -1112,7 +1122,8 @@ async fn load_operation_by_id(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
          provider_operation_id, provider_checkout_session_id, provider_checkout_price_id, \
-         provider_checkout_success_url, provider_checkout_cancel_url, provider_checkout_url, \
+         provider_checkout_success_url, provider_checkout_cancel_url, \
+         provider_checkout_automatic_tax_enabled, provider_checkout_url, \
          extract(epoch from created_at)::bigint AS created_at_epoch, reconciliation_attempt_count, \
          state, result_code FROM billing_operations WHERE operation_id = $1",
     )
@@ -1131,7 +1142,8 @@ async fn load_by_idempotency(
         "SELECT operation_id, idempotency_key, request_hash, actor_user_id, payer_id, \
          beneficiary_id, offer, quote_version, quote_expires_at_epoch, provider_idempotency_key, \
          provider_operation_id, provider_checkout_session_id, provider_checkout_price_id, \
-         provider_checkout_success_url, provider_checkout_cancel_url, provider_checkout_url, \
+         provider_checkout_success_url, provider_checkout_cancel_url, \
+         provider_checkout_automatic_tax_enabled, provider_checkout_url, \
          extract(epoch from created_at)::bigint AS created_at_epoch, reconciliation_attempt_count, state, result_code FROM billing_operations \
          WHERE actor_user_id = $1 AND idempotency_key = $2 FOR UPDATE",
     )
@@ -1161,6 +1173,8 @@ fn operation_from_row(
         provider_checkout_price_id: row.try_get("provider_checkout_price_id")?,
         provider_checkout_success_url: row.try_get("provider_checkout_success_url")?,
         provider_checkout_cancel_url: row.try_get("provider_checkout_cancel_url")?,
+        provider_checkout_automatic_tax_enabled: row
+            .try_get("provider_checkout_automatic_tax_enabled")?,
         provider_checkout_url: row.try_get("provider_checkout_url")?,
         created_at_epoch: row.try_get("created_at_epoch")?,
         reconciliation_attempt_count: row.try_get("reconciliation_attempt_count")?,
