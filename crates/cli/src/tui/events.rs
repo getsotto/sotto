@@ -279,8 +279,8 @@ pub fn handle_mouse_event(app: &mut TuiApp, mouse: MouseEvent) -> Result<()> {
         MouseEventKind::ScrollUp => {
             app.move_selection_up();
         }
-        MouseEventKind::Down(MouseButton::Left) if app.show_help => {
-            app.show_help = false;
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.select_secret_at(mouse.column, mouse.row);
         }
         _ => {}
     }
@@ -660,6 +660,141 @@ mod tests {
 
         handle_mouse_event(&mut tui_app, scroll_down).unwrap();
         assert_eq!(tui_app.selected_filtered_index, 1);
+    }
+
+    fn left_click_at(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Run `check` against a dashboard holding `KEY_00..KEY_{count}` after one 80x24 draw, which is
+    /// what tells the mouse handler where the secret list is.
+    fn with_drawn_app(count: usize, check: impl FnOnce(&mut TuiApp<'_>, &mut dyn FnMut(&TuiApp))) {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let keychain = crate::keychain::MemoryKeychain::default();
+        crate::session::init(
+            &store,
+            &keychain,
+            b"pw",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master = crate::session::current_master_key(&keychain)
+            .unwrap()
+            .unwrap();
+        let keypair = crate::session::account_keypair(&store, &master).unwrap();
+        let project = crate::vault::Vault::create_project(&store, &keypair, "click-test").unwrap();
+        let config = crate::config::Config {
+            project_id: project.id,
+            project: "click-test".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let theme = crate::theme::Theme::default();
+        let app = crate::commands::App::new(&store, &keychain);
+        for i in 0..count {
+            app.set(&config, &format!("KEY_{i:02}"), b"value").unwrap();
+        }
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut redraw = move |app: &TuiApp| {
+            terminal.draw(|f| crate::tui::ui::draw(f, app)).unwrap();
+        };
+        redraw(&tui_app);
+        check(&mut tui_app, &mut redraw);
+    }
+
+    #[test]
+    fn left_click_selects_the_clicked_secret_row() {
+        with_drawn_app(5, |app, _| {
+            let view = app.secret_list_view.get();
+            handle_mouse_event(app, left_click_at(view.area.x + 2, view.area.y + 2)).unwrap();
+
+            assert_eq!(app.selected_filtered_index, 2);
+            assert_eq!(app.selected_secret().unwrap().name, "KEY_02");
+        });
+    }
+
+    #[test]
+    fn left_click_accounts_for_list_scrolling() {
+        with_drawn_app(30, |app, redraw| {
+            app.move_selection_end();
+            redraw(app);
+            let view = app.secret_list_view.get();
+            assert!(view.offset > 0, "the list should have scrolled");
+
+            handle_mouse_event(app, left_click_at(view.area.x, view.area.y)).unwrap();
+            assert_eq!(app.selected_filtered_index, view.offset);
+            assert_eq!(
+                app.selected_secret().unwrap().name,
+                format!("KEY_{:02}", view.offset)
+            );
+
+            let last_visible = view.area.y + view.area.height - 1;
+            handle_mouse_event(app, left_click_at(view.area.x, last_visible)).unwrap();
+            assert_eq!(
+                app.selected_filtered_index,
+                view.offset + usize::from(view.area.height) - 1
+            );
+        });
+    }
+
+    #[test]
+    fn left_click_outside_the_secret_rows_changes_nothing() {
+        with_drawn_app(3, |app, _| {
+            let view = app.secret_list_view.get();
+            app.selected_filtered_index = 1;
+            let (x, y, w, h) = (view.area.x, view.area.y, view.area.width, view.area.height);
+
+            for (column, row) in [
+                (x, y + 3),     // empty space below the last secret
+                (x, y + h - 1), // bottom of the pane, still empty
+                (x, y - 1),     // the list's top border
+                (x - 1, y),     // the list's left border
+                (x + w, y),     // the list's right border
+                (x, y - 4),     // the search bar
+                (x + w + 5, y), // the inspector pane
+                (0, 0),         // the header
+                (0, 23),        // the footer
+            ] {
+                handle_mouse_event(app, left_click_at(column, row)).unwrap();
+                assert_eq!(app.selected_filtered_index, 1, "click at ({column}, {row})");
+            }
+        });
+    }
+
+    #[test]
+    fn left_click_selects_without_revealing_the_secret() {
+        with_drawn_app(3, |app, _| {
+            let view = app.secret_list_view.get();
+            app.revealed = true;
+
+            handle_mouse_event(app, left_click_at(view.area.x, view.area.y + 1)).unwrap();
+
+            assert_eq!(app.selected_filtered_index, 1);
+            assert!(
+                !app.revealed,
+                "moving to another secret hides the revealed value"
+            );
+            assert!(app.decrypted_cache.is_none());
+        });
+    }
+
+    #[test]
+    fn left_click_is_ignored_while_a_modal_is_open() {
+        with_drawn_app(3, |app, _| {
+            let view = app.secret_list_view.get();
+            app.show_delete_modal = true;
+
+            handle_mouse_event(app, left_click_at(view.area.x, view.area.y + 2)).unwrap();
+
+            assert_eq!(app.selected_filtered_index, 0);
+        });
     }
 
     #[test]

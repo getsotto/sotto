@@ -154,7 +154,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -172,7 +172,7 @@ exemplos de matriz, Windows e workflows reutilizáveis.
 
 Quer uma demo funcional? O [**sotto-example**](https://github.com/getsotto/sotto-example)
 mostra a injeção local de segredos com um GIF de Python e passos copiáveis, além de pequenos exemplos
-em JavaScript, TypeScript, Java, C#, PHP, Go e C++. Não precisa de conta; as instruções cobrem
+em JavaScript, TypeScript, Java, C#, PHP, Go, Rust e C++. Não precisa de conta; as instruções cobrem
 macOS, Linux e Windows.
 
 ```sh
@@ -292,6 +292,36 @@ Para recuperar um valor anterior, veja [Restaurar uma versão anterior de um seg
 Esse histórico vem do servidor, então só ajuda com valores que você já havia enviado. Execute
 `sotto import --help` para ver as regras de aspas e de valores literais em vez de repeti-las aqui.
 
+### Remover um segredo
+
+Para remover um segredo obsoleto de `staging` sem alterar o ambiente padrão:
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` remove o segredo do ambiente selecionado no cofre local.
+`sotto push` sincroniza a remoção com o servidor depois de `sotto login`;
+execute `sotto pull` no mesmo ambiente em outro dispositivo para receber
+a remoção. Execute o último comando no outro dispositivo.
+
+Em um terminal interativo, `sotto rm` sem nome abre o seletor de segredos.
+Depois, aparece uma confirmação com Não como opção padrão; cancelar ou
+recusar mantém o segredo. `--yes` (ou `-y`) ignora a confirmação, mas não
+ignora o seletor sem nome nem uma solicitação de desbloqueio necessária.
+
+As solicitações interativas exigem que stdin, stdout e stderr sejam terminais,
+que `TERM` não seja «dumb» e que `CI` esteja inativo. Em uso não interativo,
+é obrigatório informar o nome; a remoção com nome não pede confirmação
+mesmo sem `--yes`.
+
+Segredos removidos deixam de aparecer nas leituras e listagens comuns, mas
+o histórico de versões é mantido. Isso não é uma exclusão segura e não revoga
+a credencial no provedor externo. Para recuperação, use `sotto history`
+e `sotto rollback`.
+
 ### Compartilhar um segredo
 
 `sotto share` criptografa um segredo em um link de uso único. A chave fica depois do `#` no link,
@@ -336,6 +366,28 @@ sotto shares revoke <token>  # the token is the part of the link between /s/ and
 
 `sotto shares ls` nunca mostra o texto cifrado nem a chave do link.
 
+Repare no plural: `sotto share` cria um link e `sotto shares` gerencia os links que você criou.
+Ambos falam com o servidor configurado, então precisam de `sotto login`; o cofre local não precisa
+estar desbloqueado. Uma listagem fica assim (token fictício, valores ilustrativos):
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Passe a primeira coluna para `sotto shares revoke`. É o token público, não o link inteiro: para
+`https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...`, passe só `3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` e nunca nada depois
+do `#`. A listagem lê apenas metadados. Ela não abre nenhum link nem consome uma visualização, e não
+consegue reconstruir um link, porque a chave depois do `#` nunca chegou ao servidor.
+
+`sotto shares ls --json` imprime um objeto, não um array simples: `active_free_count` e `links`, em
+que cada link tem `token`, `share_class`, `max_views`, `view_count`, `expires_at`, `revoked_at` e
+`created_at`. O servidor retorna só os seus 100 links mais recentes, então isso não é um histórico
+completo.
+
+Revogar impede novas recuperações pelo link. Não desfaz uma recuperação que já aconteceu; se o
+destinatário pode ter revelado o segredo, troque-o na origem.
+
 ### Trabalhar em equipe
 
 Equipes compartilham ambientes por meio de uma organização. Cada membro recebe sua própria cópia
@@ -350,11 +402,26 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prin
 sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
 
-O membro executa o comando exibido na própria cópia do projeto:
+Depois, o membro executa o comando exibido. Isso não é o mesmo que **Outro dispositivo**, que restaura a sua própria conta em uma segunda
+máquina. O membro usa a própria conta no mesmo servidor: executa `sotto login` e `sotto unlock` e
+depois o comando exibido em um diretório que ainda não tem `sotto.toml`:
 
 ```sh
+mkdir acme-api && cd acme-api
 sotto clone <project-id> <env-id> --org <org-id>
 ```
+
+Ser membro da organização e ter acesso a um ambiente são etapas separadas. `sotto org invite` torna
+alguém membro; `sotto grant <user-id>` dá a essa pessoa um ambiente. Se você não tiver mais o ID do
+usuário, `sotto org members <org-id>` mostra. `sotto clone` não concede nada sozinho: ele busca o
+grant que o membro já tem, baixa esse ambiente e grava `sotto.toml`. Sem grant, ele para com
+`you have not been granted this environment (ask an admin to share it)`, e um administrador precisa
+executar `sotto grant` para essa pessoa. Nunca entregue o seu Emergency Kit a um colega; ele
+desbloqueia a sua conta, não a dele.
+
+Mantenha `--org` do comando exibido, porque ele registra a organização proprietária para que os
+pushes seguintes correspondam ao servidor. `--as <environment-name>` e `--name <project-label>` só
+definem rótulos locais: por padrão, o ambiente mantém o nome real e o projeto se chama `shared`.
 
 Para ver quem tem acesso, remover alguém ou rotacionar você mesmo a chave de um ambiente:
 
@@ -512,6 +579,42 @@ Sem `sotto.toml` nem identidade local:
 
 Sem `sotto.toml`, nenhum projeto está selecionado. Um arquivo inválido ou ilegível causa um erro.
 
+### Bloquear, desbloquear e sair
+
+Com uma identidade local já inicializada, bloqueie o cofre, confira seu estado e
+desbloqueie-o quando precisar usá-lo novamente:
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` limpa a sessão local da chave mestra em cache usada pelos próximos
+comandos da CLI. Não exclui sua identidade, o cofre criptografado nem o login salvo
+do servidor de sincronização. `sotto unlock` usa sua senha mestra quando não há uma
+sessão válida em cache. Os comandos que precisam descriptografar dados locais
+também solicitam o desbloqueio quando necessário. Consulte
+[Consultar o estado local](#consultar-o-estado-local) para conhecer os campos de estado.
+
+A sessão local dura 12 horas a partir do armazenamento da chave em cache, não da
+sua última atividade. A expiração é verificada quando a chave em cache é lida.
+Executar `sotto unlock` quando o cofre já está desbloqueado não prolonga esse prazo.
+Nem o bloqueio nem a expiração limpam o texto sem criptografia que os aplicativos
+em execução já possuem.
+
+Para limpar também o login da CLI salvo no servidor de sincronização, execute
+os dois comandos:
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` remove o token de sessão do servidor armazenado pela CLI,
+independentemente do cache de desbloqueio local. Não encerra sessões do navegador
+nem de outros dispositivos.
+
 ### Status do Cloud
 
 Para consultar o servidor configurado e a elegibilidade do Cloud da sua conta, faça login primeiro:
@@ -556,6 +659,9 @@ O formato JSON é útil para scripts. Sua estrutura de nível superior é:
 ```
 
 O exemplo é sintético; `actions` e as datas opcionais vêm do estado retornado da conta, e servidores antigos podem retornar null para qualquer um dos dois endpoints. `sotto cloud status` apenas informa o status e pode mostrar uma URL de cobrança. Ele não inicia uma compra nem altera a elegibilidade. Para diagnósticos do cofre local e dos ambientes, use `sotto status`; essa visão é separada das informações do servidor e da conta acima.
+
+Para mover a cobrança pessoal para uma organização a partir da página de conta do Sotto Cloud,
+consulte o [guia de transferência de cobrança](CLOUD-BILLING-TRANSFER.md).
 
 ### Temas de saída
 
@@ -668,6 +774,26 @@ Aponte a CLI para o seu servidor uma vez; os comandos seguintes o reutilizam:
 ```sh
 sotto login --server https://sotto.example.com
 ```
+
+Em uma configuração nova da CLI, o link web gerado por `sotto share` também
+usa a URL desse servidor. Se a API e o aplicativo web tiverem origens diferentes,
+`--server` continua selecionando o servidor de sincronização/API, enquanto
+`--web` define a URL base do aplicativo web para links de compartilhamento:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+A CLI salva a URL web separadamente. Um login posterior apenas com `--server`
+preserva a configuração anterior de `--web`, mesmo ao trocar de servidor.
+Para voltar aos links na mesma origem, defina as duas URLs explicitamente:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+A opção `--web` não redireciona requisições de API nem configura cookies,
+CORS, OAuth, CSP ou o build do aplicativo web no servidor.
 
 ## Arquitetura
 

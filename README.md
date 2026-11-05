@@ -152,7 +152,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -170,7 +170,7 @@ reusable-workflow examples.
 
 Want a runnable demo? [**sotto-example**](https://github.com/getsotto/sotto-example)
 walks through local secret injection with a Python GIF and copyable steps, plus tiny examples
-in JavaScript, TypeScript, Java, C#, PHP, Go, and C++. No account required; instructions cover
+in JavaScript, TypeScript, Java, C#, PHP, Go, Rust, and C++. No account required; instructions cover
 macOS, Linux, and Windows.
 
 ```sh
@@ -290,6 +290,34 @@ To get an earlier value back, see [Restore an earlier secret version](#restore-a
 That history comes from the server, so it only helps for values you had already pushed. Run
 `sotto import --help` for the quoting and literal-value rules instead of repeating them here.
 
+### Remove a secret
+
+To remove an obsolete secret from `staging` without changing your default environment:
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` removes the secret from the selected environment in your local vault.
+`sotto push` synchronises the removal with the server after `sotto login`; run
+`sotto pull` for that same environment on another device to receive the removal.
+Run the final command on the other device, not the device that made the change.
+
+In an interactive terminal, `sotto rm` without a name opens the secret picker.
+Removal then asks for confirmation, with No as the default; cancelling or declining
+does not remove anything. `--yes` (or `-y`) skips confirmation but never skips
+the picker when the name is omitted or a required unlock prompt.
+
+Interactive prompts require stdin, stdout and stderr to be terminals, a non-dumb
+`TERM`, and `CI` not being active. In non-interactive use, the name is required;
+a named removal proceeds without confirmation even if `--yes` is absent.
+
+Removed secrets disappear from ordinary reads and listings, but their version
+history remains. This is not secure erasure and does not revoke a credential at
+its external provider. Use `sotto history` and `sotto rollback` for recovery.
+
 ### Share a secret
 
 `sotto share` encrypts one secret into a one-time link. The key sits after the `#` in the link,
@@ -332,6 +360,28 @@ sotto shares revoke <token>  # the token is the part of the link between /s/ and
 
 `sotto shares ls` never shows the ciphertext or the key in the link.
 
+Note the plural: `sotto share` creates a link, and `sotto shares` manages the links you created.
+Both talk to the configured server, so they need `sotto login`; the local vault does not need to be
+unlocked. A listing looks like this (synthetic token, illustrative values):
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Pass the first column to `sotto shares revoke`. It is the public token, not the whole link: for
+`https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...`, pass only `3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` and never anything after
+the `#`. Listing reads metadata only. It does not open a link or use up a view, and it cannot
+rebuild a link for you, because the key after the `#` never reached the server.
+
+`sotto shares ls --json` prints an object rather than a bare array: `active_free_count` and `links`,
+where each link has `token`, `share_class`, `max_views`, `view_count`, `expires_at`, `revoked_at`
+and `created_at`. The server returns only your 100 most recent links, so this is not a complete
+history.
+
+Revoking stops future retrievals through the link. It cannot undo a retrieval that has already
+happened, so if the recipient may already have revealed the secret, change it at its source.
+
 ### Work with a team
 
 Teams share environments through an organisation. Each member receives their own sealed copy of an
@@ -346,11 +396,26 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prin
 sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
 
-The member runs the printed command in their own checkout:
+The member then runs the printed command. This is not the same as **Another device**, which restores your own account on a second machine.
+The member uses their own account on the same server: they run `sotto login` and `sotto unlock`,
+then run the printed command in a directory that has no `sotto.toml` yet:
 
 ```sh
+mkdir acme-api && cd acme-api
 sotto clone <project-id> <env-id> --org <org-id>
 ```
+
+Organisation membership and access to an environment are separate steps. `sotto org invite` makes
+someone a member; `sotto grant <user-id>` gives them one environment. If you no longer have the user
+id, `sotto org members <org-id>` lists it. `sotto clone` grants nothing by itself: it fetches the
+member's existing grant, pulls that environment and writes `sotto.toml`. Without a grant it stops
+with `you have not been granted this environment (ask an admin to share it)`, and an admin needs to
+run `sotto grant` for them. Never hand a teammate your Emergency Kit; it unlocks your account, not
+theirs.
+
+Keep `--org` from the printed command, because it records the owning organisation so that later
+pushes match the server. `--as <environment-name>` and `--name <project-label>` only set local
+labels: by default the environment keeps its real name and the project is labelled `shared`.
 
 To see who has access, remove someone, or rotate an environment's key yourself:
 
@@ -505,6 +570,38 @@ Without a `sotto.toml` or local identity:
 
 An absent `sotto.toml` means no project is selected. A malformed or unreadable file is an error.
 
+### Lock, unlock and log out
+
+For an already-initialised local identity, lock the vault, check its state, then
+unlock it when you need it again:
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` clears the cached local master-key session used by subsequent CLI
+commands. It does not delete your identity, encrypted vault or saved sync-server
+login. `sotto unlock` uses your master password when no valid cached session is
+available. Commands that need local decryption also request unlocking when needed.
+See [Inspect local status](#inspect-local-status) for the status fields.
+
+The local session lasts 12 hours from when the key is cached, not from your last
+activity. Expiry is checked when the cached key is read. Running `sotto unlock`
+while already unlocked does not extend that lifetime. Neither locking nor expiry
+clears plaintext already held by running applications.
+
+To clear the CLI's saved sync-server login as well, run both commands:
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` removes the CLI's stored server session token, independently of the
+local unlock cache. It does not sign out browser sessions or other devices.
+
 ### Cloud status
 
 To inspect the configured server and your account's Cloud eligibility, first log in:
@@ -549,6 +646,9 @@ The JSON form is useful for scripts. Its top-level shape is:
 ```
 
 The example is synthetic; `actions` and the optional dates come from the returned account state, and older servers can return null for either endpoint. `sotto cloud status` only reports status and may print a billing URL. It does not start a purchase or change eligibility. For local vault and environment diagnostics, use `sotto status`; that view is separate from the server and account information above.
+
+To move personal billing to an organisation from the Sotto Cloud account page, see the
+[billing transfer guide](CLOUD-BILLING-TRANSFER.md).
 
 ### Output themes
 
@@ -660,6 +760,26 @@ Point the CLI at your server once; later commands reuse it:
 ```sh
 sotto login --server https://sotto.example.com
 ```
+
+On a fresh CLI configuration, the web link used by `sotto share` also uses this
+server URL. If your API and web app have different origins, `--server` still
+selects the sync/API server, while `--web` sets the web-app base URL for
+generated share links:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+The CLI saves the web URL separately. A later login with `--server` alone
+preserves the previous `--web` setting, even when you switch servers. To return
+to same-origin share links, set both URLs explicitly:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+The `--web` flag does not redirect API requests or configure server-side
+cookies, CORS, OAuth, CSP or the web build.
 
 ## Architecture
 
