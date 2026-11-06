@@ -798,6 +798,25 @@ impl<'a> TuiApp<'a> {
         }
     }
 
+    /// Move history selection up by a page step.
+    pub fn history_modal_page_up(&mut self, step: usize) {
+        if self.history_modal_selected_index > 0 {
+            self.history_modal_selected_index =
+                self.history_modal_selected_index.saturating_sub(step);
+        }
+    }
+
+    /// Move history selection down by a page step.
+    pub fn history_modal_page_down(&mut self, step: usize) {
+        if !self.history_modal_items.is_empty() {
+            let last_idx = self.history_modal_items.len() - 1;
+            if self.history_modal_selected_index < last_idx {
+                self.history_modal_selected_index =
+                    (self.history_modal_selected_index + step).min(last_idx);
+            }
+        }
+    }
+
     /// Toggle masking of secret values in the version history dialogue.
     pub fn toggle_history_reveal(&mut self) {
         self.history_modal_revealed = !self.history_modal_revealed;
