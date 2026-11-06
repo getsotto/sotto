@@ -96,6 +96,7 @@ export function VaultView({
   const [linkCopyFeedback, setLinkCopyFeedback] = useState<string | null>(null);
   const linkCopyGeneration = useRef(0);
   const [secretQuery, setSecretQuery] = useState("");
+  const secretSearchInput = useRef<HTMLInputElement>(null);
   // Org members of the active project (loaded when an org env is opened), for the share picker.
   const [members, setMembers] = useState<Member[] | null>(null);
   const [shareTo, setShareTo] = useState("");
@@ -609,12 +610,24 @@ export function VaultView({
               <label>
                 Search secret names
                 <input
+                  ref={secretSearchInput}
                   type="search"
                   value={secretQuery}
                   onChange={(e) => setSecretQuery(e.target.value)}
                   autoComplete="off"
                 />
               </label>
+              {secretQuery !== "" && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSecretQuery("");
+                    secretSearchInput.current?.focus();
+                  }}
+                >
+                  Clear search
+                </button>
+              )}
               <p
                 className="muted"
                 role="status"
