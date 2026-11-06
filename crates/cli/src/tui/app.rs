@@ -192,6 +192,22 @@ impl<'a> TuiApp<'a> {
         Ok(())
     }
 
+    /// Reload the current environment from the local store and report the outcome.
+    ///
+    /// Failures stay on the dashboard as a status notice so the user can retry.
+    pub fn reload_local_secrets(&mut self) {
+        match self.refresh_secrets() {
+            Ok(()) => self.set_status(
+                StatusKind::Success,
+                format!("Reloaded local secrets for `{}`", self.config.environment),
+            ),
+            Err(err) => self.set_status(
+                StatusKind::Failure,
+                format!("Failed to reload local secrets: {err}"),
+            ),
+        }
+    }
+
     /// Filter the secret list using the current search query.
     pub fn apply_filter(&mut self) {
         if self.search_query.trim().is_empty() {
