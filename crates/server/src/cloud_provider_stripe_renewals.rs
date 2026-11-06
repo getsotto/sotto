@@ -478,7 +478,6 @@ pub fn decode_personal_renewal_failure(
             if term.allocation_reference() != binding.allocation_reference()
                 || term.customer_id() != binding.customer_id()
                 || term.subscription_id() != binding.subscription_id()
-                || term.provider_item_id() != binding.provider_item_id()
             {
                 return Err(StripeContractError::OwnershipMismatch);
             }
@@ -758,7 +757,6 @@ pub fn decode_personal_renewal_failure(
                     && term.allocation_reference() == binding.allocation_reference()
                     && term.customer_id() == binding.customer_id()
                     && term.subscription_id() == binding.subscription_id()
-                    && term.provider_item_id() == binding.provider_item_id()
                     && term.interval() == expected_interval
                     && term.period_end() == renewal_period_start =>
             {
@@ -852,7 +850,6 @@ pub(crate) fn link_repaired_candidate(
         || history.customer_id() != binding.customer_id()
         || candidate.customer_id() != binding.customer_id()
         || candidate.subscription_id() != binding.subscription_id()
-        || candidate.provider_item_id() != binding.provider_item_id()
         || candidate.allocation_reference() != binding.allocation_reference()
     {
         return Err(StripeContractError::ContextMismatch);
@@ -866,7 +863,6 @@ pub(crate) fn link_repaired_candidate(
                     && term.allocation_reference() == binding.allocation_reference()
                     && term.customer_id() == binding.customer_id()
                     && term.subscription_id() == binding.subscription_id()
-                    && term.provider_item_id() == binding.provider_item_id()
                     && term.interval() == candidate.interval()
                     && term.period_end() == candidate.period_start() =>
             {
@@ -892,7 +888,14 @@ pub(crate) fn link_repaired_candidate(
     };
     let mut evidence = StripeRenewalFailureEvidence {
         evidence_reference: String::new(),
-        renewal_id: renewal_identity(config, binding, candidate.invoice_id()),
+        renewal_id: renewal_identity_from_parts(
+            &config.account_id,
+            config.environment,
+            binding.allocation_reference(),
+            binding.subscription_id(),
+            candidate.provider_item_id(),
+            candidate.invoice_id(),
+        ),
         event_id: provenance.event_id().to_owned(),
         invoice_id: candidate.invoice_id().to_owned(),
         invoice_line_id: candidate.invoice_line_id().to_owned(),

@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
@@ -282,6 +282,7 @@ pub struct SponsoredSubscriptionSnapshot {
     pub default_payment_method_id: Option<String>,
     pub subscription_id: String,
     pub status: SubscriptionStatus,
+    pub automatic_tax_enabled: bool,
     pub cancel_at_period_end: bool,
     pub cancel_at: Option<i64>,
     pub current_period_start: Option<i64>,
@@ -404,6 +405,7 @@ pub trait SubscriptionProvider: Send + Sync {
         _idempotency_key: &str,
         _success_url: &str,
         _cancel_url: &str,
+        _collect_billing_address: bool,
     ) -> ProviderResult<TransferSetupSession> {
         Err(ProviderError::unsupported("transfer_setup_session_create"))
     }
@@ -509,6 +511,7 @@ pub trait SubscriptionProvider: Send + Sync {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
+        _automatic_tax_enabled: bool,
     ) -> ProviderResult<PersonalCheckoutSession> {
         let _ = (
             price_id,
@@ -569,6 +572,7 @@ pub trait SubscriptionProvider: Send + Sync {
         _expires_at_epoch: i64,
         _success_url: &str,
         _cancel_url: &str,
+        _automatic_tax_enabled: bool,
     ) -> ProviderResult<SponsoredCheckoutSession> {
         Err(ProviderError::unsupported("sponsored_checkout"))
     }
@@ -773,6 +777,7 @@ pub struct BillingState {
     return_url: String,
     price_catalogue: Option<BillingPriceIds>,
     cloud_sales_enabled: bool,
+    cloud_automatic_tax_enabled: bool,
     founding_schedule_worker_enabled: bool,
     cloud_portal_configuration_id: Option<String>,
     personal_coverage: Option<PersonalCoverageRuntime>,
@@ -797,6 +802,10 @@ impl BillingState {
 
     pub fn cloud_sales_enabled(&self) -> bool {
         self.cloud_sales_enabled
+    }
+
+    pub fn cloud_automatic_tax_enabled(&self) -> bool {
+        self.cloud_automatic_tax_enabled
     }
 
     pub fn return_url(&self) -> &str {
@@ -829,6 +838,7 @@ impl BillingState {
         let provider = StripeBilling {
             api_key: config.api_key.clone(),
             price_id: config.price_id,
+            automatic_tax_enabled: config.cloud_automatic_tax_enabled,
             api_origin: "https://api.stripe.com".into(),
         };
         Self {
@@ -838,6 +848,7 @@ impl BillingState {
             price_catalogue: config.price_catalogue,
             cloud_portal_configuration_id: config.cloud_portal_configuration_id,
             cloud_sales_enabled: config.cloud_sales_enabled,
+            cloud_automatic_tax_enabled: config.cloud_automatic_tax_enabled,
             founding_schedule_worker_enabled: false,
             personal_coverage: None,
         }
@@ -895,6 +906,7 @@ impl BillingState {
             return_url,
             price_catalogue: None,
             cloud_sales_enabled,
+            cloud_automatic_tax_enabled: false,
             founding_schedule_worker_enabled: true,
             cloud_portal_configuration_id: cloud_sales_enabled.then(|| "bpc_test".into()),
             personal_coverage: None,
@@ -909,6 +921,7 @@ impl BillingState {
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
             cloud_sales_enabled: config.cloud_sales_enabled,
+            cloud_automatic_tax_enabled: config.cloud_automatic_tax_enabled,
             founding_schedule_worker_enabled: false,
             cloud_portal_configuration_id: config.cloud_portal_configuration_id,
             personal_coverage: None,
@@ -919,6 +932,7 @@ impl BillingState {
 struct StripeBilling {
     api_key: String,
     price_id: String,
+    automatic_tax_enabled: bool,
     api_origin: String,
 }
 
@@ -1030,11 +1044,18 @@ impl SubscriptionProvider for StripeBilling {
         idempotency_key: &str,
         success_url: &str,
         cancel_url: &str,
+        collect_billing_address: bool,
     ) -> ProviderResult<TransferSetupSession> {
         if transfer_id.trim().is_empty() || customer_id.trim().is_empty() {
             return Err(ProviderError::malformed_response());
         }
-        let form = transfer_setup_checkout_form(transfer_id, customer_id, success_url, cancel_url);
+        let form = transfer_setup_checkout_form(
+            transfer_id,
+            customer_id,
+            success_url,
+            cancel_url,
+            collect_billing_address,
+        );
         let value = stripe_post_with_idempotency_at(
             &self.api_key,
             &self.api_origin,
@@ -1111,6 +1132,7 @@ impl SubscriptionProvider for StripeBilling {
             price_id,
             allocation_reference,
             start_at_epoch,
+            self.automatic_tax_enabled,
         );
         let created = stripe_post_with_idempotency_at(
             &self.api_key,
@@ -1140,6 +1162,7 @@ impl SubscriptionProvider for StripeBilling {
             price_id,
             allocation_reference,
             start_at_epoch,
+            self.automatic_tax_enabled,
         )
     }
 
@@ -1198,6 +1221,7 @@ impl SubscriptionProvider for StripeBilling {
             price_id,
             allocation_reference,
             operation_id,
+            self.automatic_tax_enabled,
         );
         let created = stripe_post_with_idempotency_at(
             &self.api_key,
@@ -1218,7 +1242,8 @@ impl SubscriptionProvider for StripeBilling {
         )
         .await?;
         let snapshot = sponsored_subscription_snapshot(&observed, subscription_id)?;
-        if snapshot.customer_id.as_deref() != Some(customer_id)
+        if !automatic_tax_state_matches(&observed, self.automatic_tax_enabled)
+            || snapshot.customer_id.as_deref() != Some(customer_id)
             || snapshot.default_payment_method_id.as_deref() != Some(payment_method_id)
             || snapshot.items.len() != 1
             || snapshot.items[0].provider_price_id != price_id
@@ -1280,7 +1305,8 @@ impl SubscriptionProvider for StripeBilling {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(ProviderError::malformed_response)?;
         let snapshot = sponsored_subscription_snapshot(object, subscription_id)?;
-        if snapshot.customer_id.as_deref() != Some(customer_id)
+        if !automatic_tax_state_matches(object, self.automatic_tax_enabled)
+            || snapshot.customer_id.as_deref() != Some(customer_id)
             || snapshot.default_payment_method_id.as_deref() != Some(payment_method_id)
             || snapshot.items.len() != 1
             || snapshot.items[0].provider_price_id != price_id
@@ -1320,8 +1346,10 @@ impl SubscriptionProvider for StripeBilling {
         if let Some(customer) = customer {
             form.push(("customer".to_string(), customer.to_string()));
         }
+        append_checkout_tax_fields(&mut form, customer.is_some(), self.automatic_tax_enabled);
 
         let session = stripe_post(&self.api_key, "checkout/sessions", &form).await?;
+        require_checkout_tax_state(&session, self.automatic_tax_enabled)?;
         session["url"]
             .as_str()
             .map(str::to_string)
@@ -1340,6 +1368,7 @@ impl SubscriptionProvider for StripeBilling {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
+        automatic_tax_enabled: bool,
     ) -> ProviderResult<PersonalCheckoutSession> {
         if price_id.is_empty() {
             return Err(ProviderError::malformed_response());
@@ -1371,6 +1400,7 @@ impl SubscriptionProvider for StripeBilling {
         if let Some(customer) = customer {
             form.push(("customer".to_string(), customer.to_string()));
         }
+        append_checkout_tax_fields(&mut form, customer.is_some(), automatic_tax_enabled);
         let session = stripe_post_with_idempotency(
             &self.api_key,
             "checkout/sessions",
@@ -1378,6 +1408,7 @@ impl SubscriptionProvider for StripeBilling {
             idempotency_key,
         )
         .await?;
+        require_checkout_tax_state(&session, automatic_tax_enabled)?;
         let session_id = session["id"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -1437,6 +1468,7 @@ impl SubscriptionProvider for StripeBilling {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
+        automatic_tax_enabled: bool,
     ) -> ProviderResult<SponsoredCheckoutSession> {
         if items.is_empty()
             || items
@@ -1476,6 +1508,7 @@ impl SubscriptionProvider for StripeBilling {
         if let Some(customer) = customer {
             form.push(("customer".to_string(), customer.to_string()));
         }
+        append_checkout_tax_fields(&mut form, customer.is_some(), automatic_tax_enabled);
         let session = stripe_post_with_idempotency_at(
             &self.api_key,
             &self.api_origin,
@@ -1484,6 +1517,7 @@ impl SubscriptionProvider for StripeBilling {
             idempotency_key,
         )
         .await?;
+        require_checkout_tax_state(&session, automatic_tax_enabled)?;
         let session_id = session["id"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -1532,8 +1566,9 @@ impl SubscriptionProvider for StripeBilling {
         let schedule_id = if let Some(schedule_id) = current.schedule_id.clone() {
             schedule_id
         } else {
-            let schedule = stripe_post_with_idempotency(
+            let schedule = stripe_post_with_idempotency_at(
                 &self.api_key,
+                &self.api_origin,
                 "subscription_schedules",
                 &[("from_subscription".into(), subscription_id.into())],
                 &format!("{idempotency_key}-schedule"),
@@ -1609,6 +1644,11 @@ impl SubscriptionProvider for StripeBilling {
             ("phases[0][start_date]".into(), current_start.to_string()),
             ("phases[0][end_date]".into(), current_end.to_string()),
         ];
+        append_sponsored_phase_tax_fields(
+            &mut form,
+            normalized.len(),
+            current.automatic_tax_enabled,
+        );
         for (index, item) in current.items.iter().enumerate() {
             form.push((
                 format!("phases[0][items][{index}][price]"),
@@ -1639,8 +1679,9 @@ impl SubscriptionProvider for StripeBilling {
                 ));
             }
         }
-        stripe_post_with_idempotency(
+        stripe_post_with_idempotency_at(
             &self.api_key,
+            &self.api_origin,
             &format!("subscription_schedules/{schedule_id}"),
             &form,
             &schedule_update_idempotency_key(idempotency_key, &normalized),
@@ -1652,12 +1693,13 @@ impl SubscriptionProvider for StripeBilling {
             &format!("subscription_schedules/{schedule_id}"),
         )
         .await?;
-        if !stripe_schedule_contains_phases(
+        if !stripe_schedule_contains_phases_with_tax(
             &schedule,
             current_start,
             current_end,
             &current.items,
             &normalized,
+            current.automatic_tax_enabled,
         ) {
             return Err(ProviderError::malformed_response());
         }
@@ -3223,6 +3265,7 @@ async fn sponsored_checkout(
                 customer_id: checkout_customer_id,
                 items: sponsored_provider_items(&state.pool, &org_id, catalogue, &operation)
                     .await?,
+                automatic_tax_enabled: billing.cloud_automatic_tax_enabled(),
                 expires_at_epoch: personal_checkout_expiry(
                     operation.quote_expires_at_epoch,
                     sponsored_billing::current_epoch(),
@@ -3580,10 +3623,7 @@ async fn select_founding_aware_offer(
 }
 
 fn billing_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs() as i64
+    crate::clock::business_epoch_seconds()
 }
 
 fn personal_billing_error(error: personal_billing::PersonalBillingError) -> Error {
@@ -3698,6 +3738,11 @@ async fn personal_quote(
 /// verified paid webhook handled below.
 const SAFE_CHECKOUT_IDEMPOTENCY_WINDOW_SECONDS: i64 = 23 * 60 * 60;
 
+#[cfg(feature = "e2e-test-clock")]
+fn test_checkout_customer_matches(configured: Option<&str>, stored: Option<&str>) -> bool {
+    configured.is_none_or(|customer_id| Some(customer_id) == stored)
+}
+
 async fn personal_checkout(
     State(state): State<AppState>,
     user: AuthUser,
@@ -3730,6 +3775,8 @@ async fn personal_checkout(
     validate_personal_catalogue(billing, catalogue).await?;
     let price_id = catalogue.id_for(offer).to_string();
     let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
+    #[cfg(feature = "e2e-test-clock")]
+    let test_clock_customer_id = crate::clock::test_clock_customer_id();
     billing_operations::validate_return_url(&billing.return_url, &request.return_url)
         .map_err(Error::from)?;
     #[cfg(feature = "e2e-stripe-test-clock")]
@@ -3800,12 +3847,31 @@ async fn personal_checkout(
             )
             .await
             .map_err(personal_billing_error)?;
+            #[cfg(feature = "e2e-test-clock")]
+            if let Some(customer_id) = test_clock_customer_id.as_deref() {
+                let result = sqlx::query(
+                    "UPDATE billing_personal_accounts SET stripe_customer_id = $2, updated_at = now() \
+                     WHERE user_id = $1 AND operation_id = $3 AND state = 'pending' \
+                       AND (stripe_customer_id IS NULL OR stripe_customer_id = $2)",
+                )
+                .bind(&user.user_id)
+                .bind(customer_id)
+                .bind(&operation.operation_id)
+                .execute(&mut *tx)
+                .await?;
+                if result.rows_affected() != 1 {
+                    return Err(Error::Conflict(
+                        "billing operation is bound to a different test customer".into(),
+                    ));
+                }
+            }
             let operation = billing_operations::record_personal_checkout_request(
                 &mut tx,
                 &operation.operation_id,
                 &price_id,
                 &success_url,
                 &cancel_url,
+                billing.cloud_automatic_tax_enabled(),
             )
             .await
             .map_err(Error::from)?;
@@ -3928,6 +3994,12 @@ async fn personal_checkout(
     .bind(&operation.operation_id)
     .fetch_one(&state.pool)
     .await?;
+    #[cfg(feature = "e2e-test-clock")]
+    if !test_checkout_customer_matches(test_clock_customer_id.as_deref(), customer_id.as_deref()) {
+        return Err(Error::Conflict(
+            "billing operation is bound to a different test customer".into(),
+        ));
+    }
     let stored_price_id = operation
         .provider_checkout_price_id
         .as_deref()
@@ -3967,6 +4039,9 @@ async fn personal_checkout(
             checkout_expires_at_epoch,
             stored_success_url,
             stored_cancel_url,
+            operation
+                .provider_checkout_automatic_tax_enabled
+                .unwrap_or(false),
         )
         .await
         .map_err(ProviderError::into_error)?;
@@ -4143,6 +4218,9 @@ pub async fn recover_personal_billing_operation_once(
             expires_at_epoch,
             success_url,
             cancel_url,
+            operation
+                .provider_checkout_automatic_tax_enabled
+                .unwrap_or(false),
         )
         .await;
     match result {
@@ -4313,6 +4391,7 @@ pub async fn recover_sponsored_billing_operation_by_id(
             organization_id,
             customer_id,
             items,
+            automatic_tax_enabled,
             expires_at_epoch,
             success_url,
             cancel_url,
@@ -4408,6 +4487,7 @@ pub async fn recover_sponsored_billing_operation_by_id(
                     expires_at_epoch,
                     &success_url,
                     &cancel_url,
+                    automatic_tax_enabled,
                 )
                 .await
             {
@@ -6045,6 +6125,64 @@ async fn stripe_post_with_idempotency_at(
     stripe_response(response).await
 }
 
+fn append_checkout_tax_fields(
+    form: &mut Vec<(String, String)>,
+    existing_customer: bool,
+    automatic_tax_enabled: bool,
+) {
+    if !automatic_tax_enabled {
+        return;
+    }
+    form.push(("automatic_tax[enabled]".into(), "true".into()));
+    form.push(("billing_address_collection".into(), "auto".into()));
+    if existing_customer {
+        form.push(("customer_update[address]".into(), "auto".into()));
+    }
+}
+
+fn append_sponsored_phase_tax_fields(
+    form: &mut Vec<(String, String)>,
+    future_phase_count: usize,
+    automatic_tax_enabled: bool,
+) {
+    for phase_index in 0..=future_phase_count {
+        form.push((
+            format!("phases[{phase_index}][automatic_tax][enabled]"),
+            automatic_tax_enabled.to_string(),
+        ));
+    }
+}
+
+fn automatic_tax_state_matches(object: &serde_json::Value, enabled: bool) -> bool {
+    automatic_tax_object_matches(&object["automatic_tax"], enabled)
+}
+
+fn automatic_tax_object_matches(automatic_tax: &serde_json::Value, enabled: bool) -> bool {
+    if !enabled || automatic_tax["enabled"].as_bool() == Some(true) {
+        return true;
+    }
+    if automatic_tax["enabled"].as_bool() == Some(false)
+        && automatic_tax["disabled_reason"].as_str() == Some("requires_location_inputs")
+    {
+        eprintln!(
+            "warning: Stripe disabled automatic tax because customer location inputs are required"
+        );
+        return true;
+    }
+    false
+}
+
+fn require_checkout_tax_state(
+    session: &serde_json::Value,
+    automatic_tax_enabled: bool,
+) -> ProviderResult<()> {
+    if automatic_tax_state_matches(session, automatic_tax_enabled) {
+        Ok(())
+    } else {
+        Err(ProviderError::malformed_response())
+    }
+}
+
 /// Fetch one Stripe resource with the pinned API version and structured error classification.
 async fn stripe_get(api_key: &str, path: &str) -> ProviderResult<serde_json::Value> {
     stripe_get_at(api_key, "https://api.stripe.com", path).await
@@ -6117,13 +6255,45 @@ fn stripe_schedule_contains_phases(
         })
 }
 
+fn stripe_schedule_contains_phases_with_tax(
+    schedule: &serde_json::Value,
+    current_start: i64,
+    current_end: i64,
+    current_items: &[SponsoredSubscriptionItem],
+    expected_phases: &[SponsoredSubscriptionPhase],
+    expected_automatic_tax_enabled: bool,
+) -> bool {
+    if !stripe_schedule_contains_phases(
+        schedule,
+        current_start,
+        current_end,
+        current_items,
+        expected_phases,
+    ) {
+        return false;
+    }
+    schedule["phases"].as_array().is_some_and(|phases| {
+        phases
+            .iter()
+            .filter(|phase| {
+                phase["end_date"]
+                    .as_i64()
+                    .is_some_and(|end| end > current_start)
+            })
+            .all(|phase| {
+                phase["automatic_tax"]["enabled"].as_bool() == Some(expected_automatic_tax_enabled)
+            })
+    })
+}
+
 fn transfer_setup_checkout_form(
     transfer_id: &str,
     customer_id: &str,
     success_url: &str,
     cancel_url: &str,
+    collect_billing_address: bool,
 ) -> Vec<(String, String)> {
-    vec![
+    let mut form = vec![
         ("mode".into(), "setup".into()),
         ("customer".into(), customer_id.into()),
         (
@@ -6138,7 +6308,12 @@ fn transfer_setup_checkout_form(
         ("setup_intent_data[usage]".into(), "off_session".into()),
         ("success_url".into(), success_url.into()),
         ("cancel_url".into(), cancel_url.into()),
-    ]
+    ];
+    if collect_billing_address {
+        form.push(("billing_address_collection".into(), "required".into()));
+        form.push(("customer_update[address]".into(), "auto".into()));
+    }
+    form
 }
 
 fn transfer_setup_session_from_object(
@@ -6273,6 +6448,7 @@ fn personal_transfer_schedule_form(
     price_id: &str,
     allocation_reference: &str,
     start_at_epoch: i64,
+    automatic_tax_enabled: bool,
 ) -> Vec<(String, String)> {
     let operation_id = format!("{transfer_id}:destination");
     let mut form: Vec<(String, String)> = vec![
@@ -6316,10 +6492,17 @@ fn personal_transfer_schedule_form(
             offer.as_str().into(),
         ),
     ];
+    if automatic_tax_enabled {
+        form.push((
+            "default_settings[automatic_tax][enabled]".into(),
+            "true".into(),
+        ));
+    }
     form.sort_by(|left, right| left.0.cmp(&right.0));
     form
 }
 
+#[allow(clippy::too_many_arguments)]
 fn personal_source_restoration_form(
     transfer_id: &str,
     beneficiary_id: &str,
@@ -6328,8 +6511,9 @@ fn personal_source_restoration_form(
     price_id: &str,
     allocation_reference: &str,
     operation_id: &str,
+    automatic_tax_enabled: bool,
 ) -> Vec<(String, String)> {
-    vec![
+    let mut form = vec![
         ("customer".into(), customer_id.into()),
         ("items[0][price]".into(), price_id.into()),
         ("default_payment_method".into(), payment_method_id.into()),
@@ -6343,7 +6527,11 @@ fn personal_source_restoration_form(
             allocation_reference.into(),
         ),
         ("metadata[sotto_transfer_id]".into(), transfer_id.into()),
-    ]
+    ];
+    if automatic_tax_enabled {
+        form.push(("automatic_tax[enabled]".into(), "true".into()));
+    }
+    form
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6357,6 +6545,7 @@ fn transfer_schedule_from_object(
     price_id: &str,
     allocation_reference: &str,
     start_at_epoch: i64,
+    automatic_tax_enabled: bool,
 ) -> ProviderResult<TransferSubscriptionSchedule> {
     let operation_id = format!("{transfer_id}:destination");
     let schedule_id = object["id"]
@@ -6390,6 +6579,10 @@ fn transfer_schedule_from_object(
         || phase["proration_behavior"].as_str() != Some("none")
         || phase_payment_method.as_deref() != Some(payment_method_id)
         || default_payment_method.as_deref() != Some(payment_method_id)
+        || !automatic_tax_object_matches(
+            &object["default_settings"]["automatic_tax"],
+            automatic_tax_enabled,
+        )
         || object["metadata"]["sotto_transfer_id"].as_str() != Some(transfer_id)
         || object["metadata"]["personal_user_id"].as_str() != Some(beneficiary_id)
         || object["metadata"]["operation_id"].as_str() != Some(operation_id.as_str())
@@ -6672,6 +6865,9 @@ fn sponsored_subscription_snapshot(
     let cancel_at_period_end = object["cancel_at_period_end"]
         .as_bool()
         .ok_or_else(ProviderError::malformed_response)?;
+    let automatic_tax_enabled = object["automatic_tax"]["enabled"]
+        .as_bool()
+        .ok_or_else(ProviderError::malformed_response)?;
     let cancel_at = match object.get("cancel_at") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(
@@ -6710,6 +6906,7 @@ fn sponsored_subscription_snapshot(
         default_payment_method_id: stripe_reference(&object["default_payment_method"]),
         subscription_id: base.id,
         status: base.status,
+        automatic_tax_enabled,
         cancel_at_period_end,
         cancel_at,
         current_period_start: subscription_period_start(object),
@@ -6786,10 +6983,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         .get("Stripe-Signature")
         .and_then(|v| v.to_str().ok())
         .ok_or(Error::Unauthorized)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = crate::clock::wall_epoch_seconds();
     if !verify_signature(&billing.webhook_secret, signature, &body, now) {
         return Err(Error::Unauthorized);
     }
@@ -7125,6 +7319,8 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                         &coverage.context,
                         &coverage.event,
                         &coverage.allocation,
+                        coverage.previous_provider_item_id.as_deref(),
+                        coverage.provider_item_rebind_allowed,
                         true,
                     )
                     .await?;
@@ -7632,6 +7828,8 @@ pub(crate) async fn repair_authenticated_stripe_event(
                 &coverage.context,
                 &coverage.event,
                 &coverage.allocation,
+                coverage.previous_provider_item_id.as_deref(),
+                coverage.provider_item_rebind_allowed,
                 true,
             )
             .await?;
@@ -7741,6 +7939,8 @@ pub(crate) async fn repair_authenticated_stripe_event(
             &coverage.context,
             &coverage.event,
             &coverage.allocation,
+            coverage.previous_provider_item_id.as_deref(),
+            coverage.provider_item_rebind_allowed,
             true,
         )
         .await?;
@@ -8064,6 +8264,8 @@ struct PreparedPersonalInvoiceCoverage {
     payment_reference: String,
     period_start: i64,
     period_end: i64,
+    previous_provider_item_id: Option<String>,
+    provider_item_rebind_allowed: bool,
 }
 
 enum PersonalInvoiceCoveragePreparation {
@@ -8081,6 +8283,8 @@ struct PreparedPersonalRenewalFailure {
     context: ProviderContext,
     allocation: VerifiedAllocation,
     evidence: crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence,
+    previous_provider_item_id: Option<String>,
+    provider_item_rebind_allowed: bool,
 }
 
 struct PreparedSponsoredRenewalFailure {
@@ -8154,13 +8358,39 @@ async fn prepare_signed_personal_renewal_failure(
     let Some(allocation_reference) = invoice_allocation_reference_claim(invoice) else {
         return Ok(None);
     };
+    let Some(failed_line) = invoice
+        .get("lines")
+        .and_then(|lines| lines.get("data"))
+        .and_then(serde_json::Value::as_array)
+        .filter(|lines| lines.len() == 1)
+        .and_then(|lines| lines.first())
+    else {
+        return Ok(None);
+    };
+    let Some(event_item_id) = failed_line
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_item_details"))
+        .and_then(|details| details.get("subscription_item"))
+        .and_then(stripe_reference)
+    else {
+        return Ok(None);
+    };
+    let Some(failed_period_start) = failed_line
+        .get("period")
+        .and_then(|period| period.get("start"))
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return Ok(None);
+    };
     let row = sqlx::query(
         "SELECT allocation.allocation_id, allocation.payer_id, allocation.beneficiary_id, \
                 allocation.provider_subscription_id, allocation.provider_item_id, \
                 allocation.external_allocation_reference, allocation.coverage_source_id, \
                 allocation.effective_from, allocation.effective_until, allocation.state, \
                 allocation.ownership_evidence_reference, allocation.provider_account_id, \
-                allocation.provider_environment, payer.provider_customer_id, payer.payer_kind \
+                allocation.provider_environment, payer.provider_customer_id, payer.payer_kind, \
+                (SELECT paid_through_epoch FROM billing_personal_accounts \
+                 WHERE user_id = allocation.beneficiary_id) AS personal_paid_through_epoch \
          FROM cloud_provider_allocations AS allocation \
          JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
          WHERE allocation.provider_namespace = 'stripe' \
@@ -8180,12 +8410,19 @@ async fn prepare_signed_personal_renewal_failure(
     }
     let customer_id: String = row.try_get("provider_customer_id")?;
     let subscription_id: String = row.try_get("provider_subscription_id")?;
-    let provider_item_id: String = row.try_get("provider_item_id")?;
+    let previous_provider_item_id: String = row.try_get("provider_item_id")?;
+    let item_changed = previous_provider_item_id != event_item_id;
+    let provider_item_rebind_allowed = item_changed
+        && row.try_get::<Option<i64>, _>("personal_paid_through_epoch")?
+            == Some(failed_period_start);
+    if item_changed && !provider_item_rebind_allowed {
+        return Ok(None);
+    }
     let binding = StripeAllocationBinding::new(
         allocation_reference,
         customer_id.clone(),
         subscription_id.clone(),
-        provider_item_id.clone(),
+        event_item_id.clone(),
         ProviderPayerKind::Personal,
     )
     .map_err(|_| Error::Internal("stored Stripe allocation binding is invalid".into()))?;
@@ -8196,7 +8433,7 @@ async fn prepare_signed_personal_renewal_failure(
         ProviderPayerKind::Personal,
         row.try_get::<String, _>("beneficiary_id")?,
         subscription_id.clone(),
-        provider_item_id,
+        event_item_id,
         row.try_get::<String, _>("external_allocation_reference")?,
         row.try_get::<String, _>("coverage_source_id")?,
         row.try_get::<i64, _>("effective_from")?,
@@ -8264,6 +8501,8 @@ async fn prepare_signed_personal_renewal_failure(
         context,
         allocation,
         evidence,
+        previous_provider_item_id: item_changed.then_some(previous_provider_item_id),
+        provider_item_rebind_allowed,
     }))
 }
 
@@ -8271,6 +8510,26 @@ async fn accept_prepared_personal_renewal_failure(
     tx: &mut Transaction<'_, Postgres>,
     failure: &PreparedPersonalRenewalFailure,
 ) -> Result<()> {
+    if failure.provider_item_rebind_allowed {
+        let previous_item_id = failure
+            .previous_provider_item_id
+            .as_deref()
+            .ok_or_else(|| {
+                Error::Internal(
+                    "personal renewal item transition lacks its previous binding".into(),
+                )
+            })?;
+        crate::cloud_provider::rebind_personal_allocation_item(
+            tx,
+            &failure.context,
+            &failure.allocation,
+            previous_item_id,
+        )
+        .await
+        .map_err(|_| {
+            Error::Internal("personal renewal item binding could not be advanced".into())
+        })?;
+    }
     crate::cloud_provider_stripe_renewal_store::accept_personal_renewal_failure(
         tx,
         &failure.context,
@@ -9410,6 +9669,7 @@ async fn prepare_personal_invoice_coverage(
     let row = sqlx::query(
         "SELECT user_id, operation_id, allocation_reference, stripe_coverage_binding_required, \
                 offer, stripe_customer_id, \
+                paid_through_epoch, \
                 (SELECT offer FROM billing_founding_awards \
                  WHERE beneficiary_id = billing_personal_accounts.user_id) AS founding_offer, \
                 (SELECT original_end_epoch FROM billing_founding_awards \
@@ -9446,6 +9706,7 @@ async fn prepare_personal_invoice_coverage(
         .map(parse_founding_offer)
         .transpose()?;
     let founding_end_epoch: Option<i64> = row.try_get("founding_end_epoch")?;
+    let account_paid_through_epoch: Option<i64> = row.try_get("paid_through_epoch")?;
     let Some(customer_id) = row.try_get::<Option<String>, _>("stripe_customer_id")? else {
         return Err(Error::Internal(
             "personal invoice checkout is not yet linked".into(),
@@ -9749,6 +10010,14 @@ async fn prepare_personal_invoice_coverage(
             ));
         }
     };
+    let previous_provider_item_id = stored
+        .as_ref()
+        .map(|row| row.try_get::<String, _>("provider_item_id"))
+        .transpose()?;
+    let provider_item_rebind_allowed = previous_provider_item_id
+        .as_deref()
+        .is_some_and(|previous| previous != allocation.provider_item_id)
+        && account_paid_through_epoch == Some(evidence.period_start);
     if stored.as_ref().is_some_and(|row| {
         row.try_get::<String, _>("beneficiary_id").ok().as_deref()
             != Some(allocation.beneficiary_id.as_str())
@@ -9762,8 +10031,9 @@ async fn prepare_personal_invoice_coverage(
                 .ok()
                 .as_deref()
                 != Some(allocation.subscription_id.as_str())
-            || row.try_get::<String, _>("provider_item_id").ok().as_deref()
+            || (row.try_get::<String, _>("provider_item_id").ok().as_deref()
                 != Some(allocation.provider_item_id.as_str())
+                && !provider_item_rebind_allowed)
             || row.try_get::<String, _>("payer_kind").ok().as_deref() != Some("personal")
             || row
                 .try_get::<String, _>("provider_account_id")
@@ -9791,6 +10061,8 @@ async fn prepare_personal_invoice_coverage(
             payment_reference: evidence.payment_intent_id,
             period_start: evidence.period_start,
             period_end: evidence.period_end,
+            previous_provider_item_id,
+            provider_item_rebind_allowed,
         },
     )))
 }
@@ -9811,11 +10083,28 @@ async fn accept_personal_invoice_coverage(
     context: &ProviderContext,
     event: &crate::cloud_provider::VerifiedProviderEvent,
     allocation: &VerifiedAllocation,
+    previous_provider_item_id: Option<&str>,
+    provider_item_rebind_allowed: bool,
     ingest_enabled: bool,
 ) -> Result<()> {
     record_verified_event(tx, context, event)
         .await
         .map_err(|_| Error::Internal("personal provider event receipt failed".into()))?;
+    if provider_item_rebind_allowed {
+        let previous_item_id = previous_provider_item_id.ok_or_else(|| {
+            Error::Internal("personal provider item transition lacks its previous binding".into())
+        })?;
+        crate::cloud_provider::rebind_personal_allocation_item(
+            tx,
+            context,
+            allocation,
+            previous_item_id,
+        )
+        .await
+        .map_err(|_| {
+            Error::Internal("personal provider item binding could not be advanced".into())
+        })?;
+    }
     register_verified_allocation(tx, context, allocation)
         .await
         .map_err(|_| Error::Internal("personal provider source registration failed".into()))?;
@@ -10302,6 +10591,7 @@ mod e2e_stripe_test_clock_tests {
         let provider = StripeBilling {
             api_key: "rk_test_private".into(),
             price_id: "price_test".into(),
+            automatic_tax_enabled: false,
             api_origin: format!("http://{address}"),
         };
 
@@ -13015,6 +13305,22 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "e2e-test-clock")]
+    #[test]
+    fn test_clock_checkout_replays_only_with_its_original_customer() {
+        assert!(test_checkout_customer_matches(None, None));
+        assert!(test_checkout_customer_matches(None, Some("cus_existing")));
+        assert!(test_checkout_customer_matches(
+            Some("cus_original"),
+            Some("cus_original")
+        ));
+        assert!(!test_checkout_customer_matches(
+            Some("cus_original"),
+            Some("cus_different")
+        ));
+        assert!(!test_checkout_customer_matches(Some("cus_original"), None));
+    }
     use axum::response::IntoResponse;
     use std::collections::HashSet;
     use std::str::FromStr;
@@ -13193,7 +13499,8 @@ mod tests {
             "id": "cs_recovered_http",
             "url": "https://checkout.stripe.test/cs_recovered_http",
             "customer": "cus_recovered_http",
-            "subscription": null
+            "subscription": null,
+            "automatic_tax": {"enabled": true}
         }))
         .into_response()
     }
@@ -13285,6 +13592,7 @@ mod tests {
                 "object": "subscription",
                 "customer": "cus_recovery_http",
                 "status": "active",
+                "automatic_tax": {"enabled": false},
                 "cancel_at_period_end": false,
                 "cancel_at": null,
                 "default_payment_method": "pm_recovery_http",
@@ -13309,6 +13617,94 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("serve sponsored schedule verification mock");
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    #[derive(Clone)]
+    struct SponsoredTaxScheduleHttpState {
+        requests: Arc<Mutex<Vec<(String, String, String)>>>,
+    }
+
+    async fn sponsored_tax_schedule_http_mock(
+        State(state): State<SponsoredTaxScheduleHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let method = request.method().to_string();
+        let path = request.uri().path().to_owned();
+        let body = axum::body::to_bytes(request.into_body(), 16 * 1024)
+            .await
+            .expect("small schedule update body");
+        let body = String::from_utf8(body.to_vec()).expect("form body is UTF-8");
+        state
+            .requests
+            .lock()
+            .expect("tax schedule request lock")
+            .push((method.clone(), path.clone(), body));
+
+        let response = match (method.as_str(), path.as_str()) {
+            ("GET", "/v1/subscriptions/sub_tax_preserved") => serde_json::json!({
+                "id":"sub_tax_preserved", "object":"subscription", "customer":"cus_tax",
+                "status":"active", "automatic_tax":{"enabled":true},
+                "cancel_at_period_end":false, "cancel_at":null,
+                "schedule":"sched_tax_preserved",
+                "items":{"data":[{
+                    "id":"si_tax_current", "price":{"id":"price_current"}, "quantity":1,
+                    "current_period_start":1600000000_i64, "current_period_end":1700000000_i64
+                }]}
+            }),
+            ("GET", "/v1/subscription_schedules/sched_tax_preserved") => serde_json::json!({
+                "id":"sched_tax_preserved", "subscription":"sub_tax_preserved",
+                "end_behavior":"release",
+                "phases":[
+                    {
+                        "start_date":1600000000_i64, "end_date":1700000000_i64,
+                        "automatic_tax":{"enabled":true},
+                        "items":[{"price":"price_current", "quantity":1}]
+                    },
+                    {
+                        "start_date":1700000000_i64, "end_date":1800000000_i64,
+                        "automatic_tax":{"enabled":true},
+                        "items":[{"price":"price_next", "quantity":2}]
+                    }
+                ]
+            }),
+            ("POST", "/v1/subscription_schedules/sched_tax_preserved") => {
+                serde_json::json!({"id":"sched_tax_preserved"})
+            }
+            _ => {
+                return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::NOT_FOUND)
+                    .body(axum::body::Body::from("{}"))
+                    .expect("mock response")
+            }
+        };
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(response.to_string()))
+            .expect("mock response")
+    }
+
+    async fn sponsored_tax_schedule_http_server() -> (
+        String,
+        Arc<Mutex<Vec<(String, String, String)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind sponsored tax schedule mock");
+        let address = listener.local_addr().expect("mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(axum::routing::any(sponsored_tax_schedule_http_mock))
+            .with_state(SponsoredTaxScheduleHttpState {
+                requests: requests.clone(),
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve sponsored tax schedule mock");
         });
         (format!("http://{address}"), requests, server)
     }
@@ -13363,6 +13759,7 @@ mod tests {
                 "object":"search_result", "data":[{
                     "id":"sub_restored", "object":"subscription", "customer":"cus_original",
                     "status":"incomplete", "default_payment_method":"pm_saved",
+                    "automatic_tax":{"enabled":false},
                     "cancel_at_period_end":false, "cancel_at":null,
                     "metadata":{
                         "personal_user_id":"user_restore", "operation_id":"transfer:one:source-restoration",
@@ -13376,6 +13773,7 @@ mod tests {
             }),
             ("GET", "/v1/subscriptions/sub_scheduled") => serde_json::json!({
                 "id":"sub_scheduled", "customer":"cus_test", "status":"active",
+                "automatic_tax":{"enabled":false},
                 "cancel_at_period_end":false,
                 "cancel_at":if schedule_updated.contains("sched_test") { Some(1707776000) } else { None::<i64> },
                 "schedule":"sched_test", "items":{"data":[{
@@ -13410,6 +13808,7 @@ mod tests {
             }),
             ("GET", "/v1/subscriptions/sub_transition") => serde_json::json!({
                 "id":"sub_transition", "customer":"cus_test", "status":"active",
+                "automatic_tax":{"enabled":false},
                 "cancel_at_period_end":false, "cancel_at":null,
                 "schedule":"sched_transition", "items":{"data":[{
                     "id":"si_transition", "price":{"id":"price_founding_monthly"}, "quantity":1,
@@ -13453,6 +13852,7 @@ mod tests {
             }),
             ("GET", "/v1/subscriptions/sub_unscheduled") => serde_json::json!({
                 "id":"sub_unscheduled", "customer":"cus_test", "status":"active",
+                "automatic_tax":{"enabled":false},
                 "cancel_at_period_end":false, "cancel_at":null,
                 "items":{"data":[{
                     "id":"si_test", "price":{"id":"price_standard_monthly"}, "quantity":1,
@@ -13461,6 +13861,7 @@ mod tests {
             }),
             ("GET", "/v1/subscriptions/sub_boundary_direct") => serde_json::json!({
                 "id":"sub_boundary_direct", "customer":"cus_test", "status":"active",
+                "automatic_tax":{"enabled":false},
                 "cancel_at_period_end":false,
                 "cancel_at":if boundary_cancelled { Some(1707776000) } else { None::<i64> },
                 "items":{"data":[{
@@ -13926,6 +14327,7 @@ mod tests {
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_test".into(),
+            automatic_tax_enabled: false,
             api_origin: origin,
         };
 
@@ -14035,6 +14437,7 @@ mod tests {
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_test".into(),
+            automatic_tax_enabled: false,
             api_origin: origin,
         };
         let end = provider
@@ -14055,6 +14458,7 @@ mod tests {
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_test".into(),
+            automatic_tax_enabled: false,
             api_origin: origin,
         };
         let refund = provider
@@ -14853,6 +15257,7 @@ mod tests {
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_test".into(),
+            automatic_tax_enabled: false,
             api_origin: origin,
         };
 
@@ -14881,6 +15286,7 @@ mod tests {
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_test".into(),
+            automatic_tax_enabled: false,
             api_origin: origin,
         };
         let found = provider
@@ -14911,6 +15317,7 @@ mod tests {
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_test".into(),
+            automatic_tax_enabled: false,
             api_origin: origin,
         };
 
@@ -14939,6 +15346,7 @@ mod tests {
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_test".into(),
+            automatic_tax_enabled: false,
             api_origin: origin,
         };
 
@@ -15330,6 +15738,7 @@ mod tests {
             price_catalogue: None,
             cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://getsotto.test".into(),
         });
 
@@ -15429,6 +15838,63 @@ mod tests {
             app_url("https://getsotto.test/"),
             "https://getsotto.test/app"
         );
+    }
+
+    #[test]
+    fn checkout_tax_fields_are_opt_in_and_update_existing_customer_address() {
+        let mut disabled = Vec::new();
+        append_checkout_tax_fields(&mut disabled, true, false);
+        assert!(disabled.is_empty());
+
+        let mut new_customer = Vec::new();
+        append_checkout_tax_fields(&mut new_customer, false, true);
+        assert!(new_customer.contains(&("automatic_tax[enabled]".into(), "true".into())));
+        assert!(new_customer.contains(&("billing_address_collection".into(), "auto".into())));
+        assert!(!new_customer
+            .iter()
+            .any(|(key, _)| key.starts_with("customer_update[")));
+
+        let mut existing_customer = Vec::new();
+        append_checkout_tax_fields(&mut existing_customer, true, true);
+        assert!(existing_customer.contains(&("customer_update[address]".into(), "auto".into())));
+    }
+
+    #[test]
+    fn enabled_checkout_tax_requires_stripe_to_confirm_it() {
+        assert!(require_checkout_tax_state(&serde_json::json!({}), false).is_ok());
+        assert!(require_checkout_tax_state(&serde_json::json!({}), true).is_err());
+        assert!(require_checkout_tax_state(
+            &serde_json::json!({"automatic_tax": {"enabled": false}}),
+            true,
+        )
+        .is_err());
+        assert!(require_checkout_tax_state(
+            &serde_json::json!({"automatic_tax": {"enabled": true}}),
+            true,
+        )
+        .is_ok());
+        assert!(require_checkout_tax_state(
+            &serde_json::json!({
+                "automatic_tax": {
+                    "enabled": false,
+                    "disabled_reason": "requires_location_inputs"
+                }
+            }),
+            true,
+        )
+        .is_ok());
+        for disabled_reason in ["tax_not_active", "unsupported_location"] {
+            assert!(require_checkout_tax_state(
+                &serde_json::json!({
+                    "automatic_tax": {
+                        "enabled": false,
+                        "disabled_reason": disabled_reason
+                    }
+                }),
+                true,
+            )
+            .is_err());
+        }
     }
 
     #[cfg(feature = "e2e-mock-billing")]
@@ -15797,6 +16263,7 @@ mod tests {
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_legacy_unused".into(),
+            automatic_tax_enabled: true,
             api_origin: origin,
         };
         let items = vec![SponsoredSubscriptionItemRequest {
@@ -15813,6 +16280,7 @@ mod tests {
                 1_800_000_000,
                 "https://app.example.test/success",
                 "https://app.example.test/cancel",
+                true,
             )
             .await;
         assert!(
@@ -15836,6 +16304,7 @@ mod tests {
                 1_800_000_000,
                 "https://app.example.test/success",
                 "https://app.example.test/cancel",
+                true,
             )
             .await
             .expect("same request succeeds after an ambiguous provider response");
@@ -15853,6 +16322,9 @@ mod tests {
             .1
             .contains("line_items%5B0%5D%5Bprice%5D=price_recovery_monthly"));
         assert!(requests[0].1.contains("line_items%5B0%5D%5Bquantity%5D=2"));
+        assert!(requests[0].1.contains("automatic_tax%5Benabled%5D=true"));
+        assert!(requests[0].1.contains("billing_address_collection=auto"));
+        assert!(requests[0].1.contains("customer_update%5Baddress%5D=auto"));
         assert_eq!(
             remote_creations.load(Ordering::SeqCst),
             1,
@@ -15906,6 +16378,7 @@ mod tests {
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_legacy_unused".into(),
+            automatic_tax_enabled: false,
             api_origin: origin,
         };
         let verified = provider
@@ -15938,6 +16411,7 @@ mod tests {
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_legacy_unused".into(),
+            automatic_tax_enabled: false,
             api_origin: origin,
         };
         let mismatched_item = provider
@@ -15960,6 +16434,7 @@ mod tests {
         let provider = StripeBilling {
             api_key: "rk_test_mock".into(),
             price_id: "price_legacy_unused".into(),
+            automatic_tax_enabled: false,
             api_origin: origin,
         };
         assert!(provider
@@ -15974,6 +16449,63 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn sponsored_seat_change_preserves_stripe_tax_state_on_current_and_future_phases() {
+        let (origin, requests, server) = sponsored_tax_schedule_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_legacy_unused".into(),
+            // A server rollout must not silently switch an existing subscription's tax mode.
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+        let updated = provider
+            .update_sponsored_subscription(
+                "org_tax",
+                "sub_tax_preserved",
+                &[SponsoredSubscriptionPhase {
+                    start_at_epoch: 1_700_000_000,
+                    end_at_epoch: None,
+                    items: vec![SponsoredSubscriptionItemRequest {
+                        provider_price_id: "price_next".into(),
+                        quantity: 2,
+                    }],
+                }],
+                "tax-preservation-request",
+            )
+            .await
+            .expect("seat update preserves the tax setting read from Stripe");
+
+        assert!(updated.automatic_tax_enabled);
+        let requests = requests.lock().expect("tax schedule request lock");
+        let update = requests
+            .iter()
+            .find(|(method, path, _)| {
+                method == "POST" && path == "/v1/subscription_schedules/sched_tax_preserved"
+            })
+            .expect("schedule update request");
+        let fields: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(update.2.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+        assert_eq!(
+            fields
+                .get("phases[0][automatic_tax][enabled]")
+                .map(String::as_str),
+            Some("true"),
+            "the current phase keeps the tax setting already on the subscription"
+        );
+        assert_eq!(
+            fields
+                .get("phases[1][automatic_tax][enabled]")
+                .map(String::as_str),
+            Some("true"),
+            "the future seat phase keeps the same tax setting"
+        );
+        drop(requests);
+        server.abort();
+    }
+
     #[test]
     fn transfer_setup_checkout_is_off_session_and_bound_to_transfer() {
         let form = transfer_setup_checkout_form(
@@ -15981,6 +16513,7 @@ mod tests {
             "cus_beneficiary",
             "https://app.example.test/success",
             "https://app.example.test/cancel",
+            true,
         );
         let fields = form
             .into_iter()
@@ -16000,7 +16533,26 @@ mod tests {
                 .map(String::as_str),
             Some("transfer:abc")
         );
+        assert_eq!(
+            fields.get("billing_address_collection").map(String::as_str),
+            Some("required")
+        );
+        assert_eq!(
+            fields.get("customer_update[address]").map(String::as_str),
+            Some("auto")
+        );
         assert!(!fields.keys().any(|key| key == "payment_method_types"));
+
+        let untaxed_fields = transfer_setup_checkout_form(
+            "transfer:abc",
+            "cus_beneficiary",
+            "https://app.example.test/success",
+            "https://app.example.test/cancel",
+            false,
+        );
+        assert!(!untaxed_fields.iter().any(
+            |(key, _)| key == "billing_address_collection" || key == "customer_update[address]"
+        ));
     }
 
     #[test]
@@ -16013,6 +16565,7 @@ mod tests {
             "price_standard_monthly",
             "alloc_restore",
             "transfer:abc:source-restoration",
+            false,
         )
         .into_iter()
         .collect::<std::collections::HashMap<_, _>>();
@@ -16053,6 +16606,17 @@ mod tests {
                 .map(String::as_str),
             Some("alloc_restore")
         );
+        let taxed = personal_source_restoration_form(
+            "transfer:abc",
+            "user_123",
+            "cus_original",
+            "pm_saved",
+            "price_standard_monthly",
+            "alloc_restore",
+            "transfer:abc:source-restoration",
+            true,
+        );
+        assert!(taxed.contains(&("automatic_tax[enabled]".into(), "true".into())));
     }
 
     #[test]
@@ -16118,6 +16682,7 @@ mod tests {
             "price_monthly",
             "alloc_transfer",
             1_900_000_000,
+            false,
         );
         let fields = form
             .into_iter()
@@ -16159,6 +16724,22 @@ mod tests {
         assert!(!fields
             .keys()
             .any(|key| key.starts_with("payment_intent_data")));
+        assert!(!fields.contains_key("default_settings[automatic_tax][enabled]"));
+        let taxed = personal_transfer_schedule_form(
+            "transfer:abc",
+            "user-1",
+            "cus_transfer",
+            "pm_saved",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            true,
+        );
+        assert!(taxed.contains(&(
+            "default_settings[automatic_tax][enabled]".into(),
+            "true".into()
+        )));
     }
 
     #[test]
@@ -16203,6 +16784,7 @@ mod tests {
             "price_monthly",
             "alloc_transfer",
             1_900_000_000,
+            false,
         )
         .expect("schedule matches its future obligation");
         assert_eq!(schedule.schedule_id, "sub_sched_transfer");
@@ -16213,6 +16795,54 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(schedule.subscription_id, None);
+
+        let mut taxed_schedule = response.clone();
+        taxed_schedule["default_settings"]["automatic_tax"] = serde_json::json!({"enabled": true});
+        assert!(transfer_schedule_from_object(
+            &taxed_schedule,
+            "transfer:abc",
+            "cus_transfer",
+            "pm_saved",
+            "user-1",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            true,
+        )
+        .is_ok());
+        taxed_schedule["default_settings"]["automatic_tax"]["enabled"] = serde_json::json!(false);
+        taxed_schedule["default_settings"]["automatic_tax"]["disabled_reason"] =
+            serde_json::json!("requires_location_inputs");
+        assert!(transfer_schedule_from_object(
+            &taxed_schedule,
+            "transfer:abc",
+            "cus_transfer",
+            "pm_saved",
+            "user-1",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            true,
+        )
+        .is_ok());
+        taxed_schedule["default_settings"]["automatic_tax"]["enabled"] = serde_json::json!(false);
+        taxed_schedule["default_settings"]["automatic_tax"]["disabled_reason"] =
+            serde_json::json!("tax_not_active");
+        assert!(transfer_schedule_from_object(
+            &taxed_schedule,
+            "transfer:abc",
+            "cus_transfer",
+            "pm_saved",
+            "user-1",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            true,
+        )
+        .is_err());
 
         let mut changed_boundary = response.clone();
         changed_boundary["phases"][0]["start_date"] = serde_json::json!(1_900_000_001);
@@ -16226,6 +16856,7 @@ mod tests {
             "price_monthly",
             "alloc_transfer",
             1_900_000_000,
+            false,
         )
         .is_err());
 
@@ -16242,8 +16873,34 @@ mod tests {
             "price_monthly",
             "alloc_transfer",
             1_900_000_000,
+            false,
         )
         .is_err());
+    }
+
+    #[test]
+    fn sponsored_schedule_update_sets_the_provider_tax_state_on_every_phase() {
+        let mut enabled = Vec::new();
+        append_sponsored_phase_tax_fields(&mut enabled, 2, true);
+        assert_eq!(
+            enabled,
+            [
+                ("phases[0][automatic_tax][enabled]".into(), "true".into()),
+                ("phases[1][automatic_tax][enabled]".into(), "true".into()),
+                ("phases[2][automatic_tax][enabled]".into(), "true".into()),
+            ]
+        );
+
+        let mut disabled = Vec::new();
+        append_sponsored_phase_tax_fields(&mut disabled, 2, false);
+        assert_eq!(
+            disabled,
+            [
+                ("phases[0][automatic_tax][enabled]".into(), "false".into()),
+                ("phases[1][automatic_tax][enabled]".into(), "false".into()),
+                ("phases[2][automatic_tax][enabled]".into(), "false".into()),
+            ]
+        );
     }
 
     #[test]
@@ -16542,6 +17199,7 @@ mod tests {
             "customer": "cus-sponsored",
             "default_payment_method": "pm_saved",
             "status": "active",
+            "automatic_tax": {"enabled": true},
             "cancel_at_period_end": false,
             "cancel_at": null,
             "current_period_start": 1,
@@ -16564,6 +17222,7 @@ mod tests {
             Some("pm_saved")
         );
         assert!(!snapshot.cancel_at_period_end);
+        assert!(snapshot.automatic_tax_enabled);
         assert_eq!(snapshot.cancel_at, None);
 
         let mut scheduled_cancellation = subscription.clone();

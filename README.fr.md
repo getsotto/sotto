@@ -156,7 +156,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -373,6 +373,30 @@ sotto shares revoke <token>  # the token is the part of the link between /s/ and
 
 `sotto shares ls` n'affiche jamais le texte chiffré ni la clé du lien.
 
+Attention au pluriel : `sotto share` crée un lien, et `sotto shares` gère les liens que vous avez
+créés. Les deux dialoguent avec le serveur configuré et nécessitent donc `sotto login` ; le coffre
+local n'a pas besoin d'être déverrouillé. Une liste ressemble à ceci (jeton fictif, valeurs
+d'exemple) :
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Passez la première colonne à `sotto shares revoke`. C'est le jeton public, pas le lien complet :
+pour `https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...`, passez seulement
+`3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` et jamais ce qui suit le `#`. La liste ne lit que des métadonnées. Elle
+n'ouvre aucun lien, ne consomme aucune vue et ne peut pas reconstituer un lien, car la clé située
+après le `#` n'a jamais atteint le serveur.
+
+`sotto shares ls --json` affiche un objet et non un simple tableau : `active_free_count` et `links`,
+où chaque lien contient `token`, `share_class`, `max_views`, `view_count`, `expires_at`,
+`revoked_at` et `created_at`. Le serveur ne renvoie que vos 100 liens les plus récents : ce n'est
+donc pas un historique complet.
+
+La révocation empêche les récupérations futures via le lien. Elle ne peut pas annuler une
+récupération déjà effectuée : si le destinataire a pu révéler le secret, changez-le à la source.
+
 ### Travailler en équipe
 
 Les équipes partagent des environnements au sein d'une organisation. Chaque membre reçoit sa propre
@@ -387,11 +411,29 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prin
 sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
 
-Le membre exécute la commande affichée dans sa propre copie du projet :
+Le membre exécute ensuite la commande affichée. Ce n'est pas la même chose que **Un autre appareil**, qui restaure votre propre compte sur une
+deuxième machine. Le membre utilise son propre compte sur le même serveur : il exécute
+`sotto login` et `sotto unlock`, puis la commande affichée dans un répertoire qui n'a pas encore de
+`sotto.toml` :
 
 ```sh
+mkdir acme-api && cd acme-api
 sotto clone <project-id> <env-id> --org <org-id>
 ```
+
+L'appartenance à l'organisation et l'accès à un environnement sont deux étapes distinctes.
+`sotto org invite` fait de quelqu'un un membre ; `sotto grant <user-id>` lui donne un environnement.
+Si vous n'avez plus l'identifiant utilisateur, `sotto org members <org-id>` l'affiche.
+`sotto clone` n'accorde rien par lui-même : il récupère le grant que le membre possède déjà,
+télécharge cet environnement et écrit `sotto.toml`. Sans grant, il s'arrête avec
+`you have not been granted this environment (ask an admin to share it)`, et un administrateur doit
+exécuter `sotto grant` pour ce membre. Ne donnez jamais votre Emergency Kit à un coéquipier ; il
+déverrouille votre compte, pas le sien.
+
+Gardez `--org` de la commande affichée : il enregistre l'organisation propriétaire pour que les push
+suivants correspondent au serveur. `--as <environment-name>` et `--name <project-label>` ne
+définissent que des libellés locaux : par défaut, l'environnement garde son vrai nom et le projet
+s'appelle `shared`.
 
 Pour voir qui a accès, retirer quelqu'un ou faire tourner vous-même la clé d'un environnement :
 
@@ -634,6 +676,9 @@ Le format JSON est pratique pour les scripts. Sa structure de premier niveau est
 
 L'exemple est synthétique ; `actions` et les dates facultatives proviennent de l'état renvoyé du compte, et les serveurs anciens peuvent renvoyer null pour l'un ou l'autre endpoint. `sotto cloud status` ne fait que signaler l'état et peut afficher une URL de facturation. Il ne lance pas d'achat et ne modifie pas l'éligibilité. Pour diagnostiquer le coffre local et les environnements, utilisez `sotto status` ; cette vue est distincte des informations du serveur et du compte ci-dessus.
 
+Pour transférer la facturation personnelle à une organisation depuis la page de compte Sotto Cloud,
+consultez le [guide du transfert de facturation](CLOUD-BILLING-TRANSFER.md).
+
 ### Thèmes de sortie
 
 La CLI fournit cinq thèmes intégrés : `nord` (par défaut), `sordino`, `terminal`, `monochrome`
@@ -713,6 +758,8 @@ Un envoi maintenant ne récupère pas les anciennes valeurs jamais synchronisée
 illisible, suivez la suggestion de la CLI : lancez `sotto pull` et réessayez ; cette opération ne
 garantit pas que les clés disponibles permettent de déchiffrer la version.
 
+Pour les scripts shell et la CI, consultez la [référence des scripts et des codes de sortie de la CLI](CLI-SCRIPTING.md).
+
 ### Variables d'environnement
 
 La CLI lit ces variables :
@@ -746,6 +793,27 @@ Faites pointer la CLI vers votre serveur une fois ; les commandes suivantes le r
 ```sh
 sotto login --server https://sotto.example.com
 ```
+
+Sur une nouvelle configuration de la CLI, le lien web produit par
+`sotto share` utilise aussi l'URL du serveur. Si l'API et l'application web
+ont des origines différentes, `--server` désigne toujours le serveur de
+synchronisation/API et `--web` fixe l'URL de base de l'application web pour
+les liens de partage :
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+La CLI enregistre l'URL web séparément. Une connexion ultérieure avec seulement
+`--server` conserve l'ancien réglage `--web`, même si vous changez de serveur.
+Pour revenir aux liens sur la même origine, définissez explicitement les deux URL :
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+L'option `--web` ne redirige pas les requêtes API et ne configure pas les
+cookies, CORS, OAuth, CSP ni la compilation de l'application web côté serveur.
 
 ## Architecture
 
