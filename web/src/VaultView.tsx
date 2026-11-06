@@ -697,7 +697,15 @@ export function VaultView({
       )}
 
       {revealed !== null && (
-        <section>
+        <section
+          onKeyDown={(event) => {
+            if (event.key !== "Escape") {
+              return;
+            }
+            event.preventDefault();
+            hideRevealed();
+          }}
+        >
           <h2 id="vault-secret-heading">{revealed.name}</h2>
           <textarea
             aria-labelledby="vault-secret-heading"
@@ -714,6 +722,7 @@ export function VaultView({
           <button className="ghost" onClick={hideRevealed}>
             Hide secret
           </button>
+          <p className="muted">Press Escape to hide this secret.</p>
           {revealed.link === null ? (
             <button
               className="ghost"
