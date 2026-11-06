@@ -532,9 +532,9 @@ Use `sotto --help` to request help explicitly.
 
 Use the arrow keys or `j` and `k` to navigate. Press `/` to search, `?` for help, and Tab to switch
 environments. This switch lasts only for the dashboard session; `sotto env use` changes the
-project's default. Press `r` to reveal or conceal the selected value, `c` to copy it to the
-clipboard, and `q` to quit. `Esc` closes the current search or dialog; from the main view, it
-clears an active search or quits.
+project's default. Press `r` to reveal or conceal the selected value, `R` to reload the current
+environment's local secrets, `c` to copy it to the clipboard, and `q` to quit. `Esc` closes the
+current search or dialog; from the main view, it clears an active search or quits.
 
 Press `t` to browse themes with a live preview. Use the arrow keys to preview each theme, then
 press `Enter` to save your choice or `Esc` to cancel. The [theme precedence rules](#output-themes)

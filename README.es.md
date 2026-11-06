@@ -545,8 +545,9 @@ ayuda expresamente.
 Usa las flechas o `j` y `k` para desplazarte. Pulsa `/` para buscar, `?` para abrir la ayuda y Tab
 para cambiar de entorno. Este cambio solo dura mientras el panel está abierto; `sotto env use`
 cambia el entorno predeterminado del proyecto. Pulsa `r` para mostrar u ocultar el valor
-seleccionado, `c` para copiarlo al portapapeles y `q` para salir. `Esc` cierra la búsqueda o el
-diálogo actual; en la vista principal, borra una búsqueda activa o sale.
+seleccionado, `R` para recargar los secretos locales del entorno actual, `c` para copiarlo al
+portapapeles y `q` para salir. `Esc` cierra la búsqueda o el diálogo actual; en la vista principal,
+borra una búsqueda activa o sale.
 
 Pulsa `t` para recorrer los temas con vista previa en directo. Usa las flechas para ver cada tema
 y pulsa `Enter` para guardar tu elección o `Esc` para cancelar. Las
