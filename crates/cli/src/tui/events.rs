@@ -182,6 +182,9 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
         KeyCode::Tab => {
             app.cycle_environment()?;
         }
+        KeyCode::BackTab => {
+            app.cycle_environment_back()?;
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             app.move_selection_up();
         }
@@ -1030,5 +1033,83 @@ mod tests {
         assert!(tui_app.show_history_modal);
         handle_key_event(&mut tui_app, key(KeyCode::Esc)).unwrap();
         assert!(!tui_app.show_history_modal);
+    }
+
+    fn shift_tab() -> KeyEvent {
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+    }
+
+    #[test]
+    fn tab_and_shift_tab_step_environments_in_both_directions() {
+        with_search_app(|app| {
+            assert_eq!(app.config.environment, "dev");
+
+            handle_key_event(app, key(KeyCode::Tab)).unwrap();
+            assert_eq!(app.config.environment, "prod");
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(app.config.environment, "dev");
+
+            // Backwards wraps from the first environment to the last.
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(app.config.environment, "staging");
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(app.config.environment, "prod");
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(app.config.environment, "dev");
+        });
+    }
+
+    #[test]
+    fn shift_tab_with_one_environment_keeps_it_selected() {
+        with_search_app(|app| {
+            app.environments = vec!["dev".into()];
+            app.active_env_index = 0;
+
+            handle_key_event(app, shift_tab()).unwrap();
+
+            assert_eq!(app.config.environment, "dev");
+            let notice = app.status_message.as_ref().unwrap();
+            assert_eq!(notice.kind, crate::tui::app::StatusKind::Information);
+        });
+    }
+
+    #[test]
+    fn shift_tab_in_secret_modal_moves_field_not_environment() {
+        with_search_app(|app| {
+            handle_key_event(app, key(KeyCode::Char('n'))).unwrap();
+            assert!(app.show_secret_modal);
+            assert_eq!(
+                app.secret_modal_field,
+                crate::tui::app::SecretModalField::Name
+            );
+
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(
+                app.secret_modal_field,
+                crate::tui::app::SecretModalField::Value
+            );
+            assert_eq!(app.config.environment, "dev");
+            assert_eq!(app.active_env_index, 0);
+
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(
+                app.secret_modal_field,
+                crate::tui::app::SecretModalField::Name
+            );
+            assert_eq!(app.config.environment, "dev");
+        });
+    }
+
+    #[test]
+    fn shift_tab_in_search_mode_is_ignored() {
+        with_search_app(|app| {
+            search_for(app, "api");
+
+            handle_key_event(app, shift_tab()).unwrap();
+
+            assert!(app.search_mode);
+            assert_eq!(app.search_query, "api");
+            assert_eq!(app.config.environment, "dev");
+        });
     }
 }
