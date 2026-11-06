@@ -1,6 +1,7 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { App } from "../App";
 
@@ -15,11 +16,60 @@ vi.mock("../RecipientPage", () => ({
 
 // Vitest globals are off, so Testing Library's automatic cleanup never registers: without this the
 // DOM of one test leaks into the next and role queries match more than one element.
-afterEach(cleanup);
+const originalTitle = document.title;
+afterEach(() => {
+  cleanup();
+  document.title = originalTitle;
+  visit("/");
+});
 
 function visit(path: string) {
   window.history.replaceState(null, "", path);
 }
+
+describe("App document titles", () => {
+  const landingTitle = "Sotto: end-to-end encrypted secret sync";
+  beforeEach(() => {
+    document.title = landingTitle;
+  });
+
+  it.each([
+    ["/app", "Vault | Sotto"],
+    ["/app/", "Vault | Sotto"],
+    ["/cloud", "Cloud account | Sotto"],
+    ["/cloud/", "Cloud account | Sotto"],
+  ])("sets a static title for %s", (path, title) => {
+    visit(path);
+    const { unmount } = render(<StrictMode><App /></StrictMode>);
+
+    expect(document.title).toBe(title);
+    unmount();
+    expect(document.title).toBe(landingTitle);
+  });
+
+  it("updates the title when switching application surfaces and restores the landing title", () => {
+    visit("/cloud");
+    const { rerender } = render(<App />);
+    expect(document.title).toBe("Cloud account | Sotto");
+
+    visit("/app");
+    rerender(<App />);
+    expect(document.title).toBe("Vault | Sotto");
+
+    visit("/");
+    rerender(<App />);
+    expect(document.title).toBe(landingTitle);
+  });
+
+  it.each(["/", "/share-env-files"])("leaves the existing title alone on %s", (path) => {
+    visit(path);
+    const title = path === "/" ? landingTitle : "A prerendered guide | Sotto";
+    document.title = title;
+    render(<App />);
+    expect(screen.getByText(path === "/" ? "landing" : "guide")).toBeInTheDocument();
+    expect(document.title).toBe(title);
+  });
+});
 
 describe("App share-link routing", () => {
   it("routes the account surface separately from the vault", () => {
