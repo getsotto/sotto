@@ -155,7 +155,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -173,7 +173,7 @@ para ejemplos de matrices, Windows y flujos reutilizables.
 
 ¿Quieres una demo funcional? [**sotto-example**](https://github.com/getsotto/sotto-example)
 muestra la inyección local de secretos con un GIF de Python y pasos copiables, además de pequeños ejemplos
-en JavaScript, TypeScript, Java, C#, PHP, Go y C++. No necesitas cuenta; las instrucciones cubren
+en JavaScript, TypeScript, Java, C#, PHP, Go, Rust y C++. No necesitas cuenta; las instrucciones cubren
 macOS, Linux y Windows.
 
 ```sh
@@ -293,6 +293,36 @@ Para recuperar un valor anterior, consulta [Restaurar una versión anterior de u
 Ese historial procede del servidor, así que solo sirve para valores que ya habías subido. Ejecuta
 `sotto import --help` para ver las reglas de comillas y de valores literales en lugar de repetirlas aquí.
 
+### Eliminar un secreto
+
+Para eliminar un secreto obsoleto de `staging` sin cambiar el entorno predeterminado:
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` elimina el secreto del entorno seleccionado en el almacén local.
+`sotto push` sincroniza la eliminación con el servidor después de `sotto login`;
+ejecuta `sotto pull` para ese mismo entorno en otro dispositivo para recibir el cambio.
+Ejecuta el último comando en el otro dispositivo, no en el que eliminó el secreto.
+
+En un terminal interactivo, `sotto rm` sin nombre abre el selector de secretos.
+Después se solicita confirmación, con No como opción predeterminada; cancelar o
+rechazar deja el secreto intacto. `--yes` (o `-y`) omite la confirmación, pero
+no evita el selector si falta el nombre ni una solicitud de desbloqueo necesaria.
+
+Las solicitudes interactivas requieren que stdin, stdout y stderr sean terminales,
+que `TERM` no sea «dumb» y que `CI` no esté activo. En un entorno no interactivo
+se debe indicar el nombre; la eliminación con nombre no pide confirmación aunque
+no se incluya `--yes`.
+
+Los secretos eliminados desaparecen de las lecturas y listas habituales, pero
+se conserva su historial de versiones. No es un borrado seguro ni revoca la
+credencial en su proveedor externo. Para recuperarla, usa `sotto history`
+y `sotto rollback`.
+
 ### Compartir un secreto
 
 `sotto share` cifra un secreto en un enlace de un solo uso. La clave va después del `#` del enlace,
@@ -337,6 +367,28 @@ sotto shares revoke <token>  # the token is the part of the link between /s/ and
 
 `sotto shares ls` nunca muestra el texto cifrado ni la clave del enlace.
 
+Fíjate en el plural: `sotto share` crea un enlace y `sotto shares` gestiona los enlaces que has
+creado. Ambos hablan con el servidor configurado, así que necesitan `sotto login`; no hace falta
+desbloquear el almacén local. Un listado tiene este aspecto (token sintético, valores de ejemplo):
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Pasa la primera columna a `sotto shares revoke`. Es el token público, no el enlace completo: para
+`https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...`, pasa solo `3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` y nunca nada de
+lo que va después de `#`. El listado solo lee metadatos. No abre ningún enlace ni gasta una vista, y
+no puede reconstruir un enlace, porque la clave que va después de `#` nunca llegó al servidor.
+
+`sotto shares ls --json` imprime un objeto y no un array: `active_free_count` y `links`, donde cada
+enlace tiene `token`, `share_class`, `max_views`, `view_count`, `expires_at`, `revoked_at` y
+`created_at`. El servidor devuelve solo tus 100 enlaces más recientes, así que no es un historial
+completo.
+
+Revocar impide futuras recuperaciones a través del enlace. No puede deshacer una recuperación que
+ya ocurrió, así que si el destinatario pudo haber revelado el secreto, cámbialo en su origen.
+
 ### Trabajo en equipo
 
 Los equipos comparten entornos mediante una organización. Cada miembro recibe su propia copia
@@ -351,11 +403,27 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prin
 sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
 
-El miembro ejecuta el comando impreso en su propia copia del proyecto:
+Después, el miembro ejecuta el comando impreso. Esto no es lo mismo que **Otro dispositivo**, que restaura tu propia cuenta en una segunda máquina.
+El miembro usa su propia cuenta en el mismo servidor: ejecuta `sotto login` y `sotto unlock` y
+después el comando impreso en un directorio que todavía no tiene `sotto.toml`:
 
 ```sh
+mkdir acme-api && cd acme-api
 sotto clone <project-id> <env-id> --org <org-id>
 ```
+
+Ser miembro de la organización y tener acceso a un entorno son pasos distintos. `sotto org invite`
+convierte a alguien en miembro; `sotto grant <user-id>` le da un entorno. Si ya no tienes el ID de
+usuario, `sotto org members <org-id>` lo muestra. `sotto clone` no concede nada por sí solo: obtiene
+el grant que el miembro ya tiene, descarga ese entorno y escribe `sotto.toml`. Sin grant se detiene
+con `you have not been granted this environment (ask an admin to share it)`, y un administrador
+tiene que ejecutar `sotto grant` para esa persona. No entregues nunca tu Emergency Kit a un
+compañero; desbloquea tu cuenta, no la suya.
+
+Conserva `--org` del comando impreso, porque guarda la organización propietaria para que los push
+posteriores coincidan con el servidor. `--as <environment-name>` y `--name <project-label>` solo
+fijan etiquetas locales: por defecto el entorno conserva su nombre real y el proyecto se llama
+`shared`.
 
 Para ver quién tiene acceso, eliminar a alguien o rotar tú mismo la clave de un entorno:
 
@@ -595,6 +663,9 @@ El formato JSON es útil para scripts. Su estructura de nivel superior es:
 
 El ejemplo es sintético; `actions` y las fechas opcionales proceden del estado devuelto de la cuenta, y los servidores antiguos pueden devolver null para cualquiera de los dos endpoints. `sotto cloud status` solo informa del estado y puede mostrar una URL de facturación. No inicia una compra ni cambia la elegibilidad. Para diagnosticar el almacén local y los entornos, usa `sotto status`; esa vista es independiente de la información del servidor y de la cuenta anterior.
 
+Para trasladar la facturación personal a una organización desde la página de cuenta de Sotto Cloud,
+consulta la [guía de traslado de facturación](CLOUD-BILLING-TRANSFER.md).
+
 ### Temas de salida
 
 La CLI incluye cinco temas integrados: `nord` (el predeterminado), `sordino`, `terminal`,
@@ -674,6 +745,8 @@ Un envío ahora no recupera valores antiguos que nunca se sincronizaron. Para un
 ilegible, sigue la sugerencia de la CLI: ejecuta `sotto pull` e inténtalo de nuevo;
 esto no garantiza que las claves disponibles permitan descifrar esa versión.
 
+Para scripts de shell y CI, consulta la [referencia de scripting y códigos de salida de la CLI](CLI-SCRIPTING.md).
+
 ### Variables de entorno
 
 La CLI lee estas variables:
@@ -707,6 +780,26 @@ Apunta la CLI a tu servidor una vez; los comandos posteriores lo reutilizan:
 ```sh
 sotto login --server https://sotto.example.com
 ```
+
+En una configuración nueva de la CLI, el enlace web de `sotto share` también usa
+la URL de ese servidor. Si la API y la aplicación web tienen orígenes distintos,
+`--server` sigue seleccionando el servidor de sincronización/API y `--web`
+establece la URL base de la aplicación web para los enlaces compartidos:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+La CLI guarda la URL web por separado. Iniciar sesión después solo con
+`--server` conserva el ajuste anterior de `--web`, incluso al cambiar de
+servidor. Para volver a los enlaces del mismo origen, configura ambas URL:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+La opción `--web` no redirige las peticiones de la API ni configura cookies,
+CORS, OAuth, CSP o la compilación de la aplicación web en el servidor.
 
 ## Arquitectura
 

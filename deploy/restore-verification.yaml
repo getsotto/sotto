@@ -84,36 +84,47 @@ steps:
         # The whole destination is used, prefix included, because backup.sh writes to
         # "$$SOTTO_BACKUP_BUCKET/sotto-<stamp>.dump" and a configured prefix is part of that.
         #
-        # `ls --long` ends with a "TOTAL:" summary line, so match on the object URL rather than
-        # taking the last line, which would otherwise pick the summary and pass it to `cp`.
-        # Tolerate the listing failing so the message below is the one that gets read. `ls`
-        # exits non-zero when nothing matches, and under pipefail that would end the step with
-        # "One or more URLs matched no objects" instead of saying there are no backups, which
-        # is the single most alarming thing this drill can discover.
-        newest="$$(gcloud storage ls --long "$${bucket}/sotto-*.dump" 2>/dev/null \
-          | awk '$$NF ~ /^gs:\/\// {print $$2, $$NF}' | sort | tail -1 | awk '{print $$2}' || true)"
+        # List successfully before interpreting a missing sidecar. Suppressing the error from a
+        # prefix lookup would turn a permission denial into "no sidecar" and could let a
+        # pre-retention dump bypass a journal that exists but was unreadable. This is names and
+        # timestamps only; no object is read to select the newest pair.
+        gcloud storage ls --long "$${bucket}/" > /workspace/object-list
+        # `ls --long` ends with a "TOTAL:" summary line, so match object URLs rather than taking
+        # the last line. Backup names have a fixed UTC timestamp, which sorts chronologically as
+        # text.
+        newest="$$(
+          awk '$$NF ~ /\/sotto-[0-9]+T[0-9]+Z\.dump$$/ {print $$2, $$NF}' /workspace/object-list \
+            | sort | tail -1 | awk '{print $$2}'
+        )"
         if [ -z "$$newest" ]; then
           echo "the backup bucket holds no dumps, so there is nothing to restore" >&2
           exit 1
         fi
-        newest_journal="$$(gcloud storage ls --long "$${bucket}/sotto-*.tombstones.jsonl" 2>/dev/null \
-          | awk '$$NF ~ /^gs:\/\// {print $$2, $$NF}' | sort | tail -1 | awk '{print $$2}' || true)"
-        if [ -z "$$newest_journal" ]; then
-          echo "the backup bucket holds no retention journal sidecars; refusing an unprotected restore" >&2
-          exit 1
-        fi
+        newest_journal="$$(
+          awk '$$NF ~ /\/sotto-[0-9]+T[0-9]+Z\.tombstones\.jsonl$$/ {print $$2, $$NF}' /workspace/object-list \
+            | sort | tail -1 | awk '{print $$2}'
+        )"
         dump_stamp="$$(basename "$$newest" .dump | sed 's/^sotto-//')"
-        journal_stamp="$$(basename "$$newest_journal" .tombstones.jsonl | sed 's/^sotto-//')"
-        if [[ "$$journal_stamp" < "$$dump_stamp" ]]; then
-          echo "the newest retention journal predates the dump; refusing an unprotected restore" >&2
-          exit 1
+        if [ -n "$$newest_journal" ]; then
+          journal_stamp="$$(basename "$$newest_journal" .tombstones.jsonl | sed 's/^sotto-//')"
+          if [[ "$$journal_stamp" < "$$dump_stamp" ]]; then
+            newest_journal=""
+          fi
+        fi
+        if [ -n "$$newest_journal" ]; then
+          gcloud storage cp "$$newest_journal" /workspace/tombstones.jsonl
+          echo "journal=present" > /workspace/journal-status
+        else
+          # A backup predating migration 50 cannot have recorded retention deletions. The
+          # restore step verifies that schema boundary before allowing an empty journal; a
+          # newer backup without a current sidecar still fails closed.
+          echo "journal=missing" > /workspace/journal-status
         fi
         gcloud storage cp "$$newest" /workspace/backup.dump
-        gcloud storage cp "$$newest_journal" /workspace/tombstones.jsonl
         # Name and size only. Both are already recorded in deploy/rehearsals, and neither says
         # anything about what is inside.
         echo "restoring $${newest} ($$(wc -c < /workspace/backup.dump) bytes)"
-        printf '%s\n%s' "$$newest" "$$newest_journal" > /workspace/object-name
+        printf '%s\n%s' "$$newest" "$${newest_journal:-pre-retention-no-sidecar}" > /workspace/object-name
 
   - id: restore
     name: postgres:16
@@ -158,6 +169,18 @@ steps:
         set -euo pipefail
         apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client
         scripts/check-restore --database-url "postgres://sotto@postgres:5432/restored"
+        if [ "$$(cat /workspace/journal-status)" = "journal=missing" ]; then
+          latest_migration="$$(psql -h postgres -U sotto -d restored -At -v ON_ERROR_STOP=1 \
+            -c 'SELECT COALESCE(max(version::integer), 0) FROM _sqlx_migrations')"
+          journal_table="$$(psql -h postgres -U sotto -d restored -At -v ON_ERROR_STOP=1 \
+            -c "SELECT to_regclass('public.cloud_retention_tombstone_journal') IS NOT NULL")"
+          if [ "$$latest_migration" -ge 50 ] || [ "$$journal_table" = "t" ]; then
+            echo "the restored schema can contain retention deletions but no current journal was found" >&2
+            exit 1
+          fi
+          : > /workspace/tombstones.jsonl
+          echo "retention replay: empty journal is valid for pre-migration-50 backup"
+        fi
         scripts/replay-retention-journal \
           --database-url "postgres://sotto@postgres:5432/restored" \
           --journal /workspace/tombstones.jsonl

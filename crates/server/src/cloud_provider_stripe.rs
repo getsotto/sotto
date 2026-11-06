@@ -307,6 +307,7 @@ pub(crate) struct StripePersonalInvoiceFacts {
     pub(crate) amount_due: i64,
     pub(crate) amount_overpaid: i64,
     pub(crate) amount_paid_off_stripe: i64,
+    pub(crate) starting_balance: i64,
     pub(crate) period_start: i64,
     pub(crate) period_end: i64,
     pub(crate) settlement: StripePaymentSettlement,
@@ -335,6 +336,7 @@ pub(crate) fn validate_personal_invoice_observation(
         || facts.amount_paid != facts.amount_due
         || facts.amount_overpaid > 0
         || facts.amount_paid_off_stripe > 0
+        || facts.starting_balance != 0
     {
         return Err(StripeContractError::UnsupportedSettlement(
             "payment must settle the full positive invoice amount",
@@ -660,19 +662,42 @@ fn decode_paid_invoice_event(
     let amount_paid = required_i64(invoice, "amount_paid")?;
     let amount_due = required_i64(invoice, "amount_due")?;
     let amount_overpaid = required_i64(invoice, "amount_overpaid")?;
+    let verified_observation_matches = verified_observation.filter(|observation| {
+        observation.invoice_id == invoice_id
+            && observation.customer_id == customer_id
+            && observation.subscription_id == binding.subscription_id
+            && observation.provider_item_id == binding.provider_item_id
+            && observation.allocation_reference == binding.allocation_reference
+    });
+    let starting_balance = match invoice.get("starting_balance") {
+        None | Some(Value::Null) => verified_observation_matches
+            .map(|_| 0)
+            .ok_or(StripeContractError::MissingField("starting_balance"))?,
+        Some(value) => value
+            .as_i64()
+            .ok_or(StripeContractError::InvalidField("starting_balance"))?,
+    };
+    // Stripe marks this includable on invoice detail reads, but does not include it in webhook
+    // snapshots by default. A matching authenticated detail observation is required when the
+    // signed event omits it.
     let amount_paid_off_stripe = match invoice.get("amount_paid_off_stripe") {
         Some(value) if !value.is_null() => required_i64(invoice, "amount_paid_off_stripe")?,
-        _ => verified_observation
-            .filter(|observation| {
-                observation.invoice_id == invoice_id
-                    && observation.customer_id == customer_id
-                    && observation.subscription_id == binding.subscription_id
-                    && observation.provider_item_id == binding.provider_item_id
-                    && observation.allocation_reference == binding.allocation_reference
-            })
+        _ => verified_observation_matches
             .map(StripePersonalInvoiceObservation::amount_paid_off_stripe)
             .ok_or(StripeContractError::MissingField("amount_paid_off_stripe"))?,
     };
+    if verified_observation_matches
+        .is_some_and(|observation| observation.amount_paid_off_stripe() != amount_paid_off_stripe)
+    {
+        return Err(StripeContractError::UnsupportedSettlement(
+            "invoice settlement changed between event and detail read",
+        ));
+    }
+    if starting_balance != 0 {
+        return Err(StripeContractError::UnsupportedSettlement(
+            "invoice uses customer balance",
+        ));
+    }
 
     let lines = invoice
         .get("lines")
@@ -769,6 +794,7 @@ fn decode_paid_invoice_event(
             amount_due,
             amount_overpaid,
             amount_paid_off_stripe,
+            starting_balance,
             period_start,
             period_end,
             settlement: settlement.clone(),
@@ -1025,12 +1051,15 @@ mod tests {
     }
 
     #[test]
-    fn nullable_off_stripe_amount_requires_a_matching_verified_invoice_read() {
+    fn webhook_requires_expanded_off_stripe_evidence_from_matching_detail_read() {
         let mut event: Value = serde_json::from_str(include_str!(
             "../tests/fixtures/stripe/invoice_paid_personal.json"
         ))
         .unwrap();
-        event["data"]["object"]["amount_paid_off_stripe"] = Value::Null;
+        event["data"]["object"]
+            .as_object_mut()
+            .unwrap()
+            .remove("amount_paid_off_stripe");
         let payload = serde_json::to_vec(&event).unwrap();
         let signature = sign(&payload);
         let config = test_config();
@@ -1104,6 +1133,44 @@ mod tests {
                 &observation,
             ),
             Err(StripeContractError::UnsupportedSettlement(_))
+        ));
+        event["data"]["object"]
+            .as_object_mut()
+            .unwrap()
+            .remove("amount_paid_off_stripe");
+
+        event["data"]["object"]["starting_balance"] = json!(1);
+        let payload = serde_json::to_vec(&event).unwrap();
+        let signature = sign(&payload);
+        assert!(matches!(
+            decode_paid_invoice_with_observation(
+                &payload,
+                &signature,
+                SECRET,
+                NOW,
+                &config,
+                &binding,
+                &settlement,
+                &observation,
+            ),
+            Err(StripeContractError::UnsupportedSettlement(_))
+        ));
+
+        event["data"]["object"]["starting_balance"] = json!("0");
+        let payload = serde_json::to_vec(&event).unwrap();
+        let signature = sign(&payload);
+        assert!(matches!(
+            decode_paid_invoice_with_observation(
+                &payload,
+                &signature,
+                SECRET,
+                NOW,
+                &config,
+                &binding,
+                &settlement,
+                &observation,
+            ),
+            Err(StripeContractError::InvalidField(_))
         ));
     }
 }
