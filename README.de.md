@@ -622,8 +622,7 @@ oder gilt `TERM=dumb`,
 schreibt ein Aufruf ohne Unterbefehl die Hilfe auf die Standardfehlerausgabe und endet mit Code 2.
 Mit `sotto --help` rufst du die Hilfe ausdrücklich auf.
 
-Navigiere mit den Pfeiltasten oder `j` und `k`. Drücke `/` zum Suchen, `?` für die Hilfe und Tab
-zum Wechseln der Umgebung. Der Wechsel gilt nur für die Dashboard-Sitzung; `sotto env use` ändert
+Navigiere mit den Pfeiltasten oder `j` und `k`. Drücke `/` zum Suchen, `?` für die Hilfe, Tab zum Wechsel zur nächsten Umgebung und Shift+Tab zum Wechsel zur vorherigen. Der Wechsel gilt nur für die Dashboard-Sitzung; `sotto env use` ändert
 die Standardumgebung des Projekts. Mit `r` zeigst du den ausgewählten Wert an oder verbirgst ihn,
 mit `c` kopierst du ihn in die Zwischenablage und mit `q` beendest du das Dashboard. `Esc`
 schließt die aktuelle Suche oder ein Dialogfenster; in der Hauptansicht löscht es eine aktive

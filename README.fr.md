@@ -627,7 +627,7 @@ doivent toutes être reliées à des terminaux. Si l'une manque, si la CI est ac
 avec le code 2. Utilisez `sotto --help` pour demander l'aide explicitement.
 
 Utilisez les flèches ou `j` et `k` pour naviguer. Appuyez sur `/` pour rechercher, `?` pour afficher
-l'aide et Tab pour changer d'environnement. Ce changement ne dure que pendant la session du
+l'aide, Tab pour passer à l'environnement suivant et Shift+Tab pour revenir au précédent. Ce changement ne dure que pendant la session du
 tableau de bord ; `sotto env use` modifie l'environnement par défaut du projet. Appuyez sur `r`
 pour afficher ou masquer la valeur sélectionnée, `c` pour la copier dans le presse-papiers et `q`
 pour quitter. `Esc` ferme la recherche ou la boîte de dialogue en cours ; dans la vue principale,
