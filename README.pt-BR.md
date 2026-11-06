@@ -77,6 +77,8 @@ lista os comandos que a sua versão suporta.
 Consulte [COMPATIBILITY.md](COMPATIBILITY.md) para ver os requisitos de versão das integrações,
 as plataformas declaradas e as evidências de teste disponíveis atualmente.
 
+Para escolher uma versão ou pasta de instalação, consulte as [opções e exemplos do instalador (em inglês)](INSTALLING.md).
+
 ### Homebrew (prévia)
 
 O [tap do Sotto](https://github.com/getsotto/homebrew-tap) oferece outra forma
