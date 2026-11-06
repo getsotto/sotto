@@ -538,8 +538,7 @@ terminais. Se faltar algum, a CI estiver ativa ou `TERM=dumb`, a execução sem 
 a ajuda na saída de erro padrão e termina com código 2. Use `sotto --help` para pedir a ajuda
 explicitamente.
 
-Use as setas ou `j` e `k` para navegar. Pressione `/` para buscar, `?` para ver a ajuda e Tab para
-trocar de ambiente. A troca vale apenas durante a sessão do painel; `sotto env use` altera o
+Use as setas ou `j` e `k` para navegar. Pressione `/` para buscar, `?` para ver a ajuda, Tab para ir ao próximo ambiente e Shift+Tab para voltar ao anterior. A troca vale apenas durante a sessão do painel; `sotto env use` altera o
 ambiente padrão do projeto. Pressione `r` para mostrar ou ocultar o valor selecionado, `c` para
 copiá-lo para a área de transferência e `q` para sair. `Esc` fecha a busca ou a caixa de diálogo
 atual; na tela principal, limpa uma busca ativa ou sai.
