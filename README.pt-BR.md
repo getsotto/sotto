@@ -544,6 +544,8 @@ ambiente padrão do projeto. Pressione `r` para mostrar ou ocultar o valor selec
 copiá-lo para a área de transferência e `q` para sair. `Esc` fecha a busca ou a caixa de diálogo
 atual; na tela principal, limpa uma busca ativa ou sai.
 
+Pressione `h` para [ver e restaurar o histórico local de um segredo](LOCAL-HISTORY.md) (guia em inglês).
+
 Pressione `t` para percorrer os temas com visualização ao vivo. Use as setas para ver cada tema
 e pressione `Enter` para salvar sua escolha ou `Esc` para cancelar. As
 [regras de precedência dos temas](#temas-de-saída) explicam como as opções do comando e as

@@ -548,6 +548,8 @@ cambia el entorno predeterminado del proyecto. Pulsa `r` para mostrar u ocultar 
 seleccionado, `c` para copiarlo al portapapeles y `q` para salir. `Esc` cierra la búsqueda o el
 diálogo actual; en la vista principal, borra una búsqueda activa o sale.
 
+Pulsa `h` para [ver y restaurar el historial local de un secreto](LOCAL-HISTORY.md) (guía en inglés).
+
 Pulsa `t` para recorrer los temas con vista previa en directo. Usa las flechas para ver cada tema
 y pulsa `Enter` para guardar tu elección o `Esc` para cancelar. Las
 [reglas de precedencia de los temas](#temas-de-salida) explican cómo los ajustes del comando y del
