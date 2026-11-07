@@ -154,7 +154,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -206,6 +206,28 @@ Server weiter. In jedem Fall speichert der Server nur Chiffrat: Der Web-Tresor u
 demselben Server entschlüsselt in deinem Browser, mit Schlüsseln, die deine Geräte nie verlassen.
 
 Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
+
+Wenn sich der Browser nicht öffnet oder die Anmeldung abläuft, siehe [Anmeldeprobleme beheben](#anmeldeprobleme-beheben).
+
+### Anmeldeprobleme beheben
+
+`sotto login` startet auf einem freien Port einen kurzlebigen Listener auf `127.0.0.1` (der
+Loopback-Adresse), öffnet deinen Browser zur Anmeldung und wartet, bis der Browser zu diesem Listener
+zurückkehrt.
+
+- **Der Browser öffnet sich nicht.** Öffne die URL, die dieser `sotto login`-Lauf nach
+  „If it doesn't open, visit:“ ausgegeben hat, in einem Browser auf demselben Rechner. Lass den
+  Befehl weiterlaufen, denn er wartet auf den Abschluss der Anmeldung.
+- **Nutze denselben Rechner.** Der Browser muss den Listener auf der Loopback-Adresse erreichen
+  können. Die URL auf einem anderen Rechner oder auf einem Smartphone zu öffnen, schließt den normalen
+  Ablauf nicht ab. Eine entfernte SSH- oder Container-Sitzung funktioniert nicht zwingend wie ein
+  lokaler Desktop; melde dich daher nach Möglichkeit von einem lokalen Terminal aus an.
+- **Das Warten läuft ab.** Der Befehl wartet fünf Minuten auf die Rückkehr des Browsers. Danach führe
+  `sotto login` erneut aus und verwende die neu ausgegebene URL. Jeder Versuch startet einen neuen
+  Listener mit neuem Zustand, sodass eine alte URL oder ein alter Callback-Link nicht funktioniert.
+
+Mache den Loopback-Listener nicht öffentlich zugänglich. Um dich an deinem eigenen Server anzumelden,
+gib dasselbe `--server <url>` wie zuvor an; siehe [Selbst hosten](#selbst-hosten).
 
 ## Agent-Workflows
 
@@ -369,6 +391,31 @@ sotto shares revoke <token>  # the token is the part of the link between /s/ and
 
 `sotto shares ls` zeigt nie das Chiffrat oder den Schlüssel im Link.
 
+Achte auf den Plural: `sotto share` erstellt einen Link, `sotto shares` verwaltet die Links, die du
+erstellt hast. Beide sprechen mit dem konfigurierten Server und brauchen daher `sotto login`; der
+lokale Tresor muss nicht entsperrt sein. Eine Auflistung sieht so aus (synthetisches Token,
+Beispielwerte):
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Übergib die erste Spalte an `sotto shares revoke`. Das ist das öffentliche Token, nicht der ganze
+Link: Bei `https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...` übergibst du nur
+`3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` und nie etwas nach dem `#`. Die Auflistung liest nur Metadaten. Sie öffnet
+keinen Link, verbraucht keinen Aufruf und kann dir keinen Link wiederherstellen, weil der Schlüssel
+nach dem `#` den Server nie erreicht hat.
+
+`sotto shares ls --json` gibt ein Objekt statt eines reinen Arrays aus: `active_free_count` und
+`links`, wobei jeder Link `token`, `share_class`, `max_views`, `view_count`, `expires_at`,
+`revoked_at` und `created_at` enthält. Der Server liefert nur deine 100 neuesten Links, das ist also
+keine vollständige Historie.
+
+Widerrufen verhindert künftige Abrufe über den Link. Ein bereits erfolgter Abruf lässt sich nicht
+rückgängig machen: Wenn der Empfänger das Secret schon angezeigt haben könnte, ändere es an der
+Quelle.
+
 ### Im Team arbeiten
 
 Teams teilen Umgebungen über eine Organisation. Jedes Mitglied erhält eine eigene versiegelte Kopie
@@ -383,11 +430,29 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prin
 sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
 
-Das Mitglied führt den ausgegebenen Befehl in seiner eigenen Arbeitskopie aus:
+Danach führt das Mitglied den ausgegebenen Befehl aus. Das ist etwas anderes als **Ein weiteres Gerät**, wo du dein eigenes Konto auf einem zweiten Rechner
+wiederherstellst. Das Mitglied nutzt sein eigenes Konto auf demselben Server: Es führt `sotto login`
+und `sotto unlock` aus und dann den ausgegebenen Befehl in einem Verzeichnis, das noch keine
+`sotto.toml` enthält:
 
 ```sh
+mkdir acme-api && cd acme-api
 sotto clone <project-id> <env-id> --org <org-id>
 ```
+
+Mitgliedschaft in der Organisation und Zugriff auf eine Umgebung sind getrennte Schritte.
+`sotto org invite` macht jemanden zum Mitglied, `sotto grant <user-id>` gibt ihm eine Umgebung. Wenn
+du die Benutzer-ID nicht mehr hast, zeigt sie `sotto org members <org-id>` an. `sotto clone` gewährt
+selbst keinen Zugriff: Es holt den vorhandenen Grant des Mitglieds, lädt diese Umgebung und schreibt
+`sotto.toml`. Ohne Grant bricht es mit
+`you have not been granted this environment (ask an admin to share it)` ab, und ein Admin muss für
+das Mitglied `sotto grant` ausführen. Gib dein Emergency Kit nie an Teammitglieder weiter; es
+entsperrt dein Konto, nicht ihres.
+
+Behalte `--org` aus dem ausgegebenen Befehl bei, denn es speichert die besitzende Organisation, damit
+spätere Pushes zum Server passen. `--as <environment-name>` und `--name <project-label>` setzen nur
+lokale Bezeichnungen: Standardmäßig behält die Umgebung ihren echten Namen und das Projekt heißt
+`shared`.
 
 Um zu sehen, wer Zugriff hat, jemanden zu entfernen oder den Schlüssel einer Umgebung selbst zu rotieren:
 
@@ -631,6 +696,9 @@ Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht 
 
 Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
 
+Wie du die persönliche Abrechnung auf der Sotto-Cloud-Kontoseite an eine Organisation übergibst,
+steht in der [Anleitung zur Abrechnungsübertragung](CLOUD-BILLING-TRANSFER.md).
+
 ### Ausgabe-Themes
 
 Die CLI enthält fünf integrierte Themes: `nord` (die Standardeinstellung), `sordino`,
@@ -711,6 +779,8 @@ Ein jetziger Push kann ältere, nie synchronisierte Werte nicht wiederherstellen
 unlesbaren Version empfiehlt die CLI, `sotto pull` auszuführen und es erneut zu versuchen;
 ein Pull garantiert nicht, dass die verfügbaren Schlüssel diese Version entschlüsseln können.
 
+Für Shell-Skripte und CI siehe die [Referenz zu CLI-Skripten und Exit-Status](CLI-SCRIPTING.md).
+
 ### Umgebungsvariablen
 
 Die CLI liest diese Variablen:
@@ -746,6 +816,26 @@ Richte die CLI einmal auf deinen Server aus; spätere Befehle verwenden ihn weit
 ```sh
 sotto login --server https://sotto.example.com
 ```
+
+Bei einer frischen CLI-Konfiguration verwendet auch der von `sotto share`
+erzeugte Weblink diese Server-URL. Haben API und Web-App verschiedene Origins,
+wählt `--server` weiterhin den Sync/API-Server, während `--web` die Basis-URL
+der Web-App für Freigabelinks festlegt:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+Die CLI speichert die Web-URL separat. Eine spätere Anmeldung nur mit
+`--server` behält die bisherige `--web`-Einstellung bei, auch beim
+Serverwechsel. Für Freigabelinks mit gemeinsamem Origin beide URLs explizit setzen:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+Die Option `--web` leitet keine API-Anfragen um und konfiguriert weder
+serverseitige Cookies, CORS, OAuth und CSP noch den Build der Web-App.
 
 ## Architektur
 

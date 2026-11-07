@@ -22,6 +22,13 @@ const emptyStatus: api.CloudContactStatus = {
 
 const acknowledgement = "If this address can be used, a verification message will arrive shortly.";
 
+function deliveryStatus(state: api.CloudEmailDeliveryState): api.CloudContactStatus {
+  return {
+    ...emptyStatus,
+    latestDelivery: { state, updatedAtEpoch: 1_800_000_000 },
+  };
+}
+
 function deferred() {
   let resolve!: () => void;
   let reject!: (cause: unknown) => void;
@@ -229,6 +236,183 @@ describe("CloudContactSettings", () => {
     await waitFor(() => expect(api.revokeCloudContact).toHaveBeenCalledOnce());
   });
 
+  describe("removing a verified contact", () => {
+    const verifiedStatus: api.CloudContactStatus = {
+      email: {
+        contactId: "contact-1",
+        maskedDestination: "p***@example.test",
+        verifiedAtEpoch: 1_800_000_000,
+      },
+      latestDelivery: null,
+      pendingExpiresAtEpoch: null,
+      enrolmentAvailable: true,
+    };
+
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      let reject!: (reason: unknown) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    }
+
+    async function renderVerified() {
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValue(verifiedStatus);
+      render(<CloudContactSettings />);
+      await screen.findByText("p***@example.test");
+      return screen.getByRole("button", { name: "Remove verified email" });
+    }
+
+    it("disables removal while the request is pending and does not delete twice", async () => {
+      const remove = await renderVerified();
+      const pending = deferred<void>();
+      vi.mocked(api.revokeCloudContact).mockReturnValueOnce(pending.promise);
+
+      fireEvent.click(remove);
+      await waitFor(() => expect(remove).toBeDisabled());
+      fireEvent.click(remove);
+      fireEvent.click(remove);
+
+      expect(api.revokeCloudContact).toHaveBeenCalledTimes(1);
+
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValue(emptyStatus);
+      pending.resolve();
+      expect(await screen.findByText("No verified email contact is set.")).toBeInTheDocument();
+      expect(api.revokeCloudContact).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the contact and offers removal again after a failed request", async () => {
+      const remove = await renderVerified();
+      vi.mocked(api.revokeCloudContact).mockRejectedValueOnce(new Error("removal unavailable"));
+
+      fireEvent.click(remove);
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("removal unavailable");
+      expect(screen.getByText("p***@example.test")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Remove verified email" })).toBeEnabled();
+      expect(screen.queryByText("Lifecycle email contact removed.")).not.toBeInTheDocument();
+      expect(api.revokeCloudContact).toHaveBeenCalledTimes(1);
+      // A failed removal must not refresh the status on its own: the contact is unchanged.
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(1);
+    });
+
+    it("recovers after an explicit retry and shows the refreshed empty state", async () => {
+      const remove = await renderVerified();
+      vi.mocked(api.revokeCloudContact).mockRejectedValueOnce(new Error("removal unavailable"));
+      fireEvent.click(remove);
+      await screen.findByRole("alert");
+
+      vi.mocked(api.revokeCloudContact).mockResolvedValueOnce(undefined);
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValue(emptyStatus);
+      fireEvent.click(screen.getByRole("button", { name: "Remove verified email" }));
+
+      expect(await screen.findByText("No verified email contact is set.")).toBeInTheDocument();
+      expect(screen.getByText("Lifecycle email contact removed.")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.queryByText("p***@example.test")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Remove verified email" })).not.toBeInTheDocument();
+      expect(api.revokeCloudContact).toHaveBeenCalledTimes(2);
+    });
+
+    it("recovers from a failed status refresh after removal without deleting again", async () => {
+      const remove = await renderVerified();
+      vi.mocked(api.revokeCloudContact).mockResolvedValueOnce(undefined);
+      vi.mocked(api.fetchCloudContactStatus).mockRejectedValueOnce(new Error("status unavailable"));
+
+      fireEvent.click(remove);
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("status unavailable");
+      expect(screen.getByText("Contact settings could not be loaded.")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+      expect(api.revokeCloudContact).toHaveBeenCalledTimes(1);
+
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce(emptyStatus);
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+      expect(await screen.findByText("No verified email contact is set.")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.queryByText("p***@example.test")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Remove verified email" })).not.toBeInTheDocument();
+      expect(api.revokeCloudContact).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("retrying a failed status load", () => {
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      let reject!: (reason: unknown) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    }
+
+    async function renderFailedLoad() {
+      vi.mocked(api.fetchCloudContactStatus).mockRejectedValueOnce(new Error("initial failure"));
+      render(<CloudContactSettings />);
+      await screen.findByText("Contact settings could not be loaded.");
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(1);
+    }
+
+    it("shows a pending retry and ignores repeated activation", async () => {
+      await renderFailedLoad();
+      const pending = deferred<api.CloudContactStatus>();
+      vi.mocked(api.fetchCloudContactStatus).mockReturnValueOnce(pending.promise);
+
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      const retrying = await screen.findByRole("button", { name: "Retrying…" });
+      expect(retrying).toBeDisabled();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+      fireEvent.click(retrying);
+      fireEvent.click(retrying);
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(2);
+
+      pending.resolve(emptyStatus);
+      expect(await screen.findByLabelText("Email address")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Retry/ })).not.toBeInTheDocument();
+      expect(screen.queryByText("Contact settings could not be loaded.")).not.toBeInTheDocument();
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(2);
+    });
+
+    it("shows the retry error and re-enables Retry after another failure", async () => {
+      await renderFailedLoad();
+      const pending = deferred<api.CloudContactStatus>();
+      vi.mocked(api.fetchCloudContactStatus).mockReturnValueOnce(pending.promise);
+
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await screen.findByRole("button", { name: "Retrying…" });
+      pending.reject(new Error("still unavailable"));
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("still unavailable");
+      const retry = screen.getByRole("button", { name: "Retry" });
+      expect(retry).toBeEnabled();
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(2);
+
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce(emptyStatus);
+      fireEvent.click(retry);
+
+      expect(await screen.findByLabelText("Email address")).toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(3);
+    });
+
+    it("does not start verification, confirmation or removal while retrying", async () => {
+      await renderFailedLoad();
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce(emptyStatus);
+
+      fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+      await screen.findByLabelText("Email address");
+
+      expect(api.startCloudContactVerification).not.toHaveBeenCalled();
+      expect(api.confirmCloudContactVerification).not.toHaveBeenCalled();
+      expect(api.revokeCloudContact).not.toHaveBeenCalled();
+    });
+  });
+
   it("explains that older servers do not support contact settings", async () => {
     vi.mocked(api.fetchCloudContactStatus).mockRejectedValue(new api.UnsupportedCloudContactError());
     render(<CloudContactSettings />);
@@ -251,6 +435,51 @@ describe("CloudContactSettings", () => {
       "Email delivery is paused because the address could not accept a previous message.",
     )).toBeInTheDocument();
     expect(screen.queryByText(/provider-message|@example\.test/)).not.toBeInTheDocument();
+  });
+
+  const deliveryCases: Array<[api.CloudEmailDeliveryState, string]> = [
+    ["queued", "The latest lifecycle email is queued."],
+    ["accepted", "The email service accepted the latest lifecycle email; delivery is not yet confirmed."],
+    ["delivery_unknown", "We could not confirm whether the latest lifecycle email was sent. Check your inbox before requesting help."],
+    ["delivered", "The email service confirmed delivery of the latest lifecycle email."],
+    ["failed", "The latest lifecycle email could not be sent."],
+    ["bounced", "The latest lifecycle email was returned by the recipient mail server. Verify a different address to resume email notices."],
+  ];
+
+  it.each(deliveryCases)("shows the %s delivery summary", async (state, message) => {
+    vi.mocked(api.fetchCloudContactStatus).mockResolvedValue(deliveryStatus(state));
+    render(<CloudContactSettings />);
+
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(message));
+  });
+
+  it.each([
+    ["null", emptyStatus],
+    ["omitted", { email: null, pendingExpiresAtEpoch: null, enrolmentAvailable: true }],
+  ])("keeps contact controls without a delivery summary when it is %s", async (_case, status) => {
+    vi.mocked(api.fetchCloudContactStatus).mockResolvedValue(status);
+    render(<CloudContactSettings />);
+
+    expect(await screen.findByLabelText("Email address")).toBeInTheDocument();
+    await enterAddress("person@example.test");
+    expect(screen.getByRole("button", { name: "Send verification link" })).toBeEnabled();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("replaces the delivery summary after a contact status refresh", async () => {
+    vi.mocked(api.fetchCloudContactStatus)
+      .mockResolvedValueOnce(deliveryStatus("queued"))
+      .mockResolvedValueOnce(deliveryStatus("delivered"));
+    vi.mocked(api.startCloudContactVerification).mockResolvedValue(undefined);
+    render(<CloudContactSettings />);
+
+    expect(await screen.findByText("The latest lifecycle email is queued.")).toBeInTheDocument();
+    await enterAddress("person@example.test");
+    sendLink();
+
+    expect(await screen.findByText("The email service confirmed delivery of the latest lifecycle email.")).toBeInTheDocument();
+    expect(screen.queryByText("The latest lifecycle email is queued.")).not.toBeInTheDocument();
+    expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(2);
   });
 
   async function emailForm(address: string) {
