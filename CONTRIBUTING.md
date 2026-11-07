@@ -19,6 +19,9 @@ You do not need to touch cryptography to help.
 
 - **Docs and copy.** README, CLI `--help` text, and the landing page. Prose uses British
   English (organisation, initialise, behaviour) and plain hyphens, never em dashes.
+- **Clipboard behaviour.** The user-visible rules - supported sessions, failure modes, and the
+  45 second best-effort clear - are documented in [README.md](README.md#clipboard-support).
+  Keep them in step with `crates/cli/src/clipboard.rs`.
 - **CLI affordances.** Completions already exist (`sotto completions bash`); wiring them
   into `install.sh`, adding examples to `--help`, and Windows PATH notes are typical
   first issues.
