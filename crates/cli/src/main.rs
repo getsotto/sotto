@@ -259,7 +259,10 @@ enum Command {
         )]
         args: Vec<String>,
     },
-    /// Print the environment's secrets in a chosen format (plaintext).
+    /// Export local plaintext secrets or download an encrypted Cloud bundle.
+    #[command(
+        after_help = "Examples:\n  sotto export --format dotenv > .env\n  sotto export --cloud ./example-export.json\n\nOrdinary export prints plaintext values from the active environment. --cloud downloads an encrypted account export from the configured server. It does not copy the current environment as plaintext. Cloud export requires login and server export eligibility. It does not require the local vault to be unlocked."
+    )]
     Export {
         /// Output format.
         #[arg(long, value_enum, default_value_t = ExportFormat::Dotenv)]
@@ -271,13 +274,16 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         cloud: Option<PathBuf>,
     },
-    /// Import secrets from a .env file into the active environment.
+    /// Import .env secrets or restore an encrypted Cloud bundle.
     #[command(after_help = r#"Examples:
   sotto import .env
+  sotto import --cloud ./example-export.json
+
+Cloud import reads the local encrypted bundle without server login. It requires the original Secret Key and master password. The bundle does not replace either. Cloud import refuses a local store that already has an identity. Use --cloud for an encrypted bundle. Ordinary dotenv import does not accept it.
 
 Values are imported literally: $OTHER and ${OTHER} are not expanded, and an inline # is part of the value; whole lines beginning with # are comments. Unquoted surrounding whitespace is trimmed, while matching quotes preserve spaces inside the value. Single-quoted values are literal. Double-quoted values decode \n, \r, \t, \\, and \". Physical multiline values are unsupported; use a double-quoted \n escape to store a newline."#)]
     Import {
-        /// Path to the .env file.
+        /// Path to a .env file or encrypted Cloud bundle.
         file: PathBuf,
         /// Restore an encrypted Cloud exit bundle instead of importing dotenv values.
         #[arg(long)]
@@ -434,8 +440,8 @@ enum OrgCommand {
     /// Show the org audit log, newest first (admins/owners).
     Audit {
         org_id: String,
-        /// Maximum events to show (server caps at 500).
-        #[arg(long)]
+        /// Maximum events to show (positive; server caps at 500).
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
         limit: Option<i64>,
     },
 }
@@ -2677,6 +2683,7 @@ mod tests {
         machine_token_list_json, org_members_json, set_confirmation, Cli, CloudCommand, Command,
         EnvCommand, OrgCommand, SharesCommand, ThemeCommand, TokenCommand,
     };
+    use super::{exec_or_replace, run_with_entries, Error};
 
     #[test]
     fn dotenv_import_parse_error_includes_path_and_writes_nothing() {
@@ -2768,6 +2775,48 @@ mod tests {
             "Single-quoted values are literal",
             "Physical multiline values are unsupported",
             "Double-quoted values decode",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
+
+    #[test]
+    fn export_help_distinguishes_plaintext_and_cloud_bundles() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("export")
+            .expect("export subcommand should exist")
+            .render_long_help()
+            .to_string();
+
+        for expected in [
+            "sotto export --format dotenv > .env",
+            "sotto export --cloud ./example-export.json",
+            "prints plaintext values from the active environment",
+            "encrypted account export from the configured server",
+            "requires login and server export eligibility",
+            "does not require the local vault to be unlocked",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
+
+    #[test]
+    fn import_help_explains_cloud_restore_requirements() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("import")
+            .expect("import subcommand should exist")
+            .render_long_help()
+            .to_string();
+
+        for expected in [
+            "sotto import --cloud ./example-export.json",
+            "local encrypted bundle without server login",
+            "original Secret Key and master password",
+            "The bundle does not replace either",
+            "refuses a local store that already has an identity",
+            "Ordinary dotenv import does not accept it",
         ] {
             assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
         }
@@ -3340,6 +3389,43 @@ mod tests {
     }
 
     #[test]
+    fn org_audit_limit_parses_positive_values_and_rejects_non_positive_values() {
+        for value in [1, 500, 501] {
+            let text = value.to_string();
+            let cli = Cli::try_parse_from(["sotto", "org", "audit", "org-1", "--limit", &text])
+                .expect("positive audit limit should parse");
+            assert!(matches!(
+                cli.command,
+                Some(Command::Org {
+                    command: OrgCommand::Audit {
+                        limit: Some(parsed),
+                        ..
+                    }
+                }) if parsed == value
+            ));
+        }
+
+        let cli = Cli::try_parse_from(["sotto", "org", "audit", "org-1"])
+            .expect("omitted audit limit should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Org {
+                command: OrgCommand::Audit { limit: None, .. }
+            })
+        ));
+
+        for option in ["--limit=0", "--limit=-1"] {
+            let error = match Cli::try_parse_from(["sotto", "org", "audit", "org-1", option]) {
+                Ok(_) => panic!("accepted {option}"),
+                Err(error) => error,
+            };
+            let message = error.to_string();
+            assert!(message.contains("--limit"), "{option}: {message}");
+            assert!(message.contains("1.."), "{option}: {message}");
+        }
+    }
+
+    #[test]
     fn org_members_json_reports_key_presence_and_omits_the_key() {
         let members = vec![
             MemberInfo {
@@ -3592,5 +3678,91 @@ mod tests {
                 command: EnvCommand::Use { name: None }
             })
         ));
+    }
+
+    /// The child fixtures for [`run_helper`]: `sh` on Unix, `cmd` on Windows. The subject
+    /// of these tests is the exit status crossing the `run` boundary, so the child only
+    /// has to exit with a known code.
+    #[cfg(unix)]
+    fn exit_fixture(code: i32) -> (String, Vec<String>) {
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), format!("exit {code}")],
+        )
+    }
+
+    #[cfg(windows)]
+    fn exit_fixture(code: i32) -> (String, Vec<String>) {
+        (
+            "cmd".to_string(),
+            vec!["/C".to_string(), format!("exit {code}")],
+        )
+    }
+
+    /// Runs one helper pass in its own process and returns that process's exit status.
+    ///
+    /// The helper cannot run in the harness: on Unix `exec_or_replace` replaces the
+    /// process, which would end the test run, and on Windows it calls `process::exit`.
+    /// The wait is bounded so a regression cannot hang the suite, and the `--exact`
+    /// filter names the helper below, so renaming that function moves this string too.
+    fn run_helper(mode: &str) -> std::process::ExitStatus {
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "tests::child_exit_status_helper", "--ignored"])
+            .env("SOTTO_TEST_CHILD_MODE", mode)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the helper process");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait for the helper") {
+                return status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the helper process did not finish inside its 30 second bound");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Child-process mode of the exit-status tests: hand this process over to the real
+    /// `sotto run` execution boundary, so the status the parent observes is the child's.
+    #[test]
+    #[ignore = "helper process for the exit-status tests; re-executed, never run directly"]
+    fn child_exit_status_helper() {
+        let mode = std::env::var("SOTTO_TEST_CHILD_MODE").expect("helper mode");
+        let code = mode.parse::<i32>().expect("helper mode is an exit code");
+        let (program, args) = exit_fixture(code);
+        let mut argv = vec![program];
+        argv.extend(args);
+
+        // Success never returns here: the process becomes the child on Unix, and exits
+        // with the child's status on Windows.
+        let error = run_with_entries(Vec::new(), argv)
+            .expect_err("the execution boundary must not return on success");
+        panic!("the execution boundary returned instead of running the child: {error}");
+    }
+
+    #[test]
+    fn child_exit_status_zero_crosses_the_run_boundary() {
+        let status = run_helper("0");
+        assert_eq!(status.code(), Some(0), "status: {status:?}");
+    }
+
+    #[test]
+    fn child_exit_status_nonzero_crosses_the_run_boundary() {
+        let status = run_helper("42");
+        assert_eq!(status.code(), Some(42), "status: {status:?}");
+    }
+
+    #[test]
+    fn launch_failure_is_an_io_error_and_sotto_exit_code_five() {
+        let program = "sotto-test-command-that-does-not-exist";
+        let error = exec_or_replace(std::process::Command::new(program), program)
+            .expect_err("launching a nonexistent program must fail");
+        assert!(matches!(error, Error::Io(_)), "{error}");
+        assert_eq!(error.exit_code(), 5);
     }
 }

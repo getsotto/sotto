@@ -6,7 +6,7 @@ import { expect } from "@playwright/test";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-export const SERVER_ORIGIN = "http://127.0.0.1:8099";
+export const SERVER_ORIGIN = process.env.SOTTO_E2E_SERVER_ORIGIN ?? "http://127.0.0.1:8099";
 
 export interface Fixture {
   owner_login_code: string;

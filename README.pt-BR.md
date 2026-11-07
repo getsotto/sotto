@@ -154,7 +154,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -206,6 +206,27 @@ servidor escolhido. De todo modo, o servidor só armazena texto cifrado: o cofre
 mesmo servidor descriptografa no seu navegador, com chaves que nunca saem dos seus dispositivos.
 
 Para explorar os segredos interativamente, consulte o [guia do painel](#painel-interativo).
+
+Se o navegador não abrir ou o login expirar, consulte [Solução de problemas do login](#solução-de-problemas-do-login).
+
+### Solução de problemas do login
+
+`sotto login` inicia um listener de curta duração em `127.0.0.1` (o endereço de loopback) em uma porta
+disponível, abre o navegador para você entrar e espera o navegador voltar a esse listener.
+
+- **O navegador não abre.** Abra, em um navegador da mesma máquina, a URL que essa execução de
+  `sotto login` imprimiu depois de "If it doesn't open, visit:". Deixe o comando em execução, pois ele
+  está esperando o login terminar.
+- **Use a mesma máquina.** O navegador precisa conseguir alcançar o listener no endereço de loopback.
+  Abrir a URL em outra máquina ou em um celular não conclui o fluxo normal. Uma sessão remota por SSH
+  ou em contêiner não necessariamente funciona como um desktop local; faça o login a partir de um
+  terminal local sempre que puder.
+- **A espera expira.** O comando espera cinco minutos pela volta do navegador. Depois disso, execute
+  `sotto login` de novo e use a URL recém-impressa. Cada tentativa inicia um novo listener com um novo
+  estado, então uma URL ou um link de callback antigos não funcionarão.
+
+Não exponha o listener de loopback publicamente. Para entrar no seu próprio servidor, use o mesmo
+`--server <url>` de antes; consulte [Auto-hospedagem](#auto-hospedagem).
 
 ## Fluxos de trabalho com agentes
 
@@ -415,6 +436,28 @@ sotto shares revoke <token>  # the token is the part of the link between /s/ and
 
 `sotto shares ls` nunca mostra o texto cifrado nem a chave do link.
 
+Repare no plural: `sotto share` cria um link e `sotto shares` gerencia os links que você criou.
+Ambos falam com o servidor configurado, então precisam de `sotto login`; o cofre local não precisa
+estar desbloqueado. Uma listagem fica assim (token fictício, valores ilustrativos):
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Passe a primeira coluna para `sotto shares revoke`. É o token público, não o link inteiro: para
+`https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...`, passe só `3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` e nunca nada depois
+do `#`. A listagem lê apenas metadados. Ela não abre nenhum link nem consome uma visualização, e não
+consegue reconstruir um link, porque a chave depois do `#` nunca chegou ao servidor.
+
+`sotto shares ls --json` imprime um objeto, não um array simples: `active_free_count` e `links`, em
+que cada link tem `token`, `share_class`, `max_views`, `view_count`, `expires_at`, `revoked_at` e
+`created_at`. O servidor retorna só os seus 100 links mais recentes, então isso não é um histórico
+completo.
+
+Revogar impede novas recuperações pelo link. Não desfaz uma recuperação que já aconteceu; se o
+destinatário pode ter revelado o segredo, troque-o na origem.
+
 ### Trabalhar em equipe
 
 Equipes compartilham ambientes por meio de uma organização. Cada membro recebe sua própria cópia
@@ -429,11 +472,26 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prin
 sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
 
-O membro executa o comando exibido na própria cópia do projeto:
+Depois, o membro executa o comando exibido. Isso não é o mesmo que **Outro dispositivo**, que restaura a sua própria conta em uma segunda
+máquina. O membro usa a própria conta no mesmo servidor: executa `sotto login` e `sotto unlock` e
+depois o comando exibido em um diretório que ainda não tem `sotto.toml`:
 
 ```sh
+mkdir acme-api && cd acme-api
 sotto clone <project-id> <env-id> --org <org-id>
 ```
+
+Ser membro da organização e ter acesso a um ambiente são etapas separadas. `sotto org invite` torna
+alguém membro; `sotto grant <user-id>` dá a essa pessoa um ambiente. Se você não tiver mais o ID do
+usuário, `sotto org members <org-id>` mostra. `sotto clone` não concede nada sozinho: ele busca o
+grant que o membro já tem, baixa esse ambiente e grava `sotto.toml`. Sem grant, ele para com
+`you have not been granted this environment (ask an admin to share it)`, e um administrador precisa
+executar `sotto grant` para essa pessoa. Nunca entregue o seu Emergency Kit a um colega; ele
+desbloqueia a sua conta, não a dele.
+
+Mantenha `--org` do comando exibido, porque ele registra a organização proprietária para que os
+pushes seguintes correspondam ao servidor. `--as <environment-name>` e `--name <project-label>` só
+definem rótulos locais: por padrão, o ambiente mantém o nome real e o projeto se chama `shared`.
 
 Para ver quem tem acesso, remover alguém ou rotacionar você mesmo a chave de um ambiente:
 
@@ -673,6 +731,9 @@ O formato JSON é útil para scripts. Sua estrutura de nível superior é:
 
 O exemplo é sintético; `actions` e as datas opcionais vêm do estado retornado da conta, e servidores antigos podem retornar null para qualquer um dos dois endpoints. `sotto cloud status` apenas informa o status e pode mostrar uma URL de cobrança. Ele não inicia uma compra nem altera a elegibilidade. Para diagnósticos do cofre local e dos ambientes, use `sotto status`; essa visão é separada das informações do servidor e da conta acima.
 
+Para mover a cobrança pessoal para uma organização a partir da página de conta do Sotto Cloud,
+consulte o [guia de transferência de cobrança](CLOUD-BILLING-TRANSFER.md).
+
 ### Temas de saída
 
 A CLI traz cinco temas integrados: `nord` (o padrão), `sordino`, `terminal`, `monochrome` e
@@ -751,6 +812,8 @@ Enviar agora não recupera valores antigos que nunca foram sincronizados. Para u
 ilegível, siga a sugestão da CLI: execute `sotto pull` e tente novamente; isso não garante
 que as chaves disponíveis permitam descriptografar essa versão.
 
+Para scripts de shell e CI, consulte a [referência de scripts e códigos de saída da CLI](CLI-SCRIPTING.md).
+
 ### Variáveis de ambiente
 
 A CLI lê estas variáveis:
@@ -784,6 +847,26 @@ Aponte a CLI para o seu servidor uma vez; os comandos seguintes o reutilizam:
 ```sh
 sotto login --server https://sotto.example.com
 ```
+
+Em uma configuração nova da CLI, o link web gerado por `sotto share` também
+usa a URL desse servidor. Se a API e o aplicativo web tiverem origens diferentes,
+`--server` continua selecionando o servidor de sincronização/API, enquanto
+`--web` define a URL base do aplicativo web para links de compartilhamento:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+A CLI salva a URL web separadamente. Um login posterior apenas com `--server`
+preserva a configuração anterior de `--web`, mesmo ao trocar de servidor.
+Para voltar aos links na mesma origem, defina as duas URLs explicitamente:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+A opção `--web` não redireciona requisições de API nem configura cookies,
+CORS, OAuth, CSP ou o build do aplicativo web no servidor.
 
 ## Arquitetura
 

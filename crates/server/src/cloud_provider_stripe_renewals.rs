@@ -478,7 +478,6 @@ pub fn decode_personal_renewal_failure(
             if term.allocation_reference() != binding.allocation_reference()
                 || term.customer_id() != binding.customer_id()
                 || term.subscription_id() != binding.subscription_id()
-                || term.provider_item_id() != binding.provider_item_id()
             {
                 return Err(StripeContractError::OwnershipMismatch);
             }
@@ -540,16 +539,9 @@ pub fn decode_personal_renewal_failure(
     if customer_id != binding.customer_id() {
         return Err(StripeContractError::OwnershipMismatch);
     }
-    let allocation_reference = invoice
-        .get("metadata")
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get(STRIPE_ALLOCATION_METADATA_KEY))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .ok_or(StripeContractError::MissingField(
-            "metadata.sotto_allocation_reference",
-        ))?;
+    let allocation_reference = invoice_allocation_reference(invoice).ok_or(
+        StripeContractError::MissingField("metadata.sotto_allocation_reference"),
+    )?;
     if allocation_reference != binding.allocation_reference() {
         return Err(StripeContractError::OwnershipMismatch);
     }
@@ -765,7 +757,6 @@ pub fn decode_personal_renewal_failure(
                     && term.allocation_reference() == binding.allocation_reference()
                     && term.customer_id() == binding.customer_id()
                     && term.subscription_id() == binding.subscription_id()
-                    && term.provider_item_id() == binding.provider_item_id()
                     && term.interval() == expected_interval
                     && term.period_end() == renewal_period_start =>
             {
@@ -800,7 +791,7 @@ pub fn decode_personal_renewal_failure(
         predecessor_evidence_reference: term.evidence_reference().to_owned(),
         provider_account_id: config.account_id.clone(),
         environment: config.environment,
-        allocation_reference,
+        allocation_reference: allocation_reference.to_owned(),
         customer_id,
         subscription_id,
         provider_item_id,
@@ -814,6 +805,27 @@ pub fn decode_personal_renewal_failure(
     };
     evidence.evidence_reference = evidence_reference(&evidence);
     Ok(StripeRenewalFailureResult::Linked(Box::new(evidence)))
+}
+
+fn invoice_allocation_reference(invoice: &Value) -> Option<&str> {
+    let root = invoice.get("metadata");
+    let parent = invoice
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_details"))
+        .and_then(|details| details.get("metadata"));
+    let line = invoice
+        .get("lines")
+        .and_then(|lines| lines.get("data"))
+        .and_then(Value::as_array)
+        .filter(|lines| lines.len() == 1)
+        .and_then(|lines| lines.first())
+        .and_then(|line| line.get("metadata"));
+    [line, parent, root]
+        .into_iter()
+        .flatten()
+        .find_map(|metadata| metadata.get(STRIPE_ALLOCATION_METADATA_KEY))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Link an authenticated repair candidate to exactly one previously paid predecessor.
@@ -838,7 +850,6 @@ pub(crate) fn link_repaired_candidate(
         || history.customer_id() != binding.customer_id()
         || candidate.customer_id() != binding.customer_id()
         || candidate.subscription_id() != binding.subscription_id()
-        || candidate.provider_item_id() != binding.provider_item_id()
         || candidate.allocation_reference() != binding.allocation_reference()
     {
         return Err(StripeContractError::ContextMismatch);
@@ -852,7 +863,6 @@ pub(crate) fn link_repaired_candidate(
                     && term.allocation_reference() == binding.allocation_reference()
                     && term.customer_id() == binding.customer_id()
                     && term.subscription_id() == binding.subscription_id()
-                    && term.provider_item_id() == binding.provider_item_id()
                     && term.interval() == candidate.interval()
                     && term.period_end() == candidate.period_start() =>
             {
@@ -878,7 +888,14 @@ pub(crate) fn link_repaired_candidate(
     };
     let mut evidence = StripeRenewalFailureEvidence {
         evidence_reference: String::new(),
-        renewal_id: renewal_identity(config, binding, candidate.invoice_id()),
+        renewal_id: renewal_identity_from_parts(
+            &config.account_id,
+            config.environment,
+            binding.allocation_reference(),
+            binding.subscription_id(),
+            candidate.provider_item_id(),
+            candidate.invoice_id(),
+        ),
         event_id: provenance.event_id().to_owned(),
         invoice_id: candidate.invoice_id().to_owned(),
         invoice_line_id: candidate.invoice_line_id().to_owned(),
