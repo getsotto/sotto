@@ -207,6 +207,27 @@ mesmo servidor descriptografa no seu navegador, com chaves que nunca saem dos se
 
 Para explorar os segredos interativamente, consulte o [guia do painel](#painel-interativo).
 
+Se o navegador não abrir ou o login expirar, consulte [Solução de problemas do login](#solução-de-problemas-do-login).
+
+### Solução de problemas do login
+
+`sotto login` inicia um listener de curta duração em `127.0.0.1` (o endereço de loopback) em uma porta
+disponível, abre o navegador para você entrar e espera o navegador voltar a esse listener.
+
+- **O navegador não abre.** Abra, em um navegador da mesma máquina, a URL que essa execução de
+  `sotto login` imprimiu depois de "If it doesn't open, visit:". Deixe o comando em execução, pois ele
+  está esperando o login terminar.
+- **Use a mesma máquina.** O navegador precisa conseguir alcançar o listener no endereço de loopback.
+  Abrir a URL em outra máquina ou em um celular não conclui o fluxo normal. Uma sessão remota por SSH
+  ou em contêiner não necessariamente funciona como um desktop local; faça o login a partir de um
+  terminal local sempre que puder.
+- **A espera expira.** O comando espera cinco minutos pela volta do navegador. Depois disso, execute
+  `sotto login` de novo e use a URL recém-impressa. Cada tentativa inicia um novo listener com um novo
+  estado, então uma URL ou um link de callback antigos não funcionarão.
+
+Não exponha o listener de loopback publicamente. Para entrar no seu próprio servidor, use o mesmo
+`--server <url>` de antes; consulte [Auto-hospedagem](#auto-hospedagem).
+
 ## Fluxos de trabalho com agentes
 
 Agentes de programação locais podem descobrir e executar tarefas declaradas pelo projeto usando o servidor MCP local do Sotto. Consulte o [guia de tarefas para agentes](AGENT-WORKFLOWS.md) para configuração, aprovações e limites de segurança.

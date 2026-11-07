@@ -211,6 +211,28 @@ appareils.
 
 Pour parcourir les secrets de façon interactive, consultez le [guide du tableau de bord](#tableau-de-bord-interactif).
 
+Si le navigateur ne s'ouvre pas ou si la connexion expire, voir [Dépanner la connexion](#dépanner-la-connexion).
+
+### Dépanner la connexion
+
+`sotto login` démarre un écouteur de courte durée sur `127.0.0.1` (l'adresse de bouclage) sur un port
+disponible, ouvre votre navigateur pour vous connecter, puis attend que le navigateur revienne vers cet
+écouteur.
+
+- **Le navigateur ne s'ouvre pas.** Ouvrez, dans un navigateur de la même machine, l'URL que cette
+  exécution de `sotto login` a affichée après « If it doesn't open, visit: ». Laissez la commande
+  tourner : elle attend la fin de la connexion.
+- **Utilisez la même machine.** Le navigateur doit pouvoir joindre l'écouteur sur l'adresse de
+  bouclage. Ouvrir l'URL sur une autre machine ou sur un téléphone ne termine pas le flux normal. Une
+  session distante en SSH ou dans un conteneur ne fonctionne pas forcément comme un bureau local ;
+  connectez-vous donc depuis un terminal local quand c'est possible.
+- **L'attente expire.** La commande attend cinq minutes le retour du navigateur. Ensuite, relancez
+  `sotto login` et utilisez l'URL nouvellement affichée. Chaque tentative démarre un nouvel écouteur
+  avec un nouvel état : une ancienne URL ou un ancien lien de callback ne fonctionnera pas.
+
+N'exposez pas publiquement l'écouteur de bouclage. Pour vous connecter à votre propre serveur, passez
+le même `--server <url>` que précédemment ; voir [Auto-hébergement](#auto-hébergement).
+
 ## Flux de travail avec des agents
 
 Les agents de programmation locaux peuvent découvrir et exécuter les tâches déclarées par le projet via le serveur MCP local de Sotto. Consultez le [guide des tâches pour agents](AGENT-WORKFLOWS.md) pour la configuration, les approbations et les limites de sécurité.
