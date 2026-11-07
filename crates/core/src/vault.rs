@@ -51,6 +51,16 @@ pub fn open_account_keypair(
     Ok(keypair)
 }
 
+/// Check that `master_key` opens the account's `enc_private_keys`, i.e. that the password and
+/// secret key it was derived from are right. Deriving a master key always succeeds, so this is the
+/// proof of a correct unlock. The recovered keypair is dropped (and zeroized) straight away.
+pub fn verify_account_keys(
+    master_key: &[u8; KEY_LEN],
+    enc_private_keys: &[u8],
+) -> Result<(), Error> {
+    open_account_keypair(master_key, enc_private_keys).map(drop)
+}
+
 /// Seal a vault key to a grantee's public key - a **grant**. The recipient opens it with their
 /// account keypair. (Sealed boxes are anonymous, so the sender is not revealed and there is no AAD.)
 pub fn grant_vault_key(
@@ -339,5 +349,24 @@ mod tests {
         );
         // A wrong master key can't recover the keypair, so the grant can't be opened.
         assert!(open_vault_grant(&[0x99; KEY_LEN], &enc_private_keys, &grant).is_err());
+    }
+
+    #[test]
+    fn verify_account_keys_accepts_only_the_right_master_and_intact_material() {
+        let master = [0x42u8; KEY_LEN];
+        let keypair = wrap::generate_keypair();
+        let enc_private_keys = wrap_private_key(&master, &keypair.secret);
+
+        assert!(verify_account_keys(&master, &enc_private_keys).is_ok());
+        assert!(verify_account_keys(&[0x43; KEY_LEN], &enc_private_keys).is_err());
+
+        let mut damaged = enc_private_keys.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 0x01;
+        assert!(verify_account_keys(&master, &damaged).is_err());
+        assert!(
+            verify_account_keys(&master, &enc_private_keys[..enc_private_keys.len() / 2]).is_err()
+        );
+        assert!(verify_account_keys(&master, &[]).is_err());
     }
 }
