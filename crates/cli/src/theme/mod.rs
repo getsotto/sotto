@@ -411,8 +411,10 @@ pub fn load_custom_themes(themes_dir: &Path) -> Vec<Theme> {
 
 /// Retrieve all available themes: the built-in presets plus custom themes in `themes_dir`.
 /// A custom theme sharing a preset's name does not shadow it; the preset wins.
+/// Surviving custom themes follow the presets in case-insensitive display-name order.
 pub fn available_themes(themes_dir: Option<&Path>) -> Vec<Theme> {
     let mut all = Theme::presets();
+    let preset_count = all.len();
     if let Some(dir) = themes_dir {
         for custom in load_custom_themes(dir) {
             if !all
@@ -423,6 +425,8 @@ pub fn available_themes(themes_dir: Option<&Path>) -> Vec<Theme> {
             }
         }
     }
+    // Sort after deduplication so directory order still determines custom-name conflicts.
+    all[preset_count..].sort_by_cached_key(|theme| theme.name.to_lowercase());
     all
 }
 
@@ -750,6 +754,64 @@ mod tests {
 
         // A missing directory yields no themes rather than an error.
         assert!(load_custom_themes(&dir.path().join("absent")).is_empty());
+    }
+
+    #[test]
+    fn available_themes_sort_custom_display_names_after_presets() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, name) in [
+            ("a.toml", "name = \"zebra\""),
+            ("z.toml", "name = \"Alpha\""),
+            ("c.toml", "name = \"beta\""),
+            ("Omega.toml", ""),
+            ("preset.toml", "name = \"NORD\""),
+        ] {
+            std::fs::write(dir.path().join(file), custom_toml(name)).unwrap();
+        }
+        std::fs::write(dir.path().join("broken.toml"), "accent = [unclosed").unwrap();
+
+        let themes = available_themes(Some(dir.path()));
+        let names: Vec<_> = themes.iter().map(|theme| theme.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "nord",
+                "sordino",
+                "terminal",
+                "monochrome",
+                "tokyo-night",
+                "Alpha",
+                "beta",
+                "Omega",
+                "zebra",
+            ]
+        );
+        assert_eq!(
+            available_themes(Some(&dir.path().join("missing")))
+                .iter()
+                .map(|theme| theme.name.clone())
+                .collect::<Vec<_>>(),
+            Theme::presets()
+                .iter()
+                .map(|theme| theme.name.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn available_themes_preserve_custom_collision_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.toml"), custom_toml("name = \"ZEBRA\"")).unwrap();
+        std::fs::write(dir.path().join("z.toml"), custom_toml("name = \"zebra\"")).unwrap();
+        let loaded = load_custom_themes(dir.path());
+        let first = &loaded[0];
+        let themes = available_themes(Some(dir.path()));
+        let surviving: Vec<_> = themes
+            .iter()
+            .filter(|theme| theme.name.eq_ignore_ascii_case("zebra"))
+            .collect();
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(surviving[0].name, first.name);
     }
 
     #[test]

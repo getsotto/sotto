@@ -676,6 +676,8 @@ Custom themes are TOML files in the `themes` directory inside your platform data
 directory). Each `*.toml` file needs the tokens below and takes its name from a `name` field,
 or from the filename when the field is absent; a file that fails to parse is skipped. Colours
 accept hex values, ANSI colour names, `ansi(<index>)` indices, and `default`.
+Both the theme list and the dashboard picker show the built-in presets first, followed
+by custom themes sorted by their displayed names, ignoring case.
 
 ```toml
 bg = "#120024"
