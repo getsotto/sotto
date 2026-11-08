@@ -1,0 +1,6 @@
+{"at": "2026-11-08T01:44:54Z", "component": "api", "detail": null, "state": "ok"}
+{"at": "2026-11-08T01:44:54Z", "component": "billing", "detail": null, "state": "ok"}
+{"at": "2026-11-08T01:44:54Z", "component": "human-sync", "detail": "SOTTO_HUMAN_CANARY_ENVIRONMENT_ID is not set", "state": "unconfigured"}
+{"at": "2026-11-08T01:44:54Z", "component": "signin", "detail": null, "state": "ok"}
+{"at": "2026-11-08T01:44:54Z", "component": "sync", "detail": null, "state": "ok"}
+{"at": "2026-11-08T01:44:54Z", "component": "web", "detail": null, "state": "ok"}
