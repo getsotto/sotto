@@ -311,7 +311,9 @@ ownership checks, never ciphertext or secret values, and is validated before upl
 same bucket lifecycle policy. A backup whose schema includes migration 50 or later needs a
 sidecar at least as recent as the dump. Older backups predate the journal table and can only be
 restored with an empty journal; the restore drill checks that schema boundary before allowing
-that case.
+that case. The export matches: on a database without the journal table it uploads an empty
+sidecar instead of failing the run, so a host running a newer script against an older database
+still ships its dump.
 
 | `SOTTO_BACKUP_BUCKET` | Uploads with | Works for |
 |---|---|---|
@@ -382,6 +384,8 @@ One-time setup, any provider:
 
    Every run logs a UTC-timestamped `backup started` and then exactly one of `backup ok: <object>`
    or `backup FAILED while <step> (exit <status>)`, so the log shows which night failed and where.
+   Each object upload is retried twice before the run gives up: a single missed night breaches
+   the 26-hour freshness threshold, so a transient blip must not fail the night.
 
 5. **Watch that it keeps running.** Cron reports to nobody, and a bucket that has stopped
    receiving objects looks exactly like a bucket nobody has checked. Installing step 4 and

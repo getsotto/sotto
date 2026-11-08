@@ -18,21 +18,31 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "deploy/backup.sh"
 
-# pg_dump emits an archive, pg_restore --list rejects an empty one, psql emits an empty journal.
+# pg_dump emits an archive, pg_restore --list rejects an empty one. psql answers the
+# table-existence probe and otherwise emits an empty journal; with STUB_NO_JOURNAL_TABLE it
+# behaves like a pre-migration-50 database, where the journal table is absent and any query
+# against it fails.
 DOCKER_STUB = """#!/bin/sh
 case " $* " in
-  *" pg_dump "*) [ -n "$STUB_DUMP_FAILS" ] && { echo "pg_dump: connection refused" >&2; exit 1; }
+  *" compose version "*) if [ -n "${STUB_NO_COMPOSE:-}" ]; then echo "docker: 'compose' is not a docker command" >&2; exit 1; fi ;;
+  *" pg_dump "*) if [ -n "${STUB_DUMP_FAILS:-}" ]; then echo "pg_dump: connection refused" >&2; exit 1; fi
                  printf 'PGDMP-stub-archive' ;;
-  *" pg_restore "*) [ -s /dev/stdin ] || { echo "pg_restore: input file is too short" >&2; exit 1; }
-                    cat > /dev/null ;;
-  *" psql "*) : ;;
+  *" pg_restore "*) if [ -s /dev/stdin ]; then cat > /dev/null; else echo "pg_restore: input file is too short" >&2; exit 1; fi ;;
+  *"to_regclass"*) if [ -z "${STUB_NO_JOURNAL_TABLE:-}" ]; then echo "cloud_retention_tombstone_journal"; fi ;;
+  *" psql "*) if [ -n "${STUB_NO_JOURNAL_TABLE:-}" ]; then echo 'psql: error: relation "cloud_retention_tombstone_journal" does not exist' >&2; exit 1; fi ;;
 esac
 """
 
-# Records every upload, and fails the one whose destination matches STUB_UPLOAD_FAILS.
+# Records every upload, fails the one whose destination matches STUB_UPLOAD_FAILS, and with
+# STUB_FLAKY_FIRST_UPLOAD fails the first upload call only, like a transient network blip.
 UPLOAD_STUB = """#!/bin/sh
 for last; do :; done
 case "$last" in *"${STUB_UPLOAD_FAILS:-<none>}"*) echo "upload refused: $last" >&2; exit 1 ;; esac
+if [ -n "${STUB_FLAKY_FIRST_UPLOAD:-}" ] && [ ! -e "$STUB_UPLOADS.flaky" ]; then
+  : > "$STUB_UPLOADS.flaky"
+  echo "upload transient failure: $last" >&2
+  exit 1
+fi
 echo "$last" >> "$STUB_UPLOADS"
 """
 
@@ -50,7 +60,7 @@ class Backup(unittest.TestCase):
             (bin_dir / name).chmod(0o755)
         # Only what the script needs from the system, so a tool left out is genuinely absent.
         for name in ("sh", "dirname", "sed", "date", "mktemp", "rm", "mkdir", "wc", "tr", "cat",
-                     "python3"):
+                     "python3", "sleep"):
             found = shutil.which(name)
             if found:
                 (bin_dir / name).symlink_to(found)
@@ -104,6 +114,33 @@ class Backup(unittest.TestCase):
         result, uploads = self.run_script(STUB_DUMP_FAILS="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("backup FAILED while dumping the database", result.stderr)
+        self.assertEqual(uploads, [])
+
+    def test_transient_upload_failure_is_retried_not_failed(self):
+        # One missed night breaches the freshness threshold, so a single blip must not fail
+        # the run. Before the retry, this stubbed blip ended the run with `backup FAILED`.
+        result, uploads = self.run_script(STUB_FLAKY_FIRST_UPLOAD="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(uploads), 2)
+        self.assertIn("backup ok: gs://sotto-backups-test/sotto-", result.stdout)
+        self.assertIn("retrying", result.stderr)
+
+    def test_pre_retention_database_still_backs_up(self):
+        # A database without the journal table (pre-migration-50) exports an empty journal
+        # instead of failing the run, mirroring check-restore which accepts an empty journal
+        # for those backups. Before that, the export query failed and no dump was uploaded.
+        result, uploads = self.run_script(STUB_NO_JOURNAL_TABLE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(uploads), 2)
+        self.assertIn("backup ok: gs://sotto-backups-test/sotto-", result.stdout)
+        self.assertIn("pre-migration-50", result.stderr)
+
+    def test_missing_compose_plugin_fails_before_the_dump_and_names_it(self):
+        # The docker binary being present does not mean `docker compose` is installed.
+        result, uploads = self.run_script(STUB_NO_COMPOSE="1")
+        self.assertEqual(result.returncode, 127)
+        self.assertIn("docker compose", result.stderr)
+        self.assertIn("backup FAILED while checking tools", result.stderr)
         self.assertEqual(uploads, [])
 
     def test_missing_upload_tool_fails_before_the_dump_and_names_cron_path(self):
