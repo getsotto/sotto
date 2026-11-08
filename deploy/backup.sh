@@ -75,6 +75,12 @@ for tool in docker python3 "$UPLOADER"; do
         exit 127
     fi
 done
+# `docker compose` is a plugin, not the binary: docker being present does not mean the
+# subcommand is installed, and without it the dump step is the first thing to fail.
+if ! docker compose version > /dev/null 2>&1; then
+    log "error: 'docker compose' is not available. Install the compose plugin; the docker binary alone is not enough." >&2
+    exit 127
+fi
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DUMP="$(mktemp /tmp/sotto-pgdump.XXXXXX)"
@@ -99,12 +105,27 @@ STEP="validating the retention journal"
 
 DEST="$BUCKET/sotto-$STAMP.dump"
 JOURNAL_DEST="$BUCKET/sotto-$STAMP.tombstones.jsonl"
+# One missed night breaches the 26-hour freshness threshold, so a transient upload blip must
+# not fail the run. Retry briefly before giving up for the night. The `if` around the case
+# is load-bearing: under `set -e` a bare failing upload would end the script on the first
+# attempt instead of reaching the retry.
 upload() {
-    case "$UPLOADER" in
-        gsutil) gsutil -q cp "$1" "$2" ;;
-        aws) aws s3 cp --only-show-errors "$1" "$2" ;;
-        rclone) rclone copyto "$1" "$2" ;;
-    esac
+    attempt=1
+    while :; do
+        if case "$UPLOADER" in
+            gsutil) gsutil -q cp "$1" "$2" ;;
+            aws) aws s3 cp --only-show-errors "$1" "$2" ;;
+            rclone) rclone copyto "$1" "$2" ;;
+        esac; then
+            return 0
+        fi
+        if [ "$attempt" -ge 3 ]; then
+            return 1
+        fi
+        log "upload attempt $attempt for $2 failed, retrying" >&2
+        attempt=$((attempt + 1))
+        sleep 5
+    done
 }
 STEP="uploading the dump to $DEST"
 upload "$DUMP" "$DEST"
