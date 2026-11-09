@@ -260,6 +260,8 @@ pub enum SponsoredProviderRequest {
         organization_id: String,
         customer_id: Option<String>,
         items: Vec<crate::billing::SponsoredSubscriptionItemRequest>,
+        #[serde(default)]
+        automatic_tax_enabled: bool,
         expires_at_epoch: i64,
         success_url: String,
         cancel_url: String,

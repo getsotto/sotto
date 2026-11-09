@@ -37,6 +37,7 @@ struct LostResponseProvider {
     remote_creations: AtomicUsize,
     accepted_sessions: Mutex<std::collections::HashMap<String, SponsoredCheckoutSession>>,
     idempotency_keys: Mutex<Vec<String>>,
+    automatic_tax_flags: Mutex<Vec<bool>>,
     first_call_started: Notify,
     release_first_call: Notify,
 }
@@ -61,6 +62,7 @@ impl LostResponseProvider {
             remote_creations: AtomicUsize::new(0),
             accepted_sessions: Mutex::new(std::collections::HashMap::new()),
             idempotency_keys: Mutex::new(Vec::new()),
+            automatic_tax_flags: Mutex::new(Vec::new()),
             first_call_started: Notify::new(),
             release_first_call: Notify::new(),
         }
@@ -114,7 +116,12 @@ impl SubscriptionProvider for LostResponseProvider {
         _expires_at_epoch: i64,
         _success_url: &str,
         _cancel_url: &str,
+        automatic_tax_enabled: bool,
     ) -> ProviderResult<SponsoredCheckoutSession> {
+        self.automatic_tax_flags
+            .lock()
+            .expect("automatic tax capture lock")
+            .push(automatic_tax_enabled);
         let accepted = SponsoredCheckoutSession {
             session_id: self.session_id.clone(),
             checkout_url: format!("https://checkout.stripe.test/{}", self.session_id),
@@ -288,6 +295,7 @@ impl AppliedScheduleProvider {
             default_payment_method_id: None,
             subscription_id: self.subscription_id.clone(),
             status: sotto_server::billing::SubscriptionStatus::Active,
+            automatic_tax_enabled: false,
             cancel_at_period_end: false,
             cancel_at: None,
             current_period_start: Some(self.period_start),
@@ -411,6 +419,7 @@ async fn create_recovery_fixture(
                 provider_price_id: "price_recovery_test".into(),
                 quantity: 1,
             }],
+            automatic_tax_enabled: true,
             expires_at_epoch: now + 3_600,
             success_url: "https://example.test/success".into(),
             cancel_url: "https://example.test/cancel".into(),
@@ -817,6 +826,7 @@ async fn sponsored_recovery_replays_immutable_request_under_a_fenced_lease() {
             provider_price_id: "price_saved".into(),
             quantity: 1,
         }],
+        automatic_tax_enabled: false,
         expires_at_epoch: 1_700_003_600,
         success_url: "https://example.test/success".into(),
         cancel_url: "https://example.test/cancel".into(),
@@ -1005,6 +1015,10 @@ async fn sponsored_recovery_replays_accepted_checkout_after_response_loss_and_se
         "whsec_test".into(),
         "https://app.example.test".into(),
     );
+    assert!(
+        !billing.cloud_automatic_tax_enabled(),
+        "the current config represents the flag being switched off after the saved request"
+    );
 
     let first_pool = pool.clone();
     let first_billing = billing.clone();
@@ -1071,6 +1085,15 @@ async fn sponsored_recovery_replays_accepted_checkout_after_response_loss_and_se
         .clone();
     assert_eq!(keys.len(), 2);
     assert_eq!(keys[0], keys[1], "recovery must replay the stored key");
+    assert_eq!(
+        provider
+            .automatic_tax_flags
+            .lock()
+            .expect("read captured tax flags")
+            .as_slice(),
+        &[true, true],
+        "both the caller and recovery worker must use the saved Checkout tax mode"
+    );
     assert_eq!(
         provider.remote_creations.load(Ordering::SeqCst),
         1,

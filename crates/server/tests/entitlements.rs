@@ -41,6 +41,7 @@ fn app_with_cloud_sales(pool: PgPool, cloud_sales_enabled: bool) -> Router {
             price_catalogue: None,
             cloud_portal_configuration_id: cloud_sales_enabled.then(|| "bpc_test".into()),
             cloud_sales_enabled,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://app.sotto.test".into(),
         });
     app_with_billing(

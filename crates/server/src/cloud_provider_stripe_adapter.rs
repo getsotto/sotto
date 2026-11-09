@@ -14,8 +14,8 @@ use thiserror::Error;
 use crate::cloud_coverage::ConfirmedPaidInterval;
 use crate::cloud_coverage_reconciliation::{CollectionTicket, SourceBinding};
 use crate::cloud_provider::{
-    ProviderCollectionError, ProviderContext, ProviderEnvironment, ProviderHistoryClient,
-    ProviderHistoryPage, VerifiedAllocation,
+    collect_provider_history, CollectionLimits, ProviderCollectionError, ProviderContext,
+    ProviderEnvironment, ProviderHistoryClient, ProviderHistoryPage, VerifiedAllocation,
 };
 use crate::cloud_provider_stripe::STRIPE_NAMESPACE;
 use crate::cloud_provider_stripe::{StripeAllocationBinding, StripeCoverageConfig};
@@ -23,7 +23,7 @@ use crate::cloud_provider_stripe_authority::StripeAuthoritySource;
 use crate::cloud_provider_stripe_corrections::StripeRetainedPaidTerm;
 use crate::cloud_provider_stripe_http::{
     StripePersonalInvoiceHistory, StripePersonalInvoiceHistoryEntry,
-    StripePersonalInvoiceHistoryResult, StripeReadClient, StripeReadSession,
+    StripePersonalInvoiceHistoryResult, StripeReadClient, StripeReadLimits, StripeReadSession,
 };
 use crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence;
 use async_trait::async_trait;
@@ -191,6 +191,29 @@ pub(crate) fn allocation_is_active(allocation: &VerifiedAllocation) -> bool {
     )
 }
 
+/// Collect Stripe history using the read session's deadline for each logical provider page.
+///
+/// A Stripe history page may require several bounded API reads (invoice details, payments and
+/// correction evidence). The generic provider default is shorter than that complete read budget,
+/// so applying it around `fetch_page` can cancel a valid Stripe session before its own deadline.
+pub(crate) async fn collect_stripe_history<C: ProviderHistoryClient + ?Sized>(
+    client: &mut C,
+    context: &ProviderContext,
+    bindings: &[SourceBinding],
+) -> Result<crate::cloud_provider::VerifiedCollection, ProviderCollectionError> {
+    let stripe_session_timeout = StripeReadLimits::default().session_timeout;
+    collect_provider_history(
+        client,
+        context,
+        bindings,
+        CollectionLimits {
+            request_timeout: stripe_session_timeout,
+            ..CollectionLimits::default()
+        },
+    )
+    .await
+}
+
 /// Concrete provider-neutral history transport for one prepared Stripe collection.
 ///
 /// A single read session is shared across every source. The client therefore applies one request,
@@ -355,6 +378,8 @@ fn active_failure_for_term<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::cloud_coverage_reconciliation::CollectionStatus;
     use crate::cloud_provider::PayerKind;
@@ -362,6 +387,29 @@ mod tests {
     use crate::cloud_provider_stripe_corrections::StripeRetainedPaidTerm;
     use crate::cloud_provider_stripe_http::StripeNonPaidInvoice;
     use crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence;
+    use async_trait::async_trait;
+
+    struct SlowStripeHistoryClient;
+
+    #[async_trait]
+    impl ProviderHistoryClient for SlowStripeHistoryClient {
+        async fn fetch_page(
+            &mut self,
+            context: &ProviderContext,
+            binding: &SourceBinding,
+            _cursor: Option<&str>,
+        ) -> Result<ProviderHistoryPage, ProviderCollectionError> {
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            Ok(ProviderHistoryPage {
+                context: context.clone(),
+                source_id: binding.source_id.clone(),
+                evidence_reference: "stripe-history:empty".into(),
+                paid_intervals: Vec::new(),
+                next_cursor: None,
+                authoritative_end: true,
+            })
+        }
+    }
 
     fn config() -> StripeCoverageConfig {
         StripeCoverageConfig::new(
@@ -433,6 +481,20 @@ mod tests {
             "pi_predecessor",
             "renewal_one",
         )
+    }
+
+    #[tokio::test]
+    async fn stripe_history_page_can_use_its_read_session_deadline() {
+        let context =
+            ProviderContext::new(STRIPE_NAMESPACE, "acct_test", ProviderEnvironment::Test).unwrap();
+        let binding = ticket().source_bindings[0].clone();
+        let mut client = SlowStripeHistoryClient;
+
+        let collection = collect_stripe_history(&mut client, &context, &[binding])
+            .await
+            .expect("an 11-second logical page fits inside Stripe's 120-second read session");
+
+        assert_eq!(collection.observations.len(), 1);
     }
 
     #[test]
