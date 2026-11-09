@@ -308,13 +308,13 @@ describe("RecipientPage", () => {
     });
 
     vi.mocked(wasm.share_passphrase_key).mockImplementation(
-        (_fragmentKey, passphraseBytes) => {
+        (_fragmentKey: Uint8Array, passphraseBytes: Uint8Array) => {
           const passphrase = new TextDecoder().decode(passphraseBytes);
           return passphrase === "correct-passphrase" ? correctKey : wrongKey;
         },
     );
 
-    vi.mocked(wasm.share_open).mockImplementation((key) => {
+    vi.mocked(wasm.share_open).mockImplementation((key: Uint8Array) => {
       if (key !== correctKey) {
         throw new Error("decryption failed");
       }
