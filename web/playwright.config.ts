@@ -14,7 +14,7 @@ const WEB_PORT = 5199;
 
 export default defineConfig({
   testDir: "./e2e",
-  testMatch: /funnel\.spec\.ts/,
+  testMatch: /(funnel|landing-terminal-motion)\.spec\.ts/,
   fullyParallel: false, // shared server + Postgres state; the funnel is one linear story
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
@@ -53,6 +53,7 @@ export default defineConfig({
         SOTTO_PUBLIC_URL: `http://127.0.0.1:${SERVER_PORT}`,
         SOTTO_DEPLOYMENT_MODE: "cloud",
         SOTTO_CLOUD_SALES_ENABLED: "1",
+        SOTTO_CLOUD_AUTOMATIC_TAX_ENABLED: "1",
         SOTTO_WEB_ORIGIN: `http://127.0.0.1:${WEB_PORT}`,
         GITHUB_CLIENT_ID: "e2e-mock",
         GITHUB_CLIENT_SECRET: "e2e-mock",
@@ -64,6 +65,7 @@ export default defineConfig({
         STRIPE_STANDARD_ANNUAL_PRICE_ID: "price_e2e_standard_annual",
         STRIPE_FOUNDING_MONTHLY_PRICE_ID: "price_e2e_founding_monthly",
         STRIPE_FOUNDING_ANNUAL_PRICE_ID: "price_e2e_founding_annual",
+        STRIPE_CLOUD_PORTAL_CONFIGURATION_ID: "bpc_e2e_mock",
         SOTTO_TELEMETRY: "off",
       },
     },

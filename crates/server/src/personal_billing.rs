@@ -88,10 +88,10 @@ pub async fn begin_account(
     operation_id: &str,
     offer: BillingOffer,
     pending_expires_at_epoch: i64,
-    now_epoch: i64,
+    _now_epoch: i64,
 ) -> Result<String, PersonalBillingError> {
     let existing = sqlx::query(
-        "SELECT operation_id, allocation_reference, offer, state, pending_expires_at_epoch \
+        "SELECT operation_id, allocation_reference, offer, state \
          FROM billing_personal_accounts WHERE user_id = $1 FOR UPDATE",
     )
     .bind(user_id)
@@ -107,10 +107,10 @@ pub async fn begin_account(
         if same_pending {
             return Ok(row.try_get("allocation_reference")?);
         }
-        let existing_pending_expires: i64 = row.try_get("pending_expires_at_epoch")?;
-        let reusable = state == PersonalBillingState::Canceled.as_str()
-            || (state == PersonalBillingState::Pending.as_str()
-                && existing_pending_expires <= now_epoch);
+        // A local Checkout expiry is not proof that Stripe can no longer settle the session.
+        // Reuse only after the signed `checkout.session.expired` webhook has changed this row to
+        // cancelled. The recovery worker owns pending rows whose provider outcome is ambiguous.
+        let reusable = state == PersonalBillingState::Canceled.as_str();
         if reusable {
             let allocation_reference = new_allocation_reference();
             sqlx::query(
@@ -173,13 +173,16 @@ pub async fn load_account(
 pub async fn record_checkout_url(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: &str,
+    session_id: Option<&str>,
     checkout_url: &str,
 ) -> Result<(), PersonalBillingError> {
     sqlx::query(
-        "UPDATE billing_operations SET provider_checkout_url = $2, updated_at = now() \
-         WHERE operation_id = $1",
+        "UPDATE billing_operations SET provider_checkout_url = $3, \
+         provider_checkout_session_id = COALESCE($2, provider_checkout_session_id), updated_at = now() \
+         WHERE operation_id = $1 AND state = 'pending'",
     )
     .bind(operation_id)
+    .bind(session_id)
     .bind(checkout_url)
     .execute(&mut **tx)
     .await?;

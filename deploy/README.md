@@ -55,9 +55,11 @@ entitlement model. Stripe configuration must be paired with `cloud`; the mode re
 New hosted purchases have a separate default-off switch, `SOTTO_CLOUD_SALES_ENABLED=0`. Turning it
 off pauses new quotes and checkout sessions while existing billing portals, cancellation, refund
 handling, and verified webhook settlement remain available. Enabling it requires Cloud mode, all
-Stripe credentials, and the complete four-price hosted catalogue. It does not authorise a launch
-by itself. Operator procedures and deployment controls are maintained separately from the public
-deployment guide.
+Stripe credentials, the complete four-price hosted catalogue, and a safe Customer Portal
+configuration. It also requires `SOTTO_CLOUD_AUTOMATIC_TAX_ENABLED=1`; configure Stripe Tax
+registrations and review the product tax classification before enabling that setting. It does not
+authorise a launch by itself. Operator procedures and deployment controls are maintained separately
+from the public deployment guide.
 
 Hosted catalogue variables are `STRIPE_STANDARD_MONTHLY_PRICE_ID`,
 `STRIPE_STANDARD_ANNUAL_PRICE_ID`, `STRIPE_FOUNDING_MONTHLY_PRICE_ID`, and
@@ -66,9 +68,33 @@ Hosted catalogue variables are `STRIPE_STANDARD_MONTHLY_PRICE_ID`,
 Founding prices remain unavailable unless `SOTTO_FOUNDING_SCHEDULE_WORKER_ENABLED=1`; the switch
 defaults to `0` and requires a complete hosted catalogue plus
 `SOTTO_FOUNDING_SCHEDULE_PREFLIGHT_VERIFIED=1`. Keep both switches at `0` until the founding
-interval-change policy is decided and the complete schedule and renewal flow, including restricted
-key write permissions, has passed a Stripe test-mode rehearsal. Set the preflight value to `1` only
-after recording that evidence. The worker switch does not enable Cloud sales by itself.
+interval-change protection, safe Customer Portal configuration, and complete schedule and renewal
+flow have passed a Stripe test-mode rehearsal. The worker requires
+`STRIPE_CLOUD_PORTAL_CONFIGURATION_ID` even when new sales are off. Set the preflight value to `1`
+only after recording that evidence. The worker switch does not enable Cloud sales by itself.
+Founding price-change notices have their own default-off `SOTTO_FOUNDING_PRICE_NOTICES_ENABLED`
+switch. It requires Cloud mode, the founding schedule worker, the hosted catalogue, and the
+protected billing operator token so late or unresolved notice cohorts can be reviewed. It creates
+only in-app notices after a schedule has been verified; it does not send email or change billing.
+
+Create a dedicated Stripe Customer Portal configuration for Cloud and set its id in
+`STRIPE_CLOUD_PORTAL_CONFIGURATION_ID`. Enable payment-method updates and period-end cancellation
+with no cancellation proration, and disable subscription updates. Sotto retrieves and checks this
+configuration before issuing Cloud quotes and checkout sessions, and passes it to Cloud portal
+sessions when configured. This applies the server owned price catalogue consistently: customers
+can't switch to a plan that Sotto doesn't track for invoice verification. When the variable is
+unset, portal sessions keep Stripe's default configuration as before. The configured portal allows
+payment-method updates and period-end cancellation, with subscription changes disabled.
+This applies to all Cloud customers, including existing organisation subscriptions that use the
+legacy Team billing path; those customers also receive period-end cancellation and cannot change
+plans in the portal once this configuration is set.
+
+Stripe does not allow customers to update or cancel a subscription while a subscription schedule
+is attached. Sotto's founding transition worker attaches such a schedule, so this portal setting
+does not provide a cancellation path for a schedule-managed founder. Keep the worker disabled until
+Sotto's cancellation route can safely end a scheduled subscription and that flow has passed a
+Stripe test-mode rehearsal. The id is not a secret; the API key needs read access to Customer
+Portal configurations and write access to create portal sessions.
 
 Hosted paid-invoice coverage intake and its refresh worker are staged separately and default off:
 `SOTTO_PROVIDER_REFRESH_INGEST_ENABLED=0` and `SOTTO_PROVIDER_REFRESH_WORKER_ENABLED=0`. These
@@ -83,6 +109,18 @@ prepared collection still matches its registered source set. An invoice received
 Checkout subscription is linked is retried without recording a receipt. Neither switch enables
 sales, reconciliation, or Cloud action enforcement; leave these values disabled until the hosted
 provider lifecycle has been exercised and reviewed.
+
+Coverage authority is a separate opt-in. `SOTTO_PROVIDER_AUTHORITY_REVALIDATION_ENABLED=1` starts
+the durable full-source scheduler; set `SOTTO_CLOUD_COVERAGE_AUTHORITY_MAX_AGE_SECONDS` to a
+positive freshness window between 60 seconds and 400 days. New and existing registered sources
+are queued independently of Stripe event ids, and a complete, generation-matched collection is
+required before it can be treated as current. Existing projections without an authority receipt
+remain unavailable to strict authority checks until revalidated. `SOTTO_CLOUD_COVERAGE_AUTHORITY_SHADOW=1`
+uses that result in non-blocking policy observations. Retention always requires current authority
+and holds candidates when it is missing or stale. Keep
+`SOTTO_CLOUD_COVERAGE_AUTHORITY_ENFORCEMENT=0` until the annual/no-event, mixed-source, invalidation,
+and restart cases have passed the pinned-version rehearsal. Enabling shadow or enforcement without
+scheduled revalidation is rejected at startup.
 
 Human hosted action checks are shadow-only by default. They record would-deny decisions while
 existing ACL, grant, lifecycle, and export responses remain unchanged. Do not set
@@ -111,6 +149,76 @@ the window for new requests. The organisation stays frozen for the whole configu
 Changing it never shortens an existing operation's stored `purge_after` deadline.
 Choose a value that covers the managed-backup and export lifecycle: backups taken before purge can
 retain ciphertext after the recovery window, and self-hosted operators must remove unmanaged copies.
+
+Personal Cloud expiry review is separately disabled by default. `SOTTO_CLOUD_RETENTION_DRY_RUN_ENABLED=1`
+starts a bounded reconciler that snapshots only explicitly personal resources and validates them
+after the person's existing export deadline. It never deletes resources, writes deletion receipts or
+tombstones, or enables the retention purge path. Keep it off until a current-candidate backup and
+tombstone restore has been verified and the customer-notice evidence has been reviewed.
+
+Shared organisation expiry review has a separate default-off switch:
+`SOTTO_CLOUD_SHARED_RETENTION_DRY_RUN_ENABLED=1`. It scans organisations whose current owners and
+admins have all lost Cloud eligibility, queues an in-app export notice for each, and starts the
+30-day shared-data export window no earlier than when those notices are first queued. The worker
+snapshots shared scope and performs validation-only dry runs; it cannot purge shared data. Keep this
+switch off until the shared-scope evidence, customer notices, backup and tombstone restore have been
+reviewed. Enabling personal expiry review does not enable the shared scanner.
+
+The protected `/ops/cloud/retention` inspection and action routes are mounted only when
+`SOTTO_CLOUD_RETENTION_OPERATOR_TOKEN` is configured. Use a dedicated value of at least 32
+characters; do not reuse a billing, deployment, or metrics token. The surface returns fixed reason
+codes, counts, deadlines, and opaque job fingerprints. `hold`, `cancel`, and `retry_dry_run` never
+enable purge; an operator-supplied label is audit text, not an authenticated identity. A successful
+dry run is review evidence, not permission to delete data. The purge route and worker have a
+separate default-off gate: `SOTTO_CLOUD_RETENTION_PURGE_ENABLED=1`. They also require a distinct
+destructive operator token, a separate evidence HMAC key, and the exact running build SHA. The
+server binary embeds its build SHA, and startup rejects a runtime SHA that differs from that
+compiled identity. Published images embed the GitHub commit that built them. For a source build,
+set `SOTTO_BUILD_SHA` to the checked-out commit before building and set
+`SOTTO_CLOUD_RETENTION_BUILD_SHA` to the same value at runtime. A source build without embedded
+identity cannot mount or run purge controls. The server refuses incomplete configuration and
+non-Cloud deployment mode. Keep this switch off
+until the current retention policy, customer notices, exact candidate scope, backup and tombstone
+restore rehearsal have all been independently reviewed. Enabling it does not delete anything by
+itself: a reviewer must register signed restore evidence, inspect the opaque scope fingerprint,
+and approve the exact dry-run candidate. An `operator_hold` can be lifted only by explicitly
+approving the current scope with fresh restore evidence. Before each bounded batch the worker
+rechecks the live approval, scope, eligibility, notice and restore-evidence journal count. A
+successful batch adds tombstones, invalidates that approval, and holds the remaining work for a
+fresh restore rehearsal and approval. The destructive operator label is audit text, not an
+authenticated individual; use the credentials only through the protected operator channel and do
+not place them in logs or support messages.
+
+Cloud lifecycle observability has its own optional credentials. See
+[`cloud-operations.md`](cloud-operations.md) for the generic protected routes and
+their separation from liveness, readiness, customer retrieval, payment-to-access acceptance and
+destructive retention. Leave the metrics and coverage-repair credentials blank until the scraper
+and private operator procedure are configured; never reuse the retention, billing-review or purge
+credentials.
+
+The signed request is produced offline from the matching backup and sidecar after restoring them
+to a dedicated local database. Name that database `retention_restore_<name>`, export its URL as
+`SOTTO_RETENTION_REHEARSAL_DATABASE_URL` (never pass it as a command-line argument), and materialise
+the evidence HMAC key from the secret store in a file readable only by the operator. From the exact
+release checkout, run:
+
+```sh
+scripts/retention-restore-rehearsal \
+  --backup ./sotto-<stamp>.dump \
+  --journal ./sotto-<stamp>.tombstones.jsonl \
+  --evidence-key-file ./retention-evidence.key \
+  --release-sha "$(git rev-parse HEAD)" \
+  --operator "<operator label>" \
+  --output ./restore-evidence-request.json
+```
+
+The command requires a local scratch database and key file mode `0600`; it validates the restored
+schema before and after replay, runs the matching sidecar twice, checks that the second replay is a
+no-op, and tests stale-incarnation guards against temporary rows in the scratch database. It writes
+the exact JSON body for `/ops/cloud/retention/purge/restore-evidence` with mode `0600`. Review and
+submit that body through the protected operator channel. The script does not contact the live
+service or register evidence itself; the evidence key must match the running build's configured
+key, and the release SHA must match that build.
 
 On a 1 GB host, give the kernel some headroom before the first start:
 
@@ -148,10 +256,15 @@ change entitlements; an approved cohort and notice decision is required before a
 git pull    # picks up compose/runbook changes
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml restart caddy
 ```
 
 Migrations are forward-only and applied on boot. Check the release notes for anything flagged as
 a compatibility break before upgrading past a minor version.
+
+Restarting Caddy after the server is recreated makes it resolve the server's new container address.
+Without this, the proxy can keep sending API and webhook requests to the previous address and return
+502 responses until Caddy restarts.
 
 **Renamed settings are the one thing `git pull` cannot fix for you.** Your `.env` is deliberately
 untracked, so a variable renamed upstream leaves the old name sitting in your file where nothing
@@ -195,7 +308,12 @@ deletion journal. The sidecar is deliberately separate from the dump: a dump tak
 purge must not resurrect ciphertext when it is restored. It contains resource identifiers and
 ownership checks, never ciphertext or secret values, and is validated before upload by
 [`replay-retention-journal`](../scripts/replay-retention-journal). Keep both objects under the
-same bucket lifecycle policy; a dump without its sidecar is not a restorable backup.
+same bucket lifecycle policy. A backup whose schema includes migration 50 or later needs a
+sidecar at least as recent as the dump. Older backups predate the journal table and can only be
+restored with an empty journal; the restore drill checks that schema boundary before allowing
+that case. The export matches: on a database without the journal table it uploads an empty
+sidecar instead of failing the run, so a host running a newer script against an older database
+still ships its dump.
 
 | `SOTTO_BACKUP_BUCKET` | Uploads with | Works for |
 |---|---|---|
@@ -255,8 +373,19 @@ One-time setup, any provider:
 
    ```sh
    crontab -e     # add:
+   # PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin
    # 17 2 * * * cd $HOME/sotto/deploy && ./backup.sh >> $HOME/sotto-backup.log 2>&1
    ```
+
+   Cron does not read your shell profile, so its `PATH` is little more than `/usr/bin:/bin`. A
+   `gsutil`, `aws` or `rclone` installed anywhere else works when you run the script by hand and is
+   missing every night. Set `PATH` in the crontab to include wherever `command -v gsutil` (or your
+   uploader) points. The script checks for its tools before dumping and names any that are missing.
+
+   Every run logs a UTC-timestamped `backup started` and then exactly one of `backup ok: <object>`
+   or `backup FAILED while <step> (exit <status>)`, so the log shows which night failed and where.
+   Each object upload is retried twice before the run gives up: a single missed night breaches
+   the 26-hour freshness threshold, so a transient blip must not fail the night.
 
 5. **Watch that it keeps running.** Cron reports to nobody, and a bucket that has stopped
    receiving objects looks exactly like a bucket nobody has checked. Installing step 4 and
@@ -329,6 +458,27 @@ One-time setup, any provider:
    A non-zero exit is the alarm. On AWS the federated equivalent of the grant above is registering
    GitHub's OIDC issuer as an identity provider and giving the role a trust policy conditioned on
    the repository, with `s3:ListBucket` and nothing else.
+
+6. **When the alarm fires** (a `Backups are stale` issue labelled `backup-alert`), work on the
+   host:
+
+   ```sh
+   crontab -l | grep backup.sh                 # is the entry still installed?
+   grep -E 'backup (started|ok|FAILED)' $HOME/sotto-backup.log | tail -n 6
+   journalctl -u cron --since "2 days ago"     # did cron start it? (/var/log/syslog without journald)
+   ```
+
+   - No `backup started` line for the missed night means cron never ran the script: the entry is
+     gone, the host was down at that time, or cron itself is stopped.
+   - A `backup FAILED while <step>` line names the step that failed. Read the tool output just above
+     it for the reason.
+   - A `backup ok` line for a night whose object is missing from the bucket should no longer occur.
+     Versions before this log line was added could print `ok` after a failed dump upload, so do not
+     trust an older `ok` line.
+
+   Once the cause is fixed, take a backup by hand (`./backup.sh`) rather than waiting a night, then
+   run the `Backup freshness` workflow manually. It closes the issue when it sees a fresh backup;
+   do not close it by hand, because that hides the alarm without checking anything.
 
 **Restore** (into a running instance; drops and recreates objects from the dump). Fetch the
 dump on your own machine, never the host - the append-only posture means the host cannot read
@@ -543,8 +693,10 @@ this uploads only this repository's source, which is public.
 What it asserts, which is the rehearsal of 2026-08-31 written down:
 
 - `pg_restore` completes with no errors;
-- a retention sidecar exists and passes strict JSON-lines validation;
-- every deletion in that sidecar is replayed against the restored database with its ownership,
+- a retention sidecar for schema at migration 50 or later exists and passes strict JSON-lines
+  validation; an older schema is accepted without a sidecar only after the drill verifies it
+  predates the retention journal, then replays an empty journal;
+- every deletion in a sidecar is replayed against the restored database with its ownership,
   creation-time and revision guards, so purged rows cannot reappear;
 - every migration the dump recorded is marked successful, and none is a version this checkout
   does not carry. A deployment **behind** the branch passes: production is often a release or
@@ -734,8 +886,9 @@ somewhere else before they age out is the whole of what that takes.
 
 Set the repository variable `SOTTO_PUBLIC_URL` to the deployment to watch. Without it the job
 skips rather than probing a default, so a fork cannot point it at somebody else's deployment.
-Set `SOTTO_CANARY_TOKEN` as well if you want the secret-sync row measured rather than reported
-unconfigured; the probe table above says how.
+Set `SOTTO_CANARY_TOKEN` and `SOTTO_HUMAN_CANARY_TOKEN` plus the variable
+`SOTTO_HUMAN_CANARY_ENVIRONMENT_ID` if you want both authenticated retrieval rows measured rather
+than reported unconfigured; the probe table and setup notes below explain their boundaries.
 
 **In a fork, one line has to change as well.** The job carries
 `if: github.repository == 'getsotto/sotto'`, so a fork of this repository collects nothing and
@@ -767,16 +920,17 @@ record that is meant to be permanent:
   Before that the path falls through to the single-page app, and the API row records real
   downtime for a deployment that is working.
 
-Four of the five probes are unauthenticated and ask only what a visitor could ask. The fifth
-presents a machine token, and is described after the table:
+Four of the six probes are unauthenticated and ask only what a visitor could ask. The other two
+use ordinary authentication against a synthetic environment:
 
-| Component   | Probe                                          | Healthy answer                   |
-| ----------- | ---------------------------------------------- | -------------------------------- |
-| API         | `GET /health/ready`                            | `200` with the body `ok`         |
-| Web app     | `GET /`                                        | `200` and an HTML content type   |
-| Sign in     | `GET /auth/github/login` with a loopback callback | a redirect to `github.com`    |
-| Billing     | `POST /billing/webhook` with no signature      | `401`                            |
-| Secret sync | `GET /machine/grant` and `GET /machine/secrets` | a usable grant and a usable secret |
+| Component        | Probe                                               | Healthy answer                                |
+| ---------------- | --------------------------------------------------- | --------------------------------------------- |
+| API              | `GET /health/ready`                                 | `200` with the body `ok`                      |
+| Web app          | `GET /`                                             | `200` and an HTML content type                |
+| Sign in          | `GET /auth/github/login` with a loopback callback   | a redirect to `github.com`                    |
+| Billing          | `POST /billing/webhook` with no signature           | `401`                                         |
+| Secret sync       | `GET /machine/grant` and `GET /machine/secrets`     | a usable grant and a usable secret            |
+| Human API access  | `GET /environments/{id}/secrets` with a user session | a usable synthetic encrypted secret snapshot |
 
 Two of those distinguish "not configured" from "broken", because they are not the same thing
 and only one of them belongs in an uptime figure. A `503` from sign-in or billing means the
@@ -789,10 +943,10 @@ The billing probe deliberately sends an unsigned payload and requires a `401`. A
 would mean signature verification is not happening, so that case is recorded as down rather
 than as a passing request.
 
-Secret sync is the one probe that authenticates, because the question it asks cannot be asked
-from outside: can a machine still get hold of what it needs to decrypt an environment? Every
-other probe reads a public surface, and a deployment can serve all of them perfectly while the
-grant that makes a CI run work has gone.
+The two retrieval probes authenticate because these questions cannot be asked from outside: can a
+machine still get its sealed grant and ciphertext, and can an ordinary signed-in user still read
+an environment they are authorised to access? A deployment can serve every public surface
+perfectly while either authenticated path is broken.
 
 It needs a throwaway project holding junk secrets and a machine token scoped to one of its
 environments. A personal project is enough; an organisation is only needed for sharing, and a
@@ -808,7 +962,7 @@ sotto token create --name status-canary --expires-in-days 365   # prints a SOTTO
 gh secret set SOTTO_CANARY_TOKEN --body 'smt_...'   # the part BEFORE the dot, nothing after it
 ```
 
-The canary token expires like any other, a year at most, and an expired token is refused exactly
+The machine canary token expires like any other, a year at most, and an expired token is refused exactly
 as a revoked one is. The probe cannot tell the two apart, so a lapsed canary token is recorded as
 secret sync being down. `sotto token ls`, run in the canary project, shows its end date; replace
 it before then, and put that date somewhere you will see it, because this job never alerts.
@@ -821,7 +975,7 @@ and decrypt the canary. Refusing is what makes "the collector cannot decrypt" a 
 it holds rather than a promise about what it does. If the whole token is stored, the row reports
 unconfigured and says so.
 
-Without the secret the row reports unconfigured and the other four probes are unaffected, which
+Without the machine secret the row reports unconfigured and the other five probes are unaffected, which
 is what a self-hoster with no canary should see: an unconfigured component is not an outage and
 is left out of the tally.
 
@@ -838,6 +992,14 @@ grown, not the deployment having failed, and it has no business in the published
 not to have. The credential is also withheld from a target that has not answered for itself:
 unauthenticated probes run first, and if the configured URL is not `https`, or every one of them
 was redirected elsewhere, no token is sent at all.
+
+The human row uses a normal Sotto user session, not a special canary header or bypass. Keep its
+account dedicated to the canary, with access only to one throwaway project containing junk
+secrets. Configure the session bearer in the repository secret `SOTTO_HUMAN_CANARY_TOKEN` and
+the environment id in `SOTTO_HUMAN_CANARY_ENVIRONMENT_ID`. User sessions expire after 30 days, so
+rotate this secret through the ordinary sign-in flow before expiry. Do not use a staff account or
+an account with customer or organisation access. With either setting absent, the human row reports
+unconfigured and no authenticated request is made.
 
 The job records and never alerts. A component being down leaves the workflow green, because
 paging belongs to an external monitor that survives this repository being unreachable, and a
@@ -1104,6 +1266,55 @@ organisation whose purge has already begun. Existing operations keep their store
 deadline; the routes return `404` again and the worker stops advancing the queue, leaving frozen
 organisations frozen until deletion is re-enabled or an operator recovers them through the runbook.
 
+## Cloud lifecycle email contacts
+
+Contact enrolment is optional and independent of billing and vault access. Both
+`SOTTO_CLOUD_CONTACT_ENROLMENT_ENABLED` and `SOTTO_CLOUD_CONTACT_EMAIL_SEND_ENABLED` default to
+`0` and must be enabled together; the server rejects a partial configuration. Keep both off until
+the sender domain is authenticated and a test recipient has completed the full challenge flow.
+The server requires an HTTPS `SOTTO_WEB_ORIGIN`, a configured sender address, and the transport
+credential from the deployment secret store. Do not put the credential in a checked-in file or
+pass it on a command line.
+
+The contact endpoints let a signed-in user set, verify, view, and revoke their own lifecycle email
+address without unlocking the vault. Verification proves control of that address; it does not
+change billing, access, or export rights, and it does not mean future notices have been delivered.
+The verification callback token is one-use and short-lived. The server stores only its digest.
+
+To disable the journey, turn both flags off and restart the server. Existing verified contacts are
+retained, and users can still revoke their own contact. Re-enabling the flags does not resend an
+old challenge; the user starts a fresh verification request.
+
+Lifecycle-notice email dispatch is a separate Cloud-only control:
+`SOTTO_CLOUD_NOTICE_DISPATCH_ENABLED` defaults to `0`. It requires the configured Resend API
+credential, sender address and webhook signing secret. The callback path is rate-limited at the
+edge and accepts only signed provider feedback. Relay acceptance is recorded separately from a
+verified delivery event. Notices with a future due date are not sent early; uncertain sends are
+retried with one stable message identity only inside the provider's idempotency window. The
+dispatcher never enables sales or coverage enforcement and is not started on self-hosted instances.
+Each email links to the no-vault `/cloud` account surface.
+Impending-purge email remains unavailable until the purge notice timing policy is approved; dispatch
+does not infer a cadence from the retention deadline.
+
+Email intents are recorded for users with a verified contact even while dispatch is disabled. Before
+enabling dispatch after contact enrolment has been available, review the pending queue through the
+protected notice diagnostics and suppress notices that are no longer timely; due backlog becomes
+eligible for sending as soon as the worker starts. A send whose outcome remains unknown is moved to
+`delivery_unknown` 23 hours after its first attempt to stay inside Resend's idempotency window. Check
+the provider dashboard before deciding how to handle that notice; do not create a new message identity
+to retry it.
+
+The recovery-period warning is scheduled three days before the recovery deadline and is sent only
+while the same renewal remains in recovery. If payment resolves or the recovery period ends before the
+warning is delivered, current eligibility suppresses it.
+
+Protected notice diagnostics are available at `/ops/cloud/notices` when the existing Cloud retention
+operator token is configured. The endpoint returns bounded opaque fingerprints and fixed reason
+codes only. `retry` is limited to a known rejected request with a current verified contact and a
+remaining idempotency window; `suppress` only stops work that has not been accepted by the provider.
+Operator labels are declared audit text, not authenticated identities. A sent message cannot be
+recalled, and this surface is not a live-delivery rehearsal.
+
 ## Database security
 
 The default `docker-compose.prod.yml` keeps Postgres on the **internal compose network only** - it
@@ -1172,6 +1383,155 @@ Card data never touches the server - checkout and subscription management happen
 Stripe-hosted pages, and the webhook only assigns the org's tier.
 
 ## Operations
+
+The default-off `SOTTO_BILLING_RECOVERY_WORKER_ENABLED` retries interrupted personal Checkout
+creation from the stored offer, allocation, expiry and original Stripe idempotency key. It only
+creates or reopens the same Checkout session; payment and coverage still require the signed
+`invoice.paid` webhook. Retries stop before Stripe's documented idempotency-key pruning window, and
+ambiguous older operations are parked for review. The worker also checks Stripe's current status
+for locally expired pending personal accounts with a stored Checkout session id. For older rows
+that contain only the Checkout URL, it extracts the session id from the URL path; it also accepts
+`provider_operation_id` when that field actually contains a Checkout session id. Stripe's response
+must confirm the exact personal operation before the account is released, and the session must be
+expired and unpaid. This repairs missed or previously acknowledged expiry events; an open or
+completed session is never released by this check. This switch does not enable sales.
+
+The default-off `SOTTO_SPONSORED_BILLING_RECOVERY_WORKER_ENABLED` reconciles saved sponsored
+Checkout and shared-subscription schedule requests. It reuses the exact saved request and original
+Stripe idempotency key, and parks missing, changed or out-of-window evidence for review. Signed
+payment webhooks remain authoritative for activating sponsored seats. This switch requires Cloud
+mode and the hosted Stripe price catalogue, and it does not enable sponsored sales or refund
+processing. Older unresolved operations without saved request facts are parked by migration 0071;
+do not reconstruct a provider request manually.
+
+Signed Stripe expiry and paid webhooks can still close an operation while it is in `manual_review`.
+For an operation parked without a recorded Checkout session, first search Stripe for
+`client_reference_id=sponsored:<operation_id>`, subscription metadata
+`sponsored_operation_id=<operation_id>`, and related invoices and payments. Do not clear the seat
+or founding reservation if any provider object or payment may exist. If Stripe confirms that no
+Checkout session, subscription, invoice, or payment exists, record the incident and perform this
+guarded repair. The capacity row and operation query must each return exactly one row; the seat
+query may return zero or one pending seat; the reservation query may return zero or one reserved
+reservation. Roll back if another state or provider reference is present. The three updates must
+affect one operation and no more than one seat or reservation; otherwise roll back and investigate.
+
+```sql
+BEGIN;
+SELECT singleton FROM billing_founding_capacity WHERE singleton = TRUE FOR UPDATE;
+SELECT operation_id FROM billing_sponsored_operations
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND recovery_manual_review_required = TRUE
+   AND action = 'add'
+   AND provider_customer_id IS NULL
+   AND provider_subscription_id IS NULL
+   AND provider_checkout_session_id IS NULL
+   AND provider_payment_reference IS NULL
+   AND provider_item_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL
+ FOR UPDATE;
+SELECT seat_id FROM billing_sponsored_seats
+ WHERE operation_id = '<operation_id>' AND state = 'pending'
+ FOR UPDATE;
+SELECT reservation_id FROM billing_founding_reservations
+ WHERE operation_id = '<operation_id>' AND status = 'reserved'
+ FOR UPDATE;
+UPDATE billing_founding_reservations
+   SET status = 'released', updated_at = now()
+ WHERE operation_id = '<operation_id>' AND status = 'reserved';
+UPDATE billing_sponsored_seats
+   SET state = 'canceled', updated_at = now()
+ WHERE operation_id = '<operation_id>' AND state = 'pending';
+UPDATE billing_sponsored_operations
+   SET state = 'failed', result_code = 'operator_confirmed_no_provider_object',
+       recovery_manual_review_required = FALSE,
+       recovery_last_error_code = 'operator_confirmed_no_provider_object',
+       recovery_lease_token = NULL, recovery_lease_until = NULL, updated_at = now()
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND recovery_manual_review_required = TRUE
+   AND action = 'add'
+   AND provider_customer_id IS NULL
+   AND provider_subscription_id IS NULL
+   AND provider_checkout_session_id IS NULL
+   AND provider_payment_reference IS NULL
+   AND provider_item_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL
+ RETURNING operation_id;
+COMMIT;
+```
+
+Notify the organisation owner and beneficiary after commit. If the session, subscription, invoice,
+or payment cannot be ruled out, leave the operation and seat parked and escalate; do not create a
+replacement Checkout or rebuild the missing request.
+
+For a parked personal Checkout with no session id, do not clear the account because its local
+deadline elapsed. Check Stripe's event log and the customer's Checkout/subscription/payment history
+for the exact `client_reference_id` `personal:<operation_id>`. If a session exists, keep the account
+blocked and have an operator record its exact `cs_…` id on that operation so the recovery worker can
+verify its status. Bind it only when the row is still parked for this reason; require one returned
+row, then let the worker inspect Stripe before changing the account:
+
+```sql
+UPDATE billing_operations
+   SET provider_checkout_session_id = '<cs_session_id>',
+       reconciliation_next_attempt_at = now(), updated_at = now()
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND result_code = 'provider_idempotency_window_elapsed'
+   AND provider_checkout_session_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL
+   AND EXISTS (SELECT 1 FROM billing_personal_accounts AS account
+                WHERE account.operation_id = billing_operations.operation_id
+                  AND account.state = 'pending'
+                  AND account.pending_expires_at_epoch <= extract(epoch FROM now())::bigint)
+ RETURNING operation_id;
+```
+
+If Stripe confirms that no session, payment, invoice or subscription exists,
+perform the following guarded repair in one database transaction. First record the operation id and
+Stripe review in the incident log. The first two `SELECT`s must each return exactly one row; if
+either returns no row or multiple rows, roll back and investigate. The `UPDATE`s must affect one
+operation and one account; otherwise roll back. Notify the customer after commit so they can retry.
+
+```sql
+BEGIN;
+SELECT singleton FROM billing_founding_capacity WHERE singleton = TRUE FOR UPDATE;
+SELECT operation_id FROM billing_operations
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND result_code = 'provider_idempotency_window_elapsed'
+   AND provider_checkout_session_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL
+ FOR UPDATE;
+SELECT operation_id FROM billing_personal_accounts
+ WHERE operation_id = '<operation_id>'
+   AND state = 'pending'
+   AND pending_expires_at_epoch <= extract(epoch FROM now())::bigint
+ FOR UPDATE;
+UPDATE billing_founding_reservations SET status = 'released', updated_at = now()
+ WHERE operation_id = '<operation_id>' AND status = 'reserved';
+UPDATE billing_personal_accounts SET state = 'canceled', updated_at = now()
+ WHERE operation_id = '<operation_id>' AND state = 'pending';
+UPDATE billing_operations SET state = 'failed', result_code = 'operator_confirmed_no_session',
+       reconciliation_manual_review_required = FALSE,
+       reconciliation_last_error_code = 'operator_confirmed_no_session',
+       reconciliation_lease_token = NULL, reconciliation_lease_until = NULL, updated_at = now()
+ WHERE operation_id = '<operation_id>'
+   AND state = 'manual_review'
+   AND result_code = 'provider_idempotency_window_elapsed'
+   AND provider_checkout_session_id IS NULL
+   AND provider_operation_id IS NULL
+   AND provider_checkout_url IS NULL;
+COMMIT;
+```
+
+If a provider session or payment cannot be ruled out, leave the operation parked and escalate; do
+not create another Checkout or mark the account canceled.
 
 ```sh
 docker compose -f docker-compose.prod.yml logs -f server   # API logs

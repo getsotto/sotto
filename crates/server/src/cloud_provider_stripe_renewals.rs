@@ -1,8 +1,9 @@
-//! Pure, signed evidence for one failed automatic personal subscription renewal.
+//! Immutable evidence for one failed automatic Stripe subscription renewal.
 //!
-//! The decoder consumes an authenticated invoice history and a signed
-//! `invoice.payment_failed` snapshot. It never reads Stripe, consults a clock, writes a receipt,
-//! or decides current entitlement. A linked result is historical evidence only.
+//! Personal evidence is decoded from an authenticated invoice history and a signed
+//! `invoice.payment_failed` snapshot. Sponsored evidence is assembled from bounded authenticated
+//! API reads because a grouped invoice has no single beneficiary allocation reference. Neither
+//! path decides current entitlement; linked results are historical evidence only.
 
 use std::fmt;
 
@@ -36,6 +37,7 @@ pub struct StripeRenewalFailureEvidence {
     customer_id: String,
     subscription_id: String,
     provider_item_id: String,
+    provider_price_id: Option<String>,
     predecessor_period_start: i64,
     predecessor_period_end: i64,
     renewal_period_start: i64,
@@ -45,6 +47,85 @@ pub struct StripeRenewalFailureEvidence {
 }
 
 impl StripeRenewalFailureEvidence {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_sponsored_parts(
+        event_id: &str,
+        invoice_id: &str,
+        invoice_line_id: &str,
+        predecessor_invoice_id: &str,
+        predecessor_evidence_reference: &str,
+        provider_account_id: &str,
+        environment: ProviderEnvironment,
+        allocation_reference: &str,
+        customer_id: &str,
+        subscription_id: &str,
+        provider_item_id: &str,
+        provider_price_id: &str,
+        predecessor_period_start: i64,
+        predecessor_period_end: i64,
+        renewal_period_start: i64,
+        renewal_period_end: i64,
+        event_created_at: i64,
+        interval: StripeInterval,
+    ) -> Result<Self, ProviderAdapterError> {
+        if [
+            event_id,
+            invoice_id,
+            invoice_line_id,
+            predecessor_invoice_id,
+            predecessor_evidence_reference,
+            provider_account_id,
+            allocation_reference,
+            customer_id,
+            subscription_id,
+            provider_item_id,
+            provider_price_id,
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+            || predecessor_period_start < 0
+            || predecessor_period_end <= predecessor_period_start
+            || predecessor_period_end != renewal_period_start
+            || renewal_period_end <= renewal_period_start
+            || event_created_at < 0
+        {
+            return Err(ProviderAdapterError::InvalidEvidence(
+                "sponsored renewal evidence is incomplete or non-contiguous".into(),
+            ));
+        }
+        let mut evidence = Self {
+            evidence_reference: String::new(),
+            renewal_id: renewal_identity_from_parts(
+                provider_account_id,
+                environment,
+                allocation_reference,
+                subscription_id,
+                provider_item_id,
+                invoice_id,
+            ),
+            event_id: event_id.to_owned(),
+            invoice_id: invoice_id.to_owned(),
+            invoice_line_id: invoice_line_id.to_owned(),
+            predecessor_invoice_id: predecessor_invoice_id.to_owned(),
+            predecessor_evidence_reference: predecessor_evidence_reference.to_owned(),
+            provider_account_id: provider_account_id.to_owned(),
+            environment,
+            allocation_reference: allocation_reference.to_owned(),
+            customer_id: customer_id.to_owned(),
+            subscription_id: subscription_id.to_owned(),
+            provider_item_id: provider_item_id.to_owned(),
+            provider_price_id: Some(provider_price_id.to_owned()),
+            predecessor_period_start,
+            predecessor_period_end,
+            renewal_period_start,
+            renewal_period_end,
+            event_created_at,
+            interval,
+        };
+        evidence.evidence_reference = evidence_reference(&evidence);
+        Ok(evidence)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         allocation_reference: &str,
@@ -69,6 +150,7 @@ impl StripeRenewalFailureEvidence {
             customer_id: customer_id.into(),
             subscription_id: subscription_id.into(),
             provider_item_id: provider_item_id.into(),
+            provider_price_id: None,
             predecessor_period_start: 1_700_000_000,
             predecessor_period_end: 1_702_592_000,
             renewal_period_start: 1_702_592_000,
@@ -143,6 +225,10 @@ impl StripeRenewalFailureEvidence {
         &self.provider_item_id
     }
 
+    pub fn provider_price_id(&self) -> Option<&str> {
+        self.provider_price_id.as_deref()
+    }
+
     pub const fn predecessor_period_start(&self) -> i64 {
         self.predecessor_period_start
     }
@@ -170,14 +256,27 @@ impl StripeRenewalFailureEvidence {
     /// Derive the generic provider event identity without retaining the signed payload.
     pub(crate) fn verified_event(&self) -> Result<VerifiedProviderEvent, ProviderAdapterError> {
         let canonical = canonical_event_encoding(self);
-        VerifiedProviderEvent::from_payload(
-            self.event_id.clone(),
-            "invoice.payment_failed",
-            self.event_created_at,
-            Some(self.subscription_id.clone()),
-            Some(self.allocation_reference.clone()),
-            &canonical,
-        )
+        let grouped_sponsored = self.provider_price_id.is_some();
+        if grouped_sponsored {
+            VerifiedProviderEvent::from_payload_with_object_id(
+                self.event_id.clone(),
+                "invoice.payment_failed",
+                self.event_created_at,
+                Some(self.subscription_id.clone()),
+                None,
+                self.invoice_id.clone(),
+                &canonical,
+            )
+        } else {
+            VerifiedProviderEvent::from_payload(
+                self.event_id.clone(),
+                "invoice.payment_failed",
+                self.event_created_at,
+                Some(self.subscription_id.clone()),
+                Some(self.allocation_reference.clone()),
+                &canonical,
+            )
+        }
     }
 
     /// Reconstruct sealed evidence from validated persistence columns.
@@ -188,7 +287,14 @@ impl StripeRenewalFailureEvidence {
     pub(crate) fn from_stored(
         stored: StoredStripeRenewalFailure,
     ) -> Result<Self, ProviderAdapterError> {
-        if stored.version != RENEWAL_EVIDENCE_VERSION {
+        if !matches!(
+            stored.version,
+            PERSONAL_RENEWAL_EVIDENCE_VERSION | SPONSORED_RENEWAL_EVIDENCE_VERSION
+        ) || (stored.version == PERSONAL_RENEWAL_EVIDENCE_VERSION
+            && stored.provider_price_id.is_some())
+            || (stored.version == SPONSORED_RENEWAL_EVIDENCE_VERSION
+                && stored.provider_price_id.is_none())
+        {
             return Err(ProviderAdapterError::InvalidEvidence(
                 "unsupported Stripe renewal evidence version".into(),
             ));
@@ -253,6 +359,7 @@ impl StripeRenewalFailureEvidence {
             customer_id: stored.customer_id,
             subscription_id: stored.subscription_id,
             provider_item_id: stored.provider_item_id,
+            provider_price_id: stored.provider_price_id,
             predecessor_period_start: stored.predecessor_period_start,
             predecessor_period_end: stored.predecessor_period_end,
             renewal_period_start: stored.renewal_period_start,
@@ -283,7 +390,8 @@ impl StripeRenewalFailureEvidence {
     }
 }
 
-pub(crate) const RENEWAL_EVIDENCE_VERSION: i16 = 1;
+pub(crate) const PERSONAL_RENEWAL_EVIDENCE_VERSION: i16 = 1;
+pub(crate) const SPONSORED_RENEWAL_EVIDENCE_VERSION: i16 = 2;
 
 /// Persistence-shaped data accepted only by the validated reconstruction path above.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,6 +410,7 @@ pub(crate) struct StoredStripeRenewalFailure {
     pub customer_id: String,
     pub subscription_id: String,
     pub provider_item_id: String,
+    pub provider_price_id: Option<String>,
     pub predecessor_period_start: i64,
     pub predecessor_period_end: i64,
     pub renewal_period_start: i64,
@@ -369,7 +478,6 @@ pub fn decode_personal_renewal_failure(
             if term.allocation_reference() != binding.allocation_reference()
                 || term.customer_id() != binding.customer_id()
                 || term.subscription_id() != binding.subscription_id()
-                || term.provider_item_id() != binding.provider_item_id()
             {
                 return Err(StripeContractError::OwnershipMismatch);
             }
@@ -431,16 +539,9 @@ pub fn decode_personal_renewal_failure(
     if customer_id != binding.customer_id() {
         return Err(StripeContractError::OwnershipMismatch);
     }
-    let allocation_reference = invoice
-        .get("metadata")
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get(STRIPE_ALLOCATION_METADATA_KEY))
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-        .ok_or(StripeContractError::MissingField(
-            "metadata.sotto_allocation_reference",
-        ))?;
+    let allocation_reference = invoice_allocation_reference(invoice).ok_or(
+        StripeContractError::MissingField("metadata.sotto_allocation_reference"),
+    )?;
     if allocation_reference != binding.allocation_reference() {
         return Err(StripeContractError::OwnershipMismatch);
     }
@@ -468,7 +569,8 @@ pub fn decode_personal_renewal_failure(
     let amount_remaining = required_i64(invoice, "amount_remaining")?;
     let amount_paid = required_i64(invoice, "amount_paid")?;
     let amount_overpaid = required_i64(invoice, "amount_overpaid")?;
-    let amount_paid_off_stripe = required_i64(invoice, "amount_paid_off_stripe")?;
+    let amount_paid_off_stripe = optional_i64(invoice, "amount_paid_off_stripe")?;
+    let starting_balance = required_i64(invoice, "starting_balance")?;
     for (amount, field) in [
         (amount_due, "amount_due"),
         (amount_remaining, "amount_remaining"),
@@ -486,7 +588,11 @@ pub fn decode_personal_renewal_failure(
     if amount_remaining == 0 {
         return Err(StripeContractError::InvalidField("amount_remaining"));
     }
-    if amount_paid != 0 || amount_overpaid != 0 || amount_paid_off_stripe != 0 {
+    if amount_paid != 0
+        || amount_overpaid != 0
+        || amount_paid_off_stripe != 0
+        || starting_balance != 0
+    {
         return Err(StripeContractError::UnsupportedSettlement(
             "renewal invoice has a partial or off-Stripe settlement",
         ));
@@ -651,7 +757,6 @@ pub fn decode_personal_renewal_failure(
                     && term.allocation_reference() == binding.allocation_reference()
                     && term.customer_id() == binding.customer_id()
                     && term.subscription_id() == binding.subscription_id()
-                    && term.provider_item_id() == binding.provider_item_id()
                     && term.interval() == expected_interval
                     && term.period_end() == renewal_period_start =>
             {
@@ -686,10 +791,11 @@ pub fn decode_personal_renewal_failure(
         predecessor_evidence_reference: term.evidence_reference().to_owned(),
         provider_account_id: config.account_id.clone(),
         environment: config.environment,
-        allocation_reference,
+        allocation_reference: allocation_reference.to_owned(),
         customer_id,
         subscription_id,
         provider_item_id,
+        provider_price_id: None,
         predecessor_period_start: term.period_start(),
         predecessor_period_end: term.period_end(),
         renewal_period_start,
@@ -699,6 +805,27 @@ pub fn decode_personal_renewal_failure(
     };
     evidence.evidence_reference = evidence_reference(&evidence);
     Ok(StripeRenewalFailureResult::Linked(Box::new(evidence)))
+}
+
+fn invoice_allocation_reference(invoice: &Value) -> Option<&str> {
+    let root = invoice.get("metadata");
+    let parent = invoice
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_details"))
+        .and_then(|details| details.get("metadata"));
+    let line = invoice
+        .get("lines")
+        .and_then(|lines| lines.get("data"))
+        .and_then(Value::as_array)
+        .filter(|lines| lines.len() == 1)
+        .and_then(|lines| lines.first())
+        .and_then(|line| line.get("metadata"));
+    [line, parent, root]
+        .into_iter()
+        .flatten()
+        .find_map(|metadata| metadata.get(STRIPE_ALLOCATION_METADATA_KEY))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Link an authenticated repair candidate to exactly one previously paid predecessor.
@@ -723,7 +850,6 @@ pub(crate) fn link_repaired_candidate(
         || history.customer_id() != binding.customer_id()
         || candidate.customer_id() != binding.customer_id()
         || candidate.subscription_id() != binding.subscription_id()
-        || candidate.provider_item_id() != binding.provider_item_id()
         || candidate.allocation_reference() != binding.allocation_reference()
     {
         return Err(StripeContractError::ContextMismatch);
@@ -737,7 +863,6 @@ pub(crate) fn link_repaired_candidate(
                     && term.allocation_reference() == binding.allocation_reference()
                     && term.customer_id() == binding.customer_id()
                     && term.subscription_id() == binding.subscription_id()
-                    && term.provider_item_id() == binding.provider_item_id()
                     && term.interval() == candidate.interval()
                     && term.period_end() == candidate.period_start() =>
             {
@@ -763,7 +888,14 @@ pub(crate) fn link_repaired_candidate(
     };
     let mut evidence = StripeRenewalFailureEvidence {
         evidence_reference: String::new(),
-        renewal_id: renewal_identity(config, binding, candidate.invoice_id()),
+        renewal_id: renewal_identity_from_parts(
+            &config.account_id,
+            config.environment,
+            binding.allocation_reference(),
+            binding.subscription_id(),
+            candidate.provider_item_id(),
+            candidate.invoice_id(),
+        ),
         event_id: provenance.event_id().to_owned(),
         invoice_id: candidate.invoice_id().to_owned(),
         invoice_line_id: candidate.invoice_line_id().to_owned(),
@@ -775,6 +907,7 @@ pub(crate) fn link_repaired_candidate(
         customer_id: candidate.customer_id().to_owned(),
         subscription_id: candidate.subscription_id().to_owned(),
         provider_item_id: candidate.provider_item_id().to_owned(),
+        provider_price_id: None,
         predecessor_period_start: term.period_start(),
         predecessor_period_end: term.period_end(),
         renewal_period_start: candidate.period_start(),
@@ -833,6 +966,18 @@ fn renewal_identity_from_parts(
 }
 
 fn canonical_event_encoding(evidence: &StripeRenewalFailureEvidence) -> Vec<u8> {
+    if evidence.provider_price_id.is_some() {
+        let mut encoder = CanonicalEncoder::new("stripe sponsored renewal failure event", 1);
+        encoder.string("event_type", "invoice.payment_failed");
+        encoder.string("event_id", &evidence.event_id);
+        encoder.integer("event_created_at", evidence.event_created_at);
+        encoder.string("provider_account", &evidence.provider_account_id);
+        encoder.string("environment", evidence.environment.as_str());
+        encoder.string("customer", &evidence.customer_id);
+        encoder.string("subscription", &evidence.subscription_id);
+        encoder.string("invoice", &evidence.invoice_id);
+        return encoder.finish();
+    }
     let mut encoder = CanonicalEncoder::new("stripe renewal failure event", 1);
     encoder.string("event_type", "invoice.payment_failed");
     encoder.string("event_id", &evidence.event_id);
@@ -852,10 +997,12 @@ fn canonical_event_encoding(evidence: &StripeRenewalFailureEvidence) -> Vec<u8> 
 }
 
 fn evidence_reference(evidence: &StripeRenewalFailureEvidence) -> String {
-    let mut encoder = CanonicalEncoder::new(
-        "stripe renewal failure evidence",
-        RENEWAL_EVIDENCE_VERSION as u16,
-    );
+    let version = if evidence.provider_price_id.is_some() {
+        SPONSORED_RENEWAL_EVIDENCE_VERSION
+    } else {
+        PERSONAL_RENEWAL_EVIDENCE_VERSION
+    };
+    let mut encoder = CanonicalEncoder::new("stripe renewal failure evidence", version as u16);
     encoder.string("renewal_id", &evidence.renewal_id);
     encoder.field_bytes("event", &canonical_event_encoding(evidence));
     encoder.string("predecessor_invoice", &evidence.predecessor_invoice_id);
@@ -868,9 +1015,21 @@ fn evidence_reference(evidence: &StripeRenewalFailureEvidence) -> String {
         evidence.predecessor_period_start,
     );
     encoder.integer("predecessor_period_end", evidence.predecessor_period_end);
+    if let Some(price_id) = evidence.provider_price_id.as_deref() {
+        // Sponsored failures share one invoice-wide provider event, so the event hash omits
+        // per-seat details. Bind every per-allocation field here or a stored row could be altered
+        // to point at another invoice line or term while retaining the same evidence reference.
+        encoder.string("allocation", &evidence.allocation_reference);
+        encoder.string("provider_item", &evidence.provider_item_id);
+        encoder.string("provider_price", price_id);
+        encoder.string("invoice_line", &evidence.invoice_line_id);
+        encoder.integer("renewal_period_start", evidence.renewal_period_start);
+        encoder.integer("renewal_period_end", evidence.renewal_period_end);
+        encoder.string("interval", evidence.interval.to_string().as_str());
+    }
     format!(
         "stripe:renewal-failure:v{}:{}",
-        RENEWAL_EVIDENCE_VERSION,
+        version,
         hex_lower(&Sha256::digest(encoder.finish()))
     )
 }
@@ -975,6 +1134,13 @@ fn required_i64(object: &Value, field: &'static str) -> Result<i64, StripeContra
         .ok_or(StripeContractError::MissingField(field))
 }
 
+fn optional_i64(object: &Value, field: &'static str) -> Result<i64, StripeContractError> {
+    match object.get(field) {
+        None | Some(Value::Null) => Ok(0),
+        Some(_) => required_i64(object, field),
+    }
+}
+
 fn required_bool(object: &Value, field: &'static str) -> Result<bool, StripeContractError> {
     object
         .get(field)
@@ -1008,6 +1174,7 @@ mod identity_tests {
             customer_id: "cus_1".into(),
             subscription_id: "sub_1".into(),
             provider_item_id: "si_1".into(),
+            provider_price_id: None,
             predecessor_period_start: 100,
             predecessor_period_end: 200,
             renewal_period_start: 200,
@@ -1034,10 +1201,76 @@ mod identity_tests {
     }
 
     #[test]
-    fn stored_reconstruction_rejects_reference_tampering() {
-        let original = evidence();
-        let mut stored = StoredStripeRenewalFailure {
-            version: RENEWAL_EVIDENCE_VERSION,
+    fn grouped_sponsored_allocations_share_one_invoice_event_identity() {
+        let make = |allocation_reference: &str, line_id: &str| {
+            StripeRenewalFailureEvidence::from_sponsored_parts(
+                "evt_grouped_failure",
+                "in_grouped_failure",
+                line_id,
+                "in_grouped_paid",
+                "stripe:sponsored-predecessor:test",
+                "acct_test",
+                ProviderEnvironment::Test,
+                allocation_reference,
+                "cus_sponsor",
+                "sub_sponsor",
+                "si_monthly",
+                "price_month",
+                100,
+                200,
+                200,
+                300,
+                210,
+                StripeInterval::Month,
+            )
+            .unwrap()
+        };
+        let first = make("alloc_first", "il_first");
+        let second = make("alloc_second", "il_second");
+
+        let first_event = first.verified_event().unwrap();
+        let second_event = second.verified_event().unwrap();
+        assert_eq!(
+            first_event.normalized_payload_hash,
+            second_event.normalized_payload_hash
+        );
+        assert_eq!(
+            first_event.provider_object_id.as_deref(),
+            Some("in_grouped_failure")
+        );
+        assert_eq!(first_event.allocation_reference, None);
+        assert_ne!(first.renewal_id(), second.renewal_id());
+        assert_ne!(first.evidence_reference(), second.evidence_reference());
+    }
+
+    #[test]
+    fn sponsored_stored_evidence_reference_binds_each_allocation_term_field() {
+        let original = StripeRenewalFailureEvidence::from_sponsored_parts(
+            "evt_grouped_failure",
+            "in_grouped_failure",
+            "il_grouped_failure",
+            "in_grouped_paid",
+            "stripe:sponsored-predecessor:test",
+            "acct_test",
+            ProviderEnvironment::Test,
+            "alloc_grouped",
+            "cus_sponsor",
+            "sub_sponsor",
+            "si_monthly",
+            "price_month",
+            100,
+            200,
+            200,
+            300,
+            210,
+            StripeInterval::Month,
+        )
+        .unwrap();
+        assert!(original
+            .evidence_reference
+            .starts_with("stripe:renewal-failure:v2:"));
+        let stored = || StoredStripeRenewalFailure {
+            version: SPONSORED_RENEWAL_EVIDENCE_VERSION,
             evidence_reference: original.evidence_reference.clone(),
             renewal_id: original.renewal_id.clone(),
             event_id: original.event_id.clone(),
@@ -1051,6 +1284,54 @@ mod identity_tests {
             customer_id: original.customer_id.clone(),
             subscription_id: original.subscription_id.clone(),
             provider_item_id: original.provider_item_id.clone(),
+            provider_price_id: original.provider_price_id.clone(),
+            predecessor_period_start: original.predecessor_period_start,
+            predecessor_period_end: original.predecessor_period_end,
+            renewal_period_start: original.renewal_period_start,
+            renewal_period_end: original.renewal_period_end,
+            event_created_at: original.event_created_at,
+            interval: original.interval.to_string(),
+        };
+        assert_eq!(
+            StripeRenewalFailureEvidence::from_stored(stored()).unwrap(),
+            original
+        );
+
+        let mut changed_line = stored();
+        changed_line.invoice_line_id = "il_other".into();
+        assert!(StripeRenewalFailureEvidence::from_stored(changed_line).is_err());
+
+        let mut changed_end = stored();
+        changed_end.renewal_period_end = 301;
+        assert!(StripeRenewalFailureEvidence::from_stored(changed_end).is_err());
+
+        let mut changed_interval = stored();
+        changed_interval.interval = "year".into();
+        assert!(StripeRenewalFailureEvidence::from_stored(changed_interval).is_err());
+    }
+
+    #[test]
+    fn stored_reconstruction_rejects_reference_tampering() {
+        let original = evidence();
+        assert!(original
+            .evidence_reference
+            .starts_with("stripe:renewal-failure:v1:"));
+        let mut stored = StoredStripeRenewalFailure {
+            version: PERSONAL_RENEWAL_EVIDENCE_VERSION,
+            evidence_reference: original.evidence_reference.clone(),
+            renewal_id: original.renewal_id.clone(),
+            event_id: original.event_id.clone(),
+            invoice_id: original.invoice_id.clone(),
+            invoice_line_id: original.invoice_line_id.clone(),
+            predecessor_invoice_id: original.predecessor_invoice_id.clone(),
+            predecessor_evidence_reference: original.predecessor_evidence_reference.clone(),
+            provider_account_id: original.provider_account_id.clone(),
+            environment: original.environment,
+            allocation_reference: original.allocation_reference.clone(),
+            customer_id: original.customer_id.clone(),
+            subscription_id: original.subscription_id.clone(),
+            provider_item_id: original.provider_item_id.clone(),
+            provider_price_id: original.provider_price_id.clone(),
             predecessor_period_start: original.predecessor_period_start,
             predecessor_period_end: original.predecessor_period_end,
             renewal_period_start: original.renewal_period_start,

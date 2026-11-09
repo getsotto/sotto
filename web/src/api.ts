@@ -172,12 +172,227 @@ export interface CloudNotice {
     effectiveAtEpoch: number | null;
     deadlineEpoch: number | null;
     amountPence: number | null;
+    priceInterval?: string | null;
   };
   dueAtEpoch: number;
   status: string;
   lastErrorCode: string | null;
   deliveredAtEpoch: number | null;
   createdAtEpoch: number;
+}
+
+export interface PayerTransferCapabilities {
+  available: boolean;
+  setupAvailable: boolean;
+}
+
+export async function fetchPayerTransferCapabilities(): Promise<PayerTransferCapabilities> {
+  const body = await authedJson<{
+    payer_transfers_available?: unknown;
+    payer_transfer_setup_available?: unknown;
+  }>("/server/info");
+  // Older servers do not advertise transfer journeys. Missing or malformed flags fail closed.
+  return {
+    available: body.payer_transfers_available === true,
+    setupAvailable: body.payer_transfer_setup_available === true,
+  };
+}
+
+export interface PayerTransferQuote {
+  quoteId: string;
+  quoteVersion: number;
+  quoteExpiresAtEpoch: number;
+  beneficiaryId: string;
+  counterpartyUserId: string;
+  sourceKind: "personal" | "sponsor";
+  sourceOrganizationId: string | null;
+  destinationKind: "personal" | "sponsor";
+  destinationOrganizationId: string | null;
+  offer: BillingOffer;
+  amountPence: number;
+  currency: string;
+  interval: string;
+  effectiveFrom: number;
+  creditPence: number;
+  founding: boolean;
+}
+
+export interface PayerTransfer {
+  transferId: string;
+  beneficiaryId: string;
+  participantRole: "initiator" | "counterparty";
+  sourceKind: "personal" | "sponsor";
+  sourceOrganizationId: string | null;
+  destinationKind: "personal" | "sponsor";
+  destinationOrganizationId: string | null;
+  offer: BillingOffer;
+  amountPence: number;
+  currency: string;
+  interval: string;
+  effectiveFrom: number;
+  quoteExpiresAtEpoch: number;
+  consentExpiresAtEpoch: number;
+  personalPaymentSetupNeeded: boolean;
+  state: string;
+  resultCode: string | null;
+}
+
+function parsePayerTransfer(body: {
+  transfer_id: string;
+  beneficiary_id: string;
+  participant_role: "initiator" | "counterparty";
+  source_kind: "personal" | "sponsor";
+  source_organization_id: string | null;
+  destination_kind: "personal" | "sponsor";
+  destination_organization_id: string | null;
+  offer: BillingOffer;
+  amount_pence: number;
+  currency: string;
+  interval: string;
+  effective_from: number;
+  quote_expires_at_epoch: number;
+  consent_expires_at_epoch: number;
+  personal_payment_setup_needed: boolean;
+  state: string;
+  result_code: string | null;
+}): PayerTransfer {
+  return {
+    transferId: body.transfer_id,
+    beneficiaryId: body.beneficiary_id,
+    participantRole: body.participant_role,
+    sourceKind: body.source_kind,
+    sourceOrganizationId: body.source_organization_id,
+    destinationKind: body.destination_kind,
+    destinationOrganizationId: body.destination_organization_id,
+    offer: body.offer,
+    amountPence: body.amount_pence,
+    currency: body.currency,
+    interval: body.interval,
+    effectiveFrom: body.effective_from,
+    quoteExpiresAtEpoch: body.quote_expires_at_epoch,
+    consentExpiresAtEpoch: body.consent_expires_at_epoch,
+    personalPaymentSetupNeeded: body.personal_payment_setup_needed,
+    state: body.state,
+    resultCode: body.result_code,
+  };
+}
+
+export async function fetchPayerTransfers(before?: string): Promise<{
+  transfers: PayerTransfer[];
+  nextCursor: string | null;
+}> {
+  const query = new URLSearchParams({ limit: "50" });
+  if (before !== undefined) query.set("before", before);
+  const body = await authedJson<{
+    transfers: Parameters<typeof parsePayerTransfer>[0][];
+    next_cursor: string | null;
+  }>(`/billing/transfers?${query.toString()}`);
+  return {
+    transfers: body.transfers.map(parsePayerTransfer),
+    nextCursor: body.next_cursor,
+  };
+}
+
+export async function fetchPayerTransfer(transferId: string): Promise<PayerTransfer> {
+  return parsePayerTransfer(
+    await authedJson<Parameters<typeof parsePayerTransfer>[0]>(
+      `/billing/transfers/${encodeURIComponent(transferId)}`,
+    ),
+  );
+}
+
+export async function quotePayerTransfer(input: {
+  beneficiaryId: string;
+  counterpartyUserId: string;
+  destinationKind: "personal" | "sponsor";
+  destinationOrganizationId?: string;
+}): Promise<PayerTransferQuote> {
+  const body = await postJson<{
+    quote_id: string;
+    quote_version: number;
+    quote_expires_at_epoch: number;
+    beneficiary_id: string;
+    source_kind: "personal" | "sponsor";
+    source_organization_id: string | null;
+    destination_kind: "personal" | "sponsor";
+    destination_organization_id: string | null;
+    offer: BillingOffer;
+    amount_pence: number;
+    currency: string;
+    interval: string;
+    effective_from: number;
+    credit_pence: number;
+    founding: boolean;
+  }>("/billing/transfers/quote", {
+    beneficiary_id: input.beneficiaryId,
+    counterparty_user_id: input.counterpartyUserId,
+    destination_kind: input.destinationKind,
+    destination_organization_id: input.destinationOrganizationId ?? null,
+  });
+  return {
+    quoteId: body.quote_id,
+    quoteVersion: body.quote_version,
+    quoteExpiresAtEpoch: body.quote_expires_at_epoch,
+    beneficiaryId: body.beneficiary_id,
+    counterpartyUserId: input.counterpartyUserId,
+    sourceKind: body.source_kind,
+    sourceOrganizationId: body.source_organization_id,
+    destinationKind: body.destination_kind,
+    destinationOrganizationId: body.destination_organization_id,
+    offer: body.offer,
+    amountPence: body.amount_pence,
+    currency: body.currency,
+    interval: body.interval,
+    effectiveFrom: body.effective_from,
+    creditPence: body.credit_pence,
+    founding: body.founding,
+  };
+}
+
+export async function beginPayerTransfer(input: {
+  quote: PayerTransferQuote;
+  idempotencyKey: string;
+}): Promise<PayerTransfer> {
+  const quote = input.quote;
+  const body = await postJson<Parameters<typeof parsePayerTransfer>[0]>("/billing/transfers", {
+    beneficiary_id: quote.beneficiaryId,
+    counterparty_user_id: quote.counterpartyUserId,
+    destination_kind: quote.destinationKind,
+    destination_organization_id: quote.destinationOrganizationId,
+    quote_id: quote.quoteId,
+    quote_version: quote.quoteVersion,
+    quote_expires_at_epoch: quote.quoteExpiresAtEpoch,
+    idempotency_key: input.idempotencyKey,
+  });
+  return parsePayerTransfer(body);
+}
+
+export async function acceptPayerTransfer(transferId: string): Promise<PayerTransfer> {
+  return parsePayerTransfer(
+    await postJson<Parameters<typeof parsePayerTransfer>[0]>(
+      `/billing/transfers/${encodeURIComponent(transferId)}/accept`,
+      {},
+    ),
+  );
+}
+
+export async function withdrawPayerTransfer(transferId: string): Promise<PayerTransfer> {
+  return parsePayerTransfer(
+    await postJson<Parameters<typeof parsePayerTransfer>[0]>(
+      `/billing/transfers/${encodeURIComponent(transferId)}/withdraw`,
+      {},
+    ),
+  );
+}
+
+export async function createPayerTransferPaymentSetup(
+  transferId: string,
+): Promise<{ checkoutUrl: string | null }> {
+  const body = await postJson<{ checkout_url: string | null }>(
+    `/billing/transfers/${encodeURIComponent(transferId)}/payment-method`,
+    {},
+  );
+  return { checkoutUrl: body.checkout_url };
 }
 
 export async function fetchCloudNotices(): Promise<CloudNotice[]> {
@@ -191,6 +406,7 @@ export async function fetchCloudNotices(): Promise<CloudNotice[]> {
       effective_at_epoch: number | null;
       deadline_epoch: number | null;
       amount_pence: number | null;
+      price_interval?: string | null;
     };
     due_at_epoch: number;
     status: string;
@@ -210,6 +426,7 @@ export async function fetchCloudNotices(): Promise<CloudNotice[]> {
       effectiveAtEpoch: notice.content.effective_at_epoch,
       deadlineEpoch: notice.content.deadline_epoch,
       amountPence: notice.content.amount_pence,
+      priceInterval: notice.content.price_interval ?? null,
     },
     dueAtEpoch: notice.due_at_epoch,
     status: notice.status,
@@ -217,6 +434,92 @@ export async function fetchCloudNotices(): Promise<CloudNotice[]> {
     deliveredAtEpoch: notice.delivered_at_epoch,
     createdAtEpoch: notice.created_at_epoch,
   }));
+}
+
+export interface VerifiedContactStatus {
+  contactId: string;
+  maskedDestination: string;
+  verifiedAtEpoch: number;
+}
+
+export interface CloudContactStatus {
+  email: VerifiedContactStatus | null;
+  latestDelivery?: {
+    state: CloudEmailDeliveryState;
+    updatedAtEpoch: number;
+  } | null;
+  pendingExpiresAtEpoch: number | null;
+  enrolmentAvailable: boolean;
+}
+
+export type CloudEmailDeliveryState =
+  | "queued"
+  | "accepted"
+  | "delivery_unknown"
+  | "delivered"
+  | "failed"
+  | "bounced"
+  | "suppressed";
+
+export class UnsupportedCloudContactError extends Error {
+  constructor() {
+    super("Email contact settings require a newer Sotto server version.");
+    this.name = "UnsupportedCloudContactError";
+  }
+}
+
+export async function fetchCloudContactStatus(): Promise<CloudContactStatus> {
+  const response = await request("/account/contacts", CREDS);
+  if (response.status === 404) throw new UnsupportedCloudContactError();
+  if (!response.ok) throw new Error(`server error (${response.status})`);
+  const body = await readBody(() => response.json()) as {
+    email: {
+      contact_id: string;
+      masked_destination: string;
+      verified_at_epoch: number;
+    } | null;
+    latest_delivery?: {
+      state: CloudEmailDeliveryState;
+      updated_at_epoch: number;
+    } | null;
+    pending_expires_at_epoch: number | null;
+    enrolment_available: boolean;
+  };
+  return {
+    email: body.email === null ? null : {
+      contactId: body.email.contact_id,
+      maskedDestination: body.email.masked_destination,
+      verifiedAtEpoch: body.email.verified_at_epoch,
+    },
+    latestDelivery: body.latest_delivery == null ? null : {
+      state: body.latest_delivery.state,
+      updatedAtEpoch: body.latest_delivery.updated_at_epoch,
+    },
+    pendingExpiresAtEpoch: body.pending_expires_at_epoch,
+    enrolmentAvailable: body.enrolment_available === true,
+  };
+}
+
+export async function startCloudContactVerification(email: string, idempotencyKey: string): Promise<void> {
+  await postJson<{ accepted: boolean }>("/account/contacts/verification", {
+    email,
+    idempotency_key: idempotencyKey,
+  }, true);
+}
+
+export async function confirmCloudContactVerification(token: string): Promise<boolean> {
+  const result = await postJson<{ verified: boolean }>(
+    "/account/contacts/verification/confirm",
+    { token },
+    true,
+  );
+  return result.verified;
+}
+
+export async function revokeCloudContact(): Promise<void> {
+  const resp = await request("/account/contacts", { method: "DELETE", ...CREDS });
+  if (resp.status === 404) throw new UnsupportedCloudContactError();
+  if (!resp.ok) throw new Error(`server error (${resp.status})`);
 }
 
 export type PersonalBillingTerm = "monthly" | "annual";
@@ -533,13 +836,14 @@ export async function fetchCloudExportChunk(exportId: string, index: number): Pr
   return authedJson(`/account/export/${encodeURIComponent(exportId)}/chunks/${index}`);
 }
 
-async function postJson<T>(path: string, value: unknown): Promise<T> {
+async function postJson<T>(path: string, value: unknown, unsupportedOn404 = false): Promise<T> {
   const resp = await request(path, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(value),
     ...CREDS,
   });
+  if (unsupportedOn404 && resp.status === 404) throw new UnsupportedCloudContactError();
   if (!resp.ok) throw new Error(`server error (${resp.status})`);
   return readBody(() => resp.json()) as Promise<T>;
 }

@@ -22,19 +22,33 @@ Sotto basiert auf einer einzigen Rust-Kryptoimplementierung, die sich die native
 WebAssembly teilen. Der Server speichert und synchronisiert verschlüsselte Daten, ohne jemals Klartext-Secrets
 oder verwendbare Schlüssel zu erhalten.
 
+## Möglichkeiten, Sotto zu betreiben
+
+Sotto ist ein einziges Open-Source-Produkt, das du auf drei Arten betreiben kannst. Egal, wofür du
+dich entscheidest: Der Server speichert immer nur Chiffrat.
+
+| Modus | Was du bekommst |
+| --- | --- |
+| Lokal | Die CLI und ein verschlüsselter Tresor auf deinem eigenen Rechner. Kein Konto und kein Server. |
+| Selbst gehostet | Derselbe Apache-2.0-Server auf Infrastruktur, die du betreibst. Er wendet keine Plan-Limits und keine Prüfungen des gehosteten Dienstes an; siehe [Selbst hosten](#selbst-hosten). |
+| Sotto Cloud | Der Server, den Sotto unter [getsotto.co.uk](https://getsotto.co.uk) betreibt, wenn du lieber keinen eigenen betreibst. `sotto login` verwendet ihn standardmäßig. Pläne und Limits stehen auf der [Preisseite](https://getsotto.co.uk/#pricing), den Dienststatus findest du unter [status.getsotto.co.uk](https://status.getsotto.co.uk). |
+
+Du kannst lokal anfangen und später einen Server hinzufügen: Nach `sotto login` lädt `sotto push`
+die aktive Umgebung so hoch, wie sie ist.
+
 ## Aktueller Stand
 
 Der Ende-zu-Ende-Ablauf funktioniert: lokal verschlüsseln, Chiffrat synchronisieren, auf einem anderen Gerät oder im
 Browser entschlüsseln und ein einzelnes Secret über einen Einmal-Link teilen. Auch für Teams funktioniert der gesamte Ablauf:
 Organisationen mit Rollen, Umgebungs-Grants pro Mitglied, Schlüsselrotation beim Entfernen von Mitgliedern,
-Maschinen-Token für CI und Kontowiederherstellung bei Schlüsselverlust.
+Maschinen-Token für CI, ein Organisations-Auditprotokoll und das Zurücksetzen des Kontos bei verlorenem Emergency Kit.
 
 | Komponente | Jetzt verfügbar |
 | --- | --- |
-| Krypto-Kern | KDF, XChaCha20-Poly1305 AEAD + AAD, Key-Wrapping, X25519-Sealed-Box-Grants, die Tresor-Hierarchie der Umgebungen, Rewrap von Datenschlüsseln (Rotation), Share-Link-Krypto und Schlüsselkodierung, mit gemeinsamen Referenzvektoren für native und WASM-Builds |
-| CLI | `init`, lokale Secret-Verwaltung, Injektion per `run`, Synchronisierung mit `login`/`push`/`pull`, `setup` für neue Geräte, `share`; Teams: `org create/ls/invite/members/remove/plan`, `grant`, `clone`, `rotate`, Maschinen-`token create/ls/revoke` (mit `SOTTO_TOKEN`-Modus für CI), `reset` bei verlorenem Notfall-Kit |
-| Server | OAuth-Anmeldung + Sitzungen, Konto- und Snapshot-Synchronisierung (versionierte Schreibvorgänge, ETag), Organisationen + Mitgliedschaften + Rollen, Tresorschlüssel-Grants pro Mitglied, transaktionale Schlüsselrotation, Maschinen-Token, Konto-Zurücksetzung und Share-Links - nur Chiffrat |
-| Web | Anmeldung (Cookie-Sitzung), Entsperren im Browser + Tresorentschlüsselung mit dem eigenen Grant, Erstellen und Empfangen von Einmal-Links und ein Team-Panel: Organisationen, Mitglieder, Einladung per E-Mail, Teilen einer Umgebung mit einem Mitglied |
+| Krypto-Kern | KDF, XChaCha20-Poly1305 AEAD + AAD, Key-Wrapping, X25519-Sealed-Box-Grants, die Tresor-Hierarchie der Umgebungen, Rewrap von Datenschlüsseln (Rotation), Share-Link-Krypto und Schlüsselkodierung, mit gemeinsamen Referenzvektoren für native und WASM-Builds, Codec-Fuzzing und Kani-Beweisen für das Parsen von Umschlag-Headern und Schlüsselsymbolen |
+| CLI | Lokale Secrets (`init`, `set`, `get`, `ls`, `rm`, `import`, `export`, `run`), Umgebungen (`env ls/use/diff/copy`), ein interaktives Dashboard, Synchronisierung mit `login`/`push`/`pull`, `setup` für neue Geräte, `history` und `rollback`, Einmal-Links (`share`, `shares ls/revoke`); Teams: `org create/ls/invite/members/remove/plan/audit`, `grant`, `clone`, `rotate`, ablaufende Maschinen-`token create/ls/revoke` (mit `SOTTO_TOKEN`-Modus für CI); `status`, `cloud status`, `reset` bei verlorenem Notfall-Kit, Themes und Shell-Vervollständigungen |
+| Server | OAuth-Anmeldung + Sitzungen, Konto- und Snapshot-Synchronisierung (versionierte Schreibvorgänge, ETag), Organisationen + Mitgliedschaften + Rollen, Tresorschlüssel-Grants pro Mitglied, transaktionale Schlüsselrotation, ablaufende Maschinen-Token, Secret-Verlauf, ein Organisations-Auditprotokoll, optionale Organisationslöschung mit Wiederherstellungsfrist, Konto-Zurücksetzung und Einmal-Links - nur Chiffrat. Ein Sotto-Cloud-Deployment setzt außerdem Plan-Limits durch und kann über Stripe abrechnen |
+| Web | Eine Landingpage und Anleitungen; der Tresor unter `/app`, der sich im Browser entsperren lässt, um Secrets zu durchsuchen, anzuzeigen und zu kopieren, Einmal-Links zu erstellen, eine Umgebung mit einem Mitglied zu teilen und den Schlüssel einer Umgebung zu rotieren; ein Team-Panel mit Organisationen, Mitgliedern, Einladungen per E-Mail, dem Plan, dem Auditprotokoll und der Organisationslöschung; die Empfangsseite für Einmal-Links; und eine Sotto-Cloud-Kontoseite unter `/cloud` |
 
 ## Installation
 
@@ -54,6 +68,56 @@ Sigstore-Signatur, bevor er installiert (`~/.local/bin` unter macOS/Linux, `%LOC
 Windows). Lieber erst ansehen? Lade ein Archiv von der
 [Release-Seite](https://github.com/getsotto/sotto/releases) herunter und verifiziere es manuell gemäß
 [SECURITY.md](SECURITY.md), oder baue aus den Quellen (siehe [Entwicklung](#entwicklung)).
+
+Die Installer, die Homebrew-Formel und die GitHub-Action installieren veröffentlichte Releases,
+diese README folgt dagegen dem Branch `main`, der dem neuesten Release voraus sein kann. Ein hier
+beschriebener Befehl existiert in deiner installierten Version daher möglicherweise noch nicht.
+`sotto --help` listet die Befehle auf, die deine Version unterstützt.
+
+In [COMPATIBILITY.md](COMPATIBILITY.md) findest du die Versionsanforderungen der Integrationen,
+die angegebenen Plattformen und die derzeit verfügbaren Testergebnisse.
+
+### Homebrew (Vorschau)
+
+Der [Sotto-Tap](https://github.com/getsotto/homebrew-tap) bietet einen weiteren
+Installationsweg für macOS. Die Formula stellt geprüfte CLI-Versionen bereit
+und setzt macOS 15 oder neuer voraus. Apple Silicon ist die primäre Plattform;
+Intel wird bestmöglich unterstützt und ist bei Homebrew Tier 3. Homebrew plant,
+den Intel-Support im September 2027 oder später einzustellen. Lies vor der Nutzung die [Installations- und Supporthinweise des Taps](https://github.com/getsotto/homebrew-tap#readme)
+und den [Bericht zur Launch-Bereitschaft](https://github.com/getsotto/homebrew-tap/blob/main/releases/READINESS.md).
+Verwende diese Vorschau nicht für kritische Produktionsgeheimnisse.
+
+Installiere und aktualisiere die Formula mit:
+
+```sh
+brew install getsotto/tap/sotto
+```
+
+```sh
+brew update
+brew upgrade getsotto/tap/sotto
+```
+
+Wenn eine weitere `sotto`-Installation in deinem `PATH` liegt, prüfe vor der
+Auswahl die gefundenen ausführbaren Dateien und das von Homebrew verwaltete
+Binary:
+
+```sh
+which -a sotto
+brew list --versions sotto
+"$(brew --prefix)/bin/sotto" --version
+```
+
+Um nur die Homebrew-Formula zu entfernen, führe Folgendes aus:
+
+```sh
+brew uninstall getsotto/tap/sotto
+```
+
+Beim Entfernen der Formula bleiben Projektdateien, lokale Sotto-Daten,
+Schlüsselbund-Einträge und andere `sotto`-Installationen erhalten. Prüfe das
+ausgewählte Binary und sichere dein Notfall-Kit, bevor du eine vorhandene
+Installation entfernst oder wechselst.
 
 ### Shell-Vervollständigungen
 
@@ -90,36 +154,296 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
           SOTTO_TOKEN: ${{ secrets.SOTTO_TOKEN }}
 ```
 
-Die Action-Referenz und `sotto-version` sind unabhängig. Das Beispiel pinnt die zusammengeführte v1.1-Implementierung
-per vollständigen Commit-SHA, weil noch kein nummeriertes Action-Release veröffentlicht wurde. Belasse
-`sotto-version` bei einem exakten `vX.Y.Z`-Release. Setze die optionale Repository-Variable `SOTTO_SERVER`
-für einen selbst gehosteten Server. Siehe die [Action-Dokumentation](https://github.com/getsotto/sotto-action#readme)
-für Matrix-, Windows- und Reusable-Workflow-Beispiele.
+Die Action-Referenz und `sotto-version` sind unabhängig. Belasse `sotto-version` bei einem exakten
+`vX.Y.Z`-Release. Setze die Repository-Variable `SOTTO_SERVER` auf die URL deines Servers, auch bei
+Sotto Cloud (`https://getsotto.co.uk`): Ist `SOTTO_TOKEN` gesetzt, greifen `sotto run` und
+`sotto export` nie auf einen Standardserver zurück, sodass das Token nur an einen Server geht, den du
+benannt hast. Siehe die [Action-Dokumentation](https://github.com/getsotto/sotto-action#readme) für
+Matrix-, Windows- und Reusable-Workflow-Beispiele.
 
 ## Schnellstart
 
 Lust auf eine lauffähige Demo? [**sotto-example**](https://github.com/getsotto/sotto-example)
 zeigt lokale Secret-Injektion mit einem Python-GIF und kopierbaren Schritten, plus winzige Beispiele
-in JavaScript, TypeScript, Java, C#, PHP, Go und C++. Kein Konto erforderlich; die Anleitungen decken
+in JavaScript, TypeScript, Java, C#, PHP, Go, Rust und C++. Kein Konto erforderlich; die Anleitungen decken
 macOS, Linux und Windows ab.
 
 ```sh
 sotto init                   # create your identity + first project - SAVE the printed Emergency Kit
 sotto set DATABASE_URL       # hidden prompt; encrypted locally before it ever touches disk
 sotto import .env            # optional: pull in an existing file, still encrypted locally
-sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 sotto run -- npm start       # inject the environment's secrets into any command
-sotto login && sotto push    # optional: sync ciphertext via the hosted instance (getsotto.co.uk)
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
-sotto share DATABASE_URL     # choose view and lifetime limits in an interactive terminal
+sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
+```
+
+`sotto init` legt die Umgebungen `dev`, `staging` und `prod` an und wählt `dev` aus. Der Export
+schreibt Klartext und benötigt daher in einem Terminal `--reveal`, genau wie `sotto get`; `--format`
+akzeptiert außerdem `shell` und `json`. Das Löschen der Zwischenablage erfolgt nach bestem Bemühen:
+Das Ersetzen des Inhalts schützt den neuen Wert, während Zwischenablage-Manager, Ruhezustand oder
+ein beendeter Hilfsprozess eine Kopie behalten können.
+
+Bis hierhin bleibt alles auf deinem Rechner. Um ein weiteres Gerät zu synchronisieren, im Team zu
+arbeiten oder CI zu nutzen, melde dich bei einem Server an:
+
+```sh
+sotto login                  # Sotto Cloud by default; --server <url> for your own server
+sotto push                   # upload the active environment's ciphertext
+sotto share DATABASE_URL     # a one-time link whose key never reaches the server
+```
+
+`sotto login` öffnet einen Browser für die Anmeldung mit GitHub. Es verwendet Sotto Cloud unter
+[getsotto.co.uk](https://getsotto.co.uk), sofern du nicht `--server <url>` angibst (siehe
+[Selbst hosten](#selbst-hosten) für den eigenen Betrieb), und spätere Befehle verwenden den gewählten
+Server weiter. In jedem Fall speichert der Server nur Chiffrat: Der Web-Tresor unter `/app` auf
+demselben Server entschlüsselt in deinem Browser, mit Schlüsseln, die deine Geräte nie verlassen.
+
+Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
+Um eine ganze Datei als ein Secret zu speichern, siehe [Dateibasierte Secrets](#dateibasierte-secrets).
+
+Wenn sich der Browser nicht öffnet oder die Anmeldung abläuft, siehe [Anmeldeprobleme beheben](#anmeldeprobleme-beheben).
+
+### Anmeldeprobleme beheben
+
+`sotto login` startet auf einem freien Port einen kurzlebigen Listener auf `127.0.0.1` (der
+Loopback-Adresse), öffnet deinen Browser zur Anmeldung und wartet, bis der Browser zu diesem Listener
+zurückkehrt.
+
+- **Der Browser öffnet sich nicht.** Öffne die URL, die dieser `sotto login`-Lauf nach
+  „If it doesn't open, visit:“ ausgegeben hat, in einem Browser auf demselben Rechner. Lass den
+  Befehl weiterlaufen, denn er wartet auf den Abschluss der Anmeldung.
+- **Nutze denselben Rechner.** Der Browser muss den Listener auf der Loopback-Adresse erreichen
+  können. Die URL auf einem anderen Rechner oder auf einem Smartphone zu öffnen, schließt den normalen
+  Ablauf nicht ab. Eine entfernte SSH- oder Container-Sitzung funktioniert nicht zwingend wie ein
+  lokaler Desktop; melde dich daher nach Möglichkeit von einem lokalen Terminal aus an.
+- **Das Warten läuft ab.** Der Befehl wartet fünf Minuten auf die Rückkehr des Browsers. Danach führe
+  `sotto login` erneut aus und verwende die neu ausgegebene URL. Jeder Versuch startet einen neuen
+  Listener mit neuem Zustand, sodass eine alte URL oder ein alter Callback-Link nicht funktioniert.
+
+Mache den Loopback-Listener nicht öffentlich zugänglich. Um dich an deinem eigenen Server anzumelden,
+gib dasselbe `--server <url>` wie zuvor an; siehe [Selbst hosten](#selbst-hosten).
+
+## Agent-Workflows
+
+Lokale Coding-Agenten können projektdefinierte Aufgaben über den lokalen MCP-Server von Sotto finden und ausführen. Die [Anleitung für Agent-Aufgaben](AGENT-WORKFLOWS.md) erklärt Einrichtung, Freigaben und Sicherheitsgrenzen.
+
+## Sotto verwenden
+
+### Ein weiteres Gerät
+
+```sh
+sotto login                  # same account as the first machine
+sotto setup                  # unpack the Emergency Kit onto this device
+sotto pull                   # download the ciphertext you already pushed
+```
+
+Du brauchst das von `sotto init` ausgegebene Emergency Kit. Ohne es kann ein neues Gerät den Tresor nicht entschlüsseln.
+
+Wenn du das Emergency Kit verlierst, gibt `sotto reset` deinem Konto neue Schlüssel. Das ist ein
+Zurücksetzen, keine Wiederherstellung: Alles, was mit den alten Schlüsseln verschlüsselt wurde, ist
+dauerhaft unlesbar, und Organisationsadmins müssen dir die geteilten Umgebungen erneut gewähren.
+Wenn ein Gerät den Tresor noch entsperren kann, exportiere zuerst, was du brauchst.
+
+### Umgebungen
+
+Mit `--env` wählst du eine Umgebung für einen einzelnen Befehl aus, ohne die Standardumgebung des Projekts zu ändern:
+
+```sh
+sotto run --env staging -- npm test
+sotto ls --env staging
+```
+
+`--env` gilt nur für diesen Befehl; `sotto env use` ändert die in der `sotto.toml` des Projekts
+gespeicherte Standardumgebung (siehe [Projektkonfiguration](#projektkonfiguration)).
+
+Liste die Umgebungen auf, wechsle die Standardumgebung, vergleiche zwei Umgebungen oder prüfe eine Kopie zwischen ihnen:
+
+```sh
+sotto env ls                          # list environments; the active one is marked
+sotto env use staging                 # switch the project's active environment
+sotto env diff dev staging            # compare keys; values stay hidden without --reveal
+sotto env copy dev staging            # preview additions and updates without writing
+sotto env copy dev staging --confirm  # apply the copy; never delete destination keys
+```
+
+`env diff` markiert jeden Schlüssel mit `=` (gleicher Wert), `!` (unterschiedliche Werte), `<` (nur
+in der ersten Umgebung) oder `>` (nur in der zweiten). Ohne `--confirm` ist die Kopie ein Probelauf.
+Eine bestätigte Kopie fügt Geheimnisse hinzu und aktualisiert sie, lässt aber Schlüssel unverändert,
+die nur in der Zielumgebung vorhanden sind.
+
+### Projektkonfiguration
+
+`sotto init` und `sotto clone` schreiben eine `sotto.toml` in das aktuelle Verzeichnis. Sie verknüpft
+dieses Verzeichnis mit einem lokalen Projekt und einer Standardumgebung. Dieses Beispiel dient nur der
+Veranschaulichung und verwendet erfundene Kennungen:
+
+```toml
+project_id = "11111111-1111-1111-1111-111111111111"
+project = "acme-api"
+environment = "dev"
+org_id = "22222222-2222-2222-2222-222222222222"
+```
+
+- `project_id` (erforderlich): die stabile Kennung des Projekts.
+- `project` (erforderlich): der lesbare Name des Projekts.
+- `environment` (erforderlich): die Standardumgebung für Befehle in diesem Verzeichnis.
+- `org_id` (optional): die Organisation, der das Projekt gehört. Bei einem persönlichen Projekt entfällt es.
+
+Die Datei enthält Projektmetadaten, keine geheimen Werte, und ist zum Einchecken gedacht. Sie ist kein
+Tresor und gewährt keinen Zugriff auf Secrets: Wer sie auscheckt, braucht weiterhin eine eigene
+Freigabe. Eine Datei mit erfundenen Kennungen legt kein Projekt an. Führe `sotto init` aus, um eines
+anzulegen, oder folge [Im Team arbeiten](#im-team-arbeiten), um eine geteilte Umgebung zu klonen.
+
+Befehle suchen `sotto.toml` im aktuellen Verzeichnis und dann in jedem übergeordneten Verzeichnis und
+verwenden die nächstgelegene, so wie `git` mit `.git`. In einem verschachtelten Projekt gewinnt die innere Datei:
+
+```text
+monorepo/
+├── sotto.toml            # project "platform"
+├── tools/                # commands here use "platform"
+└── services/
+    └── billing/
+        ├── sotto.toml    # project "billing"
+        └── src/          # commands here use "billing"
+```
+
+Ist die nächstgelegene `sotto.toml` fehlerhaft oder unlesbar, bricht der Befehl mit einem Fehler ab, der
+diese Datei nennt. Er weicht nicht auf ein übergeordnetes Projekt aus.
+
+`sotto env use staging` speichert `staging` als `environment` in der gefundenen `sotto.toml`, sodass es
+auch für spätere Befehle gilt. Ein `--env staging` pro Befehl liest diese Umgebung für einen einzelnen
+Befehl und lässt die Datei unverändert. Siehe [Umgebungen](#umgebungen).
+
+`sotto.toml` gehört zu einem Projektverzeichnis. Davon getrennt enthält das Sotto-Datenverzeichnis die
+globale `config.toml` mit rechnerweiten Einstellungen wie dem von `sotto login` gespeicherten Server und
+deinem Theme sowie die verschlüsselte `store.db` mit deinem Tresor. Beide gehören nicht in ein
+Repository. Siehe [Umgebungsvariablen](#umgebungsvariablen) für `SOTTO_DATA_DIR` und
+[Ausgabe-Themes](#ausgabe-themes) für den Standardort auf jeder Plattform.
+
+### Eine dotenv-Datei importieren
+
+`sotto import` liest eine dotenv-Datei und setzt jede Zuweisung in einer Umgebung, wobei jeder Wert lokal
+verschlüsselt wird. Es schreibt in die aktive Umgebung, sofern Sie mit `--env` keine andere nennen:
+
+```sh
+sotto import .env                         # into the active environment
+sotto import --env staging .env.staging   # into staging; the default environment is unchanged
+```
+
+Ein Import wird mit dem Vorhandenen zusammengeführt. Angenommen, `staging` enthält bereits `API_URL` und
+`REGION`, und `.env.staging` enthält:
+
+```dotenv
+API_URL=https://staging.example.test
+FEATURE_FLAG=on
+```
+
+Nach dem Import in `staging`:
+
+- `API_URL` übernimmt den Wert aus der Datei, weil ein vorhandener Name aktualisiert wird.
+- `FEATURE_FLAG` wird hinzugefügt, weil ein neuer Name angelegt wird.
+- `REGION` bleibt erhalten, weil ein Name, der in der Datei fehlt, nie entfernt wird.
+
+Der Import schreibt nur in Ihren lokalen Speicher. Laden Sie das Ergebnis nach `sotto login` in einem separaten Schritt hoch:
+
+```sh
+sotto push --env staging
+```
+
+Die dotenv-Datei wird nur gelesen: Der Import ändert, verbraucht oder löscht sie nicht, schützen oder
+löschen Sie sie also selbst, wenn sie echte Werte enthält. Eine Datei, die sich nicht parsen lässt, ändert
+nichts, aber ein Fehler beim Schreiben macht bereits gespeicherte Zuweisungen nicht rückgängig; prüfen Sie
+nach einem unterbrochenen Import daher `sotto ls --env staging`.
+
+Um einen früheren Wert zurückzuholen, siehe [Eine frühere Secret-Version wiederherstellen](#eine-frühere-secret-version-wiederherstellen).
+Dieser Verlauf stammt vom Server und hilft daher nur bei Werten, die Sie bereits hochgeladen hatten. Führen Sie
+`sotto import --help` aus, um die Regeln für Anführungszeichen und literale Werte nachzulesen, statt sie hier zu wiederholen.
+
+### Dateibasierte Secrets
+
+Ein Secret-Wert besteht aus Bytes, nicht nur aus Text. Du kannst also eine ganze Datei (ein
+Zertifikat, eine Schlüsseldatei oder eine kleine Binärdatei) als ein Secret speichern. Du brauchst
+ein initialisiertes Projekt und einen entsperrten lokalen Tresor. Dieses POSIX-Shell-Beispiel nutzt
+eine synthetische Datei und prüft den Hin- und Rückweg Byte für Byte, ohne den Wert auszugeben:
+
+```sh
+printf 'synthetic-demo-bytes\001\377\n' > example-input.bin   # a made-up file, not a real secret
+sotto set EXAMPLE_FILE --stdin < example-input.bin
+sotto get EXAMPLE_FILE > example-output.bin                   # redirected, so nothing is printed
+cmp example-input.bin example-output.bin && echo "round-trip OK"
+rm example-input.bin example-output.bin
+```
+
+`--stdin` liest bis zum Dateiende und behält jedes Byte: Nichts wird abgeschnitten, auch kein
+abschließender Zeilenumbruch. Die gesamte Eingabe wird ein einziger Secret-Wert; sie wird nicht als
+dotenv gelesen, nutze also [`sotto import`](#eine-dotenv-datei-importieren) für eine Datei mit
+Zuweisungen. Wenn die Ausgabe von `sotto get` umgeleitet oder per Pipe weitergegeben wird, schreibt
+es genau die gespeicherten Bytes und hängt keinen Zeilenumbruch an. Die Ausgabedatei enthält
+Klartext, also lösche sie danach und committe sie nie, auch nicht als Test-Fixture.
+
+Nur `set --stdin` und umgeleitetes `get` verarbeiten beliebige Bytes. Befehle, die Secrets als Text
+behandeln, brauchen gültiges UTF-8:
+
+- `sotto run` und Klartext-`sotto export` lesen in jedem `--format` alle Einträge der gewählten
+  Umgebung. Ein einziger Wert, der kein gültiges UTF-8 ist, bricht den ganzen Befehl mit einem
+  Fehler ab; der Wert wird weder übersprungen noch in Base64 umgewandelt.
+- `sotto get NAME --copy` braucht ebenfalls gültiges UTF-8. Nutze umgeleitetes `get`, um beliebige
+  Bytes abzurufen.
+
+Lege Binärwerte in eine eigene Umgebung, wenn du diese Umgebung auch mit `sotto run` einspeist.
+Dieser Abruf als Klartextdatei ist kein Backup: Für eine verschlüsselte Kopie deines Kontos nutze
+den verschlüsselten Export auf der Sotto-Cloud-Kontoseite unter `/cloud`, und für den Verlauf siehe
+[Eine frühere Secret-Version wiederherstellen](#eine-frühere-secret-version-wiederherstellen).
+
+### Ein Secret entfernen
+
+Um ein veraltetes Secret aus `staging` zu entfernen, ohne die Standardumgebung zu ändern:
+
+```sh
+sotto --env staging rm DEMO_OBSOLETE_KEY
+sotto --env staging push
+sotto --env staging pull
+```
+
+`sotto rm` entfernt das Secret aus der gewählten Umgebung im lokalen Tresor.
+`sotto push` synchronisiert die Entfernung nach `sotto login` mit dem Server.
+Führe `sotto pull` für dieselbe Umgebung auf einem anderen Gerät aus, um die
+Entfernung zu übernehmen. Der letzte Befehl gehört auf das andere Gerät.
+
+Im interaktiven Terminal öffnet `sotto rm` ohne Namen die Secret-Auswahl.
+Danach wird eine Bestätigung abgefragt, wobei Nein voreingestellt ist;
+Abbrechen oder Ablehnen lässt das Secret unverändert. `--yes` (oder `-y`)
+überspringt nur die Bestätigung, nicht die Auswahl bei fehlendem Namen oder
+eine erforderliche Entsperrabfrage.
+
+Interaktive Abfragen erfordern Terminals für stdin, stdout und stderr, einen
+`TERM`-Wert ungleich »dumb« und eine inaktive `CI`-Umgebung. Ohne interaktives
+Terminal ist ein Name erforderlich; das benannte Secret wird auch ohne `--yes`
+ohne Bestätigungsfrage entfernt.
+
+Entfernte Secrets erscheinen nicht mehr in normalen Abfragen oder Listen;
+der Versionsverlauf bleibt jedoch erhalten. Das ist keine sichere Löschung und
+widerruft keine Zugangsdaten beim externen Anbieter. Zur Wiederherstellung
+dienen `sotto history` und `sotto rollback`.
+
+### Ein Secret teilen
+
+`sotto share` verschlüsselt ein Secret in einen Einmal-Link. Der Schlüssel steht im Link hinter dem
+`#`, einem Teil, den Browser nie an einen Server senden; der Server hält also nur Chiffrat. Zum
+Erstellen eines Links brauchst du `sotto login`; die empfangende Person braucht kein Konto. Das
+Öffnen des Links verbraucht keinen Aufruf, das Anzeigen des Secrets schon.
+
+```sh
+sotto share DATABASE_URL                           # choose view and lifetime limits in an interactive terminal
 sotto share DATABASE_URL --views 3 --expire 3600   # skip both limit prompts
+sotto share DATABASE_URL --passphrase              # also require a passphrase; send it separately
 ```
 
 In einem interaktiven Terminal öffnet jede ausgelassene Freigabegrenze ein eigenes Menü. Das
@@ -136,63 +460,158 @@ in einem interaktiven Terminal zu überspringen, gib den Namen und beide Grenzen
 `sotto share DATABASE_URL --views 3 --expire 3600`. Aufforderungen zum Entsperren und zur Eingabe
 einer Passphrase können weiterhin erscheinen.
 
-Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
+Ein Server kann für manche Konten strengere Grenzen setzen. Lehnt er eine Anfrage ab, gibt die CLI
+die Begründung des Servers aus und erstellt keinen Link.
 
-Mit `--env` wählst du eine Umgebung für einen einzelnen Befehl aus, ohne die Standardumgebung des Projekts zu ändern:
-
-```sh
-sotto run --env staging -- npm test
-sotto ls --env staging
-```
-
-`--env` gilt nur für diesen Befehl; `sotto env use` ändert die Standardumgebung.
-
-Der Export schreibt Klartext und benötigt daher in einem Terminal `--reveal`, genau wie `sotto get`.
 Verwende `sotto share --no-copy`, um das interaktive Kopieren zu deaktivieren, oder `--copy`, um es ausdrücklich anzufordern.
 Diese Optionen steuern nur die Zwischenablage; `--no-copy` überspringt die Freigabegrenzen-Menüs nicht.
-Das Löschen der Zwischenablage erfolgt nach bestem Bemühen: Das Ersetzen des Inhalts schützt den neuen Wert,
-während Zwischenablage-Manager, Ruhezustand oder ein beendeter Hilfsprozess eine Kopie behalten können.
 
-`sotto login` verwendet die gehostete Instanz unter [getsotto.co.uk](https://getsotto.co.uk), sofern du die CLI nicht mit
-`--server <url>` auf einen anderen Server richtest (siehe [Bereitstellung](deploy/README.md) für den eigenen Betrieb). In jedem Fall
-speichert der Server nur Chiffrat: Der Web-Tresor unter derselben Adresse entschlüsselt in deinem
-Browser, mit Schlüsseln, die deine Geräte nie verlassen.
+Ein Link funktioniert nicht mehr, wenn seine Aufrufe aufgebraucht sind, wenn er abläuft oder wenn du
+ihn widerrufst. Der Widerruf verhindert, dass der Server das Chiffrat weiter ausliefert, löscht es
+aber nicht vom Server:
 
-Arbeit im Team:
+```sh
+sotto shares ls              # your 100 most recent links: views used, expiry, revocation
+sotto shares ls --json
+sotto shares revoke <token>  # the token is the part of the link between /s/ and #
+```
+
+`sotto shares ls` zeigt nie das Chiffrat oder den Schlüssel im Link.
+
+Achte auf den Plural: `sotto share` erstellt einen Link, `sotto shares` verwaltet die Links, die du
+erstellt hast. Beide sprechen mit dem konfigurierten Server und brauchen daher `sotto login`; der
+lokale Tresor muss nicht entsperrt sein. Eine Auflistung sieht so aus (synthetisches Token,
+Beispielwerte):
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Übergib die erste Spalte an `sotto shares revoke`. Das ist das öffentliche Token, nicht der ganze
+Link: Bei `https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...` übergibst du nur
+`3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` und nie etwas nach dem `#`. Die Auflistung liest nur Metadaten. Sie öffnet
+keinen Link, verbraucht keinen Aufruf und kann dir keinen Link wiederherstellen, weil der Schlüssel
+nach dem `#` den Server nie erreicht hat.
+
+`sotto shares ls --json` gibt ein Objekt statt eines reinen Arrays aus: `active_free_count` und
+`links`, wobei jeder Link `token`, `share_class`, `max_views`, `view_count`, `expires_at`,
+`revoked_at` und `created_at` enthält. Der Server liefert nur deine 100 neuesten Links, das ist also
+keine vollständige Historie.
+
+Widerrufen verhindert künftige Abrufe über den Link. Ein bereits erfolgter Abruf lässt sich nicht
+rückgängig machen: Wenn der Empfänger das Secret schon angezeigt haben könnte, ändere es an der
+Quelle.
+
+### Im Team arbeiten
+
+Teams teilen Umgebungen über eine Organisation. Jedes Mitglied erhält eine eigene versiegelte Kopie
+des Umgebungsschlüssels (einen Grant), und der Server prüft Rollen und Grants bei jeder Anfrage, ohne
+etwas lesen zu können.
 
 ```sh
 sotto org create acme                      # prints the org id
 sotto init --org <org-id>                  # an org-owned project
-sotto org invite <org-id> dev@example.com  # invite an existing Sotto user
-sotto org plan <org-id>                    # tier, trial, and limits for this organisation
-sotto grant <user-id>                      # share the active environment (they run `sotto clone`)
-sotto token create --name ci               # SOTTO_TOKEN: run/export in CI, no password needed
+sotto push                                 # create it on the server before sharing
+sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prints their user id
+sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
+
+Danach führt das Mitglied den ausgegebenen Befehl aus. Das ist etwas anderes als **Ein weiteres Gerät**, wo du dein eigenes Konto auf einem zweiten Rechner
+wiederherstellst. Das Mitglied nutzt sein eigenes Konto auf demselben Server: Es führt `sotto login`
+und `sotto unlock` aus und dann den ausgegebenen Befehl in einem Verzeichnis, das noch keine
+`sotto.toml` enthält:
+
+```sh
+mkdir acme-api && cd acme-api
+sotto clone <project-id> <env-id> --org <org-id>
+```
+
+Mitgliedschaft in der Organisation und Zugriff auf eine Umgebung sind getrennte Schritte.
+`sotto org invite` macht jemanden zum Mitglied, `sotto grant <user-id>` gibt ihm eine Umgebung. Wenn
+du die Benutzer-ID nicht mehr hast, zeigt sie `sotto org members <org-id>` an. `sotto clone` gewährt
+selbst keinen Zugriff: Es holt den vorhandenen Grant des Mitglieds, lädt diese Umgebung und schreibt
+`sotto.toml`. Ohne Grant bricht es mit
+`you have not been granted this environment (ask an admin to share it)` ab, und ein Admin muss für
+das Mitglied `sotto grant` ausführen. Gib dein Emergency Kit nie an Teammitglieder weiter; es
+entsperrt dein Konto, nicht ihres.
+
+Behalte `--org` aus dem ausgegebenen Befehl bei, denn es speichert die besitzende Organisation, damit
+spätere Pushes zum Server passen. `--as <environment-name>` und `--name <project-label>` setzen nur
+lokale Bezeichnungen: Standardmäßig behält die Umgebung ihren echten Namen und das Projekt heißt
+`shared`.
+
+Um zu sehen, wer Zugriff hat, jemanden zu entfernen oder den Schlüssel einer Umgebung selbst zu rotieren:
+
+```sh
+sotto org members <org-id>                 # members, roles and user ids
+sotto org remove <org-id> <user-id>        # remove a member and rotate every environment they held
+sotto rotate                               # rotate the active environment's key
+```
+
+Das Entfernen eines Mitglieds rotiert den Schlüssel jeder Umgebung, auf die es Zugriff hatte, und
+widerruft die Maschinen-Token, die es in der Organisation erstellt hat; jedes wird namentlich genannt,
+damit du es neu erstellen kannst. Die Rotation schützt, was danach geschrieben wird. Werte, die das
+Mitglied bereits gesehen hat, bleiben offengelegt; ändere sie daher an ihrer Quelle.
+
+#### Ältere Organisationsberechtigungen
 
 `sotto org plan <org-id>` liest die aktuelle Berechtigungsansicht des konfigurierten Servers für
 diese Organisation. Du musst angemeldet sein (`sotto login`); der lokale Tresor muss nicht
-entsperrt sein. Es zeigt die zugewiesene Stufe, die wirksame Stufe (deren Limits jetzt gelten), ein
-optionales Trial-Ende sowie entweder Mitglieder- und Organisationsprojekt-Limits oder
-`limits: none (Team)`.
+entsperrt sein. Es zeigt die zugewiesene und wirksame Stufe, das gespeicherte Trial-Ende und die
+geltenden Limits wie `limits: none (Team)`. Diese Felder erhalten die Kompatibilität mit älteren Organisationsplan-Datensätzen
+und Deployments; sie beschreiben weder die aktuellen personenbezogenen Cloud-Preise noch ein neues
+Cloud-Trial-Angebot.
 
-Illustrative Free-Ausgabe:
+Illustrative Ausgabe aus einem älteren Organisationsplan-Datensatz:
 
 ```text
 tier:      free
 effective: free
+trial:     ends 2026-07-16T09:00:00Z
 limits:    3 members, 1 org project(s)
 ```
 
-Illustrative Team-Ausgabe:
+Ein selbst gehosteter Server wendet keine Plan-Limits an und meldet daher immer `team` als wirksame
+Stufe, unabhängig davon, welche Stufe und welches Trial-Ende für die Organisation gespeichert sind:
 
 ```text
-tier:      team
+tier:      free
 effective: team
+trial:     ends 2026-07-16T09:00:00Z
 limits:    none (Team)
 ```
 
-Diese Beispiele sind illustrativ; echte Organisationen können andere Stufen, Trials und Limits
-zeigen.
+Diese Beispiele zeigen gespeicherte Kompatibilitätsfelder, keine aktuellen Cloud-Angebote. Reale
+Deployments können andere gespeicherte Stufen, Trial-Daten und Limits anzeigen.
+
+#### Organisations-Auditprotokoll
+
+Organisationsinhaber und Administratoren können die aktuelle Teamaktivität anzeigen:
+
+```sh
+sotto org audit <org-id>
+sotto org audit <org-id> --limit 20
+```
+
+Verwende die ID, die `sotto org create <name>` ausgibt oder `sotto org ls` auflistet. Die Ergebnisse
+werden zuerst mit den neuesten Ereignissen angezeigt; standardmäßig werden 100 Ereignisse abgerufen,
+und der Server begrenzt `--limit` auf 1-500. Der Befehl zeigt pro Ereignis eine Zeile im Format
+`timestamp  action  actor` sowie optional `target=...`, `env=...` und `(detail)`. Es handelt sich um
+eine begrenzte Aktivitäts-/Metadatenansicht, nicht um eine Möglichkeit, Secret-Werte abzurufen; eine
+Seitennavigation oder ein vollständiges historisches Archiv gibt es nicht.
+
+Dieser Befehl behält die ältere Zugriffsprüfung anhand der Team-Berechtigung der Organisation bei.
+Selbst gehostete Deployments überspringen diese Planprüfung, aber der Aufrufer braucht weiterhin die
+Rolle als Inhaber oder Administrator. Wenn keine Ereignisse vorhanden sind, gibt der Befehl keine
+Zeilen aus und wird erfolgreich beendet.
+
+### Maschinen-Token und CI
+
+Mit einem Maschinen-Token kann CI oder ein Dienst eine Umgebung ohne Passwort oder Emergency Kit
+lesen. Ist `SOTTO_TOKEN` gesetzt, holen und entschlüsseln `sotto run` und `sotto export` diese
+Umgebung bei jedem Lauf; setze auch `SOTTO_SERVER`, wie das [GitHub-Actions](#github-actions)-Beispiel
+zeigt.
 
 Maschinen-Tokens laufen ab. Ein neues Token gilt 90 Tage, sofern du nicht `--expires-in-days`
 mit einem Wert von 1 bis 365 angibst; `sotto token ls` zeigt, wann jedes abläuft. Zwei Wochen
@@ -223,51 +642,6 @@ aktualisiere das CI-Secret und prüfe, ob die CI es verwendet, und widerrufe dan
 der API authentifiziert, rotiert aber nicht den Umgebungsschlüssel. Für eine
 Organisationsumgebung beachte bei Bedarf die vorhandenen Hinweise zu `sotto rotate`. Weder
 Widerruf noch Rotation können bereits kopierten Klartext löschen.
-
-### Cloud-Status
-
-Um den konfigurierten Server und die Cloud-Berechtigung deines Kontos zu prüfen, melde dich zuerst an:
-
-```sh
-sotto login
-sotto cloud status
-sotto cloud status --json
-```
-
-Der Befehl benötigt eine aktive Anmeldung, entsperrt aber weder den lokalen Tresor noch öffnet er einen Browser. Er zeigt den konfigurierten `server`, die `server_info` des Servers, die `eligibility` des Kontos und nur dann eine `billing_url`, wenn der zurückgegebene Status verfügbare Abrechnung meldet. Die lesbare Ausgabe zeigt außerdem `actions`, `next_actions` und optionale Werte für `paid_through_epoch`, `recovery_until_epoch` oder `export_until_epoch`. Fehlt `server_info` oder `eligibility`, stellt ein älterer Server diesen Endpoint nicht bereit; daraus folgt nicht, dass der Zugriff erlaubt oder verweigert ist.
-
-Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht so aus:
-
-```json
-{
-  "server": "https://getsotto.co.uk",
-  "billing_url": "https://getsotto.co.uk/cloud",
-  "server_info": {
-    "deployment_mode": "cloud",
-    "entitlement_model": "person"
-  },
-  "eligibility": {
-    "model": "person_eligibility_v1",
-    "state": "paid",
-    "deployment_mode": "cloud",
-    "account_initialized": true,
-    "billing_available": true,
-    "paid_through_epoch": 1798761600,
-    "recovery_until_epoch": null,
-    "export_until_epoch": null,
-    "actions": {
-      "setup": false,
-      "billing": false,
-      "export": false,
-      "revoke": true
-    },
-    "next_actions": ["revoke"],
-    "payer": "personal"
-  }
-}
-```
-
-Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
 
 ### Interaktives Dashboard
 
@@ -326,6 +700,92 @@ Ohne `sotto.toml` und ohne lokale Identität:
 ```
 
 Fehlt `sotto.toml`, ist kein Projekt ausgewählt. Eine fehlerhafte oder unlesbare Datei führt zu einem Fehler.
+Unter [Projektkonfiguration](#projektkonfiguration) stehen die Felder der Datei und wie sie gefunden wird.
+
+### Sperren, entsperren und abmelden
+
+Bei einer bereits initialisierten lokalen Identität kannst du den Tresor sperren,
+seinen Status prüfen und ihn bei Bedarf wieder entsperren:
+
+```sh
+sotto lock
+sotto status
+sotto unlock
+```
+
+`sotto lock` löscht die zwischengespeicherte lokale Hauptschlüssel-Sitzung, die
+nachfolgende CLI-Befehle verwenden. Deine Identität, der verschlüsselte Tresor und
+die gespeicherte Anmeldung am Synchronisierungsserver bleiben erhalten.
+`sotto unlock` verwendet dein Hauptpasswort, wenn keine gültige Sitzung im Cache
+vorliegt. Befehle, die lokale Daten entschlüsseln müssen, fordern bei Bedarf
+ebenfalls zum Entsperren auf. Die Statusfelder erklärt
+[Lokalen Status prüfen](#lokalen-status-prüfen).
+
+Die lokale Sitzung gilt 12 Stunden ab dem Zwischenspeichern des Schlüssels, nicht
+ab deiner letzten Aktivität. Der Ablauf wird beim Lesen des Schlüssels aus dem
+Cache geprüft. `sotto unlock` verlängert diese Dauer nicht, wenn der Tresor bereits
+entsperrt ist. Weder Sperren noch Ablauf löschen Klartext, den laufende Anwendungen
+bereits enthalten.
+
+Um auch die gespeicherte CLI-Anmeldung am Synchronisierungsserver zu löschen,
+führe beide Befehle aus:
+
+```sh
+sotto lock
+sotto logout
+```
+
+`sotto logout` entfernt das gespeicherte Server-Sitzungstoken der CLI, unabhängig
+vom lokalen Entsperr-Cache. Browser-Sitzungen und andere Geräte werden dadurch
+nicht abgemeldet.
+
+### Cloud-Status
+
+Um den konfigurierten Server und die Cloud-Berechtigung deines Kontos zu prüfen, melde dich zuerst an:
+
+```sh
+sotto login
+sotto cloud status
+sotto cloud status --json
+```
+
+Der Befehl benötigt eine aktive Anmeldung, entsperrt aber weder den lokalen Tresor noch öffnet er einen Browser. Er zeigt den konfigurierten `server`, die `server_info` des Servers, die `eligibility` des Kontos und nur dann eine `billing_url`, wenn der zurückgegebene Status verfügbare Abrechnung meldet. Die lesbare Ausgabe zeigt außerdem `actions`, `next_actions` und optionale Werte für `paid_through_epoch`, `recovery_until_epoch` oder `export_until_epoch`. Fehlt `server_info` oder `eligibility`, stellt ein älterer Server diesen Endpoint nicht bereit; daraus folgt nicht, dass der Zugriff erlaubt oder verweigert ist.
+
+Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht so aus:
+
+```json
+{
+  "server": "https://getsotto.co.uk",
+  "billing_url": "https://getsotto.co.uk/cloud",
+  "server_info": {
+    "deployment_mode": "cloud",
+    "entitlement_model": "organisation_tiers_v1"
+  },
+  "eligibility": {
+    "model": "person_eligibility_v1",
+    "state": "paid",
+    "deployment_mode": "cloud",
+    "account_initialized": true,
+    "billing_available": true,
+    "paid_through_epoch": 1798761600,
+    "recovery_until_epoch": null,
+    "export_until_epoch": null,
+    "actions": {
+      "setup": false,
+      "billing": false,
+      "export": false,
+      "revoke": true
+    },
+    "next_actions": ["revoke"],
+    "payer": "personal"
+  }
+}
+```
+
+Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
+
+Wie du die persönliche Abrechnung auf der Sotto-Cloud-Kontoseite an eine Organisation übergibst,
+steht in der [Anleitung zur Abrechnungsübertragung](CLOUD-BILLING-TRANSFER.md).
 
 ### Ausgabe-Themes
 
@@ -371,15 +831,99 @@ Als `synth.toml` gespeichert, fügt diese Datei ein Theme `synth` hinzu. Mit
 `sotto theme set synth` wendest du es an, oder für einen einzelnen Befehl mit
 `sotto --theme synth <command>`.
 
-### Ein weiteres Gerät
+### Eine frühere Secret-Version wiederherstellen
+
+Beginne in einem bereits konfigurierten Projekt und behalte dieselbe Umgebung ausgewählt.
+Du brauchst eine angemeldete Sitzung und einen entsperrten lokalen Speicher. Der Verlauf
+kommt vom Server: Werte, die nie hochgeladen wurden, stehen dort nicht zur Wiederherstellung bereit.
 
 ```sh
-sotto login                  # same account as the first machine
-sotto setup                  # unpack the Emergency Kit onto this device
-sotto pull                   # download the ciphertext you already pushed
+sotto history DATABASE_URL
 ```
 
-Du brauchst das von `sotto init` ausgegebene Emergency Kit. Ohne es kann ein neues Gerät den Tresor nicht entschlüsseln.
+Wähle eine lesbare, positive Versionsnummer aus dem Verlauf. Das folgende Beispiel verwendet `2`;
+ersetze sie durch eine verfügbare Version, ohne das angezeigte Präfix `v`.
+
+```sh
+sotto rollback DATABASE_URL 2
+sotto push
+```
+
+Rollback stellt den gewählten Wert als neue lokale Version wieder her. Es löscht oder
+überschreibt keinen älteren Verlauf. Der Server wird erst beim anschließenden Push aktualisiert.
+
+Für JSON mit ausschließlich Metadaten:
+
+```sh
+sotto history DATABASE_URL --json
+```
+
+Jede Zeile enthält `version`, `readable` (ob der Wert entschlüsselt werden konnte) und `size_bytes`
+(die Byteanzahl des Klartexts oder null bei einer unlesbaren Version). Werte werden nicht ausgegeben.
+Dagegen gibt `--reveal` Secret-Werte aus und kann nicht mit `--json` kombiniert werden.
+
+Wenn kein Serververlauf vorliegt, prüfe die ausgewählte Umgebung und ob sie hochgeladen wurde.
+Ein jetziger Push kann ältere, nie synchronisierte Werte nicht wiederherstellen. Bei einer
+unlesbaren Version empfiehlt die CLI, `sotto pull` auszuführen und es erneut zu versuchen;
+ein Pull garantiert nicht, dass die verfügbaren Schlüssel diese Version entschlüsseln können.
+
+Für Shell-Skripte und CI siehe die [Referenz zu CLI-Skripten und Exit-Status](CLI-SCRIPTING.md).
+
+### Umgebungsvariablen
+
+Die CLI liest diese Variablen:
+
+- `SOTTO_SERVER`: die Server-URL; sie überschreibt die von `sotto login` gespeicherte. Mit
+  `SOTTO_TOKEN` ist sie Pflicht, sofern `sotto login` auf diesem Rechner keinen Server gespeichert hat.
+- `SOTTO_TOKEN`: ein Maschinen-Token. `sotto run` und `sotto export` lesen dann die Umgebung des
+  Tokens statt des lokalen Tresors.
+- `SOTTO_PASSWORD`: das Master-Passwort, für Skripte, die keine Eingabeaufforderung beantworten
+  können. Nutze nach Möglichkeit die verdeckte Eingabe.
+- `SOTTO_SECRET_KEY`: der Secret Key aus deinem Emergency Kit, für `sotto setup` ohne
+  Eingabeaufforderung.
+- `SOTTO_DATA_DIR`: verschiebt das lokale Datenverzeichnis mit dem verschlüsselten Speicher,
+  gespeicherten Einstellungen wie dem Server und eigenen Themes.
+- `SOTTO_THEME` und `NO_COLOR`: Ausgabestil; siehe [Ausgabe-Themes](#ausgabe-themes).
+
+## Selbst hosten
+
+Ein Befehl bringt ein komplettes Deployment hoch: Postgres, Server und Caddy mit automatischem HTTPS,
+aus [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml); die Anleitung steht in
+[`deploy/README.md`](deploy/README.md). Die Teile funktionieren auch eigenständig: Betreibe Web-App und API unter
+**einem Origin** (damit Sitzungs-Cookie und CSP same-origin bleiben); die mitgelieferte
+[`Caddyfile`](Caddyfile) liefert `web/dist` aus und leitet die API per Reverse-Proxy weiter, mit Sicherheits-Headern;
+das [`Dockerfile`](Dockerfile) baut das Server-Image (Migrationen laufen beim Start).
+
+`SOTTO_DEPLOYMENT_MODE` steht standardmäßig auf `self_hosted`. In diesem Modus wendet der Server
+keine Plan-Limits oder anderen Einschränkungen des gehosteten Dienstes an und braucht kein
+Stripe-Konto. Der Modus `cloud` ist für den Dienst gedacht, den Sotto betreibt; lies die Anleitung,
+bevor du ihn setzt.
+
+Richte die CLI einmal auf deinen Server aus; spätere Befehle verwenden ihn weiter:
+
+```sh
+sotto login --server https://sotto.example.com
+```
+
+Bei einer frischen CLI-Konfiguration verwendet auch der von `sotto share`
+erzeugte Weblink diese Server-URL. Haben API und Web-App verschiedene Origins,
+wählt `--server` weiterhin den Sync/API-Server, während `--web` die Basis-URL
+der Web-App für Freigabelinks festlegt:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+Die CLI speichert die Web-URL separat. Eine spätere Anmeldung nur mit
+`--server` behält die bisherige `--web`-Einstellung bei, auch beim
+Serverwechsel. Für Freigabelinks mit gemeinsamem Origin beide URLs explizit setzen:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+Die Option `--web` leitet keine API-Anfragen um und konfiguriert weder
+serverseitige Cookies, CORS, OAuth und CSP noch den Build der Web-App.
 
 ## Architektur
 
@@ -399,17 +943,22 @@ Der Workspace enthält vier Crates:
 - `crates/server`: die Axum-basierte Synchronisierungs-API.
 - `crates/wasm`: `wasm-bindgen`-Anbindungen, die den Kern für Web-Clients bereitstellen.
 
+Der Browser-Client in `web/` ist eine React- und Vite-App, die den Kern über `crates/wasm` nutzt.
+
 ## Voraussetzungen
 
 - [Rustup](https://rustup.rs/) mit stabilem Rust 1.89 oder neuer
 - Die Komponenten `clippy` und `rustfmt`
 - Das Target `wasm32-unknown-unknown`
+- Für den Web-Client: Node.js 22 (wie in der CI) und `wasm-pack` (die CI pinnt v0.15.0)
+- Für den Server und seine Datenbanktests: Postgres 16, das `docker compose up -d` bereitstellt
+- Für die Skriptprüfungen: Python 3.11 oder neuer
 
 Die eingecheckte `rust-toolchain.toml` lässt Rustup die benötigten Komponenten und das Target automatisch installieren.
 
 ## Entwicklung
 
-Klone das Repository, baue und teste dann den gesamten Workspace:
+Klone das Repository, baue und teste dann den Workspace:
 
 ```sh
 git clone https://github.com/getsotto/sotto.git
@@ -417,6 +966,17 @@ cd sotto
 
 cargo build --workspace
 cargo test --workspace
+```
+
+`cargo test --workspace` braucht keine Datenbank und überspringt daher die Integrationstests des
+Servers und den Ende-zu-Ende-Test der CLI, ohne fehlzuschlagen. Um sie auszuführen, starte das
+lokale Postgres und aktiviere sie mit `SOTTO_RUN_DB_TESTS=1`; sie verweigern eine `DATABASE_URL`,
+die auf etwas anderes als diesen Rechner zeigt:
+
+```sh
+docker compose up -d
+DATABASE_URL=postgres://sotto:sotto@localhost:5432/sotto SOTTO_RUN_DB_TESTS=1 \
+  cargo test -p sotto-server -p sotto-cli
 ```
 
 Nutze die CLI lokal (kein Server erforderlich):
@@ -454,18 +1014,15 @@ Der Browser-Client nutzt denselben Krypto-Kern über WebAssembly (`web/`):
 ```sh
 cd web
 npm ci
-npm run dev      # dev server (proxies the API to localhost:8080)
-npm run build    # production bundle → web/dist (strict CSP + Subresource Integrity)
+npm run dev        # dev server (proxies the API to localhost:8080)
+npm run build      # production bundle → web/dist (strict CSP + Subresource Integrity)
+npm run typecheck  # TypeScript checks; needs the WASM bindings a build generates
+npm test           # unit tests (Vitest)
+npm run smoke      # load the WASM core under Node and exercise it
 ```
 
-### Bereitstellung
-
-Ein Befehl bringt eine komplette gehostete Instanz hoch: Postgres, Server und Caddy mit automatischem HTTPS,
-aus [`deploy/docker-compose.prod.yml`](deploy/docker-compose.prod.yml); die Anleitung steht in
-[`deploy/README.md`](deploy/README.md). Die Teile funktionieren auch eigenständig: Betreibe Web-App und API unter
-**einem Origin** (damit Sitzungs-Cookie und CSP same-origin bleiben); die mitgelieferte
-[`Caddyfile`](Caddyfile) liefert `web/dist` aus und leitet die API per Reverse-Proxy weiter, mit Sicherheits-Headern;
-das [`Dockerfile`](Dockerfile) baut das Server-Image (Migrationen laufen beim Start).
+Die Playwright-Funnel-Suite (`npm run e2e`) braucht eine Datenbank und vorher einen
+Produktions-Build; [`web/e2e/README.md`](web/e2e/README.md) erklärt die Einrichtung.
 
 ## Entwicklungsprüfungen
 
@@ -484,32 +1041,9 @@ Die Lieferketten-Richtlinie steht in `deny.toml` und wird in der CI mit
 cargo deny check
 ```
 
-Der vollständige Lockfile-Audit läuft ebenfalls im `supply-chain`-CI-Job.
-Python 3.11 oder neuer ist erforderlich; die CI verwendet 3.12. cargo-audit muss genau 0.22.2 sein:
-
-```sh
-cargo install cargo-audit --version 0.22.2 --locked
-python3 -B -m unittest discover -s scripts/tests -v
-scripts/check-cargo-audit
-```
-
-Die [Audit-Richtlinie](.ci/cargo-audit-policy.toml) dokumentiert exakte Ausnahmen für ruhende `rsa`- und
-`spin`-Lockfile-Einträge. `package`, `version`, `source`, `kind` und `finding` müssen übereinstimmen.
-Über alle Targets darf mit Standard- und allen Workspace-Features kein Abhängigkeitspfad vom Typ
-`normal`, `build` oder `dev` bestehen. Cargos `dev`-Kanten entsprechen `dev-dependencies`.
-
-Neue Befunde, geänderte Identitäten, erreichbare Pakete, fehlgeschlagene Scans und veraltete Ausnahmen
-lassen die CI fehlschlagen. Entferne eine Ausnahme im selben PR, der ihren Befund entfernt.
-Eine leere Ausnahmeliste erfordert einen sauberen Audit. Der Prüfer beendet sich bei Erfolg mit 0,
-bei Richtlinien- oder Scanfehlern mit 1. Rohes `cargo audit` meldet die ruhenden Befunde weiterhin;
-die Ausnahmen beheben die verwundbaren oder zurückgezogenen Releases nicht.
-
-Die [Audit-Standards](.cargo/audit.toml) aktivieren Advisory-Abruf und Yanked-Prüfungen und
-überschreiben die globale Audit-Konfiguration. Füge keine Advisory-Ausnahmen oder Scan-Filter hinzu.
-
-Der JSON-Modus von cargo-audit 0.22.2 kann Yanked-Prüfungen stillschweigend überspringen. Deshalb
-verlangt der Prüfer einen unabhängigen Terminal-Scan ohne Registry-Fehler und mit übereinstimmenden
-Befundidentitäten. Dies belegt einen separaten erfolgreichen Scan, nicht den Abschluss des JSON-Scans.
+Der `supply-chain`-CI-Job prüft das gesamte Lockfile mit `scripts/check-cargo-audit`. Die
+[Anleitung zum Lockfile-Audit](.ci/cargo-audit.md) beschreibt die gepinnte cargo-audit-Version, die
+Richtlinientests und die Regeln für die ruhenden Lockfile-Ausnahmen.
 
 Das implementationsübergreifende Gate beweist, dass native und WASM-Builds übereinstimmen: nativ erzeugtes Chiffrat
 entschlüsselt in WASM Byte für Byte aus gemeinsamen Referenzvektoren:
@@ -518,7 +1052,10 @@ entschlüsselt in WASM Byte für Byte aus gemeinsamen Referenzvektoren:
 wasm-pack test --node crates/wasm
 ```
 
-Der Web-Build und sein Abhängigkeits-Audit laufen in der CI (`.github/workflows/ci.yml`).
+Der Web-Build, sein Abhängigkeits-Audit und die Prüfung der README-Übersetzungen
+(`scripts/check-readme-i18n`) laufen ebenfalls in der CI (`.github/workflows/ci.yml`).
+[CONTRIBUTING.md](CONTRIBUTING.md) verlinkt die Anleitungen für Fuzzing, Kani-Beweise, Coverage und
+die Assurance-Prüfungen.
 
 ## Telemetrie
 
@@ -551,6 +1088,8 @@ unabhängig auditiert**: siehe [SECURITY.md](SECURITY.md) für das Modell, die e
 (erneut geholte, schwächere) Web-Oberfläche gehärtet ist und wie man signierte Releases verifiziert. Das vollständige
 Angreifermodell, Garantien und explizite Nicht-Ziele stehen in [THREAT-MODEL.md](THREAT-MODEL.md). Melde Schwachstellen
 privat gemäß SECURITY.md.
+
+Umfang und Nachweise, die für ein unabhängiges Audit vorbereitet wurden, stehen in [SECURITY-AUDIT-SCOPE.md](SECURITY-AUDIT-SCOPE.md).
 
 ## Mitwirken
 

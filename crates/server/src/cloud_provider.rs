@@ -16,8 +16,8 @@ use tokio::time::timeout;
 
 use crate::cloud_coverage::{normalise_confirmed_intervals, ConfirmedPaidInterval, PersonCoverage};
 use crate::cloud_coverage_reconciliation::{
-    begin_collection, finish_collection, register_source, CollectionStatus, ReconciliationError,
-    SourceBinding, SourceObservation,
+    begin_collection, finish_collection, finish_collection_with_authority, register_source,
+    AuthorityReceiptInput, CollectionStatus, ReconciliationError, SourceBinding, SourceObservation,
 };
 use crate::cloud_coverage_store::PublicationOutcome;
 use crate::cloud_provider_refresh_jobs::{self, RefreshJobError};
@@ -557,6 +557,54 @@ pub async fn record_verified_event(
     }
 }
 
+/// Reopen a rejected receipt for an explicitly authenticated Stripe repair attempt.
+///
+/// Normal webhook replays must keep rejected receipts terminal. The authenticated repair path
+/// first re-reads the event from Stripe and verifies that an open diagnostic authorises another
+/// evidence check; only then may it move the exact same receipt back to pending.
+pub async fn reopen_rejected_event_for_repair(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+) -> Result<bool, ProviderAdapterError> {
+    context.validate()?;
+    event.validate()?;
+    let row = sqlx::query(
+        "SELECT event_type, provider_created_at, subscription_id, allocation_reference, \
+                provider_object_id, normalized_payload_hash, status \
+         FROM cloud_provider_event_receipts \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 FOR UPDATE",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ProviderAdapterError::EventMissing)?;
+    verify_stored_event(&row, event)?;
+    if row.try_get::<String, _>("status")? != "rejected" {
+        return Ok(false);
+    }
+    let updated = sqlx::query(
+        "UPDATE cloud_provider_event_receipts SET status = 'pending', rejection_code = NULL, \
+                processed_at = NULL \
+         WHERE provider_namespace = $1 AND provider_account_id = $2 \
+           AND provider_environment = $3 AND event_id = $4 AND status = 'rejected'",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&event.event_id)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ProviderAdapterError::EventNotPending);
+    }
+    Ok(true)
+}
+
 /// Register the trusted payer, allocation and source binding for a verified provider event.
 ///
 /// The caller owns the transaction and should record the event receipt first, then call this and
@@ -763,6 +811,16 @@ pub async fn accept_provider_invalidation(
     if updated.rows_affected() != 1 {
         return Err(ProviderAdapterError::InvalidationConflict);
     }
+    sqlx::query(
+        "INSERT INTO cloud_coverage_revalidation_jobs (beneficiary_id) \
+         VALUES ($1) ON CONFLICT (beneficiary_id) DO UPDATE \
+         SET status = 'pending', next_attempt_at = now(), attempt_count = 0, \
+             lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, \
+             last_error_code = NULL, updated_at = now()",
+    )
+    .bind(&allocation.beneficiary_id)
+    .execute(&mut **tx)
+    .await?;
     ensure_event_scope(tx, context, event, &allocation.beneficiary_id).await?;
     if ingest_enabled {
         enqueue_refresh_job(tx, context, event, allocation).await?;
@@ -1158,6 +1216,27 @@ pub async fn complete_verified_event(
     preparation: &CollectionPreparation,
     collection: &VerifiedCollection,
 ) -> Result<ApplyReceipt, ProviderAdapterError> {
+    complete_verified_event_with_authority(
+        tx,
+        context,
+        event,
+        allocation,
+        preparation,
+        collection,
+        None,
+    )
+    .await
+}
+
+pub async fn complete_verified_event_with_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    event: &VerifiedProviderEvent,
+    allocation: &VerifiedAllocation,
+    preparation: &CollectionPreparation,
+    collection: &VerifiedCollection,
+    authority: Option<&AuthorityReceiptInput>,
+) -> Result<ApplyReceipt, ProviderAdapterError> {
     context.validate()?;
     event.validate()?;
     allocation.validate()?;
@@ -1217,11 +1296,12 @@ pub async fn complete_verified_event(
     ensure_allocation(tx, context, allocation).await?;
     validate_provider_bindings(tx, context, &preparation.ticket.source_bindings).await?;
     validate_collection_sources(collection, &preparation.ticket.source_bindings)?;
-    let completed = finish_collection(
+    let completed = finish_collection_with_authority(
         tx,
         &preparation.ticket,
         &collection.aggregate_evidence_reference,
         &collection.observations,
+        authority,
     )
     .await
     .map_err(|error| match error {
@@ -1597,6 +1677,69 @@ async fn ensure_allocation(
         }
         Err(error) => Err(map_provider_database_error(error)),
     }
+}
+
+/// Advance a personal allocation's provider item binding after paid-invoice or renewal-failure
+/// evidence has been verified. A provider may replace a subscription item when a scheduled phase
+/// changes its price; the durable allocation remains the same because its owner, subscription
+/// and allocation reference are unchanged.
+pub(crate) async fn rebind_personal_allocation_item(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+    previous_item_id: &str,
+) -> Result<(), ProviderAdapterError> {
+    if allocation.payer_kind != PayerKind::Personal
+        || allocation.provider_item_id == previous_item_id
+    {
+        return Err(ProviderAdapterError::ProviderContextMismatch);
+    }
+    let updated = sqlx::query(
+        "UPDATE cloud_provider_allocations AS allocation \
+         SET provider_item_id = $1 \
+         FROM cloud_provider_payers AS payer \
+         WHERE allocation.allocation_id = $2 AND allocation.payer_id = $3 \
+           AND allocation.payer_kind = 'personal' AND allocation.beneficiary_id = $4 \
+           AND allocation.provider_namespace = $5 AND allocation.provider_account_id = $6 \
+           AND allocation.provider_environment = $7 \
+           AND allocation.provider_subscription_id = $8 \
+           AND allocation.provider_item_id = $9 \
+           AND allocation.external_allocation_reference = $10 \
+           AND allocation.coverage_source_id = $11 AND allocation.effective_from = $12 \
+           AND allocation.effective_until IS NOT DISTINCT FROM $13 \
+           AND allocation.state = $14 \
+           AND allocation.ownership_evidence_reference = $15 \
+           AND payer.payer_id = allocation.payer_id \
+           AND payer.provider_namespace = $5 AND payer.provider_account_id = $6 \
+           AND payer.provider_environment = $7 AND payer.provider_customer_id = $16 \
+           AND payer.payer_kind = 'personal'",
+    )
+    .bind(&allocation.provider_item_id)
+    .bind(&allocation.allocation_id)
+    .bind(&allocation.payer_id)
+    .bind(&allocation.beneficiary_id)
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(&allocation.subscription_id)
+    .bind(previous_item_id)
+    .bind(&allocation.external_allocation_reference)
+    .bind(&allocation.source_id)
+    .bind(allocation.effective_from)
+    .bind(allocation.effective_until)
+    .bind(allocation.state.as_str())
+    .bind(&allocation.ownership_evidence_reference)
+    .bind(&allocation.provider_customer_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(map_provider_database_error)?;
+    if updated.rows_affected() == 1 {
+        return Ok(());
+    }
+
+    // A duplicate delivery may race with the first event that advanced this binding. Accept only
+    // the exact already-applied new binding; never move the allocation back to an older item.
+    validate_registered_allocation(tx, context, allocation).await
 }
 
 fn map_provider_database_error(error: sqlx::Error) -> ProviderAdapterError {

@@ -97,6 +97,15 @@ pub fn vault_open_grant(
         .map_err(|e| JsError::new(&e.to_string()))
 }
 
+/// Prove an unlock: check that `master_key` opens the account's `enc_private_keys`. Returns
+/// nothing on success, so no key material crosses into JavaScript; any failure (wrong password or
+/// secret key, damaged material) is the same generic error.
+#[wasm_bindgen]
+pub fn vault_verify_account(master_key: &[u8], enc_private_keys: &[u8]) -> Result<(), JsError> {
+    sotto_core::vault::verify_account_keys(&key32(master_key)?, enc_private_keys)
+        .map_err(|_| JsError::new("could not open the account key material"))
+}
+
 /// Rewrap a secret's data key from the old vault key to a new one - the browser side of key
 /// rotation. Ciphertext is untouched; only the wrapping changes (same `(env, secret, version)`
 /// binding), exactly as the CLI does it.

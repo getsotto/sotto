@@ -97,6 +97,10 @@ pub fn classify(method: &Method, path: &str) -> Option<ActionClass> {
     if path == "/account/reset" {
         return (method == Method::POST).then_some(ActionClass::AccountReset);
     }
+    // Contact proof and revocation are recovery controls, not paid product actions.
+    if path == "/account/contacts" || path.starts_with("/account/contacts/") {
+        return None;
+    }
     if path == "/orgs" {
         return match *method {
             Method::GET => Some(ActionClass::OrganisationRead),
@@ -209,7 +213,7 @@ pub async fn shadow(State(state): State<AppState>, mut request: Request, next: N
                     request.extensions_mut().insert(AuthUser {
                         user_id: user_id.clone(),
                     });
-                    match person_eligibility::load_view(&state, &user_id).await {
+                    match person_eligibility::load_view_for_policy(&state, &user_id).await {
                         Ok(view) if decide(action, view.state) == ShadowDecision::WouldDeny => {
                             eprintln!(
                                 "cloud action shadow denial: action={action:?} state={:?}",
@@ -273,6 +277,11 @@ mod tests {
         assert_eq!(classify(&Method::POST, "/orgs/acme/billing/checkout"), None);
         assert_eq!(classify(&Method::GET, "/orgs/acme/entitlements"), None);
         assert_eq!(classify(&Method::POST, "/orgs/acme/deletion/cancel"), None);
+        assert_eq!(
+            classify(&Method::POST, "/account/contacts/verification"),
+            None
+        );
+        assert_eq!(classify(&Method::DELETE, "/account/contacts"), None);
         assert_eq!(
             classify(&Method::GET, "/orgs/billing/members"),
             Some(ActionClass::OrganisationRead)

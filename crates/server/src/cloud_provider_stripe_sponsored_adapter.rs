@@ -343,6 +343,7 @@ mod tests {
             "gbp",
             200,
             200,
+            "pi_1",
             "evt_1",
             vec![SponsoredInvoiceLine::new(
                 "line_1",
@@ -396,6 +397,7 @@ mod tests {
             "gbp",
             100,
             100,
+            format!("pi_{invoice_id}"),
             format!("event_{invoice_id}"),
             vec![SponsoredInvoiceLine::new(
                 format!("line_{invoice_id}"),

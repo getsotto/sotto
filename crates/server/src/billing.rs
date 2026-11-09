@@ -11,7 +11,7 @@
 
 use std::fmt;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::extract::{Path, Query, State};
@@ -23,8 +23,7 @@ use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, Row, Transaction};
-use uuid::Uuid;
+use sqlx::{PgPool, Postgres, Row, Transaction};
 
 #[cfg(feature = "e2e-mock-billing")]
 use url::Url;
@@ -33,20 +32,23 @@ use crate::auth::AuthUser;
 use crate::billing_catalogue::{BillingOffer, BillingPriceIds};
 use crate::billing_operations::{self, BeginOperation, BillingOperationState};
 use crate::billing_refunds::{self, CorrectionReason, PayerKind};
+use crate::billing_transfers::{self, TransferPayer, TransferState};
 use crate::cloud_provider::{
     accept_provider_invalidation, record_verified_event, register_verified_allocation,
-    reject_verified_event, AllocationState, PayerKind as ProviderPayerKind, ProviderContext,
-    ProviderEnvironment, VerifiedAllocation,
+    reject_verified_event, reopen_rejected_event_for_repair, AllocationState,
+    PayerKind as ProviderPayerKind, ProviderContext, ProviderEnvironment, VerifiedAllocation,
 };
 use crate::cloud_provider_stripe::StripeCoverageConfig;
 use crate::cloud_provider_stripe::{
-    decode_paid_invoice, decode_paid_invoice_from_authenticated_read, StripeAllocationBinding,
+    decode_paid_invoice_from_authenticated_read_with_observation,
+    decode_paid_invoice_with_observation, StripeAllocationBinding,
 };
 use crate::cloud_provider_stripe_event_repair::StripeEventRepairDisposition;
 use crate::cloud_provider_stripe_http::{AuthenticatedStripeEvent, StripeReadClient};
 use crate::cloud_provider_stripe_sponsored::{
-    compose_sponsored_coverage, SponsoredAllocationInterval, SponsoredAllocationManifest,
-    SponsoredCoverageResult, SponsoredStripeCoverageConfig,
+    compose_sponsored_coverage, sponsored_predecessor_evidence_reference,
+    SponsoredAllocationInterval, SponsoredAllocationManifest, SponsoredCoverageResult,
+    SponsoredStripeCoverageConfig,
 };
 use crate::cloud_provider_stripe_sponsored_store::{
     end_sponsored_allocation, record_sponsored_allocation_term,
@@ -159,7 +161,7 @@ impl ProviderError {
         }
     }
 
-    fn into_error(self) -> Error {
+    pub(crate) fn into_error(self) -> Error {
         let detail = self.code.unwrap_or_else(|| "unknown_error".into());
         Error::Upstream(format!("stripe provider error: {detail}"))
     }
@@ -171,49 +173,6 @@ impl ProviderError {
 fn provider_failure_is_definitive(error: &ProviderError) -> bool {
     matches!(error.status, Some(400 | 401 | 403 | 404))
         && error.kind != ProviderErrorKind::Retryable
-}
-
-async fn fail_sponsored_provider_operation(
-    pool: &sqlx::PgPool,
-    operation_id: &str,
-    result_code: &str,
-) -> Result<()> {
-    let mut tx = pool.begin().await?;
-    founding_allocator::lock_capacity(&mut tx)
-        .await
-        .map_err(|error| Error::Internal(error.to_string()))?;
-    sponsored_billing::cancel_failed_operation(&mut tx, operation_id, result_code)
-        .await
-        .map_err(Error::from)?;
-    tx.commit().await?;
-    Ok(())
-}
-
-async fn rotate_sponsored_provider_retry_key(
-    pool: &sqlx::PgPool,
-    operation_id: &str,
-    current_key: &str,
-) -> Result<()> {
-    // Updating a subscription schedule replaces the complete desired phase set, so an ambiguous
-    // outcome can be retried with a fresh provider key without duplicating a charge or a resource.
-    let operation_hash: String = Sha256::digest(operation_id.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let next_key = format!(
-        "sotto-sponsored:{operation_hash}-retry-{}",
-        Uuid::new_v4().simple()
-    );
-    sqlx::query(
-        "UPDATE billing_sponsored_operations SET provider_idempotency_key = $3, updated_at = now() \
-         WHERE operation_id = $1 AND state = 'pending' AND provider_idempotency_key = $2",
-    )
-    .bind(operation_id)
-    .bind(current_key)
-    .bind(next_key)
-    .execute(pool)
-    .await?;
-    Ok(())
 }
 
 impl fmt::Display for ProviderError {
@@ -295,21 +254,21 @@ pub enum SubscriptionObservation {
 }
 
 /// One price-class quantity on the organisation's sponsored subscription.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SponsoredSubscriptionItem {
     pub provider_item_id: String,
     pub provider_price_id: String,
     pub quantity: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SponsoredSubscriptionItemRequest {
     pub provider_price_id: String,
     pub quantity: i64,
 }
 
 /// A bounded or open-ended future phase for the organisation's sponsored subscription.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SponsoredSubscriptionPhase {
     pub start_at_epoch: i64,
     pub end_at_epoch: Option<i64>,
@@ -320,8 +279,12 @@ pub struct SponsoredSubscriptionPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SponsoredSubscriptionSnapshot {
     pub customer_id: Option<String>,
+    pub default_payment_method_id: Option<String>,
     pub subscription_id: String,
     pub status: SubscriptionStatus,
+    pub automatic_tax_enabled: bool,
+    pub cancel_at_period_end: bool,
+    pub cancel_at: Option<i64>,
     pub current_period_start: Option<i64>,
     pub current_period_end: Option<i64>,
     pub schedule_id: Option<String>,
@@ -343,12 +306,74 @@ pub struct SponsoredCheckoutSession {
     pub subscription_id: Option<String>,
 }
 
+/// The provider resource created for one personal Checkout operation. The session id is kept
+/// separately from its browser URL so recovery and webhooks never have to parse the URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersonalCheckoutSession {
+    pub session_id: Option<String>,
+    pub checkout_url: String,
+}
+
+/// Runner-owned Stripe customer details for the isolated, real-provider rehearsal build.
+#[cfg(feature = "e2e-stripe-test-clock")]
+#[derive(Debug, Clone, Deserialize)]
+struct E2eTestClockCustomer {
+    customer_id: String,
+    clock_id: String,
+    run_id: String,
+}
+
+/// Stripe's current status for a previously-created personal Checkout session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersonalCheckoutStatus {
+    Open,
+    Complete,
+    ExpiredUnpaid,
+}
+
+/// A beneficiary-authorised Checkout session for saving a payment method before a transfer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferSetupSession {
+    pub session_id: String,
+    pub checkout_url: Option<String>,
+    pub customer_id: String,
+    pub setup_intent_id: Option<String>,
+    pub status: String,
+    pub expires_at_epoch: Option<i64>,
+}
+
+/// Verified SetupIntent fields needed to create a later subscription without taking payment now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferSetupIntent {
+    pub setup_intent_id: String,
+    pub transfer_id: String,
+    pub customer_id: String,
+    pub payment_method_id: String,
+    pub status: String,
+    pub off_session: bool,
+}
+
+/// A future personal subscription obligation created from an authorised SetupIntent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferSubscriptionSchedule {
+    pub schedule_id: String,
+    pub customer_id: String,
+    pub subscription_id: Option<String>,
+    pub start_at_epoch: i64,
+    pub expected_period_end_epoch: i64,
+    pub status: String,
+}
+
 /// Provider evidence for a refund request. A refund response is not an access decision; the
 /// durable correction state decides whether the paid term remains or ends early.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefundReceipt {
     pub refund_id: String,
     pub status: String,
+    pub payment_reference: String,
+    pub charge_id: Option<String>,
+    pub amount_pence: i64,
+    pub currency: String,
 }
 
 impl SubscriptionObservation {
@@ -364,6 +389,105 @@ impl SubscriptionObservation {
 #[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait SubscriptionProvider: Send + Sync {
+    async fn create_transfer_customer(
+        &self,
+        _transfer_id: &str,
+        _beneficiary_id: &str,
+        _idempotency_key: &str,
+    ) -> ProviderResult<String> {
+        Err(ProviderError::unsupported("transfer_customer_create"))
+    }
+
+    async fn create_transfer_setup_session(
+        &self,
+        _transfer_id: &str,
+        _customer_id: &str,
+        _idempotency_key: &str,
+        _success_url: &str,
+        _cancel_url: &str,
+        _collect_billing_address: bool,
+    ) -> ProviderResult<TransferSetupSession> {
+        Err(ProviderError::unsupported("transfer_setup_session_create"))
+    }
+
+    async fn get_transfer_setup_session(
+        &self,
+        _session_id: &str,
+    ) -> ProviderResult<TransferSetupSession> {
+        Err(ProviderError::unsupported("transfer_setup_session_lookup"))
+    }
+
+    async fn get_transfer_setup_intent(
+        &self,
+        _setup_intent_id: &str,
+    ) -> ProviderResult<TransferSetupIntent> {
+        Err(ProviderError::unsupported("transfer_setup_intent_lookup"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_personal_transfer_schedule(
+        &self,
+        _transfer_id: &str,
+        _beneficiary_id: &str,
+        _customer_id: &str,
+        _payment_method_id: &str,
+        _offer: BillingOffer,
+        _price_id: &str,
+        _allocation_reference: &str,
+        _start_at_epoch: i64,
+        _idempotency_key: &str,
+    ) -> ProviderResult<TransferSubscriptionSchedule> {
+        Err(ProviderError::unsupported(
+            "personal_transfer_schedule_create",
+        ))
+    }
+
+    /// Preview the upcoming sponsored subscription invoice after its schedule has been updated.
+    /// The returned line period is Stripe's billing boundary, including the organisation's
+    /// existing anchor day.
+    async fn preview_transfer_period_end(
+        &self,
+        _subscription_id: &str,
+        _price_id: &str,
+        _period_start: i64,
+    ) -> ProviderResult<i64> {
+        Err(ProviderError::unsupported("transfer_period_preview"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_personal_source_restoration_subscription(
+        &self,
+        _transfer_id: &str,
+        _beneficiary_id: &str,
+        _customer_id: &str,
+        _payment_method_id: &str,
+        _offer: BillingOffer,
+        _price_id: &str,
+        _allocation_reference: &str,
+        _operation_id: &str,
+        _idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        Err(ProviderError::unsupported(
+            "personal_source_restoration_subscription_create",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn find_personal_source_restoration_subscription(
+        &self,
+        _operation_id: &str,
+        _transfer_id: &str,
+        _beneficiary_id: &str,
+        _customer_id: &str,
+        _payment_method_id: &str,
+        _price_id: &str,
+        _allocation_reference: &str,
+    ) -> ProviderResult<Option<SponsoredSubscriptionSnapshot>> {
+        Err(ProviderError::unsupported(
+            "personal_source_restoration_subscription_lookup",
+        ))
+    }
+
     async fn create_checkout(
         &self,
         org_id: &str,
@@ -387,7 +511,8 @@ pub trait SubscriptionProvider: Send + Sync {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
-    ) -> ProviderResult<String> {
+        _automatic_tax_enabled: bool,
+    ) -> ProviderResult<PersonalCheckoutSession> {
         let _ = (
             price_id,
             operation_id,
@@ -395,8 +520,43 @@ pub trait SubscriptionProvider: Send + Sync {
             idempotency_key,
             expires_at_epoch,
         );
-        self.create_checkout(user_id, customer, success_url, cancel_url)
-            .await
+        let checkout_url = self
+            .create_checkout(user_id, customer, success_url, cancel_url)
+            .await?;
+        Ok(PersonalCheckoutSession {
+            session_id: None,
+            checkout_url,
+        })
+    }
+
+    /// Verify and claim a runner-created test-clock Customer for one mock OAuth identity.
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    async fn claim_e2e_test_clock_customer(
+        &self,
+        _customer_id: &str,
+        _clock_id: &str,
+        _run_id: &str,
+        _user_id: &str,
+    ) -> ProviderResult<()> {
+        Err(ProviderError::unsupported("e2e_test_clock_customer"))
+    }
+
+    /// Read a previously-created personal Checkout session before releasing its pending account.
+    /// Implementations must bind the returned resource to both identifiers.
+    async fn get_personal_checkout_status(
+        &self,
+        _session_id: &str,
+        _operation_id: &str,
+    ) -> ProviderResult<PersonalCheckoutStatus> {
+        Err(ProviderError::unsupported("personal_checkout_lookup"))
+    }
+
+    async fn get_sponsored_checkout_status(
+        &self,
+        _session_id: &str,
+        _operation_id: &str,
+    ) -> ProviderResult<PersonalCheckoutStatus> {
+        Err(ProviderError::unsupported("sponsored_checkout_lookup"))
     }
 
     /// Create the initial named sponsored subscription checkout. All price classes are sent in
@@ -412,6 +572,7 @@ pub trait SubscriptionProvider: Send + Sync {
         _expires_at_epoch: i64,
         _success_url: &str,
         _cancel_url: &str,
+        _automatic_tax_enabled: bool,
     ) -> ProviderResult<SponsoredCheckoutSession> {
         Err(ProviderError::unsupported("sponsored_checkout"))
     }
@@ -427,6 +588,18 @@ pub trait SubscriptionProvider: Send + Sync {
         _idempotency_key: &str,
     ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
         Err(ProviderError::unsupported("sponsored_subscription_update"))
+    }
+
+    /// Confirm whether an earlier sponsored schedule mutation is visible at the provider. A
+    /// positive result is independently read back; `None` means it is not proven applied.
+    async fn verify_sponsored_subscription_update(
+        &self,
+        _subscription_id: &str,
+        _expected_period_start: i64,
+        _expected_period_end: i64,
+        _phases: &[SponsoredSubscriptionPhase],
+    ) -> ProviderResult<Option<SponsoredSubscriptionSnapshot>> {
+        Ok(None)
     }
 
     /// Schedule a personal subscription's founding-to-standard transition without adding
@@ -468,7 +641,20 @@ pub trait SubscriptionProvider: Send + Sync {
         Err(ProviderError::unsupported("personal_price_validation"))
     }
 
-    async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String>;
+    async fn validate_cloud_portal_configuration(
+        &self,
+        configuration_id: &str,
+    ) -> ProviderResult<()> {
+        let _ = configuration_id;
+        Ok(())
+    }
+
+    async fn create_portal(
+        &self,
+        customer: &str,
+        return_url: &str,
+        configuration_id: Option<&str>,
+    ) -> ProviderResult<String>;
 
     /// Create a refund against a verified payment reference. The caller owns the durable
     /// correction transaction and must record the receipt before changing any entitlement.
@@ -486,6 +672,17 @@ pub trait SubscriptionProvider: Send + Sync {
     /// read before another create call is attempted.
     async fn get_refund(&self, _provider_refund_id: &str) -> ProviderResult<RefundReceipt> {
         Err(ProviderError::unsupported("refund_lookup"))
+    }
+
+    /// Read the amount available immediately before a successful refund. Stripe's charge
+    /// aggregate includes the successful refund being checked, so subtract its amount first.
+    async fn get_refundable_amount(
+        &self,
+        _payment_reference: &str,
+        _charge_id: &str,
+        _refund_amount_pence: i64,
+    ) -> ProviderResult<(i64, String)> {
+        Err(ProviderError::unsupported("payment_lookup"))
     }
 
     async fn get_subscription(
@@ -520,6 +717,39 @@ pub trait SubscriptionProvider: Send + Sync {
             .await
     }
 
+    /// Cancel a transfer source only at the paid-through boundary accepted in the quote. The
+    /// default adapter verifies the current period first; provider implementations should also
+    /// bind the write itself to the explicit timestamp where the API supports it.
+    async fn cancel_personal_subscription_at_boundary(
+        &self,
+        subscription_id: &str,
+        boundary_epoch: i64,
+        idempotency_key: &str,
+        user_id: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        let current = self.get_sponsored_subscription(subscription_id).await?;
+        if current.current_period_end != Some(boundary_epoch) {
+            return Err(ProviderError::malformed_response());
+        }
+        match self
+            .cancel_personal_subscription(subscription_id, idempotency_key, user_id)
+            .await?
+        {
+            SubscriptionObservation::Current(_) => {
+                let updated = self.get_sponsored_subscription(subscription_id).await?;
+                if updated.current_period_end != Some(boundary_epoch)
+                    || (!updated.cancel_at_period_end
+                        && updated.cancel_at != Some(boundary_epoch)
+                        && updated.status != SubscriptionStatus::Canceled)
+                {
+                    return Err(ProviderError::malformed_response());
+                }
+                Ok(updated)
+            }
+            SubscriptionObservation::Missing => Err(ProviderError::malformed_response()),
+        }
+    }
+
     /// Immediately terminate a personal subscription after an approved full refund. The
     /// correction workflow keeps its request in `provider_pending` until this step and the
     /// refund both succeed, so a retry can safely repeat the same provider idempotency key.
@@ -547,7 +777,9 @@ pub struct BillingState {
     return_url: String,
     price_catalogue: Option<BillingPriceIds>,
     cloud_sales_enabled: bool,
+    cloud_automatic_tax_enabled: bool,
     founding_schedule_worker_enabled: bool,
+    cloud_portal_configuration_id: Option<String>,
     personal_coverage: Option<PersonalCoverageRuntime>,
 }
 
@@ -572,8 +804,29 @@ impl BillingState {
         self.cloud_sales_enabled
     }
 
+    pub fn cloud_automatic_tax_enabled(&self) -> bool {
+        self.cloud_automatic_tax_enabled
+    }
+
+    pub fn return_url(&self) -> &str {
+        &self.return_url
+    }
+
     pub fn founding_schedule_worker_enabled(&self) -> bool {
         self.founding_schedule_worker_enabled
+    }
+
+    pub fn cloud_portal_configuration_id(&self) -> Option<&str> {
+        self.cloud_portal_configuration_id.as_deref()
+    }
+
+    pub async fn validate_cloud_portal_configuration(&self) -> ProviderResult<()> {
+        let configuration_id = self
+            .cloud_portal_configuration_id()
+            .ok_or_else(ProviderError::malformed_response)?;
+        self.provider
+            .validate_cloud_portal_configuration(configuration_id)
+            .await
     }
 
     pub fn with_founding_schedule_worker_enabled(mut self, enabled: bool) -> Self {
@@ -585,13 +838,17 @@ impl BillingState {
         let provider = StripeBilling {
             api_key: config.api_key.clone(),
             price_id: config.price_id,
+            automatic_tax_enabled: config.cloud_automatic_tax_enabled,
+            api_origin: "https://api.stripe.com".into(),
         };
         Self {
             provider: Arc::new(provider),
             webhook_secret: config.webhook_secret,
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
+            cloud_portal_configuration_id: config.cloud_portal_configuration_id,
             cloud_sales_enabled: config.cloud_sales_enabled,
+            cloud_automatic_tax_enabled: config.cloud_automatic_tax_enabled,
             founding_schedule_worker_enabled: false,
             personal_coverage: None,
         }
@@ -649,7 +906,9 @@ impl BillingState {
             return_url,
             price_catalogue: None,
             cloud_sales_enabled,
+            cloud_automatic_tax_enabled: false,
             founding_schedule_worker_enabled: true,
+            cloud_portal_configuration_id: cloud_sales_enabled.then(|| "bpc_test".into()),
             personal_coverage: None,
         }
     }
@@ -662,7 +921,9 @@ impl BillingState {
             return_url: config.return_url,
             price_catalogue: config.price_catalogue,
             cloud_sales_enabled: config.cloud_sales_enabled,
+            cloud_automatic_tax_enabled: config.cloud_automatic_tax_enabled,
             founding_schedule_worker_enabled: false,
+            cloud_portal_configuration_id: config.cloud_portal_configuration_id,
             personal_coverage: None,
         }
     }
@@ -671,10 +932,396 @@ impl BillingState {
 struct StripeBilling {
     api_key: String,
     price_id: String,
+    automatic_tax_enabled: bool,
+    api_origin: String,
 }
 
 #[async_trait]
 impl SubscriptionProvider for StripeBilling {
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    async fn claim_e2e_test_clock_customer(
+        &self,
+        customer_id: &str,
+        clock_id: &str,
+        run_id: &str,
+        user_id: &str,
+    ) -> ProviderResult<()> {
+        if !self.api_key.starts_with("rk_test_")
+            || !valid_stripe_id(customer_id, "cus_")
+            || !valid_stripe_id(clock_id, "clock_")
+            || !valid_run_id(run_id)
+            || !valid_e2e_customer_user_id(user_id)
+        {
+            return Err(ProviderError::malformed_response());
+        }
+
+        let customer = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("customers/{customer_id}"),
+        )
+        .await?;
+        if !e2e_test_clock_customer_matches(&customer, customer_id, clock_id, run_id, None) {
+            return Err(ProviderError::malformed_response());
+        }
+        let claimed_user = customer["metadata"]["sotto_lifecycle_user_id"].as_str();
+        if claimed_user.is_some_and(|claimed_user| claimed_user != user_id) {
+            return Err(ProviderError::malformed_response());
+        }
+
+        if claimed_user.is_none() {
+            let subscriptions = stripe_get_at(
+                &self.api_key,
+                &self.api_origin,
+                &format!("subscriptions?customer={customer_id}&status=all&limit=1"),
+            )
+            .await?;
+            if subscriptions["data"]
+                .as_array()
+                .is_none_or(|rows| !rows.is_empty())
+            {
+                return Err(ProviderError::malformed_response());
+            }
+            let updated = stripe_post_with_idempotency_at(
+                &self.api_key,
+                &self.api_origin,
+                &format!("customers/{customer_id}"),
+                &[(
+                    "metadata[sotto_lifecycle_user_id]".into(),
+                    user_id.to_owned(),
+                )],
+                &format!("sotto-lifecycle:{run_id}:claim:{customer_id}"),
+            )
+            .await?;
+            if !e2e_test_clock_customer_matches(
+                &updated,
+                customer_id,
+                clock_id,
+                run_id,
+                Some(user_id),
+            ) {
+                return Err(ProviderError::malformed_response());
+            }
+        }
+        Ok(())
+    }
+
+    async fn create_transfer_customer(
+        &self,
+        transfer_id: &str,
+        beneficiary_id: &str,
+        idempotency_key: &str,
+    ) -> ProviderResult<String> {
+        if transfer_id.trim().is_empty() || beneficiary_id.trim().is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        let form = vec![
+            ("metadata[sotto_transfer_id]".into(), transfer_id.into()),
+            (
+                "metadata[sotto_beneficiary_id]".into(),
+                beneficiary_id.into(),
+            ),
+        ];
+        let customer = stripe_post_with_idempotency_at(
+            &self.api_key,
+            &self.api_origin,
+            "customers",
+            &form,
+            idempotency_key,
+        )
+        .await?;
+        customer["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(ProviderError::malformed_response)
+    }
+
+    async fn create_transfer_setup_session(
+        &self,
+        transfer_id: &str,
+        customer_id: &str,
+        idempotency_key: &str,
+        success_url: &str,
+        cancel_url: &str,
+        collect_billing_address: bool,
+    ) -> ProviderResult<TransferSetupSession> {
+        if transfer_id.trim().is_empty() || customer_id.trim().is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        let form = transfer_setup_checkout_form(
+            transfer_id,
+            customer_id,
+            success_url,
+            cancel_url,
+            collect_billing_address,
+        );
+        let value = stripe_post_with_idempotency_at(
+            &self.api_key,
+            &self.api_origin,
+            "checkout/sessions",
+            &form,
+            idempotency_key,
+        )
+        .await?;
+        let session = transfer_setup_session_from_object(&value, None, Some(transfer_id))?;
+        if session.status != "open" || session.checkout_url.is_none() {
+            return Err(ProviderError::malformed_response());
+        }
+        Ok(session)
+    }
+
+    async fn get_transfer_setup_session(
+        &self,
+        session_id: &str,
+    ) -> ProviderResult<TransferSetupSession> {
+        let value = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("checkout/sessions/{session_id}"),
+        )
+        .await?;
+        transfer_setup_session_from_object(&value, Some(session_id), None)
+    }
+
+    async fn get_transfer_setup_intent(
+        &self,
+        setup_intent_id: &str,
+    ) -> ProviderResult<TransferSetupIntent> {
+        if setup_intent_id.trim().is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        let value = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("setup_intents/{setup_intent_id}"),
+        )
+        .await?;
+        transfer_setup_intent_from_object(&value, setup_intent_id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_personal_transfer_schedule(
+        &self,
+        transfer_id: &str,
+        beneficiary_id: &str,
+        customer_id: &str,
+        payment_method_id: &str,
+        offer: BillingOffer,
+        price_id: &str,
+        allocation_reference: &str,
+        start_at_epoch: i64,
+        idempotency_key: &str,
+    ) -> ProviderResult<TransferSubscriptionSchedule> {
+        if transfer_id.trim().is_empty()
+            || beneficiary_id.trim().is_empty()
+            || customer_id.trim().is_empty()
+            || payment_method_id.trim().is_empty()
+            || price_id.trim().is_empty()
+            || allocation_reference.trim().is_empty()
+            || start_at_epoch <= 0
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let form = personal_transfer_schedule_form(
+            transfer_id,
+            beneficiary_id,
+            customer_id,
+            payment_method_id,
+            offer,
+            price_id,
+            allocation_reference,
+            start_at_epoch,
+            self.automatic_tax_enabled,
+        );
+        let created = stripe_post_with_idempotency_at(
+            &self.api_key,
+            &self.api_origin,
+            "subscription_schedules",
+            &form,
+            idempotency_key,
+        )
+        .await?;
+        let schedule_id = created["id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let observed = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("subscription_schedules/{schedule_id}"),
+        )
+        .await?;
+        transfer_schedule_from_object(
+            &observed,
+            transfer_id,
+            customer_id,
+            payment_method_id,
+            beneficiary_id,
+            offer,
+            price_id,
+            allocation_reference,
+            start_at_epoch,
+            self.automatic_tax_enabled,
+        )
+    }
+
+    async fn preview_transfer_period_end(
+        &self,
+        subscription_id: &str,
+        price_id: &str,
+        period_start: i64,
+    ) -> ProviderResult<i64> {
+        if subscription_id.trim().is_empty() || price_id.trim().is_empty() || period_start <= 0 {
+            return Err(ProviderError::malformed_response());
+        }
+        let invoice = stripe_post_at(
+            &self.api_key,
+            &self.api_origin,
+            "invoices/create_preview",
+            &[("subscription".into(), subscription_id.into())],
+        )
+        .await?;
+        preview_subscription_period_end_from_invoice(
+            &invoice,
+            subscription_id,
+            price_id,
+            period_start,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_personal_source_restoration_subscription(
+        &self,
+        transfer_id: &str,
+        beneficiary_id: &str,
+        customer_id: &str,
+        payment_method_id: &str,
+        _offer: BillingOffer,
+        price_id: &str,
+        allocation_reference: &str,
+        operation_id: &str,
+        idempotency_key: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        if transfer_id.trim().is_empty()
+            || beneficiary_id.trim().is_empty()
+            || customer_id.trim().is_empty()
+            || payment_method_id.trim().is_empty()
+            || price_id.trim().is_empty()
+            || allocation_reference.trim().is_empty()
+            || operation_id.trim().is_empty()
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let form = personal_source_restoration_form(
+            transfer_id,
+            beneficiary_id,
+            customer_id,
+            payment_method_id,
+            price_id,
+            allocation_reference,
+            operation_id,
+            self.automatic_tax_enabled,
+        );
+        let created = stripe_post_with_idempotency_at(
+            &self.api_key,
+            &self.api_origin,
+            "subscriptions",
+            &form,
+            idempotency_key,
+        )
+        .await?;
+        let subscription_id = created["id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let observed = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("subscriptions/{subscription_id}"),
+        )
+        .await?;
+        let snapshot = sponsored_subscription_snapshot(&observed, subscription_id)?;
+        if !automatic_tax_state_matches(&observed, self.automatic_tax_enabled)
+            || snapshot.customer_id.as_deref() != Some(customer_id)
+            || snapshot.default_payment_method_id.as_deref() != Some(payment_method_id)
+            || snapshot.items.len() != 1
+            || snapshot.items[0].provider_price_id != price_id
+            || snapshot.items[0].quantity != 1
+            || observed["metadata"]["personal_user_id"].as_str() != Some(beneficiary_id)
+            || observed["metadata"]["operation_id"].as_str() != Some(operation_id)
+            || observed["metadata"]["sotto_allocation_reference"].as_str()
+                != Some(allocation_reference)
+            || observed["metadata"]["sotto_transfer_id"].as_str() != Some(transfer_id)
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        Ok(snapshot)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn find_personal_source_restoration_subscription(
+        &self,
+        operation_id: &str,
+        transfer_id: &str,
+        beneficiary_id: &str,
+        customer_id: &str,
+        payment_method_id: &str,
+        price_id: &str,
+        allocation_reference: &str,
+    ) -> ProviderResult<Option<SponsoredSubscriptionSnapshot>> {
+        if operation_id.trim().is_empty()
+            || transfer_id.trim().is_empty()
+            || beneficiary_id.trim().is_empty()
+            || customer_id.trim().is_empty()
+            || payment_method_id.trim().is_empty()
+            || price_id.trim().is_empty()
+            || allocation_reference.trim().is_empty()
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let query = format!("metadata['operation_id']:'{operation_id}'");
+        let response = stripe_client()
+            .get(format!(
+                "{}/v1/subscriptions/search",
+                self.api_origin.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.api_key)
+            .headers(stripe_headers(None)?)
+            .query(&[("query", query.as_str()), ("limit", "2")])
+            .send()
+            .await
+            .map_err(|_| ProviderError::transport())?;
+        let value = stripe_response(response).await?;
+        let rows = value["data"]
+            .as_array()
+            .filter(|rows| rows.len() <= 1)
+            .ok_or_else(ProviderError::malformed_response)?;
+        let Some(object) = rows.first() else {
+            return Ok(None);
+        };
+        let subscription_id = object["id"]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let snapshot = sponsored_subscription_snapshot(object, subscription_id)?;
+        if !automatic_tax_state_matches(object, self.automatic_tax_enabled)
+            || snapshot.customer_id.as_deref() != Some(customer_id)
+            || snapshot.default_payment_method_id.as_deref() != Some(payment_method_id)
+            || snapshot.items.len() != 1
+            || snapshot.items[0].provider_price_id != price_id
+            || snapshot.items[0].quantity != 1
+            || object["metadata"]["personal_user_id"].as_str() != Some(beneficiary_id)
+            || object["metadata"]["operation_id"].as_str() != Some(operation_id)
+            || object["metadata"]["sotto_allocation_reference"].as_str()
+                != Some(allocation_reference)
+            || object["metadata"]["sotto_transfer_id"].as_str() != Some(transfer_id)
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        Ok(Some(snapshot))
+    }
+
     async fn create_checkout(
         &self,
         org_id: &str,
@@ -699,8 +1346,10 @@ impl SubscriptionProvider for StripeBilling {
         if let Some(customer) = customer {
             form.push(("customer".to_string(), customer.to_string()));
         }
+        append_checkout_tax_fields(&mut form, customer.is_some(), self.automatic_tax_enabled);
 
         let session = stripe_post(&self.api_key, "checkout/sessions", &form).await?;
+        require_checkout_tax_state(&session, self.automatic_tax_enabled)?;
         session["url"]
             .as_str()
             .map(str::to_string)
@@ -719,7 +1368,8 @@ impl SubscriptionProvider for StripeBilling {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
-    ) -> ProviderResult<String> {
+        automatic_tax_enabled: bool,
+    ) -> ProviderResult<PersonalCheckoutSession> {
         if price_id.is_empty() {
             return Err(ProviderError::malformed_response());
         }
@@ -750,6 +1400,7 @@ impl SubscriptionProvider for StripeBilling {
         if let Some(customer) = customer {
             form.push(("customer".to_string(), customer.to_string()));
         }
+        append_checkout_tax_fields(&mut form, customer.is_some(), automatic_tax_enabled);
         let session = stripe_post_with_idempotency(
             &self.api_key,
             "checkout/sessions",
@@ -757,10 +1408,53 @@ impl SubscriptionProvider for StripeBilling {
             idempotency_key,
         )
         .await?;
-        session["url"]
+        require_checkout_tax_state(&session, automatic_tax_enabled)?;
+        let session_id = session["id"]
             .as_str()
-            .map(str::to_string)
-            .ok_or_else(ProviderError::malformed_response)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let checkout_url = session["url"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        Ok(PersonalCheckoutSession {
+            session_id: Some(session_id.to_string()),
+            checkout_url: checkout_url.to_string(),
+        })
+    }
+
+    async fn get_personal_checkout_status(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> ProviderResult<PersonalCheckoutStatus> {
+        if session_id.trim().is_empty() || operation_id.trim().is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        let value = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("checkout/sessions/{session_id}"),
+        )
+        .await?;
+        personal_checkout_status_from_object(&value, session_id, operation_id)
+    }
+
+    async fn get_sponsored_checkout_status(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> ProviderResult<PersonalCheckoutStatus> {
+        if session_id.trim().is_empty() || operation_id.trim().is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        let value = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("checkout/sessions/{session_id}"),
+        )
+        .await?;
+        checkout_status_from_object(&value, session_id, &format!("sponsored:{operation_id}"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -774,6 +1468,7 @@ impl SubscriptionProvider for StripeBilling {
         expires_at_epoch: i64,
         success_url: &str,
         cancel_url: &str,
+        automatic_tax_enabled: bool,
     ) -> ProviderResult<SponsoredCheckoutSession> {
         if items.is_empty()
             || items
@@ -813,13 +1508,16 @@ impl SubscriptionProvider for StripeBilling {
         if let Some(customer) = customer {
             form.push(("customer".to_string(), customer.to_string()));
         }
-        let session = stripe_post_with_idempotency(
+        append_checkout_tax_fields(&mut form, customer.is_some(), automatic_tax_enabled);
+        let session = stripe_post_with_idempotency_at(
             &self.api_key,
+            &self.api_origin,
             "checkout/sessions",
             &form,
             idempotency_key,
         )
         .await?;
+        require_checkout_tax_state(&session, automatic_tax_enabled)?;
         let session_id = session["id"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -868,8 +1566,9 @@ impl SubscriptionProvider for StripeBilling {
         let schedule_id = if let Some(schedule_id) = current.schedule_id.clone() {
             schedule_id
         } else {
-            let schedule = stripe_post_with_idempotency(
+            let schedule = stripe_post_with_idempotency_at(
                 &self.api_key,
+                &self.api_origin,
                 "subscription_schedules",
                 &[("from_subscription".into(), subscription_id.into())],
                 &format!("{idempotency_key}-schedule"),
@@ -945,6 +1644,11 @@ impl SubscriptionProvider for StripeBilling {
             ("phases[0][start_date]".into(), current_start.to_string()),
             ("phases[0][end_date]".into(), current_end.to_string()),
         ];
+        append_sponsored_phase_tax_fields(
+            &mut form,
+            normalized.len(),
+            current.automatic_tax_enabled,
+        );
         for (index, item) in current.items.iter().enumerate() {
             form.push((
                 format!("phases[0][items][{index}][price]"),
@@ -975,35 +1679,128 @@ impl SubscriptionProvider for StripeBilling {
                 ));
             }
         }
-        stripe_post_with_idempotency(
+        stripe_post_with_idempotency_at(
             &self.api_key,
+            &self.api_origin,
             &format!("subscription_schedules/{schedule_id}"),
             &form,
             &schedule_update_idempotency_key(idempotency_key, &normalized),
         )
         .await?;
-        let schedule = stripe_get(
+        let schedule = stripe_get_at(
             &self.api_key,
+            &self.api_origin,
             &format!("subscription_schedules/{schedule_id}"),
         )
         .await?;
-        if !stripe_schedule_contains_phases(
+        if !stripe_schedule_contains_phases_with_tax(
             &schedule,
             current_start,
             current_end,
             &current.items,
             &normalized,
+            current.automatic_tax_enabled,
         ) {
             return Err(ProviderError::malformed_response());
         }
         self.get_sponsored_subscription(subscription_id).await
     }
 
+    async fn verify_sponsored_subscription_update(
+        &self,
+        subscription_id: &str,
+        expected_period_start: i64,
+        expected_period_end: i64,
+        phases: &[SponsoredSubscriptionPhase],
+    ) -> ProviderResult<Option<SponsoredSubscriptionSnapshot>> {
+        let current = self.get_sponsored_subscription(subscription_id).await?;
+        if current.current_period_start != Some(expected_period_start)
+            || current.current_period_end != Some(expected_period_end)
+        {
+            return Ok(None);
+        }
+        let Some(schedule_id) = current.schedule_id.as_deref() else {
+            return Ok(None);
+        };
+        let schedule = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("subscription_schedules/{schedule_id}"),
+        )
+        .await?;
+        let phase_at_end = phases
+            .iter()
+            .find(|phase| {
+                phase.start_at_epoch <= expected_period_end
+                    && phase
+                        .end_at_epoch
+                        .is_none_or(|end| expected_period_end < end)
+            })
+            .or_else(|| {
+                phases
+                    .iter()
+                    .find(|phase| phase.start_at_epoch == expected_period_end)
+            })
+            .ok_or_else(ProviderError::malformed_response)?;
+        let mut normalized = vec![SponsoredSubscriptionPhase {
+            start_at_epoch: expected_period_end,
+            end_at_epoch: phase_at_end.end_at_epoch,
+            items: phase_at_end.items.clone(),
+        }];
+        normalized.extend(
+            phases
+                .iter()
+                .filter(|phase| phase.start_at_epoch > expected_period_end)
+                .cloned(),
+        );
+        if normalized.windows(2).any(|window| {
+            window[0]
+                .end_at_epoch
+                .is_some_and(|end| end != window[1].start_at_epoch)
+        }) {
+            return Err(ProviderError::malformed_response());
+        }
+        let final_empty = normalized
+            .last()
+            .is_some_and(|phase| phase.items.is_empty());
+        if final_empty {
+            normalized.pop();
+        }
+        if normalized.iter().any(|phase| phase.items.is_empty()) {
+            return Err(ProviderError::malformed_response());
+        }
+        let current_start = stripe_current_schedule_phase_start(
+            &schedule,
+            schedule_id,
+            subscription_id,
+            expected_period_start,
+            expected_period_end,
+        )?;
+        if stripe_schedule_contains_phases(
+            &schedule,
+            current_start,
+            expected_period_end,
+            &current.items,
+            &normalized,
+        ) && schedule["end_behavior"].as_str()
+            == Some(if final_empty { "cancel" } else { "release" })
+        {
+            Ok(Some(current))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn get_sponsored_subscription(
         &self,
         subscription_id: &str,
     ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
-        let value = stripe_get(&self.api_key, &format!("subscriptions/{subscription_id}")).await?;
+        let value = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("subscriptions/{subscription_id}"),
+        )
+        .await?;
         sponsored_subscription_snapshot(&value, subscription_id)
     }
 
@@ -1050,12 +1847,25 @@ impl SubscriptionProvider for StripeBilling {
                     .to_string()
             }
         };
-        let current_start = current
+        let current_period_start = current
             .current_period_start
             .ok_or_else(ProviderError::malformed_response)?;
         let current_end = current
             .current_period_end
             .ok_or_else(ProviderError::malformed_response)?;
+        let existing_schedule = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("subscription_schedules/{schedule_id}"),
+        )
+        .await?;
+        let current_start = stripe_current_schedule_phase_start(
+            &existing_schedule,
+            &schedule_id,
+            subscription_id,
+            current_period_start,
+            current_end,
+        )?;
         let phase_at_end = phases
             .iter()
             .find(|phase| {
@@ -1121,15 +1931,17 @@ impl SubscriptionProvider for StripeBilling {
                 ));
             }
         }
-        stripe_post_with_idempotency(
+        stripe_post_with_idempotency_at(
             &self.api_key,
+            &self.api_origin,
             &format!("subscription_schedules/{schedule_id}"),
             &form,
             &schedule_update_idempotency_key(idempotency_key, &normalized),
         )
         .await?;
-        let schedule = stripe_get(
+        let schedule = stripe_get_at(
             &self.api_key,
+            &self.api_origin,
             &format!("subscription_schedules/{schedule_id}"),
         )
         .await?;
@@ -1183,11 +1995,33 @@ impl SubscriptionProvider for StripeBilling {
         )
     }
 
-    async fn create_portal(&self, customer: &str, return_url: &str) -> ProviderResult<String> {
-        let form = vec![
-            ("customer".to_string(), customer.to_string()),
-            ("return_url".to_string(), return_url.to_string()),
-        ];
+    async fn validate_cloud_portal_configuration(
+        &self,
+        configuration_id: &str,
+    ) -> ProviderResult<()> {
+        let value = stripe_get(
+            &self.api_key,
+            &format!("billing_portal/configurations/{configuration_id}"),
+        )
+        .await?;
+        validate_cloud_portal_configuration(
+            &value,
+            configuration_id,
+            self.api_key.starts_with("sk_live_") || self.api_key.starts_with("rk_live_"),
+        )
+    }
+
+    async fn create_portal(
+        &self,
+        customer: &str,
+        return_url: &str,
+        configuration_id: Option<&str>,
+    ) -> ProviderResult<String> {
+        if let Some(configuration_id) = configuration_id {
+            self.validate_cloud_portal_configuration(configuration_id)
+                .await?;
+        }
+        let form = portal_session_form(customer, return_url, configuration_id);
         let session = stripe_post(&self.api_key, "billing_portal/sessions", &form).await?;
         session["url"]
             .as_str()
@@ -1221,9 +2055,26 @@ impl SubscriptionProvider for StripeBilling {
             .as_str()
             .filter(|status| !status.is_empty())
             .ok_or_else(ProviderError::malformed_response)?;
+        let payment_reference = value["payment_intent"]
+            .as_str()
+            .filter(|payment_reference| !payment_reference.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let amount_pence = value["amount"]
+            .as_i64()
+            .filter(|amount| *amount > 0)
+            .ok_or_else(ProviderError::malformed_response)?;
+        let currency = value["currency"]
+            .as_str()
+            .filter(|currency| !currency.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let charge_id = parse_refund_charge_id(&value)?;
         Ok(RefundReceipt {
             refund_id: refund_id.to_string(),
             status: status.to_string(),
+            payment_reference: payment_reference.to_string(),
+            charge_id,
+            amount_pence,
+            currency: currency.to_string(),
         })
     }
 
@@ -1231,7 +2082,12 @@ impl SubscriptionProvider for StripeBilling {
         if !provider_refund_id.starts_with("re_") {
             return Err(ProviderError::malformed_response());
         }
-        let value = stripe_get(&self.api_key, &format!("refunds/{provider_refund_id}")).await?;
+        let value = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("refunds/{provider_refund_id}"),
+        )
+        .await?;
         let refund_id = value["id"]
             .as_str()
             .filter(|id| *id == provider_refund_id)
@@ -1240,10 +2096,95 @@ impl SubscriptionProvider for StripeBilling {
             .as_str()
             .filter(|status| !status.is_empty())
             .ok_or_else(ProviderError::malformed_response)?;
+        let payment_reference = value["payment_intent"]
+            .as_str()
+            .filter(|payment_reference| !payment_reference.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let amount_pence = value["amount"]
+            .as_i64()
+            .filter(|amount| *amount > 0)
+            .ok_or_else(ProviderError::malformed_response)?;
+        let currency = value["currency"]
+            .as_str()
+            .filter(|currency| !currency.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let charge_id = parse_refund_charge_id(&value)?;
         Ok(RefundReceipt {
             refund_id: refund_id.to_string(),
             status: status.to_string(),
+            payment_reference: payment_reference.to_string(),
+            charge_id,
+            amount_pence,
+            currency: currency.to_string(),
         })
+    }
+
+    async fn get_refundable_amount(
+        &self,
+        payment_reference: &str,
+        expected_charge_id: &str,
+        refund_amount_pence: i64,
+    ) -> ProviderResult<(i64, String)> {
+        if !payment_reference.starts_with("pi_")
+            || !expected_charge_id.starts_with("ch_")
+            || refund_amount_pence <= 0
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let payment = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("payment_intents/{payment_reference}"),
+        )
+        .await?;
+        if payment["id"].as_str() != Some(payment_reference)
+            || payment["status"].as_str() != Some("succeeded")
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let amount_received = payment["amount_received"]
+            .as_i64()
+            .filter(|amount| *amount > 0)
+            .ok_or_else(ProviderError::malformed_response)?;
+        let currency = payment["currency"]
+            .as_str()
+            .filter(|currency| !currency.is_empty())
+            .ok_or_else(ProviderError::malformed_response)?;
+        let charge_id = payment["latest_charge"]
+            .as_str()
+            .filter(|id| id.starts_with("ch_"))
+            .ok_or_else(ProviderError::malformed_response)?;
+        if charge_id != expected_charge_id {
+            return Err(ProviderError::malformed_response());
+        }
+        let charge = stripe_get_at(
+            &self.api_key,
+            &self.api_origin,
+            &format!("charges/{charge_id}"),
+        )
+        .await?;
+        if charge["id"].as_str() != Some(charge_id)
+            || charge["payment_intent"].as_str() != Some(payment_reference)
+            || charge["currency"].as_str() != Some(currency)
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        let captured_amount = charge["amount_captured"]
+            .as_i64()
+            .filter(|amount| *amount > 0)
+            .ok_or_else(ProviderError::malformed_response)?;
+        let amount_refunded = charge["amount_refunded"]
+            .as_i64()
+            .filter(|amount| *amount >= refund_amount_pence)
+            .ok_or_else(ProviderError::malformed_response)?;
+        if captured_amount != amount_received || amount_refunded > captured_amount {
+            return Err(ProviderError::malformed_response());
+        }
+        let refundable = amount_received
+            .checked_sub(amount_refunded - refund_amount_pence)
+            .filter(|amount| *amount > 0)
+            .ok_or_else(ProviderError::malformed_response)?;
+        Ok((refundable, currency.to_string()))
     }
 
     async fn get_subscription(
@@ -1310,9 +2251,86 @@ impl SubscriptionProvider for StripeBilling {
         idempotency_key: &str,
         _user_id: &str,
     ) -> ProviderResult<SubscriptionObservation> {
+        let current = self.get_sponsored_subscription(subscription_id).await?;
+        if let Some(schedule_id) = current.schedule_id.as_deref() {
+            let current_period_start = current
+                .current_period_start
+                .filter(|start| *start >= 0)
+                .ok_or_else(ProviderError::malformed_response)?;
+            let current_end = current
+                .current_period_end
+                .filter(|end| *end > current_period_start)
+                .ok_or_else(ProviderError::malformed_response)?;
+            if current.items.len() != 1
+                || current.items[0].quantity != 1
+                || current.items[0].provider_price_id.is_empty()
+            {
+                return Err(ProviderError::malformed_response());
+            }
+            let existing_schedule = stripe_get_at(
+                &self.api_key,
+                &self.api_origin,
+                &format!("subscription_schedules/{schedule_id}"),
+            )
+            .await?;
+            let current_start = stripe_current_schedule_phase_start(
+                &existing_schedule,
+                schedule_id,
+                subscription_id,
+                current_period_start,
+                current_end,
+            )?;
+            let form =
+                personal_schedule_cancellation_form(current_start, current_end, &current.items);
+            // Each route request or worker lease gets its own key. Reusing a key across the route
+            // and worker could replay a response from before the worker's schedule update.
+            let provider_key = personal_schedule_cancellation_idempotency_key(
+                subscription_id,
+                current_end,
+                idempotency_key,
+            );
+            stripe_post_with_idempotency_at(
+                &self.api_key,
+                &self.api_origin,
+                &format!("subscription_schedules/{schedule_id}"),
+                &form,
+                &provider_key,
+            )
+            .await?;
+            let schedule = stripe_get_at(
+                &self.api_key,
+                &self.api_origin,
+                &format!("subscription_schedules/{schedule_id}"),
+            )
+            .await?;
+            if schedule["id"].as_str() != Some(schedule_id)
+                || stripe_schedule_subscription_id(&schedule) != Some(subscription_id)
+                || schedule["end_behavior"].as_str() != Some("cancel")
+                || !stripe_schedule_contains_phases(
+                    &schedule,
+                    current_start,
+                    current_end,
+                    &current.items,
+                    &[],
+                )
+            {
+                return Err(ProviderError::malformed_response());
+            }
+            let response = stripe_get_at(
+                &self.api_key,
+                &self.api_origin,
+                &format!("subscriptions/{subscription_id}"),
+            )
+            .await?;
+            return Ok(SubscriptionObservation::Current(subscription_snapshot(
+                &response,
+                subscription_id,
+            )?));
+        }
         let form = vec![("cancel_at_period_end".to_string(), "true".to_string())];
-        let response = stripe_post_with_idempotency(
+        let response = stripe_post_with_idempotency_at(
             &self.api_key,
+            &self.api_origin,
             &format!("subscriptions/{subscription_id}"),
             &form,
             idempotency_key,
@@ -1322,6 +2340,117 @@ impl SubscriptionProvider for StripeBilling {
             &response,
             subscription_id,
         )?))
+    }
+
+    async fn cancel_personal_subscription_at_boundary(
+        &self,
+        subscription_id: &str,
+        boundary_epoch: i64,
+        idempotency_key: &str,
+        _user_id: &str,
+    ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
+        if boundary_epoch <= 0 || idempotency_key.trim().is_empty() {
+            return Err(ProviderError::malformed_response());
+        }
+        let current = self.get_sponsored_subscription(subscription_id).await?;
+        if current.subscription_id != subscription_id
+            || current.current_period_end != Some(boundary_epoch)
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        if current.status == SubscriptionStatus::Canceled {
+            return Ok(current);
+        }
+        if current.cancel_at.is_some_and(|end| end != boundary_epoch) {
+            return Err(ProviderError::malformed_response());
+        }
+
+        if let Some(schedule_id) = current.schedule_id.as_deref() {
+            let period_start = current
+                .current_period_start
+                .filter(|start| *start >= 0)
+                .ok_or_else(ProviderError::malformed_response)?;
+            let period_end = current
+                .current_period_end
+                .filter(|end| *end > period_start && *end == boundary_epoch)
+                .ok_or_else(ProviderError::malformed_response)?;
+            if current.items.len() != 1
+                || current.items[0].quantity != 1
+                || current.items[0].provider_price_id.is_empty()
+            {
+                return Err(ProviderError::malformed_response());
+            }
+            let existing_schedule = stripe_get_at(
+                &self.api_key,
+                &self.api_origin,
+                &format!("subscription_schedules/{schedule_id}"),
+            )
+            .await?;
+            let phase_start = stripe_current_schedule_phase_start(
+                &existing_schedule,
+                schedule_id,
+                subscription_id,
+                period_start,
+                period_end,
+            )?;
+            let form =
+                personal_schedule_cancellation_form(phase_start, boundary_epoch, &current.items);
+            let provider_key = personal_schedule_cancellation_idempotency_key(
+                subscription_id,
+                boundary_epoch,
+                idempotency_key,
+            );
+            stripe_post_with_idempotency_at(
+                &self.api_key,
+                &self.api_origin,
+                &format!("subscription_schedules/{schedule_id}"),
+                &form,
+                &provider_key,
+            )
+            .await?;
+            let schedule = stripe_get_at(
+                &self.api_key,
+                &self.api_origin,
+                &format!("subscription_schedules/{schedule_id}"),
+            )
+            .await?;
+            if schedule["id"].as_str() != Some(schedule_id)
+                || stripe_schedule_subscription_id(&schedule) != Some(subscription_id)
+                || schedule["end_behavior"].as_str() != Some("cancel")
+                || !stripe_schedule_contains_phases(
+                    &schedule,
+                    phase_start,
+                    boundary_epoch,
+                    &current.items,
+                    &[],
+                )
+            {
+                return Err(ProviderError::malformed_response());
+            }
+        } else if current.cancel_at != Some(boundary_epoch) && !current.cancel_at_period_end {
+            // An explicit timestamp prevents Stripe from silently moving this cancellation to
+            // the next period if the billing boundary rolls between the read and the write.
+            let form = vec![("cancel_at".to_string(), boundary_epoch.to_string())];
+            stripe_post_with_idempotency_at(
+                &self.api_key,
+                &self.api_origin,
+                &format!("subscriptions/{subscription_id}"),
+                &form,
+                idempotency_key,
+            )
+            .await?;
+        }
+
+        let updated = self.get_sponsored_subscription(subscription_id).await?;
+        if updated.subscription_id != subscription_id
+            || updated.current_period_end != Some(boundary_epoch)
+            || (!updated.cancel_at_period_end
+                && updated.cancel_at != Some(boundary_epoch)
+                && updated.status != SubscriptionStatus::Canceled)
+        {
+            return Err(ProviderError::malformed_response());
+        }
+        Ok(updated)
     }
 
     async fn terminate_personal_subscription(
@@ -1378,7 +2507,12 @@ impl SubscriptionProvider for E2eBilling {
         )
     }
 
-    async fn create_portal(&self, _customer: &str, return_url: &str) -> ProviderResult<String> {
+    async fn create_portal(
+        &self,
+        _customer: &str,
+        return_url: &str,
+        _configuration_id: Option<&str>,
+    ) -> ProviderResult<String> {
         self.page_url("portal", &[("return_url", return_url)])
     }
 
@@ -1461,6 +2595,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/billing/refunds/{request_id}/review",
             post(operator_review_refund),
+        )
+        .route(
+            "/billing/refunds/{request_id}/resolve",
+            post(operator_resolve_refund),
         )
         .route(
             "/billing/refunds/{request_id}/process",
@@ -1578,6 +2716,9 @@ struct PersonalCheckoutRequest {
     quote_version: i64,
     quote_expires_at_epoch: i64,
     return_url: String,
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    #[serde(default)]
+    test_clock_customer: Option<E2eTestClockCustomer>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1660,6 +2801,9 @@ struct SponsoredCheckoutRequest {
     effective_until: Option<i64>,
     idempotency_key: String,
     return_url: String,
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    #[serde(default)]
+    test_clock_customer: Option<E2eTestClockCustomer>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1730,7 +2874,6 @@ async fn sponsored_quote(
     let catalogue = billing
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted sponsored billing is not configured".into()))?;
-    validate_personal_catalogue(billing, catalogue).await?;
     let access = org::access(&state.pool, &org_id, &user.user_id).await?;
     access.require_write()?;
     if !access.role().can_manage_members() {
@@ -1747,6 +2890,11 @@ async fn sponsored_quote(
             return Err(Error::NotFound("sponsored beneficiary not found".into()));
         }
     }
+    billing
+        .validate_cloud_portal_configuration()
+        .await
+        .map_err(ProviderError::into_error)?;
+    validate_personal_catalogue(billing, catalogue).await?;
     let now = sponsored_billing::current_epoch();
     let (offer, founding_remaining_places) = if action == SponsoredSeatAction::Remove {
         (requested_offer, None)
@@ -1820,6 +2968,8 @@ async fn sponsored_checkout(
     Json(input): Json<SponsoredCheckoutRequest>,
 ) -> Result<Json<SponsoredOperationView>> {
     let billing = sponsored_billing_config(&state)?;
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    let e2e_test_clock_customer = input.test_clock_customer.clone();
     let existing_operation = if billing.cloud_sales_enabled() {
         false
     } else {
@@ -1839,6 +2989,12 @@ async fn sponsored_checkout(
         .ok_or_else(|| Error::NotConfigured("hosted sponsored billing is not configured".into()))?;
     let action = SponsoredSeatAction::parse(&input.action).map_err(Error::from)?;
     let offer = billing_offer(&input.offer)?;
+    if billing.cloud_sales_enabled() {
+        billing
+            .validate_cloud_portal_configuration()
+            .await
+            .map_err(ProviderError::into_error)?;
+    }
     validate_personal_catalogue(billing, catalogue).await?;
     let request = SponsoredSeatRequest {
         action,
@@ -1853,6 +3009,23 @@ async fn sponsored_checkout(
     };
     billing_operations::validate_return_url(&billing.return_url, &input.return_url)
         .map_err(Error::from)?;
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    if let Some(binding) = e2e_test_clock_customer.as_ref() {
+        if action != SponsoredSeatAction::Add {
+            return Err(Error::BadRequest(
+                "test-clock customer can only be used for a first sponsored checkout".into(),
+            ));
+        }
+        if std::env::var("SOTTO_E2E_TEST_CLOCK_CHECKOUT_ENABLED")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return Err(Error::NotConfigured(
+                "test-clock checkout binding is disabled".into(),
+            ));
+        }
+    }
     let now = sponsored_billing::current_epoch();
     let mut tx = state.pool.begin().await?;
     // Keep the allocator mutex ahead of organisation, seat, operation and subscription locks.
@@ -1860,6 +3033,13 @@ async fn sponsored_checkout(
     founding_allocator::lock_capacity(&mut tx)
         .await
         .map_err(|error| Error::Internal(error.to_string()))?;
+    let mut transfer_beneficiaries = vec![request.beneficiary_id.as_str()];
+    if let Some(replacement) = request.replacement_beneficiary_id.as_deref() {
+        transfer_beneficiaries.push(replacement);
+    }
+    billing_transfers::lock_and_check_no_live_transfer(&mut tx, &transfer_beneficiaries, now)
+        .await
+        .map_err(Error::from)?;
     let incoming_beneficiary = request
         .replacement_beneficiary_id
         .as_deref()
@@ -1876,7 +3056,7 @@ async fn sponsored_checkout(
         sponsored_billing::begin_operation(&mut tx, &org_id, &user.user_id, &request, now)
             .await
             .map_err(Error::from)?;
-    if operation.state != "pending" {
+    if !matches!(operation.state.as_str(), "pending" | "unknown") {
         tx.rollback().await?;
         return Ok(Json(SponsoredOperationView {
             operation_id: operation.operation_id,
@@ -1917,6 +3097,37 @@ async fn sponsored_checkout(
             .bind(&org_id)
             .fetch_one(&mut *tx)
             .await?;
+
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    if let Some(binding) = e2e_test_clock_customer.as_ref() {
+        if existing_subscription.is_some() {
+            return Err(Error::BadRequest(
+                "test-clock customer can only be used for a first sponsored checkout".into(),
+            ));
+        }
+        if existing_customer
+            .as_deref()
+            .is_some_and(|existing| existing != binding.customer_id)
+        {
+            return Err(Error::Conflict(
+                "test-clock customer is not available for this organisation".into(),
+            ));
+        }
+        let attached = sqlx::query(
+            "UPDATE organizations SET stripe_customer_id = $2 \
+             WHERE id = $1 AND (stripe_customer_id IS NULL OR stripe_customer_id = $2)",
+        )
+        .bind(&org_id)
+        .bind(&binding.customer_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if attached != 1 {
+            return Err(Error::Conflict(
+                "test-clock customer is not available for this organisation".into(),
+            ));
+        }
+    }
 
     if request.action != SponsoredSeatAction::Remove {
         if let Some(founding_offer) = FoundingOffer::from_billing_offer(offer) {
@@ -1970,122 +3181,135 @@ async fn sponsored_checkout(
         .execute(&mut *tx)
         .await?;
     }
-    tx.commit().await?;
 
-    let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
-    let result = if let Some((customer_id, Some(subscription_id), _)) = existing_subscription {
-        let phases = sponsored_provider_phases(
-            &state.pool,
-            &org_id,
-            catalogue,
-            sponsored_billing::current_epoch(),
-        )
-        .await?;
-        let snapshot = match billing
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    if let Some(binding) = e2e_test_clock_customer.as_ref() {
+        // `begin_operation` has already checked the actor's organisation authority. Claiming
+        // earlier would let an unauthorised caller bind the runner Customer before rejection.
+        billing
             .provider
-            .update_sponsored_subscription(
-                &org_id,
-                &subscription_id,
-                &phases,
-                &operation.provider_idempotency_key,
+            .claim_e2e_test_clock_customer(
+                &binding.customer_id,
+                &binding.clock_id,
+                &binding.run_id,
+                &user.user_id,
             )
             .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                if provider_failure_is_definitive(&error) {
-                    fail_sponsored_provider_operation(
-                        &state.pool,
-                        &operation.operation_id,
-                        "provider_rejected",
-                    )
-                    .await?;
-                } else if error.kind == ProviderErrorKind::Retryable {
-                    rotate_sponsored_provider_retry_key(
-                        &state.pool,
-                        &operation.operation_id,
-                        &operation.provider_idempotency_key,
-                    )
-                    .await?;
-                }
-                return Err(error.into_error());
-            }
-        };
-        let mut result_tx = state.pool.begin().await?;
-        let operation = sponsored_billing::record_provider_update(
-            &mut result_tx,
-            &operation.operation_id,
-            customer_id.as_deref().or(snapshot.customer_id.as_deref()),
-            &subscription_id,
-            snapshot.schedule_id.as_deref(),
-            snapshot.current_period_end,
-            None,
-        )
-        .await
-        .map_err(Error::from)?;
-        result_tx.commit().await?;
-        SponsoredOperationView {
-            operation_id: operation.operation_id,
-            action: operation.action.as_str().into(),
-            state: operation.state,
-            provider_checkout_url: operation.provider_checkout_url,
+            .map_err(ProviderError::into_error)?;
+    }
+    tx.commit().await?;
+
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    let checkout_customer_id = e2e_test_clock_customer
+        .as_ref()
+        .map(|binding| binding.customer_id.clone())
+        .or(existing_customer.clone());
+    #[cfg(not(feature = "e2e-stripe-test-clock"))]
+    let checkout_customer_id = existing_customer.clone();
+
+    let provider_request = if let Some(value) = operation.provider_request.clone() {
+        if operation.provider_request_version != Some(1) {
+            return Err(Error::Conflict(
+                "sponsored billing operation needs recovery review".into(),
+            ));
         }
-    } else if existing_subscription.is_none() && action == SponsoredSeatAction::Add {
-        let items = sponsored_provider_items(&state.pool, &org_id, catalogue, &operation).await?;
-        let checkout = match billing
-            .provider
-            .create_sponsored_checkout(
+        let saved = serde_json::from_value::<sponsored_billing::SponsoredProviderRequest>(value)
+            .map_err(|_| Error::Internal("saved sponsored provider request is invalid".into()))?;
+        #[cfg(feature = "e2e-stripe-test-clock")]
+        if let Some(binding) = e2e_test_clock_customer.as_ref() {
+            match &saved {
+                sponsored_billing::SponsoredProviderRequest::Checkout { customer_id, .. }
+                    if customer_id.as_deref() == Some(binding.customer_id.as_str()) => {}
+                _ => {
+                    return Err(Error::Conflict(
+                        "test-clock customer does not match the saved checkout request".into(),
+                    ));
+                }
+            }
+        }
+        saved
+    } else if operation.state == "pending" {
+        let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
+        if let Some((_, Some(subscription_id), _)) = existing_subscription.as_ref() {
+            let phases = sponsored_provider_phases(
+                &state.pool,
                 &org_id,
-                existing_customer.as_deref(),
-                &items,
-                &operation.operation_id,
-                &operation.provider_idempotency_key,
-                personal_checkout_expiry(
+                catalogue,
+                sponsored_billing::current_epoch(),
+            )
+            .await?;
+            let snapshot = billing
+                .provider
+                .get_sponsored_subscription(subscription_id)
+                .await
+                .map_err(ProviderError::into_error)?;
+            if snapshot.subscription_id != *subscription_id {
+                return Err(Error::Conflict(
+                    "sponsored subscription binding changed; operation needs review".into(),
+                ));
+            }
+            sponsored_billing::SponsoredProviderRequest::ScheduleUpdate {
+                organization_id: org_id.clone(),
+                subscription_id: subscription_id.clone(),
+                expected_period_start: snapshot.current_period_start.ok_or_else(|| {
+                    Error::Conflict("sponsored subscription period is unavailable".into())
+                })?,
+                expected_period_end: snapshot.current_period_end.ok_or_else(|| {
+                    Error::Conflict("sponsored subscription period is unavailable".into())
+                })?,
+                phases,
+            }
+        } else if existing_subscription.is_none() && action == SponsoredSeatAction::Add {
+            sponsored_billing::SponsoredProviderRequest::Checkout {
+                organization_id: org_id.clone(),
+                customer_id: checkout_customer_id,
+                items: sponsored_provider_items(&state.pool, &org_id, catalogue, &operation)
+                    .await?,
+                automatic_tax_enabled: billing.cloud_automatic_tax_enabled(),
+                expires_at_epoch: personal_checkout_expiry(
                     operation.quote_expires_at_epoch,
                     sponsored_billing::current_epoch(),
                 )?,
-                &success_url,
-                &cancel_url,
-            )
-            .await
-        {
-            Ok(checkout) => checkout,
-            Err(error) => {
-                if provider_failure_is_definitive(&error) {
-                    fail_sponsored_provider_operation(
-                        &state.pool,
-                        &operation.operation_id,
-                        "provider_rejected",
-                    )
-                    .await?;
-                }
-                return Err(error.into_error());
+                success_url,
+                cancel_url,
             }
-        };
-        let mut result_tx = state.pool.begin().await?;
-        let operation = sponsored_billing::record_checkout(
-            &mut result_tx,
-            &operation.operation_id,
-            &checkout.checkout_url,
-            &checkout.session_id,
-            checkout.customer_id.as_deref(),
-            checkout.subscription_id.as_deref(),
-        )
-        .await
-        .map_err(Error::from)?;
-        result_tx.commit().await?;
-        SponsoredOperationView {
-            operation_id: operation.operation_id,
-            action: operation.action.as_str().into(),
-            state: operation.state,
-            provider_checkout_url: operation.provider_checkout_url,
+        } else {
+            return Err(Error::Conflict(
+                "sponsored subscription is missing for this change".into(),
+            ));
         }
     } else {
         return Err(Error::Conflict(
-            "sponsored subscription is missing for this change".into(),
+            "sponsored billing operation needs recovery review".into(),
         ));
     };
-    Ok(Json(result))
+    if operation.provider_request.is_none() {
+        let mut request_tx = state.pool.begin().await?;
+        sponsored_billing::persist_provider_request(
+            &mut request_tx,
+            &operation.operation_id,
+            &provider_request,
+        )
+        .await
+        .map_err(Error::from)?;
+        request_tx.commit().await?;
+    }
+    recover_sponsored_billing_operation_by_id(&state.pool, billing, &operation.operation_id)
+        .await?;
+    let operation = sponsored_billing::load_operation_for_actor(
+        &state.pool,
+        &operation.operation_id,
+        &user.user_id,
+    )
+    .await
+    .map_err(Error::from)?
+    .ok_or_else(|| Error::NotFound("sponsored billing operation not found".into()))?;
+    Ok(Json(SponsoredOperationView {
+        operation_id: operation.operation_id,
+        action: operation.action.as_str().into(),
+        state: operation.state,
+        provider_checkout_url: operation.provider_checkout_url,
+    }))
 }
 
 async fn sponsored_operation(
@@ -2189,7 +3413,8 @@ pub(crate) async fn sponsored_provider_phases(
     let pending_changes: Vec<SponsoredSchedulePendingChange> = sqlx::query_as(
         "SELECT beneficiary_id, action, effective_until \
          FROM billing_sponsored_operations \
-         WHERE organization_id = $1 AND state IN ('pending', 'checkout_created', 'provider_pending') \
+         WHERE organization_id = $1 \
+           AND state IN ('pending', 'checkout_created', 'provider_pending', 'unknown') \
            AND action IN ('remove', 'replace') ORDER BY created_at",
     )
     .bind(organization_id)
@@ -2398,10 +3623,7 @@ async fn select_founding_aware_offer(
 }
 
 fn billing_epoch() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_secs() as i64
+    crate::clock::business_epoch_seconds()
 }
 
 fn personal_billing_error(error: personal_billing::PersonalBillingError) -> Error {
@@ -2430,8 +3652,15 @@ async fn personal_quote(
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
     let requested_offer = billing_offer(&query.offer)?;
+    billing
+        .validate_cloud_portal_configuration()
+        .await
+        .map_err(ProviderError::into_error)?;
     let requested_interval = FoundingOffer::for_billing_offer_interval(requested_offer);
     validate_personal_catalogue(billing, catalogue).await?;
+    reconcile_expired_personal_checkout_once(&state.pool, billing, Some(&user.user_id))
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let now = billing_epoch();
     let expires = now
         .checked_add(founding_allocator::RESERVATION_SECONDS)
@@ -2441,13 +3670,7 @@ async fn personal_quote(
         .await
         .map_err(personal_billing_error)?
     {
-        let reusable = matches!(
-            account.state,
-            personal_billing::PersonalBillingState::Canceled
-        ) || (matches!(
-            account.state,
-            personal_billing::PersonalBillingState::Pending
-        ) && account.pending_expires_at_epoch <= now);
+        let reusable = personal_quote_account_is_reusable(account.state);
         if !reusable {
             return Err(Error::Conflict(
                 "personal billing is already active or pending".into(),
@@ -2513,6 +3736,13 @@ async fn personal_quote(
 /// `POST /billing/personal/checkout` - persist the operation before asking Stripe for a hosted
 /// page. The provider result is the creation of the checkout session; coverage waits for the
 /// verified paid webhook handled below.
+const SAFE_CHECKOUT_IDEMPOTENCY_WINDOW_SECONDS: i64 = 23 * 60 * 60;
+
+#[cfg(feature = "e2e-test-clock")]
+fn test_checkout_customer_matches(configured: Option<&str>, stored: Option<&str>) -> bool {
+    configured.is_none_or(|customer_id| Some(customer_id) == stored)
+}
+
 async fn personal_checkout(
     State(state): State<AppState>,
     user: AuthUser,
@@ -2536,14 +3766,44 @@ async fn personal_checkout(
         .price_catalogue()
         .ok_or_else(|| Error::NotConfigured("hosted personal billing is not configured".into()))?;
     let offer = billing_offer(&request.offer)?;
+    if billing.cloud_sales_enabled() {
+        billing
+            .validate_cloud_portal_configuration()
+            .await
+            .map_err(ProviderError::into_error)?;
+    }
     validate_personal_catalogue(billing, catalogue).await?;
     let price_id = catalogue.id_for(offer).to_string();
+    let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
+    #[cfg(feature = "e2e-test-clock")]
+    let test_clock_customer_id = crate::clock::test_clock_customer_id();
     billing_operations::validate_return_url(&billing.return_url, &request.return_url)
         .map_err(Error::from)?;
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    let e2e_customer_id = if let Some(binding) = request.test_clock_customer.as_ref() {
+        if std::env::var("SOTTO_E2E_TEST_CLOCK_CHECKOUT_ENABLED")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return Err(Error::NotConfigured(
+                "test-clock checkout binding is disabled".into(),
+            ));
+        }
+        Some(binding.customer_id.clone())
+    } else {
+        None
+    };
+    reconcile_expired_personal_checkout_once(&state.pool, billing, Some(&user.user_id))
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
     let mut tx = state.pool.begin().await?;
     founding_allocator::lock_capacity(&mut tx)
         .await
         .map_err(|error| Error::Internal(error.to_string()))?;
+    billing_transfers::lock_and_check_no_live_transfer(&mut tx, &[&user.user_id], billing_epoch())
+        .await
+        .map_err(Error::from)?;
     let operation = billing_operations::begin_personal_operation(
         &mut tx,
         &user.user_id,
@@ -2587,6 +3847,34 @@ async fn personal_checkout(
             )
             .await
             .map_err(personal_billing_error)?;
+            #[cfg(feature = "e2e-test-clock")]
+            if let Some(customer_id) = test_clock_customer_id.as_deref() {
+                let result = sqlx::query(
+                    "UPDATE billing_personal_accounts SET stripe_customer_id = $2, updated_at = now() \
+                     WHERE user_id = $1 AND operation_id = $3 AND state = 'pending' \
+                       AND (stripe_customer_id IS NULL OR stripe_customer_id = $2)",
+                )
+                .bind(&user.user_id)
+                .bind(customer_id)
+                .bind(&operation.operation_id)
+                .execute(&mut *tx)
+                .await?;
+                if result.rows_affected() != 1 {
+                    return Err(Error::Conflict(
+                        "billing operation is bound to a different test customer".into(),
+                    ));
+                }
+            }
+            let operation = billing_operations::record_personal_checkout_request(
+                &mut tx,
+                &operation.operation_id,
+                &price_id,
+                &success_url,
+                &cancel_url,
+                billing.cloud_automatic_tax_enabled(),
+            )
+            .await
+            .map_err(Error::from)?;
             if let Some(founding_offer) = FoundingOffer::from_billing_offer(offer) {
                 let reservation = founding_allocator::reserve_with_payer_kind_until(
                     &mut tx,
@@ -2628,44 +3916,149 @@ async fn personal_checkout(
             // the stored provider idempotency key and ask again only while the operation is still
             // pending and has no recorded checkout URL.
             tx.rollback().await?;
+            if billing_epoch().saturating_sub(operation.created_at_epoch)
+                >= SAFE_CHECKOUT_IDEMPOTENCY_WINDOW_SECONDS
+            {
+                if !billing_operations::park_personal_checkout_outside_idempotency_window(
+                    &state.pool,
+                    &operation.operation_id,
+                )
+                .await
+                .map_err(Error::from)?
+                {
+                    return Err(Error::Conflict(
+                        "billing operation changed while recovery was being reviewed".into(),
+                    ));
+                }
+                let operation = billing_operations::load_operation_for_actor(
+                    &state.pool,
+                    &operation.operation_id,
+                    &user.user_id,
+                )
+                .await
+                .map_err(Error::from)?
+                .ok_or_else(|| Error::NotFound("billing operation not found".into()))?;
+                return Ok(Json(PersonalCheckoutView {
+                    operation_id: operation.operation_id,
+                    state: operation.state.as_str().into(),
+                    checkout_url: operation.provider_checkout_url,
+                }));
+            }
             operation
         }
     };
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    if let Some(customer_id) = e2e_customer_id.as_deref() {
+        let mut customer_tx = state.pool.begin().await?;
+        let bound = sqlx::query(
+            "UPDATE billing_personal_accounts SET stripe_customer_id = $2, updated_at = now() \
+             WHERE operation_id = $1 AND state = 'pending' AND stripe_subscription_id IS NULL \
+             AND payment_reference IS NULL AND (stripe_customer_id IS NULL OR stripe_customer_id = $2)",
+        )
+        .bind(&operation.operation_id)
+        .bind(customer_id)
+        .execute(&mut *customer_tx)
+        .await?
+        .rows_affected();
+        if bound != 1 {
+            let existing_customer: Option<String> = sqlx::query_scalar(
+                "SELECT stripe_customer_id FROM billing_personal_accounts WHERE operation_id = $1",
+            )
+            .bind(&operation.operation_id)
+            .fetch_optional(&mut *customer_tx)
+            .await?
+            .flatten();
+            if existing_customer.as_deref() != Some(customer_id) {
+                return Err(Error::Conflict(
+                    "test-clock customer is not available for this checkout".into(),
+                ));
+            }
+        }
+        customer_tx.commit().await?;
+    }
     let checkout_expires_at_epoch = match checkout_expires_at_epoch {
         Some(expiry) => expiry,
-        None => personal_checkout_expiry(operation.quote_expires_at_epoch, billing_epoch())?,
+        None => personal_checkout_expiry_for_retry(
+            sqlx::query_scalar(
+                "SELECT pending_expires_at_epoch FROM billing_personal_accounts WHERE operation_id = $1",
+            )
+            .bind(&operation.operation_id)
+            .fetch_one(&state.pool)
+            .await?,
+            billing_epoch(),
+        )?,
     };
-    let allocation_reference: String = sqlx::query_scalar(
-        "SELECT allocation_reference FROM billing_personal_accounts WHERE operation_id = $1",
+    let (allocation_reference, customer_id): (String, Option<String>) = sqlx::query_as(
+        "SELECT allocation_reference, stripe_customer_id FROM billing_personal_accounts WHERE operation_id = $1",
     )
     .bind(&operation.operation_id)
     .fetch_one(&state.pool)
     .await?;
-    let (success_url, cancel_url) = checkout_return_urls(&billing.return_url);
-    let checkout_url = billing
+    #[cfg(feature = "e2e-test-clock")]
+    if !test_checkout_customer_matches(test_clock_customer_id.as_deref(), customer_id.as_deref()) {
+        return Err(Error::Conflict(
+            "billing operation is bound to a different test customer".into(),
+        ));
+    }
+    let stored_price_id = operation
+        .provider_checkout_price_id
+        .as_deref()
+        .ok_or_else(|| Error::Conflict("billing operation needs recovery review".into()))?;
+    let stored_success_url = operation
+        .provider_checkout_success_url
+        .as_deref()
+        .ok_or_else(|| Error::Conflict("billing operation needs recovery review".into()))?;
+    let stored_cancel_url = operation
+        .provider_checkout_cancel_url
+        .as_deref()
+        .ok_or_else(|| Error::Conflict("billing operation needs recovery review".into()))?;
+    #[cfg(feature = "e2e-stripe-test-clock")]
+    if let Some(binding) = request.test_clock_customer.as_ref() {
+        // The caller's quote and pending billing operation are validated before this provider
+        // metadata write, so a rejected checkout cannot claim the runner Customer.
+        billing
+            .provider
+            .claim_e2e_test_clock_customer(
+                &binding.customer_id,
+                &binding.clock_id,
+                &binding.run_id,
+                &user.user_id,
+            )
+            .await
+            .map_err(ProviderError::into_error)?;
+    }
+    let checkout = billing
         .provider
         .create_personal_checkout(
             &user.user_id,
-            None,
-            &price_id,
+            customer_id.as_deref(),
+            stored_price_id,
             &operation.operation_id,
             &allocation_reference,
             &operation.provider_idempotency_key,
             checkout_expires_at_epoch,
-            &success_url,
-            &cancel_url,
+            stored_success_url,
+            stored_cancel_url,
+            operation
+                .provider_checkout_automatic_tax_enabled
+                .unwrap_or(false),
         )
         .await
         .map_err(ProviderError::into_error)?;
     let mut result_tx = state.pool.begin().await?;
-    personal_billing::record_checkout_url(&mut result_tx, &operation.operation_id, &checkout_url)
-        .await
-        .map_err(personal_billing_error)?;
+    personal_billing::record_checkout_url(
+        &mut result_tx,
+        &operation.operation_id,
+        checkout.session_id.as_deref(),
+        &checkout.checkout_url,
+    )
+    .await
+    .map_err(personal_billing_error)?;
     let result = billing_operations::record_provider_result(
         &mut result_tx,
         &operation.operation_id,
         BillingOperationState::Succeeded,
-        None,
+        checkout.session_id.as_deref(),
         Some("checkout_created"),
     )
     .await
@@ -2674,8 +4067,987 @@ async fn personal_checkout(
     Ok(Json(PersonalCheckoutView {
         operation_id: result.operation_id,
         state: result.state.as_str().into(),
-        checkout_url: Some(checkout_url),
+        checkout_url: Some(checkout.checkout_url),
     }))
+}
+
+/// Resolve one interrupted personal Checkout creation. The operation's original key and exact
+/// stored request facts are reused only inside a conservative 23-hour window; beyond it the
+/// operation is parked rather than risking Stripe pruning the idempotency key.
+pub async fn recover_personal_billing_operation_once(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+) -> std::result::Result<bool, billing_operations::BillingRecoveryError> {
+    let mut candidates =
+        billing_operations::load_personal_reconciliation_candidates(pool, 1).await?;
+    let Some(candidate) = candidates.pop() else {
+        return reconcile_expired_personal_checkout_once(pool, billing, None).await;
+    };
+    let claim_token = format!("billing-recovery:{}", uuid::Uuid::new_v4());
+    let operation =
+        match billing_operations::claim_reconciliation(pool, &candidate.operation_id, &claim_token)
+            .await
+        {
+            Ok(operation) => operation,
+            Err(billing_operations::BillingRecoveryError::InProgress) => return Ok(true),
+            Err(error) => return Err(error),
+        };
+    if !matches!(
+        operation.state,
+        BillingOperationState::Pending | BillingOperationState::Unknown
+    ) {
+        return Ok(true);
+    }
+    let account = sqlx::query(
+        "SELECT user_id, allocation_reference, offer, stripe_customer_id, state \
+         FROM billing_personal_accounts WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| {
+        billing_operations::BillingRecoveryError::Provider("database_read_failed".into())
+    })?;
+    let Some(account) = account else {
+        billing_operations::park_reconciliation_for_review(
+            pool,
+            &operation.operation_id,
+            &claim_token,
+            "personal_binding_missing",
+        )
+        .await?;
+        return Ok(true);
+    };
+    let account_state: String = account.try_get("state").map_err(|_| {
+        billing_operations::BillingRecoveryError::Provider("personal_binding_invalid".into())
+    })?;
+    if account_state == "refund_required" {
+        billing_operations::park_reconciliation_for_review(
+            pool,
+            &operation.operation_id,
+            &claim_token,
+            "paid_checkout_requires_refund",
+        )
+        .await
+        .map_err(|_| {
+            billing_operations::BillingRecoveryError::Provider(
+                "recovery_review_update_failed".into(),
+            )
+        })?;
+        return Ok(true);
+    }
+    if matches!(account_state.as_str(), "active" | "past_due" | "unpaid") {
+        let mut tx = pool.begin().await.map_err(|_| {
+            billing_operations::BillingRecoveryError::Provider("database_write_failed".into())
+        })?;
+        billing_operations::record_claimed_provider_result(
+            &mut tx,
+            &operation.operation_id,
+            &claim_token,
+            BillingOperationState::Succeeded,
+            operation.provider_operation_id.as_deref(),
+            Some("checkout_settled"),
+        )
+        .await?;
+        tx.commit().await.map_err(|_| {
+            billing_operations::BillingRecoveryError::Provider("database_commit_failed".into())
+        })?;
+        return Ok(true);
+    }
+    let now = billing_epoch();
+    if now.saturating_sub(operation.created_at_epoch) >= SAFE_CHECKOUT_IDEMPOTENCY_WINDOW_SECONDS {
+        billing_operations::park_reconciliation_for_review(
+            pool,
+            &operation.operation_id,
+            &claim_token,
+            "provider_idempotency_window_elapsed",
+        )
+        .await?;
+        return Ok(true);
+    }
+    let Some(price_id) = operation.provider_checkout_price_id.as_deref() else {
+        billing_operations::park_reconciliation_for_review(
+            pool,
+            &operation.operation_id,
+            &claim_token,
+            "checkout_price_missing",
+        )
+        .await?;
+        return Ok(true);
+    };
+    let (Some(success_url), Some(cancel_url)) = (
+        operation.provider_checkout_success_url.as_deref(),
+        operation.provider_checkout_cancel_url.as_deref(),
+    ) else {
+        billing_operations::park_reconciliation_for_review(
+            pool,
+            &operation.operation_id,
+            &claim_token,
+            "checkout_return_urls_missing",
+        )
+        .await?;
+        return Ok(true);
+    };
+    let user_id: String = account.try_get("user_id").map_err(|_| {
+        billing_operations::BillingRecoveryError::Provider("personal_binding_invalid".into())
+    })?;
+    let allocation_reference: String = account.try_get("allocation_reference").map_err(|_| {
+        billing_operations::BillingRecoveryError::Provider("personal_binding_invalid".into())
+    })?;
+    let customer_id: Option<String> = account.try_get("stripe_customer_id").map_err(|_| {
+        billing_operations::BillingRecoveryError::Provider("personal_binding_invalid".into())
+    })?;
+    let expires_at_epoch: i64 = sqlx::query_scalar(
+        "SELECT pending_expires_at_epoch FROM billing_personal_accounts WHERE operation_id = $1",
+    )
+    .bind(&operation.operation_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|_| {
+        billing_operations::BillingRecoveryError::Provider("personal_binding_invalid".into())
+    })?;
+    let result = billing
+        .provider
+        .create_personal_checkout(
+            &user_id,
+            customer_id.as_deref(),
+            price_id,
+            &operation.operation_id,
+            &allocation_reference,
+            &operation.provider_idempotency_key,
+            expires_at_epoch,
+            success_url,
+            cancel_url,
+            operation
+                .provider_checkout_automatic_tax_enabled
+                .unwrap_or(false),
+        )
+        .await;
+    match result {
+        Ok(session) => {
+            if let Some(session_id) = session.session_id.as_deref() {
+                let mut tx = pool.begin().await.map_err(|_| {
+                    billing_operations::BillingRecoveryError::Provider(
+                        "database_write_failed".into(),
+                    )
+                })?;
+                billing_operations::record_claimed_checkout_result(
+                    &mut tx,
+                    &operation.operation_id,
+                    &claim_token,
+                    session_id,
+                    &session.checkout_url,
+                )
+                .await?;
+                tx.commit().await.map_err(|_| {
+                    billing_operations::BillingRecoveryError::Provider(
+                        "database_commit_failed".into(),
+                    )
+                })?;
+            } else {
+                billing_operations::park_reconciliation_for_review(
+                    pool,
+                    &operation.operation_id,
+                    &claim_token,
+                    "provider_session_id_missing",
+                )
+                .await?;
+            }
+        }
+        Err(error)
+            if provider_failure_is_definitive(&error)
+                && definitive_checkout_status(error.status) =>
+        {
+            let mut tx = pool.begin().await.map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_write_failed".into())
+            })?;
+            founding_allocator::release_reservation(&mut tx, &operation.operation_id)
+                .await
+                .map_err(|_| {
+                    billing_operations::BillingRecoveryError::Provider(
+                        "reservation_release_failed".into(),
+                    )
+                })?;
+            billing_operations::record_claimed_provider_result(
+                &mut tx,
+                &operation.operation_id,
+                &claim_token,
+                BillingOperationState::Failed,
+                None,
+                Some("provider_rejected"),
+            )
+            .await?;
+            sqlx::query(
+                "UPDATE billing_personal_accounts SET state='canceled', updated_at=now() \
+                 WHERE operation_id=$1 AND state='pending'",
+            )
+            .bind(&operation.operation_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_account_update_failed".into(),
+                )
+            })?;
+            tx.commit().await.map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_commit_failed".into())
+            })?;
+        }
+        Err(error) if matches!(error.kind, ProviderErrorKind::Authentication) => {
+            billing_operations::park_reconciliation_for_review(
+                pool,
+                &operation.operation_id,
+                &claim_token,
+                "provider_credentials_unavailable",
+            )
+            .await?;
+        }
+        Err(_) => {
+            billing_operations::release_reconciliation_failure(
+                pool,
+                &operation.operation_id,
+                &claim_token,
+                "provider_outcome_uncertain",
+            )
+            .await?;
+        }
+    }
+    Ok(true)
+}
+
+/// Resolve one sponsored provider operation from its immutable request record. Provider writes
+/// are never made while a database transaction is open.
+pub async fn recover_sponsored_billing_operation_once(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+) -> Result<bool> {
+    if sponsored_billing::park_unprepared_legacy_operations(pool, 8).await? > 0 {
+        return Ok(true);
+    }
+    let Some(operation_id) = sponsored_billing::next_recovery_candidate(pool).await? else {
+        return Ok(false);
+    };
+    recover_sponsored_billing_operation_by_id(pool, billing, &operation_id).await?;
+    Ok(true)
+}
+
+#[doc(hidden)]
+pub async fn recover_sponsored_billing_operation_by_id(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+    operation_id: &str,
+) -> Result<()> {
+    let lease_token = format!("sponsored-recovery:{}", uuid::Uuid::new_v4());
+    let Some(operation) = sponsored_billing::claim_recovery(pool, operation_id, &lease_token)
+        .await
+        .map_err(Error::from)?
+    else {
+        return Ok(());
+    };
+    let Some(request_value) = operation.provider_request.clone() else {
+        sponsored_billing::park_recovery_for_review(
+            pool,
+            &operation.operation_id,
+            &lease_token,
+            "provider_request_missing",
+        )
+        .await
+        .map_err(Error::from)?;
+        return Ok(());
+    };
+    if operation.provider_request_version != Some(1) {
+        sponsored_billing::park_recovery_for_review(
+            pool,
+            &operation.operation_id,
+            &lease_token,
+            "provider_request_version_unsupported",
+        )
+        .await
+        .map_err(Error::from)?;
+        return Ok(());
+    }
+    let request: sponsored_billing::SponsoredProviderRequest =
+        match serde_json::from_value(request_value) {
+            Ok(request) => request,
+            Err(_) => {
+                sponsored_billing::park_recovery_for_review(
+                    pool,
+                    &operation.operation_id,
+                    &lease_token,
+                    "provider_request_invalid",
+                )
+                .await
+                .map_err(Error::from)?;
+                return Ok(());
+            }
+        };
+    let now = sponsored_billing::current_epoch();
+    let first_sent = operation.provider_first_sent_epoch.unwrap_or(now);
+    let horizon_elapsed =
+        now.saturating_sub(first_sent) >= sponsored_billing::MAX_PROVIDER_REPLAY_SECONDS;
+
+    match request {
+        sponsored_billing::SponsoredProviderRequest::Checkout {
+            organization_id,
+            customer_id,
+            items,
+            automatic_tax_enabled,
+            expires_at_epoch,
+            success_url,
+            cancel_url,
+        } => {
+            if organization_id != operation.organization_id || items.is_empty() {
+                sponsored_billing::park_recovery_for_review(
+                    pool,
+                    &operation.operation_id,
+                    &lease_token,
+                    "provider_request_binding_invalid",
+                )
+                .await
+                .map_err(Error::from)?;
+                return Ok(());
+            }
+            if let Some(session_id) = operation.provider_checkout_session_id.as_deref() {
+                match billing
+                    .provider
+                    .get_sponsored_checkout_status(session_id, &operation.operation_id)
+                    .await
+                {
+                    Ok(PersonalCheckoutStatus::ExpiredUnpaid) => {
+                        let mut tx = pool.begin().await?;
+                        founding_allocator::lock_capacity(&mut tx)
+                            .await
+                            .map_err(|error| Error::Internal(error.to_string()))?;
+                        sponsored_billing::cancel_claimed_expired_checkout(
+                            &mut tx,
+                            &operation.operation_id,
+                            &lease_token,
+                        )
+                        .await
+                        .map_err(Error::from)?;
+                        tx.commit().await?;
+                    }
+                    Ok(PersonalCheckoutStatus::Open | PersonalCheckoutStatus::Complete) => {
+                        if horizon_elapsed {
+                            sponsored_billing::park_recovery_for_review(
+                                pool,
+                                &operation.operation_id,
+                                &lease_token,
+                                "checkout_settlement_unresolved",
+                            )
+                            .await
+                            .map_err(Error::from)?;
+                        } else {
+                            sponsored_billing::defer_recovery(
+                                pool,
+                                &operation.operation_id,
+                                &lease_token,
+                                if now < expires_at_epoch {
+                                    expires_at_epoch
+                                } else {
+                                    now.saturating_add(300)
+                                },
+                            )
+                            .await
+                            .map_err(Error::from)?;
+                        }
+                    }
+                    Err(error) => {
+                        sponsored_billing::record_recovery_failure(
+                            pool,
+                            &operation.operation_id,
+                            &lease_token,
+                            sponsored_recovery_error_code(&error),
+                        )
+                        .await
+                        .map_err(Error::from)?;
+                    }
+                }
+                return Ok(());
+            }
+            if horizon_elapsed {
+                sponsored_billing::park_recovery_for_review(
+                    pool,
+                    &operation.operation_id,
+                    &lease_token,
+                    "provider_idempotency_window_elapsed",
+                )
+                .await
+                .map_err(Error::from)?;
+                return Ok(());
+            }
+            match billing
+                .provider
+                .create_sponsored_checkout(
+                    &organization_id,
+                    customer_id.as_deref(),
+                    &items,
+                    &operation.operation_id,
+                    &operation.provider_idempotency_key,
+                    expires_at_epoch,
+                    &success_url,
+                    &cancel_url,
+                    automatic_tax_enabled,
+                )
+                .await
+            {
+                Ok(session) => {
+                    let mut tx = pool.begin().await?;
+                    sponsored_billing::record_claimed_checkout(
+                        &mut tx,
+                        &operation.operation_id,
+                        &lease_token,
+                        &session.checkout_url,
+                        &session.session_id,
+                        session.customer_id.as_deref(),
+                        session.subscription_id.as_deref(),
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    tx.commit().await?;
+                }
+                Err(error) => {
+                    record_sponsored_provider_failure(pool, &operation, &lease_token, &error)
+                        .await?;
+                }
+            }
+        }
+        sponsored_billing::SponsoredProviderRequest::ScheduleUpdate {
+            organization_id,
+            subscription_id,
+            expected_period_start,
+            expected_period_end,
+            phases,
+        } => {
+            if organization_id != operation.organization_id
+                || Some(&subscription_id) != operation.provider_subscription_id.as_ref()
+                || phases.is_empty()
+            {
+                sponsored_billing::park_recovery_for_review(
+                    pool,
+                    &operation.operation_id,
+                    &lease_token,
+                    "provider_request_binding_invalid",
+                )
+                .await
+                .map_err(Error::from)?;
+                return Ok(());
+            }
+            with_sponsored_subscription_write_lock(pool, &subscription_id, async {
+                match billing
+                    .provider
+                    .verify_sponsored_subscription_update(
+                        &subscription_id,
+                        expected_period_start,
+                        expected_period_end,
+                        &phases,
+                    )
+                    .await
+                {
+                    Ok(Some(snapshot)) => {
+                        record_claimed_sponsored_update(pool, &operation, &lease_token, &snapshot)
+                            .await?;
+                        return Ok(());
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        sponsored_billing::record_recovery_failure(
+                            pool,
+                            &operation.operation_id,
+                            &lease_token,
+                            sponsored_recovery_error_code(&error),
+                        )
+                        .await
+                        .map_err(Error::from)?;
+                        return Ok(());
+                    }
+                }
+                let snapshot = match billing
+                    .provider
+                    .get_sponsored_subscription(&subscription_id)
+                    .await
+                {
+                    Ok(snapshot) if snapshot.subscription_id == subscription_id => snapshot,
+                    Ok(_) => {
+                        sponsored_billing::park_recovery_for_review(
+                            pool,
+                            &operation.operation_id,
+                            &lease_token,
+                            "subscription_binding_changed",
+                        )
+                        .await
+                        .map_err(Error::from)?;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        record_sponsored_provider_failure(pool, &operation, &lease_token, &error)
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                let Some(current_period_start) = snapshot.current_period_start else {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "subscription_period_changed",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                };
+                let Some(current_period_end) = snapshot.current_period_end else {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "subscription_period_changed",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                };
+                let Some(catalogue) = billing.price_catalogue() else {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "price_catalogue_missing",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                };
+                let current_phases = match sponsored_provider_phases(
+                    pool,
+                    &organization_id,
+                    catalogue,
+                    sponsored_billing::current_epoch(),
+                )
+                .await
+                {
+                    Ok(phases) if !phases.is_empty() => phases,
+                    Ok(_) | Err(_) => {
+                        sponsored_billing::park_recovery_for_review(
+                            pool,
+                            &operation.operation_id,
+                            &lease_token,
+                            "local_schedule_evidence_invalid",
+                        )
+                        .await
+                        .map_err(Error::from)?;
+                        return Ok(());
+                    }
+                };
+                let Some(current_schedule) =
+                    normalized_sponsored_phases_at(&current_phases, current_period_end)
+                else {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "local_schedule_evidence_invalid",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                };
+                let Some(saved_schedule) =
+                    normalized_sponsored_phases_at(&phases, current_period_end)
+                else {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "provider_request_invalid",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                };
+                if current_schedule != saved_schedule {
+                    match billing
+                        .provider
+                        .verify_sponsored_subscription_update(
+                            &subscription_id,
+                            current_period_start,
+                            current_period_end,
+                            &current_phases,
+                        )
+                        .await
+                    {
+                        Ok(Some(snapshot)) => {
+                            record_claimed_sponsored_update(
+                                pool,
+                                &operation,
+                                &lease_token,
+                                &snapshot,
+                            )
+                            .await?;
+                        }
+                        Ok(None) if horizon_elapsed => {
+                            sponsored_billing::park_recovery_for_review(
+                                pool,
+                                &operation.operation_id,
+                                &lease_token,
+                                "superseding_schedule_not_confirmed",
+                            )
+                            .await
+                            .map_err(Error::from)?;
+                        }
+                        Ok(None) => {
+                            sponsored_billing::defer_recovery(
+                                pool,
+                                &operation.operation_id,
+                                &lease_token,
+                                sponsored_billing::current_epoch().saturating_add(300),
+                            )
+                            .await
+                            .map_err(Error::from)?;
+                        }
+                        Err(error) => {
+                            sponsored_billing::record_recovery_failure(
+                                pool,
+                                &operation.operation_id,
+                                &lease_token,
+                                sponsored_recovery_error_code(&error),
+                            )
+                            .await
+                            .map_err(Error::from)?;
+                        }
+                    }
+                    return Ok(());
+                }
+                if current_period_start != expected_period_start
+                    || current_period_end != expected_period_end
+                {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "subscription_period_changed",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                }
+                if horizon_elapsed {
+                    sponsored_billing::park_recovery_for_review(
+                        pool,
+                        &operation.operation_id,
+                        &lease_token,
+                        "provider_idempotency_window_elapsed",
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                    return Ok(());
+                }
+                match billing
+                    .provider
+                    .update_sponsored_subscription(
+                        &organization_id,
+                        &subscription_id,
+                        &phases,
+                        &operation.provider_idempotency_key,
+                    )
+                    .await
+                {
+                    Ok(snapshot) => {
+                        record_claimed_sponsored_update(pool, &operation, &lease_token, &snapshot)
+                            .await?;
+                    }
+                    Err(error) => {
+                        record_sponsored_provider_failure(pool, &operation, &lease_token, &error)
+                            .await?;
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn with_sponsored_subscription_write_lock<T, F>(
+    pool: &sqlx::PgPool,
+    subscription_id: &str,
+    operation: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let lock_name = format!("sponsored-subscription-write:{subscription_id}");
+    let mut connection = pool.acquire().await?;
+    // Closing this dedicated connection on drop also releases the session lock if the task is
+    // cancelled while a bounded provider request is in flight.
+    connection.close_on_drop();
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+        .bind(&lock_name)
+        .execute(&mut *connection)
+        .await?;
+
+    let result = operation.await;
+    let unlocked =
+        sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(&lock_name)
+            .fetch_one(&mut *connection)
+            .await;
+    match (result, unlocked) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Ok(false)) => Err(Error::Internal(
+            "sponsored subscription write lock was not held".into(),
+        )),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(value), Ok(true)) => Ok(value),
+    }
+}
+
+fn normalized_sponsored_phases_at(
+    phases: &[SponsoredSubscriptionPhase],
+    boundary: i64,
+) -> Option<Vec<SponsoredSubscriptionPhase>> {
+    let phase_at_boundary = phases
+        .iter()
+        .find(|phase| {
+            phase.start_at_epoch <= boundary && phase.end_at_epoch.is_none_or(|end| boundary < end)
+        })
+        .or_else(|| phases.iter().find(|phase| phase.start_at_epoch == boundary))?;
+    let mut normalized = vec![SponsoredSubscriptionPhase {
+        start_at_epoch: boundary,
+        end_at_epoch: phase_at_boundary.end_at_epoch,
+        items: phase_at_boundary.items.clone(),
+    }];
+    normalized.extend(
+        phases
+            .iter()
+            .filter(|phase| phase.start_at_epoch > boundary)
+            .cloned(),
+    );
+    if normalized
+        .last()
+        .is_some_and(|phase| phase.items.is_empty())
+    {
+        normalized.pop();
+    }
+    Some(normalized)
+}
+
+async fn record_claimed_sponsored_update(
+    pool: &sqlx::PgPool,
+    operation: &sponsored_billing::SponsoredOperation,
+    lease_token: &str,
+    snapshot: &SponsoredSubscriptionSnapshot,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    founding_allocator::lock_capacity(&mut tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    sponsored_billing::record_claimed_provider_update(
+        &mut tx,
+        &operation.operation_id,
+        lease_token,
+        snapshot
+            .customer_id
+            .as_deref()
+            .or(operation.provider_customer_id.as_deref()),
+        &snapshot.subscription_id,
+        snapshot.schedule_id.as_deref(),
+        snapshot.current_period_end,
+        None,
+    )
+    .await
+    .map_err(Error::from)?;
+    crate::notifications::enqueue_sponsorship_change_in_tx(&mut tx, &operation.operation_id)
+        .await
+        .map_err(notification_error)?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn record_sponsored_provider_failure(
+    pool: &sqlx::PgPool,
+    operation: &sponsored_billing::SponsoredOperation,
+    lease_token: &str,
+    error: &ProviderError,
+) -> Result<()> {
+    if operation.state == "pending"
+        && operation.recovery_attempt_count == 0
+        && provider_failure_is_definitive(error)
+    {
+        let mut tx = pool.begin().await?;
+        founding_allocator::lock_capacity(&mut tx)
+            .await
+            .map_err(|failure| Error::Internal(failure.to_string()))?;
+        sponsored_billing::cancel_claimed_rejected_operation(
+            &mut tx,
+            &operation.operation_id,
+            lease_token,
+            "provider_rejected",
+        )
+        .await
+        .map_err(Error::from)?;
+        tx.commit().await?;
+    } else {
+        sponsored_billing::record_recovery_failure(
+            pool,
+            &operation.operation_id,
+            lease_token,
+            sponsored_recovery_error_code(error),
+        )
+        .await
+        .map_err(Error::from)?;
+    }
+    Ok(())
+}
+
+fn sponsored_recovery_error_code(error: &ProviderError) -> &'static str {
+    match error.kind {
+        ProviderErrorKind::Authentication => "provider_authentication",
+        ProviderErrorKind::ResourceMissing => "provider_resource_missing",
+        ProviderErrorKind::Retryable => "provider_retryable",
+        ProviderErrorKind::Unknown => "provider_unknown",
+    }
+}
+
+/// Reconcile an expired local pending account against Stripe's current session state. This also
+/// repairs accounts whose signed expiry event was acknowledged by an older server or exhausted
+/// Stripe's webhook retry window.
+async fn reconcile_expired_personal_checkout_once(
+    pool: &sqlx::PgPool,
+    billing: &BillingState,
+    user_id: Option<&str>,
+) -> std::result::Result<bool, billing_operations::BillingRecoveryError> {
+    let lease_token = format!("billing-expiry-recovery:{}", uuid::Uuid::new_v4());
+    let Some(candidate) =
+        billing_operations::claim_expired_personal_checkout(pool, &lease_token, user_id).await?
+    else {
+        return Ok(false);
+    };
+    let status = billing
+        .provider
+        .get_personal_checkout_status(&candidate.session_id, &candidate.operation_id)
+        .await;
+    match status {
+        Ok(PersonalCheckoutStatus::ExpiredUnpaid) => {
+            let mut tx = pool.begin().await.map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_write_failed".into())
+            })?;
+            founding_allocator::lock_capacity(&mut tx)
+                .await
+                .map_err(|_| {
+                    billing_operations::BillingRecoveryError::Provider(
+                        "capacity_lock_failed".into(),
+                    )
+                })?;
+            let account = sqlx::query(
+                "SELECT state, pending_expires_at_epoch, user_id \
+                 FROM billing_personal_accounts WHERE operation_id = $1 FOR UPDATE",
+            )
+            .bind(&candidate.operation_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_read_failed".into())
+            })?;
+            let Some(account) = account else {
+                tx.rollback().await.ok();
+                billing_operations::release_expired_personal_checkout_check(
+                    pool,
+                    &candidate.operation_id,
+                    &candidate.lease_token,
+                )
+                .await?;
+                return Ok(true);
+            };
+            let state: String = account.try_get("state").map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_binding_invalid".into(),
+                )
+            })?;
+            let expires_at: i64 = account.try_get("pending_expires_at_epoch").map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_binding_invalid".into(),
+                )
+            })?;
+            let user_id: String = account.try_get("user_id").map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_binding_invalid".into(),
+                )
+            })?;
+            if state != "pending" || expires_at > billing_epoch() {
+                tx.rollback().await.ok();
+                billing_operations::release_expired_personal_checkout_check(
+                    pool,
+                    &candidate.operation_id,
+                    &candidate.lease_token,
+                )
+                .await?;
+                return Ok(true);
+            }
+            let operation = billing_operations::record_checkout_expired(
+                &mut tx,
+                &candidate.operation_id,
+                &candidate.session_id,
+            )
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("operation_update_failed".into())
+            })?;
+            sqlx::query(
+                "UPDATE billing_personal_accounts SET state='canceled', updated_at=now() \
+                 WHERE operation_id=$1 AND state='pending'",
+            )
+            .bind(&candidate.operation_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "personal_account_update_failed".into(),
+                )
+            })?;
+            founding_allocator::release_reservation(&mut tx, &candidate.operation_id)
+                .await
+                .map_err(|_| {
+                    billing_operations::BillingRecoveryError::Provider(
+                        "reservation_release_failed".into(),
+                    )
+                })?;
+            crate::notifications::enqueue_checkout_outcome_in_tx(
+                &mut tx,
+                &user_id,
+                &candidate.operation_id,
+                crate::notifications::CheckoutOutcome::Expired,
+            )
+            .await
+            .map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider(
+                    "notification_enqueue_failed".into(),
+                )
+            })?;
+            tx.commit().await.map_err(|_| {
+                billing_operations::BillingRecoveryError::Provider("database_commit_failed".into())
+            })?;
+            let _ = operation;
+        }
+        Ok(PersonalCheckoutStatus::Open | PersonalCheckoutStatus::Complete) => {
+            billing_operations::release_expired_personal_checkout_check(
+                pool,
+                &candidate.operation_id,
+                &candidate.lease_token,
+            )
+            .await?;
+        }
+        Err(_) => {
+            billing_operations::release_expired_personal_checkout_check(
+                pool,
+                &candidate.operation_id,
+                &candidate.lease_token,
+            )
+            .await?;
+        }
+    }
+    Ok(true)
 }
 
 fn personal_checkout_expiry(quote_expires_at_epoch: i64, now_epoch: i64) -> Result<i64> {
@@ -2691,6 +5063,23 @@ fn personal_checkout_expiry(quote_expires_at_epoch: i64, now_epoch: i64) -> Resu
     quote_expires_at_epoch
         .checked_add(founding_allocator::RESERVATION_SECONDS)
         .ok_or_else(|| Error::Internal("billing clock overflow".into()))
+}
+
+fn personal_quote_account_is_reusable(state: personal_billing::PersonalBillingState) -> bool {
+    matches!(state, personal_billing::PersonalBillingState::Canceled)
+}
+
+fn personal_checkout_expiry_for_retry(pending_expiry_epoch: i64, now_epoch: i64) -> Result<i64> {
+    if pending_expiry_epoch <= now_epoch {
+        return Err(Error::Conflict(
+            "personal Checkout has expired; wait for its signed expiry event".into(),
+        ));
+    }
+    Ok(pending_expiry_epoch)
+}
+
+fn definitive_checkout_status(status: Option<u16>) -> bool {
+    matches!(status, Some(400 | 404))
 }
 
 async fn personal_operation(
@@ -2747,6 +5136,11 @@ struct PersonalRefundEarlyConfirmation {
 struct BillingRefundReviewRequest {
     approve: bool,
     result_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BillingRefundResolutionRequest {
+    provider_refund_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2831,6 +5225,9 @@ async fn personal_refund_request(
     }
     let reason = correction_reason(&request.reason)?;
     let mut tx = state.pool.begin().await?;
+    billing_transfers::lock_and_check_no_live_transfer(&mut tx, &[&user.user_id], billing_epoch())
+        .await
+        .map_err(Error::from)?;
     let account = personal_billing::load_account(&mut tx, &user.user_id)
         .await
         .map_err(personal_billing_error)?
@@ -2886,6 +5283,9 @@ async fn personal_refund_confirm_early(
 ) -> Result<Json<PersonalRefundView>> {
     require_billing_corrections()?;
     let mut tx = state.pool.begin().await?;
+    billing_transfers::lock_and_check_no_live_transfer(&mut tx, &[&user.user_id], billing_epoch())
+        .await
+        .map_err(Error::from)?;
     let request = billing_refunds::confirm_early_termination(
         &mut tx,
         &request_id,
@@ -2919,6 +5319,147 @@ async fn operator_review_refund(
     Ok(Json(personal_refund_view(request)))
 }
 
+async fn operator_resolve_refund(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+    Json(resolution): Json<BillingRefundResolutionRequest>,
+) -> Result<Json<PersonalRefundView>> {
+    require_billing_corrections()?;
+    require_billing_operator(&headers)?;
+    let billing = billing_config(&state)?;
+    let mut tx = state.pool.begin().await?;
+    let current = billing_refunds::load_for_operator(&mut tx, &request_id)
+        .await
+        .map_err(Error::from)?;
+    if current.state != billing_refunds::CorrectionState::Unknown
+        || current.provider_refund_id.is_some()
+        || current.result_code.as_deref() != Some("refund_create_horizon_expired")
+    {
+        return Err(Error::Conflict(
+            "billing refund is not awaiting ambiguous-create resolution".into(),
+        ));
+    }
+    tx.rollback().await?;
+
+    let receipt = billing
+        .provider
+        .get_refund(&resolution.provider_refund_id)
+        .await
+        .map_err(ProviderError::into_error)?;
+    if !validate_refund_receipt(&*billing.provider, &current, &receipt).await? {
+        return Err(Error::Conflict(
+            "provider refund amount does not match the approved correction".into(),
+        ));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let request = match receipt.status.as_str() {
+        "succeeded" => billing_refunds::record_provider_refund(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            true,
+            None,
+        )
+        .await
+        .map_err(Error::from)?,
+        "pending" | "requires_action" => {
+            billing_refunds::record_provider_pending(&mut tx, &request_id, &receipt.refund_id)
+                .await
+                .map_err(Error::from)?
+        }
+        status @ ("failed" | "canceled") => billing_refunds::record_provider_refund(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            false,
+            Some(status),
+        )
+        .await
+        .map_err(Error::from)?,
+        _ => billing_refunds::record_provider_unknown(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            "provider_status_unrecognised",
+        )
+        .await
+        .map_err(Error::from)?,
+    };
+    tx.commit().await?;
+    Ok(Json(personal_refund_view(request)))
+}
+
+async fn validate_refund_receipt(
+    provider: &dyn SubscriptionProvider,
+    request: &billing_refunds::BillingRefundRequest,
+    receipt: &RefundReceipt,
+) -> Result<bool> {
+    let refundable_amount = if request.full_refund_requested && receipt.status == "succeeded" {
+        let Some(charge_id) = receipt.charge_id.as_deref() else {
+            return Ok(false);
+        };
+        if !refund_receipt_matches_charge(receipt, charge_id) {
+            return Ok(false);
+        }
+        Some(
+            provider
+                .get_refundable_amount(&request.payment_reference, charge_id, receipt.amount_pence)
+                .await
+                .map_err(ProviderError::into_error)?,
+        )
+    } else {
+        None
+    };
+    if request.full_refund_requested && receipt.status != "succeeded" {
+        return Ok(
+            receipt.payment_reference == request.payment_reference && receipt.currency == "gbp"
+        );
+    }
+    Ok(refund_receipt_matches_approved_correction(
+        request,
+        receipt,
+        refundable_amount.as_ref(),
+    ))
+}
+
+fn refund_receipt_matches_charge(receipt: &RefundReceipt, expected_charge_id: &str) -> bool {
+    receipt.charge_id.as_deref() == Some(expected_charge_id)
+        && expected_charge_id.starts_with("ch_")
+}
+
+fn parse_refund_charge_id(value: &serde_json::Value) -> ProviderResult<Option<String>> {
+    match value.get("charge") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(charge) => stripe_reference(charge)
+            .filter(|charge_id| charge_id.starts_with("ch_"))
+            .map(Some)
+            .ok_or_else(ProviderError::malformed_response),
+    }
+}
+
+fn refund_receipt_matches_approved_correction(
+    request: &billing_refunds::BillingRefundRequest,
+    receipt: &RefundReceipt,
+    refundable_amount: Option<&(i64, String)>,
+) -> bool {
+    if receipt.payment_reference != request.payment_reference || receipt.currency != "gbp" {
+        return false;
+    }
+    let partial_amount = request
+        .amount_pence
+        .map(|amount| (amount, "gbp".to_string()));
+    let expected_amount = if request.full_refund_requested {
+        refundable_amount
+    } else {
+        partial_amount.as_ref()
+    };
+    expected_amount.is_some_and(|(amount, currency)| {
+        currency == &receipt.currency && *amount == receipt.amount_pence
+    })
+}
+
 async fn operator_process_refund(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2931,14 +5472,70 @@ async fn operator_process_refund(
     let current = billing_refunds::load_for_operator(&mut tx, &request_id)
         .await
         .map_err(Error::from)?;
+    billing_transfers::lock_and_check_no_live_transfer(
+        &mut tx,
+        &[current.beneficiary_id.as_str()],
+        sponsored_billing::current_epoch(),
+    )
+    .await
+    .map_err(Error::from)?;
     let current = if current.state == billing_refunds::CorrectionState::Approved {
         let next = billing_refunds::begin_provider_refund(&mut tx, &request_id)
             .await
             .map_err(Error::from)?;
-        tx.commit().await?;
         next
     } else {
+        current
+    };
+    let create_claim_token = if current.state == billing_refunds::CorrectionState::ProviderPending
+        && current.provider_refund_id.is_none()
+    {
+        let claim_token = uuid::Uuid::new_v4();
+        match billing_refunds::claim_or_park_provider_refund_create(
+            &mut tx,
+            &request_id,
+            claim_token,
+        )
+        .await
+        .map_err(Error::from)?
+        {
+            billing_refunds::RefundCreateClaim::Claimed { token, .. } => {
+                tx.commit().await?;
+                let mut check_tx = state.pool.begin().await?;
+                let still_current = billing_refunds::provider_refund_create_claim_is_current(
+                    &mut check_tx,
+                    &request_id,
+                    token,
+                )
+                .await
+                .map_err(Error::from)?;
+                let latest = billing_refunds::load_for_operator(&mut check_tx, &request_id)
+                    .await
+                    .map_err(Error::from)?;
+                check_tx.rollback().await?;
+                if !still_current {
+                    return Ok(Json(personal_refund_view(latest)));
+                }
+                Some(token)
+            }
+            billing_refunds::RefundCreateClaim::InFlight(request)
+            | billing_refunds::RefundCreateClaim::Parked(request) => {
+                tx.commit().await?;
+                return Ok(Json(personal_refund_view(request)));
+            }
+        }
+    } else {
         tx.rollback().await?;
+        None
+    };
+    let current = if create_claim_token.is_some() {
+        let mut read_tx = state.pool.begin().await?;
+        let current = billing_refunds::load_for_operator(&mut read_tx, &request_id)
+            .await
+            .map_err(Error::from)?;
+        read_tx.rollback().await?;
+        current
+    } else {
         current
     };
     if current.state == billing_refunds::CorrectionState::TerminationPending {
@@ -2959,7 +5556,10 @@ async fn operator_process_refund(
         tx.commit().await?;
         return Ok(Json(personal_refund_view(request)));
     }
-    if current.state != billing_refunds::CorrectionState::ProviderPending {
+    let has_known_refund = current.provider_refund_id.is_some();
+    if current.state != billing_refunds::CorrectionState::ProviderPending
+        && !(current.state == billing_refunds::CorrectionState::Unknown && has_known_refund)
+    {
         return Ok(Json(personal_refund_view(current)));
     }
     let provider_key = format!("sotto-refund:{request_id}");
@@ -2969,7 +5569,7 @@ async fn operator_process_refund(
             .get_refund(provider_refund_id)
             .await
             .map_err(ProviderError::into_error)?
-    } else {
+    } else if create_claim_token.is_some() {
         billing
             .provider
             .create_refund(
@@ -2979,7 +5579,22 @@ async fn operator_process_refund(
             )
             .await
             .map_err(ProviderError::into_error)?
+    } else {
+        return Ok(Json(personal_refund_view(current)));
     };
+    if !validate_refund_receipt(&*billing.provider, &current, &receipt).await? {
+        let mut tx = state.pool.begin().await?;
+        let request = billing_refunds::record_provider_unknown(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            "provider_refund_evidence_mismatch",
+        )
+        .await
+        .map_err(Error::from)?;
+        tx.commit().await?;
+        return Ok(Json(personal_refund_view(request)));
+    }
     let mut tx = state.pool.begin().await?;
     let request = match receipt.status.as_str() {
         "succeeded" => billing_refunds::record_provider_refund(
@@ -2996,12 +5611,20 @@ async fn operator_process_refund(
                 .await
                 .map_err(Error::from)?
         }
-        status => billing_refunds::record_provider_refund(
+        status @ ("failed" | "canceled") => billing_refunds::record_provider_refund(
             &mut tx,
             &request_id,
             &receipt.refund_id,
             false,
             Some(status),
+        )
+        .await
+        .map_err(Error::from)?,
+        _ => billing_refunds::record_provider_unknown(
+            &mut tx,
+            &request_id,
+            &receipt.refund_id,
+            "provider_status_unrecognised",
         )
         .await
         .map_err(Error::from)?,
@@ -3044,7 +5667,11 @@ async fn personal_portal(
     tx.rollback().await?;
     let portal_url = billing
         .provider
-        .create_portal(&customer, &app_url(&billing.return_url))
+        .create_portal(
+            &customer,
+            &app_url(&billing.return_url),
+            billing.cloud_portal_configuration_id(),
+        )
         .await
         .map_err(ProviderError::into_error)?;
     Ok(Json(PersonalLifecycleView {
@@ -3143,11 +5770,57 @@ async fn personal_cancel(
     }
     let billing = billing_config(&state)?;
     let mut tx = state.pool.begin().await?;
+    billing_transfers::lock_and_check_no_live_transfer(&mut tx, &[&user.user_id], billing_epoch())
+        .await
+        .map_err(Error::from)?;
     let account = personal_billing::load_account(&mut tx, &user.user_id)
         .await
         .map_err(personal_billing_error)?
         .ok_or_else(|| Error::NotFound("personal billing account not found".into()))?;
     if account.cancel_at_period_end {
+        // A webhook or an earlier cancellation attempt may have set the account flag before the
+        // founding transition schedule was reconciled. Repeat the provider operation on retries:
+        // it is idempotent and changes an attached schedule to end at the paid boundary.
+        if account.state != personal_billing::PersonalBillingState::Canceled {
+            if let Some(subscription_id) = account.stripe_subscription_id.as_deref() {
+                founding_schedule::request_personal_cancellation(
+                    &mut tx,
+                    &user.user_id,
+                    subscription_id,
+                )
+                .await?;
+                tx.commit().await?;
+                billing
+                    .provider
+                    .cancel_personal_subscription(
+                        subscription_id,
+                        &request.idempotency_key,
+                        &user.user_id,
+                    )
+                    .await
+                    .map_err(ProviderError::into_error)?;
+                founding_schedule::record_personal_cancellation(
+                    &state.pool,
+                    &user.user_id,
+                    subscription_id,
+                )
+                .await?;
+                let mut update_tx = state.pool.begin().await?;
+                let founding = personal_founding_transition(&mut update_tx, &user.user_id).await?;
+                update_tx.commit().await?;
+                return Ok(Json(PersonalLifecycleView {
+                    state: account.state.as_str().into(),
+                    stripe_subscription_id: Some(subscription_id.to_owned()),
+                    paid_through_date: account.paid_through_date,
+                    cancel_at_period_end: true,
+                    portal_url: None,
+                    founding_price_end_epoch: founding.end_epoch,
+                    standard_renewal_amount_pence: founding.standard_amount_pence,
+                    founding_transition_status: founding.status,
+                    founding_transition_reason: founding.reason,
+                }));
+            }
+        }
         let founding = personal_founding_transition(&mut tx, &user.user_id).await?;
         tx.rollback().await?;
         return Ok(Json(PersonalLifecycleView {
@@ -3165,20 +5838,17 @@ async fn personal_cancel(
     let subscription_id = account.stripe_subscription_id.clone().ok_or_else(|| {
         Error::Conflict("personal billing has not received a paid subscription yet".into())
     })?;
-    tx.rollback().await?;
+    founding_schedule::request_personal_cancellation(&mut tx, &user.user_id, &subscription_id)
+        .await?;
+    tx.commit().await?;
     billing
         .provider
         .cancel_personal_subscription(&subscription_id, &request.idempotency_key, &user.user_id)
         .await
         .map_err(ProviderError::into_error)?;
+    founding_schedule::record_personal_cancellation(&state.pool, &user.user_id, &subscription_id)
+        .await?;
     let mut update_tx = state.pool.begin().await?;
-    sqlx::query(
-        "UPDATE billing_personal_accounts SET cancel_at_period_end = TRUE, \
-         cancellation_requested_at = now(), updated_at = now() WHERE user_id = $1",
-    )
-    .bind(&user.user_id)
-    .execute(&mut *update_tx)
-    .await?;
     let founding = personal_founding_transition(&mut update_tx, &user.user_id).await?;
     update_tx.commit().await?;
     Ok(Json(PersonalLifecycleView {
@@ -3214,6 +5884,10 @@ async fn create_checkout(
     // briefly pins a pool connection and serialises this organisation's writes; that is the
     // deliberate trade-off for closing the race.
     require_billing_admin(&mut tx, &org_id, &user.user_id).await?;
+    billing
+        .validate_cloud_portal_configuration()
+        .await
+        .map_err(ProviderError::into_error)?;
 
     // Reuse the org's Stripe customer if one exists, so a cancel/resubscribe doesn't fork billing
     // history; otherwise Checkout creates one and the webhook records it.
@@ -3261,7 +5935,11 @@ async fn create_portal(
 
     let url = billing
         .provider
-        .create_portal(&customer, &app_url(&billing.return_url))
+        .create_portal(
+            &customer,
+            &app_url(&billing.return_url),
+            billing.cloud_portal_configuration_id(),
+        )
         .await
         .map_err(ProviderError::into_error)?;
     tx.commit().await?;
@@ -3393,8 +6071,17 @@ async fn stripe_post(
     path: &str,
     form: &[(String, String)],
 ) -> ProviderResult<serde_json::Value> {
+    stripe_post_at(api_key, "https://api.stripe.com", path, form).await
+}
+
+async fn stripe_post_at(
+    api_key: &str,
+    api_origin: &str,
+    path: &str,
+    form: &[(String, String)],
+) -> ProviderResult<serde_json::Value> {
     let response = stripe_client()
-        .post(format!("https://api.stripe.com/v1/{path}"))
+        .post(format!("{}/v1/{path}", api_origin.trim_end_matches('/')))
         .bearer_auth(api_key)
         .headers(stripe_headers(None)?)
         .form(form)
@@ -3410,8 +6097,25 @@ async fn stripe_post_with_idempotency(
     form: &[(String, String)],
     idempotency_key: &str,
 ) -> ProviderResult<serde_json::Value> {
+    stripe_post_with_idempotency_at(
+        api_key,
+        "https://api.stripe.com",
+        path,
+        form,
+        idempotency_key,
+    )
+    .await
+}
+
+async fn stripe_post_with_idempotency_at(
+    api_key: &str,
+    api_origin: &str,
+    path: &str,
+    form: &[(String, String)],
+    idempotency_key: &str,
+) -> ProviderResult<serde_json::Value> {
     let response = stripe_client()
-        .post(format!("https://api.stripe.com/v1/{path}"))
+        .post(format!("{}/v1/{path}", api_origin.trim_end_matches('/')))
         .bearer_auth(api_key)
         .headers(stripe_headers(Some(idempotency_key))?)
         .form(form)
@@ -3421,10 +6125,76 @@ async fn stripe_post_with_idempotency(
     stripe_response(response).await
 }
 
+fn append_checkout_tax_fields(
+    form: &mut Vec<(String, String)>,
+    existing_customer: bool,
+    automatic_tax_enabled: bool,
+) {
+    if !automatic_tax_enabled {
+        return;
+    }
+    form.push(("automatic_tax[enabled]".into(), "true".into()));
+    form.push(("billing_address_collection".into(), "auto".into()));
+    if existing_customer {
+        form.push(("customer_update[address]".into(), "auto".into()));
+    }
+}
+
+fn append_sponsored_phase_tax_fields(
+    form: &mut Vec<(String, String)>,
+    future_phase_count: usize,
+    automatic_tax_enabled: bool,
+) {
+    for phase_index in 0..=future_phase_count {
+        form.push((
+            format!("phases[{phase_index}][automatic_tax][enabled]"),
+            automatic_tax_enabled.to_string(),
+        ));
+    }
+}
+
+fn automatic_tax_state_matches(object: &serde_json::Value, enabled: bool) -> bool {
+    automatic_tax_object_matches(&object["automatic_tax"], enabled)
+}
+
+fn automatic_tax_object_matches(automatic_tax: &serde_json::Value, enabled: bool) -> bool {
+    if !enabled || automatic_tax["enabled"].as_bool() == Some(true) {
+        return true;
+    }
+    if automatic_tax["enabled"].as_bool() == Some(false)
+        && automatic_tax["disabled_reason"].as_str() == Some("requires_location_inputs")
+    {
+        eprintln!(
+            "warning: Stripe disabled automatic tax because customer location inputs are required"
+        );
+        return true;
+    }
+    false
+}
+
+fn require_checkout_tax_state(
+    session: &serde_json::Value,
+    automatic_tax_enabled: bool,
+) -> ProviderResult<()> {
+    if automatic_tax_state_matches(session, automatic_tax_enabled) {
+        Ok(())
+    } else {
+        Err(ProviderError::malformed_response())
+    }
+}
+
 /// Fetch one Stripe resource with the pinned API version and structured error classification.
 async fn stripe_get(api_key: &str, path: &str) -> ProviderResult<serde_json::Value> {
+    stripe_get_at(api_key, "https://api.stripe.com", path).await
+}
+
+async fn stripe_get_at(
+    api_key: &str,
+    api_origin: &str,
+    path: &str,
+) -> ProviderResult<serde_json::Value> {
     let response = stripe_client()
-        .get(format!("https://api.stripe.com/v1/{path}"))
+        .get(format!("{}/v1/{path}", api_origin.trim_end_matches('/')))
         .bearer_auth(api_key)
         .headers(stripe_headers(None)?)
         .send()
@@ -3483,6 +6253,438 @@ fn stripe_schedule_contains_phases(
                 .map(|phase| phase.start_at_epoch);
             stripe_schedule_phase_matches(current_phases[index + 1], expected, next_start)
         })
+}
+
+fn stripe_schedule_contains_phases_with_tax(
+    schedule: &serde_json::Value,
+    current_start: i64,
+    current_end: i64,
+    current_items: &[SponsoredSubscriptionItem],
+    expected_phases: &[SponsoredSubscriptionPhase],
+    expected_automatic_tax_enabled: bool,
+) -> bool {
+    if !stripe_schedule_contains_phases(
+        schedule,
+        current_start,
+        current_end,
+        current_items,
+        expected_phases,
+    ) {
+        return false;
+    }
+    schedule["phases"].as_array().is_some_and(|phases| {
+        phases
+            .iter()
+            .filter(|phase| {
+                phase["end_date"]
+                    .as_i64()
+                    .is_some_and(|end| end > current_start)
+            })
+            .all(|phase| {
+                phase["automatic_tax"]["enabled"].as_bool() == Some(expected_automatic_tax_enabled)
+            })
+    })
+}
+
+fn transfer_setup_checkout_form(
+    transfer_id: &str,
+    customer_id: &str,
+    success_url: &str,
+    cancel_url: &str,
+    collect_billing_address: bool,
+) -> Vec<(String, String)> {
+    let mut form = vec![
+        ("mode".into(), "setup".into()),
+        ("customer".into(), customer_id.into()),
+        (
+            "client_reference_id".into(),
+            format!("sotto-transfer:{transfer_id}"),
+        ),
+        ("metadata[sotto_transfer_id]".into(), transfer_id.into()),
+        (
+            "setup_intent_data[metadata][sotto_transfer_id]".into(),
+            transfer_id.into(),
+        ),
+        ("setup_intent_data[usage]".into(), "off_session".into()),
+        ("success_url".into(), success_url.into()),
+        ("cancel_url".into(), cancel_url.into()),
+    ];
+    if collect_billing_address {
+        form.push(("billing_address_collection".into(), "required".into()));
+        form.push(("customer_update[address]".into(), "auto".into()));
+    }
+    form
+}
+
+fn transfer_setup_session_from_object(
+    object: &serde_json::Value,
+    expected_session_id: Option<&str>,
+    expected_transfer_id: Option<&str>,
+) -> ProviderResult<TransferSetupSession> {
+    let session_id = object["id"]
+        .as_str()
+        .filter(|value| !value.is_empty() && expected_session_id.is_none_or(|id| *value == id))
+        .ok_or_else(ProviderError::malformed_response)?;
+    if object["object"].as_str() != Some("checkout.session")
+        || object["mode"].as_str() != Some("setup")
+        || expected_transfer_id.is_some_and(|transfer_id| {
+            object["client_reference_id"].as_str()
+                != Some(format!("sotto-transfer:{transfer_id}").as_str())
+                || object["metadata"]["sotto_transfer_id"].as_str() != Some(transfer_id)
+        })
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    let customer_id = object["customer"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(ProviderError::malformed_response)?;
+    let status = object["status"]
+        .as_str()
+        .filter(|value| matches!(*value, "open" | "complete" | "expired"))
+        .ok_or_else(ProviderError::malformed_response)?;
+    let checkout_url = object["url"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let setup_intent_id = object["setup_intent"]
+        .as_str()
+        .or_else(|| object["setup_intent"]["id"].as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let expires_at_epoch = object["expires_at"].as_i64();
+    if object["url"].is_null() && status == "open" {
+        return Err(ProviderError::malformed_response());
+    }
+    Ok(TransferSetupSession {
+        session_id: session_id.to_string(),
+        checkout_url,
+        customer_id: customer_id.to_string(),
+        setup_intent_id,
+        status: status.to_string(),
+        expires_at_epoch,
+    })
+}
+
+fn personal_checkout_status_from_object(
+    object: &serde_json::Value,
+    expected_session_id: &str,
+    expected_operation_id: &str,
+) -> ProviderResult<PersonalCheckoutStatus> {
+    checkout_status_from_object(
+        object,
+        expected_session_id,
+        &format!("personal:{expected_operation_id}"),
+    )
+}
+
+fn checkout_status_from_object(
+    object: &serde_json::Value,
+    expected_session_id: &str,
+    expected_client_reference_id: &str,
+) -> ProviderResult<PersonalCheckoutStatus> {
+    if object["object"].as_str() != Some("checkout.session")
+        || object["id"].as_str() != Some(expected_session_id)
+        || object["mode"].as_str() != Some("subscription")
+        || object["client_reference_id"].as_str() != Some(expected_client_reference_id)
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    match (object["status"].as_str(), object["payment_status"].as_str()) {
+        (Some("open"), Some("unpaid")) => Ok(PersonalCheckoutStatus::Open),
+        (Some("complete"), Some("unpaid" | "paid" | "no_payment_required")) => {
+            Ok(PersonalCheckoutStatus::Complete)
+        }
+        (Some("expired"), Some("unpaid")) => Ok(PersonalCheckoutStatus::ExpiredUnpaid),
+        _ => Err(ProviderError::malformed_response()),
+    }
+}
+
+fn transfer_setup_intent_from_object(
+    object: &serde_json::Value,
+    expected_setup_intent_id: &str,
+) -> ProviderResult<TransferSetupIntent> {
+    let setup_intent_id = object["id"]
+        .as_str()
+        .filter(|value| *value == expected_setup_intent_id)
+        .ok_or_else(ProviderError::malformed_response)?;
+    let transfer_id = object["metadata"]["sotto_transfer_id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(ProviderError::malformed_response)?;
+    let customer_id = object["customer"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(ProviderError::malformed_response)?;
+    let payment_method_id = object["payment_method"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(ProviderError::malformed_response)?;
+    let status = object["status"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(ProviderError::malformed_response)?;
+    let off_session = object["usage"].as_str() == Some("off_session");
+    if object["object"].as_str() != Some("setup_intent") || !off_session {
+        return Err(ProviderError::malformed_response());
+    }
+    Ok(TransferSetupIntent {
+        setup_intent_id: setup_intent_id.to_string(),
+        transfer_id: transfer_id.to_string(),
+        customer_id: customer_id.to_string(),
+        payment_method_id: payment_method_id.to_string(),
+        status: status.to_string(),
+        off_session,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn personal_transfer_schedule_form(
+    transfer_id: &str,
+    beneficiary_id: &str,
+    customer_id: &str,
+    payment_method_id: &str,
+    offer: BillingOffer,
+    price_id: &str,
+    allocation_reference: &str,
+    start_at_epoch: i64,
+    automatic_tax_enabled: bool,
+) -> Vec<(String, String)> {
+    let operation_id = format!("{transfer_id}:destination");
+    let mut form: Vec<(String, String)> = vec![
+        ("customer".into(), customer_id.into()),
+        ("start_date".into(), start_at_epoch.to_string()),
+        ("end_behavior".into(), "release".into()),
+        (
+            "default_settings[default_payment_method]".into(),
+            payment_method_id.into(),
+        ),
+        ("metadata[sotto_transfer_id]".into(), transfer_id.into()),
+        ("metadata[personal_user_id]".into(), beneficiary_id.into()),
+        ("metadata[operation_id]".into(), operation_id.clone()),
+        (
+            "metadata[sotto_allocation_reference]".into(),
+            allocation_reference.into(),
+        ),
+        ("metadata[sotto_offer]".into(), offer.as_str().into()),
+        (
+            "phases[0][default_payment_method]".into(),
+            payment_method_id.into(),
+        ),
+        ("phases[0][proration_behavior]".into(), "none".into()),
+        ("phases[0][items][0][price]".into(), price_id.into()),
+        ("phases[0][items][0][quantity]".into(), "1".into()),
+        (
+            "phases[0][metadata][sotto_transfer_id]".into(),
+            transfer_id.into(),
+        ),
+        (
+            "phases[0][metadata][personal_user_id]".into(),
+            beneficiary_id.into(),
+        ),
+        ("phases[0][metadata][operation_id]".into(), operation_id),
+        (
+            "phases[0][metadata][sotto_allocation_reference]".into(),
+            allocation_reference.into(),
+        ),
+        (
+            "phases[0][metadata][sotto_offer]".into(),
+            offer.as_str().into(),
+        ),
+    ];
+    if automatic_tax_enabled {
+        form.push((
+            "default_settings[automatic_tax][enabled]".into(),
+            "true".into(),
+        ));
+    }
+    form.sort_by(|left, right| left.0.cmp(&right.0));
+    form
+}
+
+#[allow(clippy::too_many_arguments)]
+fn personal_source_restoration_form(
+    transfer_id: &str,
+    beneficiary_id: &str,
+    customer_id: &str,
+    payment_method_id: &str,
+    price_id: &str,
+    allocation_reference: &str,
+    operation_id: &str,
+    automatic_tax_enabled: bool,
+) -> Vec<(String, String)> {
+    let mut form = vec![
+        ("customer".into(), customer_id.into()),
+        ("items[0][price]".into(), price_id.into()),
+        ("default_payment_method".into(), payment_method_id.into()),
+        ("collection_method".into(), "charge_automatically".into()),
+        ("payment_behavior".into(), "allow_incomplete".into()),
+        ("off_session".into(), "true".into()),
+        ("metadata[personal_user_id]".into(), beneficiary_id.into()),
+        ("metadata[operation_id]".into(), operation_id.into()),
+        (
+            "metadata[sotto_allocation_reference]".into(),
+            allocation_reference.into(),
+        ),
+        ("metadata[sotto_transfer_id]".into(), transfer_id.into()),
+    ];
+    if automatic_tax_enabled {
+        form.push(("automatic_tax[enabled]".into(), "true".into()));
+    }
+    form
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transfer_schedule_from_object(
+    object: &serde_json::Value,
+    transfer_id: &str,
+    customer_id: &str,
+    payment_method_id: &str,
+    beneficiary_id: &str,
+    offer: BillingOffer,
+    price_id: &str,
+    allocation_reference: &str,
+    start_at_epoch: i64,
+    automatic_tax_enabled: bool,
+) -> ProviderResult<TransferSubscriptionSchedule> {
+    let operation_id = format!("{transfer_id}:destination");
+    let schedule_id = object["id"]
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(ProviderError::malformed_response)?;
+    let observed_customer = object["customer"]
+        .as_str()
+        .filter(|value| *value == customer_id)
+        .ok_or_else(ProviderError::malformed_response)?;
+    let status = object["status"]
+        .as_str()
+        .filter(|value| matches!(*value, "not_started" | "active"))
+        .ok_or_else(ProviderError::malformed_response)?;
+    let phases = object["phases"]
+        .as_array()
+        .filter(|phases| phases.len() == 1)
+        .ok_or_else(ProviderError::malformed_response)?;
+    let phase = &phases[0];
+    let items = phase["items"]
+        .as_array()
+        .filter(|items| items.len() == 1)
+        .ok_or_else(ProviderError::malformed_response)?;
+    let phase_payment_method = stripe_reference(&phase["default_payment_method"]);
+    let default_payment_method =
+        stripe_reference(&object["default_settings"]["default_payment_method"]);
+    if object["object"].as_str() != Some("subscription_schedule")
+        || object["start_date"].as_i64() != Some(start_at_epoch)
+        || phase["start_date"].as_i64() != Some(start_at_epoch)
+        || object["end_behavior"].as_str() != Some("release")
+        || phase["proration_behavior"].as_str() != Some("none")
+        || phase_payment_method.as_deref() != Some(payment_method_id)
+        || default_payment_method.as_deref() != Some(payment_method_id)
+        || !automatic_tax_object_matches(
+            &object["default_settings"]["automatic_tax"],
+            automatic_tax_enabled,
+        )
+        || object["metadata"]["sotto_transfer_id"].as_str() != Some(transfer_id)
+        || object["metadata"]["personal_user_id"].as_str() != Some(beneficiary_id)
+        || object["metadata"]["operation_id"].as_str() != Some(operation_id.as_str())
+        || object["metadata"]["sotto_allocation_reference"].as_str() != Some(allocation_reference)
+        || object["metadata"]["sotto_offer"].as_str() != Some(offer.as_str())
+        || items[0]["price"].as_str() != Some(price_id)
+        || items[0]["quantity"].as_i64() != Some(1)
+        || phase["metadata"]["sotto_transfer_id"].as_str() != Some(transfer_id)
+        || phase["metadata"]["personal_user_id"].as_str() != Some(beneficiary_id)
+        || phase["metadata"]["operation_id"].as_str() != Some(operation_id.as_str())
+        || phase["metadata"]["sotto_allocation_reference"].as_str() != Some(allocation_reference)
+        || phase["metadata"]["sotto_offer"].as_str() != Some(offer.as_str())
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    let subscription_id = object["subscription"]
+        .as_str()
+        .or_else(|| object["subscription"]["id"].as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string);
+    Ok(TransferSubscriptionSchedule {
+        schedule_id: schedule_id.to_string(),
+        customer_id: observed_customer.to_string(),
+        subscription_id,
+        start_at_epoch,
+        expected_period_end_epoch: FoundingDate::anchored_term_end_epoch(
+            start_at_epoch,
+            FoundingOffer::for_billing_offer_interval(offer),
+            1,
+        )
+        .map_err(|_| ProviderError::malformed_response())?,
+        status: status.to_string(),
+    })
+}
+
+fn personal_schedule_cancellation_form(
+    current_start: i64,
+    current_end: i64,
+    current_items: &[SponsoredSubscriptionItem],
+) -> Vec<(String, String)> {
+    let mut form = vec![
+        ("end_behavior".into(), "cancel".into()),
+        ("proration_behavior".into(), "none".into()),
+        ("phases[0][start_date]".into(), current_start.to_string()),
+        ("phases[0][end_date]".into(), current_end.to_string()),
+    ];
+    for (index, item) in current_items.iter().enumerate() {
+        form.push((
+            format!("phases[0][items][{index}][price]"),
+            item.provider_price_id.clone(),
+        ));
+        form.push((
+            format!("phases[0][items][{index}][quantity]"),
+            item.quantity.to_string(),
+        ));
+    }
+    form
+}
+
+fn stripe_schedule_subscription_id(schedule: &serde_json::Value) -> Option<&str> {
+    schedule["subscription"]
+        .as_str()
+        .or_else(|| schedule["subscription"]["id"].as_str())
+}
+
+fn personal_schedule_cancellation_idempotency_key(
+    subscription_id: &str,
+    current_end: i64,
+    request_key: &str,
+) -> String {
+    let digest = Sha256::digest(request_key.as_bytes());
+    let request_fingerprint = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sotto-personal-cancel:{subscription_id}:{current_end}:{request_fingerprint}")
+}
+
+fn stripe_current_schedule_phase_start(
+    schedule: &serde_json::Value,
+    schedule_id: &str,
+    subscription_id: &str,
+    period_start: i64,
+    period_end: i64,
+) -> ProviderResult<i64> {
+    if schedule["id"].as_str() != Some(schedule_id)
+        || stripe_schedule_subscription_id(schedule) != Some(subscription_id)
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    let start = schedule["current_phase"]["start_date"]
+        .as_i64()
+        .filter(|start| *start >= 0)
+        .ok_or_else(ProviderError::malformed_response)?;
+    let end = schedule["current_phase"]["end_date"]
+        .as_i64()
+        .filter(|end| *end > start)
+        .ok_or_else(ProviderError::malformed_response)?;
+    if start > period_start || end < period_end {
+        return Err(ProviderError::malformed_response());
+    }
+    Ok(start)
 }
 
 fn stripe_schedule_phase_matches(
@@ -3563,6 +6765,41 @@ fn validate_stripe_personal_price(
     Ok(())
 }
 
+fn validate_cloud_portal_configuration(
+    value: &serde_json::Value,
+    configuration_id: &str,
+    expected_livemode: bool,
+) -> ProviderResult<()> {
+    if value["id"].as_str() != Some(configuration_id)
+        || value["object"].as_str() != Some("billing_portal.configuration")
+        || value["active"].as_bool() != Some(true)
+        || value["livemode"].as_bool() != Some(expected_livemode)
+        || value["features"]["subscription_update"]["enabled"].as_bool() != Some(false)
+        || value["features"]["payment_method_update"]["enabled"].as_bool() != Some(true)
+        || value["features"]["subscription_cancel"]["enabled"].as_bool() != Some(true)
+        || value["features"]["subscription_cancel"]["mode"].as_str() != Some("at_period_end")
+        || value["features"]["subscription_cancel"]["proration_behavior"].as_str() != Some("none")
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    Ok(())
+}
+
+fn portal_session_form(
+    customer: &str,
+    return_url: &str,
+    configuration_id: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut form = vec![
+        ("customer".to_string(), customer.to_string()),
+        ("return_url".to_string(), return_url.to_string()),
+    ];
+    if let Some(configuration_id) = configuration_id {
+        form.push(("configuration".to_string(), configuration_id.to_string()));
+    }
+    form
+}
+
 /// Delete one Stripe resource with an idempotency key and the explicit cancellation form.
 async fn stripe_delete(
     api_key: &str,
@@ -3625,6 +6862,21 @@ fn sponsored_subscription_snapshot(
     requested_id: &str,
 ) -> ProviderResult<SponsoredSubscriptionSnapshot> {
     let base = subscription_snapshot(object, requested_id)?;
+    let cancel_at_period_end = object["cancel_at_period_end"]
+        .as_bool()
+        .ok_or_else(ProviderError::malformed_response)?;
+    let automatic_tax_enabled = object["automatic_tax"]["enabled"]
+        .as_bool()
+        .ok_or_else(ProviderError::malformed_response)?;
+    let cancel_at = match object.get("cancel_at") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_i64()
+                .filter(|timestamp| *timestamp >= 0)
+                .ok_or_else(ProviderError::malformed_response)?,
+        ),
+    };
     let items = object["items"]["data"]
         .as_array()
         .ok_or_else(ProviderError::malformed_response)?
@@ -3651,8 +6903,12 @@ fn sponsored_subscription_snapshot(
         .collect::<ProviderResult<Vec<_>>>()?;
     Ok(SponsoredSubscriptionSnapshot {
         customer_id: object["customer"].as_str().map(str::to_string),
+        default_payment_method_id: stripe_reference(&object["default_payment_method"]),
         subscription_id: base.id,
         status: base.status,
+        automatic_tax_enabled,
+        cancel_at_period_end,
+        cancel_at,
         current_period_start: subscription_period_start(object),
         current_period_end: subscription_period_end(object),
         schedule_id: object["schedule"].as_str().map(str::to_string),
@@ -3710,6 +6966,14 @@ struct EventData {
     object: serde_json::Value,
 }
 
+#[derive(Clone, Debug)]
+struct VerifiedTransferSetup {
+    transfer_id: String,
+    customer_id: String,
+    session_id: String,
+    setup_intent_id: String,
+}
+
 /// `POST /billing/webhook` - Stripe's event delivery. Signature-verified against the endpoint's
 /// signing secret; unhandled event types are acknowledged and ignored (so the endpoint can be
 /// subscribed broadly in the dashboard without breaking).
@@ -3719,10 +6983,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         .get("Stripe-Signature")
         .and_then(|v| v.to_str().ok())
         .ok_or(Error::Unauthorized)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = crate::clock::wall_epoch_seconds();
     if !verify_signature(&billing.webhook_secret, signature, &body, now) {
         return Err(Error::Unauthorized);
     }
@@ -3764,6 +7025,15 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         )));
     }
 
+    // Make the signed billing fact visible even if the separate coverage-evidence read below
+    // needs Stripe to retry. The receipt stays unprocessed until the ordinary webhook path has
+    // applied all billing and coverage work; this transaction only records the customer notice.
+    if event.kind == "invoice.payment_failed"
+        && record_personal_renewal_failure_notice(&state.pool, &event).await?
+    {
+        return Ok(());
+    }
+
     let processed_duplicate =
         if event.kind == "invoice.paid" && billing.personal_coverage_ingest_enabled() {
             sqlx::query_scalar::<_, bool>(
@@ -3776,6 +7046,50 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         } else {
             false
         };
+    // Disabling setup stops new Checkout sessions, not settlement of sessions already created.
+    // Recovery must continue when either transfer intake or the setup route is switched off.
+    let transfer_setup = if event.kind == "checkout.session.completed"
+        && object_is_transfer_setup(&event.data.object)
+    {
+        let object = &event.data.object;
+        let transfer_id = transfer_setup_transfer_id(object)
+            .ok_or_else(|| Error::BadRequest("malformed transfer setup session".into()))?;
+        let session_id = object["id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::BadRequest("transfer setup session has no id".into()))?;
+        let customer_id = object["customer"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::BadRequest("transfer setup session has no customer".into()))?;
+        let setup_intent_id = object["setup_intent"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::BadRequest("transfer setup session has no SetupIntent".into()))?;
+        let setup_intent = billing
+            .provider
+            .get_transfer_setup_intent(setup_intent_id)
+            .await
+            .map_err(ProviderError::into_error)?;
+        if setup_intent.transfer_id != transfer_id
+            || setup_intent.setup_intent_id != setup_intent_id
+            || setup_intent.customer_id != customer_id
+            || setup_intent.status != "succeeded"
+            || !setup_intent.off_session
+        {
+            return Err(Error::Conflict(
+                "transfer payment setup evidence does not match the session".into(),
+            ));
+        }
+        Some(VerifiedTransferSetup {
+            transfer_id: transfer_id.to_string(),
+            customer_id: customer_id.to_string(),
+            session_id: session_id.to_string(),
+            setup_intent_id: setup_intent_id.to_string(),
+        })
+    } else {
+        None
+    };
     let accepted_failure_duplicate =
         if event.kind == "invoice.payment_failed" && billing.personal_coverage_ingest_enabled() {
             if let Some((coverage, _)) = billing.personal_coverage() {
@@ -3811,11 +7125,29 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     } else {
         (None, None)
     };
+    let mut sponsored_rejection = None;
+    // A transfer destination subscription may not yet be linked to the personal account. Do not
+    // persist that association from webhook metadata alone: wait until the invoice and its
+    // payment have been read back from Stripe and their period, price and binding all agree.
+    if let Some(coverage) = personal_coverage.as_ref() {
+        if let Some(transfer_id) = coverage.transfer_id.as_deref() {
+            link_prepared_personal_transfer_invoice(&state.pool, coverage, transfer_id).await?;
+        }
+    }
     let personal_renewal_failure = if event.kind == "invoice.payment_failed"
         && billing.personal_coverage_ingest_enabled()
         && !accepted_failure_duplicate
     {
         prepare_signed_personal_renewal_failure(&state.pool, billing, &body, signature, now).await?
+    } else {
+        None
+    };
+    let sponsored_renewal_failure = if event.kind == "invoice.payment_failed"
+        && billing.personal_coverage_ingest_enabled()
+        && sponsored_billing_enabled()
+        && !accepted_failure_duplicate
+    {
+        Some(prepare_sponsored_renewal_failure(&state.pool, billing, &body, &event).await?)
     } else {
         None
     };
@@ -3868,8 +7200,14 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         None
     };
     if disposition == EventDisposition::Reconcile {
-        if is_sponsored_checkout_expired_event(&event) {
+        if is_checkout_expired_event(&event) {
             sponsored_checkout_expired(&mut tx, object).await?;
+            mark_webhook_event_processed(&mut tx, &event.id).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+        if let Some(setup) = transfer_setup.as_ref() {
+            accept_transfer_setup(&mut tx, setup).await?;
             mark_webhook_event_processed(&mut tx, &event.id).await?;
             tx.commit().await?;
             return Ok(());
@@ -3896,9 +7234,17 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         }
         if let Some(failure) = personal_renewal_failure.as_ref() {
             accept_prepared_personal_renewal_failure(&mut tx, failure).await?;
-            if let Some(subscription_id) = subscription_id {
-                update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
-            }
+            mark_webhook_event_processed(&mut tx, &event.id).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+        if let Some(failure) = sponsored_renewal_failure.as_ref() {
+            apply_sponsored_renewal_failure(
+                &mut tx,
+                failure,
+                crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::SignedWebhook,
+            )
+            .await?;
             mark_webhook_event_processed(&mut tx, &event.id).await?;
             tx.commit().await?;
             return Ok(());
@@ -3929,6 +7275,18 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
         return Ok(());
     }
 
+    if matches!(disposition, EventDisposition::Apply) {
+        if let Some(setup) = transfer_setup.as_ref() {
+            accept_transfer_setup(&mut tx, setup).await?;
+            if let Some(subscription_id) = subscription_id.as_deref() {
+                update_subscription_watermark(&mut tx, &event, subscription_id).await?;
+            }
+            mark_webhook_event_processed(&mut tx, &event.id).await?;
+            tx.commit().await?;
+            return Ok(());
+        }
+    }
+
     match disposition {
         EventDisposition::Apply => match event.kind.as_str() {
             "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
@@ -3946,7 +7304,7 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             "customer.subscription.updated" => subscription_updated(&mut tx, object).await?,
             "customer.subscription.deleted" => subscription_deleted(&mut tx, object).await?,
             "invoice.paid" => {
-                invoice_paid(
+                sponsored_rejection = invoice_paid(
                     &mut tx,
                     object,
                     event.created,
@@ -3961,14 +7319,67 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
                         &coverage.context,
                         &coverage.event,
                         &coverage.allocation,
+                        coverage.previous_provider_item_id.as_deref(),
+                        coverage.provider_item_rebind_allowed,
                         true,
                     )
                     .await?;
+                    record_transfer_invoice_payment(
+                        &mut tx,
+                        &coverage.operation_id,
+                        &coverage.allocation.beneficiary_id,
+                        TransferPayer::Personal,
+                        None,
+                        &coverage.offer,
+                        &coverage.allocation.provider_customer_id,
+                        subscription_id.as_deref().unwrap_or_default(),
+                        &coverage.payment_reference,
+                        coverage.period_start,
+                        coverage.period_end,
+                    )
+                    .await?;
+                }
+                if let Some(SponsoredInvoiceCoveragePreparation::Prepared(prepared)) =
+                    sponsored_coverage.as_ref()
+                {
+                    let customer_id = object
+                        .get("customer")
+                        .and_then(stripe_reference)
+                        .ok_or_else(|| {
+                            Error::Config("paid sponsored invoice has no customer".into())
+                        })?;
+                    let subscription_id = invoice_subscription_id(object).ok_or_else(|| {
+                        Error::Config("paid sponsored invoice has no subscription".into())
+                    })?;
+                    for seat in &prepared.seats {
+                        record_transfer_invoice_payment(
+                            &mut tx,
+                            &seat.operation_id,
+                            &seat.allocation.beneficiary_id,
+                            TransferPayer::Sponsor,
+                            Some(&prepared.organization_id),
+                            seat.offer.as_str(),
+                            &customer_id,
+                            subscription_id,
+                            &prepared.payment_reference,
+                            seat.period_start,
+                            seat.period_end,
+                        )
+                        .await?;
+                    }
                 }
             }
             "invoice.payment_failed" => {
                 if let Some(failure) = personal_renewal_failure.as_ref() {
                     accept_prepared_personal_renewal_failure(&mut tx, failure).await?;
+                }
+                if let Some(failure) = sponsored_renewal_failure.as_ref() {
+                    apply_sponsored_renewal_failure(
+                        &mut tx,
+                        failure,
+                        crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::SignedWebhook,
+                    )
+                    .await?;
                 }
             }
             _ => {}
@@ -3977,20 +7388,56 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
             return Err(Error::Config("invalid webhook disposition".into()));
         }
     }
-    if let Some(subscription_id) = subscription_id {
-        update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+    if event_updates_subscription_watermark(&event) {
+        if let Some(subscription_id) = subscription_id {
+            update_subscription_watermark(&mut tx, &event, &subscription_id).await?;
+        }
     }
     mark_webhook_event_processed(&mut tx, &event.id).await?;
     tx.commit().await?;
     if let Some(reason) = coverage_rejection {
+        if let Some((coverage, _)) = billing.personal_coverage() {
+            if let Err(error) = crate::cloud_operations::record_coverage_rejection(
+                &state.pool,
+                &coverage.account_id,
+                coverage.environment,
+                &event.id,
+                "personal",
+                reason,
+            )
+            .await
+            {
+                eprintln!(
+                    "error: failed to persist personal coverage rejection diagnostic: {error}"
+                );
+            }
+        }
         eprintln!(
             "error: accepted Stripe invoice event {} for billing without personal Cloud coverage: {}",
             event.id, reason
         );
     }
-    if let Some(SponsoredInvoiceCoveragePreparation::Rejected { reason, .. }) =
-        sponsored_coverage.as_ref()
-    {
+    let sponsored_rejection = sponsored_rejection.or(match sponsored_coverage.as_ref() {
+        Some(SponsoredInvoiceCoveragePreparation::Rejected { reason, .. }) => Some(*reason),
+        _ => None,
+    });
+    if let Some(reason) = sponsored_rejection {
+        if let Some((coverage, _)) = billing.personal_coverage() {
+            if let Err(error) = crate::cloud_operations::record_coverage_rejection(
+                &state.pool,
+                &coverage.account_id,
+                coverage.environment,
+                &event.id,
+                "sponsored",
+                reason,
+            )
+            .await
+            {
+                eprintln!(
+                    "error: failed to persist sponsored coverage rejection diagnostic: {error}"
+                );
+            }
+        }
         eprintln!(
             "error: accepted Stripe invoice event {} for billing without sponsored Cloud coverage: {}",
             event.id, reason
@@ -3999,9 +7446,181 @@ async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String
     Ok(())
 }
 
-/// Apply an Event retrieved from Stripe's authenticated Events API using the same settlement
-/// stores as signed webhooks. The sealed transport value remains distinct from webhook signature
-/// provenance; this function accepts only the invoice event types enumerated by the scanner.
+async fn link_prepared_personal_transfer_invoice(
+    pool: &PgPool,
+    coverage: &PreparedPersonalInvoiceCoverage,
+    transfer_id: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    founding_allocator::lock_capacity(&mut tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(&coverage.allocation.beneficiary_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(Error::NotFound("billing beneficiary not found".into()))?;
+    billing_transfers::link_personal_destination_subscription(
+        &mut tx,
+        transfer_id,
+        &coverage.allocation.beneficiary_id,
+        &coverage.operation_id,
+        &coverage.allocation.external_allocation_reference,
+        &coverage.allocation.provider_customer_id,
+        &coverage.allocation.subscription_id,
+        &coverage.offer,
+        coverage.period_start,
+    )
+    .await
+    .map_err(Error::from)?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_transfer_invoice_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    beneficiary_id: &str,
+    destination_kind: billing_transfers::TransferPayer,
+    destination_organization_id: Option<&str>,
+    offer: &str,
+    customer_id: &str,
+    subscription_id: &str,
+    payment_reference: &str,
+    period_start: i64,
+    period_end: i64,
+) -> Result<()> {
+    let restoration = sqlx::query(
+        "SELECT transfer_id, beneficiary_id, source_kind, source_organization_id, offer, state, \
+                source_restoration_provider_subscription_id, source_restoration_payment_reference, \
+                effective_from, (SELECT account.offer FROM billing_personal_accounts account \
+                  WHERE account.user_id = billing_transfer_intents.beneficiary_id \
+                    AND account.operation_id = billing_transfer_intents.source_restoration_operation_id \
+                    AND account.stripe_customer_id = $2 \
+                    AND account.stripe_subscription_id = billing_transfer_intents.source_restoration_provider_subscription_id) \
+                    AS account_offer \
+         FROM billing_transfer_intents WHERE source_restoration_operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .bind(customer_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = restoration {
+        let transfer_id: String = row.try_get("transfer_id")?;
+        let source_kind: String = row.try_get("source_kind")?;
+        let source_organization_id: Option<String> = row.try_get("source_organization_id")?;
+        let restored_subscription: Option<String> =
+            row.try_get("source_restoration_provider_subscription_id")?;
+        let recorded_payment: Option<String> =
+            row.try_get("source_restoration_payment_reference")?;
+        let state: String = row.try_get("state")?;
+        let effective_from: i64 = row.try_get("effective_from")?;
+        let restoration_offer: String = row.try_get("offer")?;
+        let account_offer: Option<String> = row.try_get("account_offer")?;
+        if row.try_get::<String, _>("beneficiary_id")? != beneficiary_id
+            || source_kind != destination_kind.as_str()
+            || source_organization_id.as_deref() != destination_organization_id
+            || account_offer.is_none()
+            || restored_subscription.as_deref() != Some(subscription_id)
+        {
+            return Err(Error::Conflict(
+                "paid invoice does not match its source restoration".into(),
+            ));
+        }
+        // The restoration operation id remains attached to the account after recovery. Only
+        // its first paid invoice is transfer evidence; later renewals belong to normal billing.
+        if recorded_payment.is_some()
+            || !matches!(state.as_str(), "source_restoration_pending" | "unknown")
+        {
+            return Ok(());
+        }
+        if restoration_offer != offer
+            || account_offer.as_deref() != Some(offer)
+            || period_start < effective_from
+            || period_end <= period_start
+        {
+            return Err(Error::Conflict(
+                "paid invoice does not match its source restoration".into(),
+            ));
+        }
+        billing_transfers::record_source_restoration_payment(
+            tx,
+            &transfer_id,
+            operation_id,
+            subscription_id,
+            payment_reference,
+        )
+        .await
+        .map_err(Error::from)?;
+        return Ok(());
+    }
+
+    let row = sqlx::query(
+        "SELECT transfer_id, beneficiary_id, destination_kind, destination_organization_id, \
+                destination_customer_id, destination_provider_subscription_id, offer, effective_from, \
+                state, destination_payment_reference \
+         FROM billing_transfer_intents WHERE destination_operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let transfer_id: String = row.try_get("transfer_id")?;
+    let stored_kind: String = row.try_get("destination_kind")?;
+    let stored_organization: Option<String> = row.try_get("destination_organization_id")?;
+    let stored_customer: Option<String> = row.try_get("destination_customer_id")?;
+    let stored_subscription: Option<String> =
+        row.try_get("destination_provider_subscription_id")?;
+    let effective_from: i64 = row.try_get("effective_from")?;
+    let state: String = row.try_get("state")?;
+    let recorded_payment: Option<String> = row.try_get("destination_payment_reference")?;
+    if row.try_get::<String, _>("beneficiary_id")? != beneficiary_id
+        || stored_kind != destination_kind.as_str()
+        || stored_organization.as_deref() != destination_organization_id
+        || stored_customer.as_deref() != Some(customer_id)
+        || stored_subscription.as_deref() != Some(subscription_id)
+    {
+        return Err(Error::Conflict(
+            "paid invoice does not match its payer transfer".into(),
+        ));
+    }
+    // Destination operation ids stay on the account/seat after the transfer completes. Do
+    // not reinterpret later renewals as transfer evidence or compare them to the boundary
+    // invoice's payment reference.
+    if recorded_payment.is_some()
+        || !matches!(
+            state.as_str(),
+            "destination_prepared" | "source_adjustment_pending" | "unknown"
+        )
+    {
+        return Ok(());
+    }
+    // An invoice for the paid term ending at the transfer boundary is still the source term.
+    // A period that overlaps or follows the boundary is relevant: record_destination_paid
+    // will park a wrong start/end for operator review instead of aborting invoice settlement.
+    if period_end <= effective_from {
+        return Ok(());
+    }
+    if row.try_get::<String, _>("offer")? != offer {
+        return Err(Error::Conflict(
+            "paid invoice does not match its payer transfer".into(),
+        ));
+    }
+    billing_transfers::record_destination_paid(
+        tx,
+        &transfer_id,
+        payment_reference,
+        period_start,
+        period_end,
+    )
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
 async fn repair_event_already_completed(
     pool: &sqlx::PgPool,
     account_id: &str,
@@ -4019,8 +7638,25 @@ async fn repair_event_already_completed(
         return Ok(false);
     }
     match event.kind.as_str() {
-        "invoice.paid" => Ok(sqlx::query_scalar(
-            "SELECT EXISTS( \
+        "invoice.paid" => {
+            // Billing may already be committed even though permanent coverage rejection left a
+            // durable diagnostic open. Let the authenticated repair path re-read that invoice and
+            // retry only coverage; never replay or roll back the paid billing transition.
+            let repairable: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM cloud_coverage_rejection_incidents \
+                 WHERE provider_account_id = $1 AND provider_environment = $2 \
+                   AND event_id = $3 AND state IN ('open','repairing'))",
+            )
+            .bind(account_id)
+            .bind(environment.as_str())
+            .bind(&event.id)
+            .fetch_one(pool)
+            .await?;
+            if !should_skip_processed_paid_invoice(true, repairable) {
+                return Ok(false);
+            }
+            Ok(sqlx::query_scalar(
+                "SELECT EXISTS( \
                  SELECT 1 FROM cloud_provider_event_receipts receipt \
                  WHERE receipt.provider_namespace = 'stripe' \
                    AND receipt.provider_account_id = $1 \
@@ -4028,12 +7664,13 @@ async fn repair_event_already_completed(
                    AND receipt.event_id = $3 \
                    AND receipt.status IN ('applied', 'rejected') \
              )",
-        )
-        .bind(account_id)
-        .bind(environment.as_str())
-        .bind(&event.id)
-        .fetch_one(pool)
-        .await?),
+            )
+            .bind(account_id)
+            .bind(environment.as_str())
+            .bind(&event.id)
+            .fetch_one(pool)
+            .await?)
+        }
         "invoice.payment_failed" => Ok(sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM cloud_provider_stripe_renewal_failures \
              WHERE provider_namespace = 'stripe' AND provider_account_id = $1 \
@@ -4046,6 +7683,10 @@ async fn repair_event_already_completed(
         .await?),
         _ => Ok(false),
     }
+}
+
+fn should_skip_processed_paid_invoice(processed: bool, coverage_repair_open: bool) -> bool {
+    processed && !coverage_repair_open
 }
 
 pub(crate) async fn repair_authenticated_stripe_event(
@@ -4083,6 +7724,23 @@ pub(crate) async fn repair_authenticated_stripe_event(
         return Ok(StripeEventRepairDisposition::AlreadyApplied);
     }
     if event.kind == "invoice.payment_failed" {
+        if sponsored_billing_enabled() {
+            let sponsored: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM billing_sponsored_subscriptions WHERE provider_subscription_id = $1)",
+            )
+            .bind(invoice_subscription_id_claim(&event.data.object).unwrap_or_default())
+            .fetch_one(pool)
+            .await?;
+            if sponsored {
+                return repair_authenticated_sponsored_renewal_failure(
+                    pool,
+                    billing,
+                    authenticated,
+                    &event,
+                )
+                .await;
+            }
+        }
         return repair_authenticated_personal_renewal_failure(
             pool,
             billing,
@@ -4146,20 +7804,43 @@ pub(crate) async fn repair_authenticated_stripe_event(
     prune_webhook_events(&mut tx).await?;
     let disposition = record_webhook_event(&mut tx, &event).await?;
     if disposition == EventDisposition::Ignore {
+        if let Some(sponsored) = sponsored_coverage.as_ref() {
+            let evidence = match sponsored {
+                SponsoredInvoiceCoveragePreparation::Prepared(prepared) => {
+                    Some((&prepared.context, &prepared.event))
+                }
+                SponsoredInvoiceCoveragePreparation::Rejected { context, event, .. } => {
+                    Some((context, event.as_ref()))
+                }
+                SponsoredInvoiceCoveragePreparation::NotApplicable => None,
+            };
+            if let Some((context, evidence)) = evidence {
+                reopen_rejected_event_for_repair(&mut tx, context, evidence)
+                    .await
+                    .map_err(|_| {
+                        Error::Internal("sponsored provider repair receipt changed".into())
+                    })?;
+            }
+        }
         if let Some(coverage) = &personal_coverage {
             accept_personal_invoice_coverage(
                 &mut tx,
                 &coverage.context,
                 &coverage.event,
                 &coverage.allocation,
+                coverage.previous_provider_item_id.as_deref(),
+                coverage.provider_item_rebind_allowed,
                 true,
             )
             .await?;
         }
+        let mut sponsored_rejection = None;
         if let Some(SponsoredInvoiceCoveragePreparation::Prepared(prepared)) =
             sponsored_coverage.as_ref()
         {
-            accept_sponsored_invoice_coverage(&mut tx, prepared).await?;
+            if !accept_sponsored_invoice_coverage(&mut tx, prepared).await? {
+                sponsored_rejection = Some("sponsored_invoice_no_eligible_seats");
+            }
         }
         if let Some(SponsoredInvoiceCoveragePreparation::Rejected {
             context,
@@ -4168,14 +7849,64 @@ pub(crate) async fn repair_authenticated_stripe_event(
         }) = sponsored_coverage.as_ref()
         {
             reject_sponsored_invoice_coverage(&mut tx, context, event, reason).await?;
+            sponsored_rejection = Some(*reason);
         }
         tx.commit().await?;
+        if (personal_coverage.is_some()
+            || matches!(
+                sponsored_coverage.as_ref(),
+                Some(SponsoredInvoiceCoveragePreparation::Prepared(_))
+            ))
+            && personal_rejection.is_none()
+            && sponsored_rejection.is_none()
+            && !matches!(
+                sponsored_coverage.as_ref(),
+                Some(SponsoredInvoiceCoveragePreparation::Rejected { .. })
+            )
+        {
+            if let Err(error) = crate::cloud_operations::resolve_coverage_rejections(
+                pool,
+                authenticated.account_id(),
+                authenticated.environment(),
+                authenticated.event_id(),
+            )
+            .await
+            {
+                eprintln!("error: failed to resolve coverage rejection diagnostic: {error}");
+            }
+        }
         if let Some(reason) = personal_rejection {
+            if let Err(error) = crate::cloud_operations::record_coverage_rejection(
+                pool,
+                authenticated.account_id(),
+                authenticated.environment(),
+                authenticated.event_id(),
+                "personal",
+                reason,
+            )
+            .await
+            {
+                eprintln!(
+                    "error: failed to persist personal coverage rejection diagnostic: {error}"
+                );
+            }
             return Ok(StripeEventRepairDisposition::Rejected(reason));
         }
-        if let Some(SponsoredInvoiceCoveragePreparation::Rejected { reason, .. }) =
-            sponsored_coverage.as_ref()
-        {
+        if let Some(reason) = sponsored_rejection {
+            if let Err(error) = crate::cloud_operations::record_coverage_rejection(
+                pool,
+                authenticated.account_id(),
+                authenticated.environment(),
+                authenticated.event_id(),
+                "sponsored",
+                reason,
+            )
+            .await
+            {
+                eprintln!(
+                    "error: failed to persist sponsored coverage rejection diagnostic: {error}"
+                );
+            }
             return Ok(StripeEventRepairDisposition::Rejected(reason));
         }
         if personal_coverage.is_some()
@@ -4193,7 +7924,7 @@ pub(crate) async fn repair_authenticated_stripe_event(
             "authenticated invoice event has an invalid disposition".into(),
         ));
     }
-    invoice_paid(
+    let sponsored_rejection = invoice_paid(
         &mut tx,
         &event.data.object,
         event.created,
@@ -4208,6 +7939,8 @@ pub(crate) async fn repair_authenticated_stripe_event(
             &coverage.context,
             &coverage.event,
             &coverage.allocation,
+            coverage.previous_provider_item_id.as_deref(),
+            coverage.provider_item_rebind_allowed,
             true,
         )
         .await?;
@@ -4215,18 +7948,61 @@ pub(crate) async fn repair_authenticated_stripe_event(
     complete_repaired_invoice_event(&mut tx, &event).await?;
     tx.commit().await?;
 
+    if (personal_coverage.is_some()
+        || matches!(
+            sponsored_coverage.as_ref(),
+            Some(SponsoredInvoiceCoveragePreparation::Prepared(_))
+        ))
+        && personal_rejection.is_none()
+        && sponsored_rejection.is_none()
+        && !matches!(
+            sponsored_coverage.as_ref(),
+            Some(SponsoredInvoiceCoveragePreparation::Rejected { .. })
+        )
+    {
+        if let Err(error) = crate::cloud_operations::resolve_coverage_rejections(
+            pool,
+            authenticated.account_id(),
+            authenticated.environment(),
+            authenticated.event_id(),
+        )
+        .await
+        {
+            eprintln!("error: failed to resolve coverage rejection diagnostic: {error}");
+        }
+    }
+
     if let Some(reason) = personal_rejection {
+        if let Err(error) = crate::cloud_operations::record_coverage_rejection(
+            pool,
+            authenticated.account_id(),
+            authenticated.environment(),
+            authenticated.event_id(),
+            "personal",
+            reason,
+        )
+        .await
+        {
+            eprintln!("error: failed to persist personal coverage rejection diagnostic: {error}");
+        }
         eprintln!(
             "error: repaired Stripe invoice settled without personal Cloud coverage: {reason}"
         );
         return Ok(StripeEventRepairDisposition::Rejected(reason));
     }
-    if let Some(SponsoredInvoiceCoveragePreparation::Rejected { reason, .. }) =
-        sponsored_coverage.as_ref()
-    {
-        eprintln!(
-            "error: repaired Stripe invoice settled without sponsored Cloud coverage: {reason}"
-        );
+    if let Some(reason) = sponsored_rejection {
+        if let Err(error) = crate::cloud_operations::record_coverage_rejection(
+            pool,
+            authenticated.account_id(),
+            authenticated.environment(),
+            authenticated.event_id(),
+            "sponsored",
+            reason,
+        )
+        .await
+        {
+            eprintln!("error: failed to persist sponsored coverage rejection diagnostic: {error}");
+        }
         return Ok(StripeEventRepairDisposition::Rejected(reason));
     }
     Ok(StripeEventRepairDisposition::Applied)
@@ -4369,6 +8145,19 @@ async fn repair_authenticated_personal_renewal_failure(
             ));
         }
     };
+    let failure_invoice_is_open = stripe
+        .personal_renewal_failure_invoice_is_open_and_unpaid(
+            &mut session,
+            candidate.invoice_id(),
+            &binding,
+        )
+        .await
+        .map_err(|_| Error::Internal("Stripe failed invoice detail read failed".into()))?;
+    if !failure_invoice_is_open {
+        return Ok(StripeEventRepairDisposition::Unresolved(
+            "renewal_invoice_not_open_or_unpaid",
+        ));
+    }
     let linked = crate::cloud_provider_stripe_renewals::link_repaired_candidate(
         &candidate,
         coverage_config,
@@ -4414,11 +8203,12 @@ async fn repair_authenticated_personal_renewal_failure(
         subscription_id,
     )
     .await?;
-    crate::cloud_provider_stripe_renewal_store::accept_personal_renewal_failure(
+    crate::cloud_provider_stripe_renewal_store::accept_personal_renewal_failure_with_provenance(
         &mut tx,
         &context,
         &allocation,
         &evidence,
+        crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::AuthenticatedApiRead,
         true,
     )
     .await
@@ -4428,12 +8218,54 @@ async fn repair_authenticated_personal_renewal_failure(
     Ok(StripeEventRepairDisposition::Applied)
 }
 
+async fn repair_authenticated_sponsored_renewal_failure(
+    pool: &PgPool,
+    billing: &BillingState,
+    authenticated: &AuthenticatedStripeEvent,
+    event: &Event,
+) -> Result<StripeEventRepairDisposition> {
+    let raw_event = serde_json::to_string(authenticated.payload())
+        .map_err(|_| Error::BadRequest("malformed authenticated Stripe event".into()))?;
+    let prepared = prepare_sponsored_renewal_failure(pool, billing, &raw_event, event).await?;
+    if matches!(&prepared, SponsoredRenewalFailurePreparation::NotApplicable) {
+        return Ok(StripeEventRepairDisposition::Unrelated);
+    }
+    let rejection = match &prepared {
+        SponsoredRenewalFailurePreparation::Rejected { reason, .. } => Some(*reason),
+        _ => None,
+    };
+    let subscription_id = invoice_subscription_id_claim(&event.data.object);
+    let mut tx = pool.begin().await?;
+    if let Some(subscription_id) = subscription_id.as_deref() {
+        lock_subscription(&mut tx, subscription_id).await?;
+    }
+    record_webhook_receipt(&mut tx, event, subscription_id.as_deref()).await?;
+    apply_sponsored_renewal_failure(
+        &mut tx,
+        &prepared,
+        crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::AuthenticatedApiRead,
+    )
+    .await?;
+    mark_webhook_event_processed(&mut tx, &event.id).await?;
+    tx.commit().await?;
+    Ok(rejection.map_or(
+        StripeEventRepairDisposition::Applied,
+        StripeEventRepairDisposition::Rejected,
+    ))
+}
+
 struct PreparedPersonalInvoiceCoverage {
     context: ProviderContext,
     event: crate::cloud_provider::VerifiedProviderEvent,
     allocation: VerifiedAllocation,
+    operation_id: String,
+    transfer_id: Option<String>,
+    offer: String,
     payment_reference: String,
+    period_start: i64,
     period_end: i64,
+    previous_provider_item_id: Option<String>,
+    provider_item_rebind_allowed: bool,
 }
 
 enum PersonalInvoiceCoveragePreparation {
@@ -4451,6 +8283,63 @@ struct PreparedPersonalRenewalFailure {
     context: ProviderContext,
     allocation: VerifiedAllocation,
     evidence: crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence,
+    previous_provider_item_id: Option<String>,
+    provider_item_rebind_allowed: bool,
+}
+
+struct PreparedSponsoredRenewalFailure {
+    context: ProviderContext,
+    event: crate::cloud_provider::VerifiedProviderEvent,
+    organization_id: String,
+    subscription_id: String,
+    invoice_id: String,
+    affected: Vec<(
+        VerifiedAllocation,
+        crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence,
+    )>,
+}
+
+enum SponsoredRenewalFailurePreparation {
+    NotApplicable,
+    Prepared(Box<PreparedSponsoredRenewalFailure>),
+    Rejected {
+        context: ProviderContext,
+        event: Box<crate::cloud_provider::VerifiedProviderEvent>,
+        organization_id: String,
+        subscription_id: String,
+        invoice_id: String,
+        period_start: i64,
+        reason: &'static str,
+    },
+}
+
+struct SponsoredFailurePredecessor {
+    settlement: crate::cloud_provider_stripe_sponsored::SponsoredInvoiceSettlement,
+    manifest: SponsoredAllocationManifest,
+}
+
+fn sponsored_invoice_lines_can_be_predecessors(
+    predecessor_lines: &[crate::cloud_provider_stripe_http::StripeInvoiceLineResource],
+    failed_lines: &[crate::cloud_provider_stripe_http::StripeInvoiceLineResource],
+) -> bool {
+    failed_lines.iter().any(|failed_line| {
+        let (Some(item_id), Some(price_id), Some(start)) = (
+            failed_line.subscription_item_id.as_deref(),
+            failed_line.price_id.as_deref(),
+            failed_line.period_start,
+        ) else {
+            return false;
+        };
+        predecessor_lines.iter().any(|line| {
+            (line
+                .subscription_item_id
+                .as_deref()
+                .or(line.legacy_subscription_item_id.as_deref())
+                == Some(item_id))
+                && line.price_id.as_deref() == Some(price_id)
+                && line.period_end == Some(start)
+        })
+    })
 }
 
 async fn prepare_signed_personal_renewal_failure(
@@ -4469,13 +8358,39 @@ async fn prepare_signed_personal_renewal_failure(
     let Some(allocation_reference) = invoice_allocation_reference_claim(invoice) else {
         return Ok(None);
     };
+    let Some(failed_line) = invoice
+        .get("lines")
+        .and_then(|lines| lines.get("data"))
+        .and_then(serde_json::Value::as_array)
+        .filter(|lines| lines.len() == 1)
+        .and_then(|lines| lines.first())
+    else {
+        return Ok(None);
+    };
+    let Some(event_item_id) = failed_line
+        .get("parent")
+        .and_then(|parent| parent.get("subscription_item_details"))
+        .and_then(|details| details.get("subscription_item"))
+        .and_then(stripe_reference)
+    else {
+        return Ok(None);
+    };
+    let Some(failed_period_start) = failed_line
+        .get("period")
+        .and_then(|period| period.get("start"))
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return Ok(None);
+    };
     let row = sqlx::query(
         "SELECT allocation.allocation_id, allocation.payer_id, allocation.beneficiary_id, \
                 allocation.provider_subscription_id, allocation.provider_item_id, \
                 allocation.external_allocation_reference, allocation.coverage_source_id, \
                 allocation.effective_from, allocation.effective_until, allocation.state, \
                 allocation.ownership_evidence_reference, allocation.provider_account_id, \
-                allocation.provider_environment, payer.provider_customer_id, payer.payer_kind \
+                allocation.provider_environment, payer.provider_customer_id, payer.payer_kind, \
+                (SELECT paid_through_epoch FROM billing_personal_accounts \
+                 WHERE user_id = allocation.beneficiary_id) AS personal_paid_through_epoch \
          FROM cloud_provider_allocations AS allocation \
          JOIN cloud_provider_payers AS payer ON payer.payer_id = allocation.payer_id \
          WHERE allocation.provider_namespace = 'stripe' \
@@ -4495,12 +8410,19 @@ async fn prepare_signed_personal_renewal_failure(
     }
     let customer_id: String = row.try_get("provider_customer_id")?;
     let subscription_id: String = row.try_get("provider_subscription_id")?;
-    let provider_item_id: String = row.try_get("provider_item_id")?;
+    let previous_provider_item_id: String = row.try_get("provider_item_id")?;
+    let item_changed = previous_provider_item_id != event_item_id;
+    let provider_item_rebind_allowed = item_changed
+        && row.try_get::<Option<i64>, _>("personal_paid_through_epoch")?
+            == Some(failed_period_start);
+    if item_changed && !provider_item_rebind_allowed {
+        return Ok(None);
+    }
     let binding = StripeAllocationBinding::new(
         allocation_reference,
         customer_id.clone(),
         subscription_id.clone(),
-        provider_item_id.clone(),
+        event_item_id.clone(),
         ProviderPayerKind::Personal,
     )
     .map_err(|_| Error::Internal("stored Stripe allocation binding is invalid".into()))?;
@@ -4511,7 +8433,7 @@ async fn prepare_signed_personal_renewal_failure(
         ProviderPayerKind::Personal,
         row.try_get::<String, _>("beneficiary_id")?,
         subscription_id.clone(),
-        provider_item_id,
+        event_item_id,
         row.try_get::<String, _>("external_allocation_reference")?,
         row.try_get::<String, _>("coverage_source_id")?,
         row.try_get::<i64, _>("effective_from")?,
@@ -4527,6 +8449,9 @@ async fn prepare_signed_personal_renewal_failure(
     }
 
     let mut session = stripe.session();
+    let Some(invoice_id) = invoice.get("id").and_then(stripe_reference) else {
+        return Ok(None);
+    };
     let history = match stripe
         .personal_invoice_history(&mut session, &binding)
         .await
@@ -4539,6 +8464,13 @@ async fn prepare_signed_personal_renewal_failure(
             return Ok(None);
         }
     };
+    let failure_invoice_is_open = stripe
+        .personal_renewal_failure_invoice_is_open_and_unpaid(&mut session, &invoice_id, &binding)
+        .await
+        .map_err(|_| Error::Internal("Stripe failed invoice detail read failed".into()))?;
+    if !failure_invoice_is_open {
+        return Ok(None);
+    }
     let result = crate::cloud_provider_stripe_renewals::decode_personal_renewal_failure(
         raw_event.as_bytes(),
         signature,
@@ -4569,6 +8501,8 @@ async fn prepare_signed_personal_renewal_failure(
         context,
         allocation,
         evidence,
+        previous_provider_item_id: item_changed.then_some(previous_provider_item_id),
+        provider_item_rebind_allowed,
     }))
 }
 
@@ -4576,6 +8510,26 @@ async fn accept_prepared_personal_renewal_failure(
     tx: &mut Transaction<'_, Postgres>,
     failure: &PreparedPersonalRenewalFailure,
 ) -> Result<()> {
+    if failure.provider_item_rebind_allowed {
+        let previous_item_id = failure
+            .previous_provider_item_id
+            .as_deref()
+            .ok_or_else(|| {
+                Error::Internal(
+                    "personal renewal item transition lacks its previous binding".into(),
+                )
+            })?;
+        crate::cloud_provider::rebind_personal_allocation_item(
+            tx,
+            &failure.context,
+            &failure.allocation,
+            previous_item_id,
+        )
+        .await
+        .map_err(|_| {
+            Error::Internal("personal renewal item binding could not be advanced".into())
+        })?;
+    }
     crate::cloud_provider_stripe_renewal_store::accept_personal_renewal_failure(
         tx,
         &failure.context,
@@ -4588,6 +8542,639 @@ async fn accept_prepared_personal_renewal_failure(
     Ok(())
 }
 
+/// Read and link one grouped sponsor failure before opening the webhook transaction. Stripe reads
+/// are bounded and all local manifests are loaded independently, so no database lock is held
+/// across the network boundary. An incomplete historical chain is retained as a fixed rejection
+/// outcome rather than a partial set of beneficiary evidence.
+async fn prepare_sponsored_renewal_failure(
+    pool: &PgPool,
+    billing: &BillingState,
+    raw_event: &str,
+    event: &Event,
+) -> Result<SponsoredRenewalFailurePreparation> {
+    let Some((personal_config, stripe)) = billing.personal_coverage() else {
+        return Ok(SponsoredRenewalFailurePreparation::NotApplicable);
+    };
+    let Some(catalogue) = billing.price_catalogue() else {
+        return Ok(SponsoredRenewalFailurePreparation::NotApplicable);
+    };
+    let invoice = &event.data.object;
+    let (Some(invoice_id), Some(subscription_id), Some(customer_id)) = (
+        invoice.get("id").and_then(stripe_reference),
+        invoice_subscription_id_claim(invoice),
+        invoice.get("customer").and_then(stripe_reference),
+    ) else {
+        return Ok(SponsoredRenewalFailurePreparation::NotApplicable);
+    };
+    let subscription = sqlx::query(
+        "SELECT organization_id, provider_customer_id FROM billing_sponsored_subscriptions \
+         WHERE provider_subscription_id = $1",
+    )
+    .bind(&subscription_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(subscription) = subscription else {
+        return Ok(SponsoredRenewalFailurePreparation::NotApplicable);
+    };
+    let organization_id: String = subscription.try_get("organization_id")?;
+    if subscription
+        .try_get::<Option<String>, _>("provider_customer_id")?
+        .as_deref()
+        != Some(customer_id.as_str())
+    {
+        let context = personal_config
+            .provider_context()
+            .map_err(|_| Error::Internal("Stripe provider context is invalid".into()))?;
+        let identity = sponsored_verified_event(event, raw_event, &subscription_id, &invoice_id)?;
+        return Ok(SponsoredRenewalFailurePreparation::Rejected {
+            context,
+            event: Box::new(identity),
+            organization_id,
+            subscription_id,
+            invoice_id,
+            period_start: invoice_period_start(invoice).unwrap_or(event.created),
+            reason: "sponsored_renewal_binding_mismatch",
+        });
+    }
+    let context = personal_config
+        .provider_context()
+        .map_err(|_| Error::Internal("Stripe provider context is invalid".into()))?;
+    let sponsored_config = SponsoredStripeCoverageConfig::new(
+        personal_config.account_id.clone(),
+        personal_config.environment,
+        catalogue.standard_monthly.clone(),
+        catalogue.standard_annual.clone(),
+        catalogue.founding_monthly.clone(),
+        catalogue.founding_annual.clone(),
+    )
+    .map_err(|_| Error::Internal("sponsored Stripe coverage prices are invalid".into()))?;
+
+    let mut session = stripe.session();
+    let failure_result = stripe
+        .sponsored_failure_invoice(&mut session, &invoice_id, &customer_id, &subscription_id)
+        .await;
+    let (failure_invoice, failed_lines) = match failure_result {
+        Ok(Some(result)) => result,
+        Ok(None) => return Ok(SponsoredRenewalFailurePreparation::NotApplicable),
+        Err(error) if error.is_evidence_rejection() => {
+            return Ok(SponsoredRenewalFailurePreparation::Rejected {
+                context,
+                event: Box::new(sponsored_verified_event(
+                    event,
+                    raw_event,
+                    &subscription_id,
+                    &invoice_id,
+                )?),
+                organization_id,
+                subscription_id,
+                invoice_id,
+                period_start: invoice_period_start(invoice).unwrap_or(event.created),
+                reason: "sponsored_renewal_invoice_unusable",
+            });
+        }
+        Err(_) => {
+            return Err(Error::Internal(
+                "sponsored renewal invoice read failed".into(),
+            ));
+        }
+    };
+    if failure_invoice.id != invoice_id || failed_lines.is_empty() {
+        return Err(Error::Internal(
+            "sponsored renewal invoice identity changed".into(),
+        ));
+    }
+    let invoices = stripe
+        .subscription_invoices_bounded(&mut session, &subscription_id, Some(&customer_id), 64)
+        .await
+        .map_err(|_| Error::Internal("sponsored renewal history read failed".into()))?;
+    let mut predecessors = Vec::new();
+    for paid_invoice in invoices
+        .iter()
+        .filter(|invoice| invoice.status.as_deref() == Some("paid"))
+    {
+        let predecessor_lines = if paid_invoice.lines_complete {
+            paid_invoice.line_summaries.clone()
+        } else {
+            match stripe.invoice_lines(&mut session, &paid_invoice.id).await {
+                Ok(lines) => lines,
+                Err(error) if error.is_evidence_rejection() => {
+                    return Ok(SponsoredRenewalFailurePreparation::Rejected {
+                        context,
+                        event: Box::new(sponsored_verified_event(
+                            event,
+                            raw_event,
+                            &subscription_id,
+                            &invoice_id,
+                        )?),
+                        organization_id,
+                        subscription_id: subscription_id.clone(),
+                        invoice_id,
+                        period_start: invoice_period_start(invoice).unwrap_or(event.created),
+                        reason: "sponsored_renewal_history_unusable",
+                    });
+                }
+                Err(_) => {
+                    return Err(Error::Internal(
+                        "sponsored renewal history read failed".into(),
+                    ));
+                }
+            }
+        };
+        let could_be_predecessor =
+            sponsored_invoice_lines_can_be_predecessors(&predecessor_lines, &failed_lines);
+        if !could_be_predecessor {
+            continue;
+        }
+        let settlement = match stripe
+            .sponsored_invoice_settlement(
+                &mut session,
+                &paid_invoice.id,
+                &customer_id,
+                &subscription_id,
+                &sponsored_config,
+            )
+            .await
+        {
+            Ok(settlement) => settlement,
+            Err(error) if error.is_evidence_rejection() => {
+                return Ok(SponsoredRenewalFailurePreparation::Rejected {
+                    context,
+                    event: Box::new(sponsored_verified_event(
+                        event,
+                        raw_event,
+                        &subscription_id,
+                        &invoice_id,
+                    )?),
+                    organization_id,
+                    subscription_id: subscription_id.clone(),
+                    invoice_id,
+                    period_start: invoice_period_start(invoice).unwrap_or(event.created),
+                    reason: "sponsored_renewal_history_unusable",
+                });
+            }
+            Err(_) => {
+                return Err(Error::Internal(
+                    "sponsored renewal settlement read failed".into(),
+                ));
+            }
+        };
+        let manifest =
+            match crate::cloud_provider_stripe_sponsored_store::load_sponsored_allocation_manifest(
+                pool,
+                &context,
+                &customer_id,
+                &subscription_id,
+                settlement.period_start(),
+                settlement.period_end(),
+                crate::cloud_provider_stripe_sponsored_store::SponsoredManifestLoadLimits::default(
+                ),
+            )
+            .await
+            {
+                Ok(manifest) => manifest,
+                Err(crate::cloud_provider_stripe_sponsored_store::SponsoredManifestLoadError::Database(_)) => {
+                    return Err(Error::Internal(
+                        "sponsored renewal manifest read failed".into(),
+                    ));
+                }
+                Err(_) => {
+                    return Ok(SponsoredRenewalFailurePreparation::Rejected {
+                        context,
+                        event: Box::new(sponsored_verified_event(
+                            event,
+                            raw_event,
+                            &subscription_id,
+                            &invoice_id,
+                        )?),
+                        organization_id,
+                        subscription_id: subscription_id.clone(),
+                        invoice_id,
+                        period_start: invoice_period_start(invoice).unwrap_or(event.created),
+                        reason: "sponsored_renewal_manifest_unusable",
+                    });
+                }
+            };
+        match compose_sponsored_coverage(&sponsored_config, &manifest, &settlement) {
+            Ok(SponsoredCoverageResult::Candidate(_)) => {
+                predecessors.push(SponsoredFailurePredecessor {
+                    settlement,
+                    manifest,
+                })
+            }
+            _ => {
+                return Ok(SponsoredRenewalFailurePreparation::Rejected {
+                    context,
+                    event: Box::new(sponsored_verified_event(
+                        event,
+                        raw_event,
+                        &subscription_id,
+                        &invoice_id,
+                    )?),
+                    organization_id,
+                    subscription_id: subscription_id.clone(),
+                    invoice_id,
+                    period_start: invoice_period_start(invoice).unwrap_or(event.created),
+                    reason: "sponsored_renewal_predecessor_unusable",
+                });
+            }
+        }
+    }
+
+    let mut affected = Vec::new();
+    let mut used = std::collections::BTreeSet::new();
+    let mut rejected_reason = None;
+    let mut notice_period_start = i64::MAX;
+    for failed_line in &failed_lines {
+        let (Some(item_id), Some(price_id), Some(start), Some(end), Some(line_id)) = (
+            failed_line.subscription_item_id.as_deref(),
+            failed_line.price_id.as_deref(),
+            failed_line.period_start,
+            failed_line.period_end,
+            Some(failed_line.id.as_str()),
+        ) else {
+            rejected_reason = Some("sponsored_renewal_line_incomplete");
+            break;
+        };
+        notice_period_start = notice_period_start.min(start);
+        let Some(interval) = sponsored_config.stripe_interval_for_price(price_id) else {
+            rejected_reason = Some("sponsored_renewal_price_unsupported");
+            break;
+        };
+        let matches = predecessors
+            .iter()
+            .filter(|predecessor| {
+                predecessor.settlement.lines().iter().any(|line| {
+                    line.provider_item_id() == item_id
+                        && line.price_id() == price_id
+                        && line.period_end() == start
+                })
+            })
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            rejected_reason = Some("sponsored_renewal_predecessor_missing_or_ambiguous");
+            break;
+        }
+        let predecessor = matches[0];
+        let predecessor_line = predecessor
+            .settlement
+            .lines()
+            .iter()
+            .find(|line| {
+                line.provider_item_id() == item_id
+                    && line.price_id() == price_id
+                    && line.period_end() == start
+            })
+            .expect("matched predecessor line exists");
+        let failure_manifest =
+            match crate::cloud_provider_stripe_sponsored_store::load_sponsored_allocation_manifest(
+                pool,
+                &context,
+                &customer_id,
+                &subscription_id,
+                start,
+                end,
+                crate::cloud_provider_stripe_sponsored_store::SponsoredManifestLoadLimits::default(
+                ),
+            )
+            .await
+            {
+                Ok(manifest) => manifest,
+                Err(crate::cloud_provider_stripe_sponsored_store::SponsoredManifestLoadError::Database(_)) => {
+                    return Err(Error::Internal(
+                        "sponsored renewal manifest read failed".into(),
+                    ));
+                }
+                Err(_) => {
+                    rejected_reason = Some("sponsored_renewal_manifest_unusable");
+                    break;
+                }
+            };
+        let continuing = failure_manifest
+            .allocations()
+            .iter()
+            .filter(|allocation| {
+                allocation.provider_item_id() == item_id
+                    && allocation.price_id() == price_id
+                    && allocation.effective_from() <= start
+                    && allocation
+                        .effective_until()
+                        .is_none_or(|until| until >= end)
+            })
+            .collect::<Vec<_>>();
+        if failed_line.quantity.is_none_or(|quantity| quantity <= 0)
+            || continuing.len() as i64 != failed_line.quantity.unwrap_or_default()
+        {
+            rejected_reason = Some("sponsored_renewal_quantity_mismatch");
+            break;
+        }
+        let predecessor_reference = sponsored_predecessor_evidence_reference(
+            &predecessor.manifest,
+            &predecessor.settlement,
+        );
+        for current in continuing {
+            let old = predecessor
+                .manifest
+                .allocations()
+                .iter()
+                .find(|allocation| {
+                    allocation.allocation_reference() == current.allocation_reference()
+                        && allocation.source_id() == current.source_id()
+                        && allocation.beneficiary_id() == current.beneficiary_id()
+                        && allocation.provider_item_id() == item_id
+                        && allocation.price_id() == price_id
+                        && allocation.effective_from() <= predecessor.settlement.period_start()
+                        && allocation
+                            .effective_until()
+                            .is_none_or(|until| until >= predecessor.settlement.period_end())
+                });
+            let Some(_) = old else { continue };
+            let allocation = match load_sponsored_failure_allocation(
+                pool,
+                &context,
+                &customer_id,
+                &subscription_id,
+                current.allocation_reference(),
+                current.source_id(),
+                current.beneficiary_id(),
+                item_id,
+            )
+            .await
+            {
+                Ok(Some(allocation)) => allocation,
+                Ok(None) => {
+                    rejected_reason = Some("sponsored_renewal_allocation_unusable");
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            if !used.insert((allocation.allocation_id.clone(), line_id.to_owned())) {
+                rejected_reason = Some("sponsored_renewal_line_ambiguous");
+                break;
+            }
+            let evidence = crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence::from_sponsored_parts(
+                &event.id,
+                &invoice_id,
+                line_id,
+                predecessor.settlement.invoice_id(),
+                &predecessor_reference,
+                &context.account_id,
+                context.environment,
+                current.allocation_reference(),
+                &customer_id,
+                &subscription_id,
+                item_id,
+                price_id,
+                predecessor_line.period_start(),
+                predecessor_line.period_end(),
+                start,
+                end,
+                event.created,
+                interval,
+            )
+            .map_err(|_| Error::Internal("sponsored renewal evidence is invalid".into()))?;
+            affected.push((allocation, evidence));
+            if affected.len() > 128 {
+                rejected_reason = Some("sponsored_renewal_scope_exceeded");
+                break;
+            }
+        }
+        if rejected_reason.is_some() {
+            break;
+        }
+    }
+    let period_start = if notice_period_start == i64::MAX {
+        invoice_period_start(invoice).unwrap_or(event.created)
+    } else {
+        notice_period_start
+    };
+    if let Some(reason) = rejected_reason.or_else(|| {
+        affected
+            .is_empty()
+            .then_some("sponsored_renewal_no_continuing_allocations")
+    }) {
+        return Ok(SponsoredRenewalFailurePreparation::Rejected {
+            context,
+            event: Box::new(sponsored_verified_event(
+                event,
+                raw_event,
+                &subscription_id,
+                &invoice_id,
+            )?),
+            organization_id,
+            subscription_id,
+            invoice_id,
+            period_start,
+            reason,
+        });
+    }
+    let verified_event = affected[0]
+        .1
+        .verified_event()
+        .map_err(|_| Error::Internal("sponsored renewal event identity is invalid".into()))?;
+    Ok(SponsoredRenewalFailurePreparation::Prepared(Box::new(
+        PreparedSponsoredRenewalFailure {
+            context,
+            event: verified_event,
+            organization_id,
+            subscription_id,
+            invoice_id,
+            affected,
+        },
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn load_sponsored_failure_allocation(
+    pool: &PgPool,
+    context: &ProviderContext,
+    customer_id: &str,
+    subscription_id: &str,
+    allocation_reference: &str,
+    source_id: &str,
+    beneficiary_id: &str,
+    item_id: &str,
+) -> Result<Option<VerifiedAllocation>> {
+    let row = sqlx::query(
+        "SELECT allocation.allocation_id, allocation.payer_id, allocation.beneficiary_id, \
+                allocation.provider_subscription_id, allocation.provider_item_id, \
+                allocation.external_allocation_reference, allocation.coverage_source_id, \
+                allocation.effective_from, allocation.effective_until, allocation.state, \
+                allocation.ownership_evidence_reference, allocation.provider_account_id, \
+                allocation.provider_environment, payer.provider_customer_id, payer.payer_kind \
+         FROM cloud_provider_allocations allocation \
+         JOIN cloud_provider_payers payer ON payer.payer_id = allocation.payer_id \
+         WHERE allocation.provider_namespace = $1 AND allocation.provider_account_id = $2 \
+           AND allocation.provider_environment = $3 \
+           AND allocation.provider_subscription_id = $4 AND allocation.provider_item_id = $5 \
+           AND allocation.external_allocation_reference = $6 \
+           AND allocation.coverage_source_id = $7 AND allocation.beneficiary_id = $8",
+    )
+    .bind(&context.namespace)
+    .bind(&context.account_id)
+    .bind(context.environment.as_str())
+    .bind(subscription_id)
+    .bind(item_id)
+    .bind(allocation_reference)
+    .bind(source_id)
+    .bind(beneficiary_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    if row.try_get::<String, _>("payer_kind")? != "sponsor"
+        || row.try_get::<String, _>("provider_customer_id")? != customer_id
+        || row.try_get::<String, _>("provider_account_id")? != context.account_id
+        || row.try_get::<String, _>("provider_environment")? != context.environment.as_str()
+    {
+        return Ok(None);
+    }
+    let allocation = VerifiedAllocation::new(
+        row.try_get::<String, _>("allocation_id")?,
+        row.try_get::<String, _>("payer_id")?,
+        customer_id.to_owned(),
+        ProviderPayerKind::Sponsor,
+        beneficiary_id.to_owned(),
+        subscription_id.to_owned(),
+        item_id.to_owned(),
+        allocation_reference.to_owned(),
+        source_id.to_owned(),
+        row.try_get::<i64, _>("effective_from")?,
+        row.try_get::<Option<i64>, _>("effective_until")?,
+        parse_allocation_state(&row.try_get::<String, _>("state")?)?,
+        row.try_get::<String, _>("ownership_evidence_reference")?,
+    )
+    .map_err(|_| Error::Internal("stored sponsored allocation is invalid".into()))?;
+    Ok(Some(allocation))
+}
+
+async fn apply_sponsored_renewal_failure(
+    tx: &mut Transaction<'_, Postgres>,
+    preparation: &SponsoredRenewalFailurePreparation,
+    provenance: crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance,
+) -> Result<()> {
+    // Callers hold the subscription advisory lock before reaching this point. A paid invoice may
+    // have committed after Stripe preparation observed the failed invoice as open; its durable
+    // processed receipt is authoritative and prevents late failure evidence from reviving it.
+    let paid_invoice = match preparation {
+        SponsoredRenewalFailurePreparation::Prepared(prepared) => {
+            Some((&prepared.subscription_id, &prepared.invoice_id))
+        }
+        SponsoredRenewalFailurePreparation::Rejected {
+            subscription_id,
+            invoice_id,
+            ..
+        } => Some((subscription_id, invoice_id)),
+        SponsoredRenewalFailurePreparation::NotApplicable => None,
+    };
+    if let Some((subscription_id, invoice_id)) = paid_invoice {
+        if sponsored_renewal_paid_receipt_exists(tx, subscription_id, invoice_id).await? {
+            return Ok(());
+        }
+    }
+    match preparation {
+        SponsoredRenewalFailurePreparation::NotApplicable => {}
+        SponsoredRenewalFailurePreparation::Prepared(prepared) => {
+            sqlx::query(
+                "UPDATE billing_sponsored_subscriptions SET status = 'past_due', updated_at = now() \
+                 WHERE organization_id = $1 AND provider_subscription_id = $2",
+            )
+            .bind(&prepared.organization_id)
+            .bind(&prepared.subscription_id)
+            .execute(&mut **tx)
+            .await?;
+            for (allocation, evidence) in &prepared.affected {
+                crate::cloud_provider_stripe_renewal_store::accept_sponsored_renewal_failure(
+                    tx,
+                    &prepared.context,
+                    allocation,
+                    evidence,
+                    &prepared.event,
+                    provenance,
+                    true,
+                )
+                .await
+                .map_err(|_| {
+                    Error::Internal("sponsored renewal evidence could not be recorded".into())
+                })?;
+                enqueue_sponsored_renewal_failure_notices(
+                    tx,
+                    &prepared.organization_id,
+                    &prepared.invoice_id,
+                    &allocation.beneficiary_id,
+                    evidence.predecessor_period_end(),
+                    false,
+                )
+                .await?;
+            }
+            let period_start = prepared
+                .affected
+                .first()
+                .map(|(_, evidence)| evidence.predecessor_period_end())
+                .ok_or_else(|| Error::Internal("sponsored renewal has no affected seats".into()))?;
+            enqueue_sponsored_renewal_failure_notices(
+                tx,
+                &prepared.organization_id,
+                &prepared.invoice_id,
+                "",
+                period_start,
+                true,
+            )
+            .await?;
+        }
+        SponsoredRenewalFailurePreparation::Rejected {
+            context,
+            event,
+            organization_id,
+            subscription_id,
+            invoice_id,
+            period_start,
+            reason,
+        } => {
+            reject_verified_event(tx, context, event, reason)
+                .await
+                .map_err(|_| {
+                    Error::Internal("sponsored renewal rejection could not be recorded".into())
+                })?;
+            sqlx::query(
+                "UPDATE billing_sponsored_subscriptions SET status = 'past_due', updated_at = now() \
+                 WHERE organization_id = $1 AND provider_subscription_id = $2",
+            )
+            .bind(organization_id)
+            .bind(subscription_id)
+            .execute(&mut **tx)
+            .await?;
+            enqueue_sponsored_renewal_failure_notices(
+                tx,
+                organization_id,
+                invoice_id,
+                "",
+                *period_start,
+                true,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn sponsored_renewal_paid_receipt_exists(
+    tx: &mut Transaction<'_, Postgres>,
+    subscription_id: &str,
+    invoice_id: &str,
+) -> Result<bool> {
+    if subscription_id.is_empty() || invoice_id.trim().is_empty() {
+        return Ok(false);
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM stripe_webhook_events \
+         WHERE event_type = 'invoice.paid' AND subscription_id = $1 \
+           AND provider_object_id = $2 AND processed_at IS NOT NULL)",
+    )
+    .bind(subscription_id)
+    .bind(invoice_id)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
 struct PreparedSponsoredInvoiceSeat {
     seat_id: String,
     operation_id: String,
@@ -4595,6 +9182,8 @@ struct PreparedSponsoredInvoiceSeat {
     registered_offer: BillingOffer,
     provider_item_id: String,
     price_id: String,
+    period_start: i64,
+    period_end: i64,
     desired_effective_until: Option<i64>,
     ending_evidence_reference: String,
     allocation: VerifiedAllocation,
@@ -4603,6 +9192,9 @@ struct PreparedSponsoredInvoiceSeat {
 struct PreparedSponsoredInvoiceCoverage {
     context: ProviderContext,
     event: crate::cloud_provider::VerifiedProviderEvent,
+    organization_id: String,
+    invoice_id: String,
+    payment_reference: String,
     seats: Vec<PreparedSponsoredInvoiceSeat>,
 }
 
@@ -4732,6 +9324,7 @@ async fn prepare_sponsored_invoice_coverage(
             ));
         }
     };
+    let payment_reference = settlement.payment_intent_id().to_owned();
     let event = sponsored_verified_event(event, raw_event, &subscription_id, &invoice_id)?;
     let seats = sqlx::query(
         "SELECT seat.seat_id, seat.beneficiary_id, seat.offer, award.offer AS founding_offer, \
@@ -4925,6 +9518,8 @@ async fn prepare_sponsored_invoice_coverage(
                 registered_offer: stored_offer,
                 provider_item_id: line.provider_item_id().to_owned(),
                 price_id: line.price_id().to_owned(),
+                period_start: line.period_start(),
+                period_end: line.period_end(),
                 desired_effective_until,
                 ending_evidence_reference,
                 allocation,
@@ -4975,6 +9570,9 @@ async fn prepare_sponsored_invoice_coverage(
         PreparedSponsoredInvoiceCoverage {
             context,
             event,
+            organization_id,
+            invoice_id,
+            payment_reference,
             seats: prepared_seats,
         },
     )))
@@ -5071,6 +9669,7 @@ async fn prepare_personal_invoice_coverage(
     let row = sqlx::query(
         "SELECT user_id, operation_id, allocation_reference, stripe_coverage_binding_required, \
                 offer, stripe_customer_id, \
+                paid_through_epoch, \
                 (SELECT offer FROM billing_founding_awards \
                  WHERE beneficiary_id = billing_personal_accounts.user_id) AS founding_offer, \
                 (SELECT original_end_epoch FROM billing_founding_awards \
@@ -5107,16 +9706,52 @@ async fn prepare_personal_invoice_coverage(
         .map(parse_founding_offer)
         .transpose()?;
     let founding_end_epoch: Option<i64> = row.try_get("founding_end_epoch")?;
+    let account_paid_through_epoch: Option<i64> = row.try_get("paid_through_epoch")?;
     let Some(customer_id) = row.try_get::<Option<String>, _>("stripe_customer_id")? else {
         return Err(Error::Internal(
             "personal invoice checkout is not yet linked".into(),
         ));
     };
-    let Some(subscription_id) = row.try_get::<Option<String>, _>("stripe_subscription_id")? else {
-        return Err(Error::Internal(
-            "personal invoice checkout is not yet linked".into(),
+    let invoice_subscription_id = subscription_claim
+        .as_deref()
+        .ok_or_else(|| Error::Config("personal invoice has no subscription binding".into()))?;
+    let claimed_transfer_id = invoice_metadata_claim(invoice, "sotto_transfer_id");
+    let stored_subscription_id: Option<String> = row.try_get("stripe_subscription_id")?;
+    let transfer_link_id = if stored_subscription_id.as_deref() == Some(invoice_subscription_id) {
+        None
+    } else if stored_subscription_id.is_none() {
+        let Some(transfer_id) = claimed_transfer_id else {
+            return Err(Error::Internal(
+                "personal invoice checkout is not yet linked".into(),
+            ));
+        };
+        let transfer_matches: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM billing_transfer_intents \
+             WHERE transfer_id = $1 AND beneficiary_id = $2 AND destination_kind = 'personal' \
+               AND destination_operation_id = $3 AND destination_customer_id = $4 \
+               AND destination_provider_subscription_id = $5 \
+               AND state IN ('destination_prepared','destination_paid', \
+                             'source_adjustment_pending','completed','unknown'))",
+        )
+        .bind(transfer_id)
+        .bind(&user_id)
+        .bind(&operation_id)
+        .bind(&customer_id)
+        .bind(invoice_subscription_id)
+        .fetch_one(pool)
+        .await?;
+        if !transfer_matches || operation_id != format!("{transfer_id}:destination") {
+            return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+                "invoice_binding_mismatch",
+            ));
+        }
+        Some(transfer_id.to_string())
+    } else {
+        return Ok(PersonalInvoiceCoveragePreparation::Rejected(
+            "invoice_binding_mismatch",
         ));
     };
+    let subscription_id = invoice_subscription_id.to_string();
     if stored_reference != allocation_reference
         || invoice_metadata_claim(invoice, "personal_user_id").is_some_and(|claim| claim != user_id)
         || invoice_metadata_claim(invoice, "operation_id")
@@ -5218,21 +9853,25 @@ async fn prepare_personal_invoice_coverage(
         }
     };
     let decoded = match source {
-        PersonalInvoiceEventSource::Signed { signature, now } => decode_paid_invoice(
-            raw_event.as_bytes(),
-            signature,
-            &billing.webhook_secret,
-            now,
-            coverage_config,
-            &binding,
-            &settlement,
-        ),
+        PersonalInvoiceEventSource::Signed { signature, now } => {
+            decode_paid_invoice_with_observation(
+                raw_event.as_bytes(),
+                signature,
+                &billing.webhook_secret,
+                now,
+                coverage_config,
+                &binding,
+                &settlement,
+                &observation,
+            )
+        }
         PersonalInvoiceEventSource::AuthenticatedRead(event) => {
-            decode_paid_invoice_from_authenticated_read(
+            decode_paid_invoice_from_authenticated_read_with_observation(
                 event,
                 coverage_config,
                 &binding,
                 &settlement,
+                &observation,
             )
         }
     };
@@ -5371,6 +10010,14 @@ async fn prepare_personal_invoice_coverage(
             ));
         }
     };
+    let previous_provider_item_id = stored
+        .as_ref()
+        .map(|row| row.try_get::<String, _>("provider_item_id"))
+        .transpose()?;
+    let provider_item_rebind_allowed = previous_provider_item_id
+        .as_deref()
+        .is_some_and(|previous| previous != allocation.provider_item_id)
+        && account_paid_through_epoch == Some(evidence.period_start);
     if stored.as_ref().is_some_and(|row| {
         row.try_get::<String, _>("beneficiary_id").ok().as_deref()
             != Some(allocation.beneficiary_id.as_str())
@@ -5384,8 +10031,9 @@ async fn prepare_personal_invoice_coverage(
                 .ok()
                 .as_deref()
                 != Some(allocation.subscription_id.as_str())
-            || row.try_get::<String, _>("provider_item_id").ok().as_deref()
+            || (row.try_get::<String, _>("provider_item_id").ok().as_deref()
                 != Some(allocation.provider_item_id.as_str())
+                && !provider_item_rebind_allowed)
             || row.try_get::<String, _>("payer_kind").ok().as_deref() != Some("personal")
             || row
                 .try_get::<String, _>("provider_account_id")
@@ -5407,8 +10055,14 @@ async fn prepare_personal_invoice_coverage(
             context,
             event: evidence.event,
             allocation,
+            operation_id,
+            transfer_id: transfer_link_id,
+            offer,
             payment_reference: evidence.payment_intent_id,
+            period_start: evidence.period_start,
             period_end: evidence.period_end,
+            previous_provider_item_id,
+            provider_item_rebind_allowed,
         },
     )))
 }
@@ -5429,11 +10083,28 @@ async fn accept_personal_invoice_coverage(
     context: &ProviderContext,
     event: &crate::cloud_provider::VerifiedProviderEvent,
     allocation: &VerifiedAllocation,
+    previous_provider_item_id: Option<&str>,
+    provider_item_rebind_allowed: bool,
     ingest_enabled: bool,
 ) -> Result<()> {
     record_verified_event(tx, context, event)
         .await
         .map_err(|_| Error::Internal("personal provider event receipt failed".into()))?;
+    if provider_item_rebind_allowed {
+        let previous_item_id = previous_provider_item_id.ok_or_else(|| {
+            Error::Internal("personal provider item transition lacks its previous binding".into())
+        })?;
+        crate::cloud_provider::rebind_personal_allocation_item(
+            tx,
+            context,
+            allocation,
+            previous_item_id,
+        )
+        .await
+        .map_err(|_| {
+            Error::Internal("personal provider item binding could not be advanced".into())
+        })?;
+    }
     register_verified_allocation(tx, context, allocation)
         .await
         .map_err(|_| Error::Internal("personal provider source registration failed".into()))?;
@@ -5446,7 +10117,7 @@ async fn accept_personal_invoice_coverage(
 async fn accept_sponsored_invoice_coverage(
     tx: &mut Transaction<'_, Postgres>,
     prepared: &PreparedSponsoredInvoiceCoverage,
-) -> Result<()> {
+) -> Result<bool> {
     record_verified_event(tx, &prepared.context, &prepared.event)
         .await
         .map_err(|_| Error::Internal("sponsored provider event receipt failed".into()))?;
@@ -5556,8 +10227,9 @@ async fn accept_sponsored_invoice_coverage(
         )
         .await
         .map_err(|_| Error::Internal("sponsored provider evidence rejection failed".into()))?;
+        return Ok(false);
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn reject_sponsored_invoice_coverage(
@@ -5688,6 +10360,45 @@ fn stripe_reference(value: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[cfg(feature = "e2e-stripe-test-clock")]
+fn valid_stripe_id(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    })
+}
+
+#[cfg(feature = "e2e-stripe-test-clock")]
+fn valid_run_id(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
+}
+
+#[cfg(feature = "e2e-stripe-test-clock")]
+fn valid_e2e_customer_user_id(value: &str) -> bool {
+    !value.trim().is_empty() && value.chars().count() <= 500 && !value.chars().any(char::is_control)
+}
+
+#[cfg(feature = "e2e-stripe-test-clock")]
+fn e2e_test_clock_customer_matches(
+    customer: &serde_json::Value,
+    customer_id: &str,
+    clock_id: &str,
+    run_id: &str,
+    user_id: Option<&str>,
+) -> bool {
+    customer["id"].as_str() == Some(customer_id)
+        && customer["object"].as_str() == Some("customer")
+        && customer["livemode"].as_bool() == Some(false)
+        && customer["deleted"].as_bool() != Some(true)
+        && stripe_reference(&customer["test_clock"]).as_deref() == Some(clock_id)
+        && customer["metadata"]["sotto_lifecycle_run_id"].as_str() == Some(run_id)
+        && user_id.is_none_or(|user_id| {
+            customer["metadata"]["sotto_lifecycle_user_id"].as_str() == Some(user_id)
+        })
+}
+
 fn billing_offer_matches_price(
     catalogue: Option<&BillingPriceIds>,
     offer: &str,
@@ -5699,6 +10410,205 @@ fn billing_offer_matches_price(
             .find(|candidate| candidate.as_str() == offer)
             .is_some_and(|candidate| catalogue.id_for(candidate) == price_id)
     })
+}
+
+#[cfg(all(test, feature = "e2e-stripe-test-clock"))]
+mod e2e_stripe_test_clock_tests {
+    use super::{
+        e2e_test_clock_customer_matches, valid_e2e_customer_user_id, valid_run_id, valid_stripe_id,
+    };
+    use serde_json::json;
+
+    const RUN_ID: &str = "7e57d004-2b97-4e7f-9f47-68d9f5d9e3c1";
+    const USER_ID: &str = "e2e-e2e-invitee";
+
+    fn customer() -> serde_json::Value {
+        json!({
+            "id": "cus_clock123",
+            "object": "customer",
+            "livemode": false,
+            "test_clock": {"id": "clock_123", "object": "test_helpers.test_clock"},
+            "metadata": {"sotto_lifecycle_run_id": RUN_ID}
+        })
+    }
+
+    #[test]
+    fn test_clock_customer_must_match_run_clock_and_test_mode() {
+        let value = customer();
+        assert!(e2e_test_clock_customer_matches(
+            &value,
+            "cus_clock123",
+            "clock_123",
+            RUN_ID,
+            None,
+        ));
+        assert!(!e2e_test_clock_customer_matches(
+            &value,
+            "cus_other",
+            "clock_123",
+            RUN_ID,
+            None,
+        ));
+        assert!(!e2e_test_clock_customer_matches(
+            &value,
+            "cus_clock123",
+            "clock_other",
+            RUN_ID,
+            None,
+        ));
+        assert!(!e2e_test_clock_customer_matches(
+            &value,
+            "cus_clock123",
+            "clock_123",
+            "00000000-0000-0000-0000-000000000000",
+            None,
+        ));
+        let mut live = value.clone();
+        live["livemode"] = json!(true);
+        assert!(!e2e_test_clock_customer_matches(
+            &live,
+            "cus_clock123",
+            "clock_123",
+            RUN_ID,
+            None,
+        ));
+        let mut deleted = value.clone();
+        deleted["deleted"] = json!(true);
+        assert!(!e2e_test_clock_customer_matches(
+            &deleted,
+            "cus_clock123",
+            "clock_123",
+            RUN_ID,
+            None,
+        ));
+        let mut claimed = value;
+        claimed["metadata"]["sotto_lifecycle_user_id"] = json!(USER_ID);
+        assert!(e2e_test_clock_customer_matches(
+            &claimed,
+            "cus_clock123",
+            "clock_123",
+            RUN_ID,
+            Some(USER_ID),
+        ));
+        assert!(!e2e_test_clock_customer_matches(
+            &claimed,
+            "cus_clock123",
+            "clock_123",
+            RUN_ID,
+            Some("00000000-0000-0000-0000-000000000000"),
+        ));
+    }
+
+    #[test]
+    fn test_clock_binding_identifiers_are_narrowly_validated() {
+        assert!(valid_stripe_id("cus_clock123", "cus_"));
+        assert!(valid_stripe_id("clock_123", "clock_"));
+        assert!(!valid_stripe_id("cus_../customers", "cus_"));
+        assert!(!valid_stripe_id("cus_", "cus_"));
+        assert!(valid_run_id(RUN_ID));
+        assert!(!valid_run_id("../customers"));
+        assert!(valid_run_id("e4a7bc0d-7f4b-4f2b-93aa-9d4086cbd11e"));
+        assert!(valid_e2e_customer_user_id("e2e-e2e-invitee"));
+        assert!(valid_e2e_customer_user_id(
+            "e4a7bc0d-7f4b-4f2b-93aa-9d4086cbd11e"
+        ));
+        assert!(!valid_e2e_customer_user_id(" \t"));
+        assert!(!valid_e2e_customer_user_id("user\nwith-control"));
+        assert!(!valid_e2e_customer_user_id(&"x".repeat(501)));
+    }
+
+    #[tokio::test]
+    async fn stripe_claim_requires_an_unused_owned_test_clock_customer() {
+        use super::{StripeBilling, SubscriptionProvider};
+        use axum::{
+            body::{to_bytes, Body},
+            extract::State,
+            http::{Method, Request, StatusCode},
+            response::IntoResponse,
+            routing::any,
+            Json, Router,
+        };
+        use serde_json::{json, Value};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        #[derive(Clone, Default)]
+        struct FakeState(Arc<Mutex<Vec<(Method, String, String)>>>);
+
+        async fn fake_stripe(
+            State(state): State<FakeState>,
+            request: Request<Body>,
+        ) -> impl IntoResponse {
+            let method = request.method().clone();
+            let path = request.uri().path().to_owned();
+            let body = to_bytes(request.into_body(), 1024)
+                .await
+                .map(|body| String::from_utf8_lossy(&body).into_owned())
+                .unwrap_or_default();
+            state.0.lock().expect("fake request log lock").push((
+                method.clone(),
+                path.clone(),
+                body.clone(),
+            ));
+            let response: Value = match (method, path.as_str()) {
+                (Method::GET, "/v1/customers/cus_clock123") => json!({
+                    "id": "cus_clock123", "object": "customer", "livemode": false,
+                    "test_clock": "clock_123", "metadata": {"sotto_lifecycle_run_id": RUN_ID}
+                }),
+                (Method::GET, "/v1/subscriptions") => json!({"data": []}),
+                (Method::POST, "/v1/customers/cus_clock123")
+                    if body
+                        .contains(&format!("metadata%5Bsotto_lifecycle_user_id%5D={USER_ID}")) =>
+                {
+                    json!({
+                        "id": "cus_clock123", "object": "customer", "livemode": false,
+                        "test_clock": "clock_123", "metadata": {
+                            "sotto_lifecycle_run_id": RUN_ID,
+                            "sotto_lifecycle_user_id": USER_ID
+                        }
+                    })
+                }
+                _ => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error": {"code": "not_found"}})),
+                    )
+                        .into_response();
+                }
+            };
+            Json(response).into_response()
+        }
+
+        let fake_state = FakeState::default();
+        let app = Router::new()
+            .fallback(any(fake_stripe))
+            .with_state(fake_state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = StripeBilling {
+            api_key: "rk_test_private".into(),
+            price_id: "price_test".into(),
+            automatic_tax_enabled: false,
+            api_origin: format!("http://{address}"),
+        };
+
+        provider
+            .claim_e2e_test_clock_customer("cus_clock123", "clock_123", RUN_ID, USER_ID)
+            .await
+            .unwrap();
+        let calls = fake_state.0.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].0, Method::GET);
+        assert_eq!(calls[1].1, "/v1/subscriptions");
+        assert_eq!(calls[2].0, Method::POST);
+        assert!(calls[2]
+            .2
+            .contains(&format!("metadata%5Bsotto_lifecycle_user_id%5D={USER_ID}")));
+        server.abort();
+    }
 }
 
 fn opaque_provider_id(prefix: &str, parts: &[&str]) -> String {
@@ -5716,9 +10626,460 @@ fn opaque_provider_id(prefix: &str, parts: &[&str]) -> String {
     )
 }
 
+fn personal_renewal_notice_event_key(
+    user_id: &str,
+    subscription_id: &str,
+    invoice_id: &str,
+) -> String {
+    opaque_provider_id(
+        "personal-renewal-v1",
+        &[user_id, subscription_id, invoice_id],
+    )
+}
+
+/// Persist the customer-facing failure notice before any optional Stripe history read. The
+/// webhook receipt and notice commit together, but the receipt remains pending until the regular
+/// webhook transaction accepts the billing and coverage work.
+async fn record_personal_renewal_failure_notice(pool: &PgPool, event: &Event) -> Result<bool> {
+    let invoice = &event.data.object;
+    let Some(subscription_id) = invoice_subscription_id_claim(invoice) else {
+        log_personal_renewal_notice_skip("subscription_missing");
+        return Ok(false);
+    };
+    let Some(invoice_id) = invoice["id"].as_str().filter(|value| !value.is_empty()) else {
+        log_personal_renewal_notice_skip("invoice_id_missing");
+        return Ok(false);
+    };
+    let Some(customer_id) = stripe_reference(&invoice["customer"]) else {
+        log_personal_renewal_notice_skip("customer_missing");
+        return Ok(false);
+    };
+    // `paid_through_epoch` retains Stripe's time of day, so compare the exact line boundary.
+    let Some(period_start) = invoice_period_start(invoice)
+        .filter(|value| FoundingDate::from_unix_seconds(*value).is_ok())
+    else {
+        log_personal_renewal_notice_skip("period_start_missing_or_invalid");
+        return Ok(false);
+    };
+    let shape_skip_reason = if invoice["object"].as_str() != Some("invoice") {
+        Some("not_an_invoice")
+    } else if invoice["billing_reason"].as_str() != Some("subscription_cycle") {
+        Some("not_a_subscription_cycle")
+    } else if invoice["collection_method"].as_str() != Some("charge_automatically") {
+        Some("not_automatic_collection")
+    } else if invoice["status"].as_str() != Some("open") {
+        Some("invoice_not_open")
+    } else if invoice["amount_remaining"]
+        .as_i64()
+        .is_none_or(|amount| amount <= 0)
+    {
+        Some("amount_remaining_not_positive")
+    } else {
+        None
+    };
+    if let Some(reason) = shape_skip_reason {
+        log_personal_renewal_notice_skip(reason);
+        return Ok(false);
+    }
+
+    let mut tx = pool.begin().await?;
+    prune_webhook_events(&mut tx).await?;
+    let disposition = record_webhook_event(&mut tx, event).await?;
+    let outcome = if disposition == EventDisposition::Ignore {
+        PersonalRenewalNoticeOutcome::WebhookAlreadyProcessed
+    } else {
+        let account = sqlx::query(
+            "SELECT user_id, paid_through_epoch, state FROM billing_personal_accounts \
+             WHERE stripe_subscription_id=$1 AND stripe_customer_id=$2 \
+               AND state IN ('active','past_due','unpaid') FOR UPDATE",
+        )
+        .bind(&subscription_id)
+        .bind(&customer_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(account) = account {
+            let user_id: String = account.try_get("user_id")?;
+            let paid_through: Option<i64> = account.try_get("paid_through_epoch")?;
+            if let Some(paid_through) = paid_through {
+                if period_start < paid_through {
+                    PersonalRenewalNoticeOutcome::Skipped("invoice_period_precedes_paid_through")
+                } else {
+                    let deadline = paid_through
+                        .checked_add(crate::cloud_coverage::RENEWAL_RECOVERY_SECONDS)
+                        .ok_or_else(|| {
+                            Error::Internal("personal recovery deadline overflowed".into())
+                        })?;
+                    let due_at_epoch: i64 =
+                        sqlx::query_scalar("SELECT floor(extract(epoch FROM now()))::bigint")
+                            .fetch_one(&mut *tx)
+                            .await?;
+                    let intent = crate::notifications::NoticeIntent {
+                recipient_user_id: user_id.clone(),
+                event_key: personal_renewal_notice_event_key(
+                    &user_id,
+                    &subscription_id,
+                    invoice_id,
+                ),
+                policy_key: "personal-renewal-failure-v1".into(),
+                kind: crate::notifications::NoticeKind::FailedRenewal,
+                channel: crate::notifications::NoticeChannel::InApp,
+                contact_id: None,
+                scope_id: None,
+                due_at_epoch,
+                content: crate::notifications::NoticeContent {
+                    title: "Action needed for your Cloud renewal".into(),
+                    detail: "Your renewal payment was unsuccessful. Update your payment method in Cloud billing before the recovery deadline.".into(),
+                    effective_at_epoch: Some(paid_through),
+                    deadline_epoch: Some(deadline),
+                    amount_pence: None,
+                    price_interval: None,
+                },
+            };
+                    let outcome = crate::notifications::enqueue_in_tx(&mut tx, &intent)
+                        .await
+                        .map_err(notification_error)?;
+                    match outcome {
+                        crate::notifications::EnqueueOutcome::Enqueued => {
+                            PersonalRenewalNoticeOutcome::Enqueued
+                        }
+                        crate::notifications::EnqueueOutcome::AlreadyQueued => {
+                            PersonalRenewalNoticeOutcome::AlreadyQueued
+                        }
+                    }
+                }
+            } else {
+                PersonalRenewalNoticeOutcome::Skipped("paid_through_missing")
+            }
+        } else {
+            PersonalRenewalNoticeOutcome::Skipped("personal_account_binding_not_found")
+        }
+    };
+    tx.commit().await?;
+    log_personal_renewal_notice_outcome(outcome);
+    Ok(matches!(
+        outcome,
+        PersonalRenewalNoticeOutcome::WebhookAlreadyProcessed
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum PersonalRenewalNoticeOutcome {
+    Skipped(&'static str),
+    Enqueued,
+    AlreadyQueued,
+    WebhookAlreadyProcessed,
+}
+
+fn log_personal_renewal_notice_skip(reason: &'static str) {
+    eprintln!("warning: skipped personal renewal failure notice: {reason}");
+}
+
+fn log_personal_renewal_notice_outcome(outcome: PersonalRenewalNoticeOutcome) {
+    match outcome {
+        PersonalRenewalNoticeOutcome::Skipped(reason) => log_personal_renewal_notice_skip(reason),
+        PersonalRenewalNoticeOutcome::Enqueued => {
+            eprintln!("warning: queued personal renewal failure notice");
+        }
+        PersonalRenewalNoticeOutcome::AlreadyQueued => {
+            eprintln!("warning: personal renewal failure notice was already queued");
+        }
+        PersonalRenewalNoticeOutcome::WebhookAlreadyProcessed => {
+            eprintln!("warning: personal renewal failure webhook was already processed");
+        }
+    }
+}
+
+fn notification_error(error: crate::notifications::NoticeError) -> Error {
+    match error {
+        crate::notifications::NoticeError::Database(error) => Error::Db(error),
+        other => Error::Internal(other.to_string()),
+    }
+}
+
+/// A verified payment only resolves the matching invoice's failure. The invoice identity is
+/// hashed before it enters the outbox; the raw provider identifiers never reach the account API.
+async fn enqueue_personal_renewal_recovered_notice(
+    tx: &mut Transaction<'_, Postgres>,
+    invoice: &serde_json::Value,
+    subscription_id: &str,
+    event_created: i64,
+) -> Result<()> {
+    if invoice["object"].as_str() != Some("invoice")
+        || invoice["billing_reason"].as_str() != Some("subscription_cycle")
+        || invoice["status"].as_str() != Some("paid")
+    {
+        return Ok(());
+    }
+    let Some(invoice_id) = invoice["id"].as_str().filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let Some(customer_id) = stripe_reference(&invoice["customer"]) else {
+        return Ok(());
+    };
+    let Some(period_end) = invoice_period_end(invoice)
+        .and_then(|value| FoundingDate::from_unix_seconds(value).ok())
+        .map(|value| value.to_unix_seconds())
+    else {
+        return Ok(());
+    };
+    let account = sqlx::query(
+        "SELECT user_id, paid_through_epoch, state FROM billing_personal_accounts \
+         WHERE stripe_subscription_id=$1 AND stripe_customer_id=$2 \
+           AND state IN ('active','past_due','unpaid','canceled') FOR UPDATE",
+    )
+    .bind(subscription_id)
+    .bind(customer_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(account) = account else {
+        return Ok(());
+    };
+    let user_id: String = account.try_get("user_id")?;
+    let paid_through: Option<i64> = account.try_get("paid_through_epoch")?;
+    let account_state: String = account.try_get("state")?;
+    if paid_through.is_none_or(|paid_through| paid_through < period_end) {
+        return Ok(());
+    }
+    let event_key = personal_renewal_notice_event_key(&user_id, subscription_id, invoice_id);
+    let failed_notice_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM cloud_notice_outbox \
+         WHERE recipient_user_id=$1 AND event_key=$2 \
+           AND policy_key='personal-renewal-failure-v1' AND kind='failed_renewal' \
+           AND channel='in_app')",
+    )
+    .bind(&user_id)
+    .bind(&event_key)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !failed_notice_exists {
+        return Ok(());
+    }
+    // A successful retry makes the original warning obsolete. Retire it in the same transaction
+    // as the resolution notice so customers never see contradictory advice after this commits.
+    sqlx::query(
+        "UPDATE cloud_notice_outbox SET status='cancelled', cancelled_at=now(), \
+             lease_owner=NULL, lease_expires_at=NULL, updated_at=now() \
+         WHERE recipient_user_id=$1 AND event_key=$2 \
+           AND policy_key='personal-renewal-failure-v1' AND kind='failed_renewal' \
+           AND status <> 'cancelled'",
+    )
+    .bind(&user_id)
+    .bind(&event_key)
+    .execute(&mut **tx)
+    .await?;
+    // A late paid invoice can arrive after cancellation. It clears the stale payment warning,
+    // but must not imply that the cancelled subscription has resumed.
+    if account_state == "canceled" {
+        return Ok(());
+    }
+    let due_at_epoch: i64 = sqlx::query_scalar("SELECT floor(extract(epoch FROM now()))::bigint")
+        .fetch_one(&mut **tx)
+        .await?;
+    let intent = crate::notifications::NoticeIntent {
+        recipient_user_id: user_id,
+        event_key,
+        policy_key: "personal-renewal-recovered-v1".into(),
+        kind: crate::notifications::NoticeKind::RecoveryResolved,
+        channel: crate::notifications::NoticeChannel::InApp,
+        contact_id: None,
+        scope_id: None,
+        due_at_epoch,
+        content: crate::notifications::NoticeContent {
+            title: "Your Cloud renewal is up to date".into(),
+            detail: "Your renewal payment was received. No further action is needed.".into(),
+            effective_at_epoch: (event_created > 0).then_some(event_created),
+            deadline_epoch: None,
+            amount_pence: None,
+            price_interval: None,
+        },
+    };
+    crate::notifications::enqueue_in_tx(tx, &intent)
+        .await
+        .map_err(notification_error)?;
+    Ok(())
+}
+
+async fn enqueue_sponsored_renewal_failure_notices(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    invoice_id: &str,
+    beneficiary_id: &str,
+    period_start: i64,
+    include_administrators: bool,
+) -> Result<()> {
+    let deadline = period_start
+        .checked_add(crate::cloud_coverage::RENEWAL_RECOVERY_SECONDS)
+        .ok_or_else(|| Error::Internal("sponsored recovery deadline overflowed".into()))?;
+    let due_at_epoch: i64 = sqlx::query_scalar("SELECT floor(extract(epoch FROM now()))::bigint")
+        .fetch_one(&mut **tx)
+        .await?;
+    let event_key = opaque_provider_id("sponsored-renewal-v1", &[organization_id, invoice_id]);
+    if !beneficiary_id.is_empty() {
+        let intent = crate::notifications::NoticeIntent {
+            recipient_user_id: beneficiary_id.to_owned(),
+            event_key: event_key.clone(),
+            policy_key: "sponsored-renewal-failure-v1".into(),
+            kind: crate::notifications::NoticeKind::SponsoredRenewalFailure,
+            channel: crate::notifications::NoticeChannel::InApp,
+            contact_id: None,
+            scope_id: Some(organization_id.to_owned()),
+            due_at_epoch,
+            content: crate::notifications::NoticeContent {
+                title: "Your sponsored Cloud renewal needs attention".into(),
+                detail: "Your organisation’s Cloud renewal payment was unsuccessful. Ask an organisation billing admin to review the payment before the recovery deadline.".into(),
+                effective_at_epoch: Some(period_start),
+                deadline_epoch: Some(deadline),
+                amount_pence: None,
+                price_interval: None,
+            },
+        };
+        crate::notifications::enqueue_in_tx(tx, &intent)
+            .await
+            .map_err(notification_error)?;
+    }
+    if !include_administrators {
+        return Ok(());
+    }
+    let administrators: Vec<String> = sqlx::query_scalar(
+        "SELECT membership.user_id FROM organization_memberships membership \
+         JOIN organizations organization ON organization.id = membership.org_id \
+         WHERE membership.org_id = $1 AND membership.role IN ('owner','admin') \
+           AND organization.lifecycle_state = 'active' \
+         ORDER BY membership.user_id COLLATE \"C\" LIMIT 129",
+    )
+    .bind(organization_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if administrators.len() > 128 {
+        return Err(Error::Internal(
+            "sponsored renewal administrator scope exceeded".into(),
+        ));
+    }
+    for administrator in administrators {
+        let intent = crate::notifications::NoticeIntent {
+            recipient_user_id: administrator,
+            event_key: event_key.clone(),
+            policy_key: "sponsored-renewal-action-v1".into(),
+            kind: crate::notifications::NoticeKind::SponsoredRenewalAction,
+            channel: crate::notifications::NoticeChannel::InApp,
+            contact_id: None,
+            scope_id: Some(organization_id.to_owned()),
+            due_at_epoch,
+            content: crate::notifications::NoticeContent {
+                title: "Organisation Cloud renewal needs attention".into(),
+                detail: "The organisation’s sponsored Cloud renewal payment was unsuccessful. Review the organisation billing panel before the recovery deadline.".into(),
+                effective_at_epoch: Some(period_start),
+                deadline_epoch: Some(deadline),
+                amount_pence: None,
+                price_interval: None,
+            },
+        };
+        crate::notifications::enqueue_in_tx(tx, &intent)
+            .await
+            .map_err(notification_error)?;
+    }
+    Ok(())
+}
+
+/// Resolve only failures for this exact paid invoice. Notice cancellation, resolution rows and
+/// replacement notices share the billing transaction, so a retry cannot leave contradictory UI.
+async fn resolve_sponsored_renewal_failures(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    subscription_id: &str,
+    invoice_id: &str,
+    event_created: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO cloud_provider_stripe_renewal_resolutions \
+         (provider_namespace, provider_account_id, provider_environment, event_id, \
+          beneficiary_id, allocation_id, resolution_invoice_id) \
+         SELECT failure.provider_namespace, failure.provider_account_id, \
+                failure.provider_environment, failure.event_id, failure.beneficiary_id, \
+                failure.allocation_id, $2 \
+         FROM cloud_provider_stripe_renewal_failures failure \
+         JOIN cloud_provider_allocations allocation ON allocation.allocation_id = failure.allocation_id \
+         JOIN cloud_provider_payers payer ON payer.payer_id = allocation.payer_id \
+         WHERE failure.provider_namespace = 'stripe' AND failure.subscription_id = $1 \
+           AND failure.invoice_id = $2 AND payer.payer_kind = 'sponsor' \
+           AND NOT EXISTS (SELECT 1 FROM cloud_provider_stripe_renewal_resolutions resolution \
+                           WHERE resolution.provider_namespace = failure.provider_namespace \
+                             AND resolution.provider_account_id = failure.provider_account_id \
+                             AND resolution.provider_environment = failure.provider_environment \
+                             AND resolution.event_id = failure.event_id \
+                             AND resolution.beneficiary_id = failure.beneficiary_id \
+                             AND resolution.allocation_id = failure.allocation_id) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(subscription_id)
+    .bind(invoice_id)
+    .execute(&mut **tx)
+    .await?;
+    let event_key = opaque_provider_id("sponsored-renewal-v1", &[organization_id, invoice_id]);
+    let due_at_epoch: i64 = sqlx::query_scalar("SELECT floor(extract(epoch FROM now()))::bigint")
+        .fetch_one(&mut **tx)
+        .await?;
+    let notices = sqlx::query(
+        "SELECT DISTINCT recipient_user_id COLLATE \"C\" AS recipient_user_id, kind \
+         FROM cloud_notice_outbox \
+         WHERE event_key = $1 AND kind IN ('sponsored_renewal_failure','sponsored_renewal_action') \
+           AND policy_key IN ('sponsored-renewal-failure-v1','sponsored-renewal-action-v1') \
+         ORDER BY recipient_user_id COLLATE \"C\" LIMIT 257",
+    )
+    .bind(&event_key)
+    .fetch_all(&mut **tx)
+    .await?;
+    if notices.len() > 256 {
+        return Err(Error::Internal(
+            "sponsored renewal notice scope exceeded".into(),
+        ));
+    }
+    sqlx::query(
+        "UPDATE cloud_notice_outbox SET status='cancelled', cancelled_at=now(), \
+             lease_owner=NULL, lease_expires_at=NULL, updated_at=now() \
+         WHERE event_key=$1 AND kind IN ('sponsored_renewal_failure','sponsored_renewal_action') \
+           AND policy_key IN ('sponsored-renewal-failure-v1','sponsored-renewal-action-v1') \
+           AND status <> 'cancelled'",
+    )
+    .bind(&event_key)
+    .execute(&mut **tx)
+    .await?;
+    for row in notices {
+        let recipient: String = row.try_get("recipient_user_id")?;
+        let was_admin = row.try_get::<String, _>("kind")? == "sponsored_renewal_action";
+        let intent = crate::notifications::NoticeIntent {
+            recipient_user_id: recipient,
+            event_key: event_key.clone(),
+            policy_key: if was_admin {
+                "sponsored-renewal-recovered-admin-v1".into()
+            } else {
+                "sponsored-renewal-recovered-v1".into()
+            },
+            kind: crate::notifications::NoticeKind::RecoveryResolved,
+            channel: crate::notifications::NoticeChannel::InApp,
+            contact_id: None,
+            scope_id: None,
+            due_at_epoch,
+            content: crate::notifications::NoticeContent {
+                title: "Organisation Cloud renewal recovered".into(),
+                detail: "The organisation’s sponsored Cloud renewal payment was received. The matching renewal warning has been resolved.".into(),
+                effective_at_epoch: Some(event_created.max(0)),
+                deadline_epoch: None,
+                amount_pence: None,
+                price_interval: None,
+            },
+        };
+        crate::notifications::enqueue_in_tx(tx, &intent)
+            .await
+            .map_err(notification_error)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventDisposition {
-    /// The event is newer than the stored watermark and can apply its payload normally.
+    /// The event can apply normally: either it is newer than the watermark or it is a
+    /// payment fact whose ordering is guarded by the subscription lock instead.
     Apply,
     /// The event ties the watermark timestamp and must reconcile against Stripe's current state.
     Reconcile,
@@ -5756,6 +11117,12 @@ async fn record_webhook_event(
     if event.kind == "invoice.paid" {
         return Ok(EventDisposition::Apply);
     }
+    // A failed invoice is a payment fact, not a subscription-state observation. Keep it under
+    // the subscription lock for paid-versus-failed ordering, but let the corresponding
+    // customer.subscription.updated event own the watermark and status transition.
+    if event.kind == "invoice.payment_failed" {
+        return Ok(EventDisposition::Apply);
+    }
 
     let Some(subscription_id) = subscription_id else {
         return Ok(EventDisposition::Apply);
@@ -5788,14 +11155,19 @@ async fn record_webhook_receipt(
 ) -> Result<bool> {
     let inserted = sqlx::query(
         "INSERT INTO stripe_webhook_events \
-         (event_id, event_type, api_version, stripe_created, subscription_id) \
-         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING",
+         (event_id, event_type, api_version, stripe_created, subscription_id, provider_object_id) \
+         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (event_id) DO NOTHING",
     )
     .bind(&event.id)
     .bind(&event.kind)
     .bind(event.api_version.as_deref().unwrap_or("missing"))
     .bind(event.created)
     .bind(subscription_id)
+    .bind(
+        event.data.object["id"]
+            .as_str()
+            .filter(|id| !id.trim().is_empty()),
+    )
     .execute(&mut **tx)
     .await?
     .rows_affected()
@@ -5878,10 +11250,16 @@ async fn complete_repaired_invoice_event(
     tx: &mut Transaction<'_, Postgres>,
     event: &Event,
 ) -> Result<()> {
-    if let Some(subscription_id) = event_subscription_id(event) {
-        update_subscription_watermark(tx, event, &subscription_id).await?;
+    if event_updates_subscription_watermark(event) {
+        if let Some(subscription_id) = event_subscription_id(event) {
+            update_subscription_watermark(tx, event, &subscription_id).await?;
+        }
     }
     mark_webhook_event_processed(tx, &event.id).await
+}
+
+fn event_updates_subscription_watermark(event: &Event) -> bool {
+    event.kind != "invoice.payment_failed"
 }
 
 fn event_subscription_id(event: &Event) -> Option<String> {
@@ -5892,6 +11270,7 @@ fn event_subscription_id(event: &Event) -> Option<String> {
                 .map(str::to_string)
         }
         "invoice.paid" => invoice_subscription_id(&event.data.object).map(str::to_string),
+        "invoice.payment_failed" => invoice_subscription_id_claim(&event.data.object),
         "customer.subscription.updated" | "customer.subscription.deleted" => {
             event.data.object["id"].as_str().map(str::to_string)
         }
@@ -5946,22 +11325,132 @@ fn is_sponsored_checkout_expired_event(event: &Event) -> bool {
             .is_some_and(|reference| reference.starts_with("sponsored:"))
 }
 
+fn is_checkout_expired_event(event: &Event) -> bool {
+    is_sponsored_checkout_expired_event(event)
+        || (event.kind == "checkout.session.expired"
+            && event.data.object["client_reference_id"]
+                .as_str()
+                .is_some_and(|reference| reference.starts_with("personal:")))
+}
+
 async fn sponsored_checkout_expired(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
 ) -> Result<()> {
-    if !sponsored_billing_enabled() {
-        return Ok(());
-    }
     let Some(reference) = object["client_reference_id"].as_str() else {
         return Ok(());
     };
+    if let Some(operation_id) = reference.strip_prefix("personal:") {
+        let session_id = object["id"]
+            .as_str()
+            .filter(|session_id| !session_id.trim().is_empty())
+            .ok_or_else(|| Error::Config("expired Checkout session has no id".into()))?;
+        // Match personal checkout's founding-capacity -> operation/account lock order. Stripe's
+        // signed expiry event is the evidence that permits the pending account to be reused.
+        founding_allocator::lock_capacity(tx)
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?;
+        let account_state: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM billing_personal_accounts WHERE operation_id=$1 FOR UPDATE",
+        )
+        .bind(operation_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if matches!(
+            account_state.as_deref(),
+            Some("active" | "past_due" | "unpaid" | "refund_required")
+        ) {
+            // A paid settlement wins over a delayed expiry delivery.
+            return Ok(());
+        }
+        let operation = billing_operations::record_checkout_expired(tx, operation_id, session_id)
+            .await
+            .map_err(Error::from)?;
+        if account_state.as_deref() == Some("pending") {
+            sqlx::query(
+                "UPDATE billing_personal_accounts SET state='canceled', updated_at=now() \
+                 WHERE operation_id=$1 AND state='pending'",
+            )
+            .bind(operation_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+        founding_allocator::release_reservation(tx, operation_id)
+            .await
+            .map_err(|error| Error::Internal(error.to_string()))?;
+        crate::notifications::enqueue_checkout_outcome_in_tx(
+            tx,
+            &operation.beneficiary_id,
+            operation_id,
+            crate::notifications::CheckoutOutcome::Expired,
+        )
+        .await
+        .map_err(notification_error)?;
+        return Ok(());
+    }
+    if !sponsored_billing_enabled() {
+        return Ok(());
+    }
     let Some(operation_id) = reference.strip_prefix("sponsored:") else {
         return Ok(());
     };
-    sponsored_billing::cancel_failed_operation(tx, operation_id, "checkout_expired")
+    let operation =
+        sponsored_billing::cancel_failed_operation(tx, operation_id, "checkout_expired")
+            .await
+            .map_err(Error::from)?;
+    crate::notifications::enqueue_checkout_outcome_in_tx(
+        tx,
+        &operation.beneficiary_id,
+        operation_id,
+        crate::notifications::CheckoutOutcome::Expired,
+    )
+    .await
+    .map_err(notification_error)?;
+    if operation.actor_user_id != operation.beneficiary_id {
+        crate::notifications::enqueue_checkout_outcome_in_tx(
+            tx,
+            &operation.actor_user_id,
+            operation_id,
+            crate::notifications::CheckoutOutcome::Expired,
+        )
         .await
-        .map_err(Error::from)?;
+        .map_err(notification_error)?;
+    }
+    Ok(())
+}
+
+async fn enqueue_sponsored_checkout_outcome(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: &str,
+    outcome: crate::notifications::CheckoutOutcome,
+) -> Result<()> {
+    let recipients: Option<(String, String)> = sqlx::query_as(
+        "SELECT beneficiary_id,actor_user_id FROM billing_sponsored_operations WHERE operation_id=$1",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((beneficiary_id, actor_user_id)) = recipients else {
+        return Ok(());
+    };
+    crate::notifications::enqueue_checkout_outcome_in_tx(
+        tx,
+        &beneficiary_id,
+        operation_id,
+        outcome,
+    )
+    .await
+    .map_err(notification_error)?;
+    if actor_user_id != beneficiary_id {
+        crate::notifications::enqueue_checkout_outcome_in_tx(
+            tx,
+            &actor_user_id,
+            operation_id,
+            outcome,
+        )
+        .await
+        .map_err(notification_error)?;
+    }
     Ok(())
 }
 
@@ -5975,6 +11464,11 @@ async fn checkout_completed(
     personal_period: Option<PersonalSubscriptionPeriod>,
     sponsored_snapshot: Option<&SponsoredSubscriptionSnapshot>,
 ) -> Result<()> {
+    if object["mode"].as_str() == Some("setup") {
+        // Setup Checkout is fulfilled only by the payer-transfer setup handler. It is never a
+        // subscription checkout and must not fall through to legacy organisation billing.
+        return Ok(());
+    }
     // Sessions this server creates always carry the org id; anything else isn't ours to act on.
     // Said out loud, because ignoring an event and acting on one are indistinguishable from
     // outside: both answer 200, and Stripe records both as delivered. A payment that completes
@@ -6035,11 +11529,29 @@ async fn checkout_completed(
         if record_sponsored_founding_award(tx, operation_id, &evidence, period_start, event_created)
             .await?
         {
+            enqueue_sponsored_checkout_outcome(
+                tx,
+                operation_id,
+                crate::notifications::CheckoutOutcome::Completed,
+            )
+            .await?;
+            crate::notifications::enqueue_sponsorship_change_in_tx(tx, operation_id)
+                .await
+                .map_err(notification_error)?;
             return Ok(());
         }
         sponsored_billing::complete_paid_checkout(tx, operation_id, &evidence)
             .await
             .map_err(Error::from)?;
+        enqueue_sponsored_checkout_outcome(
+            tx,
+            operation_id,
+            crate::notifications::CheckoutOutcome::Completed,
+        )
+        .await?;
+        crate::notifications::enqueue_sponsorship_change_in_tx(tx, operation_id)
+            .await
+            .map_err(notification_error)?;
         return Ok(());
     }
     let customer = object["customer"].as_str();
@@ -6081,6 +11593,38 @@ async fn checkout_completed(
         )
         .await?;
     }
+    Ok(())
+}
+
+fn object_is_transfer_setup(object: &serde_json::Value) -> bool {
+    transfer_setup_transfer_id(object).is_some()
+}
+
+fn transfer_setup_transfer_id(object: &serde_json::Value) -> Option<&str> {
+    let transfer_id = object["metadata"]["sotto_transfer_id"].as_str()?;
+    let client_reference = object["client_reference_id"].as_str()?;
+    (object["mode"].as_str() == Some("setup")
+        && !transfer_id.trim().is_empty()
+        && client_reference == format!("sotto-transfer:{transfer_id}"))
+    .then_some(transfer_id)
+}
+
+async fn accept_transfer_setup(
+    tx: &mut Transaction<'_, Postgres>,
+    setup: &VerifiedTransferSetup,
+) -> Result<()> {
+    founding_allocator::lock_capacity(tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    billing_transfers::record_destination_setup_completion(
+        tx,
+        &setup.transfer_id,
+        &setup.customer_id,
+        &setup.session_id,
+        &setup.setup_intent_id,
+    )
+    .await
+    .map_err(Error::from)?;
     Ok(())
 }
 
@@ -6190,6 +11734,14 @@ async fn personal_checkout_completed(
                     .await
                     .map_err(personal_billing_error)?;
                 }
+                crate::notifications::enqueue_checkout_outcome_in_tx(
+                    tx,
+                    &user_id,
+                    operation_id,
+                    crate::notifications::CheckoutOutcome::RefundRequired,
+                )
+                .await
+                .map_err(notification_error)?;
                 return Ok(());
             }
         }
@@ -6216,6 +11768,14 @@ async fn personal_checkout_completed(
         .await
         .map_err(personal_billing_error)?;
     }
+    crate::notifications::enqueue_checkout_outcome_in_tx(
+        tx,
+        &user_id,
+        operation_id,
+        crate::notifications::CheckoutOutcome::Completed,
+    )
+    .await
+    .map_err(notification_error)?;
     Ok(())
 }
 
@@ -6312,12 +11872,8 @@ async fn apply_sponsored_subscription_state(
     period_start: Option<i64>,
     period_end: Option<i64>,
 ) -> Result<()> {
-    if terminal {
-        // Match invoice settlement's lock order before touching subscription or operation rows.
-        founding_allocator::lock_capacity(tx)
-            .await
-            .map_err(|error| Error::Internal(error.to_string()))?;
-    }
+    let transfer_ids = live_transfer_ids_for_subscription(tx, subscription_id).await?;
+    lock_sponsored_subscription_beneficiaries_except(tx, organization_id, &transfer_ids).await?;
     sqlx::query(
         "UPDATE billing_sponsored_subscriptions SET \
            provider_customer_id = COALESCE($2, provider_customer_id), \
@@ -6367,6 +11923,102 @@ async fn apply_sponsored_subscription_state(
     Ok(())
 }
 
+async fn live_transfer_ids_for_subscription(
+    tx: &mut Transaction<'_, Postgres>,
+    subscription_id: &str,
+) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT transfer_id FROM billing_transfer_intents \
+         WHERE (source_provider_subscription_id = $1 OR destination_provider_subscription_id = $1) \
+           AND state IN ('pending','destination_prepared','destination_paid', \
+                         'source_adjustment_pending','source_restoration_pending','unknown') \
+         ORDER BY transfer_id COLLATE \"C\"",
+    )
+    .bind(subscription_id)
+    .fetch_all(&mut **tx)
+    .await?)
+}
+
+async fn record_terminal_destination_transfer(
+    tx: &mut Transaction<'_, Postgres>,
+    subscription_id: &str,
+) -> Result<()> {
+    founding_allocator::lock_capacity(tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    let row = sqlx::query(
+        "SELECT transfer_id, state, source_adjustment_reference \
+         FROM billing_transfer_intents WHERE destination_provider_subscription_id = $1 \
+           AND destination_payment_reference IS NULL \
+           AND state IN ('pending','destination_prepared','unknown','source_adjustment_pending') \
+         ORDER BY transfer_id COLLATE \"C\" FOR UPDATE",
+    )
+    .bind(subscription_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let transfer_id: String = row.try_get("transfer_id")?;
+    let state: String = row.try_get("state")?;
+    let source_adjustment_reference: Option<String> = row.try_get("source_adjustment_reference")?;
+    if state == TransferState::SourceAdjustmentPending.as_str()
+        && source_adjustment_reference.is_some()
+    {
+        billing_transfers::request_source_restoration(
+            tx,
+            &transfer_id,
+            "destination_subscription_ended",
+        )
+        .await
+        .map_err(Error::from)?;
+    } else {
+        billing_transfers::mark_failed(tx, &transfer_id, "destination_subscription_ended")
+            .await
+            .map_err(Error::from)?;
+    }
+    Ok(())
+}
+
+async fn lock_sponsored_subscription_beneficiaries_except(
+    tx: &mut Transaction<'_, Postgres>,
+    organization_id: &str,
+    allowed_transfer_ids: &[String],
+) -> Result<()> {
+    // Subscription lifecycle and invoice settlement can rewrite every seat on the subscription.
+    // Take the shared lock before reading the affected set so a transfer cannot be accepted
+    // between enumerating beneficiaries and applying the provider event.
+    founding_allocator::lock_capacity(tx)
+        .await
+        .map_err(|error| Error::Internal(error.to_string()))?;
+    let beneficiary_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT beneficiary_id FROM billing_sponsored_seats \
+         WHERE organization_id = $1 AND state IN ('pending', 'active', 'scheduled_removal') \
+         UNION \
+         SELECT beneficiary_id FROM billing_sponsored_operations \
+         WHERE organization_id = $1 AND state IN ('pending', 'checkout_created', 'provider_pending', 'unknown') \
+         UNION \
+         SELECT replacement_beneficiary_id FROM billing_sponsored_operations \
+         WHERE organization_id = $1 AND replacement_beneficiary_id IS NOT NULL \
+           AND state IN ('pending', 'checkout_created', 'provider_pending', 'unknown')",
+    )
+    .bind(organization_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let beneficiary_refs = beneficiary_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    billing_transfers::lock_and_check_no_provider_transfer_except(
+        tx,
+        &beneficiary_refs,
+        allowed_transfer_ids,
+        sponsored_billing::current_epoch(),
+    )
+    .await
+    .map_err(Error::from)
+}
+
 async fn sponsored_subscription_updated(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
@@ -6385,6 +12037,9 @@ async fn sponsored_subscription_updated(
     else {
         return Ok(true);
     };
+    if terminal {
+        record_terminal_destination_transfer(tx, subscription_id).await?;
+    }
     apply_sponsored_subscription_state(
         tx,
         &organization_id,
@@ -6423,9 +12078,33 @@ async fn subscription_updated(
         let subscription_id = object["id"].as_str().ok_or_else(|| {
             Error::Config("personal subscription event has no subscription id".into())
         })?;
+        let transfer_ids = live_transfer_ids_for_subscription(tx, subscription_id).await?;
+        billing_transfers::lock_and_check_no_provider_transfer_except(
+            tx,
+            &[user_id.as_str()],
+            &transfer_ids,
+            sponsored_billing::current_epoch(),
+        )
+        .await
+        .map_err(Error::from)?;
         let cancel_at_period_end = object["cancel_at_period_end"].as_bool().ok_or_else(|| {
             Error::Config("personal subscription event has no cancellation state".into())
         })?;
+        let cancel_at_epoch = object["cancel_at"]
+            .as_i64()
+            .filter(|timestamp| *timestamp >= 0);
+        let will_cancel = cancel_at_period_end || cancel_at_epoch.is_some();
+        let was_cancel_at_period_end: bool = sqlx::query_scalar(
+            "SELECT cancel_at_period_end FROM billing_personal_accounts \
+             WHERE user_id = $1 FOR UPDATE",
+        )
+        .bind(&user_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        // A schedule-managed cancellation can be represented by `cancel_at` even when Stripe
+        // leaves `cancel_at_period_end` false. Only an unscheduled transition from a recorded
+        // cancellation back to no cancellation is treated as customer reactivation.
+        let reactivated = was_cancel_at_period_end && !will_cancel && object["schedule"].is_null();
         let state = match SubscriptionStatus::parse(status) {
             SubscriptionStatus::Active | SubscriptionStatus::Trialing => "active",
             SubscriptionStatus::PastDue | SubscriptionStatus::Paused => "past_due",
@@ -6434,18 +12113,26 @@ async fn subscription_updated(
             SubscriptionStatus::Incomplete => "pending",
             SubscriptionStatus::Unknown(_) => return Ok(()),
         };
+        if matches!(state, "canceled") {
+            record_terminal_destination_transfer(tx, subscription_id).await?;
+        }
         sqlx::query(
             "UPDATE billing_personal_accounts SET state = CASE \
                  WHEN state = 'pending' AND $2 <> 'canceled' THEN state ELSE $2 END, \
                  cancel_at_period_end = $3, stripe_subscription_id = COALESCE(stripe_subscription_id, $4), \
+                 cancellation_requested_at = CASE WHEN $5 THEN NULL ELSE cancellation_requested_at END, \
                  updated_at = now() WHERE user_id = $1",
         )
         .bind(&user_id)
         .bind(state)
-        .bind(cancel_at_period_end)
+        .bind(will_cancel)
         .bind(subscription_id)
+        .bind(reactivated)
         .execute(&mut **tx)
         .await?;
+        if reactivated {
+            founding_schedule::resume_personal_transition(tx, &user_id, subscription_id).await?;
+        }
         return Ok(());
     }
     if sponsored_subscription_updated(tx, object).await? {
@@ -6606,6 +12293,40 @@ fn invoice_subscription_id(object: &serde_json::Value) -> Option<&str> {
     object["parent"]["subscription_details"]["subscription"].as_str()
 }
 
+fn preview_subscription_period_end_from_invoice(
+    invoice: &serde_json::Value,
+    subscription_id: &str,
+    price_id: &str,
+    period_start: i64,
+) -> ProviderResult<i64> {
+    if invoice["object"].as_str() != Some("invoice")
+        || invoice_subscription_id(invoice) != Some(subscription_id)
+    {
+        return Err(ProviderError::malformed_response());
+    }
+    let matching_ends: Vec<i64> = invoice["lines"]["data"]
+        .as_array()
+        .ok_or_else(ProviderError::malformed_response)?
+        .iter()
+        .filter(|line| {
+            line["parent"]["type"].as_str() == Some("subscription_item_details")
+                && line["parent"]["subscription_item_details"]["proration"].as_bool() != Some(true)
+        })
+        .filter(|line| {
+            line["price"]["id"].as_str() == Some(price_id)
+                || line["pricing"]["price_details"]["price"].as_str() == Some(price_id)
+                || line["parent"]["subscription_item_details"]["price"].as_str() == Some(price_id)
+        })
+        .filter(|line| line["period"]["start"].as_i64() == Some(period_start))
+        .filter_map(|line| line["period"]["end"].as_i64())
+        .filter(|period_end| *period_end > period_start)
+        .collect();
+    let [period_end] = matching_ends.as_slice() else {
+        return Err(ProviderError::malformed_response());
+    };
+    Ok(*period_end)
+}
+
 async fn invoice_paid(
     tx: &mut Transaction<'_, Postgres>,
     object: &serde_json::Value,
@@ -6613,17 +12334,28 @@ async fn invoice_paid(
     catalogue: Option<&BillingPriceIds>,
     verified_personal_invoice: Option<&PreparedPersonalInvoiceCoverage>,
     verified_sponsored_invoice: Option<&SponsoredInvoiceCoveragePreparation>,
-) -> Result<()> {
+) -> Result<Option<&'static str>> {
     let Some(subscription_id) = invoice_subscription_id(object) else {
-        return Ok(());
+        return Ok(None);
     };
     if sponsored_billing_enabled() {
         let sponsored_organization =
             sponsored_invoice_paid(tx, object, subscription_id, event_created, catalogue).await?;
         if let Some(organization_id) = sponsored_organization {
+            let mut coverage_rejection = None;
             match verified_sponsored_invoice {
                 Some(SponsoredInvoiceCoveragePreparation::Prepared(prepared)) => {
-                    accept_sponsored_invoice_coverage(tx, prepared).await?;
+                    if !accept_sponsored_invoice_coverage(tx, prepared).await? {
+                        coverage_rejection = Some("sponsored_invoice_no_eligible_seats");
+                    }
+                    resolve_sponsored_renewal_failures(
+                        tx,
+                        &prepared.organization_id,
+                        subscription_id,
+                        &prepared.invoice_id,
+                        event_created,
+                    )
+                    .await?;
                 }
                 Some(SponsoredInvoiceCoveragePreparation::Rejected {
                     context,
@@ -6631,6 +12363,7 @@ async fn invoice_paid(
                     reason,
                 }) => {
                     reject_sponsored_invoice_coverage(tx, context, event, reason).await?;
+                    coverage_rejection = Some(*reason);
                 }
                 Some(SponsoredInvoiceCoveragePreparation::NotApplicable) | None => {}
             }
@@ -6645,22 +12378,51 @@ async fn invoice_paid(
                 )
                 .await?;
             }
-            return Ok(());
+            return Ok(coverage_rejection);
         }
     }
-    let personal: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM billing_personal_accounts \
-         WHERE stripe_subscription_id = $1)",
+    let personal_account: Option<(String, String)> = sqlx::query_as(
+        "SELECT user_id, operation_id FROM billing_personal_accounts \
+         WHERE stripe_subscription_id = $1",
     )
     .bind(subscription_id)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    if !personal {
-        return Ok(());
-    }
-    founding_allocator::lock_capacity(tx)
-        .await
-        .map_err(|error| Error::Internal(error.to_string()))?;
+    let Some((personal_user_id, operation_id)) = personal_account else {
+        return Ok(None);
+    };
+    let invoice_period_start = verified_personal_invoice
+        .map(|evidence| evidence.period_start)
+        .or_else(|| invoice_period_start(object));
+    let allowed_transfer_ids: Vec<String> = if let Some(period_start) = invoice_period_start {
+        sqlx::query_scalar(
+            "SELECT transfer_id FROM billing_transfer_intents \
+             WHERE ((destination_operation_id = $1 AND destination_kind = 'personal' \
+               AND destination_provider_subscription_id = $2 AND beneficiary_id = $3 \
+               AND effective_from = $4) OR \
+               (source_restoration_operation_id = $1 AND source_kind = 'personal' \
+               AND source_restoration_provider_subscription_id = $2 AND beneficiary_id = $3 \
+               AND effective_from <= $4)) AND state IN \
+                 ('pending','destination_prepared','destination_paid','source_adjustment_pending', \
+                  'source_restoration_pending','unknown')",
+        )
+        .bind(&operation_id)
+        .bind(subscription_id)
+        .bind(&personal_user_id)
+        .bind(period_start)
+        .fetch_all(&mut **tx)
+        .await?
+    } else {
+        Vec::new()
+    };
+    billing_transfers::lock_and_check_no_provider_transfer_except(
+        tx,
+        &[personal_user_id.as_str()],
+        &allowed_transfer_ids,
+        sponsored_billing::current_epoch(),
+    )
+    .await
+    .map_err(Error::from)?;
     let period_end = verified_personal_invoice
         .map(|evidence| evidence.period_end)
         .or_else(|| invoice_period_end(object))
@@ -6675,17 +12437,54 @@ async fn invoice_paid(
                 .or_else(|| object["id"].as_str())
         })
         .ok_or_else(|| Error::Config("paid personal invoice has no payment reference".into()))?;
-    personal_billing::record_invoice_paid(
-        tx,
-        subscription_id,
-        payment_reference,
-        period_end,
-        &paid_through.to_string(),
+    let account_state: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM billing_personal_accounts WHERE user_id = $1 AND operation_id = $2 FOR UPDATE",
     )
-    .await
-    .map_err(personal_billing_error)?;
+    .bind(&personal_user_id)
+    .bind(&operation_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if account_state.as_deref() == Some("pending") {
+        let evidence = verified_personal_invoice.ok_or_else(|| {
+            Error::Internal("pending personal invoice lacks verified payment evidence".into())
+        })?;
+        if evidence.operation_id != operation_id
+            || evidence.allocation.beneficiary_id != personal_user_id
+            || stripe_reference(&object["customer"]).as_deref()
+                != Some(evidence.allocation.provider_customer_id.as_str())
+        {
+            return Err(Error::Conflict(
+                "pending personal invoice binding changed".into(),
+            ));
+        }
+        personal_billing::record_paid_settlement(
+            tx,
+            &operation_id,
+            &evidence.allocation.provider_customer_id,
+            subscription_id,
+            payment_reference,
+            period_end,
+            &paid_through.to_string(),
+        )
+        .await
+        .map_err(personal_billing_error)?;
+        billing_operations::record_verified_paid_invoice(tx, &operation_id)
+            .await
+            .map_err(Error::from)?;
+    } else {
+        personal_billing::record_invoice_paid(
+            tx,
+            subscription_id,
+            payment_reference,
+            period_end,
+            &paid_through.to_string(),
+        )
+        .await
+        .map_err(personal_billing_error)?;
+    }
     reconcile_personal_founding_invoice(tx, object, subscription_id, catalogue).await?;
-    Ok(())
+    enqueue_personal_renewal_recovered_notice(tx, object, subscription_id, event_created).await?;
+    Ok(None)
 }
 
 async fn reconcile_personal_founding_invoice(
@@ -6791,13 +12590,46 @@ async fn sponsored_invoice_paid(
     let Some(organization_id) = organization_id else {
         return Ok(None);
     };
+    let period_start = invoice_period_start(object);
+    let period_end = invoice_period_end(object)
+        .ok_or_else(|| Error::Config("paid sponsored invoice has no period end".into()))?;
+    let allowed_transfer_ids: Vec<String> = if let Some(period_start) = period_start {
+        sqlx::query_scalar(
+            "SELECT transfer.transfer_id FROM billing_transfer_intents AS transfer \
+             JOIN billing_sponsored_operations AS operation \
+               ON operation.operation_id = transfer.destination_operation_id \
+             WHERE transfer.effective_from = $3 AND transfer.state IN \
+                 ('pending','destination_prepared','destination_paid','source_adjustment_pending', \
+                  'source_restoration_pending','unknown') \
+               AND ((transfer.destination_kind = 'sponsor' \
+                     AND transfer.destination_organization_id = $1 \
+                     AND transfer.destination_provider_subscription_id = $2 \
+                     AND operation.organization_id = $1 \
+                     AND operation.provider_subscription_id = $2) \
+                 OR (transfer.source_kind = 'sponsor' \
+                     AND transfer.source_organization_id = $1 \
+                     AND transfer.source_provider_subscription_id = $2 \
+                     AND transfer.source_schedule_id IS NOT NULL \
+                     AND operation.operation_id = transfer.transfer_id || ':destination:source' \
+                     AND operation.organization_id = $1 \
+                     AND operation.provider_subscription_id = $2)) \
+               AND operation.state IN ('provider_pending','active') \
+             ORDER BY transfer.transfer_id COLLATE \"C\"",
+        )
+        .bind(&organization_id)
+        .bind(subscription_id)
+        .bind(period_start)
+        .fetch_all(&mut **tx)
+        .await?
+    } else {
+        Vec::new()
+    };
+    lock_sponsored_subscription_beneficiaries_except(tx, &organization_id, &allowed_transfer_ids)
+        .await?;
     let payment_reference = object["payment_intent"]
         .as_str()
         .or_else(|| object["id"].as_str())
         .ok_or_else(|| Error::Config("paid sponsored invoice has no payment reference".into()))?;
-    let period_end = invoice_period_end(object)
-        .ok_or_else(|| Error::Config("paid sponsored invoice has no period end".into()))?;
-    let period_start = invoice_period_start(object);
     let paid_at = object["status_transitions"]["paid_at"]
         .as_i64()
         .or_else(|| object["created"].as_i64())
@@ -6833,8 +12665,10 @@ async fn sponsored_invoice_paid(
             .map_err(Error::from)?;
         }
     }
-    let operations: Vec<(String, String)> = sqlx::query_as(
-        "SELECT operation_id, offer FROM billing_sponsored_operations \
+    let line_terms = sponsored_invoice_line_terms(object);
+    let operations: Vec<(String, String, i64, Option<String>, String)> = sqlx::query_as(
+        "SELECT operation_id, offer, effective_from, provider_item_id, action \
+         FROM billing_sponsored_operations \
          WHERE organization_id = $1 \
            AND state = 'provider_pending' AND provider_subscription_id = $2 \
            AND effective_from < $3 \
@@ -6845,15 +12679,22 @@ async fn sponsored_invoice_paid(
     .bind(period_end)
     .fetch_all(&mut **tx)
     .await?;
-    for (operation_id, offer) in operations {
+    for (operation_id, offer, effective_from, recorded_item_id, action) in operations {
         let offer = billing_offer(&offer)?;
-        let provider_item_id = line_items
-            .iter()
-            .find(|(_, price_id, _)| price_id == catalogue.id_for(offer))
-            .map(|(item_id, _, _)| item_id.clone());
-        if provider_item_id.is_none() {
+        // A shared subscription can have the same price on multiple lines. Only settle this
+        // operation when one invoice line identifies both its item and the term that began at
+        // (or after) the operation's effective boundary. Invoice-wide max period_end is not
+        // enough: a long annual line must not settle a monthly operation early.
+        let Some(provider_item_id) = sponsored_invoice_line_item_for_operation(
+            &line_terms,
+            catalogue.id_for(offer),
+            effective_from,
+            recorded_item_id.as_deref(),
+            action != "remove",
+        ) else {
             continue;
-        }
+        };
+        let provider_item_id = Some(provider_item_id);
         let evidence = sponsored_billing::SponsoredProviderEvidence {
             customer_id: customer_id.clone(),
             subscription_id: subscription_id.to_string(),
@@ -6865,11 +12706,29 @@ async fn sponsored_invoice_paid(
         if record_sponsored_founding_award(tx, &operation_id, &evidence, period_start, paid_at)
             .await?
         {
+            enqueue_sponsored_checkout_outcome(
+                tx,
+                &operation_id,
+                crate::notifications::CheckoutOutcome::Completed,
+            )
+            .await?;
+            crate::notifications::enqueue_sponsorship_change_in_tx(tx, &operation_id)
+                .await
+                .map_err(notification_error)?;
             continue;
         }
         sponsored_billing::complete_paid_checkout(tx, &operation_id, &evidence)
             .await
             .map_err(Error::from)?;
+        enqueue_sponsored_checkout_outcome(
+            tx,
+            &operation_id,
+            crate::notifications::CheckoutOutcome::Completed,
+        )
+        .await?;
+        crate::notifications::enqueue_sponsorship_change_in_tx(tx, &operation_id)
+            .await
+            .map_err(notification_error)?;
     }
     Ok(Some(organization_id))
 }
@@ -7103,6 +12962,62 @@ fn sponsored_invoice_items(object: &serde_json::Value) -> Vec<(String, String, i
         .collect()
 }
 
+fn sponsored_invoice_line_terms(
+    object: &serde_json::Value,
+) -> Vec<(String, String, i64, i64, i64, bool)> {
+    object["lines"]["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|line| {
+            let item_id = line["subscription_item"].as_str().or_else(|| {
+                line["parent"]["subscription_item_details"]["subscription_item"].as_str()
+            })?;
+            let price_id = line["price"]["id"]
+                .as_str()
+                .or_else(|| line["pricing"]["price_details"]["price"].as_str())
+                .or_else(|| line["parent"]["subscription_item_details"]["price"].as_str())?;
+            let period_start = line["period"]["start"].as_i64()?;
+            let period_end = line["period"]["end"].as_i64()?;
+            let amount = line["amount"].as_i64()?;
+            let proration = line["parent"]["subscription_item_details"]["proration"]
+                .as_bool()
+                .or_else(|| line["proration"].as_bool())?;
+            (period_start >= 0 && period_end > period_start).then(|| {
+                (
+                    item_id.to_string(),
+                    price_id.to_string(),
+                    period_start,
+                    period_end,
+                    amount,
+                    proration,
+                )
+            })
+        })
+        .collect()
+}
+
+fn sponsored_invoice_line_item_for_operation(
+    line_terms: &[(String, String, i64, i64, i64, bool)],
+    expected_price_id: &str,
+    effective_from: i64,
+    recorded_item_id: Option<&str>,
+    require_positive_amount: bool,
+) -> Option<String> {
+    let mut matches = line_terms.iter().filter(
+        |(item_id, price_id, period_start, period_end, amount, proration)| {
+            price_id == expected_price_id
+                && effective_from < *period_end
+                && (!require_positive_amount || *amount > 0)
+                && (effective_from <= *period_start
+                    || (*proration && *period_start <= effective_from))
+                && recorded_item_id.is_none_or(|recorded_item_id| recorded_item_id == item_id)
+        },
+    );
+    let (item_id, _, _, _, _, _) = matches.next()?;
+    matches.next().is_none().then(|| item_id.clone())
+}
+
 /// The subscription ended for good: back to the free tier (existing data stays readable - the
 /// entitlement gates are creation-time only).
 async fn subscription_deleted(
@@ -7113,6 +13028,15 @@ async fn subscription_deleted(
         let subscription_id = object["id"].as_str().ok_or_else(|| {
             Error::Config("personal subscription event has no subscription id".into())
         })?;
+        let transfer_ids = live_transfer_ids_for_subscription(tx, subscription_id).await?;
+        billing_transfers::lock_and_check_no_provider_transfer_except(
+            tx,
+            &[user_id.as_str()],
+            &transfer_ids,
+            sponsored_billing::current_epoch(),
+        )
+        .await
+        .map_err(Error::from)?;
         sqlx::query(
             "UPDATE billing_personal_accounts SET state = 'canceled', \
              stripe_subscription_id = COALESCE(stripe_subscription_id, $2), updated_at = now() \
@@ -7122,12 +13046,14 @@ async fn subscription_deleted(
         .bind(subscription_id)
         .execute(&mut **tx)
         .await?;
+        record_terminal_destination_transfer(tx, subscription_id).await?;
         return Ok(());
     }
     if let Some(organization_id) = sponsored_subscription_organization(tx, object).await? {
         let subscription_id = object["id"].as_str().ok_or_else(|| {
             Error::Config("sponsored subscription event has no subscription id".into())
         })?;
+        record_terminal_destination_transfer(tx, subscription_id).await?;
         apply_sponsored_subscription_state(
             tx,
             &organization_id,
@@ -7379,7 +13305,610 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "e2e-test-clock")]
+    #[test]
+    fn test_clock_checkout_replays_only_with_its_original_customer() {
+        assert!(test_checkout_customer_matches(None, None));
+        assert!(test_checkout_customer_matches(None, Some("cus_existing")));
+        assert!(test_checkout_customer_matches(
+            Some("cus_original"),
+            Some("cus_original")
+        ));
+        assert!(!test_checkout_customer_matches(
+            Some("cus_original"),
+            Some("cus_different")
+        ));
+        assert!(!test_checkout_customer_matches(Some("cus_original"), None));
+    }
+    use axum::response::IntoResponse;
+    use std::collections::HashSet;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use tokio::net::TcpListener;
+    use uuid::Uuid;
+
+    #[derive(Clone)]
+    struct PreviewHttpState {
+        request: Arc<Mutex<Option<String>>>,
+    }
+
+    async fn preview_http_mock(
+        State(state): State<PreviewHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let body = axum::body::to_bytes(request.into_body(), 16 * 1024)
+            .await
+            .expect("small Stripe preview request");
+        *state.request.lock().expect("preview request lock") =
+            Some(String::from_utf8(body.to_vec()).expect("form body is UTF-8"));
+        axum::Json(serde_json::json!({
+            "object": "invoice",
+            "parent": {"subscription_details": {"subscription": "sub-preview"}},
+            "lines": {"data": [{
+                "parent": {"type": "subscription_item_details", "subscription_item_details": {
+                    "subscription": "sub-preview", "proration": false
+                }},
+                "pricing": {"price_details": {"price": "price-monthly"}},
+                "period": {"start": 1_802_592_000, "end": 1_805_270_400}
+            }]}
+        }))
+        .into_response()
+    }
+
+    async fn preview_http_server() -> (
+        String,
+        Arc<Mutex<Option<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind preview mock");
+        let address = listener.local_addr().expect("preview mock address");
+        let request = Arc::new(Mutex::new(None));
+        let state = PreviewHttpState {
+            request: request.clone(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/v1/invoices/create_preview",
+                axum::routing::post(preview_http_mock),
+            )
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve preview mock");
+        });
+        (format!("http://{address}"), request, server)
+    }
+
+    #[derive(Clone)]
+    struct RefundHttpState {
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn refund_http_mock(
+        State(state): State<RefundHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let path = request.uri().to_string();
+        state
+            .requests
+            .lock()
+            .expect("refund request log lock")
+            .push(path.clone());
+        match path.as_str() {
+            "/v1/refunds/re_verified" => axum::Json(serde_json::json!({
+                "id": "re_verified",
+                "status": "succeeded",
+                "payment_intent": "pi_expected",
+                "charge": "ch_expected",
+                "amount": 299,
+                "currency": "gbp"
+            }))
+            .into_response(),
+            "/v1/payment_intents/pi_expected" => axum::Json(serde_json::json!({
+                "id": "pi_expected",
+                "status": "succeeded",
+                "amount_received": 799,
+                "currency": "gbp",
+                "latest_charge": "ch_expected"
+            }))
+            .into_response(),
+            "/v1/charges/ch_expected" => axum::Json(serde_json::json!({
+                "id": "ch_expected",
+                "payment_intent": "pi_expected",
+                "currency": "gbp",
+                "amount_captured": 799,
+                "amount_refunded": 799
+            }))
+            .into_response(),
+            _ => axum::http::StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn refund_http_server() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>)
+    {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind refund mock");
+        let address = listener.local_addr().expect("refund mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route("/{*path}", axum::routing::any(refund_http_mock))
+            .with_state(RefundHttpState {
+                requests: requests.clone(),
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve refund mock");
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    type CapturedSponsoredCheckoutRequests = Arc<Mutex<Vec<(Option<String>, String)>>>;
+
+    #[derive(Clone)]
+    struct SponsoredCheckoutHttpState {
+        requests: CapturedSponsoredCheckoutRequests,
+        calls: Arc<AtomicUsize>,
+        accepted_keys: Arc<Mutex<HashSet<String>>>,
+        remote_creations: Arc<AtomicUsize>,
+    }
+
+    async fn sponsored_checkout_http_mock(
+        State(state): State<SponsoredCheckoutHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let idempotency_key = request
+            .headers()
+            .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = axum::body::to_bytes(request.into_body(), 16 * 1024)
+            .await
+            .expect("small sponsored Checkout request");
+        state
+            .requests
+            .lock()
+            .expect("sponsored Checkout request lock")
+            .push((
+                idempotency_key.clone(),
+                String::from_utf8(body.to_vec()).expect("form body is UTF-8"),
+            ));
+        if let Some(key) = idempotency_key.as_ref() {
+            let mut accepted_keys = state
+                .accepted_keys
+                .lock()
+                .expect("accepted Checkout idempotency keys");
+            if accepted_keys.insert(key.clone()) {
+                state.remote_creations.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        if state.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "error": {"type": "api_error", "code": "api_error"}
+                })),
+            )
+                .into_response();
+        }
+        axum::Json(serde_json::json!({
+            "id": "cs_recovered_http",
+            "url": "https://checkout.stripe.test/cs_recovered_http",
+            "customer": "cus_recovered_http",
+            "subscription": null,
+            "automatic_tax": {"enabled": true}
+        }))
+        .into_response()
+    }
+
+    async fn sponsored_checkout_http_server() -> (
+        String,
+        CapturedSponsoredCheckoutRequests,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind sponsored Checkout mock");
+        let address = listener
+            .local_addr()
+            .expect("sponsored Checkout mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let remote_creations = Arc::new(AtomicUsize::new(0));
+        let state = SponsoredCheckoutHttpState {
+            requests: requests.clone(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            accepted_keys: Arc::new(Mutex::new(HashSet::new())),
+            remote_creations: remote_creations.clone(),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/v1/checkout/sessions",
+                axum::routing::post(sponsored_checkout_http_mock),
+            )
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve sponsored Checkout mock");
+        });
+        (
+            format!("http://{address}"),
+            requests,
+            remote_creations,
+            server,
+        )
+    }
+
+    #[derive(Clone)]
+    struct SponsoredScheduleVerificationHttpState {
+        subscription: serde_json::Value,
+        schedule: serde_json::Value,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn sponsored_schedule_verification_http_mock(
+        State(state): State<SponsoredScheduleVerificationHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let path = request.uri().path().to_owned();
+        state
+            .requests
+            .lock()
+            .expect("schedule verification request lock")
+            .push(path.clone());
+        match path.as_str() {
+            "/v1/subscriptions/sub_recovery_http" => axum::Json(state.subscription).into_response(),
+            "/v1/subscription_schedules/sched_recovery_http" => {
+                axum::Json(state.schedule).into_response()
+            }
+            _ => (
+                axum::http::StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({
+                    "error": {"type": "invalid_request_error", "code": "resource_missing"}
+                })),
+            )
+                .into_response(),
+        }
+    }
+
+    async fn sponsored_schedule_verification_http_server(
+        schedule: serde_json::Value,
+    ) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind sponsored schedule verification mock");
+        let address = listener
+            .local_addr()
+            .expect("sponsored schedule verification mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = SponsoredScheduleVerificationHttpState {
+            subscription: serde_json::json!({
+                "id": "sub_recovery_http",
+                "object": "subscription",
+                "customer": "cus_recovery_http",
+                "status": "active",
+                "automatic_tax": {"enabled": false},
+                "cancel_at_period_end": false,
+                "cancel_at": null,
+                "default_payment_method": "pm_recovery_http",
+                "schedule": "sched_recovery_http",
+                "items": {"data": [{
+                    "id": "si_recovery_http",
+                    "price": {"id": "price_current_http"},
+                    "quantity": 1,
+                    "current_period_start": 1_600_000_000_i64,
+                    "current_period_end": 1_700_000_000_i64
+                }]}
+            }),
+            schedule,
+            requests: requests.clone(),
+        };
+        let app = axum::Router::new()
+            .fallback(axum::routing::any(
+                sponsored_schedule_verification_http_mock,
+            ))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve sponsored schedule verification mock");
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    #[derive(Clone)]
+    struct SponsoredTaxScheduleHttpState {
+        requests: Arc<Mutex<Vec<(String, String, String)>>>,
+    }
+
+    async fn sponsored_tax_schedule_http_mock(
+        State(state): State<SponsoredTaxScheduleHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let method = request.method().to_string();
+        let path = request.uri().path().to_owned();
+        let body = axum::body::to_bytes(request.into_body(), 16 * 1024)
+            .await
+            .expect("small schedule update body");
+        let body = String::from_utf8(body.to_vec()).expect("form body is UTF-8");
+        state
+            .requests
+            .lock()
+            .expect("tax schedule request lock")
+            .push((method.clone(), path.clone(), body));
+
+        let response = match (method.as_str(), path.as_str()) {
+            ("GET", "/v1/subscriptions/sub_tax_preserved") => serde_json::json!({
+                "id":"sub_tax_preserved", "object":"subscription", "customer":"cus_tax",
+                "status":"active", "automatic_tax":{"enabled":true},
+                "cancel_at_period_end":false, "cancel_at":null,
+                "schedule":"sched_tax_preserved",
+                "items":{"data":[{
+                    "id":"si_tax_current", "price":{"id":"price_current"}, "quantity":1,
+                    "current_period_start":1600000000_i64, "current_period_end":1700000000_i64
+                }]}
+            }),
+            ("GET", "/v1/subscription_schedules/sched_tax_preserved") => serde_json::json!({
+                "id":"sched_tax_preserved", "subscription":"sub_tax_preserved",
+                "end_behavior":"release",
+                "phases":[
+                    {
+                        "start_date":1600000000_i64, "end_date":1700000000_i64,
+                        "automatic_tax":{"enabled":true},
+                        "items":[{"price":"price_current", "quantity":1}]
+                    },
+                    {
+                        "start_date":1700000000_i64, "end_date":1800000000_i64,
+                        "automatic_tax":{"enabled":true},
+                        "items":[{"price":"price_next", "quantity":2}]
+                    }
+                ]
+            }),
+            ("POST", "/v1/subscription_schedules/sched_tax_preserved") => {
+                serde_json::json!({"id":"sched_tax_preserved"})
+            }
+            _ => {
+                return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::NOT_FOUND)
+                    .body(axum::body::Body::from("{}"))
+                    .expect("mock response")
+            }
+        };
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(response.to_string()))
+            .expect("mock response")
+    }
+
+    async fn sponsored_tax_schedule_http_server() -> (
+        String,
+        Arc<Mutex<Vec<(String, String, String)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind sponsored tax schedule mock");
+        let address = listener.local_addr().expect("mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .fallback(axum::routing::any(sponsored_tax_schedule_http_mock))
+            .with_state(SponsoredTaxScheduleHttpState {
+                requests: requests.clone(),
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve sponsored tax schedule mock");
+        });
+        (format!("http://{address}"), requests, server)
+    }
+
+    #[derive(Clone)]
+    struct CancellationHttpState {
+        requests: Arc<Mutex<Vec<(String, String, String)>>>,
+        updated_schedules: Arc<Mutex<HashSet<String>>>,
+        boundary_cancelled: Arc<Mutex<bool>>,
+    }
+
+    async fn cancellation_http_mock(
+        State(state): State<CancellationHttpState>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response<axum::body::Body> {
+        let method = request.method().to_string();
+        let path = request.uri().path().to_owned();
+        let body = axum::body::to_bytes(request.into_body(), 16 * 1024)
+            .await
+            .expect("small Stripe mock body");
+        let body = String::from_utf8(body.to_vec()).expect("form body is UTF-8");
+        state.requests.lock().expect("request log lock").push((
+            method.clone(),
+            path.clone(),
+            body.clone(),
+        ));
+        if method == "POST" && path.starts_with("/v1/subscription_schedules/") {
+            let schedule_id = path.trim_start_matches("/v1/subscription_schedules/");
+            state
+                .updated_schedules
+                .lock()
+                .expect("updated schedule lock")
+                .insert(schedule_id.to_owned());
+        }
+        if method == "POST" && path == "/v1/subscriptions/sub_boundary_direct" {
+            *state
+                .boundary_cancelled
+                .lock()
+                .expect("boundary cancellation lock") = true;
+        }
+        let boundary_cancelled = *state
+            .boundary_cancelled
+            .lock()
+            .expect("boundary cancellation lock");
+        let schedule_updated = state
+            .updated_schedules
+            .lock()
+            .expect("updated schedule lock")
+            .clone();
+        let value = match (method.as_str(), path.as_str()) {
+            ("GET", "/v1/subscriptions/search") => serde_json::json!({
+                "object":"search_result", "data":[{
+                    "id":"sub_restored", "object":"subscription", "customer":"cus_original",
+                    "status":"incomplete", "default_payment_method":"pm_saved",
+                    "automatic_tax":{"enabled":false},
+                    "cancel_at_period_end":false, "cancel_at":null,
+                    "metadata":{
+                        "personal_user_id":"user_restore", "operation_id":"transfer:one:source-restoration",
+                        "sotto_allocation_reference":"alloc_restore", "sotto_transfer_id":"transfer:one"
+                    },
+                    "items":{"data":[{
+                        "id":"si_restored", "price":{"id":"price_standard_monthly"}, "quantity":1,
+                        "current_period_start":1700000000, "current_period_end":1702592000
+                    }]}
+                }]
+            }),
+            ("GET", "/v1/subscriptions/sub_scheduled") => serde_json::json!({
+                "id":"sub_scheduled", "customer":"cus_test", "status":"active",
+                "automatic_tax":{"enabled":false},
+                "cancel_at_period_end":false,
+                "cancel_at":if schedule_updated.contains("sched_test") { Some(1707776000) } else { None::<i64> },
+                "schedule":"sched_test", "items":{"data":[{
+                    "id":"si_test", "price":{"id":"price_founding_monthly"}, "quantity":1,
+                    "current_period_start":1705184000, "current_period_end":1707776000
+                }]}
+            }),
+            ("GET", "/v1/subscription_schedules/sched_test")
+                if schedule_updated.contains("sched_test") =>
+            {
+                serde_json::json!({
+                    "id":"sched_test", "subscription":"sub_scheduled", "end_behavior":"cancel",
+                    "current_phase":{"start_date":1702592000,"end_date":1707776000},
+                    "phases":[{"start_date":1702592000,"end_date":1707776000,"items":[{
+                        "price":{"id":"price_founding_monthly"},"quantity":1
+                    }]}]
+                })
+            }
+            ("GET", "/v1/subscription_schedules/sched_test") => serde_json::json!({
+                "id":"sched_test", "subscription":"sub_scheduled", "end_behavior":"cancel",
+                "current_phase":{"start_date":1702592000,"end_date":1710368000},
+                "phases":[{"start_date":1702592000,"end_date":1710368000,"items":[{
+                    "price":{"id":"price_founding_monthly"},"quantity":1
+                }]}]
+            }),
+            ("POST", "/v1/subscription_schedules/sched_test") => serde_json::json!({
+                "id":"sched_test", "subscription":"sub_scheduled", "end_behavior":"cancel",
+                "current_phase":{"start_date":1702592000,"end_date":1707776000},
+                "phases":[{"start_date":1702592000,"end_date":1707776000,"items":[{
+                    "price":{"id":"price_founding_monthly"},"quantity":1
+                }]}]
+            }),
+            ("GET", "/v1/subscriptions/sub_transition") => serde_json::json!({
+                "id":"sub_transition", "customer":"cus_test", "status":"active",
+                "automatic_tax":{"enabled":false},
+                "cancel_at_period_end":false, "cancel_at":null,
+                "schedule":"sched_transition", "items":{"data":[{
+                    "id":"si_transition", "price":{"id":"price_founding_monthly"}, "quantity":1,
+                    "current_period_start":1705184000, "current_period_end":1707776000
+                }]}
+            }),
+            ("GET", "/v1/subscription_schedules/sched_transition")
+                if schedule_updated.contains("sched_transition") =>
+            {
+                serde_json::json!({
+                    "id":"sched_transition", "subscription":"sub_transition", "end_behavior":"release",
+                    "current_phase":{"start_date":1702592000,"end_date":1707776000},
+                    "phases":[
+                        {"start_date":1702592000,"end_date":1707776000,"items":[{
+                            "price":{"id":"price_founding_monthly"},"quantity":1
+                        }]},
+                        {"start_date":1707776000,"end_date":1710368000,"items":[{
+                            "price":{"id":"price_standard_monthly"},"quantity":1
+                        }]}
+                    ]
+                })
+            }
+            ("GET", "/v1/subscription_schedules/sched_transition") => serde_json::json!({
+                "id":"sched_transition", "subscription":"sub_transition", "end_behavior":"release",
+                "current_phase":{"start_date":1702592000,"end_date":1710368000},
+                "phases":[{"start_date":1702592000,"end_date":1710368000,"items":[{
+                    "price":{"id":"price_founding_monthly"},"quantity":1
+                }]}]
+            }),
+            ("POST", "/v1/subscription_schedules/sched_transition") => serde_json::json!({
+                "id":"sched_transition", "subscription":"sub_transition", "end_behavior":"release",
+                "current_phase":{"start_date":1702592000,"end_date":1707776000},
+                "phases":[
+                    {"start_date":1702592000,"end_date":1707776000,"items":[{
+                        "price":{"id":"price_founding_monthly"},"quantity":1
+                    }]},
+                    {"start_date":1707776000,"end_date":1710368000,"items":[{
+                        "price":{"id":"price_standard_monthly"},"quantity":1
+                    }]}
+                ]
+            }),
+            ("GET", "/v1/subscriptions/sub_unscheduled") => serde_json::json!({
+                "id":"sub_unscheduled", "customer":"cus_test", "status":"active",
+                "automatic_tax":{"enabled":false},
+                "cancel_at_period_end":false, "cancel_at":null,
+                "items":{"data":[{
+                    "id":"si_test", "price":{"id":"price_standard_monthly"}, "quantity":1,
+                    "current_period_start":1700000000, "current_period_end":1702592000
+                }]}
+            }),
+            ("GET", "/v1/subscriptions/sub_boundary_direct") => serde_json::json!({
+                "id":"sub_boundary_direct", "customer":"cus_test", "status":"active",
+                "automatic_tax":{"enabled":false},
+                "cancel_at_period_end":false,
+                "cancel_at":if boundary_cancelled { Some(1707776000) } else { None::<i64> },
+                "items":{"data":[{
+                    "id":"si_boundary", "price":{"id":"price_standard_monthly"}, "quantity":1,
+                    "current_period_start":1705184000, "current_period_end":1707776000
+                }]}
+            }),
+            ("POST", "/v1/subscriptions/sub_boundary_direct") => serde_json::json!({
+                "id":"sub_boundary_direct", "status":"active"
+            }),
+            ("POST", "/v1/subscriptions/sub_unscheduled") => serde_json::json!({
+                "id":"sub_unscheduled", "status":"active"
+            }),
+            _ => {
+                return axum::response::Response::builder()
+                    .status(axum::http::StatusCode::NOT_FOUND)
+                    .body(axum::body::Body::from("{}"))
+                    .expect("mock response")
+            }
+        };
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(value.to_string()))
+            .expect("mock response")
+    }
+
+    async fn cancellation_http_server() -> (
+        String,
+        Arc<Mutex<Vec<(String, String, String)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind Stripe HTTP mock");
+        let address = listener.local_addr().expect("mock address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let router = Router::new()
+            .fallback(axum::routing::any(cancellation_http_mock))
+            .with_state(CancellationHttpState {
+                requests: requests.clone(),
+                updated_schedules: Arc::new(Mutex::new(HashSet::new())),
+                boundary_cancelled: Arc::new(Mutex::new(false)),
+            });
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://{address}"), requests, task)
+    }
 
     #[test]
     fn founding_price_moves_to_standard_at_the_award_boundary() {
@@ -7725,6 +14254,1129 @@ mod tests {
     }
 
     #[test]
+    fn personal_schedule_cancellation_keeps_only_the_paid_phase() {
+        let current_items = vec![SponsoredSubscriptionItem {
+            provider_item_id: "si_personal".into(),
+            provider_price_id: "price_founding_monthly".into(),
+            quantity: 1,
+        }];
+        let form =
+            personal_schedule_cancellation_form(1_700_000_000, 1_702_592_000, &current_items);
+        assert!(form.contains(&("end_behavior".into(), "cancel".into())));
+        assert!(form.contains(&("proration_behavior".into(), "none".into())));
+        assert!(form.contains(&("phases[0][start_date]".into(), "1700000000".into())));
+        assert!(form.contains(&("phases[0][end_date]".into(), "1702592000".into())));
+        assert!(form.contains(&(
+            "phases[0][items][0][price]".into(),
+            "price_founding_monthly".into()
+        )));
+        assert!(!form.iter().any(|(key, _)| key.starts_with("phases[1]")));
+        assert_eq!(
+            personal_schedule_cancellation_idempotency_key(
+                "sub_personal_1",
+                1_702_592_000,
+                "request-1"
+            ),
+            "sotto-personal-cancel:sub_personal_1:1702592000:19f1064b619d49d35392eac7261cd726"
+        );
+
+        let readback = serde_json::json!({
+            "id": "sub_sched_1",
+            "subscription": {"id": "sub_personal_1"},
+            "end_behavior": "cancel",
+            "phases": [{
+                "start_date": 1_700_000_000,
+                "end_date": 1_702_592_000,
+                "items": [{"price": {"id": "price_founding_monthly"}, "quantity": 1}]
+            }]
+        });
+        assert_eq!(
+            stripe_schedule_subscription_id(&readback),
+            Some("sub_personal_1")
+        );
+        assert_eq!(readback["end_behavior"].as_str(), Some("cancel"));
+        assert!(stripe_schedule_contains_phases(
+            &readback,
+            1_700_000_000,
+            1_702_592_000,
+            &current_items,
+            &[],
+        ));
+    }
+
+    #[tokio::test]
+    async fn stripe_personal_cancellation_updates_schedules_and_direct_subscriptions() {
+        let (origin, requests, server) = cancellation_http_server().await;
+        let schedule_readback = serde_json::json!({
+            "id":"sched_test", "subscription":"sub_scheduled", "end_behavior":"cancel",
+            "phases":[{"start_date":1702592000,"end_date":1707776000,"items":[{
+                "price":{"id":"price_founding_monthly"},"quantity":1
+            }]}]
+        });
+        assert!(stripe_schedule_contains_phases(
+            &schedule_readback,
+            1702592000,
+            1707776000,
+            &[SponsoredSubscriptionItem {
+                provider_item_id: "si_test".into(),
+                provider_price_id: "price_founding_monthly".into(),
+                quantity: 1,
+            }],
+            &[]
+        ));
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_test".into(),
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+
+        let scheduled = provider
+            .cancel_personal_subscription("sub_scheduled", "cancel-request", "user")
+            .await;
+        assert!(
+            scheduled.is_ok(),
+            "scheduled cancellation succeeds after read-back: {:?}; requests: {:?}",
+            scheduled,
+            requests.lock().expect("request log lock")
+        );
+        assert!(matches!(scheduled, Ok(SubscriptionObservation::Current(_))));
+        let unscheduled = provider
+            .cancel_personal_subscription("sub_unscheduled", "cancel-unscheduled", "user")
+            .await
+            .expect("unscheduled cancellation succeeds");
+        assert!(matches!(unscheduled, SubscriptionObservation::Current(_)));
+        let transitioned = provider
+            .update_personal_subscription(
+                "sub_transition",
+                &[SponsoredSubscriptionPhase {
+                    start_at_epoch: 1707776000,
+                    end_at_epoch: None,
+                    items: vec![SponsoredSubscriptionItemRequest {
+                        provider_price_id: "price_standard_monthly".into(),
+                        quantity: 1,
+                    }],
+                }],
+                "transition-request",
+            )
+            .await;
+        assert!(
+            transitioned.is_ok(),
+            "transition update retains the active schedule phase start: {:?}; requests: {:?}",
+            transitioned,
+            requests.lock().expect("request log lock")
+        );
+        let transitioned = transitioned.expect("transition update returned snapshot");
+        assert_eq!(
+            transitioned.schedule_id.as_deref(),
+            Some("sched_transition")
+        );
+
+        let requests = requests.lock().expect("request log lock").clone();
+        assert_eq!(requests.len(), 12);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(method, path, _)| {
+                    method == "GET" && path == "/v1/subscription_schedules/sched_test"
+                })
+                .count(),
+            2,
+            "scheduled cancellation verifies the updated schedule"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(method, path, _)| {
+                    method == "GET" && path == "/v1/subscriptions/sub_scheduled"
+                })
+                .count(),
+            2,
+            "scheduled cancellation reads the subscription before and after the update"
+        );
+        let schedule_update = requests
+            .iter()
+            .find(|(method, path, _)| {
+                method == "POST" && path == "/v1/subscription_schedules/sched_test"
+            })
+            .expect("schedule update request");
+        assert!(schedule_update.2.contains("end_behavior=cancel"));
+        assert!(schedule_update
+            .2
+            .contains("phases%5B0%5D%5Bstart_date%5D=1702592000"));
+        assert!(schedule_update
+            .2
+            .contains("phases%5B0%5D%5Bend_date%5D=1707776000"));
+        assert!(schedule_update.2.contains("proration_behavior=none"));
+        assert!(!schedule_update.2.contains("phases%5B1%5D"));
+        let direct_update = requests
+            .iter()
+            .find(|(method, path, _)| {
+                method == "POST" && path == "/v1/subscriptions/sub_unscheduled"
+            })
+            .expect("direct subscription update request");
+        assert!(direct_update.2.contains("cancel_at_period_end=true"));
+        let transition_update = requests
+            .iter()
+            .find(|(method, path, _)| {
+                method == "POST" && path == "/v1/subscription_schedules/sched_transition"
+            })
+            .expect("transition schedule update request");
+        assert!(transition_update
+            .2
+            .contains("phases%5B0%5D%5Bstart_date%5D=1702592000"));
+        assert!(transition_update
+            .2
+            .contains("phases%5B0%5D%5Bend_date%5D=1707776000"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sponsored_transfer_reads_the_next_period_from_stripe_preview() {
+        let (origin, request, server) = preview_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_test".into(),
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+        let end = provider
+            .preview_transfer_period_end("sub-preview", "price-monthly", 1_802_592_000)
+            .await
+            .expect("Stripe preview returns the sponsor's anchored renewal period");
+        assert_eq!(end, 1_805_270_400);
+        let request = request.lock().expect("preview request lock");
+        let body = request.as_deref().expect("preview request was sent");
+        assert!(body.contains("subscription=sub-preview"));
+        drop(request);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn refund_recovery_uses_charge_totals_without_listing_refunds() {
+        let (origin, requests, server) = refund_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_test".into(),
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+        let refund = provider
+            .get_refund("re_verified")
+            .await
+            .expect("retrieve the existing refund by its Stripe id");
+        assert_eq!(refund.refund_id, "re_verified");
+        assert_eq!(refund.payment_reference, "pi_expected");
+        assert_eq!(refund.charge_id.as_deref(), Some("ch_expected"));
+        assert_eq!(refund.amount_pence, 299);
+        assert_eq!(refund.currency, "gbp");
+        assert_eq!(
+            provider
+                .get_refundable_amount("pi_expected", "ch_expected", 299)
+                .await
+                .expect("read the remaining amount for full-refund validation"),
+            (299, "gbp".into())
+        );
+        assert!(provider
+            .get_refundable_amount("pi_expected", "ch_other", 299)
+            .await
+            .is_err());
+        assert_eq!(
+            *requests.lock().expect("refund request log lock"),
+            [
+                "/v1/refunds/re_verified".to_string(),
+                "/v1/payment_intents/pi_expected".to_string(),
+                "/v1/charges/ch_expected".to_string(),
+                "/v1/payment_intents/pi_expected".to_string()
+            ]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sponsored_failure_fanout_and_resolution_cover_bounded_recipients() {
+        if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+        let options =
+            sqlx::postgres::PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
+        assert!(
+            matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+            "refusing to write test fixtures to non-local database: {}",
+            options.get_host()
+        );
+        let pool = crate::db::connect(&database_url)
+            .await
+            .expect("connect test database");
+        crate::db::migrate(&pool)
+            .await
+            .expect("migrate test database");
+
+        let fixture = Uuid::new_v4().simple().to_string();
+        let account_id = format!("acct_sponsor_failure_{fixture}");
+        let customer_id = format!("cus_sponsor_failure_{fixture}");
+        let subscription_id = format!("sub_sponsor_failure_{fixture}");
+        let organization_id = format!("sponsor_failure_org_{fixture}");
+        let administrator_id = format!("sponsor_failure_admin_{fixture}");
+        let additional_administrator_ids = (0..127)
+            .map(|index| format!("sponsor_failure_admin_{fixture}_{index}"))
+            .collect::<Vec<_>>();
+        let beneficiary_ids = (0..128)
+            .map(|index| format!("sponsor_failure_beneficiary_{fixture}_{index}"))
+            .collect::<Vec<_>>();
+        let event_ids = [
+            format!("evt_sponsor_failure_a_{fixture}"),
+            format!("evt_sponsor_failure_b_{fixture}"),
+        ];
+        let invoice_id = format!("in_sponsor_failure_{fixture}");
+        let payer_id = format!("payer_sponsor_failure_{fixture}");
+        let context = ProviderContext::new("stripe", &account_id, ProviderEnvironment::Test)
+            .expect("valid sponsor provider context");
+
+        for user_id in std::iter::once(&administrator_id)
+            .chain(additional_administrator_ids.iter())
+            .chain(beneficiary_ids.iter())
+        {
+            sqlx::query(
+                "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, $2, $1)",
+            )
+            .bind(user_id)
+            .bind(format!("sponsor-failure-{fixture}"))
+            .execute(&pool)
+            .await
+            .expect("insert test user");
+        }
+        sqlx::query("INSERT INTO organizations (id, enc_name, tier) VALUES ($1, $2, 'free')")
+            .bind(&organization_id)
+            .bind(b"opaque".as_slice())
+            .execute(&pool)
+            .await
+            .expect("insert sponsor organisation");
+        for (administrator, role) in std::iter::once((&administrator_id, "owner"))
+            .chain(additional_administrator_ids.iter().map(|id| (id, "admin")))
+        {
+            sqlx::query(
+                "INSERT INTO organization_memberships (org_id, user_id, role) VALUES ($1, $2, $3)",
+            )
+            .bind(&organization_id)
+            .bind(administrator)
+            .bind(role)
+            .execute(&pool)
+            .await
+            .expect("insert sponsor administrator");
+        }
+        sqlx::query(
+            "INSERT INTO billing_sponsored_subscriptions \
+             (organization_id, provider_customer_id, provider_subscription_id, status) \
+             VALUES ($1, $2, $3, 'active')",
+        )
+        .bind(&organization_id)
+        .bind(&customer_id)
+        .bind(&subscription_id)
+        .execute(&pool)
+        .await
+        .expect("insert sponsored subscription");
+
+        let mut allocations = Vec::new();
+        let mut evidence_by_event = [Vec::new(), Vec::new()];
+        for (index, beneficiary_id) in beneficiary_ids.iter().enumerate() {
+            let allocation_reference = format!("alloc_sponsor_failure_{fixture}_{index}");
+            let allocation = VerifiedAllocation::new(
+                format!("allocation_sponsor_failure_{fixture}_{index}"),
+                &payer_id,
+                &customer_id,
+                ProviderPayerKind::Sponsor,
+                beneficiary_id,
+                &subscription_id,
+                "si_sponsor_monthly",
+                &allocation_reference,
+                format!("source_sponsor_failure_{fixture}_{index}"),
+                1_000,
+                None,
+                AllocationState::Active,
+                format!("stripe:sponsor-failure-owner:{fixture}:{index}"),
+            )
+            .expect("valid sponsored allocation");
+            allocations.push(allocation);
+            for event_index in 0..event_ids.len() {
+                evidence_by_event[event_index].push(
+                    crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence::from_sponsored_parts(
+                        &event_ids[event_index],
+                        &invoice_id,
+                        &format!("il_sponsor_failure_{fixture}_{event_index}_{index}"),
+                        &format!("in_sponsor_paid_{fixture}"),
+                        &format!("stripe:sponsor-predecessor:{fixture}"),
+                        &account_id,
+                        ProviderEnvironment::Test,
+                        &allocation_reference,
+                        &customer_id,
+                        &subscription_id,
+                        "si_sponsor_monthly",
+                        "price_sponsor_monthly",
+                        1_000,
+                        2_000,
+                        2_000,
+                        3_000,
+                        2_100 + event_index as i64,
+                        crate::cloud_provider_stripe::StripeInterval::Month,
+                    )
+                    .expect("valid sponsored failure evidence"),
+                );
+            }
+        }
+        let mut registration = pool.begin().await.expect("begin allocation registration");
+        for allocation in &allocations {
+            register_verified_allocation(&mut registration, &context, allocation)
+                .await
+                .expect("register sponsored allocation");
+        }
+        registration
+            .commit()
+            .await
+            .expect("commit allocation registration");
+
+        let event = evidence_by_event[0][0]
+            .verified_event()
+            .expect("invoice wide event identity");
+        assert_eq!(
+            event.normalized_payload_hash,
+            evidence_by_event[0][127]
+                .verified_event()
+                .expect("second invoice wide event identity")
+                .normalized_payload_hash
+        );
+        let preparation = SponsoredRenewalFailurePreparation::Prepared(Box::new(
+            PreparedSponsoredRenewalFailure {
+                context: context.clone(),
+                event,
+                organization_id: organization_id.clone(),
+                subscription_id: subscription_id.clone(),
+                invoice_id: invoice_id.clone(),
+                affected: allocations
+                    .iter()
+                    .cloned()
+                    .zip(evidence_by_event[0].clone())
+                    .collect(),
+            },
+        ));
+        let second_preparation = SponsoredRenewalFailurePreparation::Prepared(Box::new(
+            PreparedSponsoredRenewalFailure {
+                context: context.clone(),
+                event: evidence_by_event[1][0]
+                    .verified_event()
+                    .expect("second shared invoice event identity"),
+                organization_id: organization_id.clone(),
+                subscription_id: subscription_id.clone(),
+                invoice_id: invoice_id.clone(),
+                affected: allocations
+                    .iter()
+                    .cloned()
+                    .zip(evidence_by_event[1].clone())
+                    .collect(),
+            },
+        ));
+        for preparation in [&preparation, &second_preparation] {
+            let mut tx = pool
+                .begin()
+                .await
+                .expect("begin grouped failure transaction");
+            apply_sponsored_renewal_failure(
+                &mut tx,
+                preparation,
+                crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::SignedWebhook,
+            )
+            .await
+            .expect("accept every beneficiary failure atomically");
+            tx.commit().await.expect("commit grouped failure");
+        }
+
+        let failures: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_provider_stripe_renewal_failures WHERE event_id = ANY($1)",
+        )
+        .bind(event_ids.to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("count per allocation failures");
+        let receipts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_provider_event_receipts WHERE event_id = ANY($1)",
+        )
+        .bind(event_ids.to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("count shared event receipts");
+        let notice_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_notice_outbox WHERE event_key = $1 \
+             AND kind IN ('sponsored_renewal_failure','sponsored_renewal_action')",
+        )
+        .bind(opaque_provider_id(
+            "sponsored-renewal-v1",
+            &[&organization_id, &invoice_id],
+        ))
+        .fetch_one(&pool)
+        .await
+        .expect("count beneficiary and administrator notices");
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM billing_sponsored_subscriptions WHERE organization_id = $1",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await
+        .expect("sponsored subscription status");
+        assert_eq!(failures, 256);
+        assert_eq!(receipts, 2);
+        assert_eq!(notice_count, 256);
+        assert_eq!(status, "past_due");
+
+        let event_key =
+            opaque_provider_id("sponsored-renewal-v1", &[&organization_id, &invoice_id]);
+        let mut resolution = pool
+            .begin()
+            .await
+            .expect("begin matching paid invoice resolution");
+        resolve_sponsored_renewal_failures(
+            &mut resolution,
+            &organization_id,
+            &subscription_id,
+            &invoice_id,
+            2_500,
+        )
+        .await
+        .expect("resolve only the matching sponsored invoice");
+        resolution
+            .commit()
+            .await
+            .expect("commit matching invoice resolution");
+        let resolutions: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_provider_stripe_renewal_resolutions WHERE event_id = ANY($1)",
+        )
+        .bind(event_ids.to_vec())
+        .fetch_one(&pool)
+        .await
+        .expect("count resolved beneficiary evidence");
+        let recovered_notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_notice_outbox WHERE event_key = $1 \
+             AND kind = 'recovery_resolved' AND status = 'pending'",
+        )
+        .bind(&event_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count recovery notices");
+        let failure_notices: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM cloud_notice_outbox WHERE event_key = $1 \
+             AND kind IN ('sponsored_renewal_failure','sponsored_renewal_action') \
+             AND status = 'cancelled'",
+        )
+        .bind(&event_key)
+        .fetch_one(&pool)
+        .await
+        .expect("count retired failure notices");
+        assert_eq!(resolutions, 256);
+        assert_eq!(recovered_notices, 256);
+        assert_eq!(failure_notices, 256);
+
+        let paid_event = Event {
+            id: format!("evt_sponsor_paid_{fixture}"),
+            created: 2_600,
+            api_version: Some("2026-07-29.dahlia".into()),
+            kind: "invoice.paid".into(),
+            data: EventData {
+                object: serde_json::json!({
+                    "id": invoice_id,
+                    "subscription": subscription_id,
+                }),
+            },
+        };
+        let mut paid_receipt = pool.begin().await.expect("begin paid invoice receipt");
+        record_webhook_receipt(&mut paid_receipt, &paid_event, Some(&subscription_id))
+            .await
+            .expect("record exact paid invoice identity");
+        mark_webhook_event_processed(&mut paid_receipt, &paid_event.id)
+            .await
+            .expect("mark paid invoice receipt complete");
+        paid_receipt
+            .commit()
+            .await
+            .expect("commit paid invoice receipt");
+        sqlx::query(
+            "UPDATE billing_sponsored_subscriptions SET status = 'active' WHERE organization_id = $1",
+        )
+        .bind(&organization_id)
+        .execute(&pool)
+        .await
+        .expect("reflect the later paid invoice");
+        let mut late_failure = pool.begin().await.expect("begin late failure replay");
+        let late_failure_event = Event {
+            id: event_ids[0].clone(),
+            created: 2_100,
+            api_version: Some("2026-07-29.dahlia".into()),
+            kind: "invoice.payment_failed".into(),
+            data: EventData {
+                object: serde_json::json!({
+                    "id": invoice_id,
+                    "subscription": subscription_id,
+                }),
+            },
+        };
+        assert_eq!(
+            record_webhook_event(&mut late_failure, &late_failure_event)
+                .await
+                .expect("failure receipt takes the subscription lock"),
+            EventDisposition::Apply
+        );
+        apply_sponsored_renewal_failure(
+            &mut late_failure,
+            &preparation,
+            crate::cloud_provider_stripe_renewal_store::StripeRenewalFailureProvenance::SignedWebhook,
+        )
+        .await
+        .expect("processed paid invoice suppresses stale failure");
+        late_failure
+            .commit()
+            .await
+            .expect("commit ignored late failure");
+        let failure_receipt: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT subscription_id, provider_object_id FROM stripe_webhook_events WHERE event_id = $1",
+        )
+        .bind(&late_failure_event.id)
+        .fetch_one(&pool)
+        .await
+        .expect("load failure receipt identity");
+        assert_eq!(failure_receipt.0.as_deref(), Some(subscription_id.as_str()));
+        assert_eq!(failure_receipt.1.as_deref(), Some(invoice_id.as_str()));
+        let status_after_late_failure: String = sqlx::query_scalar(
+            "SELECT status FROM billing_sponsored_subscriptions WHERE organization_id = $1",
+        )
+        .bind(&organization_id)
+        .fetch_one(&pool)
+        .await
+        .expect("subscription remains current after late failure");
+        assert_eq!(status_after_late_failure, "active");
+
+        sqlx::query("DELETE FROM cloud_notice_outbox WHERE event_key = $1")
+            .bind(event_key)
+            .execute(&pool)
+            .await
+            .expect("remove test notices");
+        sqlx::query(
+            "DELETE FROM cloud_provider_stripe_renewal_resolutions WHERE event_id = ANY($1)",
+        )
+        .bind(event_ids.to_vec())
+        .execute(&pool)
+        .await
+        .expect("remove test resolutions");
+        sqlx::query("DELETE FROM cloud_provider_stripe_renewal_failures WHERE event_id = ANY($1)")
+            .bind(event_ids.to_vec())
+            .execute(&pool)
+            .await
+            .expect("remove test evidence");
+        sqlx::query(
+            "DELETE FROM cloud_provider_invalidation_associations WHERE event_id = ANY($1)",
+        )
+        .bind(event_ids.to_vec())
+        .execute(&pool)
+        .await
+        .expect("remove test invalidations");
+        sqlx::query("DELETE FROM cloud_provider_event_receipts WHERE event_id = ANY($1)")
+            .bind(event_ids.to_vec())
+            .execute(&pool)
+            .await
+            .expect("remove test event receipt");
+        sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = $1")
+            .bind(&paid_event.id)
+            .execute(&pool)
+            .await
+            .expect("remove paid webhook receipt");
+        for allocation_index in 0..beneficiary_ids.len() {
+            let allocation_id = format!("allocation_sponsor_failure_{fixture}_{allocation_index}");
+            let source_id = format!("source_sponsor_failure_{fixture}_{allocation_index}");
+            sqlx::query("DELETE FROM cloud_provider_allocations WHERE allocation_id = $1")
+                .bind(allocation_id)
+                .execute(&pool)
+                .await
+                .expect("remove test allocation");
+            sqlx::query("DELETE FROM cloud_coverage_sources WHERE source_id = $1")
+                .bind(source_id)
+                .execute(&pool)
+                .await
+                .expect("remove test source");
+        }
+        sqlx::query("DELETE FROM cloud_coverage_coordinators WHERE beneficiary_id = ANY($1)")
+            .bind(beneficiary_ids.to_vec())
+            .execute(&pool)
+            .await
+            .expect("remove test coordinators");
+        sqlx::query("DELETE FROM cloud_provider_payers WHERE payer_id = $1")
+            .bind(&payer_id)
+            .execute(&pool)
+            .await
+            .expect("remove test payer");
+        sqlx::query("DELETE FROM billing_sponsored_subscriptions WHERE organization_id = $1")
+            .bind(&organization_id)
+            .execute(&pool)
+            .await
+            .expect("remove test sponsored subscription");
+        for table in [
+            "cloud_coverage_heads",
+            "cloud_coverage_revision_facts",
+            "cloud_coverage_revisions",
+        ] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE beneficiary_id = ANY($1)"
+            ))
+            .bind(beneficiary_ids.to_vec())
+            .execute(&pool)
+            .await
+            .expect("remove test coverage projections");
+        }
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(&organization_id)
+            .execute(&pool)
+            .await
+            .expect("remove test organisation");
+        for user_id in std::iter::once(&administrator_id)
+            .chain(additional_administrator_ids.iter())
+            .chain(beneficiary_ids.iter())
+        {
+            sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user_id)
+                .execute(&pool)
+                .await
+                .expect("remove test user");
+        }
+    }
+
+    #[tokio::test]
+    async fn transfer_invoice_webhook_ignores_later_renewals_and_reviews_wrong_boundary_start() {
+        if std::env::var("SOTTO_RUN_DB_TESTS").as_deref() != Ok("1") {
+            return;
+        }
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL is required");
+        let options =
+            sqlx::postgres::PgConnectOptions::from_str(&database_url).expect("parse DATABASE_URL");
+        assert!(
+            matches!(options.get_host(), "localhost" | "127.0.0.1" | "::1"),
+            "refusing to write test fixtures to non-local database: {}",
+            options.get_host()
+        );
+        let pool = crate::db::connect(&database_url)
+            .await
+            .expect("connect test database");
+        crate::db::migrate(&pool)
+            .await
+            .expect("migrate test database");
+
+        let fixture = Uuid::new_v4().simple().to_string();
+        let user_id = format!("transfer_invoice_{fixture}");
+        let organization_id = format!("transfer_invoice_org_{fixture}");
+        let completed_id = format!("transfer_invoice_completed_{fixture}");
+        let prepared_id = format!("transfer_invoice_prepared_{fixture}");
+        let restoration_id = format!("transfer_invoice_restoration_{fixture}");
+        let completed_operation = format!("{completed_id}:destination");
+        let prepared_operation = format!("{prepared_id}:destination");
+        let restoration_operation = format!("{restoration_id}:source-restoration");
+        let boundary = 1_800_000_000_i64;
+        let expected_end = 1_802_592_000_i64;
+
+        sqlx::query(
+            "INSERT INTO users (id, oauth_provider, oauth_subject) VALUES ($1, 'transfer_invoice_test', $1)",
+        )
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("insert transfer invoice beneficiary");
+        sqlx::query(
+            "INSERT INTO organizations (id, enc_name, created_by) VALUES ($1, decode('6f7267', 'hex'), $2)",
+        )
+        .bind(&organization_id)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .expect("insert transfer invoice destination organisation");
+        sqlx::query(
+            "INSERT INTO billing_operations \
+             (operation_id, idempotency_key, request_hash, actor_user_id, payer_id, beneficiary_id, \
+              offer, quote_version, quote_expires_at_epoch, provider_idempotency_key) \
+             VALUES ($1, $1, $1, $2, $2, $2, 'standard_monthly', 1, $3, $1)",
+        )
+        .bind(&restoration_operation)
+        .bind(&user_id)
+        .bind(boundary + 900)
+        .execute(&pool)
+        .await
+        .expect("insert restoration billing operation");
+        sqlx::query(
+            "INSERT INTO billing_personal_accounts \
+             (user_id, operation_id, offer, stripe_customer_id, stripe_subscription_id, state, pending_expires_at_epoch) \
+             VALUES ($1, $2, 'standard_monthly', 'cus_restored', 'sub_restored', 'active', $3)",
+        )
+        .bind(&user_id)
+        .bind(&restoration_operation)
+        .bind(boundary + 900)
+        .execute(&pool)
+        .await
+        .expect("insert restored personal account");
+        for (transfer_id, operation_id, state, result_code, payment, period_end) in [
+            (
+                &completed_id,
+                &completed_operation,
+                "completed",
+                Some("transfer_completed"),
+                Some("pi_transfer_boundary"),
+                Some(expected_end),
+            ),
+            (
+                &prepared_id,
+                &prepared_operation,
+                "destination_prepared",
+                None,
+                None,
+                None,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO billing_transfer_intents \
+                 (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
+                  destination_kind, destination_organization_id, offer, quote_version, \
+                  quote_expires_at_epoch, consent_expires_at_epoch, effective_from, idempotency_key, request_hash, \
+                  provider_idempotency_key, destination_operation_id, source_provider_subscription_id, \
+                  destination_provider_subscription_id, destination_customer_id, state, result_code, \
+                  destination_payment_reference, destination_period_end, destination_expected_period_end) \
+                 VALUES ($1, $2, $2, $2, 'personal', 'sponsor', $3, 'standard_monthly', 1, \
+                         $4, $4, $5, $6, $6, $6, $7, 'sub_source', 'sub_destination', 'cus_destination', \
+                         $8, $9, $10, $11, $12)",
+            )
+            .bind(transfer_id)
+            .bind(&user_id)
+            .bind(&organization_id)
+            .bind(boundary + 900)
+            .bind(boundary)
+            .bind(format!("key_{transfer_id}"))
+            .bind(operation_id)
+            .bind(state)
+            .bind(result_code)
+            .bind(payment)
+            .bind(period_end)
+            .bind(expected_end)
+            .execute(&pool)
+            .await
+            .expect("insert transfer invoice fixture");
+        }
+        sqlx::query(
+            "INSERT INTO billing_transfer_intents \
+             (transfer_id, actor_user_id, counterparty_user_id, beneficiary_id, source_kind, \
+              destination_kind, destination_organization_id, offer, quote_version, \
+              quote_expires_at_epoch, consent_expires_at_epoch, effective_from, idempotency_key, request_hash, \
+              provider_idempotency_key, source_provider_subscription_id, state, result_code, \
+              source_restoration_operation_id, source_restoration_provider_subscription_id, \
+              source_restoration_payment_reference) \
+             VALUES ($1, $2, $2, $2, 'personal', 'sponsor', $3, 'standard_monthly', 1, \
+                     $4, $4, $5, $6, $6, $6, 'sub_source', 'failed', 'destination_initial_payment_failed', \
+                     $7, 'sub_restored', 'pi_restoration_boundary')",
+        )
+        .bind(&restoration_id)
+        .bind(&user_id)
+        .bind(&organization_id)
+        .bind(boundary + 900)
+        .bind(boundary)
+        .bind(format!("key_{restoration_id}"))
+        .bind(&restoration_operation)
+        .execute(&pool)
+        .await
+        .expect("insert restored transfer fixture");
+
+        let mut tx = pool.begin().await.expect("begin later renewal webhook");
+        record_transfer_invoice_payment(
+            &mut tx,
+            &completed_operation,
+            &user_id,
+            TransferPayer::Sponsor,
+            Some(&organization_id),
+            "standard_monthly",
+            "cus_destination",
+            "sub_destination",
+            "pi_second_renewal",
+            expected_end,
+            expected_end + 2_678_400,
+        )
+        .await
+        .expect("a renewal after transfer completion is ordinary invoice billing");
+        tx.commit().await.expect("commit later renewal webhook");
+        let completed_payment: String = sqlx::query_scalar(
+            "SELECT destination_payment_reference FROM billing_transfer_intents WHERE transfer_id = $1",
+        )
+        .bind(&completed_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read completed transfer payment");
+        assert_eq!(completed_payment, "pi_transfer_boundary");
+
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin restored source renewal webhook");
+        record_transfer_invoice_payment(
+            &mut tx,
+            &restoration_operation,
+            &user_id,
+            TransferPayer::Personal,
+            None,
+            "standard_monthly",
+            "cus_restored",
+            "sub_restored",
+            "pi_restoration_second_renewal",
+            expected_end,
+            expected_end + 2_678_400,
+        )
+        .await
+        .expect("a renewal after restoration settlement is ordinary invoice billing");
+        tx.commit()
+            .await
+            .expect("commit restored source renewal webhook");
+        let restoration_payment: String = sqlx::query_scalar(
+            "SELECT source_restoration_payment_reference FROM billing_transfer_intents WHERE transfer_id = $1",
+        )
+        .bind(&restoration_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read restoration boundary payment");
+        assert_eq!(restoration_payment, "pi_restoration_boundary");
+
+        let mut tx = pool.begin().await.expect("begin wrong-boundary webhook");
+        record_transfer_invoice_payment(
+            &mut tx,
+            &prepared_operation,
+            &user_id,
+            TransferPayer::Sponsor,
+            Some(&organization_id),
+            "standard_monthly",
+            "cus_destination",
+            "sub_destination",
+            "pi_wrong_boundary",
+            boundary + 1,
+            expected_end + 1,
+        )
+        .await
+        .expect("a mismatched boundary start is retained for manual review");
+        tx.commit().await.expect("commit wrong-boundary webhook");
+        let review_code: Option<String> = sqlx::query_scalar(
+            "SELECT last_execution_error_code FROM billing_transfer_intents WHERE transfer_id = $1",
+        )
+        .bind(&prepared_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read mismatch review code");
+        assert_eq!(
+            review_code.as_deref(),
+            Some("destination_period_start_mismatch")
+        );
+
+        sqlx::query(
+            "UPDATE billing_transfer_intents SET state = 'unknown', result_code = 'provider_outcome_unknown', \
+                 destination_payment_reference = NULL, destination_period_start = NULL, destination_period_end = NULL, \
+                 execution_manual_review_required = FALSE, last_execution_error_code = 'provider_outcome_unknown', \
+                 execution_next_attempt_at = now() WHERE transfer_id = $1",
+        )
+        .bind(&prepared_id)
+        .execute(&pool)
+        .await
+        .expect("park the prepared transfer in unknown for provider review");
+        let mut tx = pool
+            .begin()
+            .await
+            .expect("begin invoice for unknown transfer");
+        record_transfer_invoice_payment(
+            &mut tx,
+            &prepared_operation,
+            &user_id,
+            TransferPayer::Sponsor,
+            Some(&organization_id),
+            "standard_monthly",
+            "cus_destination",
+            "sub_destination",
+            "pi_unknown_destination",
+            boundary,
+            expected_end,
+        )
+        .await
+        .expect("an invoice for an unknown transfer must be retained for review");
+        tx.commit()
+            .await
+            .expect("commit paid invoice evidence for unknown transfer");
+        let unknown: (String, bool, Option<String>, Option<String>, bool) = sqlx::query_as(
+            "SELECT state, execution_manual_review_required, last_execution_error_code, \
+                    destination_payment_reference, execution_next_attempt_at = 'infinity'::timestamptz \
+             FROM billing_transfer_intents WHERE transfer_id = $1",
+        )
+        .bind(&prepared_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read unknown transfer evidence");
+        assert_eq!(unknown.0, "unknown", "the evidence must not move the state");
+        assert!(unknown.1);
+        assert_eq!(
+            unknown.2.as_deref(),
+            Some("destination_invoice_received_while_unknown")
+        );
+        assert_eq!(unknown.3.as_deref(), Some("pi_unknown_destination"));
+        assert!(
+            unknown.4,
+            "manual review remains parked until an operator acts"
+        );
+
+        sqlx::query("DELETE FROM billing_transfer_intents WHERE transfer_id = ANY($1)")
+            .bind(vec![completed_id, prepared_id, restoration_id])
+            .execute(&pool)
+            .await
+            .expect("delete transfer invoice fixtures");
+        sqlx::query("DELETE FROM billing_personal_accounts WHERE user_id = $1")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("delete restored personal account");
+        sqlx::query("DELETE FROM billing_operations WHERE operation_id = $1")
+            .bind(&restoration_operation)
+            .execute(&pool)
+            .await
+            .expect("delete restoration billing operation");
+        sqlx::query("DELETE FROM organizations WHERE id = $1")
+            .bind(&organization_id)
+            .execute(&pool)
+            .await
+            .expect("delete transfer invoice organisation");
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("delete transfer invoice beneficiary");
+    }
+
+    #[tokio::test]
+    async fn transfer_personal_cancellation_uses_and_verifies_the_quoted_boundary() {
+        let (origin, requests, server) = cancellation_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_test".into(),
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+
+        let result = provider
+            .cancel_personal_subscription_at_boundary(
+                "sub_boundary_direct",
+                1_707_776_000,
+                "transfer-source",
+                "beneficiary",
+            )
+            .await
+            .expect("cancellation is read back at the accepted boundary");
+        assert_eq!(result.cancel_at, Some(1_707_776_000));
+        let requests = requests.lock().expect("request log lock").clone();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].0, "GET");
+        assert_eq!(requests[1].0, "POST");
+        assert!(requests[1].2.contains("cancel_at=1707776000"));
+        assert_eq!(requests[2].0, "GET");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restoration_lookup_finds_only_the_metadata_bound_subscription() {
+        let (origin, requests, server) = cancellation_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_test".into(),
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+        let found = provider
+            .find_personal_source_restoration_subscription(
+                "transfer:one:source-restoration",
+                "transfer:one",
+                "user_restore",
+                "cus_original",
+                "pm_saved",
+                "price_standard_monthly",
+                "alloc_restore",
+            )
+            .await
+            .expect("search succeeds")
+            .expect("metadata returns the restored subscription");
+        assert_eq!(found.subscription_id, "sub_restored");
+        assert_eq!(found.status, SubscriptionStatus::Incomplete);
+        assert_eq!(
+            requests.lock().expect("request log lock")[0].1,
+            "/v1/subscriptions/search"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transfer_personal_cancellation_refuses_a_changed_boundary_before_write() {
+        let (origin, requests, server) = cancellation_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_test".into(),
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+
+        let result = provider
+            .cancel_personal_subscription_at_boundary(
+                "sub_boundary_direct",
+                1_707_776_001,
+                "transfer-source",
+                "beneficiary",
+            )
+            .await;
+        assert!(result.is_err());
+        let requests = requests.lock().expect("request log lock").clone();
+        assert_eq!(
+            requests.len(),
+            1,
+            "period drift must fail before a provider write"
+        );
+        assert_eq!(requests[0].0, "GET");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transfer_personal_schedule_cancellation_ends_at_the_quoted_boundary() {
+        let (origin, requests, server) = cancellation_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_test".into(),
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+
+        let result = provider
+            .cancel_personal_subscription_at_boundary(
+                "sub_scheduled",
+                1_707_776_000,
+                "transfer-source",
+                "beneficiary",
+            )
+            .await
+            .expect("scheduled source cancellation is read back");
+        assert_eq!(result.current_period_end, Some(1_707_776_000));
+        assert_eq!(result.cancel_at, Some(1_707_776_000));
+        let requests = requests.lock().expect("request log lock").clone();
+        let schedule_update = requests
+            .iter()
+            .find(|(method, path, _)| {
+                method == "POST" && path == "/v1/subscription_schedules/sched_test"
+            })
+            .expect("schedule update request");
+        assert!(schedule_update.2.contains("end_behavior=cancel"));
+        assert!(schedule_update
+            .2
+            .contains("phases%5B0%5D%5Bend_date%5D=1707776000"));
+        assert!(schedule_update.2.contains("proration_behavior=none"));
+        server.abort();
+    }
+
+    #[test]
     fn malformed_paid_invoice_shape_becomes_an_unresolved_repair() {
         assert_eq!(
             paid_invoice_repair_shape_error(&serde_json::json!({"id": "in_1"}), None, true),
@@ -7862,6 +15514,27 @@ mod tests {
         )
         .await
         .expect("check completed paid event"));
+        let rejection_fingerprint = "b".repeat(64);
+        sqlx::query(
+            "INSERT INTO cloud_coverage_rejection_incidents \
+             (fingerprint, provider_account_id, provider_environment, event_id, event_type, \
+              coverage_kind, reason_code) \
+             VALUES ($1, $2, 'test', $3, 'invoice.paid', 'personal', 'invoice_price_mismatch')",
+        )
+        .bind(&rejection_fingerprint)
+        .bind(&account_id)
+        .bind(&paid_event_id)
+        .execute(&pool)
+        .await
+        .expect("insert open coverage rejection");
+        assert!(!repair_event_already_completed(
+            &pool,
+            &account_id,
+            ProviderEnvironment::Test,
+            &paid
+        )
+        .await
+        .expect("open diagnostic must make the event repairable"));
         assert!(!repair_event_already_completed(
             &pool,
             &account_id,
@@ -7879,6 +15552,11 @@ mod tests {
         .execute(&pool)
         .await
         .expect("remove coverage fixture");
+        sqlx::query("DELETE FROM cloud_coverage_rejection_incidents WHERE fingerprint = $1")
+            .bind(rejection_fingerprint)
+            .execute(&pool)
+            .await
+            .expect("remove rejection fixture");
         sqlx::query("DELETE FROM stripe_webhook_events WHERE event_id = ANY($1)")
             .bind(vec![paid_event_id, failed_event_id])
             .execute(&pool)
@@ -8058,7 +15736,9 @@ mod tests {
             webhook_secret: "whsec_repair".into(),
             price_id: "price_legacy".into(),
             price_catalogue: None,
+            cloud_portal_configuration_id: None,
             cloud_sales_enabled: false,
+            cloud_automatic_tax_enabled: false,
             return_url: "https://getsotto.test".into(),
         });
 
@@ -8160,6 +15840,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn checkout_tax_fields_are_opt_in_and_update_existing_customer_address() {
+        let mut disabled = Vec::new();
+        append_checkout_tax_fields(&mut disabled, true, false);
+        assert!(disabled.is_empty());
+
+        let mut new_customer = Vec::new();
+        append_checkout_tax_fields(&mut new_customer, false, true);
+        assert!(new_customer.contains(&("automatic_tax[enabled]".into(), "true".into())));
+        assert!(new_customer.contains(&("billing_address_collection".into(), "auto".into())));
+        assert!(!new_customer
+            .iter()
+            .any(|(key, _)| key.starts_with("customer_update[")));
+
+        let mut existing_customer = Vec::new();
+        append_checkout_tax_fields(&mut existing_customer, true, true);
+        assert!(existing_customer.contains(&("customer_update[address]".into(), "auto".into())));
+    }
+
+    #[test]
+    fn enabled_checkout_tax_requires_stripe_to_confirm_it() {
+        assert!(require_checkout_tax_state(&serde_json::json!({}), false).is_ok());
+        assert!(require_checkout_tax_state(&serde_json::json!({}), true).is_err());
+        assert!(require_checkout_tax_state(
+            &serde_json::json!({"automatic_tax": {"enabled": false}}),
+            true,
+        )
+        .is_err());
+        assert!(require_checkout_tax_state(
+            &serde_json::json!({"automatic_tax": {"enabled": true}}),
+            true,
+        )
+        .is_ok());
+        assert!(require_checkout_tax_state(
+            &serde_json::json!({
+                "automatic_tax": {
+                    "enabled": false,
+                    "disabled_reason": "requires_location_inputs"
+                }
+            }),
+            true,
+        )
+        .is_ok());
+        for disabled_reason in ["tax_not_active", "unsupported_location"] {
+            assert!(require_checkout_tax_state(
+                &serde_json::json!({
+                    "automatic_tax": {
+                        "enabled": false,
+                        "disabled_reason": disabled_reason
+                    }
+                }),
+                true,
+            )
+            .is_err());
+        }
+    }
+
     #[cfg(feature = "e2e-mock-billing")]
     #[tokio::test]
     async fn e2e_provider_builds_a_local_checkout_url() {
@@ -8194,7 +15931,7 @@ mod tests {
             provider_origin: "http://127.0.0.1:8099/".into(),
         };
         let url = provider
-            .create_portal("cus-test", "http://127.0.0.1:5199/app")
+            .create_portal("cus-test", "http://127.0.0.1:5199/app", None)
             .await
             .unwrap();
         let parsed = Url::parse(&url).unwrap();
@@ -8419,6 +16156,82 @@ mod tests {
     }
 
     #[test]
+    fn cloud_portal_requires_payment_updates_and_period_end_cancellation_without_plan_changes() {
+        let configuration = serde_json::json!({
+            "id": "bpc_cloud_safe",
+            "object": "billing_portal.configuration",
+            "active": true,
+            "livemode": false,
+            "features": {
+                "payment_method_update": {"enabled": true},
+                "subscription_cancel": {
+                    "enabled": true,
+                    "mode": "at_period_end",
+                    "proration_behavior": "none"
+                },
+                "subscription_update": {"enabled": false}
+            }
+        });
+        assert!(
+            validate_cloud_portal_configuration(&configuration, "bpc_cloud_safe", false).is_ok()
+        );
+
+        for (path, invalid) in [
+            ("active", serde_json::json!(false)),
+            ("livemode", serde_json::json!(true)),
+            (
+                "features.subscription_update.enabled",
+                serde_json::json!(true),
+            ),
+            (
+                "features.payment_method_update.enabled",
+                serde_json::json!(false),
+            ),
+            (
+                "features.subscription_cancel.enabled",
+                serde_json::json!(false),
+            ),
+            (
+                "features.subscription_cancel.mode",
+                serde_json::json!("immediately"),
+            ),
+            (
+                "features.subscription_cancel.proration_behavior",
+                serde_json::json!("always_invoice"),
+            ),
+        ] {
+            let mut candidate = configuration.clone();
+            let mut target = &mut candidate;
+            let mut segments = path.split('.').peekable();
+            while let Some(segment) = segments.next() {
+                if segments.peek().is_none() {
+                    target[segment] = invalid.clone();
+                } else {
+                    target = &mut target[segment];
+                }
+            }
+            assert!(
+                validate_cloud_portal_configuration(&candidate, "bpc_cloud_safe", false).is_err(),
+                "unsafe portal configuration accepted at {path}"
+            );
+        }
+        assert!(validate_cloud_portal_configuration(&configuration, "bpc_other", false).is_err());
+    }
+
+    #[test]
+    fn cloud_portal_session_uses_the_configured_safe_configuration() {
+        let form = portal_session_form("cus_123", "https://app.sotto.test/cloud", Some("bpc_safe"));
+        assert!(form.contains(&("configuration".into(), "bpc_safe".into())));
+        assert!(form.contains(&("customer".into(), "cus_123".into())));
+        assert!(form.contains(&("return_url".into(), "https://app.sotto.test/cloud".into())));
+        assert!(
+            !portal_session_form("cus_123", "https://app.sotto.test", None)
+                .iter()
+                .any(|(key, _)| key == "configuration")
+        );
+    }
+
+    #[test]
     fn cancellation_form_is_explicit_and_traceable() {
         let form = cancellation_form("org-123");
         assert!(form.contains(&("invoice_now".into(), "false".into())));
@@ -8442,6 +16255,652 @@ mod tests {
         assert_eq!(headers.get("Stripe-Version").unwrap(), STRIPE_API_VERSION);
         assert_eq!(headers.get("Idempotency-Key").unwrap(), "operation-123");
         assert!(stripe_headers(Some("bad\nkey")).is_err());
+    }
+
+    #[tokio::test]
+    async fn sponsored_checkout_retry_reuses_the_exact_http_request_and_idempotency_key() {
+        let (origin, requests, remote_creations, server) = sponsored_checkout_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_legacy_unused".into(),
+            automatic_tax_enabled: true,
+            api_origin: origin,
+        };
+        let items = vec![SponsoredSubscriptionItemRequest {
+            provider_price_id: "price_recovery_monthly".into(),
+            quantity: 2,
+        }];
+        let first = provider
+            .create_sponsored_checkout(
+                "org_recovery",
+                Some("cus_recovery"),
+                &items,
+                "sponsored:operation_recovery",
+                "sotto-sponsored:stable-key",
+                1_800_000_000,
+                "https://app.example.test/success",
+                "https://app.example.test/cancel",
+                true,
+            )
+            .await;
+        assert!(
+            matches!(
+                &first,
+                Err(ProviderError {
+                    kind: ProviderErrorKind::Retryable,
+                    ..
+                })
+            ),
+            "first provider response should be retryable: {first:?}"
+        );
+
+        let replay = provider
+            .create_sponsored_checkout(
+                "org_recovery",
+                Some("cus_recovery"),
+                &items,
+                "sponsored:operation_recovery",
+                "sotto-sponsored:stable-key",
+                1_800_000_000,
+                "https://app.example.test/success",
+                "https://app.example.test/cancel",
+                true,
+            )
+            .await
+            .expect("same request succeeds after an ambiguous provider response");
+        assert_eq!(replay.session_id, "cs_recovered_http");
+
+        let requests = requests.lock().expect("read HTTP requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0.as_deref(), Some("sotto-sponsored:stable-key"));
+        assert_eq!(requests[1].0.as_deref(), Some("sotto-sponsored:stable-key"));
+        assert_eq!(requests[0].1, requests[1].1);
+        assert!(requests[0]
+            .1
+            .contains("subscription_data%5Bmetadata%5D%5Bsponsored_operation_id%5D=sponsored%3Aoperation_recovery"));
+        assert!(requests[0]
+            .1
+            .contains("line_items%5B0%5D%5Bprice%5D=price_recovery_monthly"));
+        assert!(requests[0].1.contains("line_items%5B0%5D%5Bquantity%5D=2"));
+        assert!(requests[0].1.contains("automatic_tax%5Benabled%5D=true"));
+        assert!(requests[0].1.contains("billing_address_collection=auto"));
+        assert!(requests[0].1.contains("customer_update%5Baddress%5D=auto"));
+        assert_eq!(
+            remote_creations.load(Ordering::SeqCst),
+            1,
+            "the HTTP mock accepted only one remote Checkout despite losing the first response"
+        );
+        drop(requests);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sponsored_schedule_recovery_verifies_provider_binding_and_exact_saved_items_over_http()
+    {
+        let schedule = |subscription_id: &str, future_price: &str| {
+            serde_json::json!({
+                "id": "sched_recovery_http",
+                "object": "subscription_schedule",
+                "subscription": subscription_id,
+                "end_behavior": "release",
+                "current_phase": {
+                    "start_date": 1_600_000_000_i64,
+                    "end_date": 1_700_000_000_i64
+                },
+                "phases": [
+                    {
+                        "start_date": 1_600_000_000_i64,
+                        "end_date": 1_700_000_000_i64,
+                        "items": [{"price": "price_current_http", "quantity": 1}]
+                    },
+                    {
+                        "start_date": 1_700_000_000_i64,
+                        "end_date": 1_800_000_000_i64,
+                        "items": [{"price": future_price, "quantity": 2}]
+                    }
+                ]
+            })
+        };
+        let expected = [SponsoredSubscriptionPhase {
+            start_at_epoch: 1_700_000_000,
+            end_at_epoch: None,
+            items: vec![SponsoredSubscriptionItemRequest {
+                provider_price_id: "price_recovery_http".into(),
+                quantity: 2,
+            }],
+        }];
+
+        let (origin, requests, server) = sponsored_schedule_verification_http_server(schedule(
+            "sub_recovery_http",
+            "price_recovery_http",
+        ))
+        .await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_legacy_unused".into(),
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+        let verified = provider
+            .verify_sponsored_subscription_update(
+                "sub_recovery_http",
+                1_600_000_000,
+                1_700_000_000,
+                &expected,
+            )
+            .await
+            .expect("read and validate accepted schedule");
+        assert!(verified.is_some());
+        assert_eq!(
+            requests
+                .lock()
+                .expect("read verification requests")
+                .as_slice(),
+            [
+                "/v1/subscriptions/sub_recovery_http",
+                "/v1/subscription_schedules/sched_recovery_http"
+            ]
+        );
+        server.abort();
+
+        let (origin, _, server) = sponsored_schedule_verification_http_server(schedule(
+            "sub_recovery_http",
+            "price_unexpected_http",
+        ))
+        .await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_legacy_unused".into(),
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+        let mismatched_item = provider
+            .verify_sponsored_subscription_update(
+                "sub_recovery_http",
+                1_600_000_000,
+                1_700_000_000,
+                &expected,
+            )
+            .await
+            .expect("a valid but different schedule is not a read error");
+        assert!(mismatched_item.is_none());
+        server.abort();
+
+        let (origin, _, server) = sponsored_schedule_verification_http_server(schedule(
+            "sub_other_http",
+            "price_recovery_http",
+        ))
+        .await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_legacy_unused".into(),
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+        assert!(provider
+            .verify_sponsored_subscription_update(
+                "sub_recovery_http",
+                1_600_000_000,
+                1_700_000_000,
+                &expected,
+            )
+            .await
+            .is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sponsored_seat_change_preserves_stripe_tax_state_on_current_and_future_phases() {
+        let (origin, requests, server) = sponsored_tax_schedule_http_server().await;
+        let provider = StripeBilling {
+            api_key: "rk_test_mock".into(),
+            price_id: "price_legacy_unused".into(),
+            // A server rollout must not silently switch an existing subscription's tax mode.
+            automatic_tax_enabled: false,
+            api_origin: origin,
+        };
+        let updated = provider
+            .update_sponsored_subscription(
+                "org_tax",
+                "sub_tax_preserved",
+                &[SponsoredSubscriptionPhase {
+                    start_at_epoch: 1_700_000_000,
+                    end_at_epoch: None,
+                    items: vec![SponsoredSubscriptionItemRequest {
+                        provider_price_id: "price_next".into(),
+                        quantity: 2,
+                    }],
+                }],
+                "tax-preservation-request",
+            )
+            .await
+            .expect("seat update preserves the tax setting read from Stripe");
+
+        assert!(updated.automatic_tax_enabled);
+        let requests = requests.lock().expect("tax schedule request lock");
+        let update = requests
+            .iter()
+            .find(|(method, path, _)| {
+                method == "POST" && path == "/v1/subscription_schedules/sched_tax_preserved"
+            })
+            .expect("schedule update request");
+        let fields: std::collections::HashMap<_, _> =
+            url::form_urlencoded::parse(update.2.as_bytes())
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+        assert_eq!(
+            fields
+                .get("phases[0][automatic_tax][enabled]")
+                .map(String::as_str),
+            Some("true"),
+            "the current phase keeps the tax setting already on the subscription"
+        );
+        assert_eq!(
+            fields
+                .get("phases[1][automatic_tax][enabled]")
+                .map(String::as_str),
+            Some("true"),
+            "the future seat phase keeps the same tax setting"
+        );
+        drop(requests);
+        server.abort();
+    }
+
+    #[test]
+    fn transfer_setup_checkout_is_off_session_and_bound_to_transfer() {
+        let form = transfer_setup_checkout_form(
+            "transfer:abc",
+            "cus_beneficiary",
+            "https://app.example.test/success",
+            "https://app.example.test/cancel",
+            true,
+        );
+        let fields = form
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(fields.get("mode").map(String::as_str), Some("setup"));
+        assert_eq!(
+            fields.get("customer").map(String::as_str),
+            Some("cus_beneficiary")
+        );
+        assert_eq!(
+            fields.get("setup_intent_data[usage]").map(String::as_str),
+            Some("off_session")
+        );
+        assert_eq!(
+            fields
+                .get("setup_intent_data[metadata][sotto_transfer_id]")
+                .map(String::as_str),
+            Some("transfer:abc")
+        );
+        assert_eq!(
+            fields.get("billing_address_collection").map(String::as_str),
+            Some("required")
+        );
+        assert_eq!(
+            fields.get("customer_update[address]").map(String::as_str),
+            Some("auto")
+        );
+        assert!(!fields.keys().any(|key| key == "payment_method_types"));
+
+        let untaxed_fields = transfer_setup_checkout_form(
+            "transfer:abc",
+            "cus_beneficiary",
+            "https://app.example.test/success",
+            "https://app.example.test/cancel",
+            false,
+        );
+        assert!(!untaxed_fields.iter().any(
+            |(key, _)| key == "billing_address_collection" || key == "customer_update[address]"
+        ));
+    }
+
+    #[test]
+    fn personal_source_restoration_charges_the_original_customer_idempotently() {
+        let fields = personal_source_restoration_form(
+            "transfer:abc",
+            "user_123",
+            "cus_original",
+            "pm_saved",
+            "price_standard_monthly",
+            "alloc_restore",
+            "transfer:abc:source-restoration",
+            false,
+        )
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            fields.get("customer").map(String::as_str),
+            Some("cus_original")
+        );
+        assert_eq!(
+            fields.get("default_payment_method").map(String::as_str),
+            Some("pm_saved")
+        );
+        assert_eq!(
+            fields.get("items[0][price]").map(String::as_str),
+            Some("price_standard_monthly")
+        );
+        assert_eq!(
+            fields.get("collection_method").map(String::as_str),
+            Some("charge_automatically")
+        );
+        assert_eq!(
+            fields.get("payment_behavior").map(String::as_str),
+            Some("allow_incomplete")
+        );
+        assert_eq!(fields.get("off_session").map(String::as_str), Some("true"));
+        assert_eq!(
+            fields
+                .get("metadata[sotto_transfer_id]")
+                .map(String::as_str),
+            Some("transfer:abc")
+        );
+        assert_eq!(
+            fields.get("metadata[operation_id]").map(String::as_str),
+            Some("transfer:abc:source-restoration")
+        );
+        assert_eq!(
+            fields
+                .get("metadata[sotto_allocation_reference]")
+                .map(String::as_str),
+            Some("alloc_restore")
+        );
+        let taxed = personal_source_restoration_form(
+            "transfer:abc",
+            "user_123",
+            "cus_original",
+            "pm_saved",
+            "price_standard_monthly",
+            "alloc_restore",
+            "transfer:abc:source-restoration",
+            true,
+        );
+        assert!(taxed.contains(&("automatic_tax[enabled]".into(), "true".into())));
+    }
+
+    #[test]
+    fn transfer_setup_response_requires_expected_customer_and_transfer_metadata() {
+        let response = serde_json::json!({
+            "id": "cs_test_transfer",
+            "object": "checkout.session",
+            "mode": "setup",
+            "status": "open",
+            "url": "https://checkout.stripe.com/c/pay/cs_test_transfer",
+            "customer": "cus_transfer",
+            "client_reference_id": "sotto-transfer:transfer:abc",
+            "metadata": { "sotto_transfer_id": "transfer:abc" },
+            "setup_intent": null,
+            "expires_at": 1900000000
+        });
+        let session = transfer_setup_session_from_object(
+            &response,
+            Some("cs_test_transfer"),
+            Some("transfer:abc"),
+        )
+        .expect("matching Setup Checkout response");
+        assert_eq!(session.customer_id, "cus_transfer");
+        assert_eq!(session.status, "open");
+        assert!(session.checkout_url.is_some());
+        assert_eq!(session.expires_at_epoch, Some(1_900_000_000));
+
+        let mut forged = response;
+        forged["metadata"]["sotto_transfer_id"] = serde_json::json!("transfer:other");
+        assert!(transfer_setup_session_from_object(&forged, None, Some("transfer:abc")).is_err());
+    }
+
+    #[test]
+    fn transfer_setup_intent_requires_an_off_session_payment_method() {
+        let response = serde_json::json!({
+            "id": "seti_transfer",
+            "object": "setup_intent",
+            "status": "succeeded",
+            "usage": "off_session",
+            "customer": "cus_transfer",
+            "payment_method": "pm_transfer",
+            "metadata": {"sotto_transfer_id": "transfer:abc"}
+        });
+        let setup = transfer_setup_intent_from_object(&response, "seti_transfer")
+            .expect("off-session SetupIntent belongs to the transfer");
+        assert_eq!(setup.transfer_id, "transfer:abc");
+        assert_eq!(setup.payment_method_id, "pm_transfer");
+        assert!(setup.off_session);
+
+        let mut on_session = response;
+        on_session["usage"] = serde_json::json!("on_session");
+        assert!(transfer_setup_intent_from_object(&on_session, "seti_transfer").is_err());
+    }
+
+    #[test]
+    fn personal_transfer_schedule_starts_at_boundary_with_the_authorised_method() {
+        let form = personal_transfer_schedule_form(
+            "transfer:abc",
+            "user-1",
+            "cus_transfer",
+            "pm_saved",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            false,
+        );
+        let fields = form
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(
+            fields.get("start_date").map(String::as_str),
+            Some("1900000000")
+        );
+        assert_eq!(
+            fields
+                .get("default_settings[default_payment_method]")
+                .map(String::as_str),
+            Some("pm_saved")
+        );
+        assert_eq!(
+            fields.get("phases[0][items][0][price]").map(String::as_str),
+            Some("price_monthly")
+        );
+        assert_eq!(
+            fields
+                .get("phases[0][metadata][sotto_allocation_reference]")
+                .map(String::as_str),
+            Some("alloc_transfer")
+        );
+        assert_eq!(
+            fields.get("end_behavior").map(String::as_str),
+            Some("release")
+        );
+        assert_eq!(
+            fields
+                .get("phases[0][proration_behavior]")
+                .map(String::as_str),
+            Some("none")
+        );
+        assert!(
+            !fields.contains_key("phases[0][start_date]"),
+            "the top-level schedule start determines its first phase start"
+        );
+        assert!(!fields
+            .keys()
+            .any(|key| key.starts_with("payment_intent_data")));
+        assert!(!fields.contains_key("default_settings[automatic_tax][enabled]"));
+        let taxed = personal_transfer_schedule_form(
+            "transfer:abc",
+            "user-1",
+            "cus_transfer",
+            "pm_saved",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            true,
+        );
+        assert!(taxed.contains(&(
+            "default_settings[automatic_tax][enabled]".into(),
+            "true".into()
+        )));
+    }
+
+    #[test]
+    fn personal_transfer_schedule_readback_must_match_customer_boundary_and_binding() {
+        let response = serde_json::json!({
+            "id": "sub_sched_transfer",
+            "object": "subscription_schedule",
+            "customer": "cus_transfer",
+            "subscription": null,
+            "status": "not_started",
+            "start_date": 1900000000,
+            "end_behavior": "release",
+            "metadata": {
+                "sotto_transfer_id": "transfer:abc",
+                "personal_user_id": "user-1",
+                "operation_id": "transfer:abc:destination",
+                "sotto_allocation_reference": "alloc_transfer",
+                "sotto_offer": "standard_monthly"
+            },
+            "default_settings": {"default_payment_method": "pm_saved"},
+            "phases": [{
+                "start_date": 1900000000,
+                "default_payment_method": "pm_saved",
+                "proration_behavior": "none",
+                "items": [{"price": "price_monthly", "quantity": 1}],
+                "metadata": {
+                    "sotto_transfer_id": "transfer:abc",
+                    "personal_user_id": "user-1",
+                    "operation_id": "transfer:abc:destination",
+                    "sotto_allocation_reference": "alloc_transfer",
+                    "sotto_offer": "standard_monthly"
+                }
+            }]
+        });
+        let schedule = transfer_schedule_from_object(
+            &response,
+            "transfer:abc",
+            "cus_transfer",
+            "pm_saved",
+            "user-1",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            false,
+        )
+        .expect("schedule matches its future obligation");
+        assert_eq!(schedule.schedule_id, "sub_sched_transfer");
+        assert_eq!(schedule.start_at_epoch, 1_900_000_000);
+        assert_eq!(
+            schedule.expected_period_end_epoch,
+            FoundingDate::anchored_term_end_epoch(1_900_000_000, FoundingOffer::Monthly, 1)
+                .unwrap()
+        );
+        assert_eq!(schedule.subscription_id, None);
+
+        let mut taxed_schedule = response.clone();
+        taxed_schedule["default_settings"]["automatic_tax"] = serde_json::json!({"enabled": true});
+        assert!(transfer_schedule_from_object(
+            &taxed_schedule,
+            "transfer:abc",
+            "cus_transfer",
+            "pm_saved",
+            "user-1",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            true,
+        )
+        .is_ok());
+        taxed_schedule["default_settings"]["automatic_tax"]["enabled"] = serde_json::json!(false);
+        taxed_schedule["default_settings"]["automatic_tax"]["disabled_reason"] =
+            serde_json::json!("requires_location_inputs");
+        assert!(transfer_schedule_from_object(
+            &taxed_schedule,
+            "transfer:abc",
+            "cus_transfer",
+            "pm_saved",
+            "user-1",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            true,
+        )
+        .is_ok());
+        taxed_schedule["default_settings"]["automatic_tax"]["enabled"] = serde_json::json!(false);
+        taxed_schedule["default_settings"]["automatic_tax"]["disabled_reason"] =
+            serde_json::json!("tax_not_active");
+        assert!(transfer_schedule_from_object(
+            &taxed_schedule,
+            "transfer:abc",
+            "cus_transfer",
+            "pm_saved",
+            "user-1",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            true,
+        )
+        .is_err());
+
+        let mut changed_boundary = response.clone();
+        changed_boundary["phases"][0]["start_date"] = serde_json::json!(1_900_000_001);
+        assert!(transfer_schedule_from_object(
+            &changed_boundary,
+            "transfer:abc",
+            "cus_transfer",
+            "pm_saved",
+            "user-1",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            false,
+        )
+        .is_err());
+
+        let mut changed_owner = response;
+        changed_owner["phases"][0]["metadata"]["personal_user_id"] =
+            serde_json::json!("someone-else");
+        assert!(transfer_schedule_from_object(
+            &changed_owner,
+            "transfer:abc",
+            "cus_transfer",
+            "pm_saved",
+            "user-1",
+            BillingOffer::StandardMonthly,
+            "price_monthly",
+            "alloc_transfer",
+            1_900_000_000,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn sponsored_schedule_update_sets_the_provider_tax_state_on_every_phase() {
+        let mut enabled = Vec::new();
+        append_sponsored_phase_tax_fields(&mut enabled, 2, true);
+        assert_eq!(
+            enabled,
+            [
+                ("phases[0][automatic_tax][enabled]".into(), "true".into()),
+                ("phases[1][automatic_tax][enabled]".into(), "true".into()),
+                ("phases[2][automatic_tax][enabled]".into(), "true".into()),
+            ]
+        );
+
+        let mut disabled = Vec::new();
+        append_sponsored_phase_tax_fields(&mut disabled, 2, false);
+        assert_eq!(
+            disabled,
+            [
+                ("phases[0][automatic_tax][enabled]".into(), "false".into()),
+                ("phases[1][automatic_tax][enabled]".into(), "false".into()),
+                ("phases[2][automatic_tax][enabled]".into(), "false".into()),
+            ]
+        );
     }
 
     #[test]
@@ -8479,6 +16938,109 @@ mod tests {
     }
 
     #[test]
+    fn personal_checkout_expiry_requires_the_exact_unpaid_session_binding() {
+        let expired = serde_json::json!({
+            "object": "checkout.session",
+            "id": "cs_personal",
+            "mode": "subscription",
+            "client_reference_id": "personal:billing:operation",
+            "status": "expired",
+            "payment_status": "unpaid"
+        });
+        assert_eq!(
+            personal_checkout_status_from_object(&expired, "cs_personal", "billing:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::ExpiredUnpaid
+        );
+        let mut paid = expired.clone();
+        paid["payment_status"] = serde_json::json!("paid");
+        assert!(
+            personal_checkout_status_from_object(&paid, "cs_personal", "billing:operation")
+                .is_err()
+        );
+        assert!(
+            personal_checkout_status_from_object(&expired, "cs_other", "billing:operation")
+                .is_err()
+        );
+        assert!(
+            personal_checkout_status_from_object(&expired, "cs_personal", "billing:other").is_err()
+        );
+        let mut open = expired.clone();
+        open["status"] = serde_json::json!("open");
+        assert_eq!(
+            personal_checkout_status_from_object(&open, "cs_personal", "billing:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::Open
+        );
+        let mut complete = open;
+        complete["status"] = serde_json::json!("complete");
+        assert_eq!(
+            personal_checkout_status_from_object(&complete, "cs_personal", "billing:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::Complete
+        );
+        complete["payment_status"] = serde_json::json!("no_payment_required");
+        assert_eq!(
+            personal_checkout_status_from_object(&complete, "cs_personal", "billing:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::Complete
+        );
+    }
+
+    #[test]
+    fn sponsored_checkout_status_requires_its_operation_binding() {
+        let expired = serde_json::json!({
+            "object": "checkout.session",
+            "id": "cs_sponsored",
+            "mode": "subscription",
+            "client_reference_id": "sponsored:sponsored:operation",
+            "status": "expired",
+            "payment_status": "unpaid"
+        });
+        assert_eq!(
+            checkout_status_from_object(&expired, "cs_sponsored", "sponsored:sponsored:operation")
+                .unwrap(),
+            PersonalCheckoutStatus::ExpiredUnpaid
+        );
+        assert!(
+            checkout_status_from_object(&expired, "cs_sponsored", "sponsored:other-operation")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn expired_quote_retries_use_the_existing_checkout_deadline() {
+        let quote_expiry = 100;
+        let now = 110;
+        let original_checkout_expiry = 130;
+        assert!(quote_expiry < now);
+        assert_eq!(
+            personal_checkout_expiry_for_retry(original_checkout_expiry, now).unwrap(),
+            original_checkout_expiry
+        );
+        assert!(personal_checkout_expiry_for_retry(now, now).is_err());
+    }
+
+    #[test]
+    fn expired_pending_personal_accounts_are_not_quote_reusable() {
+        assert!(!personal_quote_account_is_reusable(
+            personal_billing::PersonalBillingState::Pending
+        ));
+        assert!(personal_quote_account_is_reusable(
+            personal_billing::PersonalBillingState::Canceled
+        ));
+    }
+
+    #[test]
+    fn definitive_checkout_status_matches_http_codes_individually() {
+        assert!(definitive_checkout_status(Some(400)));
+        assert!(definitive_checkout_status(Some(404)));
+        assert!(!definitive_checkout_status(Some(401)));
+        assert!(!definitive_checkout_status(Some(500)));
+        assert!(!definitive_checkout_status(None));
+    }
+
+    #[test]
     fn stripe_period_helpers_use_item_and_line_service_periods() {
         let subscription = serde_json::json!({
             "current_period_end": 1_700_000_001,
@@ -8500,6 +17062,108 @@ mod tests {
         });
         assert_eq!(invoice_period_end(&invoice), Some(1_950_000_000));
         assert_eq!(invoice_subscription_id(&invoice), Some("sub-1"));
+    }
+
+    #[test]
+    fn invoice_payment_failed_events_use_the_subscription_from_the_invoice_parent() {
+        let event = Event {
+            id: "evt_failed_1".into(),
+            created: 1_800_000_000,
+            api_version: Some("2026-07-29.dahlia".into()),
+            kind: "invoice.payment_failed".into(),
+            data: EventData {
+                object: serde_json::json!({
+                    "id": "in_failed_1",
+                    "parent": {
+                        "type": "subscription_details",
+                        "subscription_details": {"subscription": {"id": "sub_failed_1"}}
+                    }
+                }),
+            },
+        };
+
+        assert_eq!(
+            event_subscription_id(&event).as_deref(),
+            Some("sub_failed_1")
+        );
+        assert!(!event_updates_subscription_watermark(&event));
+    }
+
+    #[test]
+    fn sponsored_transfer_period_preview_uses_stripe_line_boundaries() {
+        let at = |year, month, day, hour| {
+            FoundingDate::new(year, month, day)
+                .unwrap()
+                .to_unix_seconds()
+                + i64::from(hour) * 60 * 60
+        };
+        let monthly_start = at(2027, 4, 30, 8);
+        let monthly_end = at(2027, 5, 31, 8);
+        let annual_start = at(2027, 2, 28, 9);
+        let annual_end = at(2028, 2, 29, 9);
+        let invoice = serde_json::json!({
+            "object": "invoice",
+            "parent": {"subscription_details": {"subscription": "sub-sponsor"}},
+            "lines": {"data": [
+                {
+                    "parent": {"type": "subscription_item_details", "subscription_item_details": {
+                        "subscription": "sub-sponsor", "proration": false
+                    }},
+                    "pricing": {"price_details": {"price": "price-monthly"}},
+                    "period": {"start": monthly_start - 31 * 86_400, "end": monthly_start}
+                },
+                {
+                    "parent": {"type": "subscription_item_details", "subscription_item_details": {
+                        "subscription": "sub-sponsor", "proration": false
+                    }},
+                    "pricing": {"price_details": {"price": "price-monthly"}},
+                    "period": {"start": monthly_start, "end": monthly_end}
+                },
+                {
+                    "parent": {"type": "subscription_item_details", "subscription_item_details": {
+                        "subscription": "sub-sponsor", "proration": true
+                    }},
+                    "pricing": {"price_details": {"price": "price-monthly"}},
+                    "period": {"start": monthly_start, "end": monthly_start + 100}
+                },
+                {
+                    "parent": {"type": "subscription_item_details", "subscription_item_details": {
+                        "subscription": "sub-sponsor", "proration": false
+                    }},
+                    "pricing": {"price_details": {"price": "price-annual"}},
+                    "period": {"start": annual_start, "end": annual_end}
+                }
+            ]}
+        });
+        assert_eq!(
+            preview_subscription_period_end_from_invoice(
+                &invoice,
+                "sub-sponsor",
+                "price-monthly",
+                monthly_start,
+            )
+            .unwrap(),
+            monthly_end,
+            "a subscription anchored on the 31st renews on 31 May after 30 April"
+        );
+        assert_eq!(
+            preview_subscription_period_end_from_invoice(
+                &invoice,
+                "sub-sponsor",
+                "price-annual",
+                annual_start,
+            )
+            .unwrap(),
+            annual_end,
+            "an annual 29 February anchor returns to 29 February in the leap year"
+        );
+        assert!(preview_subscription_period_end_from_invoice(
+            &invoice,
+            "another-subscription",
+            "price-monthly",
+            monthly_start,
+        )
+        .is_err());
     }
 
     #[test]
@@ -8533,7 +17197,11 @@ mod tests {
         let subscription = serde_json::json!({
             "id": "sub-sponsored",
             "customer": "cus-sponsored",
+            "default_payment_method": "pm_saved",
             "status": "active",
+            "automatic_tax": {"enabled": true},
+            "cancel_at_period_end": false,
+            "cancel_at": null,
             "current_period_start": 1,
             "current_period_end": 2,
             "schedule": "sub_sched",
@@ -8549,19 +17217,319 @@ mod tests {
         assert_eq!(snapshot.current_period_start, Some(1_700_000_000));
         assert_eq!(snapshot.current_period_end, Some(1_702_678_400));
         assert_eq!(snapshot.schedule_id.as_deref(), Some("sub_sched"));
+        assert_eq!(
+            snapshot.default_payment_method_id.as_deref(),
+            Some("pm_saved")
+        );
+        assert!(!snapshot.cancel_at_period_end);
+        assert!(snapshot.automatic_tax_enabled);
+        assert_eq!(snapshot.cancel_at, None);
+
+        let mut scheduled_cancellation = subscription.clone();
+        scheduled_cancellation["cancel_at_period_end"] = serde_json::json!(false);
+        scheduled_cancellation["cancel_at"] = serde_json::json!(1_702_678_400);
+        let snapshot =
+            sponsored_subscription_snapshot(&scheduled_cancellation, "sub-sponsored").unwrap();
+        assert!(snapshot.cancel_at.is_some());
+
+        let malformed_cancellation = serde_json::json!({
+            "id":"sub-sponsored", "status":"active", "items":{"data":[]}
+        });
+        assert_eq!(
+            sponsored_subscription_snapshot(&malformed_cancellation, "sub-sponsored")
+                .unwrap_err()
+                .kind,
+            ProviderErrorKind::Unknown
+        );
 
         let invoice = serde_json::json!({
             "lines": {"data": [{
                 "parent": {"subscription_item_details": {
-                    "subscription_item": "si-sponsored"
+                    "subscription_item": "si-sponsored",
+                    "proration": false
                 }},
                 "pricing": {"price_details": {"price": "price-sponsored"}},
-                "quantity": 3
+                "quantity": 3,
+                "amount": 897,
+                "period": {"start": 100, "end": 200}
             }]}
         });
         assert_eq!(
             sponsored_invoice_items(&invoice),
             vec![("si-sponsored".into(), "price-sponsored".into(), 3)]
         );
+        assert_eq!(
+            sponsored_invoice_line_terms(&invoice),
+            vec![(
+                "si-sponsored".into(),
+                "price-sponsored".into(),
+                100,
+                200,
+                897,
+                false
+            )]
+        );
+    }
+
+    #[test]
+    fn sponsored_invoice_operation_matches_its_own_line_term_not_invoice_max_end() {
+        let lines = vec![
+            (
+                "si_month".into(),
+                "price_month".into(),
+                100,
+                130,
+                299,
+                false,
+            ),
+            (
+                "si_year".into(),
+                "price_year".into(),
+                100,
+                465,
+                2_999,
+                false,
+            ),
+        ];
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(&lines, "price_month", 100, None, true)
+                .as_deref(),
+            Some("si_month")
+        );
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(&lines, "price_month", 130, None, true),
+            None
+        );
+        let next_lines = vec![(
+            "si_month_next".into(),
+            "price_month".into(),
+            130,
+            160,
+            299,
+            false,
+        )];
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(&next_lines, "price_month", 130, None, true),
+            Some("si_month_next".into())
+        );
+        let prorated_lines = vec![(
+            "si_year_prorated".into(),
+            "price_year".into(),
+            100,
+            465,
+            1_835,
+            true,
+        )];
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(
+                &prorated_lines,
+                "price_year",
+                130,
+                None,
+                true
+            ),
+            Some("si_year_prorated".into())
+        );
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(
+                &lines,
+                "price_month",
+                100,
+                Some("si_year"),
+                true
+            ),
+            None
+        );
+        let credit_line = vec![(
+            "si_month_credit".into(),
+            "price_month".into(),
+            100,
+            130,
+            -299,
+            true,
+        )];
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(&credit_line, "price_month", 100, None, true),
+            None
+        );
+        assert_eq!(
+            sponsored_invoice_line_item_for_operation(
+                &credit_line,
+                "price_month",
+                100,
+                None,
+                false
+            ),
+            Some("si_month_credit".into())
+        );
+    }
+
+    #[test]
+    fn sponsored_history_reads_only_invoices_with_a_contiguous_item_price_line() {
+        let line = |item: &str, price: &str, start, end| {
+            crate::cloud_provider_stripe_http::StripeInvoiceLineResource {
+                id: "il_test".into(),
+                quantity: Some(1),
+                amount: Some(299),
+                subscription_id: Some("sub_test".into()),
+                subscription_item_id: Some(item.into()),
+                legacy_subscription_id: None,
+                legacy_subscription_item_id: None,
+                price_id: Some(price.into()),
+                allocation_reference: None,
+                parent_type: Some("subscription_item_details".into()),
+                pricing_type: Some("price_details".into()),
+                livemode: Some(false),
+                period_start: Some(start),
+                period_end: Some(end),
+                invoice_id: Some("in_test".into()),
+                proration: Some(false),
+            }
+        };
+        let failed = [line("si_month", "price_month", 200, 300)];
+        assert!(sponsored_invoice_lines_can_be_predecessors(
+            &[line("si_month", "price_month", 100, 200)],
+            &failed,
+        ));
+        assert!(!sponsored_invoice_lines_can_be_predecessors(
+            &[line("si_year", "price_year", 100, 200)],
+            &failed,
+        ));
+        assert!(!sponsored_invoice_lines_can_be_predecessors(
+            &[line("si_month", "price_month", 100, 199)],
+            &failed,
+        ));
+    }
+
+    #[test]
+    fn sponsored_failure_only_rejects_permanent_evidence_errors() {
+        use crate::cloud_provider_stripe_http::StripeReadError;
+
+        assert!(StripeReadError::MalformedResponse("invoice.status").is_evidence_rejection());
+        assert!(StripeReadError::Observation(
+            crate::cloud_provider_stripe::StripeContractError::ContextMismatch
+        )
+        .is_evidence_rejection());
+        assert!(StripeReadError::Settlement(
+            crate::cloud_provider_stripe::StripeContractError::UnsupportedSettlement(
+                "ambiguous payment"
+            )
+        )
+        .is_evidence_rejection());
+
+        let operational = [
+            StripeReadError::Authentication { status: 401 },
+            StripeReadError::Permission { status: 403 },
+            StripeReadError::ContextMismatch,
+            StripeReadError::SessionClientMismatch,
+            StripeReadError::Transport,
+            StripeReadError::Timeout,
+            StripeReadError::RateLimited {
+                retry_after: Some(std::time::Duration::from_secs(1)),
+            },
+            StripeReadError::Retryable { status: 503 },
+            StripeReadError::RequestBoundExceeded,
+            StripeReadError::PageBoundExceeded,
+            StripeReadError::RecordBoundExceeded,
+            StripeReadError::SessionBytesExceeded,
+        ];
+        assert!(operational
+            .iter()
+            .all(|error| !error.is_evidence_rejection()));
+    }
+
+    #[test]
+    fn operator_refund_evidence_must_match_payment_and_approved_amount() {
+        let request = billing_refunds::BillingRefundRequest {
+            request_id: "refund:request".into(),
+            requester_user_id: "user".into(),
+            beneficiary_id: "user".into(),
+            organization_id: None,
+            payer_kind: PayerKind::Personal,
+            payment_reference: "pi_expected".into(),
+            subscription_id: "sub_expected".into(),
+            amount_pence: Some(299),
+            reason: "billing_error".into(),
+            policy_version: "policy".into(),
+            idempotency_key: "key".into(),
+            request_hash: "hash".into(),
+            full_refund_requested: false,
+            state: billing_refunds::CorrectionState::Unknown,
+            preserve_paid_term: true,
+            early_termination_confirmed_at_epoch: None,
+            effective_at_epoch: None,
+            provider_refund_id: None,
+            provider_refund_started_at_epoch: Some(1_900_000_000),
+            result_code: Some("refund_create_horizon_expired".into()),
+        };
+        let receipt = RefundReceipt {
+            refund_id: "re_verified".into(),
+            status: "succeeded".into(),
+            payment_reference: "pi_expected".into(),
+            charge_id: Some("ch_expected".into()),
+            amount_pence: 299,
+            currency: "gbp".into(),
+        };
+        assert!(refund_receipt_matches_approved_correction(
+            &request, &receipt, None
+        ));
+
+        let mut wrong_payment = receipt.clone();
+        wrong_payment.payment_reference = "pi_other".into();
+        assert!(!refund_receipt_matches_approved_correction(
+            &request,
+            &wrong_payment,
+            None
+        ));
+        let mut wrong_amount = receipt.clone();
+        wrong_amount.amount_pence = 300;
+        assert!(!refund_receipt_matches_approved_correction(
+            &request,
+            &wrong_amount,
+            None
+        ));
+        let mut wrong_currency = receipt;
+        wrong_currency.currency = "usd".into();
+        assert!(!refund_receipt_matches_approved_correction(
+            &request,
+            &wrong_currency,
+            None
+        ));
+
+        let mut full_refund = request;
+        full_refund.full_refund_requested = true;
+        full_refund.amount_pence = None;
+        let full_receipt = RefundReceipt {
+            refund_id: "re_full".into(),
+            status: "succeeded".into(),
+            payment_reference: "pi_expected".into(),
+            charge_id: Some("ch_expected".into()),
+            amount_pence: 299,
+            currency: "gbp".into(),
+        };
+        assert!(refund_receipt_matches_approved_correction(
+            &full_refund,
+            &full_receipt,
+            Some(&(299, "gbp".into()))
+        ));
+        assert!(!refund_receipt_matches_approved_correction(
+            &full_refund,
+            &full_receipt,
+            None
+        ));
+        assert!(!refund_receipt_matches_approved_correction(
+            &full_refund,
+            &full_receipt,
+            Some(&(300, "gbp".into()))
+        ));
+        let mut incomplete_full_receipt = full_receipt.clone();
+        incomplete_full_receipt.amount_pence = 100;
+        assert!(!refund_receipt_matches_approved_correction(
+            &full_refund,
+            &incomplete_full_receipt,
+            Some(&(299, "gbp".into()))
+        ));
+        assert!(refund_receipt_matches_charge(&full_receipt, "ch_expected"));
+        assert!(!refund_receipt_matches_charge(&full_receipt, "ch_other"));
     }
 }

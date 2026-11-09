@@ -11,6 +11,7 @@ use std::time::Duration;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use clap::{CommandFactory, Parser, Subcommand};
+use inquire::Confirm;
 use zeroize::{Zeroize, Zeroizing};
 
 use sotto_cli::clipboard;
@@ -160,6 +161,19 @@ enum Command {
     Unlock,
     /// Lock the store (clear the cached session).
     Lock,
+    /// Manage project-declared tasks for local agent workflows.
+    #[command(
+        after_help = "Examples:\n  sotto task validate\n  sotto task approve test --env dev\n  sotto task approvals\n  sotto task run test --env dev\n  sotto task revoke test --env dev\n\nTask approval requires a local interactive terminal. Running a task requires a current approval and an unlocked Sotto session. Approved project code receives plaintext secrets from the selected environment; Sotto is not a sandbox."
+    )]
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+    /// Start a local MCP server over stdio for project-declared agent tasks.
+    #[command(
+        after_help = "The server uses stdin/stdout for MCP messages. Configure your MCP host to launch `sotto mcp` from the project directory. Run `sotto unlock` separately before calling run_task."
+    )]
+    Mcp,
     /// Show identity, session, and project status.
     Status {
         /// Output as a JSON object.
@@ -167,12 +181,15 @@ enum Command {
         json: bool,
     },
     /// Set a secret. Reads the value from a hidden prompt unless --value/--stdin is given.
+    #[command(
+        after_help = "Input modes:\n  Without --value or --stdin, enter the value at the hidden prompt.\n  --stdin reads until EOF and preserves every byte, including line endings and trailing newlines. It does not trim or interpolate input. A redirected file becomes one complete secret value, not a dotenv import.\n  --value and --stdin cannot be combined. Real credentials passed with --value may appear in shell history and process arguments.\n\nBefore piping input:\n  Initialise the local store and project, and unlock the local identity first. --stdin replaces only the value prompt; it does not bypass these requirements or grant write access through a machine token.\n\nExamples (POSIX shell):\n  sotto set DATABASE_URL\n  sotto set PRIVATE_KEY --stdin < ./example-key.txt\n  printf '%s' 'example-value' | sotto set EXAMPLE --stdin\n\nThe pipeline uses a synthetic value. printf avoids the extra newline commonly added by echo. Do not put real credentials in an inline shell example: they can still enter shell history."
+    )]
     Set {
         name: String,
-        /// Provide the value inline (warning: visible in shell history).
+        /// Provide the value inline (warning: visible in shell history and process arguments).
         #[arg(long, conflicts_with = "stdin")]
         value: Option<String>,
-        /// Read the value from standard input.
+        /// Read the complete value from standard input until EOF, without trimming.
         #[arg(long)]
         stdin: bool,
     },
@@ -242,7 +259,10 @@ enum Command {
         )]
         args: Vec<String>,
     },
-    /// Print the environment's secrets in a chosen format (plaintext).
+    /// Export local plaintext secrets or download an encrypted Cloud bundle.
+    #[command(
+        after_help = "Examples:\n  sotto export --format dotenv > .env\n  sotto export --cloud ./example-export.json\n\nOrdinary export prints plaintext values from the active environment. --cloud downloads an encrypted account export from the configured server. It does not copy the current environment as plaintext. Cloud export requires login and server export eligibility. It does not require the local vault to be unlocked."
+    )]
     Export {
         /// Output format.
         #[arg(long, value_enum, default_value_t = ExportFormat::Dotenv)]
@@ -254,13 +274,16 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         cloud: Option<PathBuf>,
     },
-    /// Import secrets from a .env file into the active environment.
+    /// Import .env secrets or restore an encrypted Cloud bundle.
     #[command(after_help = r#"Examples:
   sotto import .env
+  sotto import --cloud ./example-export.json
+
+Cloud import reads the local encrypted bundle without server login. It requires the original Secret Key and master password. The bundle does not replace either. Cloud import refuses a local store that already has an identity. Use --cloud for an encrypted bundle. Ordinary dotenv import does not accept it.
 
 Values are imported literally: $OTHER and ${OTHER} are not expanded, and an inline # is part of the value; whole lines beginning with # are comments. Unquoted surrounding whitespace is trimmed, while matching quotes preserve spaces inside the value. Single-quoted values are literal. Double-quoted values decode \n, \r, \t, \\, and \". Physical multiline values are unsupported; use a double-quoted \n escape to store a newline."#)]
     Import {
-        /// Path to the .env file.
+        /// Path to a .env file or encrypted Cloud bundle.
         file: PathBuf,
         /// Restore an encrypted Cloud exit bundle instead of importing dotenv values.
         #[arg(long)]
@@ -328,6 +351,22 @@ enum EnvCommand {
         #[arg(long)]
         confirm: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum TaskCommand {
+    /// List declared tasks from the current project's manifest.
+    Ls,
+    /// Validate `sotto.tasks.toml` without opening the local secret store.
+    Validate,
+    /// Approve one declared task for one environment after reviewing its full command.
+    Approve { name: String },
+    /// List local task approvals for this project.
+    Approvals,
+    /// Revoke approval for one task and environment.
+    Revoke { name: String },
+    /// Run one locally approved task with the selected Sotto environment.
+    Run { name: String },
 }
 
 #[derive(Subcommand)]
@@ -401,8 +440,8 @@ enum OrgCommand {
     /// Show the org audit log, newest first (admins/owners).
     Audit {
         org_id: String,
-        /// Maximum events to show (server caps at 500).
-        #[arg(long)]
+        /// Maximum events to show (positive; server caps at 500).
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
         limit: Option<i64>,
     },
 }
@@ -451,6 +490,65 @@ fn run() -> Result<()> {
     if let Some(Command::Completions { shell }) = &cli.command {
         clap_complete::generate(*shell, &mut Cli::command(), "sotto", &mut io::stdout());
         return Ok(());
+    }
+
+    // Task declaration listing and validation need only the project config and task file. Handle
+    // them before opening local state or the keychain, so they cannot prompt or initialise secret data.
+    if let Some(Command::Task { command }) = &cli.command {
+        match command {
+            TaskCommand::Ls => {
+                let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+                let (_, manifest) = sotto_cli::agent_tasks::TaskManifest::discover(&cwd)?;
+                let mut tasks = manifest.tasks().to_vec();
+                tasks.sort_by(|a, b| a.name().cmp(b.name()));
+                for task in &tasks {
+                    println!("{}: {}", task.name(), task.description());
+                    println!("  environments: {}", task.environments().join(", "));
+                }
+                return Ok(());
+            }
+            TaskCommand::Validate => {
+                let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+                let (_, manifest) = sotto_cli::agent_tasks::TaskManifest::discover(&cwd)?;
+                let count = manifest.tasks().len();
+                let noun = if count == 1 { "task" } else { "tasks" };
+                println!("valid: {count} {noun}");
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    // Task approvals are a separate local capability. These commands use only the project
+    // declaration and approval store; they never open the secret store or keychain.
+    if let Some(Command::Task { command }) = &cli.command {
+        match command {
+            TaskCommand::Approve { name } => {
+                let environment = cli.env.as_deref().ok_or_else(|| {
+                    Error::MissingArgument(
+                        "missing required option --env <ENVIRONMENT> for task approval".into(),
+                    )
+                })?;
+                return approve_task(name, environment);
+            }
+            TaskCommand::Approvals => return list_task_approvals(cli.env.as_deref()),
+            TaskCommand::Revoke { name } => {
+                let environment = cli.env.as_deref().ok_or_else(|| {
+                    Error::MissingArgument(
+                        "missing required option --env <ENVIRONMENT> for task revocation".into(),
+                    )
+                })?;
+                return revoke_task_approval(name, environment);
+            }
+            TaskCommand::Run { .. } => {
+                cli.env.as_deref().ok_or_else(|| {
+                    Error::MissingArgument(
+                        "missing required option --env <ENVIRONMENT> for task execution".into(),
+                    )
+                })?;
+            }
+            TaskCommand::Ls | TaskCommand::Validate => {}
+        }
     }
 
     // Machine mode: with SOTTO_TOKEN set, `run`/`export` decrypt entirely in memory - no store,
@@ -517,6 +615,10 @@ fn run() -> Result<()> {
         let _ = cmd.write_help(&mut std::io::stderr());
         eprintln!();
         std::process::exit(2);
+    }
+
+    if matches!(&cli.command, Some(Command::Mcp)) {
+        return run_mcp_server();
     }
 
     let store_path = sotto_cli::paths::store_path()?;
@@ -685,6 +787,28 @@ fn run() -> Result<()> {
             eprintln!("locked");
             Ok(())
         }
+        Command::Task { command } => match command {
+            TaskCommand::Ls
+            | TaskCommand::Validate
+            | TaskCommand::Approve { .. }
+            | TaskCommand::Approvals
+            | TaskCommand::Revoke { .. } => {
+                unreachable!("task commands are handled before store init")
+            }
+            TaskCommand::Run { name } => run_approved_task_cli(
+                &app,
+                &cwd,
+                &name,
+                cli.env.as_deref().ok_or_else(|| {
+                    Error::MissingArgument(
+                        "missing required option --env <ENVIRONMENT> for task execution".into(),
+                    )
+                })?,
+            ),
+        },
+        Command::Mcp => Err(Error::Input(
+            "MCP server must start before local command setup".into(),
+        )),
         Command::Status { json } => status(&app, &cwd, json, &theme),
         Command::Set { name, value, stdin } => {
             let config = effective_config(&cwd, cli.env.as_deref())?;
@@ -860,6 +984,291 @@ fn run() -> Result<()> {
         },
         Command::Completions { .. } => unreachable!("completions are handled before store init"),
         Command::Theme { .. } => unreachable!("theme commands are handled before store init"),
+    }
+}
+
+fn run_approved_task_cli(app: &App, cwd: &Path, task_name: &str, environment: &str) -> Result<()> {
+    let (_, discovered_root) = Config::discover(cwd)?;
+    let project_root = std::fs::canonicalize(&discovered_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    let approvals = open_task_approval_store(&project_root)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Error::Io(format!("starting task runtime: {error}")))?;
+    let (cancel, receiver) = tokio::sync::watch::channel(false);
+    let signal_sender = cancel.clone();
+    runtime.spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = signal_sender.send(true);
+        }
+    });
+    let run = sotto_cli::agent_runner::run_approved_task(
+        app,
+        &approvals,
+        cwd,
+        task_name,
+        environment,
+        receiver,
+    )?;
+    let outcome = runtime.block_on(run)?;
+    match outcome.status {
+        sotto_cli::agent_runner::TaskRunStatus::Completed => {
+            eprintln!("{}", outcome.summary());
+            Ok(())
+        }
+        _ => Err(Error::Input(outcome.summary())),
+    }
+}
+
+fn run_mcp_server() -> Result<()> {
+    let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+    let (_, discovered_root) = Config::discover(&cwd)?;
+    let project_root = std::fs::canonicalize(&discovered_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    // Fail startup before creating local Sotto state if the project's task declaration is
+    // missing or invalid. The server reloads it for listing and the runner revalidates on launch.
+    sotto_cli::agent_tasks::TaskManifest::load_from(&project_root)?;
+    let approvals = open_task_approval_store(&project_root)?;
+
+    let store_path = sotto_cli::paths::store_path()?;
+    if let Some(parent) = store_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| Error::Io(format!("creating {}: {error}", parent.display())))?;
+    }
+    let store = Store::open(&store_path)?;
+    let keychain = OsKeychain::new(KEYCHAIN_SERVICE);
+
+    // MCP does not need the machine token, unlock password, or secret key from its parent
+    // environment. Unlock must have happened separately and is read from the OS keychain.
+    for name in ["SOTTO_TOKEN", "SOTTO_PASSWORD", "SOTTO_SECRET_KEY"] {
+        std::env::remove_var(name);
+    }
+
+    let server =
+        sotto_cli::agent_mcp::SottoMcpServer::new(project_root, store, keychain, approvals);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| Error::Io(format!("starting MCP runtime: {error}")))?;
+    runtime.block_on(sotto_cli::agent_mcp::serve_stdio(server))
+}
+
+fn approve_task(name: &str, environment: &str) -> Result<()> {
+    if !prompts::can_prompt() {
+        return Err(Error::MissingArgument(
+            "task approval requires an interactive terminal; no approval was recorded".into(),
+        ));
+    }
+
+    let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+    let (config, project_root) = Config::discover(&cwd)?;
+    let project_root = std::fs::canonicalize(&project_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    let project_root_key = sotto_cli::agent_approvals::project_root_key(&project_root);
+    let manifest = sotto_cli::agent_tasks::TaskManifest::load_from(&project_root)?;
+    let task = manifest
+        .tasks()
+        .iter()
+        .find(|task| task.name() == name)
+        .ok_or_else(|| Error::NotFound(format!("agent task `{name}`")))?;
+    if !task
+        .environments()
+        .iter()
+        .any(|allowed| allowed == environment)
+    {
+        return Err(Error::Input(format!(
+            "task `{name}` does not allow environment {environment:?}"
+        )));
+    }
+
+    println!("Review this task before approving it:");
+    let resolved_executable = task.resolve_executable(&project_root)?;
+
+    println!("Project identity: {:?}", config.project_id);
+    println!("Project root: {:?}", project_root);
+    println!("Task: {:?}", task.name());
+    println!("Description: {}", task.description());
+    println!("Resolved executable: {resolved_executable:?}");
+    if task.args().is_empty() {
+        println!("Arguments: (none)");
+    } else {
+        for (index, argument) in task.args().iter().enumerate() {
+            println!("Argument {index}: {argument:?}");
+        }
+    }
+    println!(
+        "Working directory: {:?}",
+        task.working_directory(&project_root)
+    );
+    println!("Sotto environment: {environment:?}");
+    let timeout = task
+        .timeout_seconds()
+        .unwrap_or(sotto_cli::agent_tasks::DEFAULT_TASK_TIMEOUT_SECONDS);
+    println!("Execution timeout: {timeout} seconds");
+    println!(
+        "Trust warning: Sotto is not a sandbox. Current project code will receive this environment's plaintext secrets and may disclose them."
+    );
+
+    let confirmed = match Confirm::new("Approve this task and environment?")
+        .with_default(false)
+        .prompt()
+    {
+        Ok(confirmed) => confirmed,
+        Err(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
+        ) => false,
+        Err(error) => return Err(Error::Input(format!("approval prompt failed: {error}"))),
+    };
+    if !confirmed {
+        eprintln!("approval cancelled");
+        return Ok(());
+    }
+
+    let declaration_fingerprint = manifest.fingerprint_for(name)?;
+    let fingerprint = sotto_cli::agent_approvals::approval_fingerprint(
+        &declaration_fingerprint,
+        &resolved_executable,
+    )?;
+    let approvals = open_task_approval_store(&project_root)?;
+    approvals.approve(
+        &config.project_id,
+        &project_root_key,
+        name,
+        environment,
+        &fingerprint,
+    )?;
+    eprintln!("approved task {name:?} for environment {environment:?}");
+    Ok(())
+}
+
+fn list_task_approvals(environment: Option<&str>) -> Result<()> {
+    if environment.is_some_and(str::is_empty) {
+        return Err(Error::Input(
+            "task approval environment filter must not be empty".into(),
+        ));
+    }
+    let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+    let (config, project_root) = Config::discover(&cwd)?;
+    let project_root = std::fs::canonicalize(&project_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    let project_root_key = sotto_cli::agent_approvals::project_root_key(&project_root);
+    let approvals = open_task_approval_store(&project_root)?;
+    let rows = approvals.list(&config.project_id, &project_root_key)?;
+    let rows = rows
+        .into_iter()
+        .filter(|approval| environment.is_none_or(|env| approval.environment == env))
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        println!("no task approvals for this project");
+        return Ok(());
+    }
+    for approval in rows {
+        println!("{:?} --env {:?}", approval.task_name, approval.environment);
+    }
+    Ok(())
+}
+
+fn revoke_task_approval(name: &str, environment: &str) -> Result<()> {
+    let cwd = std::env::current_dir().map_err(|error| Error::Io(error.to_string()))?;
+    let (config, project_root) = Config::discover(&cwd)?;
+    let project_root = std::fs::canonicalize(&project_root)
+        .map_err(|error| Error::Io(format!("resolving project root: {error}")))?;
+    let project_root_key = sotto_cli::agent_approvals::project_root_key(&project_root);
+    let approvals = open_task_approval_store(&project_root)?;
+    if approvals.revoke(&config.project_id, &project_root_key, name, environment)? {
+        eprintln!("revoked approval for task {name:?} and environment {environment:?}");
+    } else {
+        eprintln!("no approval found for task {name:?} and environment {environment:?}");
+    }
+    Ok(())
+}
+
+fn open_task_approval_store(
+    project_root: &Path,
+) -> Result<sotto_cli::agent_approvals::ApprovalStore> {
+    let data_dir = sotto_cli::paths::data_dir()?;
+    ensure_approval_data_dir_outside_project(&data_dir, project_root)?;
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|error| Error::Io(format!("creating {}: {error}", data_dir.display())))?;
+    let data_dir = std::fs::canonicalize(&data_dir)
+        .map_err(|error| Error::Io(format!("resolving approval data directory: {error}")))?;
+    ensure_approval_data_dir_outside_project(&data_dir, project_root)?;
+    sotto_cli::agent_approvals::ApprovalStore::open(&data_dir)
+}
+
+fn ensure_approval_data_dir_outside_project(data_dir: &Path, project_root: &Path) -> Result<()> {
+    let resolved = resolve_path_with_missing_tail(data_dir)?;
+    if resolved.starts_with(project_root) {
+        return Err(Error::Input(
+            "task approvals must be stored outside the project checkout; change SOTTO_DATA_DIR"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve existing path components (including symlinks) without creating a missing tail.
+fn resolve_path_with_missing_tail(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| Error::Io(format!("resolving current directory: {error}")))?
+            .join(path)
+    };
+
+    let mut resolved = PathBuf::new();
+    let mut has_missing_component = false;
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            std::path::Component::RootDir => resolved.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                resolved.pop();
+                if has_missing_component {
+                    match std::fs::canonicalize(&resolved) {
+                        Ok(canonical) => {
+                            resolved = canonical;
+                            has_missing_component = false;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(Error::Io(format!(
+                                "resolving approval data directory {}: {error}",
+                                resolved.display()
+                            )))
+                        }
+                    }
+                }
+            }
+            std::path::Component::Normal(name) if has_missing_component => resolved.push(name),
+            std::path::Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match std::fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        resolved = candidate;
+                        has_missing_component = true;
+                    }
+                    Err(error) => {
+                        return Err(Error::Io(format!(
+                            "resolving approval data directory {}: {error}",
+                            candidate.display()
+                        )))
+                    }
+                }
+            }
+        }
+    }
+    match std::fs::canonicalize(&resolved) {
+        Ok(canonical) => Ok(canonical),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(resolved),
+        Err(error) => Err(Error::Io(format!(
+            "resolving approval data directory {}: {error}",
+            resolved.display()
+        ))),
     }
 }
 
@@ -2274,6 +2683,7 @@ mod tests {
         machine_token_list_json, org_members_json, set_confirmation, Cli, CloudCommand, Command,
         EnvCommand, OrgCommand, SharesCommand, ThemeCommand, TokenCommand,
     };
+    use super::{exec_or_replace, run_with_entries, Error};
 
     #[test]
     fn dotenv_import_parse_error_includes_path_and_writes_nothing() {
@@ -2323,6 +2733,32 @@ mod tests {
     }
 
     #[test]
+    fn set_help_explains_prompt_and_stdin_input() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("set")
+            .expect("set subcommand should exist")
+            .render_long_help()
+            .to_string();
+
+        for expected in [
+            "sotto set DATABASE_URL",
+            "sotto set PRIVATE_KEY --stdin < ./example-key.txt",
+            "printf '%s' 'example-value' | sotto set EXAMPLE --stdin",
+            "reads until EOF",
+            "trailing newlines",
+            "does not trim or interpolate",
+            "not a dotenv import",
+            "--value and --stdin cannot be combined",
+            "shell history and process arguments",
+            "unlock the local identity first",
+            "synthetic value",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
+
+    #[test]
     fn import_help_explains_literal_and_quoted_values() {
         let mut command = Cli::command();
         let help = command
@@ -2339,6 +2775,48 @@ mod tests {
             "Single-quoted values are literal",
             "Physical multiline values are unsupported",
             "Double-quoted values decode",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
+
+    #[test]
+    fn export_help_distinguishes_plaintext_and_cloud_bundles() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("export")
+            .expect("export subcommand should exist")
+            .render_long_help()
+            .to_string();
+
+        for expected in [
+            "sotto export --format dotenv > .env",
+            "sotto export --cloud ./example-export.json",
+            "prints plaintext values from the active environment",
+            "encrypted account export from the configured server",
+            "requires login and server export eligibility",
+            "does not require the local vault to be unlocked",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
+
+    #[test]
+    fn import_help_explains_cloud_restore_requirements() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("import")
+            .expect("import subcommand should exist")
+            .render_long_help()
+            .to_string();
+
+        for expected in [
+            "sotto import --cloud ./example-export.json",
+            "local encrypted bundle without server login",
+            "original Secret Key and master password",
+            "The bundle does not replace either",
+            "refuses a local store that already has an identity",
+            "Ordinary dotenv import does not accept it",
         ] {
             assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
         }
@@ -2911,6 +3389,43 @@ mod tests {
     }
 
     #[test]
+    fn org_audit_limit_parses_positive_values_and_rejects_non_positive_values() {
+        for value in [1, 500, 501] {
+            let text = value.to_string();
+            let cli = Cli::try_parse_from(["sotto", "org", "audit", "org-1", "--limit", &text])
+                .expect("positive audit limit should parse");
+            assert!(matches!(
+                cli.command,
+                Some(Command::Org {
+                    command: OrgCommand::Audit {
+                        limit: Some(parsed),
+                        ..
+                    }
+                }) if parsed == value
+            ));
+        }
+
+        let cli = Cli::try_parse_from(["sotto", "org", "audit", "org-1"])
+            .expect("omitted audit limit should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Org {
+                command: OrgCommand::Audit { limit: None, .. }
+            })
+        ));
+
+        for option in ["--limit=0", "--limit=-1"] {
+            let error = match Cli::try_parse_from(["sotto", "org", "audit", "org-1", option]) {
+                Ok(_) => panic!("accepted {option}"),
+                Err(error) => error,
+            };
+            let message = error.to_string();
+            assert!(message.contains("--limit"), "{option}: {message}");
+            assert!(message.contains("1.."), "{option}: {message}");
+        }
+    }
+
+    #[test]
     fn org_members_json_reports_key_presence_and_omits_the_key() {
         let members = vec![
             MemberInfo {
@@ -3163,5 +3678,91 @@ mod tests {
                 command: EnvCommand::Use { name: None }
             })
         ));
+    }
+
+    /// The child fixtures for [`run_helper`]: `sh` on Unix, `cmd` on Windows. The subject
+    /// of these tests is the exit status crossing the `run` boundary, so the child only
+    /// has to exit with a known code.
+    #[cfg(unix)]
+    fn exit_fixture(code: i32) -> (String, Vec<String>) {
+        (
+            "sh".to_string(),
+            vec!["-c".to_string(), format!("exit {code}")],
+        )
+    }
+
+    #[cfg(windows)]
+    fn exit_fixture(code: i32) -> (String, Vec<String>) {
+        (
+            "cmd".to_string(),
+            vec!["/C".to_string(), format!("exit {code}")],
+        )
+    }
+
+    /// Runs one helper pass in its own process and returns that process's exit status.
+    ///
+    /// The helper cannot run in the harness: on Unix `exec_or_replace` replaces the
+    /// process, which would end the test run, and on Windows it calls `process::exit`.
+    /// The wait is bounded so a regression cannot hang the suite, and the `--exact`
+    /// filter names the helper below, so renaming that function moves this string too.
+    fn run_helper(mode: &str) -> std::process::ExitStatus {
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "tests::child_exit_status_helper", "--ignored"])
+            .env("SOTTO_TEST_CHILD_MODE", mode)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the helper process");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().expect("wait for the helper") {
+                return status;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the helper process did not finish inside its 30 second bound");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Child-process mode of the exit-status tests: hand this process over to the real
+    /// `sotto run` execution boundary, so the status the parent observes is the child's.
+    #[test]
+    #[ignore = "helper process for the exit-status tests; re-executed, never run directly"]
+    fn child_exit_status_helper() {
+        let mode = std::env::var("SOTTO_TEST_CHILD_MODE").expect("helper mode");
+        let code = mode.parse::<i32>().expect("helper mode is an exit code");
+        let (program, args) = exit_fixture(code);
+        let mut argv = vec![program];
+        argv.extend(args);
+
+        // Success never returns here: the process becomes the child on Unix, and exits
+        // with the child's status on Windows.
+        let error = run_with_entries(Vec::new(), argv)
+            .expect_err("the execution boundary must not return on success");
+        panic!("the execution boundary returned instead of running the child: {error}");
+    }
+
+    #[test]
+    fn child_exit_status_zero_crosses_the_run_boundary() {
+        let status = run_helper("0");
+        assert_eq!(status.code(), Some(0), "status: {status:?}");
+    }
+
+    #[test]
+    fn child_exit_status_nonzero_crosses_the_run_boundary() {
+        let status = run_helper("42");
+        assert_eq!(status.code(), Some(42), "status: {status:?}");
+    }
+
+    #[test]
+    fn launch_failure_is_an_io_error_and_sotto_exit_code_five() {
+        let program = "sotto-test-command-that-does-not-exist";
+        let error = exec_or_replace(std::process::Command::new(program), program)
+            .expect_err("launching a nonexistent program must fail");
+        assert!(matches!(error, Error::Io(_)), "{error}");
+        assert_eq!(error.exit_code(), 5);
     }
 }

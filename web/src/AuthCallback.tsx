@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { startLogin } from "./login";
+import { PENDING_CLOUD_CONTACT_TOKEN_KEY, startLogin } from "./login";
 import { Shell } from "./Shell";
 
 // After OAuth, the server has set the session cookie and redirected here with `?state=`. Verify it
@@ -18,7 +18,18 @@ export function AuthCallback() {
     }
     const destination = sessionStorage.getItem("sotto_oauth_destination");
     sessionStorage.removeItem("sotto_oauth_destination");
-    window.location.replace(destination === "/cloud" ? "/cloud" : "/app");
+    const safeDestination = destination === "/cloud" ? "/cloud" : "/app";
+    const storedContactToken = safeDestination === "/cloud"
+      ? sessionStorage.getItem(PENDING_CLOUD_CONTACT_TOKEN_KEY)
+      : null;
+    const contactToken = storedContactToken !== null && /^[0-9a-f]{64}$/i.test(storedContactToken)
+      ? storedContactToken
+      : null;
+    sessionStorage.removeItem(PENDING_CLOUD_CONTACT_TOKEN_KEY);
+    const callback = contactToken === null
+      ? safeDestination
+      : `${safeDestination}#${new URLSearchParams({ contact_token: contactToken }).toString()}`;
+    window.location.replace(callback);
   }, []);
 
   // The state we stored is consumed above and the callback is fail-closed, so a retry has to start

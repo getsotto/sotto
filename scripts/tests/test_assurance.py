@@ -2,11 +2,13 @@
 
 import importlib.machinery
 import importlib.util
+from io import BytesIO
 import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 
@@ -61,6 +63,19 @@ class AssuranceTests(unittest.TestCase):
         verdict = assurance.validate_run(manifest, "codec", payload["run"], payload["jobs"])
         self.assertEqual(verdict["status"], "passed")
 
+    def test_queued_workflow_passes_only_when_required_jobs_pass(self):
+        manifest = assurance.load_manifest()
+        names = manifest["groups"]["codec"]["required_jobs"]
+        payload = fixture("codec", names)
+        payload["run"]["status"] = "queued"
+
+        verdict = assurance.validate_run(manifest, "codec", payload["run"], payload["jobs"])
+        self.assertEqual(verdict["status"], "passed")
+
+        payload["jobs"][0]["conclusion"] = None
+        with self.assertRaisesRegex(assurance.AssuranceError, "concluded None"):
+            assurance.validate_run(manifest, "codec", payload["run"], payload["jobs"])
+
     def test_duplicate_and_unexpected_jobs_fail(self):
         manifest = assurance.load_manifest()
         names = manifest["groups"]["kani"]["required_jobs"]
@@ -87,6 +102,78 @@ class AssuranceTests(unittest.TestCase):
             with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "1"}):
                 argv = ["--group", "kani", "--jobs-file", str(path), "--expected-sha", "abc123"]
                 self.assertEqual(assurance.main(argv), 0)
+
+    def test_remote_validation_retries_until_github_publishes_job_conclusions(self):
+        manifest = assurance.load_manifest()
+        names = manifest["groups"]["kani"]["required_jobs"]
+        incomplete = (fixture("kani", names)["run"], fixture("kani", names, {names[0]: None})["jobs"])
+        complete = (fixture("kani", names)["run"], fixture("kani", names)["jobs"])
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GITHUB_RUN_ID": "42",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_REPOSITORY": "getsotto/sotto",
+                    "GITHUB_TOKEN": "token",
+                },
+            ),
+            patch.object(assurance, "fetch_run", side_effect=[incomplete, complete]) as fetch,
+            patch.object(assurance.time, "sleep") as sleep,
+        ):
+            self.assertEqual(assurance.main(["--group", "kani", "--expected-sha", "abc123"]), 0)
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(assurance.ASSURANCE_STATUS_RETRY_DELAYS[0])
+
+    def test_remote_validation_retries_when_github_temporarily_omits_a_job(self):
+        manifest = assurance.load_manifest()
+        names = manifest["groups"]["kani"]["required_jobs"]
+        missing = (fixture("kani", names)["run"], [])
+        complete = (fixture("kani", names)["run"], fixture("kani", names)["jobs"])
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GITHUB_RUN_ID": "42",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_REPOSITORY": "getsotto/sotto",
+                    "GITHUB_TOKEN": "token",
+                },
+            ),
+            patch.object(assurance, "fetch_run", side_effect=[missing, complete]) as fetch,
+            patch.object(assurance.time, "sleep") as sleep,
+        ):
+            self.assertEqual(assurance.main(["--group", "kani", "--expected-sha", "abc123"]), 0)
+        self.assertEqual(fetch.call_count, 2)
+        sleep.assert_called_once_with(assurance.ASSURANCE_STATUS_RETRY_DELAYS[0])
+
+    def test_remote_validation_fails_closed_after_bounded_incomplete_results(self):
+        manifest = assurance.load_manifest()
+        names = manifest["groups"]["kani"]["required_jobs"]
+        incomplete = (fixture("kani", names)["run"], fixture("kani", names, {names[0]: None})["jobs"])
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GITHUB_RUN_ID": "42",
+                    "GITHUB_RUN_ATTEMPT": "1",
+                    "GITHUB_REPOSITORY": "getsotto/sotto",
+                    "GITHUB_TOKEN": "token",
+                },
+            ),
+            patch.object(
+                assurance,
+                "fetch_run",
+                side_effect=[incomplete] * (len(assurance.ASSURANCE_STATUS_RETRY_DELAYS) + 1),
+            ) as fetch,
+            patch.object(assurance.time, "sleep") as sleep,
+        ):
+            self.assertEqual(assurance.main(["--group", "kani", "--expected-sha", "abc123"]), 1)
+        self.assertEqual(fetch.call_count, len(assurance.ASSURANCE_STATUS_RETRY_DELAYS) + 1)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            list(assurance.ASSURANCE_STATUS_RETRY_DELAYS),
+        )
 
     def test_fetch_uses_latest_attempt_and_paginates(self):
         first_page = [{"name": f"job-{index}", "conclusion": "success"} for index in range(100)]
@@ -115,6 +202,41 @@ class AssuranceTests(unittest.TestCase):
         self.assertEqual(jobs, page)
         self.assertEqual(len(get_json.call_args_list), 3)
         self.assertIn("page=2", get_json.call_args_list[2].args[0])
+
+    def test_get_json_retries_transient_server_errors(self):
+        response = BytesIO(b'{"ok": true}')
+        transient = HTTPError("https://api.github.com/example", 502, "Bad Gateway", {}, None)
+        with patch.object(assurance, "urlopen", side_effect=[transient, response]) as open_url:
+            with patch.object(assurance.time, "sleep") as sleep:
+                result = assurance._get_json("https://api.github.com/example", "token")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(open_url.call_count, 2)
+        request = open_url.call_args_list[0].args[0]
+        self.assertEqual(request.get_header("Cache-control"), "no-cache")
+        sleep.assert_called_once_with(1)
+
+    def test_get_json_does_not_retry_permanent_client_errors(self):
+        permanent = HTTPError("https://api.github.com/example", 400, "Bad Request", {}, None)
+        with patch.object(assurance, "urlopen", side_effect=permanent) as open_url:
+            with patch.object(assurance.time, "sleep") as sleep:
+                with self.assertRaisesRegex(assurance.AssuranceError, "HTTP Error 400"):
+                    assurance._get_json("https://api.github.com/example", "token")
+        open_url.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_get_json_stops_after_bounded_transient_retries(self):
+        transient_errors = [
+            HTTPError("https://api.github.com/example", 502, "Bad Gateway", {}, None)
+            for _ in range(len(assurance.API_RETRY_DELAYS) + 1)
+        ]
+        with patch.object(assurance, "urlopen", side_effect=transient_errors) as open_url:
+            with patch.object(assurance.time, "sleep") as sleep:
+                with self.assertRaisesRegex(assurance.AssuranceError, "HTTP Error 502"):
+                    assurance._get_json("https://api.github.com/example", "token")
+        self.assertEqual(open_url.call_count, len(assurance.API_RETRY_DELAYS) + 1)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list], list(assurance.API_RETRY_DELAYS)
+        )
 
     def test_second_page_required_failure_reaches_validator(self):
         manifest = {

@@ -494,9 +494,14 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     let invoice_id = format!("in_sponsored_{fixture}");
     let payment_id = format!("pi_sponsored_{fixture}");
     let line = |line_id: String, item_id: String, price_id: String, quantity: u64| {
+        let unit_amount = if price_id.contains("founding") {
+            199
+        } else {
+            299
+        };
         serde_json::json!({
             "id":line_id, "object":"line_item", "invoice":invoice_id,
-            "quantity":quantity, "livemode":false,
+            "quantity":quantity, "amount":unit_amount * quantity as i64, "livemode":false,
             "parent":{"type":"subscription_item_details","subscription_item_details":{
                 "subscription":subscription_id, "subscription_item":item_id, "proration":false
             }},
@@ -510,7 +515,8 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
             "subscription":subscription_id, "metadata":{"organization_id":organization_id}
         }},
         "status":"paid", "currency":"gbp", "amount_paid":797, "amount_due":797,
-        "amount_remaining":0, "amount_overpaid":0, "amount_paid_off_stripe":0,
+        "amount_remaining":0, "amount_overpaid":0,
+        "amount_paid_off_stripe":0, "starting_balance":0,
         "livemode":false,
         "status_transitions":{"paid_at":now + 10},
         "lines":{"data":[
@@ -520,7 +526,7 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
     });
     let personal_line = serde_json::json!({
         "id":format!("il_personal_{fixture}"), "object":"line_item", "invoice":personal_invoice_id,
-        "quantity":1, "livemode":false,
+        "quantity":1, "amount":299, "livemode":false,
         "parent":{"type":"subscription_item_details","subscription_item_details":{
             "subscription":personal_subscription, "subscription_item":personal_item, "proration":false
         }},
@@ -535,13 +541,14 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
             "metadata":{"sotto_allocation_reference":personal_reference}
         }},
         "status":"paid", "currency":"gbp", "amount_paid":299, "amount_due":299,
-        "amount_remaining":0, "amount_overpaid":0, "amount_paid_off_stripe":0,
+        "amount_remaining":0, "amount_overpaid":0,
+        "amount_paid_off_stripe":0, "starting_balance":0,
         "livemode":false, "lines":{"data":[personal_line]}
     });
     let previous_sponsor_invoice_id = format!("in_previous_sponsor_{fixture}");
     let previous_sponsor_line = serde_json::json!({
         "id":format!("il_previous_sponsor_{fixture}"), "object":"line_item",
-        "invoice":previous_sponsor_invoice_id, "quantity":1, "livemode":false,
+        "invoice":previous_sponsor_invoice_id, "quantity":1, "amount":299, "livemode":false,
         "parent":{"type":"subscription_item_details","subscription_item_details":{
             "subscription":previous_sponsor_subscription,
             "subscription_item":previous_sponsor_item, "proration":false
@@ -556,7 +563,8 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
             "subscription":previous_sponsor_subscription
         }},
         "status":"paid", "currency":"gbp", "amount_paid":299, "amount_due":299,
-        "amount_remaining":0, "amount_overpaid":0, "amount_paid_off_stripe":0,
+        "amount_remaining":0, "amount_overpaid":0,
+        "amount_paid_off_stripe":0, "starting_balance":0,
         "livemode":false, "lines":{"data":[previous_sponsor_line]}
     });
     let lines_response = serde_json::json!({
@@ -700,15 +708,32 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         webhook_secret: WEBHOOK_SECRET.into(),
         price_id: "price_legacy_test".into(),
         price_catalogue: Some(catalogue),
+        cloud_portal_configuration_id: None,
         cloud_sales_enabled: false,
+        cloud_automatic_tax_enabled: false,
         return_url: "https://app.sotto.test".into(),
     })
     .with_personal_coverage(coverage.clone(), stripe, true);
     let state = AppState {
         deployment_mode: sotto_server::config::DeploymentMode::Cloud,
         telemetry_ingest: false,
+        contact_verification: None,
+        cloud_notice_dispatch_enabled: false,
+        resend_webhook_secret: None,
         cloud_action_enforcement_enabled: false,
+        cloud_coverage_authority_enforcement_enabled: false,
+        cloud_coverage_authority_shadow_enabled: false,
         machine_eligibility_enforcement_enabled: false,
+        billing_transfers_enabled: false,
+        billing_transfer_execution_enabled: false,
+        billing_transfer_setup_enabled: false,
+        cloud_retention_dry_run_enabled: false,
+        cloud_shared_retention_dry_run_enabled: false,
+        cloud_retention_operator_token: None,
+        cloud_retention_purge_enabled: false,
+        cloud_retention_destructive_token: None,
+        cloud_retention_evidence_hmac_key: None,
+        cloud_retention_build_sha: None,
         pool: pool.clone(),
         oauth: None,
         oauth_config: None,
@@ -716,7 +741,19 @@ async fn paid_sponsored_invoice_fans_out_one_event_to_each_named_beneficiary() {
         organisation_deletion_enabled: false,
         organisation_deletion_retention_days: DEFAULT_ORGANISATION_DELETION_RETENTION_DAYS,
         organisation_deletion_metrics_token: None,
+        cloud_operations_metrics_token: None,
+        cloud_coverage_repair_token: None,
+        provider_refresh_ingest_enabled: false,
+        provider_refresh_worker_enabled: false,
+        provider_refresh_reconciliation_enabled: false,
+        provider_authority_revalidation_enabled: false,
+        cloud_sales_enabled: false,
+        founding_schedule_worker_enabled: false,
+        founding_price_notices_enabled: false,
+        billing_recovery_worker_enabled: false,
+        sponsored_billing_recovery_worker_enabled: false,
         organisation_deletion_operator_token: None,
+        billing_transfer_operator_token: None,
     };
     let app = Router::new()
         .merge(sotto_server::billing::router())

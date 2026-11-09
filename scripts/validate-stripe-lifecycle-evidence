@@ -3,8 +3,9 @@
 
 The input is an operator-produced JSON manifest from a disposable Stripe test-mode run. Every
 required scenario must be observed as passed against one application SHA and the pinned Stripe
-API version. The output contains only fingerprints and aggregate check counts, so it can be
-attached to an acceptance record without publishing provider identifiers or payment details.
+API version. The output contains fixed check identifiers, observation hashes, aggregate counts and
+fingerprinted provider ids, so it can be attached to an acceptance record without publishing raw
+provider identifiers or payment details. A reviewer must still verify the private observations.
 """
 
 from __future__ import annotations
@@ -18,7 +19,11 @@ from datetime import datetime
 from pathlib import Path
 
 PINNED_API_VERSION = "2026-07-29.dahlia"
-SCHEMA = "sotto-stripe-lifecycle-acceptance-v1"
+SCHEMA = "sotto-stripe-lifecycle-acceptance-v4"
+OBSERVATION_SCHEMA = "sotto-stripe-lifecycle-observation-v1"
+REQUIRED_TOOL_VERSIONS = ("postgres", "rust", "stripe_cli", "node", "playwright")
+REQUIRED_CLIENT_VERSIONS = ("server", "web", "cli", "previous_minor_web", "previous_minor_cli")
+MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "crates/server/migrations"
 REQUIRED_SCENARIOS = (
     "personal_monthly_initial",
     "personal_annual_initial",
@@ -38,7 +43,116 @@ REQUIRED_SCENARIOS = (
     "human_export_and_restore",
     "retention_scope_and_restore",
 )
+REQUIRED_CHECKS = {
+    "personal_monthly_initial": (
+        "checkout_settled", "invoice_amount_matches_catalogue", "paid_through_matches_invoice",
+        "next_price_is_standard_monthly",
+    ),
+    "personal_annual_initial": (
+        "checkout_settled", "invoice_amount_matches_catalogue", "paid_through_matches_invoice",
+        "next_price_is_standard_annual",
+    ),
+    "personal_founding_monthly_initial": (
+        "founding_price_charged", "founding_place_awarded_to_person", "paid_through_matches_invoice",
+        "first_100_limit_is_enforced", "anniversary_uses_standard_monthly_price",
+    ),
+    "personal_founding_annual_initial": (
+        "founding_price_charged", "founding_place_awarded_to_person", "paid_through_matches_invoice",
+        "first_100_limit_is_enforced", "anniversary_matches_calendar_term",
+        "anniversary_uses_standard_annual_price",
+    ),
+    "personal_renewal": (
+        "exactly_one_renewal_invoice", "paid_through_advanced_once", "next_period_matches_provider",
+        "month_end_and_leap_day_anchor_matches_provider",
+    ),
+    "personal_interval_switch": (
+        "founding_interval_change_refused", "offer_and_interval_unchanged", "paid_through_unchanged",
+        "no_schedule_or_invoice_created", "founding_anniversary_keeps_original_interval",
+    ),
+    "personal_cancellation": (
+        "cancel_before_schedule_preserves_paid_phase", "cancel_after_schedule_preserves_paid_phase",
+        "later_month_in_same_schedule_phase_cancels_at_boundary", "no_invoice_after_cancellation_boundary",
+        "stale_webhook_does_not_clear_cancellation", "worker_race_preserves_cancellation",
+        "unscheduled_cancel_remains_period_end", "lifting_cancel_restores_founding_transition",
+    ),
+    "personal_full_refund_cancellation": (
+        "successful_full_refund_precedes_termination", "pending_refund_preserves_paid_access",
+        "unknown_refund_retry_does_not_duplicate_payout", "retry_after_provider_key_horizon_does_not_repost",
+        "termination_failure_is_retryable",
+    ),
+    "personal_failed_renewal_recovery": (
+        "failure_links_to_paid_predecessor", "recovery_window_is_fourteen_days",
+        "personal_and_grouped_sponsored_paths_are_observed", "repayment_closes_episode_once",
+        "uncertain_outcome_preserves_paid_through", "mixed_sources_are_complete",
+        "recovery_deadline_and_export_notice_are_stable",
+    ),
+    "sponsored_initial_mixed_items": (
+        "one_grouped_subscription_invoice", "every_named_allocation_links_to_invoice_item",
+        "line_quantities_match_named_allocations", "new_unbound_seat_is_included_on_grouped_line",
+        "multiple_prices_are_bound_to_their_items", "mixed_intervals_match_paid_terms",
+    ),
+    "sponsored_anniversary": (
+        "one_renewal_invoice", "named_seats_remain_covered", "founding_seats_move_to_standard_price",
+        "non_founder_seats_keep_standard_price",
+    ),
+    "sponsored_seat_replacement": (
+        "removal_and_replacement_share_one_boundary", "no_overlapping_named_seats",
+        "invoice_quantities_match_named_seats",
+    ),
+    "sponsored_payer_transfer": (
+        "source_and_destination_consent_observed", "transfer_starts_at_next_renewal",
+        "personal_to_sponsor_transfer_succeeds", "sponsor_to_personal_transfer_succeeds",
+        "sponsor_to_sponsor_transfer_succeeds",
+        "failed_destination_restores_personal_payer_or_holds_sponsor",
+        "wrong_period_evidence_is_parked_again_after_resume",
+        "operator_can_reject_wrong_period_payment_evidence", "two_post_transfer_renewals_succeed",
+        "sponsor_day_31_and_leap_year_terms_match_provider",
+    ),
+    "webhook_replay_and_out_of_order_delivery": (
+        "duplicate_delivery_has_one_durable_effect", "same_second_failure_and_state_events_both_apply",
+        "async_checkout_event_orders_converge", "missed_event_repair_is_idempotent",
+        "source_invalidation_race_converges", "authority_expiry_without_event_is_detected",
+    ),
+    "ambiguous_provider_outcome_and_worker_restart": (
+        "provider_timeout_is_recorded_as_ambiguous", "restart_reuses_operation_idempotency",
+        "remote_success_is_verified_before_local_completion", "cleanup_is_scoped_to_run_resources",
+    ),
+    "human_export_and_restore": (
+        "partial_organisation_grants_export_without_unshared_data",
+        "restore_succeeds_in_supported_self_host_target", "machine_token_cannot_use_human_export",
+        "free_recipient_remains_usable",
+    ),
+    "retention_scope_and_restore": (
+        "personal_shared_and_link_scopes_are_classified", "notice_and_real_deadline_evidence_is_present",
+        "repayment_and_cancellation_races_hold_deletion", "purge_deletes_only_approved_scope",
+        "tombstone_replay_twice_does_not_resurrect_rows",
+    ),
+}
 ID_RE = re.compile(r"^[A-Za-z0-9_:.\-/]+$")
+
+
+class DuplicateJsonKeyError(ValueError):
+    """A JSON object repeats a key and would parse ambiguously across implementations."""
+
+
+def reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise DuplicateJsonKeyError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def latest_migration_version() -> str:
+    versions = []
+    for path in MIGRATIONS_DIR.glob("*.sql"):
+        match = re.match(r"^(\d+)_", path.name)
+        if match:
+            versions.append(int(match.group(1)))
+    if not versions:
+        raise ValueError("could not determine the current migration version")
+    return f"{max(versions):04d}"
 
 
 def fingerprint(value: str) -> str:
@@ -51,25 +165,137 @@ def require_string(value: object, name: str) -> str:
     return value
 
 
+def parse_timestamp(value: object, name: str) -> str:
+    timestamp = require_string(value, name)
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"{name} must be an ISO-8601 timestamp") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"{name} must include a timezone")
+    return timestamp
+
+
+def validate_version_map(value: object, name: str, required_keys: tuple[str, ...]) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != set(required_keys):
+        raise ValueError(f"{name} must contain exactly: {', '.join(required_keys)}")
+    return {
+        key: require_string(value[key], f"{name}.{key}")
+        for key in required_keys
+    }
+
+
+def validate_migration_state(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {"latest_applied", "pending"}:
+        raise ValueError("migration_state must include latest_applied and pending")
+    latest = value["latest_applied"]
+    pending = value["pending"]
+    expected_latest = latest_migration_version()
+    if latest != expected_latest:
+        raise ValueError(f"migration_state.latest_applied must match current version {expected_latest}")
+    if type(pending) is not int or pending != 0:
+        raise ValueError("migration_state.pending must be zero")
+    return {"latest_applied": latest, "pending": pending}
+
+
+def read_observation(
+    manifest_path: Path,
+    row: dict,
+    scenario: str,
+    app_sha: str,
+) -> tuple[str, list[str], list[str], str, int | None] | None:
+    evidence_file = row["evidence_file"]
+    supplied_digest = row["evidence_sha256"]
+    if not evidence_file and not supplied_digest:
+        return None
+    if not isinstance(evidence_file, str) or not evidence_file.strip():
+        raise ValueError(f"evidence_file for {scenario} must identify a private observation")
+    if not isinstance(supplied_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", supplied_digest):
+        raise ValueError(f"evidence_sha256 for {scenario} must be a lowercase SHA-256 digest")
+    observation_path = Path(evidence_file)
+    if not observation_path.is_absolute():
+        observation_path = manifest_path.parent / observation_path
+    raw = observation_path.read_bytes()
+    actual_digest = hashlib.sha256(raw).hexdigest()
+    if actual_digest != supplied_digest:
+        raise ValueError(f"evidence_sha256 for {scenario} does not match its observation file")
+    try:
+        artifact = json.loads(raw, object_pairs_hook=reject_duplicate_json_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError, DuplicateJsonKeyError) as error:
+        raise ValueError(f"observation for {scenario} is not valid JSON") from error
+    expected_shape = {
+        "schema", "scenario", "app_sha", "api_version", "captured_at",
+        "wall_clock_at", "stripe_test_clock_epoch", "checks", "provider_ids",
+    }
+    if not isinstance(artifact, dict) or set(artifact) != expected_shape:
+        raise ValueError(f"observation for {scenario} has an incomplete shape")
+    if artifact["schema"] != OBSERVATION_SCHEMA:
+        raise ValueError(f"observation for {scenario} has an unsupported schema")
+    if artifact["scenario"] != scenario:
+        raise ValueError(f"observation file is bound to a different scenario than {scenario}")
+    if artifact["app_sha"] != app_sha:
+        raise ValueError(f"observation for {scenario} is bound to a different app SHA")
+    if artifact["api_version"] != PINNED_API_VERSION:
+        raise ValueError(f"observation for {scenario} uses a different Stripe API version")
+    parse_timestamp(artifact["captured_at"], f"observation captured_at for {scenario}")
+    parse_timestamp(artifact["wall_clock_at"], f"observation wall_clock_at for {scenario}")
+    test_clock_epoch = artifact["stripe_test_clock_epoch"]
+    if test_clock_epoch is not None and (type(test_clock_epoch) is not int or test_clock_epoch <= 0):
+        raise ValueError(f"stripe_test_clock_epoch for {scenario} must be a positive Unix timestamp or null")
+    checks = artifact["checks"]
+    if not isinstance(checks, list) or not all(isinstance(check, dict) for check in checks):
+        raise ValueError(f"observation checks for {scenario} must include evidence records")
+    expected_check_shape = {"id", "source", "observed"}
+    for check in checks:
+        if set(check) != expected_check_shape:
+            raise ValueError(f"observation check for {scenario} has an incomplete shape")
+        require_string(check["source"], f"evidence source for {scenario}")
+        require_string(check["observed"], f"observed value for {scenario}")
+    expected_checks = set(REQUIRED_CHECKS[scenario])
+    check_ids = [check["id"] for check in checks]
+    if not all(isinstance(check_id, str) and check_id for check_id in check_ids):
+        raise ValueError(f"observation check ids for {scenario} must be non-empty strings")
+    if len(check_ids) != len(set(check_ids)) or set(check_ids) != expected_checks:
+        raise ValueError(f"observation for {scenario} does not contain its exact required checks")
+    provider_ids = artifact["provider_ids"]
+    if not isinstance(provider_ids, list) or not all(
+        isinstance(item, str) and ID_RE.fullmatch(item) for item in provider_ids
+    ):
+        raise ValueError(f"observation provider_ids for {scenario} are invalid")
+    return actual_digest, check_ids, provider_ids, artifact["wall_clock_at"], test_clock_epoch
+
+
 def validate(path: str) -> tuple[dict, list[str]]:
-    with Path(path).open(encoding="utf-8") as stream:
-        value = json.load(stream)
+    manifest_path = Path(path)
+    manifest_raw = manifest_path.read_bytes()
+    value = json.loads(manifest_raw, object_pairs_hook=reject_duplicate_json_keys)
     if not isinstance(value, dict):
         raise ValueError("lifecycle evidence must be an object")
-    expected = {"schema", "app_sha", "api_version", "sandbox_account_id", "captured_at", "scenarios"}
+    expected = {
+        "schema", "app_sha", "api_version", "sandbox_account_id", "captured_at",
+        "image_digest", "migration_state", "tool_versions", "client_versions", "scenarios",
+    }
     if set(value) != expected:
         raise ValueError("lifecycle evidence has an incomplete shape")
     if value["schema"] != SCHEMA:
         raise ValueError(f"unsupported lifecycle evidence schema: {value['schema']!r}")
     app_sha = require_string(value["app_sha"], "app_sha")
-    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", app_sha):
-        raise ValueError("app_sha must be a commit SHA")
+    if not re.fullmatch(r"[0-9a-f]{40}", app_sha):
+        raise ValueError("app_sha must be a full lowercase commit SHA")
     if value["api_version"] != PINNED_API_VERSION:
         raise ValueError(f"api_version must be {PINNED_API_VERSION}")
+    image_digest = value["image_digest"]
+    if not isinstance(image_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_digest):
+        raise ValueError("image_digest must be a lowercase sha256 image digest")
+    migration_state = validate_migration_state(value["migration_state"])
+    tool_versions = validate_version_map(value["tool_versions"], "tool_versions", REQUIRED_TOOL_VERSIONS)
+    client_versions = validate_version_map(
+        value["client_versions"], "client_versions", REQUIRED_CLIENT_VERSIONS
+    )
     account_id = require_string(value["sandbox_account_id"], "sandbox_account_id")
     if not ID_RE.fullmatch(account_id):
         raise ValueError("sandbox_account_id contains unsupported characters")
-    require_string(value["captured_at"], "captured_at")
+    parse_timestamp(value["captured_at"], "captured_at")
     scenarios = value["scenarios"]
     if not isinstance(scenarios, list) or len(scenarios) != len(REQUIRED_SCENARIOS):
         raise ValueError("lifecycle evidence must contain exactly one row for every required scenario")
@@ -81,7 +307,7 @@ def validate(path: str) -> tuple[dict, list[str]]:
     for row in scenarios:
         if not isinstance(row, dict):
             raise ValueError("each lifecycle scenario must be an object")
-        expected_row = {"scenario", "result", "checks", "provider_ids"}
+        expected_row = {"scenario", "result", "evidence_file", "evidence_sha256"}
         if set(row) != expected_row:
             raise ValueError("lifecycle scenario has an incomplete shape")
         scenario = require_string(row["scenario"], "scenario")
@@ -89,21 +315,26 @@ def validate(path: str) -> tuple[dict, list[str]]:
             raise ValueError(f"unexpected or duplicate scenario: {scenario}")
         seen.add(scenario)
         result = row["result"]
-        if result not in {"passed", "failed", "blocked", "not_run"}:
+        if not isinstance(result, str) or result not in {"passed", "failed", "blocked", "not_run"}:
             raise ValueError(f"invalid result for {scenario}: {result!r}")
-        checks = row["checks"]
-        if not isinstance(checks, list) or not checks or not all(isinstance(check, str) and check for check in checks):
-            raise ValueError(f"checks for {scenario} must be a non-empty list of strings")
-        provider_ids = row["provider_ids"]
-        if not isinstance(provider_ids, list) or not all(isinstance(item, str) and ID_RE.fullmatch(item) for item in provider_ids):
-            raise ValueError(f"provider_ids for {scenario} must contain only provider identifiers")
+        observation = read_observation(manifest_path, row, scenario, app_sha)
+        if result == "passed" and observation is None:
+            raise ValueError(f"passed scenario {scenario} requires a private observation file")
+        if observation is None:
+            evidence_sha256, checks, provider_ids, wall_clock_at, test_clock_epoch = None, [], [], None, None
+        else:
+            evidence_sha256, checks, provider_ids, wall_clock_at, test_clock_epoch = observation
         if result != "passed":
             failures.append(f"{scenario}: {result}")
         sanitised.append(
             {
                 "scenario": scenario,
                 "result": result,
+                "checks": checks,
                 "check_count": len(checks),
+                "evidence_sha256": evidence_sha256,
+                "wall_clock_at": wall_clock_at,
+                "stripe_test_clock_epoch": test_clock_epoch,
                 "provider_id_fingerprints": [fingerprint(item) for item in provider_ids],
             }
         )
@@ -115,8 +346,13 @@ def validate(path: str) -> tuple[dict, list[str]]:
             "schema": SCHEMA,
             "app_sha": app_sha,
             "api_version": PINNED_API_VERSION,
+            "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+            "image_digest": image_digest,
+            "migration_state": migration_state,
+            "tool_versions": tool_versions,
+            "client_versions": client_versions,
             "sandbox_account_fingerprint": fingerprint(account_id),
-            "captured_at": value["captured_at"],
+            "captured_at": parse_timestamp(value["captured_at"], "captured_at"),
             "scenario_count": len(sanitised),
             "check_count": sum(item["check_count"] for item in sanitised),
             "scenarios": sorted(sanitised, key=lambda item: item["scenario"]),
@@ -140,8 +376,17 @@ def main(argv: list[str] | None = None) -> int:
             "api_version": PINNED_API_VERSION,
             "sandbox_account_id": "replace-with-the-test-account-id",
             "captured_at": datetime.now().astimezone().isoformat(),
+            "image_digest": "sha256:" + "0" * 64,
+            "migration_state": {"latest_applied": latest_migration_version(), "pending": 0},
+            "tool_versions": {key: "replace-with-observed-version" for key in REQUIRED_TOOL_VERSIONS},
+            "client_versions": {key: "replace-with-observed-version" for key in REQUIRED_CLIENT_VERSIONS},
             "scenarios": [
-                {"scenario": scenario, "result": "not_run", "checks": ["replace with observed checks"], "provider_ids": []}
+                {
+                    "scenario": scenario,
+                    "result": "not_run",
+                    "evidence_file": "",
+                    "evidence_sha256": "",
+                }
                 for scenario in REQUIRED_SCENARIOS
             ],
         }

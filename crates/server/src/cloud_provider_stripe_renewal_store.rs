@@ -1,4 +1,4 @@
-//! Caller-owned persistence for verified personal Stripe renewal failures.
+//! Caller-owned persistence for verified Stripe renewal failures.
 //!
 //! This module accepts only the sealed result of the signed renewal decoder. It records the
 //! generic receipt, accepts the #471 invalidation fence, and stores the Stripe-specific
@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::cloud_provider::{
     accept_provider_invalidation, record_verified_event, InvalidationDisposition, PayerKind,
-    ProviderAdapterError, ProviderContext, VerifiedAllocation,
+    ProviderAdapterError, ProviderContext, VerifiedAllocation, VerifiedProviderEvent,
 };
 use crate::cloud_provider_stripe::STRIPE_NAMESPACE;
 use crate::cloud_provider_stripe_renewals::{
@@ -22,6 +22,21 @@ use crate::cloud_provider_stripe_renewals::{
 pub enum StripeRenewalFailureDisposition {
     Accepted,
     AlreadyAccepted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StripeRenewalFailureProvenance {
+    SignedWebhook,
+    AuthenticatedApiRead,
+}
+
+impl StripeRenewalFailureProvenance {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SignedWebhook => "signed_webhook",
+            Self::AuthenticatedApiRead => "authenticated_api_read",
+        }
+    }
 }
 
 /// The durable identity returned after a renewal failure is accepted or replayed.
@@ -95,21 +110,27 @@ pub enum StripeRenewalFailureLoadError {
     Database(#[from] sqlx::Error),
 }
 
-/// Load all accepted renewal failures for one registered allocation in a bounded snapshot.
+/// Load all accepted, unresolved renewal failures for one registered allocation in a bounded
+/// snapshot. Ownership is revalidated through the registered payer and source rows below.
 ///
 /// The joined statement sees either a committed association/evidence pair or neither. Rows are
 /// ordered by the scoped event id using bytewise collation, and limit-plus-one detection prevents
 /// returning a prefix when the local history exceeds either configured bound.
-pub async fn load_personal_renewal_failures(
+pub async fn load_renewal_failures(
     pool: &PgPool,
     context: &ProviderContext,
     allocation: &VerifiedAllocation,
     limits: StripeRenewalFailureLoadLimits,
 ) -> Result<Vec<StripeRenewalFailureEvidence>, StripeRenewalFailureLoadError> {
     let row_limit = limits.validate()?;
-    if context.namespace != STRIPE_NAMESPACE || allocation.payer_kind != PayerKind::Personal {
+    if context.namespace != STRIPE_NAMESPACE
+        || !matches!(
+            allocation.payer_kind,
+            PayerKind::Personal | PayerKind::Sponsor
+        )
+    {
         return Err(StripeRenewalFailureLoadError::Corrupt(
-            "renewal failures require a personal Stripe allocation".into(),
+            "renewal failures require a Stripe payer allocation".into(),
         ));
     }
     let mut tx = pool.begin().await?;
@@ -123,6 +144,7 @@ pub async fn load_personal_renewal_failures(
                 failure.predecessor_evidence_reference, failure.provider_account_id, \
                 failure.provider_environment, failure.allocation_reference, \
                 failure.provider_customer_id, failure.subscription_id, failure.provider_item_id, \
+                failure.provider_price_id, \
                 failure.predecessor_period_start, failure.predecessor_period_end, \
                 failure.renewal_period_start, failure.renewal_period_end, failure.event_created_at, \
                 failure.interval \
@@ -143,6 +165,13 @@ pub async fn load_personal_renewal_failures(
            AND association.beneficiary_id = $4 \
            AND association.allocation_id = $5 \
            AND association.coverage_source_id = $6 \
+           AND NOT EXISTS (SELECT 1 FROM cloud_provider_stripe_renewal_resolutions AS resolution \
+                           WHERE resolution.provider_namespace = failure.provider_namespace \
+                             AND resolution.provider_account_id = failure.provider_account_id \
+                             AND resolution.provider_environment = failure.provider_environment \
+                             AND resolution.event_id = failure.event_id \
+                             AND resolution.beneficiary_id = failure.beneficiary_id \
+                             AND resolution.allocation_id = failure.allocation_id) \
          ORDER BY failure.event_id COLLATE \"C\" ASC \
          LIMIT $7 \
        ) \
@@ -155,6 +184,7 @@ pub async fn load_personal_renewal_failures(
                 + octet_length(provider_account_id) + octet_length(provider_environment) \
                 + octet_length(allocation_reference) + octet_length(provider_customer_id) \
                 + octet_length(subscription_id) + octet_length(provider_item_id) \
+                + octet_length(COALESCE(provider_price_id, '')) \
                 + octet_length(interval) + 5 * 8 \
               ), 0)::TEXT AS evidence_bytes \
        FROM candidates",
@@ -193,7 +223,7 @@ pub async fn load_personal_renewal_failures(
                 failure.evidence_reference, failure.renewal_id, failure.invoice_id, \
                 failure.invoice_line_id, failure.predecessor_invoice_id, \
                 failure.predecessor_evidence_reference, failure.provider_customer_id, \
-                failure.subscription_id, failure.provider_item_id, failure.allocation_reference, \
+                failure.subscription_id, failure.provider_item_id, failure.provider_price_id, failure.allocation_reference, \
                 failure.beneficiary_id, failure.allocation_id, failure.coverage_source_id, \
                 failure.predecessor_period_start, failure.predecessor_period_end, \
                 failure.renewal_period_start, failure.renewal_period_end, failure.event_created_at, \
@@ -244,6 +274,13 @@ pub async fn load_personal_renewal_failures(
            AND association.beneficiary_id = $4 \
            AND association.allocation_id = $5 \
            AND association.coverage_source_id = $6 \
+           AND NOT EXISTS (SELECT 1 FROM cloud_provider_stripe_renewal_resolutions AS resolution \
+                           WHERE resolution.provider_namespace = failure.provider_namespace \
+                             AND resolution.provider_account_id = failure.provider_account_id \
+                             AND resolution.provider_environment = failure.provider_environment \
+                             AND resolution.event_id = failure.event_id \
+                             AND resolution.beneficiary_id = failure.beneficiary_id \
+                             AND resolution.allocation_id = failure.allocation_id) \
          ORDER BY failure.event_id COLLATE \"C\" ASC \
          LIMIT $7",
     )
@@ -284,6 +321,16 @@ pub async fn load_personal_renewal_failures(
     Ok(evidence)
 }
 
+/// Compatibility name retained for the personal refresh adapter.
+pub async fn load_personal_renewal_failures(
+    pool: &PgPool,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+    limits: StripeRenewalFailureLoadLimits,
+) -> Result<Vec<StripeRenewalFailureEvidence>, StripeRenewalFailureLoadError> {
+    load_renewal_failures(pool, context, allocation, limits).await
+}
+
 fn stored_evidence(
     row: &sqlx::postgres::PgRow,
     context: &ProviderContext,
@@ -304,6 +351,7 @@ fn stored_evidence(
         customer_id: row.try_get("provider_customer_id")?,
         subscription_id: row.try_get("subscription_id")?,
         provider_item_id: row.try_get("provider_item_id")?,
+        provider_price_id: row.try_get("provider_price_id")?,
         predecessor_period_start: row.try_get("predecessor_period_start")?,
         predecessor_period_end: row.try_get("predecessor_period_end")?,
         renewal_period_start: row.try_get("renewal_period_start")?,
@@ -332,7 +380,6 @@ fn stored_evidence(
         && row.try_get::<String, _>("allocation_account_id")? == context.account_id
         && row.try_get::<String, _>("allocation_environment")? == context.environment.as_str()
         && row.try_get::<String, _>("allocation_subscription_id")? == allocation.subscription_id
-        && row.try_get::<String, _>("allocation_item_id")? == allocation.provider_item_id
         && row.try_get::<String, _>("allocation_reference_durable")?
             == allocation.external_allocation_reference
         && row.try_get::<String, _>("allocation_source_durable")? == allocation.source_id
@@ -342,11 +389,16 @@ fn stored_evidence(
         && row.try_get::<String, _>("allocation_state")? == allocation_state(allocation)
         && row.try_get::<String, _>("allocation_ownership_reference")?
             == allocation.ownership_evidence_reference;
+    let expected_payer_kind = if evidence.provider_price_id().is_some() {
+        "sponsor"
+    } else {
+        "personal"
+    };
     let payer_matches = row.try_get::<String, _>("payer_namespace")? == context.namespace
         && row.try_get::<String, _>("payer_account_id")? == context.account_id
         && row.try_get::<String, _>("payer_environment")? == context.environment.as_str()
         && row.try_get::<String, _>("payer_customer_id")? == evidence.customer_id()
-        && row.try_get::<String, _>("payer_kind")? == "personal";
+        && row.try_get::<String, _>("payer_kind")? == expected_payer_kind;
     let source_matches = row.try_get::<String, _>("source_beneficiary_id")?
         == allocation.beneficiary_id
         && row.try_get::<String, _>("source_namespace")? == context.namespace
@@ -365,7 +417,6 @@ fn stored_evidence(
         || evidence.allocation_reference() != allocation.external_allocation_reference
         || evidence.customer_id() != allocation.provider_customer_id
         || evidence.subscription_id() != allocation.subscription_id
-        || evidence.provider_item_id() != allocation.provider_item_id
         || !association_matches
         || !allocation_matches
         || !payer_matches
@@ -399,6 +450,7 @@ fn evidence_size(evidence: &StripeRenewalFailureEvidence) -> usize {
         + evidence.customer_id().len()
         + evidence.subscription_id().len()
         + evidence.provider_item_id().len()
+        + evidence.provider_price_id().map_or(0, str::len)
         + evidence.evidence_reference().len()
         + evidence.environment().as_str().len()
         + evidence.interval().to_string().len()
@@ -417,11 +469,88 @@ pub async fn accept_personal_renewal_failure(
     evidence: &StripeRenewalFailureEvidence,
     ingest_enabled: bool,
 ) -> Result<StripeRenewalFailureAcceptance, StripeRenewalFailureStoreError> {
-    validate_evidence_context(context, allocation, evidence)?;
+    accept_personal_renewal_failure_with_provenance(
+        tx,
+        context,
+        allocation,
+        evidence,
+        StripeRenewalFailureProvenance::SignedWebhook,
+        ingest_enabled,
+    )
+    .await
+}
+
+pub async fn accept_personal_renewal_failure_with_provenance(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+    evidence: &StripeRenewalFailureEvidence,
+    provenance: StripeRenewalFailureProvenance,
+    ingest_enabled: bool,
+) -> Result<StripeRenewalFailureAcceptance, StripeRenewalFailureStoreError> {
+    if allocation.payer_kind != PayerKind::Personal {
+        return Err(ProviderAdapterError::ProviderContextMismatch.into());
+    }
     let event = evidence.verified_event()?;
-    let _event_disposition = record_verified_event(tx, context, &event).await?;
+    accept_renewal_failure(
+        tx,
+        context,
+        allocation,
+        evidence,
+        &event,
+        provenance,
+        ingest_enabled,
+    )
+    .await
+}
+
+/// Atomically persist one linked sponsored renewal failure using the invoice-wide provider event
+/// identity. The same event value is reused for each beneficiary in a grouped invoice so the
+/// global receipt remains identical while each invalidation/evidence row stays source-scoped.
+pub async fn accept_sponsored_renewal_failure(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+    evidence: &StripeRenewalFailureEvidence,
+    event: &VerifiedProviderEvent,
+    provenance: StripeRenewalFailureProvenance,
+    ingest_enabled: bool,
+) -> Result<StripeRenewalFailureAcceptance, StripeRenewalFailureStoreError> {
+    if allocation.payer_kind != PayerKind::Sponsor {
+        return Err(ProviderAdapterError::ProviderContextMismatch.into());
+    }
+    accept_renewal_failure(
+        tx,
+        context,
+        allocation,
+        evidence,
+        event,
+        provenance,
+        ingest_enabled,
+    )
+    .await
+}
+
+async fn accept_renewal_failure(
+    tx: &mut Transaction<'_, Postgres>,
+    context: &ProviderContext,
+    allocation: &VerifiedAllocation,
+    evidence: &StripeRenewalFailureEvidence,
+    event: &VerifiedProviderEvent,
+    provenance: StripeRenewalFailureProvenance,
+    ingest_enabled: bool,
+) -> Result<StripeRenewalFailureAcceptance, StripeRenewalFailureStoreError> {
+    validate_evidence_context(context, allocation, evidence)?;
+    if event.event_id != evidence.event_id()
+        || event.event_type != "invoice.payment_failed"
+        || event.provider_created_at != evidence.event_created_at()
+        || event.subscription_id.as_deref() != Some(evidence.subscription_id())
+    {
+        return Err(ProviderAdapterError::EventConflict.into());
+    }
+    let _event_disposition = record_verified_event(tx, context, event).await?;
     let invalidation =
-        accept_provider_invalidation(tx, context, &event, allocation, ingest_enabled).await?;
+        accept_provider_invalidation(tx, context, event, allocation, ingest_enabled).await?;
     let accepted_generation = match invalidation {
         InvalidationDisposition::Accepted { generation }
         | InvalidationDisposition::AlreadyAccepted { generation } => generation,
@@ -438,18 +567,22 @@ pub async fn accept_personal_renewal_failure(
          (provider_namespace, provider_account_id, provider_environment, event_id, \
           evidence_version, evidence_reference, renewal_id, invoice_id, invoice_line_id, \
           predecessor_invoice_id, predecessor_evidence_reference, provider_customer_id, \
-          subscription_id, provider_item_id, allocation_reference, beneficiary_id, allocation_id, \
+          subscription_id, provider_item_id, provider_price_id, allocation_reference, beneficiary_id, allocation_id, \
           coverage_source_id, predecessor_period_start, predecessor_period_end, \
-          renewal_period_start, renewal_period_end, event_created_at, interval, accepted_generation) \
+          renewal_period_start, renewal_period_end, event_created_at, interval, accepted_generation, evidence_provenance) \
          VALUES ('stripe', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-                 $16, $17, $18, $19, $20, $21, $22, $23, $24) \
-         ON CONFLICT (provider_namespace, provider_account_id, provider_environment, event_id, beneficiary_id) \
+                 $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26) \
+         ON CONFLICT (provider_namespace, provider_account_id, provider_environment, event_id, beneficiary_id, allocation_id) \
          DO NOTHING",
     )
     .bind(evidence.provider_account_id())
     .bind(evidence.environment().as_str())
     .bind(evidence.event_id())
-    .bind(crate::cloud_provider_stripe_renewals::RENEWAL_EVIDENCE_VERSION)
+    .bind(if evidence.provider_price_id().is_some() {
+        crate::cloud_provider_stripe_renewals::SPONSORED_RENEWAL_EVIDENCE_VERSION
+    } else {
+        crate::cloud_provider_stripe_renewals::PERSONAL_RENEWAL_EVIDENCE_VERSION
+    })
     .bind(evidence.evidence_reference())
     .bind(evidence.renewal_id())
     .bind(evidence.invoice_id())
@@ -459,6 +592,7 @@ pub async fn accept_personal_renewal_failure(
     .bind(evidence.customer_id())
     .bind(evidence.subscription_id())
     .bind(evidence.provider_item_id())
+    .bind(evidence.provider_price_id())
     .bind(evidence.allocation_reference())
     .bind(&allocation.beneficiary_id)
     .bind(&allocation.allocation_id)
@@ -470,6 +604,7 @@ pub async fn accept_personal_renewal_failure(
     .bind(evidence.event_created_at())
     .bind(evidence.interval().to_string())
     .bind(accepted_generation)
+    .bind(provenance.as_str())
     .execute(&mut **tx)
     .await;
 
@@ -504,12 +639,10 @@ fn validate_evidence_context(
     evidence: &StripeRenewalFailureEvidence,
 ) -> Result<(), ProviderAdapterError> {
     if context.namespace != STRIPE_NAMESPACE
-        || allocation.payer_kind != PayerKind::Personal
         || evidence.provider_account_id() != context.account_id
         || evidence.environment() != context.environment
         || allocation.provider_customer_id != evidence.customer_id()
         || allocation.subscription_id != evidence.subscription_id()
-        || allocation.provider_item_id != evidence.provider_item_id()
         || allocation.external_allocation_reference != evidence.allocation_reference()
     {
         return Err(ProviderAdapterError::ProviderContextMismatch);
@@ -528,24 +661,30 @@ async fn compare_existing(
     let row = sqlx::query(
         "SELECT evidence_version, evidence_reference, renewal_id, invoice_id, invoice_line_id, \
                 predecessor_invoice_id, predecessor_evidence_reference, provider_customer_id, \
-                subscription_id, provider_item_id, allocation_reference, beneficiary_id, \
+                subscription_id, provider_item_id, provider_price_id, allocation_reference, beneficiary_id, \
                 allocation_id, coverage_source_id, predecessor_period_start, predecessor_period_end, \
                 renewal_period_start, renewal_period_end, event_created_at, interval, \
                 accepted_generation \
          FROM cloud_provider_stripe_renewal_failures \
          WHERE provider_namespace = 'stripe' AND provider_account_id = $1 \
-           AND provider_environment = $2 AND event_id = $3 AND beneficiary_id = $4",
+           AND provider_environment = $2 AND event_id = $3 AND beneficiary_id = $4 \
+           AND allocation_id = $5",
     )
     .bind(&context.account_id)
     .bind(context.environment.as_str())
     .bind(evidence.event_id())
     .bind(&allocation.beneficiary_id)
+    .bind(&allocation.allocation_id)
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(StripeRenewalFailureStoreError::EvidenceMissing)?;
 
     let same = row.try_get::<i16, _>("evidence_version")?
-        == crate::cloud_provider_stripe_renewals::RENEWAL_EVIDENCE_VERSION
+        == if evidence.provider_price_id().is_some() {
+            crate::cloud_provider_stripe_renewals::SPONSORED_RENEWAL_EVIDENCE_VERSION
+        } else {
+            crate::cloud_provider_stripe_renewals::PERSONAL_RENEWAL_EVIDENCE_VERSION
+        }
         && row.try_get::<String, _>("evidence_reference")? == evidence.evidence_reference()
         && row.try_get::<String, _>("renewal_id")? == evidence.renewal_id()
         && row.try_get::<String, _>("invoice_id")? == evidence.invoice_id()
@@ -556,6 +695,8 @@ async fn compare_existing(
         && row.try_get::<String, _>("provider_customer_id")? == evidence.customer_id()
         && row.try_get::<String, _>("subscription_id")? == evidence.subscription_id()
         && row.try_get::<String, _>("provider_item_id")? == evidence.provider_item_id()
+        && row.try_get::<Option<String>, _>("provider_price_id")?
+            == evidence.provider_price_id().map(str::to_owned)
         && row.try_get::<String, _>("allocation_reference")? == evidence.allocation_reference()
         && row.try_get::<String, _>("beneficiary_id")? == allocation.beneficiary_id
         && row.try_get::<String, _>("allocation_id")? == allocation.allocation_id

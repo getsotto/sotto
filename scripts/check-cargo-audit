@@ -41,9 +41,9 @@ def load_policy(root):
         if (not re.fullmatch(r"[A-Za-z0-9_-]+", entry["package"])
                 or not re.fullmatch(r"\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?", entry["version"])
                 or entry["source"] != "registry+https://github.com/rust-lang/crates.io-index"
-                or entry["kind"] not in {"vulnerability", "yanked"}
+                or entry["kind"] not in {"vulnerability", "yanked", "unmaintained"}
                 or (entry["kind"] == "yanked" and entry["finding"] != "yanked")
-                or (entry["kind"] == "vulnerability"
+                or (entry["kind"] != "yanked"
                     and not re.fullmatch(r"RUSTSEC-\d{4}-\d{4}", entry["finding"]))):
             raise PolicyError(f"invalid policy identity: {entry}")
         key = finding_key(entry["kind"], {"name": entry["package"], **entry}, entry["finding"])

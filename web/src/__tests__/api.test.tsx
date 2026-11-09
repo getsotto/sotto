@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createShare, me, ServerUnreachableError } from "../api";
+import { createShare, fetchPayerTransfers, me, ServerUnreachableError } from "../api";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -53,6 +53,22 @@ describe("share creation responses", () => {
   it("returns a successful token", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ token: "synthetic-token" })));
     await expect(createShare(new Uint8Array([1]), 1)).resolves.toBe("synthetic-token");
+  });
+});
+
+describe("payer transfer listing", () => {
+  it("passes the continuation cursor and returns the next page cursor", async () => {
+    const fetch = vi.fn().mockResolvedValue(Response.json({ transfers: [], next_cursor: "transfer:older" }));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(fetchPayerTransfers("transfer:newer")).resolves.toEqual({
+      transfers: [],
+      nextCursor: "transfer:older",
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      "/billing/transfers?limit=50&before=transfer%3Anewer",
+      expect.objectContaining({ credentials: "include" }),
+    );
   });
 });
 

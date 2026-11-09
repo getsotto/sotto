@@ -191,6 +191,15 @@ pub fn router() -> Router<AppState> {
 /// dormant human-action policy. Keeping the read in one function prevents a route from applying a
 /// different interpretation of billing or coverage than `/account/eligibility`.
 pub(crate) async fn load_view(state: &AppState, user_id: &str) -> Result<EligibilityView> {
+    load_view_with_revision(state, user_id)
+        .await
+        .map(|(view, _)| view)
+}
+
+pub(crate) async fn load_view_with_revision(
+    state: &AppState,
+    user_id: &str,
+) -> Result<(EligibilityView, Option<i64>)> {
     let account_initialized: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM users WHERE id = $1 AND public_key IS NOT NULL)",
     )
@@ -199,13 +208,16 @@ pub(crate) async fn load_view(state: &AppState, user_id: &str) -> Result<Eligibi
     .await?;
 
     if state.deployment_mode == DeploymentMode::SelfHosted {
-        return Ok(evaluate_input(&EligibilityInput {
-            deployment_mode: state.deployment_mode,
-            billing_available: false,
-            account_initialized,
-            personal_billing_state: None,
-            coverage: CoverageInput::Missing,
-        }));
+        return Ok((
+            evaluate_input(&EligibilityInput {
+                deployment_mode: state.deployment_mode,
+                billing_available: false,
+                account_initialized,
+                personal_billing_state: None,
+                coverage: CoverageInput::Missing,
+            }),
+            None,
+        ));
     }
 
     let mut tx = state.pool.begin().await?;
@@ -217,40 +229,112 @@ pub(crate) async fn load_view(state: &AppState, user_id: &str) -> Result<Eligibi
         })?;
     tx.commit().await?;
 
-    let coverage = match cloud_coverage_store::load(&state.pool, user_id).await {
-        Ok(loaded) => {
+    let require_current_authority = state.cloud_coverage_authority_enforcement_enabled;
+    let loaded_coverage = if require_current_authority {
+        match crate::cloud_coverage_authority::load_current(&state.pool, user_id, epoch_now()).await
+        {
+            Ok(crate::cloud_coverage_authority::AuthorityState::Current { loaded, .. }) => {
+                Ok(loaded)
+            }
+            Ok(crate::cloud_coverage_authority::AuthorityState::Missing) => {
+                Err(StoreError::ProjectionMissing)
+            }
+            Ok(crate::cloud_coverage_authority::AuthorityState::Stale) => {
+                Err(StoreError::ProjectionUnavailable(
+                    crate::cloud_coverage_store::UnavailableReason::NeedsReconciliation,
+                ))
+            }
+            Err(crate::cloud_coverage_authority::AuthorityError::Database(error)) => {
+                return Err(Error::Db(error))
+            }
+            Err(error) => return Err(Error::Internal(error.to_string())),
+        }
+    } else {
+        cloud_coverage_store::load(&state.pool, user_id).await
+    };
+    let (coverage, coverage_revision) = match loaded_coverage {
+        Ok(loaded) => (
             CoverageInput::Decision(evaluate(&loaded.coverage, epoch_now()).map_err(|error| {
                 Error::Internal(format!("stored coverage failed validation: {error}"))
-            })?)
-        }
-        Err(StoreError::ProjectionMissing) => CoverageInput::Missing,
-        Err(StoreError::ProjectionUnavailable(_)) => CoverageInput::Unavailable,
+            })?),
+            Some(loaded.revision),
+        ),
+        Err(StoreError::ProjectionMissing) => (CoverageInput::Missing, None),
+        Err(StoreError::ProjectionUnavailable(_)) => (CoverageInput::Unavailable, None),
         Err(StoreError::Database(error)) => return Err(Error::Db(error)),
         Err(error) => return Err(Error::Internal(error.to_string())),
     };
 
-    Ok(evaluate_input(&EligibilityInput {
-        deployment_mode: state.deployment_mode,
-        billing_available: state.billing.as_ref().is_some_and(|billing| {
-            billing.cloud_sales_enabled() && billing.price_catalogue().is_some()
+    Ok((
+        evaluate_input(&EligibilityInput {
+            deployment_mode: state.deployment_mode,
+            billing_available: state.billing.as_ref().is_some_and(|billing| {
+                billing.cloud_sales_enabled() && billing.price_catalogue().is_some()
+            }),
+            account_initialized,
+            personal_billing_state: personal.as_ref().map(|account| account.state),
+            coverage,
         }),
-        account_initialized,
-        personal_billing_state: personal.as_ref().map(|account| account.state),
-        coverage,
-    }))
+        coverage_revision,
+    ))
+}
+
+pub(crate) async fn load_view_with_authority_requirement(
+    state: &AppState,
+    user_id: &str,
+    require_current_authority: bool,
+) -> Result<(EligibilityView, Option<i64>)> {
+    if require_current_authority && !state.cloud_coverage_authority_enforcement_enabled {
+        let mut strict_state = state.clone();
+        strict_state.cloud_coverage_authority_enforcement_enabled = true;
+        return load_view_with_revision(&strict_state, user_id).await;
+    }
+    load_view_with_revision(state, user_id).await
+}
+
+pub(crate) async fn load_view_for_policy(
+    state: &AppState,
+    user_id: &str,
+) -> Result<EligibilityView> {
+    let require_authority = state.cloud_coverage_authority_enforcement_enabled
+        || state.cloud_coverage_authority_shadow_enabled;
+    load_view_with_authority_requirement(state, user_id, require_authority)
+        .await
+        .map(|(view, _)| view)
 }
 
 async fn get_eligibility(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Json<EligibilityView>> {
-    Ok(Json(load_view(&state, &user.user_id).await?))
+    for _ in 0..3 {
+        let (view, revision) = load_view_with_revision(&state, &user.user_id).await?;
+        if state.deployment_mode != DeploymentMode::Cloud {
+            return Ok(Json(view));
+        }
+        let reconciled = crate::notifications::reconcile_export_deadline_notice(
+            &state.pool,
+            &user.user_id,
+            &view,
+            revision,
+            epoch_now(),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::notifications::NoticeError::Database(error) => Error::Db(error),
+            other => Error::Internal(other.to_string()),
+        })?;
+        if reconciled {
+            return Ok(Json(view));
+        }
+    }
+    Err(Error::Conflict(
+        "Cloud eligibility changed while recording its export notice; retry the request".into(),
+    ))
 }
 
 fn epoch_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64)
+    crate::clock::business_epoch_seconds()
 }
 
 #[cfg(test)]

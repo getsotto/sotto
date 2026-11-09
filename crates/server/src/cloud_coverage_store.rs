@@ -290,11 +290,23 @@ pub async fn load(pool: &PgPool, beneficiary_id: &str) -> Result<LoadedCoverage,
         .execute(&mut *tx)
         .await?;
 
+    let loaded = load_in_transaction(&mut tx, beneficiary_id).await?;
+    tx.commit().await?;
+    Ok(loaded)
+}
+
+/// Load a projection from the caller's repeatable-read snapshot without committing it.
+pub(crate) async fn load_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    beneficiary_id: &str,
+) -> Result<LoadedCoverage, StoreError> {
+    validate_identifier(beneficiary_id, StoreError::EmptyBeneficiary)?;
+
     let current_revision: Option<i64> = sqlx::query_scalar(
         "SELECT current_revision FROM cloud_coverage_heads WHERE beneficiary_id = $1",
     )
     .bind(beneficiary_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?
     .flatten();
     let Some(revision) = current_revision else {
@@ -302,7 +314,7 @@ pub async fn load(pool: &PgPool, beneficiary_id: &str) -> Result<LoadedCoverage,
             "SELECT EXISTS (SELECT 1 FROM cloud_coverage_heads WHERE beneficiary_id = $1)",
         )
         .bind(beneficiary_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         if !exists {
             return Err(StoreError::ProjectionMissing);
@@ -318,7 +330,7 @@ pub async fn load(pool: &PgPool, beneficiary_id: &str) -> Result<LoadedCoverage,
     )
     .bind(beneficiary_id)
     .bind(revision)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| {
         StoreError::CorruptProjection(format!("head points to missing revision {revision}"))
@@ -349,7 +361,7 @@ pub async fn load(pool: &PgPool, beneficiary_id: &str) -> Result<LoadedCoverage,
     )
     .bind(beneficiary_id)
     .bind(revision)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
     if fact_count != facts.len() as i64 {
         return Err(StoreError::CorruptProjection(format!(
@@ -381,7 +393,6 @@ pub async fn load(pool: &PgPool, beneficiary_id: &str) -> Result<LoadedCoverage,
     if let Some(reason) = projection.unavailable_reason {
         return Err(StoreError::ProjectionUnavailable(reason));
     }
-    tx.commit().await?;
     Ok(LoadedCoverage { revision, coverage })
 }
 

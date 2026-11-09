@@ -75,7 +75,9 @@ describe("RecipientPage", () => {
     expect(reveal).toHaveFocus();
     fireEvent.click(reveal);
     expect(await screen.findByRole("textbox", { name: "Shared secret" })).toHaveValue(secret);
-    expect(screen.getByRole("heading", { name: "Shared secret" })).toHaveFocus();
+    await waitFor(() => {
+      expect(screen.getByRole("heading", { name: "Shared secret" })).toHaveFocus();
+    });
   });
 
   it("reports a missing fragment without fetching the share", async () => {

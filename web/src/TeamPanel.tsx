@@ -21,6 +21,7 @@ import {
 } from "./api";
 import { decryptOrgName, openOrgKey, sealGrantTo } from "./vault";
 import { OrganisationDeletionPanel } from "./OrganisationDeletionPanel";
+import { SponsoredTransferStart } from "./PayerTransferStart";
 
 interface NamedOrg {
   org: Org;
@@ -254,6 +255,7 @@ export function TeamPanel({
       if (result.checkoutUrl !== null) window.location.assign(result.checkoutUrl);
       else setNotice("Seat checkout is pending provider confirmation. Reload shortly.");
     } catch (e) {
+      if (!isCurrent()) return;
       // A conflict means this price or quote can no longer be honoured. Force a fresh server
       // quote before another checkout attempt instead of resubmitting the stale one.
       if (e instanceof Error && e.message.includes("(409)")) {
@@ -262,7 +264,7 @@ export function TeamPanel({
       }
       setError(message(e));
     } finally {
-      setSponsoredBusy(false);
+      if (isCurrent()) setSponsoredBusy(false);
     }
   }
 
@@ -459,6 +461,7 @@ export function TeamPanel({
                   })}
                 </ul>
               )}
+              {orgs !== null && <SponsoredTransferStart sourceOrganizationId={openOrg.org.id} seats={sponsoredSeats} organisations={orgs.map((row) => row.org)} />}
               <form className="row" onSubmit={(e) => { e.preventDefault(); void addSponsoredSeat(); }}>
                 <label>Change <select value={sponsoredAction} onChange={(e) => { setSponsoredQuote(null); setSponsoredAction(e.target.value as "add" | "remove" | "replace"); }} disabled={sponsoredBusy}><option value="add">Add seat</option><option value="remove">Remove seat</option><option value="replace">Replace seat</option></select></label>
                 <label>Beneficiary user id<input value={sponsoredBeneficiary} onChange={(e) => { setSponsoredQuote(null); setSponsoredBeneficiary(e.target.value); }} disabled={sponsoredBusy} /></label>

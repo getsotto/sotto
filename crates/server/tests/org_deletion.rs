@@ -104,7 +104,12 @@ impl SubscriptionProvider for TestProvider {
         Err(Self::unsupported("checkout"))
     }
 
-    async fn create_portal(&self, _customer: &str, _return_url: &str) -> ProviderResult<String> {
+    async fn create_portal(
+        &self,
+        _customer: &str,
+        _return_url: &str,
+        _configuration_id: Option<&str>,
+    ) -> ProviderResult<String> {
         Err(Self::unsupported("portal"))
     }
 

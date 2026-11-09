@@ -244,6 +244,23 @@ async fn abandoned_and_canceled_accounts_can_start_a_new_operation() {
         BeginOperation::Created(operation) => operation,
         BeginOperation::AlreadyExists(_) => panic!("second operation unexpectedly existed"),
     };
+    assert!(matches!(
+        begin_account(
+            &mut second_tx,
+            USER_ID,
+            &second.operation_id,
+            BillingOffer::StandardAnnual,
+            now + 300,
+            now + 200,
+        )
+        .await,
+        Err(sotto_server::personal_billing::PersonalBillingError::AccountExists)
+    ));
+    sqlx::query("UPDATE billing_personal_accounts SET state='canceled' WHERE user_id=$1")
+        .bind(USER_ID)
+        .execute(&mut *second_tx)
+        .await
+        .expect("apply verified Checkout expiry before reuse");
     let second_allocation_reference = begin_account(
         &mut second_tx,
         USER_ID,
@@ -253,7 +270,7 @@ async fn abandoned_and_canceled_accounts_can_start_a_new_operation() {
         now + 200,
     )
     .await
-    .expect("reuse expired pending account");
+    .expect("reuse provider-confirmed expired account");
     assert_ne!(first_allocation_reference, second_allocation_reference);
     second_tx.commit().await.expect("commit second operation");
 

@@ -20,9 +20,10 @@ use crate::cloud_provider::{
 use crate::cloud_provider_refresh_inputs::RefreshJobInputs;
 use crate::cloud_provider_refresh_worker::{RefreshExecutionError, RefreshJobExecutor};
 use crate::cloud_provider_stripe_http::{StripeReadClient, StripeReadError};
+use crate::cloud_provider_stripe_renewals::StripeRenewalFailureEvidence;
 use crate::cloud_provider_stripe_sponsored::{
-    compose_sponsored_coverage, SponsoredCoverageError, SponsoredCoverageResult,
-    SponsoredNeedsEvidence, SponsoredStripeCoverageConfig,
+    SponsoredCoverageError, SponsoredCoverageResult, SponsoredNeedsEvidence,
+    SponsoredStripeCoverageConfig,
 };
 use crate::cloud_provider_stripe_sponsored_adapter::collection_for_ticket_by_source;
 use crate::cloud_provider_stripe_sponsored_store::{
@@ -165,6 +166,7 @@ impl SponsoredRefreshExecutor {
             &inputs.allocation,
             &preparation.ticket,
             self.limits,
+            &[],
         )
         .await?;
 
@@ -282,6 +284,7 @@ pub async fn collect_sponsored_collection(
     allocation: &VerifiedAllocation,
     ticket: &crate::cloud_coverage_reconciliation::CollectionTicket,
     limits: SponsoredRefreshLimits,
+    renewal_failures: &[StripeRenewalFailureEvidence],
 ) -> Result<VerifiedCollection, SponsoredRefreshError> {
     let invoice_id =
         event
@@ -311,6 +314,7 @@ pub async fn collect_sponsored_collection(
         ticket,
         limits,
         Some(invoice_id),
+        renewal_failures,
     )
     .await
 }
@@ -320,6 +324,7 @@ pub async fn collect_sponsored_collection(
 /// This path has no triggering invoice requirement and is used for other sponsored subscriptions
 /// already present in a mixed payer/source set. Their newest usable paid invoices are sufficient;
 /// the event that invalidated the beneficiary remains the same immutable provider event.
+#[allow(clippy::too_many_arguments)]
 pub async fn collect_sponsored_subscription_collection(
     pool: &PgPool,
     stripe: &StripeReadClient,
@@ -328,6 +333,7 @@ pub async fn collect_sponsored_subscription_collection(
     allocation: &VerifiedAllocation,
     ticket: &crate::cloud_coverage_reconciliation::CollectionTicket,
     limits: SponsoredRefreshLimits,
+    renewal_failures: &[StripeRenewalFailureEvidence],
 ) -> Result<VerifiedCollection, SponsoredRefreshError> {
     if allocation.payer_kind != crate::cloud_provider::PayerKind::Sponsor
         || context.namespace != crate::cloud_provider_stripe::STRIPE_NAMESPACE
@@ -340,7 +346,15 @@ pub async fn collect_sponsored_subscription_collection(
         ));
     }
     collect_sponsored_subscription_history(
-        pool, stripe, coverage, context, allocation, ticket, limits, None,
+        pool,
+        stripe,
+        coverage,
+        context,
+        allocation,
+        ticket,
+        limits,
+        None,
+        renewal_failures,
     )
     .await
 }
@@ -355,6 +369,7 @@ async fn collect_sponsored_subscription_history(
     ticket: &crate::cloud_coverage_reconciliation::CollectionTicket,
     limits: SponsoredRefreshLimits,
     triggering_invoice_id: Option<&str>,
+    renewal_failures: &[StripeRenewalFailureEvidence],
 ) -> Result<VerifiedCollection, SponsoredRefreshError> {
     let limits = limits.validate()?;
     let mut session = stripe.session();
@@ -415,6 +430,16 @@ async fn collect_sponsored_subscription_history(
         (period_end, invoice_id) > (previous_period_end, previous_invoice_id)
     }
 
+    let open_invoice_ids = invoices
+        .iter()
+        .filter(|invoice| invoice.status.as_deref() == Some("open"))
+        .map(|invoice| invoice.id.clone())
+        .collect::<BTreeSet<_>>();
+    let active_failures = renewal_failures
+        .iter()
+        .filter(|failure| open_invoice_ids.contains(failure.invoice_id()))
+        .cloned()
+        .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     let mut selections = BTreeMap::<String, SourceSelection>::new();
     for invoice in invoices {
@@ -451,7 +476,12 @@ async fn collect_sponsored_subscription_history(
         if relevant_sources.is_empty() {
             continue;
         }
-        match compose_sponsored_coverage(coverage, &manifest, &settlement)
+        match crate::cloud_provider_stripe_sponsored::compose_sponsored_coverage_with_renewal_failures(
+            coverage,
+            &manifest,
+            &settlement,
+            &active_failures,
+        )
             .map_err(SponsoredRefreshError::Composition)?
         {
             SponsoredCoverageResult::Candidate(candidate) => {

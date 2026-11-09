@@ -295,6 +295,29 @@ pub async fn end_sponsored_allocation(
     if term_update.rows_affected() != 1 {
         return Err(SponsoredAllocationTermStoreError::TermConflict);
     }
+    // Retiring a seat at or before its founding boundary means the standard-price transition
+    // will not be billed to this person. Preserve the notice row for audit, but do not leave it
+    // available to the former sponsor admins.
+    sqlx::query(
+        "WITH retired AS ( \
+             UPDATE billing_founding_price_notice_state AS notice SET outcome='retired', \
+               reason_code='subscription_ending', updated_at=now() \
+             FROM billing_founding_awards AS award \
+             WHERE notice.award_id=award.award_id AND award.beneficiary_id=$1 \
+               AND award.payer_kind='sponsor' AND award.payer_id=$2 \
+               AND notice.transition_epoch >= $3 AND notice.outcome <> 'retired' \
+             RETURNING notice.award_id, notice.transition_epoch \
+         ) \
+         UPDATE cloud_notice_outbox AS outbox SET status='cancelled', cancelled_at=now(), updated_at=now() \
+         FROM retired WHERE outbox.event_key = \
+             'founding-price-change:' || retired.award_id || ':' || retired.transition_epoch::text \
+           AND outbox.kind='price_change' AND outbox.status IN ('pending','leased')",
+    )
+    .bind(&allocation.beneficiary_id)
+    .bind(&allocation.payer_id)
+    .bind(effective_until)
+    .execute(&mut **tx)
+    .await?;
     Ok(SponsoredAllocationEndReceipt {
         allocation_id: allocation.allocation_id.clone(),
         effective_until,

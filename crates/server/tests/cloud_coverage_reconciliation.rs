@@ -2,8 +2,9 @@ use std::{str::FromStr, sync::Arc};
 
 use sotto_server::cloud_coverage::ConfirmedPaidInterval;
 use sotto_server::cloud_coverage_reconciliation::{
-    begin_collection, finish_collection, register_source, CollectionStatus, CorruptAttemptReason,
-    ReconciliationError, RegistrationOutcome, SourceBinding, SourceObservation,
+    begin_collection, finish_collection, register_source, retire_source, CollectionStatus,
+    CorruptAttemptReason, ReconciliationError, RegistrationOutcome, SourceBinding,
+    SourceObservation,
 };
 use sotto_server::cloud_coverage_store::{
     load, publish, CoverageProjection, PublicationOutcome, StoreError, UnavailableReason,
@@ -182,6 +183,11 @@ async fn cleanup_result_for(pool: &PgPool, beneficiary_id: &str) -> Result<(), S
         .execute(pool)
         .await
         .map_err(|error| format!("delete collection attempts: {error}"))?;
+    sqlx::query("DELETE FROM cloud_coverage_source_retirements WHERE beneficiary_id = $1")
+        .bind(beneficiary_id)
+        .execute(pool)
+        .await
+        .map_err(|error| format!("delete coverage source retirements: {error}"))?;
     sqlx::query("DELETE FROM cloud_coverage_sources WHERE beneficiary_id = $1")
         .bind(beneficiary_id)
         .execute(pool)
@@ -6141,6 +6147,123 @@ async fn adding_a_source_invalidates_the_previous_completeness_claim() {
             UnavailableReason::NeedsReconciliation
         ))
     ));
+    cleanup(&fixture).await;
+}
+
+#[tokio::test]
+async fn retired_source_leaves_new_snapshots_but_historical_replay_intact() {
+    let Some(fixture) = Fixture::create().await else {
+        return;
+    };
+    let old_source = binding(&fixture, "old-source", "old-allocation");
+    let current_source = binding(&fixture, "current-source", "current-allocation");
+    register(&fixture, &old_source, "old-registration").await;
+    register(&fixture, &current_source, "current-registration").await;
+
+    let historical = begin(&fixture, &attempt_id(&fixture, "before-retirement")).await;
+    let observations = [
+        SourceObservation::Complete {
+            source_id: old_source.source_id.clone(),
+            evidence_reference: "old-evidence".into(),
+            paid_intervals: vec![],
+        },
+        SourceObservation::Complete {
+            source_id: current_source.source_id.clone(),
+            evidence_reference: "current-evidence".into(),
+            paid_intervals: vec![],
+        },
+    ];
+    let mut finish = fixture.pool.begin().await.expect("begin historical finish");
+    finish_collection(
+        &mut finish,
+        &historical,
+        "historical-aggregate",
+        &observations,
+    )
+    .await
+    .expect("finish historical collection");
+    finish.commit().await.expect("commit historical finish");
+
+    let ended_at: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM now())::BIGINT - 5")
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("read elapsed retirement boundary");
+    let mut early_retire = fixture.pool.begin().await.expect("begin early retirement");
+    assert!(matches!(
+        retire_source(
+            &mut early_retire,
+            "premature-transfer-retirement",
+            &fixture.beneficiary_id,
+            &old_source.source_id,
+            "schedule:premature",
+            ended_at + 10_000,
+            ended_at,
+        )
+        .await,
+        Err(ReconciliationError::InvalidSource(_))
+    ));
+    early_retire
+        .rollback()
+        .await
+        .expect("rollback premature retirement");
+    let mut retire = fixture.pool.begin().await.expect("begin source retirement");
+    let receipt = retire_source(
+        &mut retire,
+        "transfer-retirement",
+        &fixture.beneficiary_id,
+        &old_source.source_id,
+        "schedule:transfer",
+        ended_at,
+        ended_at,
+    )
+    .await
+    .expect("retire ended source");
+    retire.commit().await.expect("commit source retirement");
+    assert_eq!(
+        receipt.source_set_generation,
+        historical.source_set_generation + 1
+    );
+    assert_eq!(receipt.outcome, RegistrationOutcome::Applied);
+    let mut retirement_replay = fixture
+        .pool
+        .begin()
+        .await
+        .expect("begin source retirement replay");
+    let replayed_retirement = retire_source(
+        &mut retirement_replay,
+        "transfer-retirement",
+        &fixture.beneficiary_id,
+        &old_source.source_id,
+        "schedule:transfer",
+        ended_at,
+        ended_at,
+    )
+    .await
+    .expect("exact source retirement replay");
+    retirement_replay
+        .commit()
+        .await
+        .expect("commit source retirement replay");
+    assert_eq!(
+        replayed_retirement.source_set_generation,
+        receipt.source_set_generation
+    );
+    assert_eq!(
+        replayed_retirement.outcome,
+        RegistrationOutcome::AlreadyApplied
+    );
+
+    let mut replay = fixture.pool.begin().await.expect("begin historical replay");
+    let replayed = begin_collection(&mut replay, &fixture.beneficiary_id, &historical.attempt_id)
+        .await
+        .expect("historical completed attempt remains replayable");
+    replay.commit().await.expect("commit historical replay");
+    assert_eq!(replayed.status, CollectionStatus::Completed);
+    assert_eq!(replayed.source_bindings, historical.source_bindings);
+
+    let next = begin(&fixture, &attempt_id(&fixture, "after-retirement")).await;
+    assert_eq!(next.source_bindings, vec![current_source]);
+    assert_ne!(next.source_set_generation, historical.source_set_generation);
     cleanup(&fixture).await;
 }
 

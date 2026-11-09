@@ -14,6 +14,8 @@ use crate::state::AppState;
 struct ServerInfo {
     deployment_mode: &'static str,
     entitlement_model: &'static str,
+    payer_transfers_available: bool,
+    payer_transfer_setup_available: bool,
 }
 
 pub fn router() -> Router<AppState> {
@@ -24,6 +26,11 @@ async fn get_server_info(State(state): State<AppState>) -> impl IntoResponse {
     let body = ServerInfo {
         deployment_mode: state.deployment_mode.as_str(),
         entitlement_model: ENTITLEMENT_MODEL,
+        payer_transfers_available: state.billing_transfers_enabled
+            && state.billing_transfer_execution_enabled,
+        payer_transfer_setup_available: state.billing_transfers_enabled
+            && state.billing_transfer_execution_enabled
+            && state.billing_transfer_setup_enabled,
     };
     ([(header::CACHE_CONTROL, "no-store")], Json(body))
 }

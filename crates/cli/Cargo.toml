@@ -23,15 +23,14 @@ uuid.workspace = true
 sotto-core.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
-# Linux uses the pure-Rust (zbus) Secret Service backend rather than `sync-secret-service`,
-# which links the system C library libdbus-1 and would require libdbus-1-dev on every Linux
-# build (CI and end users). `async-secret-service` needs a runtime (`async-io`) + crypto provider.
-keyring = { version = "3", features = [
+# Linux uses the maintained synchronous Secret Service backend. Vendoring libdbus avoids requiring
+# a system `libdbus-1-dev` package on Linux builders and end-user machines.
+keyring = { version = "3", default-features = false, features = [
     "apple-native",
     "windows-native",
-    "async-secret-service",
-    "async-io",
+    "sync-secret-service",
     "crypto-rust",
+    "vendored",
 ] }
 rpassword = "7"
 serde_json = "1"
@@ -51,12 +50,14 @@ arboard.workspace = true
 inquire.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+tokio.workspace = true
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
 
 [dev-dependencies]
 tempfile = "3"
+rmcp = { version = "3.5.1", default-features = false, features = ["client"] }
 # End-to-end test: run the real server in-process against Postgres and drive it over HTTP.
 sotto-server = { path = "../server" }
-tokio = { workspace = true }
 axum = { workspace = true }
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
@@ -67,3 +68,6 @@ sqlx = { version = "0.8", default-features = false, features = [
 # feature carries `nix::pty` (openpty) and termios. Unix only: Windows has no openpty.
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.29", features = ["term"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal", "process"] }

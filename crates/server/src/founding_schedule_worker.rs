@@ -32,7 +32,24 @@ pub async fn run_once(
     let result = process_job(pool, provider, catalogue, &job).await;
     match result {
         Ok(Some(schedule_id)) => {
-            founding_schedule::mark_scheduled(pool, &job, &schedule_id).await?;
+            let marked = founding_schedule::mark_scheduled(pool, &job, &schedule_id).await?;
+            if !marked && job.payer_kind == FoundingPayerKind::Personal {
+                let cancellation_requested = personal_cancellation_requested(pool, &job).await?;
+                if cancellation_requested {
+                    match apply_personal_cancellation(pool, provider, &job).await {
+                        Ok(()) => {
+                            founding_schedule::mark_not_required(pool, &job).await?;
+                        }
+                        Err(error) => {
+                            let _ = founding_schedule::mark_unresolved(pool, &job, &error).await?;
+                            eprintln!(
+                                "founding schedule worker: cancellation remains unresolved attempt={}",
+                                job.attempt_count,
+                            );
+                        }
+                    }
+                }
+            }
         }
         Ok(None) => {
             founding_schedule::mark_not_required(pool, &job).await?;
@@ -58,6 +75,7 @@ async fn process_job(
         FoundingPayerKind::Personal => {
             let row = sqlx::query(
                 "SELECT account.stripe_subscription_id, account.state, account.cancel_at_period_end, \
+                        account.cancellation_requested_at IS NOT NULL AS cancellation_requested, \
                         award.offer, award.original_end_epoch \
                  FROM billing_personal_accounts AS account \
                  JOIN billing_founding_awards AS award ON award.beneficiary_id = account.user_id \
@@ -79,14 +97,37 @@ async fn process_job(
             let cancel_at_period_end: bool = row
                 .try_get("cancel_at_period_end")
                 .map_err(|_| local_error("local_evidence_invalid"))?;
-            if state == "canceled" || cancel_at_period_end {
+            let cancellation_requested: bool = row
+                .try_get("cancellation_requested")
+                .map_err(|_| local_error("local_evidence_invalid"))?;
+            if state == "canceled" {
+                return Ok(None);
+            }
+            if subscription_id.as_deref() != Some(job.subscription_id.as_str()) {
+                return Err(local_error("local_binding_missing"));
+            }
+            if cancel_at_period_end || cancellation_requested {
+                provider
+                    .cancel_personal_subscription(
+                        &job.subscription_id,
+                        &personal_cancellation_idempotency_key(
+                            &job.subscription_id,
+                            &job.lease_token,
+                        ),
+                        &job.beneficiary_id,
+                    )
+                    .await?;
+                founding_schedule::record_personal_cancellation(
+                    pool,
+                    &job.beneficiary_id,
+                    &job.subscription_id,
+                )
+                .await
+                .map_err(|_| local_error("local_evidence_invalid"))?;
                 return Ok(None);
             }
             if !matches!(state.as_str(), "active" | "past_due") {
                 return Err(local_error("local_evidence_invalid"));
-            }
-            if subscription_id.as_deref() != Some(job.subscription_id.as_str()) {
-                return Err(local_error("local_binding_missing"));
             }
             let offer_text: String = row
                 .try_get("offer")
@@ -102,10 +143,20 @@ async fn process_job(
             let current = provider
                 .get_sponsored_subscription(&job.subscription_id)
                 .await?;
-            if current.subscription_id != job.subscription_id
-                || current.items.len() != 1
-                || current.items[0].quantity != 1
-            {
+            if current.subscription_id != job.subscription_id {
+                return Err(local_error("local_binding_missing"));
+            }
+            if current.cancel_at_period_end || current.cancel_at.is_some() {
+                founding_schedule::record_personal_cancellation(
+                    pool,
+                    &job.beneficiary_id,
+                    &job.subscription_id,
+                )
+                .await
+                .map_err(|_| local_error("local_evidence_invalid"))?;
+                return Ok(None);
+            }
+            if current.items.len() != 1 || current.items[0].quantity != 1 {
                 return Err(local_error("local_evidence_invalid"));
             }
             let current_end = current
@@ -128,6 +179,37 @@ async fn process_job(
             let updated = provider
                 .update_personal_subscription(&job.subscription_id, &phases, &job.idempotency_key)
                 .await?;
+            let cancellation_requested: bool = sqlx::query_scalar(
+                "SELECT cancellation_requested_at IS NOT NULL OR cancel_at_period_end \
+                 FROM billing_personal_accounts WHERE user_id = $1 \
+                   AND stripe_subscription_id = $2",
+            )
+            .bind(&job.beneficiary_id)
+            .bind(&job.subscription_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|_| local_error("local_evidence_invalid"))?
+            .ok_or_else(|| local_error("local_binding_missing"))?;
+            if cancellation_requested {
+                provider
+                    .cancel_personal_subscription(
+                        &job.subscription_id,
+                        &personal_cancellation_idempotency_key(
+                            &job.subscription_id,
+                            &job.lease_token,
+                        ),
+                        &job.beneficiary_id,
+                    )
+                    .await?;
+                founding_schedule::record_personal_cancellation(
+                    pool,
+                    &job.beneficiary_id,
+                    &job.subscription_id,
+                )
+                .await
+                .map_err(|_| local_error("local_evidence_invalid"))?;
+                return Ok(None);
+            }
             updated
                 .schedule_id
                 .ok_or_else(|| local_error("local_evidence_invalid"))
@@ -167,20 +249,71 @@ async fn process_job(
                 sponsored_provider_phases(pool, &job.payer_id, catalogue, current_period_end)
                     .await
                     .map_err(|_| local_error("local_evidence_invalid"))?;
-            let updated = provider
-                .update_sponsored_subscription(
-                    &job.payer_id,
-                    &job.subscription_id,
-                    &phases,
-                    &job.idempotency_key,
-                )
-                .await?;
+            let updated = crate::billing::with_sponsored_subscription_write_lock(
+                pool,
+                &job.subscription_id,
+                async {
+                    Ok::<_, crate::error::Error>(
+                        provider
+                            .update_sponsored_subscription(
+                                &job.payer_id,
+                                &job.subscription_id,
+                                &phases,
+                                &job.idempotency_key,
+                            )
+                            .await,
+                    )
+                },
+            )
+            .await
+            .map_err(|_| local_error("sponsored_schedule_write_unavailable"))??;
             updated
                 .schedule_id
                 .ok_or_else(|| local_error("local_evidence_invalid"))
                 .map(Some)
         }
     }
+}
+
+async fn personal_cancellation_requested(
+    pool: &PgPool,
+    job: &FoundingScheduleJob,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT cancel_at_period_end OR cancellation_requested_at IS NOT NULL \
+         FROM billing_personal_accounts WHERE user_id = $1 AND stripe_subscription_id = $2",
+    )
+    .bind(&job.beneficiary_id)
+    .bind(&job.subscription_id)
+    .fetch_optional(pool)
+    .await
+    .map(|value| value.unwrap_or(false))
+}
+
+async fn apply_personal_cancellation(
+    pool: &PgPool,
+    provider: &dyn SubscriptionProvider,
+    job: &FoundingScheduleJob,
+) -> Result<(), ProviderError> {
+    provider
+        .cancel_personal_subscription(
+            &job.subscription_id,
+            &personal_cancellation_idempotency_key(&job.subscription_id, &job.lease_token),
+            &job.beneficiary_id,
+        )
+        .await?;
+    founding_schedule::record_personal_cancellation(
+        pool,
+        &job.beneficiary_id,
+        &job.subscription_id,
+    )
+    .await
+    .map_err(|_| local_error("local_evidence_invalid"))?;
+    Ok(())
+}
+
+fn personal_cancellation_idempotency_key(subscription_id: &str, lease_token: &str) -> String {
+    format!("sotto-personal-cancel:{subscription_id}:worker:{lease_token}")
 }
 
 fn parse_founding_offer(value: &str) -> Result<FoundingOffer, ProviderError> {
@@ -312,8 +445,12 @@ mod tests {
         let snapshot =
             |price: &str, start: i64, end: i64| crate::billing::SponsoredSubscriptionSnapshot {
                 customer_id: Some("cus".into()),
+                default_payment_method_id: None,
                 subscription_id: "sub".into(),
                 status: crate::billing::SubscriptionStatus::Active,
+                automatic_tax_enabled: false,
+                cancel_at_period_end: false,
+                cancel_at: None,
                 current_period_start: Some(start),
                 current_period_end: Some(end),
                 schedule_id: None,
