@@ -324,6 +324,42 @@ seu tema, e o `store.db` criptografado que guarda o seu cofre. Nenhum dos dois d
 repositório. Veja [Variáveis de ambiente](#variáveis-de-ambiente) para `SOTTO_DATA_DIR`, e
 [Temas de saída](#temas-de-saída) para o local padrão em cada plataforma.
 
+### Listar nomes de segredos
+
+Em um projeto configurado com uma identidade local desbloqueada, liste os nomes
+dos segredos do ambiente selecionado:
+
+```sh
+sotto ls
+```
+
+Exemplo com dois nomes fictícios, ordenados e com um nome por linha:
+
+```text
+API_URL
+REGION
+```
+
+Para scripts, use JSON. Para escolher outro ambiente apenas para este comando:
+
+```sh
+sotto ls --json
+sotto --env staging ls --json
+```
+
+Exemplo de saída JSON para os mesmos nomes:
+
+```json
+["API_URL","REGION"]
+```
+
+Um ambiente vazio não imprime linhas de nomes, ou imprime `[]` com JSON. Segredos
+removidos não aparecem. A lista contém apenas nomes, sem valores ou números de versão.
+`sotto env ls` lista ambientes; `sotto export` inclui valores em texto simples.
+
+A lista vem do armazenamento local. O comando não contata o servidor nem baixa alterações
+recentes. Veja [a sincronização de outro dispositivo](#outro-dispositivo) para atualizar a cópia local.
+
 ### Importar um arquivo dotenv
 
 `sotto import` lê um arquivo dotenv e define cada atribuição em um ambiente, criptografando cada valor
