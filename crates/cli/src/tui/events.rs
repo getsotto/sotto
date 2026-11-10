@@ -218,6 +218,9 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
         KeyCode::Char('r') => {
             app.toggle_reveal()?;
         }
+        KeyCode::Char('R') => {
+            app.reload_local_secrets();
+        }
         KeyCode::Char('t') => {
             app.open_theme_modal();
         }
@@ -1030,5 +1033,203 @@ mod tests {
         assert!(tui_app.show_history_modal);
         handle_key_event(&mut tui_app, key(KeyCode::Esc)).unwrap();
         assert!(!tui_app.show_history_modal);
+    }
+
+    fn with_dashboard(
+        names: &[&str],
+        check: impl FnOnce(&crate::commands::App<'_>, &crate::keychain::MemoryKeychain, &mut TuiApp<'_>),
+    ) {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let keychain = crate::keychain::MemoryKeychain::default();
+        crate::session::init(
+            &store,
+            &keychain,
+            b"pw",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master = crate::session::current_master_key(&keychain)
+            .unwrap()
+            .unwrap();
+        let keypair = crate::session::account_keypair(&store, &master).unwrap();
+        let project = crate::vault::Vault::create_project(&store, &keypair, "acme").unwrap();
+        let config = crate::config::Config {
+            project_id: project.id,
+            project: "acme".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let theme = crate::theme::Theme::default();
+        let app = crate::commands::App::new(&store, &keychain);
+        for name in names {
+            app.set(&config, name, b"value").unwrap();
+        }
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        check(&app, &keychain, &mut tui_app);
+    }
+
+    fn listed_names<'a>(app: &'a TuiApp) -> Vec<&'a str> {
+        app.secrets.iter().map(|item| item.name.as_str()).collect()
+    }
+
+    fn listed_version(app: &TuiApp, name: &str) -> i64 {
+        app.secrets
+            .iter()
+            .find(|item| item.name == name)
+            .map(|item| item.version)
+            .unwrap()
+    }
+
+    #[test]
+    fn uppercase_r_reloads_local_secret_additions_removals_and_metadata() {
+        with_dashboard(&["ALPHA", "BETA"], |app, _, tui| {
+            app.set(&tui.config, "GAMMA", b"gamma").unwrap();
+            app.remove(&tui.config, "ALPHA").unwrap();
+            app.set(&tui.config, "BETA", b"beta-v2").unwrap();
+
+            assert_eq!(listed_names(tui), ["ALPHA", "BETA"]);
+            assert_eq!(listed_version(tui, "BETA"), 1);
+
+            handle_key_event(tui, key(KeyCode::Char('R'))).unwrap();
+
+            assert_eq!(listed_names(tui), ["BETA", "GAMMA"]);
+            assert_eq!(listed_version(tui, "BETA"), 2);
+            assert_eq!(tui.config.environment, "dev");
+            assert!(tui.running);
+            let notice = tui
+                .status_message
+                .as_ref()
+                .expect("a successful reload must report completion");
+            assert_eq!(notice.kind, crate::tui::app::StatusKind::Success);
+            assert!(
+                notice.message.to_lowercase().contains("reload"),
+                "unexpected status: {}",
+                notice.message
+            );
+        });
+    }
+
+    #[test]
+    fn uppercase_r_keeps_filter_and_clamps_when_matching_entries_disappear() {
+        with_dashboard(&["API_KEY", "DATABASE_URL", "DATA_DIR"], |app, _, tui| {
+            search_for(tui, "api");
+            handle_key_event(tui, key(KeyCode::Enter)).unwrap();
+            assert_eq!(tui.search_query, "api");
+            assert_eq!(filtered_names(tui), ["API_KEY"]);
+            assert_eq!(tui.selected_secret().unwrap().name, "API_KEY");
+
+            app.remove(&tui.config, "API_KEY").unwrap();
+            handle_key_event(tui, key(KeyCode::Char('R'))).unwrap();
+
+            assert_eq!(tui.config.environment, "dev");
+            assert_eq!(tui.search_query, "api");
+            assert!(!tui.search_mode);
+            assert!(filtered_names(tui).is_empty());
+            assert!(tui.selected_secret().is_none());
+            assert_eq!(tui.selected_filtered_index, 0);
+            assert!(tui.running);
+        });
+    }
+
+    #[test]
+    fn uppercase_r_clamps_selection_when_the_selected_entry_is_removed() {
+        with_dashboard(&["ALPHA", "BETA", "GAMMA"], |app, _, tui| {
+            handle_key_event(tui, key(KeyCode::End)).unwrap();
+            assert_eq!(tui.selected_secret().unwrap().name, "GAMMA");
+            assert_eq!(tui.selected_filtered_index, 2);
+
+            app.remove(&tui.config, "GAMMA").unwrap();
+            handle_key_event(tui, key(KeyCode::Char('R'))).unwrap();
+
+            assert_eq!(listed_names(tui), ["ALPHA", "BETA"]);
+            assert_eq!(tui.selected_secret().unwrap().name, "BETA");
+            assert_eq!(tui.selected_filtered_index, 1);
+            assert!(tui.running);
+        });
+    }
+
+    #[test]
+    fn uppercase_r_conceals_revealed_value_and_rereads_the_current_secret() {
+        with_dashboard(&["TOKEN"], |app, _, tui| {
+            handle_key_event(tui, key(KeyCode::Char('r'))).unwrap();
+            assert!(tui.revealed);
+            assert_eq!(
+                tui.decrypted_cache.as_deref().map(|value| value.as_slice()),
+                Some(b"value".as_slice())
+            );
+
+            app.set(&tui.config, "TOKEN", b"rotated").unwrap();
+            handle_key_event(tui, key(KeyCode::Char('R'))).unwrap();
+
+            assert!(!tui.revealed);
+            assert!(tui.decrypted_cache.is_none());
+            assert_eq!(listed_version(tui, "TOKEN"), 2);
+            assert!(tui.running);
+
+            handle_key_event(tui, key(KeyCode::Char('r'))).unwrap();
+            assert!(tui.revealed);
+            assert_eq!(
+                tui.decrypted_cache.as_deref().map(|value| value.as_slice()),
+                Some(b"rotated".as_slice())
+            );
+        });
+    }
+
+    #[test]
+    fn uppercase_r_in_search_is_query_text_not_a_reload() {
+        with_dashboard(&["ALPHA"], |app, _, tui| {
+            app.set(&tui.config, "GAMMA", b"gamma").unwrap();
+            search_for(tui, "R");
+
+            assert_eq!(tui.search_query, "R");
+            assert!(tui.search_mode);
+            assert_eq!(listed_names(tui), ["ALPHA"]);
+            assert!(tui.status_message.is_none());
+            assert!(tui.running);
+        });
+    }
+
+    #[test]
+    fn uppercase_r_in_secret_modal_does_not_reload_or_discard_the_draft() {
+        with_dashboard(&["ALPHA"], |app, _, tui| {
+            app.set(&tui.config, "GAMMA", b"gamma").unwrap();
+            handle_key_event(tui, key(KeyCode::Char('n'))).unwrap();
+            handle_key_event(tui, key(KeyCode::Char('N'))).unwrap();
+            handle_key_event(tui, key(KeyCode::Char('E'))).unwrap();
+            handle_key_event(tui, key(KeyCode::Char('W'))).unwrap();
+            assert_eq!(tui.secret_modal_name, "NEW");
+
+            handle_key_event(tui, key(KeyCode::Char('R'))).unwrap();
+
+            assert!(tui.show_secret_modal);
+            assert_eq!(tui.secret_modal_name, "NEWR");
+            assert_eq!(listed_names(tui), ["ALPHA"]);
+            assert!(tui.status_message.is_none());
+            assert!(tui.running);
+        });
+    }
+
+    #[test]
+    fn uppercase_r_reload_failure_shows_a_notice_without_quitting() {
+        with_dashboard(&["ALPHA"], |_, keychain, tui| {
+            crate::session::lock(keychain).unwrap();
+
+            handle_key_event(tui, key(KeyCode::Char('R'))).unwrap();
+
+            assert!(tui.running);
+            assert_eq!(listed_names(tui), ["ALPHA"]);
+            let notice = tui
+                .status_message
+                .as_ref()
+                .expect("a failed reload must set a status notice");
+            assert_eq!(notice.kind, crate::tui::app::StatusKind::Failure);
+            assert!(
+                notice.message.to_lowercase().contains("fail")
+                    || notice.message.to_lowercase().contains("reload"),
+                "unexpected status: {}",
+                notice.message
+            );
+            assert_ne!(notice.kind, crate::tui::app::StatusKind::Success);
+        });
     }
 }
