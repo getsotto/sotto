@@ -178,6 +178,30 @@ sotto init                   # create your identity + first project - SAVE the p
 sotto set DATABASE_URL       # hidden prompt; encrypted locally before it ever touches disk
 sotto import .env            # optional: pull in an existing file, still encrypted locally
 sotto run -- npm start       # inject the environment's secrets into any command
+```
+
+`sotto run` starts a child process that inherits the current process environment. Sotto then
+overlays the selected environment's secrets on top: a secret with the same name as an inherited
+variable overrides it, while unrelated variables remain available. If a secret overrides an
+inherited variable, Sotto prints a stderr diagnostic (`warning: overriding inherited environment
+variable NAME`) naming the variable without printing its value.
+
+This applies to the launched command and its descendants only. The parent shell is unchanged after
+the command finishes.
+
+Sotto launches the requested executable directly. It does not evaluate shell expansion, pipes or
+redirects inside its argument list - the invoking shell processes its own syntax before starting
+Sotto. So `sotto run -- echo "$EXAMPLE"` expands `$EXAMPLE` in the parent shell rather than
+reading the injected value. To read an injected variable inside a child shell, invoke `sh -c`
+explicitly with correct outer quoting:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
+Never use a real credential in an inline example.
+
+```sh
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
 sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 ```
