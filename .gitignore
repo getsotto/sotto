@@ -26,6 +26,7 @@ deploy/rehearsals/
 .vscode/
 .worktrees/
 .claude/
+.agents/
 
 # Internal planning docs - kept out of the public open-core repo.
 docs/
