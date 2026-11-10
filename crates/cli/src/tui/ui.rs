@@ -957,7 +957,8 @@ fn draw_history_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
         Span::styled("[Enter] ", styles.bold_accent()),
         Span::styled("Restore   ", styles.success()),
         Span::styled("[Esc] ", styles.bold_accent()),
-        Span::styled("Close", styles.muted()),
+        Span::styled("Close  ", styles.muted()),
+        Span::styled("[PgUp/PgDn]", styles.bold_accent()),
     ]));
 
     let paragraph = Paragraph::new(lines)
@@ -1005,7 +1006,9 @@ mod tests {
     use crate::session;
     use crate::store::Store;
     use crate::theme::Theme;
+    use crate::tui::events::handle_key_event;
     use crate::vault::Vault;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
     use ratatui::Terminal;
@@ -1882,5 +1885,60 @@ mod tests {
         let end_content = format!("{:?}", terminal.backend().buffer());
         assert!(end_content.contains("v1"));
         assert!(end_content.contains("more versions above"));
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn render_history_modal_page_down_keeps_selected_version_visible() {
+        let (store, keychain, config) = unlocked();
+        let theme = Theme::nord();
+        let app = App::new(&store, &keychain);
+        for i in 0..22 {
+            app.set(&config, "HISTORY_KEY", format!("value-{i}").as_bytes())
+                .unwrap();
+        }
+
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        tui_app.open_history_modal().unwrap();
+        assert_eq!(tui_app.history_modal_items.len(), 22);
+        assert_eq!(tui_app.history_modal_selected_index, 0);
+
+        handle_key_event(&mut tui_app, key(KeyCode::PageDown)).unwrap();
+        assert_eq!(tui_app.history_modal_selected_index, 10);
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &tui_app)).unwrap();
+        let lines = buffer_lines(&terminal);
+
+        let version = tui_app.history_modal_items[10].version;
+        let marker = format!("\u{25b8} v{version}");
+        assert!(
+            lines.iter().any(|line| line.contains(&marker)),
+            "paged selection `{marker}` must stay visible:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("PgUp") && line.contains("PgDn")),
+            "page shortcuts must be listed in the history dialogue hint:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Restore") && line.contains("Close")),
+            "action hints must stay visible after paging:\n{}",
+            lines.join("\n")
+        );
     }
 }
