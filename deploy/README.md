@@ -367,7 +367,9 @@ One-time setup, any provider:
    host - by design, the host can no longer read what it wrote.
 
 3. **Point the script at it** (`deploy/.env`): `SOTTO_BACKUP_BUCKET=gs://<bucket>` (or the
-   `s3://` / rclone form).
+   `s3://` / rclone form). The file must stay readable by the user whose crontab runs the backup.
+   Editing it with `sudo` can leave it owned by root, which stops every backup from that night on;
+   the script names this case rather than reporting the setting as missing.
 
 4. **Nightly cron**, with failures landing in a log you can check:
 
@@ -465,18 +467,28 @@ One-time setup, any provider:
    ```sh
    crontab -l | grep backup.sh                 # is the entry still installed?
    grep -E 'backup (started|ok|FAILED)' $HOME/sotto-backup.log | tail -n 6
-   journalctl -u cron --since "2 days ago"     # did cron start it? (/var/log/syslog without journald)
+   journalctl -u cron --since "2 days ago" | grep "$(id -un)"   # did cron start it? (/var/log/syslog without journald)
+   ls -l $HOME/sotto/deploy/.env               # must be readable by the cron user, not root-only
+   git -C $HOME/sotto log --oneline -1         # is the host running the script this runbook describes?
    ```
 
-   - No `backup started` line for the missed night means cron never ran the script: the entry is
-     gone, the host was down at that time, or cron itself is stopped.
+   - No `backup started` line, and no `CMD` line from cron for that night, means cron never ran the
+     script: the entry is gone, the host was down at that time, or cron itself is stopped.
+   - A `CMD` line from cron but no `backup started` line means the script ran and exited before
+     logging anything. Either the `cd` in the crontab line failed (cron mails that error, usually to
+     nobody), or the host's checkout predates this logging, since current versions log before any
+     check of their own. Image deploys do not move the checkout: only `git pull` in
+     `$HOME/sotto` does, so a fix to `backup.sh` reaches the host only after a pull. The older
+     script also exits silently when `deploy/.env` is unreadable, which an edit made with `sudo` can
+     cause by leaving the file owned by root. Give it back with `sudo chown $(id -un) $HOME/sotto/deploy/.env`.
    - A `backup FAILED while <step>` line names the step that failed. Read the tool output just above
      it for the reason.
    - A `backup ok` line for a night whose object is missing from the bucket should no longer occur.
      Versions before this log line was added could print `ok` after a failed dump upload, so do not
      trust an older `ok` line.
 
-   Once the cause is fixed, take a backup by hand (`./backup.sh`) rather than waiting a night, then
+   Once the cause is fixed, take a backup by hand (`./backup.sh`, as the user that owns the
+   crontab and never with `sudo`, which would read a file cron cannot) rather than waiting a night, then
    run the `Backup freshness` workflow manually. It closes the issue when it sees a fresh backup;
    do not close it by hand, because that hides the alarm without checking anything.
 

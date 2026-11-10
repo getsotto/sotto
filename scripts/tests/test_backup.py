@@ -51,8 +51,19 @@ OWN_LINE = re.compile(r"backup (started|ok|FAILED)|retention journal ok|error: "
 
 
 class Backup(unittest.TestCase):
-    def run_script(self, bucket="gs://sotto-backups-test", tools=("docker", "gsutil"), **environ):
+    def run_script(self, bucket="gs://sotto-backups-test", tools=("docker", "gsutil"), env_file=None,
+                   env_mode=0o600, **environ):
         work = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        script = SCRIPT
+        if env_file is not None:
+            # A private copy of the tree, so the test controls deploy/.env rather than inheriting
+            # whatever the developer's checkout holds there. scripts/ is shared, read-only.
+            (work / "deploy").mkdir()
+            script = work / "deploy/backup.sh"
+            shutil.copy2(SCRIPT, script)
+            (work / "scripts").symlink_to(ROOT / "scripts")
+            (work / "deploy/.env").write_text(env_file)
+            (work / "deploy/.env").chmod(env_mode)
         bin_dir = work / "bin"
         bin_dir.mkdir()
         for name in tools:
@@ -60,7 +71,7 @@ class Backup(unittest.TestCase):
             (bin_dir / name).chmod(0o755)
         # Only what the script needs from the system, so a tool left out is genuinely absent.
         for name in ("sh", "dirname", "sed", "date", "mktemp", "rm", "mkdir", "wc", "tr", "cat",
-                     "python3", "sleep"):
+                     "python3", "sleep", "id"):
             found = shutil.which(name)
             if found:
                 (bin_dir / name).symlink_to(found)
@@ -74,7 +85,7 @@ class Backup(unittest.TestCase):
             **environ,
         }
         result = subprocess.run(
-            ["/bin/sh", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=60
+            ["/bin/sh", str(script)], env=env, capture_output=True, text=True, timeout=60
         )
         return result, uploads.read_text().splitlines()
 
@@ -164,6 +175,33 @@ class Backup(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("SOTTO_BACKUP_BUCKET is not set", result.stderr)
         self.assertIn("backup FAILED while reading configuration", result.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file, so nothing is unreadable")
+    def test_unreadable_env_is_named_not_reported_as_unset(self):
+        # A sudo edit can leave deploy/.env as root:root 600, and the cron user then cannot read
+        # it. Reporting "not set" would send the operator to add a setting that
+        # is already there. The bucket comes from .env here, as it does on the host.
+        result, uploads = self.run_script(
+            bucket="", env_file="SOTTO_BACKUP_BUCKET=gs://sotto-backups-test\n", env_mode=0o000
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("deploy/.env exists but", result.stderr)
+        self.assertIn("cannot read it", result.stderr)
+        self.assertIn("sudo chown", result.stderr)
+        self.assertNotIn("is not set", result.stderr)
+        self.assertIn("backup FAILED while reading configuration", result.stderr)
+        self.assertEqual(uploads, [])
+        self.assert_timestamped(result.stderr)
+
+    def test_readable_env_supplies_the_destination(self):
+        # The control for the test above: the same private tree, readable, backs up normally, so
+        # the failure there is the permission and not the copied layout.
+        result, uploads = self.run_script(
+            bucket="", env_file="SOTTO_BACKUP_BUCKET=gs://sotto-backups-test\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(uploads), 2)
+        self.assertTrue(all(u.startswith("gs://sotto-backups-test/") for u in uploads))
 
     def test_no_dump_is_left_behind(self):
         before = set(Path("/tmp").glob("sotto-pgdump.*"))

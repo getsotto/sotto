@@ -47,6 +47,15 @@ trap 'exit 143' TERM
 
 log "backup started"
 
+# A .env this user cannot read is not the same as a setting that is missing, and must not be
+# reported as one. Editing it with sudo can leave it owned by root with mode 600; every later step
+# then fails, docker compose included, since compose reads the same file. Older versions of this
+# script exited here without printing anything, which hid exactly that for over a week.
+if [ -e .env ] && [ ! -r .env ]; then
+    log "error: deploy/.env exists but $(id -un) cannot read it. If it was edited with sudo, give it back with: sudo chown $(id -un) $(pwd)/.env" >&2
+    exit 1
+fi
+
 # A missing .env is the unset case below, not a failure here: without `|| true`, set -e would end
 # the run on sed's exit status before the error that explains it.
 BUCKET="${SOTTO_BACKUP_BUCKET:-$(sed -n 's/^SOTTO_BACKUP_BUCKET=//p' .env 2>/dev/null || true)}"
