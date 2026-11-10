@@ -2,12 +2,20 @@ import { defineConfig, devices } from "@playwright/test";
 
 // Real Stripe smoke is intentionally opt-in. It runs the production billing adapter with test
 // credentials, while the required pull-request gate uses playwright.config.ts and local fixtures.
-const SERVER_PORT = 8099;
+const SERVER_ORIGIN = process.env.SOTTO_E2E_SERVER_ORIGIN ?? "http://127.0.0.1:8099";
+const SERVER_PORT = new URL(SERVER_ORIGIN).port || "8099";
 const WEB_PORT = 5199;
+const USE_TEST_CLOCK_CHECKOUT = process.env.SOTTO_E2E_TEST_CLOCK_CHECKOUT_ENABLED === "1";
+const SERVER_FEATURES = USE_TEST_CLOCK_CHECKOUT
+  ? "e2e-mock-oauth,e2e-stripe-test-clock"
+  : "e2e-mock-oauth";
+const TEST_MATCH = USE_TEST_CLOCK_CHECKOUT
+  ? /stripe(?:-test-clock)?\.spec\.ts/
+  : /stripe\.spec\.ts/;
 
 export default defineConfig({
   testDir: "./e2e",
-  testMatch: /stripe\.spec\.ts/,
+  testMatch: TEST_MATCH,
   timeout: 120_000,
   fullyParallel: false,
   forbidOnly: true,
@@ -40,26 +48,27 @@ export default defineConfig({
       // the one process that knew why said it into a void.
       stdout: "pipe",
       stderr: "pipe",
-      command: "cargo run -p sotto-server --features e2e-mock-oauth",
-      url: `http://127.0.0.1:${SERVER_PORT}/health`,
-      reuseExistingServer: false,
+      command: `cargo run -p sotto-server --features ${SERVER_FEATURES}`,
+      url: `${SERVER_ORIGIN}/health`,
+      reuseExistingServer: process.env.SOTTO_E2E_EXTERNAL_SERVER === "1",
       // The first feature-specific cargo run can rebuild the server and its dependencies.
       timeout: 180_000,
       env: {
         ...process.env,
         SOTTO_BIND: `127.0.0.1:${SERVER_PORT}`,
-        SOTTO_PUBLIC_URL: `http://127.0.0.1:${SERVER_PORT}`,
+        SOTTO_PUBLIC_URL: SERVER_ORIGIN,
         SOTTO_WEB_ORIGIN: `http://127.0.0.1:${WEB_PORT}`,
         GITHUB_CLIENT_ID: "e2e-mock",
         GITHUB_CLIENT_SECRET: "e2e-mock",
         SOTTO_TELEMETRY: "off",
+        SOTTO_E2E_TEST_CLOCK_CHECKOUT_ENABLED: USE_TEST_CLOCK_CHECKOUT ? "1" : "0",
       },
     },
     {
       command: `npm run preview -- --port ${WEB_PORT} --strictPort --host 127.0.0.1`,
       url: `http://127.0.0.1:${WEB_PORT}`,
       reuseExistingServer: false,
-      env: { ...process.env, SOTTO_API_URL: `http://127.0.0.1:${SERVER_PORT}` },
+      env: { ...process.env, SOTTO_API_URL: SERVER_ORIGIN },
     },
   ],
 });

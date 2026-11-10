@@ -155,7 +155,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -173,7 +173,7 @@ para ejemplos de matrices, Windows y flujos reutilizables.
 
 ¿Quieres una demo funcional? [**sotto-example**](https://github.com/getsotto/sotto-example)
 muestra la inyección local de secretos con un GIF de Python y pasos copiables, además de pequeños ejemplos
-en JavaScript, TypeScript, Java, C#, PHP, Go y C++. No necesitas cuenta; las instrucciones cubren
+en JavaScript, TypeScript, Java, C#, PHP, Go, Rust y C++. No necesitas cuenta; las instrucciones cubren
 macOS, Linux y Windows.
 
 ```sh
@@ -207,6 +207,29 @@ servidor que elegiste. En cualquier caso el servidor solo almacena texto cifrado
 `/app` del mismo servidor descifra en tu navegador, con claves que nunca salen de tus dispositivos.
 
 Para explorar los secretos de forma interactiva, consulta la [guía del panel](#panel-interactivo).
+Para guardar un archivo completo como un solo secreto, consulta [Secretos a partir de archivos](#secretos-a-partir-de-archivos).
+
+Si el navegador no se abre o el inicio de sesión caduca, consulta [Solución de problemas al iniciar sesión](#solución-de-problemas-al-iniciar-sesión).
+
+### Solución de problemas al iniciar sesión
+
+`sotto login` inicia un receptor de corta duración en `127.0.0.1` (la dirección de bucle local) en un
+puerto disponible, abre tu navegador para iniciar sesión y espera a que el navegador vuelva a ese
+receptor.
+
+- **El navegador no se abre.** Abre, en un navegador de la misma máquina, la URL que esa ejecución de
+  `sotto login` imprimió tras "If it doesn't open, visit:". Deja el comando en ejecución, porque está
+  esperando a que termine el inicio de sesión.
+- **Usa la misma máquina.** El navegador debe poder llegar al receptor en la dirección de bucle local.
+  Abrir la URL en otra máquina o en un teléfono no completa el flujo normal. No se garantiza que una
+  sesión remota por SSH o en un contenedor funcione como un escritorio local, así que inicia sesión
+  desde un terminal local siempre que puedas.
+- **La espera caduca.** El comando espera cinco minutos a que el navegador vuelva. Pasado ese tiempo,
+  ejecuta `sotto login` de nuevo y usa la URL recién impresa. Cada intento inicia un receptor nuevo con
+  un estado nuevo, así que una URL o un enlace de callback antiguos no funcionarán.
+
+No expongas públicamente el receptor de bucle local. Para iniciar sesión en tu propio servidor, indica
+el mismo `--server <url>` que antes; consulta [Autoalojamiento](#autoalojamiento).
 
 ## Flujos de trabajo con agentes
 
@@ -238,7 +261,8 @@ sotto run --env staging -- npm test
 sotto ls --env staging
 ```
 
-`--env` se aplica solo a ese comando; `sotto env use` cambia el entorno predeterminado.
+`--env` se aplica solo a ese comando; `sotto env use` cambia el entorno predeterminado guardado en el
+`sotto.toml` del proyecto (consulta [Configuración del proyecto](#configuración-del-proyecto)).
 
 Lista los entornos, cambia el predeterminado, compara dos o previsualiza una copia entre ellos:
 
@@ -253,6 +277,56 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 `env diff` marca cada clave con `=` (mismo valor), `!` (valores distintos), `<` (solo en el primer
 entorno) o `>` (solo en el segundo). Sin `--confirm`, la copia es una simulación. Una copia confirmada
 añade y actualiza secretos, pero deja intactas las claves que solo existen en el destino.
+
+### Configuración del proyecto
+
+`sotto init` y `sotto clone` escriben un `sotto.toml` en el directorio actual. Este archivo vincula
+ese directorio a un proyecto local y a un entorno predeterminado. Este ejemplo ilustrativo usa
+identificadores inventados:
+
+```toml
+project_id = "11111111-1111-1111-1111-111111111111"
+project = "acme-api"
+environment = "dev"
+org_id = "22222222-2222-2222-2222-222222222222"
+```
+
+- `project_id` (obligatorio): el identificador estable del proyecto.
+- `project` (obligatorio): el nombre legible del proyecto.
+- `environment` (obligatorio): el entorno predeterminado para los comandos ejecutados en este directorio.
+- `org_id` (opcional): la organización propietaria del proyecto. Omítelo en un proyecto personal.
+
+El archivo contiene metadatos del proyecto, no valores secretos, y está pensado para incluirse en el
+repositorio. No es una bóveda ni concede acceso a ningún secreto: un compañero que lo descargue sigue
+necesitando su propia concesión. Escribir un archivo con identificadores inventados no crea un
+proyecto. Ejecuta `sotto init` para crear uno, o sigue [Trabajo en equipo](#trabajo-en-equipo) para
+clonar un entorno compartido.
+
+Los comandos buscan `sotto.toml` en el directorio actual y después en cada directorio superior, y usan
+el más cercano que encuentran, como hace `git` con `.git`. En un proyecto anidado, gana el archivo interior:
+
+```text
+monorepo/
+├── sotto.toml            # project "platform"
+├── tools/                # commands here use "platform"
+└── services/
+    └── billing/
+        ├── sotto.toml    # project "billing"
+        └── src/          # commands here use "billing"
+```
+
+Si el `sotto.toml` más cercano está mal formado o es ilegible, el comando falla con un error que nombra
+ese archivo. No recurre a un proyecto superior.
+
+`sotto env use staging` guarda `staging` como `environment` en el `sotto.toml` encontrado, de modo que
+se aplica también a los comandos posteriores. Un `--env staging` por comando lee ese entorno para un
+solo comando y deja el archivo sin cambios. Consulta [Entornos](#entornos).
+
+`sotto.toml` pertenece a un directorio de proyecto. Por separado, el directorio de datos de Sotto
+contiene el `config.toml` global, con ajustes de toda la máquina como el servidor guardado por
+`sotto login` y tu tema, y el `store.db` cifrado que contiene tu bóveda. Ninguno de los dos debe ir en
+un repositorio. Consulta [Variables de entorno](#variables-de-entorno) para `SOTTO_DATA_DIR`, y
+[Temas de salida](#temas-de-salida) para la ubicación predeterminada en cada plataforma.
 
 ### Importar un archivo dotenv
 
@@ -292,6 +366,42 @@ pero un fallo durante la escritura no deshace las asignaciones ya guardadas, as�
 Para recuperar un valor anterior, consulta [Restaurar una versión anterior de un secreto](#restaurar-una-versión-anterior-de-un-secreto).
 Ese historial procede del servidor, así que solo sirve para valores que ya habías subido. Ejecuta
 `sotto import --help` para ver las reglas de comillas y de valores literales en lugar de repetirlas aquí.
+
+### Secretos a partir de archivos
+
+El valor de un secreto son bytes, no solo texto, así que puedes guardar un archivo completo (un
+certificado, un archivo de clave o un binario pequeño) como un solo secreto. Necesitas un proyecto
+inicializado y un almacén local desbloqueado. Este ejemplo para shell POSIX usa un archivo sintético
+y comprueba la ida y vuelta byte a byte sin imprimir el valor:
+
+```sh
+printf 'synthetic-demo-bytes\001\377\n' > example-input.bin   # a made-up file, not a real secret
+sotto set EXAMPLE_FILE --stdin < example-input.bin
+sotto get EXAMPLE_FILE > example-output.bin                   # redirected, so nothing is printed
+cmp example-input.bin example-output.bin && echo "round-trip OK"
+rm example-input.bin example-output.bin
+```
+
+`--stdin` lee hasta el final del archivo y conserva cada byte: no se recorta nada, ni siquiera un
+salto de línea final. Toda la entrada se convierte en un único valor; no se interpreta como dotenv,
+así que usa [`sotto import`](#importar-un-archivo-dotenv) para un archivo de asignaciones. Cuando la
+salida de `sotto get` se redirige o se envía por una tubería, escribe exactamente los bytes guardados
+y no añade un salto de línea. El archivo de salida contiene texto plano, así que bórralo al terminar
+y nunca lo confirmes en el repositorio, ni siquiera como fixture de prueba.
+
+Solo `set --stdin` y `get` redirigido manejan bytes arbitrarios. Los comandos que tratan los secretos
+como texto necesitan UTF-8 válido:
+
+- `sotto run` y `sotto export` en texto plano, en cualquier `--format`, leen todas las entradas del
+  entorno seleccionado. Un solo valor que no sea UTF-8 válido detiene todo el comando con un error;
+  el valor no se omite ni se convierte a Base64.
+- `sotto get NAME --copy` también necesita UTF-8 válido. Usa `get` redirigido para recuperar bytes
+  arbitrarios.
+
+Guarda los valores binarios en un entorno aparte si también inyectas ese entorno con `sotto run`.
+Esta recuperación a un archivo de texto plano no es una copia de seguridad: para una copia cifrada de
+tu cuenta, usa la exportación cifrada de la página de cuenta de Sotto Cloud en `/cloud`, y para el
+historial consulta [Restaurar una versión anterior de un secreto](#restaurar-una-versión-anterior-de-un-secreto).
 
 ### Eliminar un secreto
 
@@ -367,6 +477,28 @@ sotto shares revoke <token>  # the token is the part of the link between /s/ and
 
 `sotto shares ls` nunca muestra el texto cifrado ni la clave del enlace.
 
+Fíjate en el plural: `sotto share` crea un enlace y `sotto shares` gestiona los enlaces que has
+creado. Ambos hablan con el servidor configurado, así que necesitan `sotto login`; no hace falta
+desbloquear el almacén local. Un listado tiene este aspecto (token sintético, valores de ejemplo):
+
+```text
+active free links: 1
+3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c  class=free  views=1/3  expires 2026-11-01 12:00:00+00
+```
+
+Pasa la primera columna a `sotto shares revoke`. Es el token público, no el enlace completo: para
+`https://getsotto.co.uk/s/3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c#...`, pasa solo `3f9a1c0e7b2d4a6f8e1c3b5d7a9f0e2c` y nunca nada de
+lo que va después de `#`. El listado solo lee metadatos. No abre ningún enlace ni gasta una vista, y
+no puede reconstruir un enlace, porque la clave que va después de `#` nunca llegó al servidor.
+
+`sotto shares ls --json` imprime un objeto y no un array: `active_free_count` y `links`, donde cada
+enlace tiene `token`, `share_class`, `max_views`, `view_count`, `expires_at`, `revoked_at` y
+`created_at`. El servidor devuelve solo tus 100 enlaces más recientes, así que no es un historial
+completo.
+
+Revocar impide futuras recuperaciones a través del enlace. No puede deshacer una recuperación que
+ya ocurrió, así que si el destinatario pudo haber revelado el secreto, cámbialo en su origen.
+
 ### Trabajo en equipo
 
 Los equipos comparten entornos mediante una organización. Cada miembro recibe su propia copia
@@ -381,11 +513,27 @@ sotto org invite <org-id> dev@example.com  # invite an existing Sotto user; prin
 sotto grant <user-id>                      # share the active environment; prints their clone command
 ```
 
-El miembro ejecuta el comando impreso en su propia copia del proyecto:
+Después, el miembro ejecuta el comando impreso. Esto no es lo mismo que **Otro dispositivo**, que restaura tu propia cuenta en una segunda máquina.
+El miembro usa su propia cuenta en el mismo servidor: ejecuta `sotto login` y `sotto unlock` y
+después el comando impreso en un directorio que todavía no tiene `sotto.toml`:
 
 ```sh
+mkdir acme-api && cd acme-api
 sotto clone <project-id> <env-id> --org <org-id>
 ```
+
+Ser miembro de la organización y tener acceso a un entorno son pasos distintos. `sotto org invite`
+convierte a alguien en miembro; `sotto grant <user-id>` le da un entorno. Si ya no tienes el ID de
+usuario, `sotto org members <org-id>` lo muestra. `sotto clone` no concede nada por sí solo: obtiene
+el grant que el miembro ya tiene, descarga ese entorno y escribe `sotto.toml`. Sin grant se detiene
+con `you have not been granted this environment (ask an admin to share it)`, y un administrador
+tiene que ejecutar `sotto grant` para esa persona. No entregues nunca tu Emergency Kit a un
+compañero; desbloquea tu cuenta, no la suya.
+
+Conserva `--org` del comando impreso, porque guarda la organización propietaria para que los push
+posteriores coincidan con el servidor. `--as <environment-name>` y `--name <project-label>` solo
+fijan etiquetas locales: por defecto el entorno conserva su nombre real y el proyecto se llama
+`shared`.
 
 Para ver quién tiene acceso, eliminar a alguien o rotar tú mismo la clave de un entorno:
 
@@ -544,6 +692,7 @@ Sin un `sotto.toml` ni identidad local:
 ```
 
 Si falta `sotto.toml`, no hay ningún proyecto seleccionado. Un archivo mal formado o ilegible produce un error.
+Consulta [Configuración del proyecto](#configuración-del-proyecto) para ver los campos del archivo y cómo se encuentra.
 
 ### Bloquear, desbloquear y cerrar sesión
 
@@ -625,6 +774,9 @@ El formato JSON es útil para scripts. Su estructura de nivel superior es:
 
 El ejemplo es sintético; `actions` y las fechas opcionales proceden del estado devuelto de la cuenta, y los servidores antiguos pueden devolver null para cualquiera de los dos endpoints. `sotto cloud status` solo informa del estado y puede mostrar una URL de facturación. No inicia una compra ni cambia la elegibilidad. Para diagnosticar el almacén local y los entornos, usa `sotto status`; esa vista es independiente de la información del servidor y de la cuenta anterior.
 
+Para trasladar la facturación personal a una organización desde la página de cuenta de Sotto Cloud,
+consulta la [guía de traslado de facturación](CLOUD-BILLING-TRANSFER.md).
+
 ### Temas de salida
 
 La CLI incluye cinco temas integrados: `nord` (el predeterminado), `sordino`, `terminal`,
@@ -704,6 +856,8 @@ Un envío ahora no recupera valores antiguos que nunca se sincronizaron. Para un
 ilegible, sigue la sugerencia de la CLI: ejecuta `sotto pull` e inténtalo de nuevo;
 esto no garantiza que las claves disponibles permitan descifrar esa versión.
 
+Para scripts de shell y CI, consulta la [referencia de scripting y códigos de salida de la CLI](CLI-SCRIPTING.md).
+
 ### Variables de entorno
 
 La CLI lee estas variables:
@@ -737,6 +891,26 @@ Apunta la CLI a tu servidor una vez; los comandos posteriores lo reutilizan:
 ```sh
 sotto login --server https://sotto.example.com
 ```
+
+En una configuración nueva de la CLI, el enlace web de `sotto share` también usa
+la URL de ese servidor. Si la API y la aplicación web tienen orígenes distintos,
+`--server` sigue seleccionando el servidor de sincronización/API y `--web`
+establece la URL base de la aplicación web para los enlaces compartidos:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+La CLI guarda la URL web por separado. Iniciar sesión después solo con
+`--server` conserva el ajuste anterior de `--web`, incluso al cambiar de
+servidor. Para volver a los enlaces del mismo origen, configura ambas URL:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+La opción `--web` no redirige las peticiones de la API ni configura cookies,
+CORS, OAuth, CSP o la compilación de la aplicación web en el servidor.
 
 ## Arquitectura
 

@@ -4,7 +4,7 @@ import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "../api";
-import type { Entitlements, Member, Org } from "../api";
+import type { AuditEvent, Entitlements, Member, Org } from "../api";
 import { TeamPanel } from "../TeamPanel";
 import * as vault from "../vault";
 
@@ -171,6 +171,54 @@ describe("TeamPanel organisation loading", () => {
     expect(api.fetchEntitlements).toHaveBeenCalledOnce();
     expect(api.fetchEntitlements).toHaveBeenCalledWith("org-b");
   });
+});
+
+describe("TeamPanel optional sponsored-seat discovery", () => {
+  beforeEach(() => {
+    resetMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), role: "admin" }]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([member("member-a")]);
+    vi.mocked(api.fetchEntitlements).mockResolvedValue({
+      ...freePlan, tier: "team", effectiveTier: "team",
+    });
+    vi.mocked(api.fetchAudit).mockResolvedValue([]);
+  });
+
+  it.each(["unavailable", "empty"] as const)(
+    "keeps members, invitations and audit usable when sponsored seats are %s",
+    async (outcome) => {
+      if (outcome === "unavailable") {
+        vi.mocked(api.fetchSponsoredSeats).mockRejectedValueOnce(new Error("synthetic seat failure"));
+      }
+      render(
+        <TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />,
+      );
+      fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+      expect(await screen.findByRole("heading", { name: "Audit log" })).toBeInTheDocument();
+
+      expect(screen.getByText("member-a")).toBeInTheDocument();
+      expect(screen.getByText("No events yet.")).toBeInTheDocument();
+      const invite = screen.getByRole("textbox", { name: "Invite by email" });
+      expect(invite).toBeEnabled();
+      fireEvent.change(invite, { target: { value: "teammate@example.com" } });
+      expect(invite).toHaveValue("teammate@example.com");
+      expect(screen.getByRole("button", { name: "Invite" })).toBeEnabled();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(api.fetchSponsoredSeats).toHaveBeenCalledExactlyOnceWith("org-a");
+      expect(api.fetchAudit).toHaveBeenCalledExactlyOnceWith("org-a");
+      expect(api.fetchSponsoredQuote).not.toHaveBeenCalled();
+      expect(api.createSponsoredCheckout).not.toHaveBeenCalled();
+      expect(api.inviteMember).not.toHaveBeenCalled();
+
+      if (outcome === "unavailable") {
+        expect(screen.queryByRole("heading", { name: "Sponsored Cloud seats" })).not.toBeInTheDocument();
+        expect(screen.queryByText("No sponsored seats are active.")).not.toBeInTheDocument();
+      } else {
+        expect(screen.getByRole("heading", { name: "Sponsored Cloud seats" })).toBeInTheDocument();
+        expect(screen.getByText("No sponsored seats are active.")).toBeInTheDocument();
+      }
+    },
+  );
 });
 
 describe("TeamPanel organisation names", () => {
@@ -966,7 +1014,138 @@ describe("TeamPanel audit visibility", () => {
 
     expect(api.fetchAudit).toHaveBeenCalledTimes(allowed ? 1 : 0);
     if (allowed) expect(await screen.findByText("No events yet.")).toBeInTheDocument();
-    else expect(screen.queryByRole("heading", { name: "Audit log" })).not.toBeInTheDocument();
+    else {
+      expect(screen.queryByRole("heading", { name: "Audit log" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Retry audit log" })).not.toBeInTheDocument();
+    }
+  });
+});
+
+describe("TeamPanel audit recovery", () => {
+  const events: AuditEvent[] = [{
+    id: 1,
+    actor: "user-a",
+    action: "secret.read",
+    target: null,
+    envId: null,
+    detail: null,
+    at: "2026-10-31T00:00:00Z",
+  }];
+
+  beforeEach(() => {
+    resetMocks();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([{ ...org("org-a"), role: "owner" }]);
+    vi.mocked(api.fetchMembers).mockResolvedValue([member("loaded-member")]);
+    vi.mocked(api.fetchEntitlements).mockResolvedValue({ ...freePlan, effectiveTier: "team" });
+  });
+
+  it.each([
+    { state: "empty", result: [] },
+    { state: "populated", result: events },
+  ])("recovers with a $state audit log without reloading members", async ({ result }) => {
+    const initial = deferred<AuditEvent[]>();
+    const retry = deferred<AuditEvent[]>();
+    vi.mocked(api.fetchAudit)
+      .mockReturnValueOnce(initial.promise)
+      .mockReturnValueOnce(retry.promise);
+
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    await waitFor(() => expect(api.fetchAudit).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("region", { name: "Audit log" })).toBeInTheDocument();
+    expect(screen.getByText("Loading audit log…")).toHaveAttribute("role", "status");
+    expect(screen.queryByText("No events yet.")).not.toBeInTheDocument();
+
+    await act(async () => initial.reject(new Error("audit unavailable")));
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not load audit log: audit unavailable");
+    expect(screen.queryByText("No events yet.")).not.toBeInTheDocument();
+    expect(screen.getByText(/loaded-member/)).toBeInTheDocument();
+    const button = screen.getByRole("button", { name: "Retry audit log" });
+    act(() => {
+      fireEvent.click(button);
+      fireEvent.click(button);
+    });
+    expect(api.fetchAudit).toHaveBeenCalledTimes(2);
+    expect(api.fetchAudit).toHaveBeenLastCalledWith("org-a");
+    expect(screen.getByRole("button", { name: "Retry audit log" })).toBeDisabled();
+    expect(screen.getByText("Loading audit log…")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByText(/loaded-member/)).toBeInTheDocument();
+    expect(screen.getByText("team", { selector: "strong" })).toBeInTheDocument();
+
+    await act(async () => retry.resolve(result));
+    expect(screen.queryByRole("button", { name: /audit log/ })).not.toBeInTheDocument();
+    if (result.length === 0) {
+      expect(screen.getByText("No events yet.")).toBeInTheDocument();
+    } else {
+      expect(screen.getByText(/secret\.read/)).toBeInTheDocument();
+    }
+    for (const request of [api.fetchOrgs, api.fetchMembers, api.fetchEntitlements, api.fetchSponsoredSeats]) {
+      expect(request).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("keeps retry usable after another failure", async () => {
+    vi.mocked(api.fetchAudit)
+      .mockRejectedValueOnce(new Error("initial failure"))
+      .mockRejectedValueOnce(new Error("retry failure"))
+      .mockResolvedValueOnce([]);
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Retry audit log" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("retry failure");
+    expect(screen.queryByText("No events yet.")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry audit log" }));
+    expect(await screen.findByText("No events yet.")).toBeInTheDocument();
+    expect(api.fetchAudit).toHaveBeenCalledTimes(3);
+    expect(api.fetchMembers).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ["success", "team"],
+    ["failure", "team"],
+    ["success", "free"],
+    ["failure", "free"],
+  ] as const)("ignores a stale retry %s after switching to %s", async (outcome, tier) => {
+    const staleRetry = deferred<AuditEvent[]>();
+    const current = deferred<AuditEvent[]>();
+    vi.mocked(api.fetchOrgs).mockResolvedValue([
+      { ...org("org-a"), role: "owner" },
+      { ...org("org-b"), role: "owner" },
+    ]);
+    vi.mocked(api.fetchEntitlements).mockImplementation(async (id) => ({
+      ...freePlan, effectiveTier: id === "org-a" ? "team" : tier,
+    }));
+    vi.mocked(api.fetchAudit)
+      .mockRejectedValueOnce(new Error("initial failure"))
+      .mockReturnValueOnce(staleRetry.promise)
+      .mockReturnValueOnce(current.promise);
+    render(<TeamPanel master={new Uint8Array(32)} encPrivateKeys={new Uint8Array([1])} />);
+    fireEvent.click(await screen.findByRole("button", { name: /org-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Retry audit log" }));
+    fireEvent.click(screen.getByRole("button", { name: /org-b/ }));
+    await screen.findByText(tier, { selector: "strong" });
+    await act(async () => {
+      if (outcome === "success") staleRetry.resolve(events);
+      else staleRetry.reject(new Error("stale failure"));
+    });
+    expect(screen.queryByText(/secret\.read/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    if (tier === "team") {
+      expect(screen.getByText("Loading audit log…")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Retry audit log" })).toBeDisabled();
+      expect(api.fetchAudit).toHaveBeenLastCalledWith("org-b");
+      await act(async () => current.reject(new Error("current failure")));
+      expect(screen.getByRole("alert")).toHaveTextContent("current failure");
+      vi.mocked(api.fetchAudit).mockResolvedValueOnce([]);
+      fireEvent.click(screen.getByRole("button", { name: "Retry audit log" }));
+      expect(await screen.findByText("No events yet.")).toBeInTheDocument();
+      expect(api.fetchAudit).toHaveBeenCalledTimes(4);
+    } else {
+      expect(screen.queryByRole("region", { name: "Audit log" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Retry audit log" })).not.toBeInTheDocument();
+      expect(api.fetchAudit).toHaveBeenCalledTimes(2);
+    }
   });
 });
 
