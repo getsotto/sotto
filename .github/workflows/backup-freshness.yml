@@ -102,6 +102,11 @@ jobs:
           # schedule above, and a deployment that changes the schedule should change both together
           # rather than tune a threshold until the alarm stops complaining.
           MAX_AGE_HOURS: "26"
+          # The crontab's backup time, HH:MM UTC. An open alarm closes only on a fresh backup that
+          # started within the hour after it, because a hand-run backup proves the script works,
+          # not that cron will run it tonight. A deployment whose crontab runs at another time
+          # sets the repository variable; otherwise its alarms would never close.
+          SCHEDULED_AT: ${{ vars.SOTTO_BACKUP_SCHEDULE_UTC || '02:17' }}
         run: |
           set -euo pipefail
 
@@ -130,7 +135,8 @@ jobs:
           curl -fsS \
             -H "Authorization: Bearer ${ACCESS_TOKEN}" \
             "https://storage.googleapis.com/storage/v1/b/${bucket}/o?fields=items(name,timeCreated)" \
-            | python3 scripts/backup-freshness --max-age-hours "$MAX_AGE_HOURS" >> "$GITHUB_OUTPUT"
+            | python3 scripts/backup-freshness --max-age-hours "$MAX_AGE_HOURS" \
+                --scheduled-at "$SCHEDULED_AT" >> "$GITHUB_OUTPUT"
 
       - name: Send the heartbeat
         # Only on success, and only when a heartbeat is configured. Whichever external checker owns
@@ -178,10 +184,36 @@ jobs:
           fi
           exit 1
 
+      - name: Say why the alert stays open
+        # Fresh, but not from cron: most likely the hand-run backup the runbook asks for after a
+        # fix. Saying so once keeps the open issue from looking like a check that has not noticed.
+        if: >-
+          steps.config.outputs.configured == 'true' && steps.check.outputs.healthy == 'true'
+          && steps.check.outputs.scheduled == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # gh ignores GITHUB_REPOSITORY, so name the repository explicitly, as the other steps do.
+          GH_REPO: ${{ github.repository }}
+          LABEL: backup-alert
+          SCHEDULED_AT: ${{ vars.SOTTO_BACKUP_SCHEDULE_UTC || '02:17' }}
+        run: |
+          set -euo pipefail
+          note="A fresh backup has arrived, but none started in the hour after the ${SCHEDULED_AT} UTC schedule, so it was most likely taken by hand. This stays open until a scheduled backup is seen, which is what shows cron is running it again."
+          open_alerts="$(gh issue list --state open --label "$LABEL" \
+            --json number --jq '.[].number' 2>/dev/null || true)"
+          for number in $open_alerts; do
+            last="$(gh issue view "$number" --json comments --jq '.comments[-1].body // ""')"
+            if [ "$last" != "$note" ]; then
+              gh issue comment "$number" --body "$note"
+            fi
+          done
+
       - name: Close a resolved alert
         # Recovering silently would leave a stale issue implying an outage that has ended, which
-        # trains you to ignore the alert that matters.
-        if: steps.config.outputs.configured == 'true' && steps.check.outputs.healthy == 'true'
+        # trains you to ignore the alert that matters. Only a scheduled backup resolves it.
+        if: >-
+          steps.config.outputs.configured == 'true' && steps.check.outputs.healthy == 'true'
+          && steps.check.outputs.scheduled == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           # gh resolves the repository from a git remote and ignores GITHUB_REPOSITORY. This job
