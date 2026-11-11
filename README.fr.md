@@ -211,6 +211,8 @@ suit appartient à la commande. Par exemple, `sotto run --env staging -- npm tes
 l'environnement staging pour cette seule commande. Voir [Environnements](#environnements) pour
 savoir comment un environnement est sélectionné et [Secrets issus de fichiers](#secrets-issus-de-fichiers)
 pour les secrets qui ne sont pas du texte brut.
+Pour savoir ce que renvoie `sotto run` une fois la commande démarrée, consultez la
+[référence des scripts et des codes de sortie de la CLI](CLI-SCRIPTING.md).
 
 ```sh
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged

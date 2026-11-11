@@ -207,6 +207,8 @@ Die eigenen Optionen von Sotto, etwa `--env`, stehen vor dem Trennzeichen `--`; 
 gehört zum Befehl. Zum Beispiel wählt `sotto run --env staging -- npm test` die Umgebung staging
 nur für diesen einen Befehl aus. Siehe [Umgebungen](#umgebungen), wie eine Umgebung ausgewählt
 wird, und [Dateibasierte Secrets](#dateibasierte-secrets) für Secrets, die kein reiner Text sind.
+Was `sotto run` nach dem Start des Befehls zurückgibt, steht in der
+[Referenz zu CLI-Skripten und Exit-Status](CLI-SCRIPTING.md).
 
 ```sh
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged

@@ -208,6 +208,8 @@ pertence ao comando. Por exemplo, `sotto run --env staging -- npm test` selecion
 staging apenas para esse comando. Veja [Ambientes](#ambientes) para saber como um ambiente é
 selecionado e [Segredos a partir de arquivos](#segredos-a-partir-de-arquivos) para segredos que
 não são texto simples.
+Para saber o que `sotto run` retorna depois que o comando é iniciado, consulte a
+[referência de scripts e códigos de saída da CLI](CLI-SCRIPTING.md).
 
 ```sh
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
