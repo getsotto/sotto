@@ -22,10 +22,11 @@ def obj(name, created):
 
 
 class Freshness(unittest.TestCase):
-    def verdict(self, items, now=NOW, max_age=26):
+    def verdict(self, items, now=NOW, max_age=26, scheduled_at=None):
         listing = {"items": items} if items is not None else {}
+        schedule = ["--scheduled-at", scheduled_at] if scheduled_at else []
         result = subprocess.run(
-            [str(SCRIPT), "--max-age-hours", str(max_age), "--now", now],
+            [str(SCRIPT), "--max-age-hours", str(max_age), "--now", now, *schedule],
             input=json.dumps(listing), capture_output=True, text=True, timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -37,7 +38,7 @@ class Freshness(unittest.TestCase):
             obj("sotto-20261111T021701Z.dump", "2026-11-11T02:17:20.618Z"),
             obj("sotto-20261111T021701Z.tombstones.jsonl", "2026-11-11T02:17:21.000Z"),
         ])
-        self.assertEqual(out, {"healthy": "true"})
+        self.assertEqual(out, {"healthy": "true", "scheduled": "true"})
         self.assertIn("Newest backup: 2026-11-11T02:17:20.618Z (7h old, threshold 26h)", stderr)
 
     def test_fresh_marker_does_not_make_a_stale_bucket_healthy(self):
@@ -88,7 +89,7 @@ class Freshness(unittest.TestCase):
 
     def test_a_prefix_in_the_destination_is_allowed(self):
         out, _ = self.verdict([obj("prod/sotto-20261111T021701Z.dump", "2026-11-11T02:17:20.000Z")])
-        self.assertEqual(out, {"healthy": "true"})
+        self.assertEqual(out, {"healthy": "true", "scheduled": "true"})
 
     def test_marker_step_outside_the_expected_wording_is_ignored(self):
         # The step reaches an issue body. A name with anything but lowercase words and hyphens is
@@ -119,6 +120,61 @@ class Freshness(unittest.TestCase):
             obj("sotto-20261111T021701Z.failed.uploading-the-dump", "2026-11-11T02:17:40.000Z"),
         ])
         self.assertNotIn("\n", out["reason"])
+
+    def test_scheduled_backup_counts_as_scheduled(self):
+        out, _ = self.verdict(
+            [obj("sotto-20261111T021701Z.dump", "2026-11-11T02:17:20.618Z")], scheduled_at="02:17")
+        self.assertEqual(out, {"healthy": "true", "scheduled": "true"})
+
+    def test_hand_run_is_fresh_but_not_scheduled(self):
+        # The 1 November case: a backup taken by hand at 16:04 while cron was broken. The bucket
+        # is fresh, so no new alarm, but it proves nothing about tonight, so the open one stays.
+        out, _ = self.verdict([
+            obj("sotto-20261030T021702Z.dump", "2026-10-30T02:17:20.618Z"),
+            obj("sotto-20261101T160430Z.dump", "2026-11-01T16:04:41.430Z"),
+        ], now="2026-11-02T09:43:00Z", scheduled_at="02:17")
+        self.assertEqual(out, {"healthy": "true", "scheduled": "false"})
+
+    def test_hand_run_after_a_scheduled_one_still_counts_as_scheduled(self):
+        # Only the newest dump being a hand run must not hide that cron ran this morning.
+        out, _ = self.verdict([
+            obj("sotto-20261111T021701Z.dump", "2026-11-11T02:17:20.618Z"),
+            obj("sotto-20261111T083000Z.dump", "2026-11-11T08:30:10.000Z"),
+        ], scheduled_at="02:17")
+        self.assertEqual(out["scheduled"], "true")
+
+    def test_scheduled_backup_too_old_to_be_fresh_does_not_count(self):
+        out, _ = self.verdict([
+            obj("sotto-20261109T021701Z.dump", "2026-11-09T02:17:20.618Z"),
+            obj("sotto-20261111T083000Z.dump", "2026-11-11T08:30:10.000Z"),
+        ], scheduled_at="02:17")
+        self.assertEqual(out, {"healthy": "true", "scheduled": "false"})
+
+    def test_window_edges(self):
+        def scheduled(stamp):
+            name = f"sotto-20261111T{stamp}Z.dump"
+            return self.verdict([obj(name, "2026-11-11T03:30:00.000Z")], scheduled_at="02:17")[0]["scheduled"]
+        self.assertEqual(scheduled("021600"), "false")
+        self.assertEqual(scheduled("021700"), "true")
+        self.assertEqual(scheduled("031659"), "true")
+        self.assertEqual(scheduled("031700"), "false")
+
+    def test_window_wraps_past_midnight(self):
+        out, _ = self.verdict(
+            [obj("sotto-20261111T001000Z.dump", "2026-11-11T00:10:30.000Z")], scheduled_at="23:30")
+        self.assertEqual(out["scheduled"], "true")
+
+    def test_unhealthy_verdict_has_no_scheduled_line(self):
+        out, _ = self.verdict(
+            [obj("sotto-20261101T172800Z.dump", "2026-11-01T17:28:13.157Z")], scheduled_at="02:17")
+        self.assertNotIn("scheduled", out)
+
+    def test_malformed_schedule_is_refused(self):
+        result = subprocess.run(
+            [str(SCRIPT), "--max-age-hours", "26", "--scheduled-at", "2:17am"],
+            input="{}", capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("HH:MM", result.stderr)
 
 
 if __name__ == "__main__":
