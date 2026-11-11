@@ -8,7 +8,9 @@
 //!
 //! Machines get a deliberately tiny, read-only surface: `GET /machine/grant` and
 //! `GET /machine/secrets`, both authenticated by the machine token alone. They cannot reach any
-//! other endpoint, and user sessions cannot reach these (different token namespace).
+//! other endpoint, and user sessions cannot reach these (different token namespace). The snapshot
+//! carries the grant too, so a current client needs one round trip; `/machine/grant` stays for
+//! clients that predate that.
 
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
@@ -396,9 +398,16 @@ async fn machine_grant(
     machine: MachineAuth,
 ) -> Result<Json<MachineGrant>> {
     enforce_machine_eligibility(&state, &machine).await?;
-    // Fail closed: if the token row vanished (e.g. an env-deletion cascade in the window after auth),
-    // was revoked, or expired in between, answer 401 rather than letting `RowNotFound` bubble up
-    // as a 500.
+    Ok(Json(load_grant(&state.pool, &machine).await?))
+}
+
+/// Read the machine's current grant. Fails closed: if the token row vanished (e.g. an
+/// env-deletion cascade in the window after auth), was revoked, or expired in between, answer 401
+/// rather than letting `RowNotFound` bubble up as a 500.
+async fn load_grant<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    machine: &MachineAuth,
+) -> Result<MachineGrant> {
     let row: Option<(Vec<u8>, String, String, i64)> = sqlx::query_as(concat!(
         "SELECT enc_vault_key, name, ",
         expiry_columns_sql!(),
@@ -406,16 +415,16 @@ async fn machine_grant(
         active_token_sql!(),
     ))
     .bind(&machine.token_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(executor)
     .await?;
     let (enc_vault_key, name, expires_at, expires_in_days) = row.ok_or(Error::Unauthorized)?;
-    Ok(Json(MachineGrant {
-        env_id: machine.env_id,
+    Ok(MachineGrant {
+        env_id: machine.env_id.clone(),
         enc_vault_key: encoding::encode(&enc_vault_key),
         name,
         expires_at,
         expires_in_days,
-    }))
+    })
 }
 
 #[derive(Serialize)]
@@ -432,22 +441,35 @@ struct MachineSecret {
 struct MachineSnapshot {
     revision: i64,
     secrets: Vec<MachineSecret>,
+    /// The machine's grant, read in the same database snapshot as `secrets`. Clients that
+    /// predate it ignore the field and keep calling `/machine/grant`.
+    grant: MachineGrant,
 }
 
 /// Snapshot row: `(id, enc_name, enc_value, enc_data_key, version, deleted)`.
 type SecretRow = (String, Vec<u8>, Vec<u8>, Vec<u8>, i64, bool);
 
-/// `GET /machine/secrets` - the full secret snapshot of the machine's environment (same shape as
-/// the user snapshot endpoint, minus the ETag machinery: CI fetches once per run).
+/// `GET /machine/secrets` - the machine's grant plus the full secret snapshot of its environment
+/// (same shape as the user snapshot endpoint, minus the ETag machinery: CI fetches once per run).
+///
+/// Everything is read in one repeatable-read transaction, so the vault key and the data keys it
+/// unwraps always come from the same side of a rotation. Two separate requests cannot promise
+/// that: a rotation landing between them leaves the machine holding a key that opens nothing.
 async fn machine_secrets(
     State(state): State<AppState>,
     machine: MachineAuth,
 ) -> Result<Json<MachineSnapshot>> {
     enforce_machine_eligibility(&state, &machine).await?;
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+
+    let grant = load_grant(&mut *tx, &machine).await?;
     let revision: Option<i64> =
         sqlx::query_scalar("SELECT revision FROM environments WHERE id = $1")
             .bind(&machine.env_id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(&mut *tx)
             .await?;
     let revision = revision.ok_or_else(|| Error::NotFound("environment not found".into()))?;
 
@@ -456,8 +478,9 @@ async fn machine_secrets(
          FROM secrets WHERE env_id = $1 ORDER BY id",
     )
     .bind(&machine.env_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     let secrets = rows
         .into_iter()
@@ -473,7 +496,11 @@ async fn machine_secrets(
         )
         .collect();
 
-    Ok(Json(MachineSnapshot { revision, secrets }))
+    Ok(Json(MachineSnapshot {
+        revision,
+        secrets,
+        grant,
+    }))
 }
 
 /// Generate a fresh machine token: `smt_` + 256 bits of hex.

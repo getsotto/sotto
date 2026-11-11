@@ -277,10 +277,16 @@ async fn machine_reads_its_grant_and_secrets() {
     assert!(body.contains(e), "grant response names the env");
     assert!(body.contains(&b64(b"machine-grant")));
 
+    let grant: Value = serde_json::from_str(&body).unwrap();
+
     let (status, body) = get(&pool, &api_token, "/machine/secrets").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(&format!("{e}-s1")));
     assert!(body.contains(&b64(b"value")));
+    // The snapshot carries the same grant, so a current client needs no second request.
+    let snapshot: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(snapshot["grant"], grant);
+    assert_eq!(snapshot["grant"]["env_id"], e);
 
     // The token shows in the active listing (with its public key), visible to the admin.
     let (status, body) = get(&pool, &owner, &format!("/environments/{e}/tokens")).await;
