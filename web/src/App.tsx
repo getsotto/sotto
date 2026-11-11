@@ -1,3 +1,5 @@
+import { useEffect } from "react";
+
 import { AuthCallback } from "./AuthCallback";
 import { AccountApp } from "./AccountApp";
 import { Landing } from "./Landing";
@@ -56,6 +58,15 @@ function route():
 
 export function App() {
   const current = route();
+  useEffect(() => {
+    if (current.name !== "vault" && current.name !== "account") return;
+    const previousTitle = document.title;
+    document.title = current.name === "vault" ? "Vault | Sotto" : "Cloud account | Sotto";
+    return () => {
+      document.title = previousTitle;
+    };
+  }, [current.name]);
+
   switch (current.name) {
     case "landing":
       return <Landing />;
