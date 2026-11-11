@@ -93,6 +93,9 @@ struct SecretEntry {
 #[derive(Deserialize)]
 struct SnapshotResponse {
     secrets: Vec<SecretEntry>,
+    // Absent from servers that predate the combined snapshot; `/machine/grant` has it there.
+    #[serde(default)]
+    grant: Option<GrantResponse>,
 }
 
 /// What a machine fetch yields: the decrypted secrets, and a warning to print if the token is
@@ -122,6 +125,9 @@ pub fn expiry_warning(name: &str, expires_at: &str, days_left: i64) -> Option<St
 
 /// Fetch the machine's grant + env snapshot and decrypt every live secret in memory. The vault
 /// key and plaintexts never touch disk.
+///
+/// One request against a current server, whose snapshot carries the grant. An older server's
+/// snapshot does not, so the grant is fetched separately there.
 pub fn fetch_entries(server: &str, token: &MachineToken) -> Result<MachineFetch> {
     let http = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -155,12 +161,15 @@ pub fn fetch_entries(server: &str, token: &MachineToken) -> Result<MachineFetch>
         Ok(resp)
     };
 
-    let grant: GrantResponse = get("/machine/grant")?
+    let mut snapshot: SnapshotResponse = get("/machine/secrets")?
         .json()
         .map_err(|e| Error::Server(e.to_string()))?;
-    let snapshot: SnapshotResponse = get("/machine/secrets")?
-        .json()
-        .map_err(|e| Error::Server(e.to_string()))?;
+    let grant: GrantResponse = match snapshot.grant.take() {
+        Some(grant) => grant,
+        None => get("/machine/grant")?
+            .json()
+            .map_err(|e| Error::Server(e.to_string()))?,
+    };
 
     let vault_key = Zeroizing::new(vault::open_vault_key(
         &token.keypair,
@@ -194,7 +203,112 @@ pub fn fetch_entries(server: &str, token: &MachineToken) -> Result<MachineFetch>
 
 #[cfg(test)]
 mod tests {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::{channel, Receiver};
+
+    use super::super::api::b64encode;
     use super::*;
+
+    /// A machine token plus the wire JSON a server would hold for it: one environment with a
+    /// single secret, `API_KEY=hunter2`.
+    struct Fixture {
+        token: MachineToken,
+        grant_json: String,
+        secrets_json: String,
+    }
+
+    fn fixture() -> Fixture {
+        let secret = [0x42u8; 32];
+        let keypair = wrap::keypair_from_secret(&secret);
+        let vault_key = vault::generate_vault_key();
+        let grant = vault::grant_vault_key(&keypair.public, &vault_key).unwrap();
+        let enc = vault::encrypt_secret(&vault_key, "env-1", "sec-1", 1, b"API_KEY", b"hunter2");
+        let grant_json = format!(
+            r#"{{"env_id":"env-1","enc_vault_key":"{}","name":"ci","expires_at":"2027-01-01T00:00:00Z","expires_in_days":3}}"#,
+            b64encode(&grant)
+        );
+        let secrets_json = format!(
+            r#"[{{"id":"sec-1","enc_name":"{}","enc_value":"{}","enc_data_key":"{}","version":1,"deleted":false}}]"#,
+            b64encode(&enc.enc_name),
+            b64encode(&enc.enc_value),
+            b64encode(&enc.enc_data_key)
+        );
+        Fixture {
+            token: parse_token(&assemble_token("smt_abc", &secret)).unwrap(),
+            grant_json,
+            secrets_json,
+        }
+    }
+
+    /// Serve `bodies` as JSON, one per request and in order, then stop listening. Returns the base
+    /// URL and a channel yielding each request's head (request line + headers, lowercased), so a
+    /// test can assert exactly which requests were made.
+    fn serve(bodies: Vec<String>) -> (String, Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (heads, received) = channel();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).expect("read request") <= 2 {
+                        break;
+                    }
+                    head.push_str(&line.to_lowercase());
+                }
+                heads.send(head).expect("report request");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("write");
+            }
+        });
+        (format!("http://{addr}"), received)
+    }
+
+    #[test]
+    fn a_current_server_is_read_in_one_request() {
+        let f = fixture();
+        let (base, heads) = serve(vec![format!(
+            r#"{{"revision":1,"secrets":{},"grant":{}}}"#,
+            f.secrets_json, f.grant_json
+        )]);
+        let fetched = fetch_entries(&base, &f.token).expect("fetch");
+        assert_eq!(
+            fetched.entries,
+            vec![("API_KEY".to_string(), b"hunter2".to_vec())]
+        );
+        // The grant's expiry fields survive the move into the snapshot.
+        assert!(fetched.expiry_warning.expect("warned").contains("3d left"));
+        let requests: Vec<String> = heads.iter().collect();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].starts_with("get /machine/secrets "));
+        assert!(requests[0].contains("authorization: bearer smt_abc"));
+    }
+
+    #[test]
+    fn an_older_server_without_the_combined_grant_still_works() {
+        let f = fixture();
+        let (base, heads) = serve(vec![
+            format!(r#"{{"revision":1,"secrets":{}}}"#, f.secrets_json),
+            f.grant_json.clone(),
+        ]);
+        let fetched = fetch_entries(&base, &f.token).expect("fetch");
+        assert_eq!(
+            fetched.entries,
+            vec![("API_KEY".to_string(), b"hunter2".to_vec())]
+        );
+        let requests: Vec<String> = heads.iter().collect();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[0].starts_with("get /machine/secrets "));
+        assert!(requests[1].starts_with("get /machine/grant "));
+    }
 
     #[test]
     fn token_string_round_trips() {
