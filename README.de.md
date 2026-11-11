@@ -154,7 +154,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: getsotto/sotto-action@v1.1.0
         with:
-          sotto-version: v0.9.0
+          sotto-version: v0.10.1
       - run: sotto run -- npm test
         env:
           SOTTO_SERVER: ${{ vars.SOTTO_SERVER }}
@@ -206,6 +206,29 @@ Server weiter. In jedem Fall speichert der Server nur Chiffrat: Der Web-Tresor u
 demselben Server entschlüsselt in deinem Browser, mit Schlüsseln, die deine Geräte nie verlassen.
 
 Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
+Um eine ganze Datei als ein Secret zu speichern, siehe [Dateibasierte Secrets](#dateibasierte-secrets).
+
+Wenn sich der Browser nicht öffnet oder die Anmeldung abläuft, siehe [Anmeldeprobleme beheben](#anmeldeprobleme-beheben).
+
+### Anmeldeprobleme beheben
+
+`sotto login` startet auf einem freien Port einen kurzlebigen Listener auf `127.0.0.1` (der
+Loopback-Adresse), öffnet deinen Browser zur Anmeldung und wartet, bis der Browser zu diesem Listener
+zurückkehrt.
+
+- **Der Browser öffnet sich nicht.** Öffne die URL, die dieser `sotto login`-Lauf nach
+  „If it doesn't open, visit:“ ausgegeben hat, in einem Browser auf demselben Rechner. Lass den
+  Befehl weiterlaufen, denn er wartet auf den Abschluss der Anmeldung.
+- **Nutze denselben Rechner.** Der Browser muss den Listener auf der Loopback-Adresse erreichen
+  können. Die URL auf einem anderen Rechner oder auf einem Smartphone zu öffnen, schließt den normalen
+  Ablauf nicht ab. Eine entfernte SSH- oder Container-Sitzung funktioniert nicht zwingend wie ein
+  lokaler Desktop; melde dich daher nach Möglichkeit von einem lokalen Terminal aus an.
+- **Das Warten läuft ab.** Der Befehl wartet fünf Minuten auf die Rückkehr des Browsers. Danach führe
+  `sotto login` erneut aus und verwende die neu ausgegebene URL. Jeder Versuch startet einen neuen
+  Listener mit neuem Zustand, sodass eine alte URL oder ein alter Callback-Link nicht funktioniert.
+
+Mache den Loopback-Listener nicht öffentlich zugänglich. Um dich an deinem eigenen Server anzumelden,
+gib dasselbe `--server <url>` wie zuvor an; siehe [Selbst hosten](#selbst-hosten).
 
 ## Agent-Workflows
 
@@ -237,7 +260,8 @@ sotto run --env staging -- npm test
 sotto ls --env staging
 ```
 
-`--env` gilt nur für diesen Befehl; `sotto env use` ändert die Standardumgebung.
+`--env` gilt nur für diesen Befehl; `sotto env use` ändert die in der `sotto.toml` des Projekts
+gespeicherte Standardumgebung (siehe [Projektkonfiguration](#projektkonfiguration)).
 
 Liste die Umgebungen auf, wechsle die Standardumgebung, vergleiche zwei Umgebungen oder prüfe eine Kopie zwischen ihnen:
 
@@ -253,6 +277,55 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 in der ersten Umgebung) oder `>` (nur in der zweiten). Ohne `--confirm` ist die Kopie ein Probelauf.
 Eine bestätigte Kopie fügt Geheimnisse hinzu und aktualisiert sie, lässt aber Schlüssel unverändert,
 die nur in der Zielumgebung vorhanden sind.
+
+### Projektkonfiguration
+
+`sotto init` und `sotto clone` schreiben eine `sotto.toml` in das aktuelle Verzeichnis. Sie verknüpft
+dieses Verzeichnis mit einem lokalen Projekt und einer Standardumgebung. Dieses Beispiel dient nur der
+Veranschaulichung und verwendet erfundene Kennungen:
+
+```toml
+project_id = "11111111-1111-1111-1111-111111111111"
+project = "acme-api"
+environment = "dev"
+org_id = "22222222-2222-2222-2222-222222222222"
+```
+
+- `project_id` (erforderlich): die stabile Kennung des Projekts.
+- `project` (erforderlich): der lesbare Name des Projekts.
+- `environment` (erforderlich): die Standardumgebung für Befehle in diesem Verzeichnis.
+- `org_id` (optional): die Organisation, der das Projekt gehört. Bei einem persönlichen Projekt entfällt es.
+
+Die Datei enthält Projektmetadaten, keine geheimen Werte, und ist zum Einchecken gedacht. Sie ist kein
+Tresor und gewährt keinen Zugriff auf Secrets: Wer sie auscheckt, braucht weiterhin eine eigene
+Freigabe. Eine Datei mit erfundenen Kennungen legt kein Projekt an. Führe `sotto init` aus, um eines
+anzulegen, oder folge [Im Team arbeiten](#im-team-arbeiten), um eine geteilte Umgebung zu klonen.
+
+Befehle suchen `sotto.toml` im aktuellen Verzeichnis und dann in jedem übergeordneten Verzeichnis und
+verwenden die nächstgelegene, so wie `git` mit `.git`. In einem verschachtelten Projekt gewinnt die innere Datei:
+
+```text
+monorepo/
+├── sotto.toml            # project "platform"
+├── tools/                # commands here use "platform"
+└── services/
+    └── billing/
+        ├── sotto.toml    # project "billing"
+        └── src/          # commands here use "billing"
+```
+
+Ist die nächstgelegene `sotto.toml` fehlerhaft oder unlesbar, bricht der Befehl mit einem Fehler ab, der
+diese Datei nennt. Er weicht nicht auf ein übergeordnetes Projekt aus.
+
+`sotto env use staging` speichert `staging` als `environment` in der gefundenen `sotto.toml`, sodass es
+auch für spätere Befehle gilt. Ein `--env staging` pro Befehl liest diese Umgebung für einen einzelnen
+Befehl und lässt die Datei unverändert. Siehe [Umgebungen](#umgebungen).
+
+`sotto.toml` gehört zu einem Projektverzeichnis. Davon getrennt enthält das Sotto-Datenverzeichnis die
+globale `config.toml` mit rechnerweiten Einstellungen wie dem von `sotto login` gespeicherten Server und
+deinem Theme sowie die verschlüsselte `store.db` mit deinem Tresor. Beide gehören nicht in ein
+Repository. Siehe [Umgebungsvariablen](#umgebungsvariablen) für `SOTTO_DATA_DIR` und
+[Ausgabe-Themes](#ausgabe-themes) für den Standardort auf jeder Plattform.
 
 ### Eine dotenv-Datei importieren
 
@@ -292,6 +365,42 @@ nach einem unterbrochenen Import daher `sotto ls --env staging`.
 Um einen früheren Wert zurückzuholen, siehe [Eine frühere Secret-Version wiederherstellen](#eine-frühere-secret-version-wiederherstellen).
 Dieser Verlauf stammt vom Server und hilft daher nur bei Werten, die Sie bereits hochgeladen hatten. Führen Sie
 `sotto import --help` aus, um die Regeln für Anführungszeichen und literale Werte nachzulesen, statt sie hier zu wiederholen.
+
+### Dateibasierte Secrets
+
+Ein Secret-Wert besteht aus Bytes, nicht nur aus Text. Du kannst also eine ganze Datei (ein
+Zertifikat, eine Schlüsseldatei oder eine kleine Binärdatei) als ein Secret speichern. Du brauchst
+ein initialisiertes Projekt und einen entsperrten lokalen Tresor. Dieses POSIX-Shell-Beispiel nutzt
+eine synthetische Datei und prüft den Hin- und Rückweg Byte für Byte, ohne den Wert auszugeben:
+
+```sh
+printf 'synthetic-demo-bytes\001\377\n' > example-input.bin   # a made-up file, not a real secret
+sotto set EXAMPLE_FILE --stdin < example-input.bin
+sotto get EXAMPLE_FILE > example-output.bin                   # redirected, so nothing is printed
+cmp example-input.bin example-output.bin && echo "round-trip OK"
+rm example-input.bin example-output.bin
+```
+
+`--stdin` liest bis zum Dateiende und behält jedes Byte: Nichts wird abgeschnitten, auch kein
+abschließender Zeilenumbruch. Die gesamte Eingabe wird ein einziger Secret-Wert; sie wird nicht als
+dotenv gelesen, nutze also [`sotto import`](#eine-dotenv-datei-importieren) für eine Datei mit
+Zuweisungen. Wenn die Ausgabe von `sotto get` umgeleitet oder per Pipe weitergegeben wird, schreibt
+es genau die gespeicherten Bytes und hängt keinen Zeilenumbruch an. Die Ausgabedatei enthält
+Klartext, also lösche sie danach und committe sie nie, auch nicht als Test-Fixture.
+
+Nur `set --stdin` und umgeleitetes `get` verarbeiten beliebige Bytes. Befehle, die Secrets als Text
+behandeln, brauchen gültiges UTF-8:
+
+- `sotto run` und Klartext-`sotto export` lesen in jedem `--format` alle Einträge der gewählten
+  Umgebung. Ein einziger Wert, der kein gültiges UTF-8 ist, bricht den ganzen Befehl mit einem
+  Fehler ab; der Wert wird weder übersprungen noch in Base64 umgewandelt.
+- `sotto get NAME --copy` braucht ebenfalls gültiges UTF-8. Nutze umgeleitetes `get`, um beliebige
+  Bytes abzurufen.
+
+Lege Binärwerte in eine eigene Umgebung, wenn du diese Umgebung auch mit `sotto run` einspeist.
+Dieser Abruf als Klartextdatei ist kein Backup: Für eine verschlüsselte Kopie deines Kontos nutze
+den verschlüsselten Export auf der Sotto-Cloud-Kontoseite unter `/cloud`, und für den Verlauf siehe
+[Eine frühere Secret-Version wiederherstellen](#eine-frühere-secret-version-wiederherstellen).
 
 ### Ein Secret entfernen
 
@@ -591,6 +700,7 @@ Ohne `sotto.toml` und ohne lokale Identität:
 ```
 
 Fehlt `sotto.toml`, ist kein Projekt ausgewählt. Eine fehlerhafte oder unlesbare Datei führt zu einem Fehler.
+Unter [Projektkonfiguration](#projektkonfiguration) stehen die Felder der Datei und wie sie gefunden wird.
 
 ### Sperren, entsperren und abmelden
 
@@ -674,6 +784,9 @@ Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht 
 
 Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
 
+Wie du die persönliche Abrechnung auf der Sotto-Cloud-Kontoseite an eine Organisation übergibst,
+steht in der [Anleitung zur Abrechnungsübertragung](CLOUD-BILLING-TRANSFER.md).
+
 ### Ausgabe-Themes
 
 Die CLI enthält fünf integrierte Themes: `nord` (die Standardeinstellung), `sordino`,
@@ -754,6 +867,8 @@ Ein jetziger Push kann ältere, nie synchronisierte Werte nicht wiederherstellen
 unlesbaren Version empfiehlt die CLI, `sotto pull` auszuführen und es erneut zu versuchen;
 ein Pull garantiert nicht, dass die verfügbaren Schlüssel diese Version entschlüsseln können.
 
+Für Shell-Skripte und CI siehe die [Referenz zu CLI-Skripten und Exit-Status](CLI-SCRIPTING.md).
+
 ### Umgebungsvariablen
 
 Die CLI liest diese Variablen:
@@ -789,6 +904,26 @@ Richte die CLI einmal auf deinen Server aus; spätere Befehle verwenden ihn weit
 ```sh
 sotto login --server https://sotto.example.com
 ```
+
+Bei einer frischen CLI-Konfiguration verwendet auch der von `sotto share`
+erzeugte Weblink diese Server-URL. Haben API und Web-App verschiedene Origins,
+wählt `--server` weiterhin den Sync/API-Server, während `--web` die Basis-URL
+der Web-App für Freigabelinks festlegt:
+
+```sh
+sotto login --server https://api.example.test --web https://app.example.test
+```
+
+Die CLI speichert die Web-URL separat. Eine spätere Anmeldung nur mit
+`--server` behält die bisherige `--web`-Einstellung bei, auch beim
+Serverwechsel. Für Freigabelinks mit gemeinsamem Origin beide URLs explizit setzen:
+
+```sh
+sotto login --server https://sotto.example.com --web https://sotto.example.com
+```
+
+Die Option `--web` leitet keine API-Anfragen um und konfiguriert weder
+serverseitige Cookies, CORS, OAuth und CSP noch den Build der Web-App.
 
 ## Architektur
 

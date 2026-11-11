@@ -9,7 +9,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.89"  # dryoc 0.8 requires Rust >= 1.89
@@ -31,7 +31,7 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 indicatif = "0.18"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
@@ -59,3 +59,9 @@ opt-level = 2
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# sqlx's unused SQLite driver would otherwise pin the one permitted `links = "sqlite3"` crate,
+# libsqlite3-sys, below 0.39 and hold the CLI's bundled SQLite on a vulnerable release
+# (RUSTSEC-2026-0459). See third_party/sqlx-sqlite-stub/Cargo.toml for when to delete this.
+[patch.crates-io]
+sqlx-sqlite = { path = "third_party/sqlx-sqlite-stub" }
