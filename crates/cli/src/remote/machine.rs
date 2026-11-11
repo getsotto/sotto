@@ -290,6 +290,11 @@ mod tests {
         assert_eq!(requests.len(), 1, "{requests:?}");
         assert!(requests[0].starts_with("get /machine/secrets "));
         assert!(requests[0].contains("authorization: bearer smt_abc"));
+        // Compression is asked for, so a proxy that offers it can shrink a large snapshot.
+        assert!(
+            requests[0].contains("accept-encoding: gzip"),
+            "{requests:?}"
+        );
     }
 
     #[test]
