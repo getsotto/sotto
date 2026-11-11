@@ -404,6 +404,10 @@ One-time setup, any provider:
 
    Every run logs a UTC-timestamped `backup started` and then exactly one of `backup ok: <object>`
    or `backup FAILED while <step> (exit <status>)`, so the log shows which night failed and where.
+   A failed run also uploads an empty `sotto-<stamp>.failed.<step>` object, so the step is
+   visible from the bucket side too, where the freshness check below reads it into the alarm. No
+   marker after a missed night means the run never reached the bucket: cron did not start it, or
+   it stopped while reading its configuration, before it knew where the bucket was.
    Each object upload is retried twice before the run gives up: a single missed night breaches
    the 26-hour freshness threshold, so a transient blip must not fail the night.
 
@@ -468,19 +472,24 @@ One-time setup, any provider:
 
    ```sh
    # Anything rclone reaches - gs://, s3://, B2, SFTP, a NAS:
-   rclone lsjson --max-age 26h "$SOTTO_BACKUP_BUCKET" | jq -e 'length > 0'
+   rclone lsjson --max-age 26h --include 'sotto-*.dump' "$SOTTO_BACKUP_BUCKET" | jq -e 'length > 0'
 
    # AWS, without rclone:
    aws s3api list-objects-v2 --bucket <bucket> \
-     --query 'max_by(Contents, &LastModified).LastModified'
+     --query "max_by(Contents[?ends_with(Key, '.dump')], &LastModified).LastModified"
    ```
+
+   Count only the `.dump` objects, as both commands do. A failed run leaves a marker in the bucket
+   (below), and a check that takes the newest object of any kind would read last night's failure
+   as last night's backup.
 
    A non-zero exit is the alarm. On AWS the federated equivalent of the grant above is registering
    GitHub's OIDC issuer as an identity provider and giving the role a trust policy conditioned on
    the repository, with `s3:ListBucket` and nothing else.
 
-6. **When the alarm fires** (a `Backups are stale` issue labelled `backup-alert`), work on the
-   host:
+6. **When the alarm fires** (a `Backups are stale` issue labelled `backup-alert`), read the
+   issue first. If the host recorded a failure, the issue names the step it failed at; if it says
+   no failure was recorded, the run never reached the bucket. Then work on the host:
 
    ```sh
    crontab -l | grep backup.sh                 # is the entry still installed?
