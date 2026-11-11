@@ -252,12 +252,30 @@ change entitlements; an approved cohort and notice decision is required before a
 
 ## Upgrading
 
+Run [`upgrade.sh`](./upgrade.sh) on the host, as the user that owns the deployment and never with
+`sudo`:
+
 ```sh
-git pull    # picks up compose/runbook changes
+cd ~/sotto/deploy && ./upgrade.sh vX.Y.Z    # or with no argument to keep the current pin
+```
+
+It is the steps below, in this order, and it stops at the first one that fails:
+
+```sh
+git pull --ff-only    # picks up compose, runbook and backup.sh changes
+# set SOTTO_IMAGE_TAG=vX.Y.Z in .env, keeping the file owned by this user
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml restart caddy
 ```
+
+Both of the steps it guards have been skipped in practice, and neither failure announces itself.
+Images and the git checkout move independently, so an upgrade without the pull leaves the host
+running old copies of `backup.sh` and the other scripts while the containers look current. An
+edit of the pin with `sudo` can leave `.env` owned by root, and the nightly backup, which runs as
+the deployment's user, then cannot read it. The script refuses a `.env` that the user running it
+does not own, and lists any setting names in `.env` that the template no longer has (see renamed
+settings below).
 
 Migrations are forward-only and applied on boot. Check the release notes for anything flagged as
 a compatibility break before upgrading past a minor version.
@@ -478,7 +496,8 @@ One-time setup, any provider:
      logging anything. Either the `cd` in the crontab line failed (cron mails that error, usually to
      nobody), or the host's checkout predates this logging, since current versions log before any
      check of their own. Image deploys do not move the checkout: only `git pull` in
-     `$HOME/sotto` does, so a fix to `backup.sh` reaches the host only after a pull. The older
+     `$HOME/sotto` does (`upgrade.sh` runs it), so a fix to `backup.sh` reaches the host only
+     after a pull. The `backup started` line names the commit the script ran from. The older
      script also exits silently when `deploy/.env` is unreadable, which an edit made with `sudo` can
      cause by leaving the file owned by root. Give it back with `sudo chown $(id -un) $HOME/sotto/deploy/.env`.
    - A `backup FAILED while <step>` line names the step that failed. Read the tool output just above
