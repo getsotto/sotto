@@ -431,7 +431,9 @@ One-time setup, any provider:
    Configure it with repository variables `SOTTO_BACKUP_BUCKET` (the same value as in `.env`,
    scheme included), `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_MONITOR_SERVICE_ACCOUNT`, plus a
    repository secret `BACKUP_HEARTBEAT_URL`. Until all three variables are set the job skips
-   rather than failing.
+   rather than failing. If your crontab runs the backup at a time other than 02:17 UTC, also set
+   `SOTTO_BACKUP_SCHEDULE_UTC` (`HH:MM`, UTC). An open alarm closes only on a backup that started
+   in the hour after that time, so with the wrong value it would never close.
 
    Grant the identity by federation rather than by issuing a key, so that no long-lived credential
    exists to leak or rotate:
@@ -516,9 +518,12 @@ One-time setup, any provider:
      trust an older `ok` line.
 
    Once the cause is fixed, take a backup by hand (`./backup.sh`, as the user that owns the
-   crontab and never with `sudo`, which would read a file cron cannot) rather than waiting a night, then
-   run the `Backup freshness` workflow manually. It closes the issue when it sees a fresh backup;
-   do not close it by hand, because that hides the alarm without checking anything.
+   crontab and never with `sudo`, which would read a file cron cannot) rather than waiting a night,
+   so the data is safe today. Running the `Backup freshness` workflow then confirms the bucket is
+   fresh, but leaves the issue open with a note: a hand-run backup proves the script works, not
+   that cron will run it. The issue closes on the first check that sees a backup started in the
+   hour after the crontab's time. A hand run once closed it while cron stayed broken for ten more
+   days. Do not close it by hand either, because that hides the alarm without checking anything.
 
 **Restore** (into a running instance; drops and recreates objects from the dump). Fetch the
 dump on your own machine, never the host - the append-only posture means the host cannot read
