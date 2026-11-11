@@ -326,8 +326,41 @@ select {
 }
 
 /* Key material is mono, like everything that matters byte-for-byte. */
-input[type="password"] {
+input[type="password"],
+input.passphrase-input {
   font-family: var(--font-mono);
+}
+
+/* Shared-secret recipient page: passphrase input with adjacent show/hide control. */
+.passphrase-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+  max-width: var(--measure-narrow);
+}
+
+.passphrase-field > label {
+  margin: 0;
+  max-width: none;
+}
+
+.passphrase-controls {
+  display: flex;
+  align-items: stretch;
+  gap: var(--space-2);
+  width: 100%;
+}
+
+.passphrase-controls > input {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.passphrase-controls > button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 input::placeholder {
