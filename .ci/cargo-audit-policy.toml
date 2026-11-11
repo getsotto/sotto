@@ -18,8 +18,8 @@ version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 kind = "yanked"
 finding = "yanked"
-reason = """Dormant lockfile paths through flume and lazy_static retain this yanked version; \
-neither enables spin in Sotto's resolved graph. \
+reason = """A dormant lockfile path through lazy_static retains this yanked version; \
+its spin_no_std feature is not enabled in Sotto's resolved graph. \
 Re-evaluate if features or dependency paths change."""
 
 [[allowed_dormant]]

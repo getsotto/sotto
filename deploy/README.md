@@ -311,7 +311,9 @@ ownership checks, never ciphertext or secret values, and is validated before upl
 same bucket lifecycle policy. A backup whose schema includes migration 50 or later needs a
 sidecar at least as recent as the dump. Older backups predate the journal table and can only be
 restored with an empty journal; the restore drill checks that schema boundary before allowing
-that case.
+that case. The export matches: on a database without the journal table it uploads an empty
+sidecar instead of failing the run, so a host running a newer script against an older database
+still ships its dump.
 
 | `SOTTO_BACKUP_BUCKET` | Uploads with | Works for |
 |---|---|---|
@@ -365,14 +367,27 @@ One-time setup, any provider:
    host - by design, the host can no longer read what it wrote.
 
 3. **Point the script at it** (`deploy/.env`): `SOTTO_BACKUP_BUCKET=gs://<bucket>` (or the
-   `s3://` / rclone form).
+   `s3://` / rclone form). The file must stay readable by the user whose crontab runs the backup.
+   Editing it with `sudo` can leave it owned by root, which stops every backup from that night on;
+   the script names this case rather than reporting the setting as missing.
 
 4. **Nightly cron**, with failures landing in a log you can check:
 
    ```sh
    crontab -e     # add:
+   # PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin
    # 17 2 * * * cd $HOME/sotto/deploy && ./backup.sh >> $HOME/sotto-backup.log 2>&1
    ```
+
+   Cron does not read your shell profile, so its `PATH` is little more than `/usr/bin:/bin`. A
+   `gsutil`, `aws` or `rclone` installed anywhere else works when you run the script by hand and is
+   missing every night. Set `PATH` in the crontab to include wherever `command -v gsutil` (or your
+   uploader) points. The script checks for its tools before dumping and names any that are missing.
+
+   Every run logs a UTC-timestamped `backup started` and then exactly one of `backup ok: <object>`
+   or `backup FAILED while <step> (exit <status>)`, so the log shows which night failed and where.
+   Each object upload is retried twice before the run gives up: a single missed night breaches
+   the 26-hour freshness threshold, so a transient blip must not fail the night.
 
 5. **Watch that it keeps running.** Cron reports to nobody, and a bucket that has stopped
    receiving objects looks exactly like a bucket nobody has checked. Installing step 4 and
@@ -445,6 +460,37 @@ One-time setup, any provider:
    A non-zero exit is the alarm. On AWS the federated equivalent of the grant above is registering
    GitHub's OIDC issuer as an identity provider and giving the role a trust policy conditioned on
    the repository, with `s3:ListBucket` and nothing else.
+
+6. **When the alarm fires** (a `Backups are stale` issue labelled `backup-alert`), work on the
+   host:
+
+   ```sh
+   crontab -l | grep backup.sh                 # is the entry still installed?
+   grep -E 'backup (started|ok|FAILED)' $HOME/sotto-backup.log | tail -n 6
+   journalctl -u cron --since "2 days ago" | grep "$(id -un)"   # did cron start it? (/var/log/syslog without journald)
+   ls -l $HOME/sotto/deploy/.env               # must be readable by the cron user, not root-only
+   git -C $HOME/sotto log --oneline -1         # is the host running the script this runbook describes?
+   ```
+
+   - No `backup started` line, and no `CMD` line from cron for that night, means cron never ran the
+     script: the entry is gone, the host was down at that time, or cron itself is stopped.
+   - A `CMD` line from cron but no `backup started` line means the script ran and exited before
+     logging anything. Either the `cd` in the crontab line failed (cron mails that error, usually to
+     nobody), or the host's checkout predates this logging, since current versions log before any
+     check of their own. Image deploys do not move the checkout: only `git pull` in
+     `$HOME/sotto` does, so a fix to `backup.sh` reaches the host only after a pull. The older
+     script also exits silently when `deploy/.env` is unreadable, which an edit made with `sudo` can
+     cause by leaving the file owned by root. Give it back with `sudo chown $(id -un) $HOME/sotto/deploy/.env`.
+   - A `backup FAILED while <step>` line names the step that failed. Read the tool output just above
+     it for the reason.
+   - A `backup ok` line for a night whose object is missing from the bucket should no longer occur.
+     Versions before this log line was added could print `ok` after a failed dump upload, so do not
+     trust an older `ok` line.
+
+   Once the cause is fixed, take a backup by hand (`./backup.sh`, as the user that owns the
+   crontab and never with `sudo`, which would read a file cron cannot) rather than waiting a night, then
+   run the `Backup freshness` workflow manually. It closes the issue when it sees a fresh backup;
+   do not close it by hand, because that hides the alarm without checking anything.
 
 **Restore** (into a running instance; drops and recreates objects from the dump). Fetch the
 dump on your own machine, never the host - the append-only posture means the host cannot read

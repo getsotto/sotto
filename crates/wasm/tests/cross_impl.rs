@@ -151,3 +151,19 @@ fn vault_round_trip_via_bindings() {
     assert_eq!(name, b"NAME");
     assert_eq!(value, b"value");
 }
+
+/// Unlock verification via the binding: only the right master key over intact key material
+/// passes, and nothing but success or a generic error comes back.
+#[wasm_bindgen_test]
+fn verify_account_via_bindings() {
+    let master = [0x55u8; 32];
+    let keypair = sotto_core::wrap::keypair_from_secret(&[0x77u8; 32]);
+    let enc_private_keys = sotto_core::vault::wrap_private_key(&master, &keypair.secret);
+
+    assert!(sotto_wasm::vault_verify_account(&master, &enc_private_keys).is_ok());
+    assert!(sotto_wasm::vault_verify_account(&[0x56u8; 32], &enc_private_keys).is_err());
+    let mut damaged = enc_private_keys.clone();
+    damaged[0] ^= 0x01;
+    assert!(sotto_wasm::vault_verify_account(&master, &damaged).is_err());
+    assert!(sotto_wasm::vault_verify_account(&master[..16], &enc_private_keys).is_err());
+}
