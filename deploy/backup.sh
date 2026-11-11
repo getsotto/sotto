@@ -45,7 +45,10 @@ trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-log "backup started"
+# Which version of this script ran. Image deploys never move the host's git checkout, and a host
+# once ran a two-month-old copy of this file without anything showing it. A deployment that is not
+# a git checkout logs `unknown`, which is not a failure.
+log "backup started (script $(git -C .. rev-parse --short HEAD 2>/dev/null || echo unknown))"
 
 # A .env this user cannot read is not the same as a setting that is missing, and must not be
 # reported as one. Editing it with sudo can leave it owned by root with mode 600; every later step

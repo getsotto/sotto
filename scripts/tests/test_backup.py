@@ -52,7 +52,7 @@ OWN_LINE = re.compile(r"backup (started|ok|FAILED)|retention journal ok|error: "
 
 class Backup(unittest.TestCase):
     def run_script(self, bucket="gs://sotto-backups-test", tools=("docker", "gsutil"), env_file=None,
-                   env_mode=0o600, **environ):
+                   env_mode=0o600, extra_system=(), **environ):
         work = Path(self.enterContext(tempfile.TemporaryDirectory()))
         script = SCRIPT
         if env_file is not None:
@@ -71,7 +71,7 @@ class Backup(unittest.TestCase):
             (bin_dir / name).chmod(0o755)
         # Only what the script needs from the system, so a tool left out is genuinely absent.
         for name in ("sh", "dirname", "sed", "date", "mktemp", "rm", "mkdir", "wc", "tr", "cat",
-                     "python3", "sleep", "id"):
+                     "python3", "sleep", "id", *extra_system):
             found = shutil.which(name)
             if found:
                 (bin_dir / name).symlink_to(found)
@@ -202,6 +202,19 @@ class Backup(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(uploads), 2)
         self.assertTrue(all(u.startswith("gs://sotto-backups-test/") for u in uploads))
+
+    def test_start_line_names_the_script_version(self):
+        # The stubbed PATH has no git, as on a deployment that is not a checkout: that must log
+        # `unknown` rather than fail the run.
+        result, uploads = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("backup started (script unknown)", result.stdout)
+        if shutil.which("git") is None:
+            self.skipTest("no git to read the checkout with")
+        result, _ = self.run_script(extra_system=("git",))
+        head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.assertIn(f"backup started (script {head})", result.stdout)
 
     def test_no_dump_is_left_behind(self):
         before = set(Path("/tmp").glob("sotto-pgdump.*"))
