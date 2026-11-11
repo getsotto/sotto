@@ -203,6 +203,12 @@ sotto run -- sh -c 'echo "$EXAMPLE"'
 
 Nunca use uma credencial real em um exemplo em linha.
 
+As opções do próprio Sotto, como `--env`, vão antes do separador `--`; tudo o que vem depois
+pertence ao comando. Por exemplo, `sotto run --env staging -- npm test` seleciona o ambiente
+staging apenas para esse comando. Veja [Ambientes](#ambientes) para saber como um ambiente é
+selecionado e [Segredos a partir de arquivos](#segredos-a-partir-de-arquivos) para segredos que
+não são texto simples.
+
 ```sh
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
 sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
