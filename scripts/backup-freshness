@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Decide whether the newest backup is fresh, from a bucket listing alone.
+
+Usage: scripts/backup-freshness --max-age-hours 26 [--now 2026-11-11T09:43:00Z] < listing.json
+
+The listing is the GCS JSON API's `objects.list` response with `items(name,timeCreated)`. Prints
+`healthy=true|false` and, when unhealthy, a one-line `reason=...`, in the form GITHUB_OUTPUT takes.
+Nothing here reads an object, only names and creation times, so the identity that runs it needs
+no permission that could fetch a backup.
+
+Only `sotto-<stamp>.dump` counts as a backup. The bucket also holds the retention sidecar and,
+when a run fails, a `sotto-<stamp>.failed.<step>` marker that backup.sh uploads on its way out.
+A marker must never make a stale bucket look fresh, and it is the reason this is a script: when
+the alarm fires it can say which step failed on the host, or that nothing reached the bucket at
+all, without anyone logging in to find out.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import re
+import sys
+
+DUMP = re.compile(r"(?:^|/)sotto-\d{8}T\d{6}Z\.dump$")
+# The step is backup.sh's own wording with spaces as hyphens, restricted to the characters that
+# wording uses, so nothing an object name carries can reach the issue text beyond that.
+FAILED = re.compile(r"(?:^|/)sotto-\d{8}T\d{6}Z\.failed\.([a-z][a-z-]{0,63})$")
+
+TRIAGE = "deploy/README.md section Backups, step 6, has the triage."
+
+
+def parse_time(value: str) -> dt.datetime:
+    # GCS writes RFC 3339 with a Z suffix and milliseconds; fromisoformat accepts that from 3.11.
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def verdict(listing: dict, now: dt.datetime, max_age_hours: int) -> tuple[bool, str, str]:
+    """Return (healthy, reason, summary). The reason is empty when healthy."""
+    items = [i for i in listing.get("items") or [] if "name" in i and "timeCreated" in i]
+    dumps = [(parse_time(i["timeCreated"]), i["name"]) for i in items if DUMP.search(i["name"])]
+    failures = []
+    for item in items:
+        match = FAILED.search(item["name"])
+        if match:
+            failures.append((parse_time(item["timeCreated"]), match.group(1).replace("-", " ")))
+
+    if not dumps:
+        reason = ("The backup bucket holds no backup. No dump has ever been uploaded, or the "
+                  "lifecycle rule has deleted them all.")
+        return False, reason + failure_sentence(failures, ""), "no backup in the bucket"
+
+    newest, _ = max(dumps)
+    shown = listing_time(newest)
+    age_hours = int((now - newest).total_seconds() // 3600)
+    summary = f"Newest backup: {shown} ({age_hours}h old, threshold {max_age_hours}h)"
+    if age_hours < max_age_hours:
+        return True, "", summary
+
+    reason = (f"The newest backup is {age_hours} hours old, past the {max_age_hours} hour "
+              f"threshold. The most recent upload was {shown}.")
+    since = [f for f in failures if f[0] > newest]
+    return False, reason + failure_sentence(since, " since then"), summary
+
+
+def failure_sentence(failures: list, since: str) -> str:
+    if failures:
+        when, step = max(failures)
+        count = len(failures)
+        runs = "run" if count == 1 else "runs"
+        return (f" The host has recorded {count} failed {runs}{since}; the latest, at "
+                f"{listing_time(when)}, failed while {step}. Its `backup FAILED` line in "
+                f"$HOME/sotto-backup.log on the host has the tool output; {TRIAGE}")
+    return (f" The host has recorded no failure{since}, so the job did not start, or stopped "
+            "before it could reach the bucket (reading its configuration, for example). On the "
+            "host, check the cron entry, deploy/.env and the last `backup started` lines in "
+            f"$HOME/sotto-backup.log; {TRIAGE}")
+
+
+def listing_time(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--max-age-hours", type=int, required=True)
+    parser.add_argument("--now", help="the time to judge against (default: now), for tests")
+    args = parser.parse_args()
+    now = parse_time(args.now) if args.now else dt.datetime.now(dt.timezone.utc)
+
+    try:
+        listing = json.load(sys.stdin)
+    except json.JSONDecodeError as error:
+        print(f"the bucket listing is not JSON: {error}", file=sys.stderr)
+        return 1
+    healthy, reason, summary = verdict(listing, now, args.max_age_hours)
+    print(summary, file=sys.stderr)
+    print(f"healthy={'true' if healthy else 'false'}")
+    if reason:
+        print(f"reason={reason}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

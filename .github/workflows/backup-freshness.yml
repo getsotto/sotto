@@ -75,6 +75,13 @@ jobs:
               ;;
           esac
 
+      - name: Check out the verdict script
+        if: steps.config.outputs.configured == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Only scripts/backup-freshness is needed; nothing here pushes, so keep no credential.
+          persist-credentials: false
+
       - name: Authenticate to Google Cloud
         id: auth
         if: steps.config.outputs.configured == 'true'
@@ -116,27 +123,14 @@ jobs:
           # The JSON API rather than a CLI: no tool to install, and a stable contract to parse.
           # `fields` keeps the response to what is asked, so no backup content is requested even
           # accidentally. A 30-day lifecycle keeps the object count far below one page.
-          response="$(curl -fsS \
+          #
+          # The verdict lives in a script so it can be tested: only `sotto-<stamp>.dump` counts as
+          # a backup, and a `.failed.<step>` marker backup.sh leaves on a failed run names the step
+          # in the alarm, or its absence says the job never reached the bucket.
+          curl -fsS \
             -H "Authorization: Bearer ${ACCESS_TOKEN}" \
-            "https://storage.googleapis.com/storage/v1/b/${bucket}/o?fields=items(name,timeCreated)")"
-
-          newest="$(printf '%s' "$response" | jq -r '[.items[]?.timeCreated] | max // empty')"
-          if [ -z "$newest" ]; then
-            echo "reason=The backup bucket is empty. No dump has ever been uploaded, or the lifecycle rule has deleted them all." >> "$GITHUB_OUTPUT"
-            echo "healthy=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          age_seconds=$(( $(date -u +%s) - $(date -u -d "$newest" +%s) ))
-          age_hours=$(( age_seconds / 3600 ))
-          echo "Newest backup: ${newest} (${age_hours}h old, threshold ${MAX_AGE_HOURS}h)"
-
-          if [ "$age_hours" -ge "$MAX_AGE_HOURS" ]; then
-            echo "reason=The newest backup is ${age_hours} hours old, past the ${MAX_AGE_HOURS} hour threshold. The most recent upload was ${newest}. On the host, check the cron entry and the last \`backup started\`, \`backup ok\` and \`backup FAILED\` lines in \$HOME/sotto-backup.log; deploy/README.md section Backups, step 6, has the triage." >> "$GITHUB_OUTPUT"
-            echo "healthy=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "healthy=true" >> "$GITHUB_OUTPUT"
-          fi
+            "https://storage.googleapis.com/storage/v1/b/${bucket}/o?fields=items(name,timeCreated)" \
+            | python3 scripts/backup-freshness --max-age-hours "$MAX_AGE_HOURS" >> "$GITHUB_OUTPUT"
 
       - name: Send the heartbeat
         # Only on success, and only when a heartbeat is configured. Whichever external checker owns
