@@ -404,6 +404,10 @@ One-time setup, any provider:
 
    Every run logs a UTC-timestamped `backup started` and then exactly one of `backup ok: <object>`
    or `backup FAILED while <step> (exit <status>)`, so the log shows which night failed and where.
+   A failed run also uploads an empty `sotto-<stamp>.failed.<step>` object, so the step is
+   visible from the bucket side too, where the freshness check below reads it into the alarm. No
+   marker after a missed night means the run never reached the bucket: cron did not start it, or
+   it stopped while reading its configuration, before it knew where the bucket was.
    Each object upload is retried twice before the run gives up: a single missed night breaches
    the 26-hour freshness threshold, so a transient blip must not fail the night.
 
@@ -427,7 +431,9 @@ One-time setup, any provider:
    Configure it with repository variables `SOTTO_BACKUP_BUCKET` (the same value as in `.env`,
    scheme included), `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_MONITOR_SERVICE_ACCOUNT`, plus a
    repository secret `BACKUP_HEARTBEAT_URL`. Until all three variables are set the job skips
-   rather than failing.
+   rather than failing. If your crontab runs the backup at a time other than 02:17 UTC, also set
+   `SOTTO_BACKUP_SCHEDULE_UTC` (`HH:MM`, UTC). An open alarm closes only on a backup that started
+   in the hour after that time, so with the wrong value it would never close.
 
    Grant the identity by federation rather than by issuing a key, so that no long-lived credential
    exists to leak or rotate:
@@ -468,19 +474,24 @@ One-time setup, any provider:
 
    ```sh
    # Anything rclone reaches - gs://, s3://, B2, SFTP, a NAS:
-   rclone lsjson --max-age 26h "$SOTTO_BACKUP_BUCKET" | jq -e 'length > 0'
+   rclone lsjson --max-age 26h --include 'sotto-*.dump' "$SOTTO_BACKUP_BUCKET" | jq -e 'length > 0'
 
    # AWS, without rclone:
    aws s3api list-objects-v2 --bucket <bucket> \
-     --query 'max_by(Contents, &LastModified).LastModified'
+     --query "max_by(Contents[?ends_with(Key, '.dump')], &LastModified).LastModified"
    ```
+
+   Count only the `.dump` objects, as both commands do. A failed run leaves a marker in the bucket
+   (below), and a check that takes the newest object of any kind would read last night's failure
+   as last night's backup.
 
    A non-zero exit is the alarm. On AWS the federated equivalent of the grant above is registering
    GitHub's OIDC issuer as an identity provider and giving the role a trust policy conditioned on
    the repository, with `s3:ListBucket` and nothing else.
 
-6. **When the alarm fires** (a `Backups are stale` issue labelled `backup-alert`), work on the
-   host:
+6. **When the alarm fires** (a `Backups are stale` issue labelled `backup-alert`), read the
+   issue first. If the host recorded a failure, the issue names the step it failed at; if it says
+   no failure was recorded, the run never reached the bucket. Then work on the host:
 
    ```sh
    crontab -l | grep backup.sh                 # is the entry still installed?
@@ -507,9 +518,12 @@ One-time setup, any provider:
      trust an older `ok` line.
 
    Once the cause is fixed, take a backup by hand (`./backup.sh`, as the user that owns the
-   crontab and never with `sudo`, which would read a file cron cannot) rather than waiting a night, then
-   run the `Backup freshness` workflow manually. It closes the issue when it sees a fresh backup;
-   do not close it by hand, because that hides the alarm without checking anything.
+   crontab and never with `sudo`, which would read a file cron cannot) rather than waiting a night,
+   so the data is safe today. Running the `Backup freshness` workflow then confirms the bucket is
+   fresh, but leaves the issue open with a note: a hand-run backup proves the script works, not
+   that cron will run it. The issue closes on the first check that sees a backup started in the
+   hour after the crontab's time. A hand run once closed it while cron stayed broken for ten more
+   days. Do not close it by hand either, because that hides the alarm without checking anything.
 
 **Restore** (into a running instance; drops and recreates objects from the dump). Fetch the
 dump on your own machine, never the host - the append-only posture means the host cannot read
