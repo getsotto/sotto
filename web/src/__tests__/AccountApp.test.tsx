@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, fireEvent } from "@testing-library/react";
+import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AccountApp } from "../AccountApp";
@@ -40,8 +40,21 @@ function createDeferred<T>() {
 }
 
 describe("AccountApp - Initial Session Discovery", () => {
+  const originalLocation = window.location;
+
   beforeEach(() => {
     vi.clearAllMocks();
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...originalLocation, reload: vi.fn() },
+    });
+  });
+
+  afterEach(() => {
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: originalLocation,
+    });
   });
 
   it("shows loading state and hides account panel while request is pending", () => {
@@ -84,37 +97,89 @@ describe("AccountApp - Initial Session Discovery", () => {
     expect(await screen.findByTestId("mock-cloud-panel")).toBeInTheDocument();
   });
 
-  it("displays alert and triggers browser reload upon activation on session failure", async () => {
-    // Spy on window.location.reload
-    const originalLocation = window.location;
-    Object.defineProperty(window, "location", {
-      configurable: true,
-      value: { ...originalLocation, reload: vi.fn() },
-    });
+  it("retries session discovery after initial failure without reloading the page", async () => {
+    const first = createDeferred<any>();
+    const retryPending = createDeferred<any>();
+    const retrySignedIn = createDeferred<any>();
+    const retryAnonymous = createDeferred<any>();
+    const retryFailAgain = createDeferred<any>();
+    const retryRecovered = createDeferred<any>();
 
-    const deferred = createDeferred<any>();
-    vi.mocked(me).mockReturnValue(deferred.promise);
+    vi.mocked(me)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(retryPending.promise)
+      .mockReturnValueOnce(retrySignedIn.promise)
+      .mockReturnValueOnce(retryAnonymous.promise)
+      .mockReturnValueOnce(retryFailAgain.promise)
+      .mockReturnValueOnce(retryRecovered.promise);
 
     render(<AccountApp />);
 
-    // Reject the promise with a synthetic error
-    deferred.reject(new Error("Synthetic network error"));
-
-    // Verify error UI is displayed
+    // Initial failure
+    first.reject(new Error("Synthetic network error"));
     const alertMsg = await screen.findByRole("alert");
     expect(alertMsg).toHaveTextContent("Synthetic network error");
     expect(screen.queryByTestId("mock-cloud-panel")).not.toBeInTheDocument();
+    const retryBtn = screen.getByRole("button", { name: "Retry" });
 
-    // Verify clicking Reload triggers window.location.reload
-    const reloadBtn = screen.getByRole("button", { name: "Reload" });
-    fireEvent.click(reloadBtn);
+    // Pending retry: shows accessible pending status, clears previous error, no overlapping requests
+    fireEvent.click(retryBtn);
+    expect(screen.getByText("Loading your Cloud account…")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("mock-cloud-panel")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    expect(me).toHaveBeenCalledTimes(2);
+    // repeated activation not possible while pending (button not present)
+    expect(window.location.reload).not.toHaveBeenCalled();
 
-    expect(window.location.reload).toHaveBeenCalledOnce();
+    // Successful retry with a user mounts the account panel
+    retryPending.resolve({ id: "user123", username: "testuser" });
+    expect(await screen.findByTestId("mock-cloud-panel")).toBeInTheDocument();
+    expect(me).toHaveBeenCalledTimes(2);
+    expect(window.location.reload).not.toHaveBeenCalled();
+  });
 
-    // Restore window.location mockup to not break other test files
-    Object.defineProperty(window, "location", {
-      configurable: true,
-      value: originalLocation,
-    });
+  it("recovers to anonymous view on retry and allows login", async () => {
+    const first = createDeferred<any>();
+    const retry = createDeferred<any>();
+    vi.mocked(me).mockReturnValueOnce(first.promise).mockReturnValueOnce(retry.promise);
+
+    render(<AccountApp />);
+
+    first.reject(new Error("Synthetic network error"));
+    fireEvent.click(await screen.findByRole("button", { name: "Retry" }));
+    retry.resolve(null);
+
+    const loginBtn = await screen.findByRole("button", { name: "Log in with GitHub" });
+    fireEvent.click(loginBtn);
+    expect(startLogin).toHaveBeenCalledWith("/cloud");
+    expect(window.location.reload).not.toHaveBeenCalled();
+  });
+
+  it("shows new error after repeated failure and can recover on next retry", async () => {
+    const first = createDeferred<any>();
+    const retryFail = createDeferred<any>();
+    const retryRecover = createDeferred<any>();
+    vi.mocked(me)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(retryFail.promise)
+      .mockReturnValueOnce(retryRecover.promise);
+
+    render(<AccountApp />);
+
+    first.reject(new Error("first failure"));
+    fireEvent.click(await screen.findByRole("button", { name: "Retry" }));
+
+    retryFail.reject(new Error("second failure"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("second failure");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(screen.queryByTestId("mock-cloud-panel")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    retryRecover.resolve({ id: "user123", username: "testuser" });
+    expect(await screen.findByTestId("mock-cloud-panel")).toBeInTheDocument();
+    expect(me).toHaveBeenCalledTimes(3);
+    expect(startLogin).not.toHaveBeenCalled();
+    expect(window.location.reload).not.toHaveBeenCalled();
   });
 });
