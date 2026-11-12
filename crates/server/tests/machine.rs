@@ -298,6 +298,90 @@ async fn machine_reads_its_grant_and_secrets() {
     assert!(body.contains("\"beneficiary_status\":\"verified\""));
 }
 
+/// Backends waiting on a lock on `secrets` while running the machine snapshot's secrets query.
+async fn snapshot_readers_waiting_on_secrets(pool: &PgPool) -> Vec<i32> {
+    sqlx::query_scalar(
+        "SELECT a.pid FROM pg_stat_activity a JOIN pg_locks l ON l.pid = a.pid \
+         WHERE NOT l.granted AND l.relation = 'secrets'::regclass \
+           AND a.query LIKE 'SELECT id, enc_name, enc_value, enc_data_key, version%'",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read lock waiters")
+}
+
+/// A rotation that commits between the snapshot's grant read and its secrets read must not tear
+/// the response: the vault key and the data keys have to come from the same generation.
+///
+/// The handler has no seam to pause at, so the database provides one. This test takes an
+/// exclusive lock on `secrets`, which parks the handler at its secrets query with the grant
+/// already read, then rewrites the grant and the data key the way a rotation does and commits.
+/// At read committed the handler would wake up to the new data key beside the old grant.
+#[tokio::test]
+async fn a_rotation_mid_snapshot_does_not_tear_the_grant_from_the_data_keys() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (o, p, e) = ("mt-tear-o", "mt-tear-p", "mt-tear-e");
+    let owner = seed_org_env(&pool, o, p, e, "mt-tear-owner").await;
+    let (token_id, api_token) = create_token(&pool, &owner, e, b"grant-before").await;
+
+    let mut rotation = pool.begin().await.expect("begin");
+    sqlx::query("LOCK TABLE secrets IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *rotation)
+        .await
+        .expect("lock secrets");
+    // Other tests share this database and may already be parked on the same lock; only a new
+    // waiter can be this test's request.
+    let already_waiting = snapshot_readers_waiting_on_secrets(&pool).await;
+
+    let reader = tokio::spawn({
+        let (pool, api_token) = (pool.clone(), api_token.clone());
+        async move { get(&pool, &api_token, "/machine/secrets").await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let waiting = snapshot_readers_waiting_on_secrets(&pool).await;
+            if waiting.iter().any(|pid| !already_waiting.contains(pid)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the snapshot request never reached its secrets query");
+
+    sqlx::query("UPDATE machine_tokens SET enc_vault_key = $2 WHERE id = $1")
+        .bind(&token_id)
+        .bind(b"grant-after".as_slice())
+        .execute(&mut *rotation)
+        .await
+        .expect("re-seal the grant");
+    sqlx::query("UPDATE secrets SET enc_data_key = $2 WHERE env_id = $1")
+        .bind(e)
+        .bind(b"new-dk".as_slice())
+        .execute(&mut *rotation)
+        .await
+        .expect("re-wrap the data key");
+    rotation.commit().await.expect("commit");
+
+    let (status, body) = reader.await.expect("join");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let snapshot: Value = serde_json::from_str(&body).unwrap();
+    let grant = snapshot["grant"]["enc_vault_key"].as_str().unwrap();
+    let data_key = snapshot["secrets"][0]["enc_data_key"].as_str().unwrap();
+    let generation = (grant == b64(b"grant-after"), data_key == b64(b"new-dk"));
+    assert_eq!(
+        generation.0, generation.1,
+        "torn snapshot: grant {grant}, data key {data_key}"
+    );
+
+    // The next request sees the rotation whole.
+    let (_, body) = get(&pool, &api_token, "/machine/secrets").await;
+    assert!(body.contains(&b64(b"grant-after")) && body.contains(&b64(b"new-dk")));
+}
+
 #[tokio::test]
 async fn hosted_machine_policy_rejects_an_ineligible_beneficiary() {
     let Some(pool) = pool_or_skip().await else {
