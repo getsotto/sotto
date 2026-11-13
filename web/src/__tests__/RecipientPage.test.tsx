@@ -625,4 +625,83 @@ describe("RecipientPage", () => {
     expect(api.fetchShare).not.toHaveBeenCalled();
     expect(wasm.share_open).not.toHaveBeenCalled();
   });
+
+  describe("passphrase visibility control", () => {
+    it("masks the passphrase by default and toggles between show and hide without altering the value", async () => {
+      render(<RecipientPage token="share-token" />);
+
+      const input = screen.getByLabelText("Passphrase (only if the sender set one)");
+      expect(input).toHaveAttribute("type", "password");
+      const toggleBtn = screen.getByRole("button", { name: "Show passphrase" });
+      expect(toggleBtn).toHaveAttribute("type", "button");
+      expect(toggleBtn).toBeEnabled();
+
+      const testPassphrase = "  passphrase with spåces & symbøls 123  ";
+      fireEvent.change(input, { target: { value: testPassphrase } });
+      expect(input).toHaveValue(testPassphrase);
+
+      fireEvent.click(toggleBtn);
+      expect(input).toHaveAttribute("type", "text");
+      expect(input).toHaveValue(testPassphrase);
+      expect(screen.getByRole("button", { name: "Hide passphrase" })).toBeInTheDocument();
+      expect(api.fetchShare).not.toHaveBeenCalled();
+      expect(wasm.loadWasm).not.toHaveBeenCalled();
+      expect(wasm.share_passphrase_key).not.toHaveBeenCalled();
+      expect(wasm.share_open).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByRole("button", { name: "Hide passphrase" }));
+      expect(input).toHaveAttribute("type", "password");
+      expect(input).toHaveValue(testPassphrase);
+      expect(screen.getByRole("button", { name: "Show passphrase" })).toBeInTheDocument();
+      expect(api.fetchShare).not.toHaveBeenCalled();
+      expect(wasm.loadWasm).not.toHaveBeenCalled();
+      expect(wasm.share_passphrase_key).not.toHaveBeenCalled();
+      expect(wasm.share_open).not.toHaveBeenCalled();
+    });
+
+    it("does not submit the form or reveal secret when activating the visibility toggle", async () => {
+      render(<RecipientPage token="share-token" />);
+
+      const input = screen.getByLabelText("Passphrase (only if the sender set one)");
+      fireEvent.change(input, { target: { value: "some-passphrase" } });
+
+      const toggleBtn = screen.getByRole("button", { name: "Show passphrase" });
+      fireEvent.click(toggleBtn);
+
+      expect(api.fetchShare).not.toHaveBeenCalled();
+      expect(wasm.loadWasm).not.toHaveBeenCalled();
+      expect(screen.queryByRole("textbox", { name: "Shared secret" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Reveal secret" })).toBeEnabled();
+    });
+
+    it("resets visibility to masked upon submission and remains masked after a reveal error", async () => {
+      const shareDeferred = deferred();
+      vi.mocked(api.fetchShare).mockReturnValue(shareDeferred.promise as unknown as Promise<api.Share>);
+
+      render(<RecipientPage token="share-token" />);
+
+      const input = screen.getByLabelText("Passphrase (only if the sender set one)");
+      fireEvent.change(input, { target: { value: "my-passphrase" } });
+
+      fireEvent.click(screen.getByRole("button", { name: "Show passphrase" }));
+      expect(input).toHaveAttribute("type", "text");
+
+      fireEvent.click(screen.getByRole("button", { name: "Reveal secret" }));
+
+      expect(input).toHaveAttribute("type", "password");
+      expect(screen.getByRole("button", { name: "Show passphrase" })).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Revealing…" })).toBeDisabled();
+
+      await act(async () => {
+        shareDeferred.reject(new Error("network failure"));
+      });
+
+      expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't reveal the secret: network failure");
+      expect(input).toHaveAttribute("type", "password");
+      expect(input).toHaveValue("my-passphrase");
+      expect(screen.getByRole("button", { name: "Show passphrase" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Reveal secret" })).toBeEnabled();
+    });
+  });
 });
