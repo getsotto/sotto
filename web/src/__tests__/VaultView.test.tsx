@@ -157,6 +157,47 @@ describe("VaultView selection loading", () => {
     expect(screen.getByRole("searchbox", { name: "Search secret names" })).toHaveValue("");
   });
 
+  it("clears a secret search with the Clear search action, including no-match and whitespace queries", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("Alpha"), secret("Beta")]);
+
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    await screen.findByRole("button", { name: "Alpha" });
+
+    const search = screen.getByRole("searchbox", { name: "Search secret names" });
+    const resultStatus = screen.getByRole("status", { name: "Secret search results" });
+    expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
+
+    fireEvent.change(search, { target: { value: "ALP" } });
+    fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    expect(search).toHaveValue("");
+    expect(search).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Alpha" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Beta" })).toBeInTheDocument();
+    expect(resultStatus).toHaveTextContent("2 secret names available.");
+    expect(screen.queryByRole("button", { name: "Clear search" })).not.toBeInTheDocument();
+
+    fireEvent.change(search, { target: { value: "missing" } });
+    expect(resultStatus).toHaveTextContent("No secret names match this search.");
+    fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    expect(search).toHaveValue("");
+    expect(search).toHaveFocus();
+    expect(resultStatus).toHaveTextContent("2 secret names available.");
+    expect(screen.getByRole("button", { name: "Beta" })).toBeInTheDocument();
+
+    fireEvent.change(search, { target: { value: "   " } });
+    expect(screen.getByRole("button", { name: "Clear search" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Clear search" }));
+    expect(search).toHaveValue("");
+    expect(search).toHaveFocus();
+    expect(resultStatus).toHaveTextContent("2 secret names available.");
+
+    expect(api.fetchSecrets).toHaveBeenCalledTimes(1);
+    expect(vault.decryptSecretValue).not.toHaveBeenCalled();
+  });
+
   it("shows the empty environment state without a search control", async () => {
     vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-empty")]);
     vi.mocked(api.fetchSecrets).mockResolvedValue([]);
