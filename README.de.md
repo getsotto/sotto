@@ -784,6 +784,8 @@ Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht 
 
 Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
 
+Zum Hinzufügen oder Entfernen einer E-Mail-Adresse für Cloud-Mitteilungen siehe die [Anleitung für E-Mail-Kontakte (Englisch)](CLOUD-EMAIL.md).
+
 Wie du die persönliche Abrechnung auf der Sotto-Cloud-Kontoseite an eine Organisation übergibst,
 steht in der [Anleitung zur Abrechnungsübertragung](CLOUD-BILLING-TRANSFER.md).
 
