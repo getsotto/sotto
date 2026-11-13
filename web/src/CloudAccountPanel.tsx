@@ -184,6 +184,7 @@ export function CloudAccountPanel() {
     {error !== null && <p role="alert">{error}</p>}
     {eligibilityLoading && <p className="muted" role="status">{eligibilityAttempted ? "Checking account status again…" : "Loading account status…"}</p>}
     {eligibilityAttempted && <button disabled={eligibilityLoading} aria-busy={eligibilityLoading} onClick={() => void load()}>{eligibilityLoading ? "Retrying…" : "Retry account status"}</button>}
+    <p><a href="/app">Back to vault</a></p>
   </>;
   const paidThrough = date(eligibility.paidThroughEpoch); const recoveryUntil = date(eligibility.recoveryUntilEpoch); const exportUntil = date(eligibility.exportUntilEpoch);
   return <>
