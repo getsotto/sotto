@@ -1367,6 +1367,113 @@ describe("VaultView secret hiding", () => {
     expect(screen.queryByDisplayValue("secret-value")).not.toBeInTheDocument();
     expect(screen.queryByDisplayValue(/late-token/)).not.toBeInTheDocument();
   });
+
+  async function revealSecretA() {
+    renderVault();
+    fireEvent.click(await screen.findByRole("button", { name: /project-a/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "env-a" }));
+    const secretButton = await screen.findByRole("button", { name: "secret-a" });
+    fireEvent.click(secretButton);
+    return secretButton;
+  }
+
+  it("hides the panel with Escape from the value field and returns focus", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptSecretName).mockReturnValue("secret-a");
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("secret-value");
+
+    const secretButton = await revealSecretA();
+    const value = screen.getByDisplayValue("secret-value");
+    expect(screen.getByText("Press Escape to hide this secret.")).toBeInTheDocument();
+    expect(secretButton).toHaveAttribute("aria-current", "true");
+
+    fireEvent.keyDown(value, { key: "Escape" });
+
+    expect(screen.queryByDisplayValue("secret-value")).not.toBeInTheDocument();
+    expect(screen.queryByText("Press Escape to hide this secret.")).not.toBeInTheDocument();
+    expect(secretButton).not.toHaveAttribute("aria-current");
+    expect(secretButton).toHaveFocus();
+
+    fireEvent.click(secretButton);
+    expect(screen.getByDisplayValue("secret-value")).toBeInTheDocument();
+  });
+
+  it("hides a generated share link with Escape from the link field", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptSecretName).mockReturnValue("secret-a");
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("secret-value");
+    vi.mocked(vault.sealForShare).mockReturnValue({
+      encBlob: new Uint8Array([1]),
+      fragmentKey: new Uint8Array([2]),
+    });
+    vi.mocked(api.createShare).mockResolvedValue("share-token");
+
+    const secretButton = await revealSecretA();
+    fireEvent.click(screen.getByRole("button", { name: "Create one-time share link" }));
+    const link = await screen.findByLabelText("Share link (burns after one view):");
+
+    fireEvent.keyDown(link, { key: "Escape" });
+
+    expect(screen.queryByLabelText("Share link (burns after one view):")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue("secret-value")).not.toBeInTheDocument();
+    expect(secretButton).not.toHaveAttribute("aria-current");
+    expect(secretButton).toHaveFocus();
+  });
+
+  it("hides the panel with Escape from a button inside it", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptSecretName).mockReturnValue("secret-a");
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("secret-value");
+
+    const secretButton = await revealSecretA();
+    fireEvent.keyDown(screen.getByRole("button", { name: "Copy secret" }), { key: "Escape" });
+
+    expect(screen.queryByDisplayValue("secret-value")).not.toBeInTheDocument();
+    expect(secretButton).not.toHaveAttribute("aria-current");
+    expect(secretButton).toHaveFocus();
+  });
+
+  it("does not hide the panel when Escape is pressed in secret search", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptSecretName).mockReturnValue("secret-a");
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("secret-value");
+
+    const secretButton = await revealSecretA();
+    const search = screen.getByRole("searchbox", { name: "Search secret names" });
+    fireEvent.keyDown(search, { key: "Escape" });
+
+    expect(screen.getByDisplayValue("secret-value")).toBeInTheDocument();
+    expect(secretButton).toHaveAttribute("aria-current", "true");
+    expect(screen.getByRole("button", { name: "Hide secret" })).toBeInTheDocument();
+  });
+
+  it("does not restore a panel dismissed with Escape when a pending share finishes", async () => {
+    vi.mocked(api.fetchEnvironments).mockResolvedValue([environment("env-a")]);
+    vi.mocked(api.fetchSecrets).mockResolvedValue([secret("secret-a")]);
+    vi.mocked(vault.decryptSecretName).mockReturnValue("secret-a");
+    vi.mocked(vault.decryptSecretValue).mockReturnValue("secret-value");
+    vi.mocked(vault.sealForShare).mockReturnValue({
+      encBlob: new Uint8Array([1]),
+      fragmentKey: new Uint8Array([2]),
+    });
+    const shareRequest = deferred<string>();
+    vi.mocked(api.createShare).mockReturnValue(shareRequest.promise);
+
+    const secretButton = await revealSecretA();
+    fireEvent.click(screen.getByRole("button", { name: "Create one-time share link" }));
+    await waitFor(() => expect(api.createShare).toHaveBeenCalledOnce());
+
+    fireEvent.keyDown(screen.getByDisplayValue("secret-value"), { key: "Escape" });
+    await act(async () => shareRequest.resolve("late-token"));
+
+    expect(screen.queryByDisplayValue("secret-value")).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue(/late-token/)).not.toBeInTheDocument();
+    expect(secretButton).not.toHaveAttribute("aria-current");
+  });
 });
 
 describe("VaultView empty states", () => {
