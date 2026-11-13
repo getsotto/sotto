@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as api from "../api";
@@ -22,6 +22,7 @@ vi.mock("../api", () => ({
   fetchPayerTransferCapabilities: vi.fn(),
   fetchPayerTransfer: vi.fn(),
   fetchPayerTransfers: vi.fn(),
+  fetchPersonalLifecycle: vi.fn(),
   fetchMembers: vi.fn(),
   fetchOrgs: vi.fn(),
   fetchEligibility: vi.fn(),
@@ -40,6 +41,17 @@ const manifest: api.ExportManifest = {
   projects: [], environments: [], notSharedEnvironmentIds: [], omittedEnvironmentCount: 0,
 };
 
+const lifecycleFixture: api.PersonalLifecycle = {
+  state: "active",
+  paidThroughDate: "2030-01-01",
+  cancelAtPeriodEnd: false,
+  portalUrl: null,
+  foundingPriceEndEpoch: null,
+  standardRenewalAmountPence: null,
+  foundingTransitionStatus: null,
+  foundingTransitionReason: null,
+};
+
 beforeEach(() => {
   vi.resetAllMocks();
   vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: false, setupAvailable: false });
@@ -54,6 +66,7 @@ beforeEach(() => {
     payer: null, deploymentMode: "cloud",
   });
   vi.mocked(api.fetchCloudNotices).mockResolvedValue([]);
+  vi.mocked(api.fetchPersonalLifecycle).mockResolvedValue(lifecycleFixture);
   vi.mocked(api.fetchCloudContactStatus).mockResolvedValue({ email: null, pendingExpiresAtEpoch: null, enrolmentAvailable: false });
 });
 
@@ -130,4 +143,130 @@ describe("Cloud encrypted export recovery", () => {
       expect(api.createPersonalCheckout).not.toHaveBeenCalled();
     },
   );
+
+  it("shows preparation progress while manifest is pending, incremental chunk progress, and replaces with success notice", async () => {
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:synthetic-export");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    let resolveManifest!: (value: api.ExportManifest) => void;
+    vi.mocked(api.startCloudExport).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveManifest = resolve; }),
+    );
+
+    let resolveChunk0!: (value: { ciphertext: string }) => void;
+    let resolveChunk1!: (value: { ciphertext: string }) => void;
+    vi.mocked(api.fetchCloudExportChunk)
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveChunk0 = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveChunk1 = resolve; }));
+
+    render(<CloudAccountPanel />);
+    const button = await screen.findByRole("button", { name: "Download encrypted export" });
+
+    fireEvent.click(button);
+    expect(button).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent("Preparing encrypted export…");
+
+    await act(async () => { resolveManifest(manifest); });
+    expect(screen.getByRole("status")).toHaveTextContent("Downloading encrypted export: 0 of 2 parts.");
+    expect(button).toBeDisabled();
+
+    await act(async () => { resolveChunk0({ ciphertext: "chunk-zero" }); });
+    expect(screen.getByRole("status")).toHaveTextContent("Downloading encrypted export: 1 of 2 parts.");
+    expect(button).toBeDisabled();
+
+    await act(async () => { resolveChunk1({ ciphertext: "chunk-one" }); });
+    expect(screen.getByRole("status")).toHaveTextContent("Encrypted export downloaded. Keep it with your recovery materials.");
+    expect(button).toBeEnabled();
+  });
+
+  it("removes progress on failure, preserves error, and restarts progress on retry", async () => {
+    vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:synthetic-export");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    let rejectChunk1!: (reason: unknown) => void;
+    vi.mocked(api.startCloudExport).mockResolvedValueOnce(manifest);
+    vi.mocked(api.fetchCloudExportChunk)
+      .mockResolvedValueOnce({ ciphertext: "chunk-zero" })
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectChunk1 = reject; }));
+
+    render(<CloudAccountPanel />);
+    const button = await screen.findByRole("button", { name: "Download encrypted export" });
+
+    fireEvent.click(button);
+    expect(await screen.findByText("Downloading encrypted export: 1 of 2 parts.")).toBeInTheDocument();
+
+    await act(async () => { rejectChunk1(new Error("network failure")); });
+
+    expect(screen.queryByText(/Downloading encrypted export/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Preparing encrypted export/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("network failure");
+    expect(button).toBeEnabled();
+
+    let resolveRetryManifest!: (value: api.ExportManifest) => void;
+    vi.mocked(api.startCloudExport).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveRetryManifest = resolve; }),
+    );
+    fireEvent.click(button);
+
+    expect(screen.getByRole("status")).toHaveTextContent("Preparing encrypted export…");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(button).toBeDisabled();
+
+    await act(async () => { resolveRetryManifest({ ...manifest, totalChunks: 0 }); });
+  });
+
+  it("handles a zero-chunk manifest without division by zero or stale progress", async () => {
+    const createUrl = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:synthetic-export");
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    const download = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    const zeroChunkManifest: api.ExportManifest = { ...manifest, totalChunks: 0 };
+    vi.mocked(api.startCloudExport).mockResolvedValueOnce(zeroChunkManifest);
+
+    render(<CloudAccountPanel />);
+    const button = await screen.findByRole("button", { name: "Download encrypted export" });
+
+    fireEvent.click(button);
+
+    await waitFor(() => {
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Encrypted export downloaded. Keep it with your recovery materials.",
+      );
+    });
+    expect(button).toBeEnabled();
+    expect(api.fetchCloudExportChunk).not.toHaveBeenCalled();
+    expect(createUrl).toHaveBeenCalledOnce();
+    const blob = createUrl.mock.calls[0][0] as Blob;
+    expect(JSON.parse(await blob.text())).toEqual({ manifest: zeroChunkManifest, chunks: [] });
+    expect(download).toHaveBeenCalledOnce();
+  });
+
+  it("does not display export progress during unrelated panel actions", async () => {
+    let resolvePortal!: (value: api.PersonalLifecycle) => void;
+    vi.mocked(api.createPersonalPortal).mockImplementationOnce(
+      () => new Promise((resolve) => { resolvePortal = resolve; }),
+    );
+    vi.mocked(api.fetchEligibility).mockResolvedValueOnce({
+      state: "paid", accountInitialized: true, billingAvailable: true,
+      paidThroughEpoch: null, recoveryUntilEpoch: null, exportUntilEpoch: null,
+      actions: { setup: false, billing: false, export: true, revoke: false },
+      payer: "personal", deploymentMode: "cloud",
+    });
+
+    render(<CloudAccountPanel />);
+    const portalButton = await screen.findByRole("button", { name: "Open billing portal" });
+    const exportButton = screen.getByRole("button", { name: "Download encrypted export" });
+
+    fireEvent.click(portalButton);
+    expect(portalButton).toBeDisabled();
+    expect(exportButton).toBeDisabled();
+
+    expect(screen.queryByText(/Preparing encrypted export/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Downloading encrypted export/)).not.toBeInTheDocument();
+
+    await act(async () => { resolvePortal(lifecycleFixture); });
+  });
 });

@@ -12,6 +12,18 @@ fi
 
 output="$1"
 mkdir -p "$(dirname "$output")"
+# A database that predates migration 50 has no journal table because the table and its writer
+# were introduced together. check-restore deliberately accepts an empty journal for those
+# backups; failing the export here would fail the whole backup instead, leaving not even a
+# dump. Export nothing in that one case, and keep failing on every other database error.
+table="$(docker compose -f docker-compose.prod.yml exec -T postgres \
+    psql -U sotto -d sotto -At -v ON_ERROR_STOP=1 \
+    -c "SELECT to_regclass('public.cloud_retention_tombstone_journal')")"
+if [ -z "$table" ]; then
+    echo "note: cloud_retention_tombstone_journal is absent (pre-migration-50 database); exporting an empty journal" >&2
+    : > "$output"
+    exit 0
+fi
 docker compose -f docker-compose.prod.yml exec -T postgres \
     psql -U sotto -d sotto -At -v ON_ERROR_STOP=1 \
     -c "SELECT json_build_object(\

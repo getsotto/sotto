@@ -545,6 +545,7 @@ mod tests {
         /// listing the tokens to re-seal and the server checking coverage.
         expire_after_list: Option<String>,
         fail_writes: u32,
+        write_attempts: usize,
     }
 
     #[derive(Default)]
@@ -561,6 +562,12 @@ mod tests {
         }
         fn fail_next_write(&self) {
             self.state.borrow_mut().fail_writes += 1;
+        }
+        fn write_attempts(&self) -> usize {
+            self.state.borrow().write_attempts
+        }
+        fn clear_write_failures(&self) {
+            self.state.borrow_mut().fail_writes = 0;
         }
         fn expire_after_next_list(&self, token_id: &str) {
             self.state.borrow_mut().expire_after_list = Some(token_id.to_string());
@@ -733,6 +740,7 @@ mod tests {
             batch: &BatchRequest,
         ) -> Result<super::super::api::BatchResponse> {
             let mut s = self.state.borrow_mut();
+            s.write_attempts += 1;
             if s.fail_writes > 0 {
                 s.fail_writes -= 1;
                 return Err(Error::Conflict("injected conflict".into()));
@@ -1353,6 +1361,93 @@ mod tests {
         api.fail_next_write(); // first write_secrets returns 412
                                // The engine re-pulls and retries, succeeding on the second attempt.
         assert_eq!(push(&api, &store, &MASTER, &config).unwrap(), 1);
+    }
+    #[test]
+    fn push_succeeds_on_final_allowed_attempt() {
+        let api = MockApi::default();
+        let (store, project, config) = device();
+
+        Vault::open(&store, &test_keypair(), &project.id, "dev")
+            .unwrap()
+            .set("K", b"retry-boundary")
+            .unwrap();
+
+        // All attempts except the final permitted attempt conflict.
+        for _ in 0..(MAX_SYNC_ATTEMPTS - 1) {
+            api.fail_next_write();
+        }
+
+        assert_eq!(push(&api, &store, &MASTER, &config).unwrap(), 1);
+        assert_eq!(api.write_attempts(), MAX_SYNC_ATTEMPTS);
+
+        // Verify the successful write reached the server and can be read
+        // by another device, rather than relying only on push's return value.
+        let mirror = mirror(&store, &project);
+        assert_eq!(pull(&api, &mirror, &config).unwrap(), 1);
+        assert_eq!(
+            Vault::open(&mirror, &test_keypair(), &project.id, "dev")
+                .unwrap()
+                .get("K")
+                .unwrap(),
+            b"retry-boundary"
+        );
+    }
+
+    #[test]
+    fn push_exhaustion_preserves_local_change_and_can_recover() {
+        let api = MockApi::default();
+        let (store, project, config) = device();
+
+        Vault::open(&store, &test_keypair(), &project.id, "dev")
+            .unwrap()
+            .set("K", b"retry-exhaustion")
+            .unwrap();
+
+        // Leave additional conflicts queued to prove the retry limit is
+        // enforced even when the mock would keep rejecting writes.
+        for _ in 0..(MAX_SYNC_ATTEMPTS + 2) {
+            api.fail_next_write();
+        }
+
+        let result = push(&api, &store, &MASTER, &config);
+
+        assert!(matches!(
+            result,
+            Err(Error::Conflict(ref message))
+                if message == "sync: too many concurrent updates; try again"
+        ));
+        assert_eq!(api.write_attempts(), MAX_SYNC_ATTEMPTS);
+
+        // Exhaustion must not discard the user's pending local change.
+        assert_eq!(
+            Vault::open(&store, &test_keypair(), &project.id, "dev")
+                .unwrap()
+                .get("K")
+                .unwrap(),
+            b"retry-exhaustion"
+        );
+
+        // None of the failed writes should have stored the secret remotely.
+        let env = store.get_environment(&project.id, "dev").unwrap().unwrap();
+        let snapshot = api.snapshot(&env.id, None).unwrap().unwrap();
+        assert!(snapshot.secrets.is_empty());
+
+        // Remove the injected failures and retry without changing the local
+        // value. The same pending change should now reach the server.
+        api.clear_write_failures();
+
+        assert_eq!(push(&api, &store, &MASTER, &config).unwrap(), 1);
+        assert_eq!(api.write_attempts(), MAX_SYNC_ATTEMPTS + 1);
+
+        let mirror = mirror(&store, &project);
+        assert_eq!(pull(&api, &mirror, &config).unwrap(), 1);
+        assert_eq!(
+            Vault::open(&mirror, &test_keypair(), &project.id, "dev")
+                .unwrap()
+                .get("K")
+                .unwrap(),
+            b"retry-exhaustion"
+        );
     }
 
     /// A real device whose vault uses the *derived* master key (not the `MASTER` constant), so the

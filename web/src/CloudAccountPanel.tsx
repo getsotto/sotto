@@ -62,6 +62,7 @@ export function CloudAccountPanel() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [exportProgress, setExportProgress] = useState<string | null>(null);
 
   async function load() {
     if (eligibilityRequestInFlight.current) return;
@@ -168,15 +169,22 @@ export function CloudAccountPanel() {
   }
   async function exportAccount() {
     setBusy(true); setError(null); setNotice(null);
+    setExportProgress("Preparing encrypted export…");
     try {
       const manifest = await startCloudExport();
+      if (manifest.totalChunks > 0) {
+        setExportProgress(`Downloading encrypted export: 0 of ${manifest.totalChunks} parts.`);
+      }
       const chunks: unknown[] = [];
-      for (let index = 0; index < manifest.totalChunks; index += 1) chunks.push(await fetchCloudExportChunk(manifest.exportId, index));
+      for (let index = 0; index < manifest.totalChunks; index += 1) {
+        chunks.push(await fetchCloudExportChunk(manifest.exportId, index));
+        setExportProgress(`Downloading encrypted export: ${index + 1} of ${manifest.totalChunks} parts.`);
+      }
       const blob = new Blob([JSON.stringify({ manifest, chunks })], { type: "application/json" });
       const url = URL.createObjectURL(blob); const anchor = document.createElement("a"); anchor.href = url; anchor.download = `sotto-cloud-export-${manifest.exportId}.json`; anchor.click(); URL.revokeObjectURL(url);
       setNotice("Encrypted export downloaded. Keep it with your recovery materials.");
     } catch (e) { setError(message(e)); }
-    finally { setBusy(false); }
+    finally { setBusy(false); setExportProgress(null); }
   }
 
   if (eligibility === null) return <>
@@ -207,7 +215,7 @@ export function CloudAccountPanel() {
     {eligibility.state === "pending_initial_payment" && <section aria-labelledby="pending-heading"><h2 id="pending-heading">Payment confirmation pending</h2><p>Your checkout is waiting for the verified payment webhook. Hosted access stays unchanged until it arrives.</p>{operation?.state === "manual_review" && <p role="alert">We could not safely confirm the checkout. It is being reviewed; do not start another checkout while this is unresolved.</p>}{operation?.checkoutUrl !== null && operation?.checkoutUrl !== undefined && <p><a href={operation.checkoutUrl}>Return to checkout</a></p>}<button disabled={busy || operationLoading} aria-busy={operationLoading} onClick={() => void refreshOperation()}>{operationLoading ? "Refreshing payment status…" : "Refresh payment status"}</button></section>}
     {(eligibility.state === "paid" || eligibility.state === "renewal_recovery") && <section aria-labelledby="manage-heading"><h2 id="manage-heading">Manage billing</h2><button disabled={busy} onClick={() => void portal()}>Open billing portal</button>{" "}{eligibility.actions.revoke && <button disabled={busy} onClick={() => void cancel()}>Cancel at the end of the paid period</button>}<button disabled={busy} onClick={() => void askRefund()}>Request a refund</button>{lifecycle?.cancelAtPeriodEnd && <p className="muted">Cancellation is scheduled; access remains available until {lifecycle.paidThroughDate ?? "the paid period ends"}.</p>}{refund !== null && <p className="muted">Refund request: {refund.state}. The paid term is preserved by default.</p>}</section>}
     {eligibility.payer === "personal" && (eligibility.state === "paid" || eligibility.state === "renewal_recovery") && <PersonalTransferStart />}
-    {eligibility.actions.export && <section aria-labelledby="export-heading"><h2 id="export-heading">Recover your encrypted account</h2><p>{exportUntil === null ? "Your export window is open." : `Export before ${exportUntil}.`}</p>{eligibility.accountInitialized ? <button disabled={busy} onClick={() => void exportAccount()}>Download encrypted export</button> : <p>Set up your account before exporting.</p>}</section>}
+    {eligibility.actions.export && <section aria-labelledby="export-heading"><h2 id="export-heading">Recover your encrypted account</h2><p>{exportUntil === null ? "Your export window is open." : `Export before ${exportUntil}.`}</p>{exportProgress !== null && <p className="muted" role="status">{exportProgress}</p>}{eligibility.accountInitialized ? <button disabled={busy} onClick={() => void exportAccount()}>Download encrypted export</button> : <p>Set up your account before exporting.</p>}</section>}
     <PayerTransferInbox />
     <p><a href="/app">Back to vault</a></p>
   </>;
