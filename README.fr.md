@@ -77,6 +77,8 @@ commande décrite ici n'existe donc peut-être pas encore dans la version que vo
 Consultez [COMPATIBILITY.md](COMPATIBILITY.md) pour connaître les versions requises par les
 intégrations, les plateformes annoncées et les tests actuellement disponibles.
 
+Pour choisir une version ou un dossier d'installation, consultez les [options et exemples de l'installateur (en anglais)](INSTALLING.md).
+
 ### Homebrew (aperçu)
 
 Le [tap Sotto](https://github.com/getsotto/homebrew-tap) propose une autre
