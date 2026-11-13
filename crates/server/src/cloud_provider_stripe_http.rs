@@ -1715,17 +1715,13 @@ impl StripeReadClient {
                 .ok_or(StripeReadError::MalformedResponse(
                     "invoice.starting_balance",
                 ))?;
-        if !currency.eq_ignore_ascii_case(STRIPE_CURRENCY)
-            || amount_due <= 0
-            || amount_remaining != amount_due
-            || amount_paid != 0
-            || amount_overpaid != 0
-            || amount_paid_off_stripe != 0
-            || starting_balance != 0
-        {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(currency.eq_ignore_ascii_case(STRIPE_CURRENCY)
+            && amount_due > 0
+            && amount_remaining == amount_due
+            && amount_paid == 0
+            && amount_overpaid == 0
+            && amount_paid_off_stripe == 0
+            && starting_balance == 0)
     }
 
     async fn list_bounded<T, F>(
