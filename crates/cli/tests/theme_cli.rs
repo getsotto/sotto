@@ -185,3 +185,118 @@ fn custom_theme_file_is_listed_and_selectable() {
     let current = run(dir.path(), &["theme", "current"], &[]);
     assert_eq!(stdout(&current), "synth\n");
 }
+
+fn assert_read_only_theme_commands_ignore_config(label: &str, bytes: &[u8]) {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(&config_path, bytes).unwrap();
+
+    let current = run(dir.path(), &["theme", "current"], &[]);
+    assert_eq!(
+        current.status.code(),
+        Some(0),
+        "{label}: {}",
+        stderr(&current)
+    );
+    assert_eq!(stdout(&current), "nord\n", "{label}");
+    assert!(
+        !dir.path().join("store.db").exists(),
+        "{label}: theme current created store.db"
+    );
+
+    let list = run(dir.path(), &["theme", "ls"], &[]);
+    assert_eq!(list.status.code(), Some(0), "{label}: {}", stderr(&list));
+    let marked = stdout(&list)
+        .lines()
+        .find(|line| line.starts_with('*'))
+        .expect("one marked theme");
+    assert!(marked.starts_with("* nord"), "{label}: {marked:?}");
+    assert!(
+        !dir.path().join("store.db").exists(),
+        "{label}: theme ls created store.db"
+    );
+
+    let explicit = run(
+        dir.path(),
+        &["--theme", "monochrome", "theme", "current"],
+        &[],
+    );
+    assert_eq!(
+        explicit.status.code(),
+        Some(0),
+        "{label}: {}",
+        stderr(&explicit)
+    );
+    assert_eq!(stdout(&explicit), "monochrome\n", "{label}");
+    assert!(
+        !dir.path().join("store.db").exists(),
+        "{label}: explicit theme current created store.db"
+    );
+
+    let environment = run(
+        dir.path(),
+        &["theme", "current"],
+        &[("SOTTO_THEME", "tokyo-night")],
+    );
+    assert_eq!(
+        environment.status.code(),
+        Some(0),
+        "{label}: {}",
+        stderr(&environment)
+    );
+    assert_eq!(stdout(&environment), "tokyo-night\n", "{label}");
+    assert!(
+        !dir.path().join("store.db").exists(),
+        "{label}: environment theme current created store.db"
+    );
+
+    assert_eq!(
+        std::fs::read(config_path).unwrap(),
+        bytes,
+        "{label}: config changed"
+    );
+}
+
+#[test]
+fn read_only_theme_commands_ignore_malformed_global_config() {
+    for (label, bytes) in [
+        ("malformed TOML", &b"theme = ["[..]),
+        ("invalid UTF-8", &b"\xff\xfe"[..]),
+    ] {
+        assert_read_only_theme_commands_ignore_config(label, bytes);
+    }
+}
+
+#[test]
+fn theme_set_rejects_malformed_global_config_without_overwriting_it() {
+    for (label, bytes, expected_exit) in [
+        ("malformed TOML", &b"theme = ["[..], 1),
+        ("invalid UTF-8", &b"\xff\xfe"[..], 5),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, bytes).unwrap();
+
+        let set = run(dir.path(), &["theme", "set", "sordino"], &[]);
+        assert_eq!(
+            set.status.code(),
+            Some(expected_exit),
+            "{label}: {}",
+            stderr(&set)
+        );
+        assert!(
+            !stderr(&set).contains("theme set to sordino"),
+            "{label}: reported a successful save: {}",
+            stderr(&set)
+        );
+        assert_eq!(
+            std::fs::read(config_path).unwrap(),
+            bytes,
+            "{label}: config changed"
+        );
+        assert!(
+            !dir.path().join("store.db").exists(),
+            "{label}: theme set created store.db"
+        );
+    }
+}
