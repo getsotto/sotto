@@ -327,6 +327,43 @@ deinem Theme sowie die verschlüsselte `store.db` mit deinem Tresor. Beide gehö
 Repository. Siehe [Umgebungsvariablen](#umgebungsvariablen) für `SOTTO_DATA_DIR` und
 [Ausgabe-Themes](#ausgabe-themes) für den Standardort auf jeder Plattform.
 
+### Secret-Namen auflisten
+
+Liste in einem konfigurierten Projekt mit entsperrter lokaler Identität die
+Secret-Namen der ausgewählten Umgebung auf:
+
+```sh
+sotto ls
+```
+
+Beispiel mit zwei erfundenen Namen, sortiert und mit einem Namen pro Zeile:
+
+```text
+API_URL
+REGION
+```
+
+Nutze für Skripte JSON. So wählst du eine andere Umgebung nur für diesen Befehl:
+
+```sh
+sotto ls --json
+sotto --env staging ls --json
+```
+
+JSON-Beispiel für dieselben Namen:
+
+```json
+["API_URL","REGION"]
+```
+
+Eine leere Umgebung gibt keine Namenszeilen aus, mit JSON dagegen `[]`. Entfernte Secrets
+werden ausgelassen. Die Ausgabe enthält nur Namen, keine Werte oder Versionsnummern.
+`sotto env ls` listet Umgebungen auf; `sotto export` enthält Werte im Klartext.
+
+Die Liste kommt aus dem lokalen Speicher. Der Befehl kontaktiert den Server nicht und
+lädt keine neueren Änderungen herunter. Unter [Ein weiteres Gerät](#ein-weiteres-gerät)
+erfährst du, wie du die lokale Kopie aktualisierst.
+
 ### Eine dotenv-Datei importieren
 
 `sotto import` liest eine dotenv-Datei und setzt jede Zuweisung in einer Umgebung, wobei jeder Wert lokal
