@@ -302,7 +302,11 @@ fn draw_right_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
         ]));
         lines.push(Line::from(vec![
             Span::styled("  [Tab] ", styles.bold_accent()),
-            Span::styled("Cycle active environment", styles.text()),
+            Span::styled("Next environment", styles.text()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  [Shift+Tab] ", styles.bold_accent()),
+            Span::styled("Previous environment", styles.text()),
         ]));
 
         let paragraph = Paragraph::new(lines)
@@ -411,7 +415,11 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  Tab         ", styles.bold_accent()),
-            Span::styled("Cycle active environment", styles.text()),
+            Span::styled("Next environment", styles.text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Shift+Tab   ", styles.bold_accent()),
+            Span::styled("Previous environment", styles.text()),
         ]),
         Line::from(vec![
             Span::styled("  n           ", styles.bold_accent()),
@@ -1412,7 +1420,9 @@ mod tests {
         assert!(content.contains("Toggle this help screen"));
         assert!(content.contains("Copy secret to clipboard"));
         assert!(content.contains("Open live theme switcher modal"));
-        assert!(content.contains("Cycle active environment"));
+        assert!(content.contains("Next environment"));
+        assert!(content.contains("Previous environment"));
+        assert!(content.contains("Shift+Tab"));
     }
 
     #[test]
