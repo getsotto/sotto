@@ -5,14 +5,14 @@ adoption paths, and the platform evidence available for them. A declared target 
 covered by a real-CLI test. The evidence column says what has actually been exercised and links to
 the source record where possible.
 
-Last checked: 26 October 2026.
+Last checked: 1 November 2026.
 
 ## CLI release baseline
 
-The latest published CLI is [v0.9.0](https://github.com/getsotto/sotto/releases/tag/v0.9.0),
-published on 14 September 2026. The current `main` branch includes `sotto mcp`, merged in
-[PR #624](https://github.com/getsotto/sotto/pull/624), but that command is not available in the
-v0.9.0 release. A command present on `main` should not be assumed to exist in an installed release.
+The latest published CLI is [v0.10.1](https://github.com/getsotto/sotto/releases/tag/v0.10.1),
+published on 1 November 2026. It includes `sotto mcp`, merged in
+[PR #624](https://github.com/getsotto/sotto/pull/624). A command present on `main` should not
+be assumed to exist in an installed release.
 
 The release workflow builds packages for macOS Apple Silicon and Intel, Linux x86_64 and ARM64,
 and Windows x86_64. Its build and test matrix is defined in the
