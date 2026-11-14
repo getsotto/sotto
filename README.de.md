@@ -278,6 +278,35 @@ in der ersten Umgebung) oder `>` (nur in der zweiten). Ohne `--confirm` ist die 
 Eine bestätigte Kopie fügt Geheimnisse hinzu und aktualisiert sie, lässt aber Schlüssel unverändert,
 die nur in der Zielumgebung vorhanden sind.
 
+Nutze für Skripte JSON statt der Markierung für die aktive Umgebung:
+
+```sh
+sotto env ls --json
+```
+
+Beispielausgabe für ein Projekt mit zwei lokalen Umgebungen:
+
+```json
+[{"active":true,"name":"dev"},{"active":false,"name":"staging"}]
+```
+
+Jedes Objekt enthält den Umgebungsnamen `name` und das Kennzeichen `active`. Eine leere Liste ist `[]`.
+So wählst du staging nur für diesen Befehl:
+
+```sh
+sotto --env staging env ls --json
+```
+
+Hier markiert `active` staging statt dev. Das speichert keinen neuen Standard;
+nutze dafür `sotto env use`, wie oben beschrieben. Fehlt der ausgewählte Name
+in der lokalen Liste, sind alle Kennzeichen falsch. Das Kennzeichen vergleicht Namen;
+es belegt weder den Zugriff auf eine Umgebung noch eine erfolgreiche Entschlüsselung.
+
+Der Befehl liest die lokalen Umgebungsmetadaten des konfigurierten Projekts, ohne
+den Tresor zu entsperren oder den Server zu kontaktieren. Anders als `sotto ls --json`
+listet er Umgebungen auf, keine Secret-Namen. JSON steht auf der Standardausgabe,
+Diagnosen auf der Standardfehlerausgabe.
+
 ### Projektkonfiguration
 
 `sotto init` und `sotto clone` schreiben eine `sotto.toml` in das aktuelle Verzeichnis. Sie verknüpft
