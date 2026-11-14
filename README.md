@@ -323,6 +323,42 @@ theme, and the encrypted `store.db` that holds your vault. Neither belongs in a 
 [Environment variables](#environment-variables) for `SOTTO_DATA_DIR`, and
 [Output themes](#output-themes) for each platform's default location.
 
+### List secret names
+
+From a configured project with an unlocked local identity, list the selected
+environment's secret names:
+
+```sh
+sotto ls
+```
+
+Example output for two synthetic names, sorted with one name per line:
+
+```text
+API_URL
+REGION
+```
+
+For scripts, use JSON. To select a different environment for just this command:
+
+```sh
+sotto ls --json
+sotto --env staging ls --json
+```
+
+Example JSON output for the same names:
+
+```json
+["API_URL","REGION"]
+```
+
+An empty environment prints no name lines, or `[]` with JSON. Removed secrets are
+omitted. This lists names only, not values or version numbers. `sotto env ls` lists
+environments instead; `sotto export` includes plaintext values.
+
+Listing reads the local store. It does not contact the server or pull newer changes.
+See [syncing another device](#another-device) if you need to update the local copy.
+
 ### Import a dotenv file
 
 `sotto import` reads a dotenv file and sets each assignment in one environment, encrypting every

@@ -333,6 +333,43 @@ par `sotto login` et votre thème, ainsi que le `store.db` chiffré qui contient
 deux n'a sa place dans un dépôt. Voir [Variables d'environnement](#variables-denvironnement) pour
 `SOTTO_DATA_DIR`, et [Thèmes de sortie](#thèmes-de-sortie) pour l'emplacement par défaut de chaque plateforme.
 
+### Lister les noms des secrets
+
+Depuis un projet configuré avec une identité locale déverrouillée, listez les noms
+des secrets de l'environnement sélectionné :
+
+```sh
+sotto ls
+```
+
+Exemple avec deux noms fictifs, triés avec un nom par ligne :
+
+```text
+API_URL
+REGION
+```
+
+Pour les scripts, utilisez JSON. Pour choisir un autre environnement pour cette commande seulement :
+
+```sh
+sotto ls --json
+sotto --env staging ls --json
+```
+
+Exemple de sortie JSON pour les mêmes noms :
+
+```json
+["API_URL","REGION"]
+```
+
+Un environnement vide n'affiche aucune ligne de noms, ou affiche `[]` en JSON. Les secrets
+supprimés sont exclus. Seuls les noms sont affichés, sans valeurs ni numéros de version.
+`sotto env ls` liste les environnements ; `sotto export` inclut les valeurs en clair.
+
+La liste est lue dans le stockage local. Elle ne contacte pas le serveur et ne récupère
+pas les changements récents. Consultez [la synchronisation d'un autre appareil](#un-autre-appareil)
+pour mettre à jour la copie locale.
+
 ### Importer un fichier dotenv
 
 `sotto import` lit un fichier dotenv et définit chaque affectation dans un environnement, en chiffrant

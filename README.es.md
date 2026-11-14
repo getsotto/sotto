@@ -328,6 +328,42 @@ contiene el `config.toml` global, con ajustes de toda la máquina como el servid
 un repositorio. Consulta [Variables de entorno](#variables-de-entorno) para `SOTTO_DATA_DIR`, y
 [Temas de salida](#temas-de-salida) para la ubicación predeterminada en cada plataforma.
 
+### Listar nombres de secretos
+
+Desde un proyecto configurado con una identidad local desbloqueada, lista los nombres
+de los secretos del entorno seleccionado:
+
+```sh
+sotto ls
+```
+
+Ejemplo con dos nombres ficticios, ordenados y con un nombre por línea:
+
+```text
+API_URL
+REGION
+```
+
+Para scripts, usa JSON. Para elegir otro entorno solo para este comando:
+
+```sh
+sotto ls --json
+sotto --env staging ls --json
+```
+
+Ejemplo de salida JSON para los mismos nombres:
+
+```json
+["API_URL","REGION"]
+```
+
+Un entorno vacío no imprime líneas de nombres, o imprime `[]` con JSON. Los secretos
+eliminados no aparecen. Solo se muestran nombres, no valores ni números de versión.
+`sotto env ls` lista entornos; `sotto export` incluye valores en texto plano.
+
+La lista se lee del almacén local. No contacta al servidor ni descarga cambios nuevos.
+Consulta [la sincronización de otro dispositivo](#otro-dispositivo) para actualizar la copia local.
+
 ### Importar un archivo dotenv
 
 `sotto import` lee un archivo dotenv y asigna cada variable en un entorno, cifrando cada valor en local.
