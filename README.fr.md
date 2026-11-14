@@ -671,6 +671,8 @@ pour afficher ou masquer la valeur sélectionnée, `c` pour la copier dans le pr
 pour quitter. `Esc` ferme la recherche ou la boîte de dialogue en cours ; dans la vue principale,
 il efface une recherche active ou quitte.
 
+Appuyez sur `h` pour [consulter et restaurer l'historique local d'un secret](LOCAL-HISTORY.md) (guide en anglais).
+
 Appuyez sur `t` pour parcourir les thèmes avec un aperçu en direct. Utilisez les flèches pour
 prévisualiser chaque thème, puis appuyez sur `Enter` pour enregistrer votre choix ou sur `Esc` pour
 annuler. Les [règles de priorité des thèmes](#thèmes-de-sortie) expliquent comment les options de

@@ -666,6 +666,8 @@ mit `c` kopierst du ihn in die Zwischenablage und mit `q` beendest du das Dashbo
 schließt die aktuelle Suche oder ein Dialogfenster; in der Hauptansicht löscht es eine aktive
 Suche oder beendet das Dashboard.
 
+Drücke `h`, um den [lokalen Verlauf eines Secrets anzusehen und wiederherzustellen](LOCAL-HISTORY.md) (Anleitung auf Englisch).
+
 Drücke `t`, um Themes mit einer Live-Vorschau durchzugehen. Mit den Pfeiltasten siehst du jedes
 Theme. Drücke `Enter`, um deine Wahl zu speichern, oder `Esc`, um abzubrechen. Die
 [Vorrangregeln für Themes](#ausgabe-themes) erklären, wie Befehlsoptionen und Umgebungsvariablen
