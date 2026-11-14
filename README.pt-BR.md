@@ -651,6 +651,27 @@ ambiente padrão do projeto. Pressione `r` para mostrar ou ocultar o valor selec
 copiá-lo para a área de transferência e `q` para sair. `Esc` fecha a busca ou a caixa de diálogo
 atual; na tela principal, limpa uma busca ativa ou sai.
 
+Para criar um segredo na navegação normal do painel (não enquanto digita uma busca
+ou edita um campo):
+
+1. Pressione `n` para abrir New Secret.
+2. Digite um nome fictício como `DEMO_API_KEY` e pressione Tab para ir ao valor.
+3. Digite um valor de teste como `demo-only`, ou pressione `Ctrl+G` para gerar outro.
+4. Pressione `Enter` para salvar.
+
+No modo New, Tab e Shift+Tab alternam entre os campos de nome e valor. Selecione um
+segredo existente e pressione `e` para editar seu valor; Edit não muda o nome.
+New rejeita um nome existente e mantém a caixa de diálogo aberta; use Edit para atualizá-lo.
+
+Os valores começam ocultos. `Ctrl+R` mostra ou oculta o valor do rascunho. `Ctrl+G`
+o substitui por uma sequência gerada de 32 caracteres, mas não a salva. `Enter`
+salva a caixa de diálogo mesmo no campo do nome; `Esc` descarta o rascunho não salvo e a fecha.
+Este editor de texto não edita valores que não sejam UTF-8; veja [os segredos a partir de arquivos](README.md#file-backed-secrets).
+
+Salvar altera apenas o ambiente local selecionado. Não sincroniza com o servidor.
+Para sincronizar depois, siga [a orientação de push](README.md#quick-start) e informe o mesmo
+ambiente explicitamente se você mudou de ambiente no painel.
+
 Pressione `t` para percorrer os temas com visualização ao vivo. Use as setas para ver cada tema
 e pressione `Enter` para salvar sua escolha ou `Esc` para cancelar. As
 [regras de precedência dos temas](#temas-de-saída) explicam como as opções do comando e as
