@@ -180,6 +180,37 @@ sotto init                   # create your identity + first project - SAVE the p
 sotto set DATABASE_URL       # hidden prompt; encrypted locally before it ever touches disk
 sotto import .env            # optional: pull in an existing file, still encrypted locally
 sotto run -- npm start       # inject the environment's secrets into any command
+```
+
+`sotto run` startet einen Kindprozess, der die Umgebung des aktuellen Prozesses erbt. Anschließend
+legt Sotto die Secrets der ausgewählten Umgebung darüber: Ein Secret mit demselben Namen wie eine
+geerbte Variable überschreibt sie, während alle anderen Variablen verfügbar bleiben. Überschreibt ein
+Secret eine geerbte Variable, gibt Sotto auf stderr eine Diagnose (`warning: overriding inherited environment
+variable NAME`) aus, die die Variable benennt, ohne ihren Wert auszugeben.
+
+Das gilt nur für den gestarteten Befehl und seine Nachkommen. Die übergeordnete Shell bleibt nach dem
+Ende des Befehls unverändert.
+
+Sotto startet die angeforderte ausführbare Datei direkt. Es wertet in seiner Argumentliste weder
+Shell-Expansion noch Pipes oder Umleitungen aus: Die aufrufende Shell verarbeitet ihre eigene Syntax,
+bevor Sotto startet. Deshalb wird `sotto run -- echo "$EXAMPLE"` das `$EXAMPLE` in der übergeordneten
+Shell expandieren, statt den eingefügten Wert zu lesen. Um eine eingefügte Variable in einer
+Kind-Shell zu lesen, rufen Sie `sh -c` ausdrücklich mit der richtigen äußeren Quotierung auf:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
+Verwenden Sie in einem Inline-Beispiel niemals echte Zugangsdaten.
+
+Die eigenen Optionen von Sotto, etwa `--env`, stehen vor dem Trennzeichen `--`; alles danach
+gehört zum Befehl. Zum Beispiel wählt `sotto run --env staging -- npm test` die Umgebung staging
+nur für diesen einen Befehl aus. Siehe [Umgebungen](#umgebungen), wie eine Umgebung ausgewählt
+wird, und [Dateibasierte Secrets](#dateibasierte-secrets) für Secrets, die kein reiner Text sind.
+Was `sotto run` nach dem Start des Befehls zurückgibt, steht in der
+[Referenz zu CLI-Skripten und Exit-Status](CLI-SCRIPTING.md).
+
+```sh
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
 sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 ```

@@ -180,6 +180,38 @@ sotto init                   # create your identity + first project - SAVE the p
 sotto set DATABASE_URL       # hidden prompt; encrypted locally before it ever touches disk
 sotto import .env            # optional: pull in an existing file, still encrypted locally
 sotto run -- npm start       # inject the environment's secrets into any command
+```
+
+`sotto run` inicia um processo filho que herda o ambiente do processo atual. Em seguida, o Sotto
+sobrepõe os segredos do ambiente selecionado: um segredo com o mesmo nome de uma variável herdada a
+substitui, enquanto as demais variáveis continuam disponíveis. Se um segredo substituir uma variável
+herdada, o Sotto imprime em stderr um diagnóstico (`warning: overriding inherited environment
+variable NAME`) que nomeia a variável sem mostrar o valor dela.
+
+Isso vale apenas para o comando iniciado e seus descendentes. O shell pai não muda depois que o comando
+termina.
+
+O Sotto inicia o executável solicitado diretamente. Ele não avalia expansão do shell, pipes nem
+redirecionamentos dentro da sua lista de argumentos: o shell que o invoca processa a própria sintaxe
+antes de iniciar o Sotto. Por isso, `sotto run -- echo "$EXAMPLE"` expande `$EXAMPLE` no shell pai em
+vez de ler o valor injetado. Para ler uma variável injetada dentro de um shell filho, invoque `sh -c`
+explicitamente, com as aspas externas corretas:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
+Nunca use uma credencial real em um exemplo em linha.
+
+As opções do próprio Sotto, como `--env`, vão antes do separador `--`; tudo o que vem depois
+pertence ao comando. Por exemplo, `sotto run --env staging -- npm test` seleciona o ambiente
+staging apenas para esse comando. Veja [Ambientes](#ambientes) para saber como um ambiente é
+selecionado e [Segredos a partir de arquivos](#segredos-a-partir-de-arquivos) para segredos que
+não são texto simples.
+Para saber o que `sotto run` retorna depois que o comando é iniciado, consulte a
+[referência de scripts e códigos de saída da CLI](CLI-SCRIPTING.md).
+
+```sh
 sotto get DATABASE_URL -c    # copy a secret without printing it; clipboard clears after 45s when unchanged
 sotto export --format dotenv --reveal   # print a .env; refuses a terminal without --reveal
 ```
