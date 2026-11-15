@@ -1,12 +1,11 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, fireEvent } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AccountApp } from "../AccountApp";
 import { me } from "../api";
 import { startLogin } from "../login";
 
-// 1. Mock the API and external dependencies exactly as imported in AccountApp.tsx
 vi.mock("../api", () => ({
   me: vi.fn(),
   logout: vi.fn(),
@@ -20,18 +19,17 @@ vi.mock("../CloudAccountPanel", () => ({
   CloudAccountPanel: () => <div data-testid="mock-cloud-panel">Mocked Panel</div>,
 }));
 
-// Mock the Shell so it just passes children through, keeping tests focused on AccountApp logic
 vi.mock("../Shell", () => ({
-  Shell: ({ children }: { children: React.ReactNode }) => <div data-testid="mock-shell">{children}</div>,
+  Shell: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="mock-shell">{children}</div>
+  ),
 }));
 
-// Cleanup DOM after each test to prevent leaks
 afterEach(cleanup);
 
-// Utility to control the timing of the `me()` promise manually
 function createDeferred<T>() {
   let resolveFn!: (value: T | PromiseLike<T>) => void;
-  let rejectFn!: (reason?: any) => void;
+  let rejectFn!: (reason?: unknown) => void;
   const promise = new Promise<T>((resolve, reject) => {
     resolveFn = resolve;
     rejectFn = reject;
@@ -40,31 +38,37 @@ function createDeferred<T>() {
 }
 
 describe("AccountApp - Initial Session Discovery", () => {
+  let reloadSpy: ReturnType<typeof vi.fn>;
+
   beforeEach(() => {
     vi.clearAllMocks();
+    reloadSpy = vi.fn();
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...window.location, reload: reloadSpy },
+    });
   });
 
   it("shows loading state and hides account panel while request is pending", () => {
-    const deferred = createDeferred<any>();
+    const deferred = createDeferred<{ userId: string } | null>();
     vi.mocked(me).mockReturnValue(deferred.promise);
 
     render(<AccountApp />);
 
-    // Assert checking state text from the component
-    expect(screen.getByText("Loading your Cloud account…")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Loading your Cloud account…");
     expect(screen.queryByTestId("mock-cloud-panel")).not.toBeInTheDocument();
   });
 
   it("triggers login with /cloud when resolving as an anonymous visitor", async () => {
-    const deferred = createDeferred<any>();
+    const deferred = createDeferred<{ userId: string } | null>();
     vi.mocked(me).mockReturnValue(deferred.promise);
 
     render(<AccountApp />);
 
-    // Resolve with null to simulate anonymous visitor
-    deferred.resolve(null);
+    await act(async () => {
+      deferred.resolve(null);
+    });
 
-    // Wait for the UI to update to the loggedOut state
     const loginBtn = await screen.findByRole("button", { name: "Log in with GitHub" });
     fireEvent.click(loginBtn);
 
@@ -72,49 +76,127 @@ describe("AccountApp - Initial Session Discovery", () => {
   });
 
   it("mounts the CloudAccountPanel when resolving with a signed-in user", async () => {
-    const deferred = createDeferred<any>();
+    const deferred = createDeferred<{ userId: string } | null>();
     vi.mocked(me).mockReturnValue(deferred.promise);
 
     render(<AccountApp />);
 
-    // Resolve with a synthetic user object
-    deferred.resolve({ id: "user123", username: "testuser" });
+    await act(async () => {
+      deferred.resolve({ userId: "user123" });
+    });
 
-    // Wait for the panel to mount
     expect(await screen.findByTestId("mock-cloud-panel")).toBeInTheDocument();
   });
 
-  it("displays alert and triggers browser reload upon activation on session failure", async () => {
-    // Spy on window.location.reload
-    const originalLocation = window.location;
-    Object.defineProperty(window, "location", {
-      configurable: true,
-      value: { ...originalLocation, reload: vi.fn() },
-    });
-
-    const deferred = createDeferred<any>();
+  it("shows an alert and Retry session after a session failure without reloading", async () => {
+    const deferred = createDeferred<{ userId: string } | null>();
     vi.mocked(me).mockReturnValue(deferred.promise);
 
     render(<AccountApp />);
 
-    // Reject the promise with a synthetic error
-    deferred.reject(new Error("Synthetic network error"));
+    await act(async () => {
+      deferred.reject(new Error("Synthetic network error"));
+    });
 
-    // Verify error UI is displayed
-    const alertMsg = await screen.findByRole("alert");
-    expect(alertMsg).toHaveTextContent("Synthetic network error");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Synthetic network error");
+    expect(screen.getByRole("button", { name: "Retry session" })).toBeEnabled();
+    expect(screen.queryByTestId("mock-cloud-panel")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reload" })).not.toBeInTheDocument();
+    expect(reloadSpy).not.toHaveBeenCalled();
+  });
+
+  it("shows pending status and ignores a second click while a retry is in flight", async () => {
+    const first = createDeferred<{ userId: string } | null>();
+    const retry = createDeferred<{ userId: string } | null>();
+    vi.mocked(me).mockReturnValueOnce(first.promise).mockReturnValueOnce(retry.promise);
+
+    render(<AccountApp />);
+    await act(async () => {
+      first.reject(new Error("first failure"));
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Retry session" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("Loading your Cloud account…");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry session" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("mock-cloud-panel")).not.toBeInTheDocument();
+    expect(me).toHaveBeenCalledTimes(2);
+    expect(reloadSpy).not.toHaveBeenCalled();
+    expect(startLogin).not.toHaveBeenCalled();
+  });
+
+  it("mounts the account panel after a successful signed-in retry", async () => {
+    const first = createDeferred<{ userId: string } | null>();
+    const retry = createDeferred<{ userId: string } | null>();
+    vi.mocked(me).mockReturnValueOnce(first.promise).mockReturnValueOnce(retry.promise);
+
+    render(<AccountApp />);
+    await act(async () => {
+      first.reject(new Error("first failure"));
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Retry session" }));
+
+    await act(async () => {
+      retry.resolve({ userId: "user123" });
+    });
+
+    expect(await screen.findByTestId("mock-cloud-panel")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(reloadSpy).not.toHaveBeenCalled();
+  });
+
+  it("shows the signed-out view after a successful anonymous retry", async () => {
+    const first = createDeferred<{ userId: string } | null>();
+    const retry = createDeferred<{ userId: string } | null>();
+    vi.mocked(me).mockReturnValueOnce(first.promise).mockReturnValueOnce(retry.promise);
+
+    render(<AccountApp />);
+    await act(async () => {
+      first.reject(new Error("first failure"));
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Retry session" }));
+
+    await act(async () => {
+      retry.resolve(null);
+    });
+
+    const loginBtn = await screen.findByRole("button", { name: "Log in with GitHub" });
+    expect(screen.queryByTestId("mock-cloud-panel")).not.toBeInTheDocument();
+    fireEvent.click(loginBtn);
+    expect(startLogin).toHaveBeenCalledExactlyOnceWith("/cloud");
+    expect(reloadSpy).not.toHaveBeenCalled();
+  });
+
+  it("shows a new error after a failed retry and recovers on the next attempt", async () => {
+    const first = createDeferred<{ userId: string } | null>();
+    const second = createDeferred<{ userId: string } | null>();
+    const third = createDeferred<{ userId: string } | null>();
+    vi.mocked(me)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+      .mockReturnValueOnce(third.promise);
+
+    render(<AccountApp />);
+    await act(async () => {
+      first.reject(new Error("first failure"));
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Retry session" }));
+
+    await act(async () => {
+      second.reject(new Error("second failure"));
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent("second failure");
+    expect(screen.getByRole("button", { name: "Retry session" })).toBeEnabled();
     expect(screen.queryByTestId("mock-cloud-panel")).not.toBeInTheDocument();
 
-    // Verify clicking Reload triggers window.location.reload
-    const reloadBtn = screen.getByRole("button", { name: "Reload" });
-    fireEvent.click(reloadBtn);
-
-    expect(window.location.reload).toHaveBeenCalledOnce();
-
-    // Restore window.location mockup to not break other test files
-    Object.defineProperty(window, "location", {
-      configurable: true,
-      value: originalLocation,
+    fireEvent.click(screen.getByRole("button", { name: "Retry session" }));
+    await act(async () => {
+      third.resolve({ userId: "user123" });
     });
+
+    expect(await screen.findByTestId("mock-cloud-panel")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(me).toHaveBeenCalledTimes(3);
+    expect(reloadSpy).not.toHaveBeenCalled();
   });
 });
