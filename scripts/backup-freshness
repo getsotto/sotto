@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Decide whether the newest backup is fresh, from a bucket listing alone.
+
+Usage: scripts/backup-freshness --max-age-hours 26 [--scheduled-at 02:17] [--now ...] < listing.json
+
+The listing is the GCS JSON API's `objects.list` response with `items(name,timeCreated)`. Prints
+`healthy=true|false` and, when unhealthy, a one-line `reason=...`, in the form GITHUB_OUTPUT takes.
+
+When healthy it also prints `scheduled=true|false`: whether a fresh backup started within an hour
+after --scheduled-at, the crontab's time in UTC. The workflow closes an open alarm only on that.
+A backup taken by hand proves the script works, not that cron will run it tonight, and a hand run
+once closed the alarm while cron stayed broken for ten more days.
+Nothing here reads an object, only names and creation times, so the identity that runs it needs
+no permission that could fetch a backup.
+
+Only `sotto-<stamp>.dump` counts as a backup. The bucket also holds the retention sidecar and,
+when a run fails, a `sotto-<stamp>.failed.<step>` marker that backup.sh uploads on its way out.
+A marker must never make a stale bucket look fresh, and it is the reason this is a script: when
+the alarm fires it can say which step failed on the host, or that nothing reached the bucket at
+all, without anyone logging in to find out.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import re
+import sys
+
+DUMP = re.compile(r"(?:^|/)sotto-(\d{8}T\d{6}Z)\.dump$")
+# A cron run starts on the minute and the stamp is taken at its start, so an hour is generous for
+# cron's own delay and still excludes a hand run at any other time of day.
+WINDOW_MINUTES = 60
+# The step is backup.sh's own wording with spaces as hyphens, restricted to the characters that
+# wording uses, so nothing an object name carries can reach the issue text beyond that.
+FAILED = re.compile(r"(?:^|/)sotto-\d{8}T\d{6}Z\.failed\.([a-z][a-z-]{0,63})$")
+
+TRIAGE = "deploy/README.md section Backups, step 6, has the triage."
+
+
+def parse_time(value: str) -> dt.datetime:
+    # GCS writes RFC 3339 with a Z suffix and milliseconds; fromisoformat accepts that from 3.11.
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def verdict(listing: dict, now: dt.datetime, max_age_hours: int,
+            scheduled_at: int | None = None) -> tuple[bool, str, str, bool]:
+    """Return (healthy, reason, summary, scheduled). The reason is empty when healthy.
+
+    `scheduled_at` is minutes after midnight UTC. `scheduled` is whether a fresh backup started
+    in the window after it, and is True when no schedule is given.
+    """
+    items = [i for i in listing.get("items") or [] if "name" in i and "timeCreated" in i]
+    dumps = []
+    for item in items:
+        match = DUMP.search(item["name"])
+        if match:
+            stamp = dt.datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ")
+            dumps.append((parse_time(item["timeCreated"]), stamp.replace(tzinfo=dt.timezone.utc)))
+    failures = []
+    for item in items:
+        match = FAILED.search(item["name"])
+        if match:
+            failures.append((parse_time(item["timeCreated"]), match.group(1).replace("-", " ")))
+
+    if not dumps:
+        reason = ("The backup bucket holds no backup. No dump has ever been uploaded, or the "
+                  "lifecycle rule has deleted them all.")
+        return False, reason + failure_sentence(failures, ""), "no backup in the bucket", False
+
+    newest, _ = max(dumps)
+    shown = listing_time(newest)
+    age_hours = int((now - newest).total_seconds() // 3600)
+    summary = f"Newest backup: {shown} ({age_hours}h old, threshold {max_age_hours}h)"
+    if age_hours < max_age_hours:
+        fresh = [stamp for created, stamp in dumps
+                 if (now - created).total_seconds() // 3600 < max_age_hours]
+        scheduled = scheduled_at is None or any(in_window(s, scheduled_at) for s in fresh)
+        return True, "", summary, scheduled
+
+    reason = (f"The newest backup is {age_hours} hours old, past the {max_age_hours} hour "
+              f"threshold. The most recent upload was {shown}.")
+    since = [f for f in failures if f[0] > newest]
+    return False, reason + failure_sentence(since, " since then"), summary, False
+
+
+def in_window(stamp: dt.datetime, scheduled_at: int) -> bool:
+    # Modulo a day, so a schedule late in the evening still matches a run just after midnight.
+    started = stamp.hour * 60 + stamp.minute
+    return (started - scheduled_at) % (24 * 60) < WINDOW_MINUTES
+
+
+def minutes_after_midnight(value: str) -> int:
+    match = re.fullmatch(r"([01]\d|2[0-3]):([0-5]\d)", value)
+    if not match:
+        raise argparse.ArgumentTypeError(f"expected HH:MM in UTC, got {value!r}")
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def failure_sentence(failures: list, since: str) -> str:
+    if failures:
+        when, step = max(failures)
+        count = len(failures)
+        runs = "run" if count == 1 else "runs"
+        return (f" The host has recorded {count} failed {runs}{since}; the latest, at "
+                f"{listing_time(when)}, failed while {step}. Its `backup FAILED` line in "
+                f"$HOME/sotto-backup.log on the host has the tool output; {TRIAGE}")
+    return (f" The host has recorded no failure{since}, so the job did not start, or stopped "
+            "before it could reach the bucket (reading its configuration, for example). On the "
+            "host, check the cron entry, deploy/.env and the last `backup started` lines in "
+            f"$HOME/sotto-backup.log; {TRIAGE}")
+
+
+def listing_time(value: dt.datetime) -> str:
+    return value.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--max-age-hours", type=int, required=True)
+    parser.add_argument("--scheduled-at", type=minutes_after_midnight,
+                        help="the crontab's backup time, HH:MM UTC; omit to accept any time")
+    parser.add_argument("--now", help="the time to judge against (default: now), for tests")
+    args = parser.parse_args()
+    now = parse_time(args.now) if args.now else dt.datetime.now(dt.timezone.utc)
+
+    try:
+        listing = json.load(sys.stdin)
+    except json.JSONDecodeError as error:
+        print(f"the bucket listing is not JSON: {error}", file=sys.stderr)
+        return 1
+    healthy, reason, summary, scheduled = verdict(
+        listing, now, args.max_age_hours, args.scheduled_at)
+    print(summary, file=sys.stderr)
+    print(f"healthy={'true' if healthy else 'false'}")
+    if healthy:
+        print(f"scheduled={'true' if scheduled else 'false'}")
+    if reason:
+        print(f"reason={reason}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
