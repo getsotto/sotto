@@ -373,6 +373,65 @@ describe("payer transfer journeys", () => {
     expect(await screen.findByText(/The other payer must accept it/)).toBeInTheDocument();
   });
 
+  it("reuses the reviewed quote and request key after a temporary invitation failure", async () => {
+    const first = deferred<api.PayerTransfer>();
+    vi.mocked(api.beginPayerTransfer).mockReturnValueOnce(first.promise);
+    render(<PersonalTransferStart />);
+    fireEvent.change(await screen.findByLabelText("Organisation"), { target: { value: "org-b" } });
+    await screen.findByRole("option", { name: "admin-2 · owner" });
+    fireEvent.change(screen.getByLabelText("Other payer administrator"), { target: { value: "admin-2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review payer transfer" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Send request for acceptance" }));
+
+    const sending = screen.getByRole("button", { name: "Sending request…" });
+    expect(sending).toBeDisabled();
+    fireEvent.click(sending);
+    expect(api.beginPayerTransfer).toHaveBeenCalledOnce();
+
+    await act(async () => first.reject(new Error("server error (503)")));
+    expect(screen.getByRole("alert")).toHaveTextContent("The transfer service is temporarily unavailable");
+    expect(screen.queryByText(/The other payer must accept it/)).not.toBeInTheDocument();
+    expect(screen.getByText(/At renewal on/)).toHaveTextContent("£2.99 per month");
+    expect(api.beginPayerTransfer).toHaveBeenCalledOnce();
+
+    const retry = screen.getByRole("button", { name: "Send request for acceptance" });
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+    expect(await screen.findByText(/The other payer must accept it/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.quotePayerTransfer).toHaveBeenCalledOnce();
+    const [failed, retried] = vi.mocked(api.beginPayerTransfer).mock.calls;
+    expect(failed).toEqual([{ quote, idempotencyKey: expect.any(String) }]);
+    expect(retried).toEqual(failed);
+  });
+
+  it("requires a fresh quote and request key after a conflict", async () => {
+    const freshQuote = { ...quote, quoteId: "quote-2", amountPence: 399 };
+    vi.mocked(api.quotePayerTransfer).mockResolvedValueOnce(quote).mockResolvedValueOnce(freshQuote);
+    vi.mocked(api.beginPayerTransfer).mockRejectedValueOnce(new Error("server error (409)"));
+    render(<PersonalTransferStart />);
+    fireEvent.change(await screen.findByLabelText("Organisation"), { target: { value: "org-b" } });
+    await screen.findByRole("option", { name: "admin-2 · owner" });
+    fireEvent.change(screen.getByLabelText("Other payer administrator"), { target: { value: "admin-2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Review payer transfer" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Send request for acceptance" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/billing terms changed/i);
+    expect(screen.queryByRole("button", { name: "Send request for acceptance" })).not.toBeInTheDocument();
+    const review = screen.getByRole("button", { name: "Review payer transfer" });
+    expect(review).toBeEnabled();
+    fireEvent.click(review);
+    expect(await screen.findByText(/At renewal on/)).toHaveTextContent("£3.99 per month");
+    expect(api.beginPayerTransfer).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByRole("button", { name: "Send request for acceptance" }));
+    expect(await screen.findByText(/The other payer must accept it/)).toBeInTheDocument();
+    const [[failed], [retried]] = vi.mocked(api.beginPayerTransfer).mock.calls;
+    expect(failed.quote).toEqual(quote);
+    expect(retried.quote).toEqual(freshQuote);
+    expect(retried.idempotencyKey).not.toBe(failed.idempotencyKey);
+  });
+
   it("shows a recoverable error when the initial organisation lookup fails", async () => {
     vi.mocked(api.fetchOrgs).mockRejectedValue(new Error("Synthetic network error"));
     render(<PersonalTransferStart />);
