@@ -187,6 +187,23 @@ plaintext, so it needs `--reveal` on a terminal, just like `sotto get`; `--forma
 `shell` and `json`. Clipboard clearing is best-effort: replacing the clipboard protects the newer
 content, while clipboard managers, suspension, or a terminated helper may retain a history copy.
 
+`sotto run` starts the command with your current environment plus the selected environment's
+secrets. A secret replaces an inherited variable of the same name, and unrelated variables are kept.
+When that happens Sotto writes `warning: overriding inherited environment variable NAME` to stderr,
+never the value. Only the command and its descendants see the secrets; your shell's environment is
+unchanged afterwards. To use another environment, put `--env` before the `--` (see
+[Environments](#environments); [Import a dotenv file](#import-a-dotenv-file) covers filling one).
+
+Sotto runs the program directly, so it does not expand variables or interpret pipes and redirects in
+its arguments. Your own shell still processes its syntax before Sotto starts: `sotto run -- echo "$EXAMPLE"`
+prints the parent shell's value of `EXAMPLE`, not the injected one. To expand a variable inside the
+child, run a shell as the command and quote the script with single quotes (POSIX shells). In this
+synthetic example, suppose `EXAMPLE` is stored in Sotto with the value `demo-only`:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
 Everything so far stays on your machine. To sync another device, work with a team or run CI, log
 in to a server:
 
@@ -783,6 +800,8 @@ Custom themes are TOML files in the `themes` directory inside your platform data
 directory). Each `*.toml` file needs the tokens below and takes its name from a `name` field,
 or from the filename when the field is absent; a file that fails to parse is skipped. Colours
 accept hex values, ANSI colour names, `ansi(<index>)` indices, and `default`.
+Both the theme list and the dashboard picker show the built-in presets first, followed
+by custom themes sorted by their displayed names, ignoring case.
 
 ```toml
 bg = "#120024"
