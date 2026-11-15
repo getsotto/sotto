@@ -22,6 +22,13 @@ const emptyStatus: api.CloudContactStatus = {
 
 const acknowledgement = "If this address can be used, a verification message will arrive shortly.";
 
+function deliveryStatus(state: api.CloudEmailDeliveryState): api.CloudContactStatus {
+  return {
+    ...emptyStatus,
+    latestDelivery: { state, updatedAtEpoch: 1_800_000_000 },
+  };
+}
+
 function deferred() {
   let resolve!: () => void;
   let reject!: (cause: unknown) => void;
@@ -406,6 +413,67 @@ describe("CloudContactSettings", () => {
     });
   });
 
+  describe("disabled enrolment", () => {
+    const disabledStatus: api.CloudContactStatus = { ...emptyStatus, enrolmentAvailable: false };
+
+    function expectEnrolmentUnavailable() {
+      expect(screen.getByText("Email contact setup is not enabled on this instance.")).toBeInTheDocument();
+      expect(screen.queryByLabelText("Email address")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /^(Send|Resend) verification link$/ })).not.toBeInTheDocument();
+      expect(screen.queryByText("Email contact settings require a newer Sotto server version.")).not.toBeInTheDocument();
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(api.startCloudContactVerification).not.toHaveBeenCalled();
+      expect(api.confirmCloudContactVerification).not.toHaveBeenCalled();
+    }
+
+    it("shows an empty contact without offering setup or removal", async () => {
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValue(disabledStatus);
+
+      render(<CloudContactSettings />);
+
+      expect(await screen.findByText("No verified email contact is set.")).toBeInTheDocument();
+      expectEnrolmentUnavailable();
+      expect(screen.queryByRole("button", { name: "Remove verified email" })).not.toBeInTheDocument();
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledOnce();
+      expect(api.revokeCloudContact).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      { pending: "without a pending request", pendingExpiresAtEpoch: null },
+      { pending: "with a pending request", pendingExpiresAtEpoch: 1_900_000_000 },
+    ])("keeps an existing contact removable $pending and setup disabled after removal", async ({ pendingExpiresAtEpoch }) => {
+      vi.mocked(api.fetchCloudContactStatus)
+        .mockResolvedValueOnce({
+          ...disabledStatus,
+          email: {
+            contactId: "contact-1",
+            maskedDestination: "p***@example.test",
+            verifiedAtEpoch: 1_800_000_000,
+          },
+          pendingExpiresAtEpoch,
+        })
+        .mockResolvedValue(disabledStatus);
+      vi.mocked(api.revokeCloudContact).mockResolvedValue(undefined);
+
+      render(<CloudContactSettings />);
+
+      expect(await screen.findByText("p***@example.test")).toBeInTheDocument();
+      expectEnrolmentUnavailable();
+      const remove = screen.getByRole("button", { name: "Remove verified email" });
+      expect(remove).toBeEnabled();
+      expect(api.revokeCloudContact).not.toHaveBeenCalled();
+      fireEvent.click(remove);
+
+      expect(await screen.findByText("No verified email contact is set.")).toBeInTheDocument();
+      expect(screen.getByRole("status")).toHaveTextContent("Lifecycle email contact removed.");
+      expect(screen.queryByText("p***@example.test")).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Remove verified email" })).not.toBeInTheDocument();
+      expectEnrolmentUnavailable();
+      expect(api.revokeCloudContact).toHaveBeenCalledOnce();
+      expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(2);
+    });
+  });
+
   it("explains that older servers do not support contact settings", async () => {
     vi.mocked(api.fetchCloudContactStatus).mockRejectedValue(new api.UnsupportedCloudContactError());
     render(<CloudContactSettings />);
@@ -428,6 +496,51 @@ describe("CloudContactSettings", () => {
       "Email delivery is paused because the address could not accept a previous message.",
     )).toBeInTheDocument();
     expect(screen.queryByText(/provider-message|@example\.test/)).not.toBeInTheDocument();
+  });
+
+  const deliveryCases: Array<[api.CloudEmailDeliveryState, string]> = [
+    ["queued", "The latest lifecycle email is queued."],
+    ["accepted", "The email service accepted the latest lifecycle email; delivery is not yet confirmed."],
+    ["delivery_unknown", "We could not confirm whether the latest lifecycle email was sent. Check your inbox before requesting help."],
+    ["delivered", "The email service confirmed delivery of the latest lifecycle email."],
+    ["failed", "The latest lifecycle email could not be sent."],
+    ["bounced", "The latest lifecycle email was returned by the recipient mail server. Verify a different address to resume email notices."],
+  ];
+
+  it.each(deliveryCases)("shows the %s delivery summary", async (state, message) => {
+    vi.mocked(api.fetchCloudContactStatus).mockResolvedValue(deliveryStatus(state));
+    render(<CloudContactSettings />);
+
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(message));
+  });
+
+  it.each([
+    ["null", emptyStatus],
+    ["omitted", { email: null, pendingExpiresAtEpoch: null, enrolmentAvailable: true }],
+  ])("keeps contact controls without a delivery summary when it is %s", async (_case, status) => {
+    vi.mocked(api.fetchCloudContactStatus).mockResolvedValue(status);
+    render(<CloudContactSettings />);
+
+    expect(await screen.findByLabelText("Email address")).toBeInTheDocument();
+    await enterAddress("person@example.test");
+    expect(screen.getByRole("button", { name: "Send verification link" })).toBeEnabled();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("replaces the delivery summary after a contact status refresh", async () => {
+    vi.mocked(api.fetchCloudContactStatus)
+      .mockResolvedValueOnce(deliveryStatus("queued"))
+      .mockResolvedValueOnce(deliveryStatus("delivered"));
+    vi.mocked(api.startCloudContactVerification).mockResolvedValue(undefined);
+    render(<CloudContactSettings />);
+
+    expect(await screen.findByText("The latest lifecycle email is queued.")).toBeInTheDocument();
+    await enterAddress("person@example.test");
+    sendLink();
+
+    expect(await screen.findByText("The email service confirmed delivery of the latest lifecycle email.")).toBeInTheDocument();
+    expect(screen.queryByText("The latest lifecycle email is queued.")).not.toBeInTheDocument();
+    expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(2);
   });
 
   async function emailForm(address: string) {
