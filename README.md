@@ -659,6 +659,27 @@ project's default. Press `r` to reveal or conceal the selected value, `c` to cop
 clipboard, and `q` to quit. `Esc` closes the current search or dialog; from the main view, it
 clears an active search or quits.
 
+To create a secret from normal dashboard navigation (not while typing a search or
+editing a field):
+
+1. Press `n` to open New Secret.
+2. Enter a synthetic name such as `DEMO_API_KEY`, then press Tab to move to the value.
+3. Enter a dummy value such as `demo-only`, or press `Ctrl+G` to generate a replacement.
+4. Press `Enter` to save.
+
+In New mode, Tab and Shift+Tab move between the name and value fields. Select an
+existing secret and press `e` to edit its value; Edit does not rename it.
+New rejects an existing live name and leaves the dialogue open, so use Edit to update it.
+
+Values start masked. `Ctrl+R` shows or hides the draft value. `Ctrl+G` replaces it
+with a generated 32-character string, but does not save it. `Enter` saves the
+dialogue even from the name field; `Esc` discards the unsaved draft and closes it.
+This text editor cannot edit non-UTF-8 values; see [file-backed secrets](README.md#file-backed-secrets).
+
+Saving changes the selected local environment only. It does not sync to the server.
+To sync later, follow [the push guidance](README.md#quick-start) and use the same
+environment explicitly if you switched environments in the dashboard.
+
 Press `t` to browse themes with a live preview. Use the arrow keys to preview each theme, then
 press `Enter` to save your choice or `Esc` to cancel. The [theme precedence rules](#output-themes)
 explain how command and environment overrides affect the saved preference.

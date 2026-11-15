@@ -690,6 +690,27 @@ pour afficher ou masquer la valeur sélectionnée, `c` pour la copier dans le pr
 pour quitter. `Esc` ferme la recherche ou la boîte de dialogue en cours ; dans la vue principale,
 il efface une recherche active ou quitte.
 
+Pour créer un secret depuis la navigation normale du tableau de bord (pas pendant une recherche
+ou la saisie dans un champ) :
+
+1. Appuyez sur `n` pour ouvrir New Secret.
+2. Saisissez un nom fictif comme `DEMO_API_KEY`, puis appuyez sur Tab pour passer à la valeur.
+3. Saisissez une valeur de test comme `demo-only`, ou appuyez sur `Ctrl+G` pour en générer une.
+4. Appuyez sur `Enter` pour enregistrer.
+
+En mode New, Tab et Shift+Tab passent entre le nom et la valeur. Sélectionnez un secret
+existant et appuyez sur `e` pour modifier sa valeur ; Edit ne change pas son nom.
+New refuse un nom existant et laisse le dialogue ouvert ; utilisez Edit pour le mettre à jour.
+
+Les valeurs sont masquées au départ. `Ctrl+R` affiche ou masque la valeur du brouillon.
+`Ctrl+G` la remplace par une chaîne générée de 32 caractères, sans l'enregistrer. `Enter`
+enregistre le dialogue même depuis le champ du nom ; `Esc` abandonne le brouillon et ferme le dialogue.
+Cet éditeur de texte ne peut pas modifier les valeurs non UTF-8 ; consultez [les secrets issus de fichiers](README.md#file-backed-secrets).
+
+L'enregistrement ne change que l'environnement local sélectionné. Il ne synchronise pas avec le serveur.
+Pour synchroniser ensuite, suivez [le guide de push](README.md#quick-start) et indiquez le même
+environnement explicitement si vous avez changé d'environnement dans le tableau de bord.
+
 Appuyez sur `t` pour parcourir les thèmes avec un aperçu en direct. Utilisez les flèches pour
 prévisualiser chaque thème, puis appuyez sur `Enter` pour enregistrer votre choix ou sur `Esc` pour
 annuler. Les [règles de priorité des thèmes](#thèmes-de-sortie) expliquent comment les options de
