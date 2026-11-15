@@ -19,7 +19,9 @@ your secrets; still, treat it as production infrastructure.
 
 ## Prerequisites
 
-1. **A host** with Docker + Docker Compose, ports 80 and 443 reachable from the internet.
+1. **A host** with Docker + Docker Compose, ports 80 and 443 reachable from the internet. Open
+   443 for UDP as well as TCP: HTTP/3 runs over UDP, and a firewall rule that allows only TCP
+   leaves Caddy advertising a protocol no client can reach.
 2. **DNS**: an A (and/or AAAA) record for your domain pointing at the host. Caddy provisions the
    TLS certificate automatically once the name resolves.
 3. **A GitHub OAuth app** (github.com → Settings → Developer settings → OAuth Apps → New) with
