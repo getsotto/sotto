@@ -327,8 +327,41 @@ select {
 
 /* Key material is mono, like everything that matters byte-for-byte. */
 input[type="password"],
+input.secret-key,
 input.passphrase-input {
   font-family: var(--font-mono);
+}
+
+/* Unlock form: Secret Key input with an adjacent show/hide control. */
+.secret-key-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: 100%;
+  max-width: var(--measure-narrow);
+}
+
+.secret-key-field > label {
+  margin: 0;
+  max-width: none;
+}
+
+.secret-key-controls {
+  display: flex;
+  align-items: stretch;
+  gap: var(--space-2);
+  width: 100%;
+}
+
+.secret-key-controls > input {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.secret-key-controls > button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 /* Shared-secret recipient page: passphrase input with adjacent show/hide control. */

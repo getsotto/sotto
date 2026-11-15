@@ -406,8 +406,12 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled("Focus search filter", styles.text()),
         ]),
         Line::from(vec![
+            Span::styled("  Ctrl+U      ", styles.bold_accent()),
+            Span::styled("Clear search and stay in search mode", styles.text()),
+        ]),
+        Line::from(vec![
             Span::styled("  Esc         ", styles.bold_accent()),
-            Span::styled("Clear filter / close modal", styles.text()),
+            Span::styled("Clear search and exit / close modal", styles.text()),
         ]),
         Line::from(vec![
             Span::styled("  Tab         ", styles.bold_accent()),

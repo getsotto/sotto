@@ -39,7 +39,11 @@ function deferred() {
 async function revealSecret() {
   render(<RecipientPage token="share-token" />);
   fireEvent.click(screen.getByRole("button", { name: "Reveal secret" }));
-  return await screen.findByRole("textbox", { name: "Shared secret" });
+  const textbox = await screen.findByRole("textbox", { name: "Shared secret" });
+  await waitFor(() => {
+    expect(screen.getByRole("heading", { name: "Shared secret" })).toHaveFocus();
+  });
+  return textbox;
 }
 
 describe("RecipientPage", () => {

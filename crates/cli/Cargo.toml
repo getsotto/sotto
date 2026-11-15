@@ -36,9 +36,11 @@ rpassword = "7"
 serde_json = "1"
 clap_complete = "4"
 # Sync client. Blocking reqwest keeps the CLI synchronous (no tokio runtime to manage); native-tls
-# matches the server (licence-clean). base64 transports opaque ciphertext as JSON strings.
+# matches the server (licence-clean). base64 transports opaque ciphertext as JSON strings; gzip
+# is negotiated automatically and shrinks a large snapshot when the server or its proxy offers it.
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
+    "gzip",
     "json",
     "native-tls",
 ] }
