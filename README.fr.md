@@ -193,6 +193,25 @@ aussi `shell` et `json`. L'effacement du presse-papiers est une mesure de meille
 son contenu protège la nouvelle valeur, mais les gestionnaires de presse-papiers, la suspension ou
 l'arrêt du processus auxiliaire peuvent conserver une copie.
 
+`sotto run` lance la commande avec votre environnement actuel plus les secrets de l'environnement
+sélectionné. Un secret remplace une variable héritée du même nom, et les variables sans rapport sont
+conservées. Dans ce cas, Sotto écrit `warning: overriding inherited environment variable NAME` sur
+stderr, jamais la valeur. Seuls la commande et ses descendants voient les secrets ; l'environnement
+de votre shell n'est pas modifié ensuite. Pour utiliser un autre environnement, placez `--env` avant
+`--` (voir [Environnements](#environnements) ; [Importer un fichier dotenv](#importer-un-fichier-dotenv)
+explique comment en remplir un).
+
+Sotto exécute le programme directement : il ne développe pas les variables et n'interprète ni les
+tubes ni les redirections dans ses arguments. Votre propre shell traite toujours sa syntaxe avant le
+démarrage de Sotto : `sotto run -- echo "$EXAMPLE"` affiche la valeur de `EXAMPLE` dans le shell
+parent, pas celle injectée. Pour développer une variable dans le processus enfant, lancez un shell
+comme commande et mettez le script entre apostrophes (shells POSIX). Dans cet exemple fictif,
+supposez que `EXAMPLE` est enregistré dans Sotto avec la valeur `demo-only` :
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
 Jusqu'ici, tout reste sur votre machine. Pour synchroniser un autre appareil, travailler en équipe
 ou utiliser la CI, connectez-vous à un serveur :
 

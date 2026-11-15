@@ -190,6 +190,25 @@ akzeptiert außerdem `shell` und `json`. Das Löschen der Zwischenablage erfolgt
 Das Ersetzen des Inhalts schützt den neuen Wert, während Zwischenablage-Manager, Ruhezustand oder
 ein beendeter Hilfsprozess eine Kopie behalten können.
 
+`sotto run` startet den Befehl mit deiner aktuellen Umgebung plus den Geheimnissen der gewählten
+Umgebung. Ein Geheimnis ersetzt eine geerbte Variable gleichen Namens, nicht zugehörige Variablen
+bleiben erhalten. In diesem Fall schreibt Sotto `warning: overriding inherited environment variable NAME`
+nach stderr, nie den Wert. Nur der Befehl und seine Nachfahren sehen die Geheimnisse; die Umgebung
+deiner Shell bleibt danach unverändert. Für eine andere Umgebung setze `--env` vor `--` (siehe
+[Umgebungen](#umgebungen); [Eine dotenv-Datei importieren](#eine-dotenv-datei-importieren) zeigt, wie
+man eine füllt).
+
+Sotto führt das Programm direkt aus und expandiert daher weder Variablen noch interpretiert es
+Pipes oder Umleitungen in seinen Argumenten. Deine eigene Shell verarbeitet ihre Syntax weiterhin,
+bevor Sotto startet: `sotto run -- echo "$EXAMPLE"` gibt den Wert von `EXAMPLE` aus der
+übergeordneten Shell aus, nicht den injizierten. Um eine Variable im Kindprozess zu expandieren,
+starte eine Shell als Befehl und setze das Skript in einfache Anführungszeichen (POSIX-Shells). In
+diesem fiktiven Beispiel ist `EXAMPLE` mit dem Wert `demo-only` in Sotto gespeichert:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
 Bis hierhin bleibt alles auf deinem Rechner. Um ein weiteres Gerät zu synchronisieren, im Team zu
 arbeiten oder CI zu nutzen, melde dich bei einem Server an:
 

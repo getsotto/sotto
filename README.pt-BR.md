@@ -190,6 +190,25 @@ aceita `shell` e `json`. A limpeza da área de transferência é uma medida de m
 substituir o conteúdo protege o novo valor, enquanto gerenciadores da área de transferência,
 suspensão ou encerramento do processo auxiliar podem manter uma cópia.
 
+`sotto run` inicia o comando com o seu ambiente atual mais os segredos do ambiente selecionado. Um
+segredo substitui uma variável herdada de mesmo nome, e as variáveis sem relação são mantidas.
+Quando isso acontece, o Sotto escreve `warning: overriding inherited environment variable NAME` no
+stderr, nunca o valor. Somente o comando e seus descendentes veem os segredos; o ambiente do seu
+shell não muda depois. Para usar outro ambiente, coloque `--env` antes de `--` (veja
+[Ambientes](#ambientes); [Importar um arquivo dotenv](#importar-um-arquivo-dotenv) mostra como
+preencher um).
+
+O Sotto executa o programa diretamente, então não expande variáveis nem interpreta pipes ou
+redirecionamentos nos seus argumentos. O seu próprio shell ainda processa a sintaxe dele antes de o
+Sotto iniciar: `sotto run -- echo "$EXAMPLE"` imprime o valor de `EXAMPLE` no shell pai, não o
+injetado. Para expandir uma variável dentro do processo filho, execute um shell como comando e
+coloque o script entre aspas simples (shells POSIX). Neste exemplo fictício, suponha que `EXAMPLE`
+esteja armazenado no Sotto com o valor `demo-only`:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
 Até aqui, tudo fica na sua máquina. Para sincronizar outro dispositivo, trabalhar em equipe ou usar
 CI, faça login em um servidor:
 
