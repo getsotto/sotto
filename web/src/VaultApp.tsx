@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { fetchAccount, logout, me } from "./api";
 import { startLogin } from "./login";
 import { Shell } from "./Shell";
-import { deriveMasterKey } from "./vault";
+import { deriveMasterKey, verifyAccountKeys } from "./vault";
 import { VaultView } from "./VaultView";
 
 type Phase =
@@ -119,6 +119,7 @@ export function VaultApp() {
       return (
         <UnlockForm
           salt={phase.salt}
+          encPrivateKeys={phase.encPrivateKeys}
           onUnlock={(master) =>
             setPhase({ kind: "unlocked", master, encPrivateKeys: phase.encPrivateKeys })
           }
@@ -138,24 +139,34 @@ export function VaultApp() {
 
 function UnlockForm({
   salt,
+  encPrivateKeys,
   onUnlock,
   onLogout,
 }: {
   salt: Uint8Array;
+  encPrivateKeys: Uint8Array;
   onUnlock: (master: Uint8Array) => void;
   onLogout: () => void;
 }) {
   const [password, setPassword] = useState("");
   const [secretKey, setSecretKey] = useState("");
+  const [secretKeyVisible, setSecretKeyVisible] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function unlock() {
     setBusy(true);
     setError(null);
+    setSecretKeyVisible(false);
+    let master: Uint8Array | null = null;
     try {
-      onUnlock(await deriveMasterKey(password, secretKey, salt));
+      master = await deriveMasterKey(password, secretKey, salt);
+      // Any password and secret key derive *some* key; only opening the account's sealed private
+      // keys proves they were the right ones, so check that before showing the vault.
+      verifyAccountKeys(master, encPrivateKeys);
+      onUnlock(master);
     } catch {
+      master?.fill(0);
       setError("Couldn't unlock - check your master password and secret key.");
       setBusy(false);
     }
@@ -178,10 +189,27 @@ function UnlockForm({
           Master password
           <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
         </label>
-        <label>
-          Secret key (SK1-…)
-          <input type="password" value={secretKey} onChange={(e) => setSecretKey(e.target.value)} />
-        </label>
+        <div className="secret-key-field">
+          <label htmlFor="unlock-secret-key">Secret key (SK1-…)</label>
+          <div className="secret-key-controls">
+            <input
+              id="unlock-secret-key"
+              className="secret-key"
+              type={secretKeyVisible ? "text" : "password"}
+              value={secretKey}
+              onChange={(e) => setSecretKey(e.target.value)}
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              className="ghost sm"
+              disabled={busy}
+              onClick={() => setSecretKeyVisible((visible) => !visible)}
+            >
+              {secretKeyVisible ? "Hide secret key" : "Show secret key"}
+            </button>
+          </div>
+        </div>
         <button className="primary" type="submit" disabled={busy}>
           {busy ? "Deriving key…" : "Unlock"}
         </button>

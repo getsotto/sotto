@@ -14,6 +14,7 @@ vi.mock("../api", () => ({
 
 vi.mock("../vault", () => ({
   deriveMasterKey: vi.fn(),
+  verifyAccountKeys: vi.fn(),
 }));
 
 vi.mock("../VaultView", () => ({
@@ -210,6 +211,102 @@ describe("VaultApp startup transitions", () => {
   });
 });
 
+describe("VaultApp secret key visibility", () => {
+  async function showUnlockForm() {
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    vi.mocked(api.fetchAccount).mockResolvedValue(account());
+    render(<VaultApp />);
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+  }
+
+  it("masks the secret key by default and round-trips show/hide without changing the value", async () => {
+    await showUnlockForm();
+
+    const secretKey = screen.getByLabelText("Secret key (SK1-…)");
+    expect(secretKey).toHaveAttribute("type", "password");
+    expect(screen.getByRole("button", { name: "Show secret key" })).toHaveAttribute(
+      "type",
+      "button",
+    );
+
+    fireEvent.change(secretKey, { target: { value: "SK1-visible-check" } });
+    fireEvent.click(screen.getByRole("button", { name: "Show secret key" }));
+
+    expect(secretKey).toHaveAttribute("type", "text");
+    expect(secretKey).toHaveValue("SK1-visible-check");
+    expect(screen.getByRole("button", { name: "Hide secret key" })).toBeInTheDocument();
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide secret key" }));
+
+    expect(secretKey).toHaveAttribute("type", "password");
+    expect(secretKey).toHaveValue("SK1-visible-check");
+    expect(screen.getByRole("button", { name: "Show secret key" })).toBeInTheDocument();
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+  });
+
+  it("does not submit the unlock form when the visibility control is activated", async () => {
+    await showUnlockForm();
+
+    fireEvent.change(screen.getByLabelText("Master password"), {
+      target: { value: "master password" },
+    });
+    fireEvent.change(screen.getByLabelText("Secret key (SK1-…)"), {
+      target: { value: "SK1-test" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Show secret key" }));
+
+    expect(vaultCrypto.deriveMasterKey).not.toHaveBeenCalled();
+    expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Secret key (SK1-…)")).toHaveAttribute("type", "text");
+  });
+
+  it("masks the secret key when unlock starts and keeps it masked after a failed attempt", async () => {
+    const storedAccount = account();
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    vi.mocked(api.fetchAccount).mockResolvedValue(storedAccount);
+    const firstDerivation = deferred<Uint8Array>();
+    vi.mocked(vaultCrypto.deriveMasterKey).mockReturnValueOnce(firstDerivation.promise);
+
+    render(<VaultApp />);
+
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Master password"), {
+      target: { value: "wrong password" },
+    });
+    fireEvent.change(screen.getByLabelText("Secret key (SK1-…)"), {
+      target: { value: "SK1-test" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Show secret key" }));
+    expect(screen.getByLabelText("Secret key (SK1-…)")).toHaveAttribute("type", "text");
+
+    fireEvent.click(screen.getByRole("button", { name: "Unlock" }));
+
+    expect(screen.getByLabelText("Secret key (SK1-…)")).toHaveAttribute("type", "password");
+    expect(screen.getByLabelText("Secret key (SK1-…)")).toHaveValue("SK1-test");
+    expect(screen.getByRole("button", { name: "Show secret key" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Deriving key…" })).toBeDisabled();
+
+    await act(async () => {
+      firstDerivation.reject(new Error("internal derivation detail"));
+    });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Couldn't unlock - check your master password and secret key.",
+    );
+    expect(screen.getByLabelText("Secret key (SK1-…)")).toHaveAttribute("type", "password");
+    expect(screen.getByLabelText("Secret key (SK1-…)")).toHaveValue("SK1-test");
+    expect(screen.getByRole("button", { name: "Show secret key" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Unlock" })).toBeEnabled();
+    expect(vaultCrypto.deriveMasterKey).toHaveBeenCalledTimes(1);
+    expect(vaultCrypto.deriveMasterKey).toHaveBeenCalledWith(
+      "wrong password",
+      "SK1-test",
+      storedAccount.salt,
+    );
+  });
+});
+
 describe("VaultApp unlock retries", () => {
   it("recovers from a derivation failure using the latest form values", async () => {
     vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
@@ -258,6 +355,61 @@ describe("VaultApp unlock retries", () => {
       storedAccount.salt,
     );
     expect(await screen.findByText("vault-view")).toBeInTheDocument();
+  });
+});
+
+describe("VaultApp unlock verification", () => {
+  const GENERIC = "Couldn't unlock - check your master password and secret key.";
+
+  async function submitUnlock(password = "pw", secretKey = "SK1-test") {
+    vi.mocked(api.me).mockResolvedValue({ userId: "u1" });
+    vi.mocked(api.fetchAccount).mockResolvedValue(account());
+    render(<VaultApp />);
+    expect(await screen.findByText("Unlock your vault")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Master password"), { target: { value: password } });
+    fireEvent.change(screen.getByLabelText("Secret key (SK1-…)"), { target: { value: secretKey } });
+    fireEvent.click(screen.getByRole("button", { name: "Unlock" }));
+  }
+
+  it("checks the derived key against the account key material before showing the vault", async () => {
+    const master = new Uint8Array([7, 7, 7]);
+    vi.mocked(vaultCrypto.deriveMasterKey).mockResolvedValue(master);
+
+    await submitUnlock();
+
+    expect(await screen.findByText("vault-view")).toBeInTheDocument();
+    expect(vaultCrypto.verifyAccountKeys).toHaveBeenCalledExactlyOnceWith(master, account().encPrivateKeys);
+    expect(master).toEqual(new Uint8Array([7, 7, 7]));
+  });
+
+  it.each([
+    ["a wrong password or secret key", "aead: authentication failed"],
+    ["damaged account key material", "envelope: malformed"],
+  ])("stays locked and wipes the derived key on %s", async (_, detail) => {
+    const master = new Uint8Array([7, 7, 7]);
+    vi.mocked(vaultCrypto.deriveMasterKey).mockResolvedValue(master);
+    vi.mocked(vaultCrypto.verifyAccountKeys).mockImplementation(() => {
+      throw new Error(detail);
+    });
+
+    await submitUnlock("wrong password");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(GENERIC);
+    expect(screen.getByRole("alert")).not.toHaveTextContent(detail);
+    expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
+    expect(screen.getByText("Unlock your vault")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Unlock" })).toBeEnabled();
+    expect(master).toEqual(new Uint8Array([0, 0, 0]));
+  });
+
+  it("does not try to verify when the secret key can't even be decoded", async () => {
+    vi.mocked(vaultCrypto.deriveMasterKey).mockRejectedValue(new Error("format: bad prefix"));
+
+    await submitUnlock("pw", "not-a-key");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(GENERIC);
+    expect(vaultCrypto.verifyAccountKeys).not.toHaveBeenCalled();
+    expect(screen.queryByText("vault-view")).not.toBeInTheDocument();
   });
 });
 

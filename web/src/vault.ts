@@ -18,6 +18,7 @@ import {
   vault_grant_key,
   vault_open_grant,
   vault_rewrap_data_key,
+  vault_verify_account,
 } from "./wasm";
 
 const TEXT = new TextEncoder();
@@ -41,6 +42,13 @@ export async function deriveMasterKey(
   await loadWasm();
   const secretKeyBytes = format_decode_key("SK", 1, secretKey.trim());
   return kdf_derive_master_key(TEXT.encode(password), secretKeyBytes, salt);
+}
+
+/// Throw unless `master` opens the account's sealed private keys. Deriving a master key never
+/// fails on a wrong password or secret key, so this is what proves an unlock before the vault is
+/// shown. Nothing is returned: the private key stays inside WASM.
+export function verifyAccountKeys(master: Uint8Array, encPrivateKeys: Uint8Array): void {
+  vault_verify_account(master, encPrivateKeys);
 }
 
 /// Open an environment's vault-key grant: recover the account keypair from the master-sealed
