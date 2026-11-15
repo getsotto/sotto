@@ -1585,6 +1585,11 @@ docker compose -f docker-compose.prod.yml ps               # health at a glance
 ```
 
 - Postgres is **not** exposed outside the compose network; only Caddy publishes ports.
+- The Caddy container is granted `NET_ADMIN` for one purpose: its entrypoint
+  ([`edge-entrypoint.sh`](edge-entrypoint.sh)) raises TCP's initial congestion window, so a
+  response of up to about 58 KB leaves in the first flight instead of waiting a round trip per
+  doubling, then removes the capability before Caddy starts. Delete the `cap_add` entry to opt
+  out; the container logs that the kernel default is in use and runs as before.
 - Certificates and Caddy state persist in the `caddy_data` volume; database data in `pgdata`.
 - The API route list lives in the repo-root [`Caddyfile`](../Caddyfile) (baked into the web
   image at build time) - pulling the matching image version picks up route changes automatically.
