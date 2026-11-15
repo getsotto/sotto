@@ -291,6 +291,34 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 environment) or `>` (only in the second). Without `--confirm`, copying is a dry-run. A confirmed
 copy adds and updates secrets but leaves keys that exist only in the destination untouched.
 
+For scripts, use JSON instead of reading the listing's active marker:
+
+```sh
+sotto env ls --json
+```
+
+Illustrative output for a project with two local environments:
+
+```json
+[{"active":true,"name":"dev"},{"active":false,"name":"staging"}]
+```
+
+Each object has an environment `name` and an `active` flag. An empty list is `[]`.
+To select staging for this command only:
+
+```sh
+sotto --env staging env ls --json
+```
+
+Here, `active` marks staging instead of dev. This does not save a new default;
+use `sotto env use` for that, as described above. If the selected name is absent
+from the local list, every flag is false. The flag compares names; it does not
+prove access to an environment or successful decryption.
+
+This reads the configured project's local environment metadata without unlocking
+the vault or contacting the server. Unlike `sotto ls --json`, it lists environments,
+not secret names. Stdout contains the JSON result; diagnostics go to stderr.
+
 ### Project configuration
 
 `sotto init` and `sotto clone` write a `sotto.toml` in the current directory. It binds that

@@ -295,6 +295,34 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 ambiente) ou `>` (só no segundo). Sem `--confirm`, a cópia é uma simulação. Uma cópia confirmada
 adiciona e atualiza segredos, mas mantém intactas as chaves que existem apenas no destino.
 
+Para scripts, use JSON em vez de ler o marcador de ambiente ativo:
+
+```sh
+sotto env ls --json
+```
+
+Exemplo de saída para um projeto com dois ambientes locais:
+
+```json
+[{"active":true,"name":"dev"},{"active":false,"name":"staging"}]
+```
+
+Cada objeto tem um nome de ambiente `name` e um indicador `active`. Uma lista vazia é `[]`.
+Para selecionar staging apenas para este comando:
+
+```sh
+sotto --env staging env ls --json
+```
+
+Aqui, `active` marca staging em vez de dev. Isso não salva um novo padrão;
+use `sotto env use` para isso, como explicado acima. Se o nome selecionado não estiver
+na lista local, todos os indicadores serão falsos. O indicador compara nomes;
+não comprova acesso a um ambiente nem uma descriptografia bem-sucedida.
+
+O comando lê os metadados locais dos ambientes do projeto configurado sem desbloquear
+o cofre nem contatar o servidor. Ao contrário de `sotto ls --json`, ele lista ambientes,
+não nomes de segredos. A saída padrão contém JSON; os diagnósticos vão para a saída de erro padrão.
+
 ### Configuração do projeto
 
 `sotto init` e `sotto clone` gravam um `sotto.toml` no diretório atual. Ele vincula esse diretório a
