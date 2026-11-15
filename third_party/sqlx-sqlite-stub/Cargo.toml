@@ -1,0 +1,34 @@
+# Empty stand-in for sqlx's SQLite driver. Sotto never enables it (the server and the CLI's tests
+# use PostgreSQL only), but Cargo locks every optional dependency, and the real driver requires
+# libsqlite3-sys below 0.38 in every published release up to sqlx 0.9.0. Only one crate in a
+# lockfile may link `sqlite3`, so that requirement blocked rusqlite 0.41 and the patched SQLite
+# 3.54 it bundles (RUSTSEC-2026-0459).
+#
+# This crate is never compiled: nothing activates it. If a future change enables sqlx's `sqlite`
+# feature the build fails on the missing driver rather than silently using this, which is the
+# intended signal to revisit.
+#
+# The version must satisfy sqlx's exact `=0.8.6` requirement, so a sqlx upgrade breaks resolution
+# until this is updated or removed. Remove it, and the [patch.crates-io] entry in the root
+# Cargo.toml, once sqlx-sqlite accepts libsqlite3-sys 0.39 or newer. The features mirror the names
+# sqlx and sqlx-macros-core forward to the real driver.
+[package]
+name = "sqlx-sqlite"
+version = "0.8.6"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[features]
+any = []
+bundled = []
+chrono = []
+json = []
+migrate = []
+offline = []
+preupdate-hook = []
+regexp = []
+time = []
+unbundled = []
+uuid = []
