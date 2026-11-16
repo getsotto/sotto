@@ -77,6 +77,8 @@ eso es posible que un comando descrito aquí aún no exista en la versión que t
 Consulta [COMPATIBILITY.md](COMPATIBILITY.md) para ver los requisitos de versión de las
 integraciones, las plataformas declaradas y las pruebas disponibles actualmente.
 
+Para elegir una versión o carpeta de instalación, consulta las [opciones y ejemplos del instalador (en inglés)](INSTALLING.md).
+
 ### Homebrew (versión preliminar)
 
 El [tap de Sotto](https://github.com/getsotto/homebrew-tap) ofrece otra vía de
@@ -191,6 +193,24 @@ plano, por lo que necesita `--reveal` en un terminal, igual que `sotto get`; `--
 contenido se protege el nuevo valor, mientras que los gestores del portapapeles, la suspensión o la
 terminación del proceso auxiliar pueden conservar una copia.
 
+`sotto run` inicia el comando con tu entorno actual más los secretos del entorno seleccionado. Un
+secreto reemplaza a una variable heredada con el mismo nombre, y las variables sin relación se
+conservan. Cuando ocurre, Sotto escribe `warning: overriding inherited environment variable NAME` en
+stderr, nunca el valor. Solo el comando y sus descendientes ven los secretos; el entorno de tu shell
+no cambia después. Para usar otro entorno, pon `--env` antes de `--` (consulta
+[Entornos](#entornos); [Importar un archivo dotenv](#importar-un-archivo-dotenv) explica cómo llenarlo).
+
+Sotto ejecuta el programa directamente, por lo que no expande variables ni interpreta tuberías ni
+redirecciones en sus argumentos. Tu propio shell sigue procesando su sintaxis antes de que arranque
+Sotto: `sotto run -- echo "$EXAMPLE"` muestra el valor de `EXAMPLE` en el shell padre, no el
+inyectado. Para expandir una variable dentro del proceso hijo, ejecuta un shell como comando y pon el
+script entre comillas simples (shells POSIX). En este ejemplo ficticio, supón que `EXAMPLE` está
+guardado en Sotto con el valor `demo-only`:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
 Hasta aquí todo se queda en tu máquina. Para sincronizar otro dispositivo, trabajar en equipo o usar
 CI, inicia sesión en un servidor:
 
@@ -207,6 +227,7 @@ servidor que elegiste. En cualquier caso el servidor solo almacena texto cifrado
 `/app` del mismo servidor descifra en tu navegador, con claves que nunca salen de tus dispositivos.
 
 Para explorar los secretos de forma interactiva, consulta la [guía del panel](#panel-interactivo).
+Para guardar un archivo completo como un solo secreto, consulta [Secretos a partir de archivos](#secretos-a-partir-de-archivos).
 
 Si el navegador no se abre o el inicio de sesión caduca, consulta [Solución de problemas al iniciar sesión](#solución-de-problemas-al-iniciar-sesión).
 
@@ -365,6 +386,42 @@ pero un fallo durante la escritura no deshace las asignaciones ya guardadas, as�
 Para recuperar un valor anterior, consulta [Restaurar una versión anterior de un secreto](#restaurar-una-versión-anterior-de-un-secreto).
 Ese historial procede del servidor, así que solo sirve para valores que ya habías subido. Ejecuta
 `sotto import --help` para ver las reglas de comillas y de valores literales en lugar de repetirlas aquí.
+
+### Secretos a partir de archivos
+
+El valor de un secreto son bytes, no solo texto, así que puedes guardar un archivo completo (un
+certificado, un archivo de clave o un binario pequeño) como un solo secreto. Necesitas un proyecto
+inicializado y un almacén local desbloqueado. Este ejemplo para shell POSIX usa un archivo sintético
+y comprueba la ida y vuelta byte a byte sin imprimir el valor:
+
+```sh
+printf 'synthetic-demo-bytes\001\377\n' > example-input.bin   # a made-up file, not a real secret
+sotto set EXAMPLE_FILE --stdin < example-input.bin
+sotto get EXAMPLE_FILE > example-output.bin                   # redirected, so nothing is printed
+cmp example-input.bin example-output.bin && echo "round-trip OK"
+rm example-input.bin example-output.bin
+```
+
+`--stdin` lee hasta el final del archivo y conserva cada byte: no se recorta nada, ni siquiera un
+salto de línea final. Toda la entrada se convierte en un único valor; no se interpreta como dotenv,
+así que usa [`sotto import`](#importar-un-archivo-dotenv) para un archivo de asignaciones. Cuando la
+salida de `sotto get` se redirige o se envía por una tubería, escribe exactamente los bytes guardados
+y no añade un salto de línea. El archivo de salida contiene texto plano, así que bórralo al terminar
+y nunca lo confirmes en el repositorio, ni siquiera como fixture de prueba.
+
+Solo `set --stdin` y `get` redirigido manejan bytes arbitrarios. Los comandos que tratan los secretos
+como texto necesitan UTF-8 válido:
+
+- `sotto run` y `sotto export` en texto plano, en cualquier `--format`, leen todas las entradas del
+  entorno seleccionado. Un solo valor que no sea UTF-8 válido detiene todo el comando con un error;
+  el valor no se omite ni se convierte a Base64.
+- `sotto get NAME --copy` también necesita UTF-8 válido. Usa `get` redirigido para recuperar bytes
+  arbitrarios.
+
+Guarda los valores binarios en un entorno aparte si también inyectas ese entorno con `sotto run`.
+Esta recuperación a un archivo de texto plano no es una copia de seguridad: para una copia cifrada de
+tu cuenta, usa la exportación cifrada de la página de cuenta de Sotto Cloud en `/cloud`, y para el
+historial consulta [Restaurar una versión anterior de un secreto](#restaurar-una-versión-anterior-de-un-secreto).
 
 ### Eliminar un secreto
 
@@ -735,6 +792,8 @@ El formato JSON es útil para scripts. Su estructura de nivel superior es:
 ```
 
 El ejemplo es sintético; `actions` y las fechas opcionales proceden del estado devuelto de la cuenta, y los servidores antiguos pueden devolver null para cualquiera de los dos endpoints. `sotto cloud status` solo informa del estado y puede mostrar una URL de facturación. No inicia una compra ni cambia la elegibilidad. Para diagnosticar el almacén local y los entornos, usa `sotto status`; esa vista es independiente de la información del servidor y de la cuenta anterior.
+
+Para añadir o quitar una dirección de correo para los avisos de Cloud, consulta la [guía de contactos de correo (en inglés)](CLOUD-EMAIL.md).
 
 Para trasladar la facturación personal a una organización desde la página de cuenta de Sotto Cloud,
 consulta la [guía de traslado de facturación](CLOUD-BILLING-TRANSFER.md).

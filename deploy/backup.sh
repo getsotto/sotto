@@ -28,8 +28,41 @@ log() {
 }
 
 STEP="reading configuration"
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+BUCKET=""
+UPLOADER=""
 DUMP=""
 JOURNAL=""
+
+# One attempt at one object. upload() below retries; the failure marker deliberately does not.
+put() {
+    case "$UPLOADER" in
+        gsutil) gsutil -q cp "$1" "$2" ;;
+        aws) aws s3 cp --only-show-errors "$1" "$2" ;;
+        rclone) rclone copyto "$1" "$2" ;;
+    esac
+}
+
+# The log above is on the host, and the freshness alarm can only see the bucket. So a failed run
+# also leaves an empty `sotto-<stamp>.failed.<step>` object there, and the alarm can name the step
+# without anyone logging in. The step goes in the name because the monitoring identity may list
+# objects but never read one. Best effort: if the uploader is what failed, the marker fails too,
+# and the alarm then says that nothing reached the bucket, which is still true.
+record_failure() {
+    if [ -z "$UPLOADER" ]; then
+        return 0
+    fi
+    # The step's wording without its destination, as lowercase words joined by hyphens.
+    step_id="$(printf '%s' "${STEP%% to *}" | tr ' ' '-' | tr -cd 'a-z-')"
+    marker="$(mktemp /tmp/sotto-backup-failed.XXXXXX)"
+    if put "$marker" "$BUCKET/sotto-$STAMP.failed.$step_id"; then
+        log "recorded the failure in the bucket as sotto-$STAMP.failed.$step_id" >&2
+    else
+        log "could not record the failure in the bucket either" >&2
+    fi
+    rm -f "$marker"
+}
+
 finish() {
     status=$?
     # Never leave a dump of the vault database in /tmp, on any exit path.
@@ -38,6 +71,7 @@ finish() {
     done
     if [ "$status" -ne 0 ]; then
         log "backup FAILED while $STEP (exit $status)" >&2
+        record_failure
     fi
 }
 trap finish EXIT
@@ -45,7 +79,19 @@ trap finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-log "backup started"
+# Which version of this script ran. Image deploys never move the host's git checkout, and a host
+# once ran a two-month-old copy of this file without anything showing it. A deployment that is not
+# a git checkout logs `unknown`, which is not a failure.
+log "backup started (script $(git -C .. rev-parse --short HEAD 2>/dev/null || echo unknown))"
+
+# A .env this user cannot read is not the same as a setting that is missing, and must not be
+# reported as one. Editing it with sudo can leave it owned by root with mode 600; every later step
+# then fails, docker compose included, since compose reads the same file. Older versions of this
+# script exited here without printing anything, which hid exactly that for over a week.
+if [ -e .env ] && [ ! -r .env ]; then
+    log "error: deploy/.env exists but $(id -un) cannot read it. If it was edited with sudo, give it back with: sudo chown $(id -un) $(pwd)/.env" >&2
+    exit 1
+fi
 
 # A missing .env is the unset case below, not a failure here: without `|| true`, set -e would end
 # the run on sed's exit status before the error that explains it.
@@ -75,8 +121,13 @@ for tool in docker python3 "$UPLOADER"; do
         exit 127
     fi
 done
+# `docker compose` is a plugin, not the binary: docker being present does not mean the
+# subcommand is installed, and without it the dump step is the first thing to fail.
+if ! docker compose version > /dev/null 2>&1; then
+    log "error: 'docker compose' is not available. Install the compose plugin; the docker binary alone is not enough." >&2
+    exit 127
+fi
 
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 DUMP="$(mktemp /tmp/sotto-pgdump.XXXXXX)"
 JOURNAL="$(mktemp /tmp/sotto-retention-journal.XXXXXX)"
 
@@ -99,12 +150,23 @@ STEP="validating the retention journal"
 
 DEST="$BUCKET/sotto-$STAMP.dump"
 JOURNAL_DEST="$BUCKET/sotto-$STAMP.tombstones.jsonl"
+# One missed night breaches the 26-hour freshness threshold, so a transient upload blip must
+# not fail the run. Retry briefly before giving up for the night. The `if` around `put`
+# is load-bearing: under `set -e` a bare failing upload would end the script on the first
+# attempt instead of reaching the retry.
 upload() {
-    case "$UPLOADER" in
-        gsutil) gsutil -q cp "$1" "$2" ;;
-        aws) aws s3 cp --only-show-errors "$1" "$2" ;;
-        rclone) rclone copyto "$1" "$2" ;;
-    esac
+    attempt=1
+    while :; do
+        if put "$1" "$2"; then
+            return 0
+        fi
+        if [ "$attempt" -ge 3 ]; then
+            return 1
+        fi
+        log "upload attempt $attempt for $2 failed, retrying" >&2
+        attempt=$((attempt + 1))
+        sleep 5
+    done
 }
 STEP="uploading the dump to $DEST"
 upload "$DUMP" "$DEST"

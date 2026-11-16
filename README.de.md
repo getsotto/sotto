@@ -77,6 +77,8 @@ beschriebener Befehl existiert in deiner installierten Version daher möglicherw
 In [COMPATIBILITY.md](COMPATIBILITY.md) findest du die Versionsanforderungen der Integrationen,
 die angegebenen Plattformen und die derzeit verfügbaren Testergebnisse.
 
+Für eine bestimmte Version oder einen anderen Installationsordner siehe die [Installationsoptionen und Beispiele (Englisch)](INSTALLING.md).
+
 ### Homebrew (Vorschau)
 
 Der [Sotto-Tap](https://github.com/getsotto/homebrew-tap) bietet einen weiteren
@@ -190,6 +192,25 @@ akzeptiert außerdem `shell` und `json`. Das Löschen der Zwischenablage erfolgt
 Das Ersetzen des Inhalts schützt den neuen Wert, während Zwischenablage-Manager, Ruhezustand oder
 ein beendeter Hilfsprozess eine Kopie behalten können.
 
+`sotto run` startet den Befehl mit deiner aktuellen Umgebung plus den Geheimnissen der gewählten
+Umgebung. Ein Geheimnis ersetzt eine geerbte Variable gleichen Namens, nicht zugehörige Variablen
+bleiben erhalten. In diesem Fall schreibt Sotto `warning: overriding inherited environment variable NAME`
+nach stderr, nie den Wert. Nur der Befehl und seine Nachfahren sehen die Geheimnisse; die Umgebung
+deiner Shell bleibt danach unverändert. Für eine andere Umgebung setze `--env` vor `--` (siehe
+[Umgebungen](#umgebungen); [Eine dotenv-Datei importieren](#eine-dotenv-datei-importieren) zeigt, wie
+man eine füllt).
+
+Sotto führt das Programm direkt aus und expandiert daher weder Variablen noch interpretiert es
+Pipes oder Umleitungen in seinen Argumenten. Deine eigene Shell verarbeitet ihre Syntax weiterhin,
+bevor Sotto startet: `sotto run -- echo "$EXAMPLE"` gibt den Wert von `EXAMPLE` aus der
+übergeordneten Shell aus, nicht den injizierten. Um eine Variable im Kindprozess zu expandieren,
+starte eine Shell als Befehl und setze das Skript in einfache Anführungszeichen (POSIX-Shells). In
+diesem fiktiven Beispiel ist `EXAMPLE` mit dem Wert `demo-only` in Sotto gespeichert:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
 Bis hierhin bleibt alles auf deinem Rechner. Um ein weiteres Gerät zu synchronisieren, im Team zu
 arbeiten oder CI zu nutzen, melde dich bei einem Server an:
 
@@ -206,6 +227,7 @@ Server weiter. In jedem Fall speichert der Server nur Chiffrat: Der Web-Tresor u
 demselben Server entschlüsselt in deinem Browser, mit Schlüsseln, die deine Geräte nie verlassen.
 
 Zum interaktiven Durchsuchen der Secrets siehe die [Dashboard-Anleitung](#interaktives-dashboard).
+Um eine ganze Datei als ein Secret zu speichern, siehe [Dateibasierte Secrets](#dateibasierte-secrets).
 
 Wenn sich der Browser nicht öffnet oder die Anmeldung abläuft, siehe [Anmeldeprobleme beheben](#anmeldeprobleme-beheben).
 
@@ -364,6 +386,42 @@ nach einem unterbrochenen Import daher `sotto ls --env staging`.
 Um einen früheren Wert zurückzuholen, siehe [Eine frühere Secret-Version wiederherstellen](#eine-frühere-secret-version-wiederherstellen).
 Dieser Verlauf stammt vom Server und hilft daher nur bei Werten, die Sie bereits hochgeladen hatten. Führen Sie
 `sotto import --help` aus, um die Regeln für Anführungszeichen und literale Werte nachzulesen, statt sie hier zu wiederholen.
+
+### Dateibasierte Secrets
+
+Ein Secret-Wert besteht aus Bytes, nicht nur aus Text. Du kannst also eine ganze Datei (ein
+Zertifikat, eine Schlüsseldatei oder eine kleine Binärdatei) als ein Secret speichern. Du brauchst
+ein initialisiertes Projekt und einen entsperrten lokalen Tresor. Dieses POSIX-Shell-Beispiel nutzt
+eine synthetische Datei und prüft den Hin- und Rückweg Byte für Byte, ohne den Wert auszugeben:
+
+```sh
+printf 'synthetic-demo-bytes\001\377\n' > example-input.bin   # a made-up file, not a real secret
+sotto set EXAMPLE_FILE --stdin < example-input.bin
+sotto get EXAMPLE_FILE > example-output.bin                   # redirected, so nothing is printed
+cmp example-input.bin example-output.bin && echo "round-trip OK"
+rm example-input.bin example-output.bin
+```
+
+`--stdin` liest bis zum Dateiende und behält jedes Byte: Nichts wird abgeschnitten, auch kein
+abschließender Zeilenumbruch. Die gesamte Eingabe wird ein einziger Secret-Wert; sie wird nicht als
+dotenv gelesen, nutze also [`sotto import`](#eine-dotenv-datei-importieren) für eine Datei mit
+Zuweisungen. Wenn die Ausgabe von `sotto get` umgeleitet oder per Pipe weitergegeben wird, schreibt
+es genau die gespeicherten Bytes und hängt keinen Zeilenumbruch an. Die Ausgabedatei enthält
+Klartext, also lösche sie danach und committe sie nie, auch nicht als Test-Fixture.
+
+Nur `set --stdin` und umgeleitetes `get` verarbeiten beliebige Bytes. Befehle, die Secrets als Text
+behandeln, brauchen gültiges UTF-8:
+
+- `sotto run` und Klartext-`sotto export` lesen in jedem `--format` alle Einträge der gewählten
+  Umgebung. Ein einziger Wert, der kein gültiges UTF-8 ist, bricht den ganzen Befehl mit einem
+  Fehler ab; der Wert wird weder übersprungen noch in Base64 umgewandelt.
+- `sotto get NAME --copy` braucht ebenfalls gültiges UTF-8. Nutze umgeleitetes `get`, um beliebige
+  Bytes abzurufen.
+
+Lege Binärwerte in eine eigene Umgebung, wenn du diese Umgebung auch mit `sotto run` einspeist.
+Dieser Abruf als Klartextdatei ist kein Backup: Für eine verschlüsselte Kopie deines Kontos nutze
+den verschlüsselten Export auf der Sotto-Cloud-Kontoseite unter `/cloud`, und für den Verlauf siehe
+[Eine frühere Secret-Version wiederherstellen](#eine-frühere-secret-version-wiederherstellen).
 
 ### Ein Secret entfernen
 
@@ -745,6 +803,8 @@ Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht 
 ```
 
 Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
+
+Zum Hinzufügen oder Entfernen einer E-Mail-Adresse für Cloud-Mitteilungen siehe die [Anleitung für E-Mail-Kontakte (Englisch)](CLOUD-EMAIL.md).
 
 Wie du die persönliche Abrechnung auf der Sotto-Cloud-Kontoseite an eine Organisation übergibst,
 steht in der [Anleitung zur Abrechnungsübertragung](CLOUD-BILLING-TRANSFER.md).

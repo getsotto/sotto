@@ -77,6 +77,8 @@ commande décrite ici n'existe donc peut-être pas encore dans la version que vo
 Consultez [COMPATIBILITY.md](COMPATIBILITY.md) pour connaître les versions requises par les
 intégrations, les plateformes annoncées et les tests actuellement disponibles.
 
+Pour choisir une version ou un dossier d'installation, consultez les [options et exemples de l'installateur (en anglais)](INSTALLING.md).
+
 ### Homebrew (aperçu)
 
 Le [tap Sotto](https://github.com/getsotto/homebrew-tap) propose une autre
@@ -193,6 +195,25 @@ aussi `shell` et `json`. L'effacement du presse-papiers est une mesure de meille
 son contenu protège la nouvelle valeur, mais les gestionnaires de presse-papiers, la suspension ou
 l'arrêt du processus auxiliaire peuvent conserver une copie.
 
+`sotto run` lance la commande avec votre environnement actuel plus les secrets de l'environnement
+sélectionné. Un secret remplace une variable héritée du même nom, et les variables sans rapport sont
+conservées. Dans ce cas, Sotto écrit `warning: overriding inherited environment variable NAME` sur
+stderr, jamais la valeur. Seuls la commande et ses descendants voient les secrets ; l'environnement
+de votre shell n'est pas modifié ensuite. Pour utiliser un autre environnement, placez `--env` avant
+`--` (voir [Environnements](#environnements) ; [Importer un fichier dotenv](#importer-un-fichier-dotenv)
+explique comment en remplir un).
+
+Sotto exécute le programme directement : il ne développe pas les variables et n'interprète ni les
+tubes ni les redirections dans ses arguments. Votre propre shell traite toujours sa syntaxe avant le
+démarrage de Sotto : `sotto run -- echo "$EXAMPLE"` affiche la valeur de `EXAMPLE` dans le shell
+parent, pas celle injectée. Pour développer une variable dans le processus enfant, lancez un shell
+comme commande et mettez le script entre apostrophes (shells POSIX). Dans cet exemple fictif,
+supposez que `EXAMPLE` est enregistré dans Sotto avec la valeur `demo-only` :
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
 Jusqu'ici, tout reste sur votre machine. Pour synchroniser un autre appareil, travailler en équipe
 ou utiliser la CI, connectez-vous à un serveur :
 
@@ -210,6 +231,7 @@ le serveur choisi. Dans tous les cas, le serveur ne stocke que du texte chiffré
 appareils.
 
 Pour parcourir les secrets de façon interactive, consultez le [guide du tableau de bord](#tableau-de-bord-interactif).
+Pour stocker un fichier entier comme un seul secret, consultez [Secrets issus de fichiers](#secrets-issus-de-fichiers).
 
 Si le navigateur ne s'ouvre pas ou si la connexion expire, voir [Dépanner la connexion](#dépanner-la-connexion).
 
@@ -370,6 +392,43 @@ vérifiez donc `sotto ls --env staging` après un import interrompu.
 Pour retrouver une valeur antérieure, voir [Restaurer une ancienne version d'un secret](#restaurer-une-ancienne-version-dun-secret).
 Cet historique provient du serveur : il ne sert donc que pour des valeurs déjà envoyées. Exécutez
 `sotto import --help` pour les règles de guillemets et de valeurs littérales plutôt que de les répéter ici.
+
+### Secrets issus de fichiers
+
+La valeur d'un secret est une suite d'octets, pas seulement du texte : vous pouvez donc garder un
+fichier entier (un certificat, un fichier de clé ou un petit binaire) comme un seul secret. Il vous
+faut un projet initialisé et un coffre local déverrouillé. Cet exemple pour shell POSIX utilise un
+fichier synthétique et vérifie l'aller-retour octet par octet sans afficher la valeur :
+
+```sh
+printf 'synthetic-demo-bytes\001\377\n' > example-input.bin   # a made-up file, not a real secret
+sotto set EXAMPLE_FILE --stdin < example-input.bin
+sotto get EXAMPLE_FILE > example-output.bin                   # redirected, so nothing is printed
+cmp example-input.bin example-output.bin && echo "round-trip OK"
+rm example-input.bin example-output.bin
+```
+
+`--stdin` lit jusqu'à la fin du fichier et garde chaque octet : rien n'est retiré, pas même un saut
+de ligne final. Toute l'entrée devient une seule valeur ; elle n'est pas lue comme un dotenv, donc
+utilisez [`sotto import`](#importer-un-fichier-dotenv) pour un fichier d'affectations. Quand la
+sortie de `sotto get` est redirigée ou passée dans un tube, il écrit exactement les octets stockés et
+n'ajoute pas de saut de ligne. Le fichier de sortie contient du texte en clair : supprimez-le ensuite
+et ne le committez jamais, même comme fixture de test.
+
+Seuls `set --stdin` et `get` redirigé gèrent des octets arbitraires. Les commandes qui traitent les
+secrets comme du texte exigent de l'UTF-8 valide :
+
+- `sotto run` et `sotto export` en clair, quel que soit `--format`, lisent toutes les entrées de
+  l'environnement choisi. Une seule valeur qui n'est pas de l'UTF-8 valide arrête toute la commande
+  avec une erreur ; la valeur n'est ni ignorée ni convertie en Base64.
+- `sotto get NAME --copy` exige aussi de l'UTF-8 valide. Utilisez `get` redirigé pour récupérer des
+  octets arbitraires.
+
+Placez les valeurs binaires dans un environnement à part si vous injectez aussi cet environnement
+avec `sotto run`. Cette récupération dans un fichier en clair n'est pas une sauvegarde : pour une
+copie chiffrée de votre compte, utilisez l'export chiffré de la page de compte Sotto Cloud sur
+`/cloud`, et pour l'historique consultez
+[Restaurer une ancienne version d'un secret](#restaurer-une-ancienne-version-dun-secret).
 
 ### Supprimer un secret
 
@@ -749,6 +808,8 @@ Le format JSON est pratique pour les scripts. Sa structure de premier niveau est
 ```
 
 L'exemple est synthétique ; `actions` et les dates facultatives proviennent de l'état renvoyé du compte, et les serveurs anciens peuvent renvoyer null pour l'un ou l'autre endpoint. `sotto cloud status` ne fait que signaler l'état et peut afficher une URL de facturation. Il ne lance pas d'achat et ne modifie pas l'éligibilité. Pour diagnostiquer le coffre local et les environnements, utilisez `sotto status` ; cette vue est distincte des informations du serveur et du compte ci-dessus.
+
+Pour ajouter ou supprimer une adresse pour les notifications Cloud, consultez le [guide des contacts par e-mail (en anglais)](CLOUD-EMAIL.md).
 
 Pour transférer la facturation personnelle à une organisation depuis la page de compte Sotto Cloud,
 consultez le [guide du transfert de facturation](CLOUD-BILLING-TRANSFER.md).

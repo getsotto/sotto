@@ -75,6 +75,8 @@ version supports.
 See [COMPATIBILITY.md](COMPATIBILITY.md) for integration version requirements, platform claims,
 and the evidence currently available for them.
 
+To choose a release or install folder, see [installer options and examples](INSTALLING.md).
+
 ### Homebrew (preview)
 
 The [Sotto tap](https://github.com/getsotto/homebrew-tap) provides another
@@ -187,6 +189,23 @@ plaintext, so it needs `--reveal` on a terminal, just like `sotto get`; `--forma
 `shell` and `json`. Clipboard clearing is best-effort: replacing the clipboard protects the newer
 content, while clipboard managers, suspension, or a terminated helper may retain a history copy.
 
+`sotto run` starts the command with your current environment plus the selected environment's
+secrets. A secret replaces an inherited variable of the same name, and unrelated variables are kept.
+When that happens Sotto writes `warning: overriding inherited environment variable NAME` to stderr,
+never the value. Only the command and its descendants see the secrets; your shell's environment is
+unchanged afterwards. To use another environment, put `--env` before the `--` (see
+[Environments](#environments); [Import a dotenv file](#import-a-dotenv-file) covers filling one).
+
+Sotto runs the program directly, so it does not expand variables or interpret pipes and redirects in
+its arguments. Your own shell still processes its syntax before Sotto starts: `sotto run -- echo "$EXAMPLE"`
+prints the parent shell's value of `EXAMPLE`, not the injected one. To expand a variable inside the
+child, run a shell as the command and quote the script with single quotes (POSIX shells). In this
+synthetic example, suppose `EXAMPLE` is stored in Sotto with the value `demo-only`:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
 Everything so far stays on your machine. To sync another device, work with a team or run CI, log
 in to a server:
 
@@ -203,6 +222,7 @@ Either way the server only ever stores ciphertext - the web vault at `/app` on t
 decrypts in your browser, with keys that never leave your devices.
 
 To browse secrets interactively, see the [dashboard guide](#interactive-dashboard).
+To store a whole file as one secret, see [File-backed secrets](#file-backed-secrets).
 
 If the browser does not open or sign-in times out, see [Troubleshooting login](#troubleshooting-login).
 
@@ -360,6 +380,40 @@ interrupted import.
 To get an earlier value back, see [Restore an earlier secret version](#restore-an-earlier-secret-version).
 That history comes from the server, so it only helps for values you had already pushed. Run
 `sotto import --help` for the quoting and literal-value rules instead of repeating them here.
+
+### File-backed secrets
+
+A secret value is bytes, not only text, so you can keep a whole file (a certificate, a key file or
+a small binary) as one secret. You need an initialised project and an unlocked local vault. This
+POSIX-shell example uses a synthetic file and checks the round-trip byte for byte without printing
+the value:
+
+```sh
+printf 'synthetic-demo-bytes\001\377\n' > example-input.bin   # a made-up file, not a real secret
+sotto set EXAMPLE_FILE --stdin < example-input.bin
+sotto get EXAMPLE_FILE > example-output.bin                   # redirected, so nothing is printed
+cmp example-input.bin example-output.bin && echo "round-trip OK"
+rm example-input.bin example-output.bin
+```
+
+`--stdin` reads until end of file and keeps every byte: nothing is trimmed, including a trailing
+newline. The whole input becomes one secret value; it is not parsed as dotenv, so use
+[`sotto import`](#import-a-dotenv-file) for a file of assignments. When the output of `sotto get` is
+redirected or piped, it writes the stored bytes exactly and does not add a newline. The output file
+holds plaintext, so delete it when you are done and never commit it, even as a test fixture.
+
+Only `set --stdin` and redirected `get` handle arbitrary bytes. Commands that treat secrets as text
+need valid UTF-8:
+
+- `sotto run` and plaintext `sotto export`, in every `--format`, read every entry in the selected
+  environment. One value that is not valid UTF-8 stops the whole command with an error; the value is
+  not skipped and is not converted to Base64.
+- `sotto get NAME --copy` also needs valid UTF-8. Use redirected `get` to retrieve arbitrary bytes.
+
+Keep binary values in a separate environment if you also inject that environment with `sotto run`.
+This plaintext file retrieval is not a backup: for an encrypted copy of your account, use the
+encrypted export on the Sotto Cloud account page at `/cloud`, and see
+[Restore an earlier secret version](#restore-an-earlier-secret-version) for history.
 
 ### Remove a secret
 
@@ -718,6 +772,8 @@ The JSON form is useful for scripts. Its top-level shape is:
 
 The example is synthetic; `actions` and the optional dates come from the returned account state, and older servers can return null for either endpoint. `sotto cloud status` only reports status and may print a billing URL. It does not start a purchase or change eligibility. For local vault and environment diagnostics, use `sotto status`; that view is separate from the server and account information above.
 
+To add or remove an email contact for Cloud notices, see the [email contact guide](CLOUD-EMAIL.md).
+
 To move personal billing to an organisation from the Sotto Cloud account page, see the
 [billing transfer guide](CLOUD-BILLING-TRANSFER.md).
 
@@ -747,6 +803,8 @@ Custom themes are TOML files in the `themes` directory inside your platform data
 directory). Each `*.toml` file needs the tokens below and takes its name from a `name` field,
 or from the filename when the field is absent; a file that fails to parse is skipped. Colours
 accept hex values, ANSI colour names, `ansi(<index>)` indices, and `default`.
+Both the theme list and the dashboard picker show the built-in presets first, followed
+by custom themes sorted by their displayed names, ignoring case.
 
 ```toml
 bg = "#120024"
