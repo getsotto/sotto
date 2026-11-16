@@ -111,6 +111,87 @@ describe("CloudAccountPanel cancellation", () => {
     expect(api.requestPersonalRefund).not.toHaveBeenCalled();
   });
 
+  it("retries only the personal billing read and shows the returned cancellation details", async () => {
+    let rejectInitial!: (reason: Error) => void;
+    let resolveRetry!: (value: PersonalLifecycle) => void;
+    vi.mocked(api.fetchEligibility).mockResolvedValue(paid);
+    vi.mocked(api.fetchPersonalLifecycle)
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectInitial = reject; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveRetry = resolve; }));
+
+    render(<CloudAccountPanel />);
+    expect(await screen.findByText("Loading personal billing details…")).toHaveAttribute("role", "status");
+    expect(screen.getByRole("button", { name: "Open billing portal" })).toBeEnabled();
+    expect(screen.getByRole("link", { name: "Back to vault" })).toHaveAttribute("href", "/app");
+    await act(async () => rejectInitial(new Error("read unavailable")));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Personal billing details could not be loaded.");
+    const retry = screen.getByRole("button", { name: "Retry billing details" });
+    // Two activations before React updates the error view still trigger one read.
+    act(() => {
+      fireEvent.click(retry);
+      fireEvent.click(retry);
+    });
+    expect(screen.getByText("Loading personal billing details…")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry billing details" })).not.toBeInTheDocument();
+    expect(api.fetchPersonalLifecycle).toHaveBeenCalledTimes(2);
+
+    await act(async () => resolveRetry({ ...activeLifecycle, cancelAtPeriodEnd: true }));
+    expect(screen.getByText(/Cancellation is scheduled/)).toBeInTheDocument();
+    expect(screen.queryByText("Loading personal billing details…")).not.toBeInTheDocument();
+    expect(api.fetchEligibility).toHaveBeenCalledOnce();
+    expect(api.fetchCloudNotices).toHaveBeenCalledOnce();
+    expect(api.createPersonalCheckout).not.toHaveBeenCalled();
+    expect(api.createPersonalPortal).not.toHaveBeenCalled();
+    expect(api.cancelPersonalBilling).not.toHaveBeenCalled();
+    expect(api.requestPersonalRefund).not.toHaveBeenCalled();
+    expect(api.startCloudExport).not.toHaveBeenCalled();
+  });
+
+  it("offers retry again after a second billing read fails", async () => {
+    vi.mocked(api.fetchEligibility).mockResolvedValue(paid);
+    vi.mocked(api.fetchPersonalLifecycle)
+      .mockRejectedValueOnce(new Error("read unavailable"))
+      .mockRejectedValueOnce(new Error("read still unavailable"))
+      .mockResolvedValueOnce({ ...activeLifecycle, cancelAtPeriodEnd: true });
+
+    render(<CloudAccountPanel />);
+    fireEvent.click(await screen.findByRole("button", { name: "Retry billing details" }));
+    await screen.findByRole("alert");
+    fireEvent.click(screen.getByRole("button", { name: "Retry billing details" }));
+    expect(await screen.findByText(/Cancellation is scheduled/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.fetchPersonalLifecycle).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not let a late billing read overwrite a successful cancellation", async () => {
+    let resolveRead!: (value: PersonalLifecycle) => void;
+    vi.mocked(api.fetchEligibility).mockResolvedValue(paid);
+    vi.mocked(api.fetchPersonalLifecycle).mockImplementation(
+      () => new Promise((resolve) => { resolveRead = resolve; }),
+    );
+    vi.mocked(api.cancelPersonalBilling).mockResolvedValue({
+      ...activeLifecycle, cancelAtPeriodEnd: true,
+    });
+
+    render(<CloudAccountPanel />);
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel at the end of the paid period" }));
+    expect(await screen.findByText(/Cancellation is scheduled/)).toBeInTheDocument();
+    await act(async () => resolveRead(activeLifecycle));
+    expect(screen.getByText(/Cancellation is scheduled/)).toBeInTheDocument();
+    expect(screen.queryByText("Loading personal billing details…")).not.toBeInTheDocument();
+  });
+
+  it("does not load personal billing details for sponsored access", async () => {
+    vi.mocked(api.fetchEligibility).mockResolvedValue({ ...paid, payer: null });
+    render(<CloudAccountPanel />);
+    expect(await screen.findByText(/Your hosted access is sponsored/)).toBeInTheDocument();
+    expect(screen.queryByText("Loading personal billing details…")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry billing details" })).not.toBeInTheDocument();
+    expect(api.fetchPersonalLifecycle).not.toHaveBeenCalled();
+  });
+
   it("hides cancellation when the server does not permit revocation", async () => {
     vi.mocked(api.fetchEligibility).mockResolvedValue({ ...paid, actions: { ...paid.actions, revoke: false } });
 
