@@ -77,6 +77,8 @@ eso es posible que un comando descrito aquí aún no exista en la versión que t
 Consulta [COMPATIBILITY.md](COMPATIBILITY.md) para ver los requisitos de versión de las
 integraciones, las plataformas declaradas y las pruebas disponibles actualmente.
 
+Para elegir una versión o carpeta de instalación, consulta las [opciones y ejemplos del instalador (en inglés)](INSTALLING.md).
+
 ### Homebrew (versión preliminar)
 
 El [tap de Sotto](https://github.com/getsotto/homebrew-tap) ofrece otra vía de
