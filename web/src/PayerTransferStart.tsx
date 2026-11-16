@@ -30,6 +30,27 @@ function money(pence: number): string {
   return new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(pence / 100);
 }
 
+function quoteHasExpired(quote: PayerTransferQuote): boolean {
+  const expiresAt = quote.quoteExpiresAtEpoch * 1000;
+  return !Number.isFinite(expiresAt) || expiresAt <= Date.now();
+}
+
+function useQuoteExpiry(quote: PayerTransferQuote | null): boolean {
+  const [expiredQuote, setExpiredQuote] = useState<PayerTransferQuote | null>(null);
+  useEffect(() => {
+    if (quote === null) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const check = () => {
+      const remaining = quote.quoteExpiresAtEpoch * 1000 - Date.now();
+      if (!Number.isFinite(remaining) || remaining <= 0) setExpiredQuote(quote);
+      else timer = setTimeout(check, Math.min(remaining, 2_147_483_647));
+    };
+    check();
+    return () => clearTimeout(timer);
+  }, [quote]);
+  return quote !== null && (expiredQuote === quote || quoteHasExpired(quote));
+}
+
 function beginNotice(state: string): string {
   if (state === "awaiting_consent") {
     return "Transfer request sent. The other payer must accept it; no billing change has happened yet.";
@@ -86,6 +107,7 @@ export function PersonalTransferStart() {
   const [members, setMembers] = useState<Member[]>([]);
   const [counterpartyId, setCounterpartyId] = useState("");
   const [quote, setQuote] = useState<PayerTransferQuote | null>(null);
+  const quoteExpired = useQuoteExpiry(quote);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [membersError, setMembersError] = useState<string | null>(null);
@@ -176,6 +198,7 @@ export function PersonalTransferStart() {
 
   async function requestQuote() {
     if (!userId || !destinationOrgId || !counterpartyId) return;
+    setQuote(null);
     setBusy(true); setError(null); setNotice(null);
     try {
       setQuote(await quotePayerTransfer({
@@ -196,7 +219,7 @@ export function PersonalTransferStart() {
   }
 
   async function createInvitation() {
-    if (quote === null) return;
+    if (quote === null || quoteExpired || quoteHasExpired(quote)) return;
     setBusy(true); setError(null); setNotice(null);
     try {
       const result = await beginPayerTransfer({ quote, idempotencyKey: idempotencyKey.current ?? crypto.randomUUID() });
@@ -235,7 +258,8 @@ export function PersonalTransferStart() {
       </button>}
       {error !== null && <p role="alert">{error}</p>}
       {notice !== null && <p className="notice" role="status">{notice}</p>}
-      {quote === null
+      {quoteExpired && !busy && <p role="status">This quote has expired. Review a new quote before sending a request.</p>}
+      {quote === null || (quoteExpired && !busy)
         ? <button disabled={formBusy || destinationOrgId === "" || counterpartyId === ""} onClick={() => void requestQuote()}>{busy ? "Loading transfer quote…" : "Review payer transfer"}</button>
         : <div className="notice" role="status">
           <p>At renewal on {date(quote.effectiveFrom)}, {quote.destinationKind === "sponsor" ? "the organisation" : "you"} would pay {money(quote.amountPence)} per {quote.interval}. No mid-term credit is due.</p>
@@ -265,6 +289,7 @@ export function SponsoredTransferStart({
   const [members, setMembers] = useState<Member[]>([]);
   const [counterpartyId, setCounterpartyId] = useState("");
   const [quote, setQuote] = useState<PayerTransferQuote | null>(null);
+  const quoteExpired = useQuoteExpiry(quote);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -309,6 +334,7 @@ export function SponsoredTransferStart({
     if (!beneficiaryId || !counterpartyId
       || (destinationKind === "personal" && !setupAvailable)
       || (destinationKind === "sponsor" && !destinationOrgId)) return;
+    setQuote(null);
     setBusy(true); setError(null); setNotice(null);
     try {
       setQuote(await quotePayerTransfer({
@@ -329,7 +355,7 @@ export function SponsoredTransferStart({
   }
 
   async function createInvitation() {
-    if (quote === null) return;
+    if (quote === null || quoteExpired || quoteHasExpired(quote)) return;
     setBusy(true); setError(null); setNotice(null);
     try {
       const result = await beginPayerTransfer({ quote, idempotencyKey: idempotencyKey.current ?? crypto.randomUUID() });
@@ -377,7 +403,8 @@ export function SponsoredTransferStart({
     </>}
     {error !== null && <p role="alert">{error}</p>}
     {notice !== null && <p className="notice" role="status">{notice}</p>}
-    {quote === null
+    {quoteExpired && !busy && <p role="status">This quote has expired. Review a new quote before sending a request.</p>}
+    {quote === null || (quoteExpired && !busy)
       ? <button disabled={busy || beneficiaryId === "" || counterpartyId === "" || (destinationKind === "personal" && !setupAvailable) || (destinationKind === "sponsor" && destinationOrgId === "")} onClick={() => void requestQuote()}>{busy ? "Loading transfer quote…" : "Review payer transfer"}</button>
       : <div className="notice" role="status">
         <p>At renewal on {date(quote.effectiveFrom)}, {quote.destinationKind === "sponsor" ? "the destination organisation" : "the member"} would pay {money(quote.amountPence)} per {quote.interval}. No mid-term credit is due.</p>
