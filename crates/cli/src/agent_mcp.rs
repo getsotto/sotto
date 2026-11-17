@@ -232,11 +232,13 @@ impl SottoMcpServer {
                             if line.trim().is_empty() {
                                 continue;
                             }
-                            // A failed write means the client is going away;
-                            // the read side will report the disconnect.
-                            let _ = self
+                            if let Err(error) = self
                                 .handle_message(&line, &writer, &inflight, &mut tasks, &mut initialized)
-                                .await;
+                                .await
+                            {
+                                outcome = Err(error);
+                                break;
+                            }
                         }
                         Ok(None) => break,
                         Err(error) => {
@@ -1026,6 +1028,70 @@ mod tests {
             .unwrap();
         assert!(!shutdown_marker.exists());
         client.close().await;
+    }
+
+    struct FailingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            _buffer: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test broken pipe",
+            )))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_response_write_terminates_the_server() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let keychain = MemoryKeychain::default();
+        let server = SottoMcpServer::new(
+            root.path().to_path_buf(),
+            store,
+            keychain,
+            ApprovalStore::open(data.path()).unwrap(),
+        );
+        let (client_transport, server_reader) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_transport(server_reader, FailingWriter, std::future::pending())
+                .await
+        });
+        let (_client_reader, mut client_writer) = tokio::io::split(client_transport);
+        client_writer
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"sotto-test\",\"version\":\"1\"}}}\n")
+            .await
+            .unwrap();
+        client_writer.flush().await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("a failed write should end the server")
+            .unwrap()
+            .expect_err("a failed write should be reported");
+        assert!(
+            error.to_string().contains("writing MCP response"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
