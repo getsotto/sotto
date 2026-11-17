@@ -488,4 +488,63 @@ mod tests {
             Err(Error::NotFound(_))
         ));
     }
+
+    #[test]
+    fn rollback_restores_invalid_utf8_value_with_nul_bytes_exactly() {
+        let (store, keychain, config) = unlocked();
+        let app = App::new(&store, &keychain);
+
+        // Synthetic bytes that are not valid UTF-8 (0xFF never occurs in UTF-8, 0x80 is a lone
+        // continuation byte) and carry embedded NULs, so any text or C-string handling would
+        // corrupt them.
+        let v1: &[u8] = b"\xff\x00\x80bin\x00\xfe";
+        let v2: &[u8] = b"\x00v2-binary\xc3";
+        assert!(v1.contains(&0));
+        assert_ne!(v1, v2);
+
+        app.set(&config, "BLOB", v1).unwrap();
+        app.set(&config, "BLOB", v2).unwrap();
+        let before = app.secret_history(&config, "BLOB").unwrap();
+
+        // Roll back to version 1 (restores it as version 3).
+        app.rollback(&config, "BLOB", 1).unwrap();
+        assert_eq!(app.get(&config, "BLOB").unwrap(), v1);
+
+        let history = app.secret_history(&config, "BLOB").unwrap();
+        let versions: Vec<i64> = history.iter().map(|item| item.version).collect();
+        assert_eq!(versions, vec![3, 2, 1]);
+        assert_eq!(history[0].value.as_deref(), Some(v1));
+        assert_eq!(history[1].value.as_deref(), Some(v2));
+        assert_eq!(history[2].value.as_deref(), Some(v1));
+        // The earlier versions are left exactly as they were, timestamps included.
+        assert_eq!(history[1..], before[..]);
+    }
+
+    #[test]
+    fn rollback_restores_empty_value_as_present() {
+        let (store, keychain, config) = unlocked();
+        let app = App::new(&store, &keychain);
+
+        let v1: &[u8] = b"";
+        let v2: &[u8] = b"non-empty";
+
+        app.set(&config, "EMPTY", v1).unwrap();
+        app.set(&config, "EMPTY", v2).unwrap();
+        let before = app.secret_history(&config, "EMPTY").unwrap();
+
+        // Roll back to version 1 (restores it as version 3).
+        app.rollback(&config, "EMPTY", 1).unwrap();
+        // The restored value is present and empty, not missing.
+        assert_eq!(app.get(&config, "EMPTY").unwrap(), Vec::<u8>::new());
+
+        let history = app.secret_history(&config, "EMPTY").unwrap();
+        let versions: Vec<i64> = history.iter().map(|item| item.version).collect();
+        assert_eq!(versions, vec![3, 2, 1]);
+        // `Some(empty)` rather than `None`: the empty versions decrypt successfully.
+        assert_eq!(history[0].value.as_deref(), Some(v1));
+        assert_eq!(history[1].value.as_deref(), Some(v2));
+        assert_eq!(history[2].value.as_deref(), Some(v1));
+        // The earlier versions are left exactly as they were, timestamps included.
+        assert_eq!(history[1..], before[..]);
+    }
 }
