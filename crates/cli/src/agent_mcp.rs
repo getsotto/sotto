@@ -27,6 +27,16 @@ const RUN_TASK: &str = "run_task";
 
 const INSTRUCTIONS: &str = "Sotto exposes declared project tasks. Running a task requires local approval and a separately unlocked Sotto session. Approved project code receives plaintext secrets from the selected environment and is trusted to use them safely.";
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
+/// Answer a supported request verbatim; otherwise answer the newest version
+/// this adapter implements so the client can decide whether to proceed.
+fn negotiate_protocol_version(requested: Option<&str>) -> &'static str {
+    match requested {
+        Some("2024-11-05") => "2024-11-05",
+        Some("2025-03-26") => "2025-03-26",
+        Some("2025-06-18") => "2025-06-18",
+        _ => DEFAULT_PROTOCOL_VERSION,
+    }
+}
 const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 
 const CODE_PARSE_ERROR: i64 = -32700;
@@ -339,11 +349,12 @@ impl SottoMcpServer {
         match method.as_str() {
             "initialize" => {
                 *initialized = true;
-                let version = object
-                    .get("params")
-                    .and_then(|params| params.get("protocolVersion"))
-                    .and_then(Value::as_str)
-                    .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+                let version = negotiate_protocol_version(
+                    object
+                        .get("params")
+                        .and_then(|params| params.get("protocolVersion"))
+                        .and_then(Value::as_str),
+                );
                 let result = json!({
                     "protocolVersion": version,
                     "capabilities": {"tools": {}},
@@ -1040,6 +1051,22 @@ mod tests {
             .unwrap();
         assert!(!shutdown_marker.exists());
         client.close().await;
+    }
+
+    #[test]
+    fn protocol_versions_are_negotiated_against_the_supported_set() {
+        for supported in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+            assert_eq!(negotiate_protocol_version(Some(supported)), supported);
+        }
+        assert_eq!(
+            negotiate_protocol_version(Some("1999-01-01")),
+            DEFAULT_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            negotiate_protocol_version(Some("2026-07-28")),
+            DEFAULT_PROTOCOL_VERSION
+        );
+        assert_eq!(negotiate_protocol_version(None), DEFAULT_PROTOCOL_VERSION);
     }
 
     #[tokio::test]
