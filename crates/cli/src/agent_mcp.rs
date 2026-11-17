@@ -3,21 +3,16 @@
 //! This module exposes task metadata and the shared approved-task runner. It never reads or
 //! returns secret values, creates approvals, or returns child output.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use rmcp::handler::server::ServerHandler;
-use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorData, Implementation, JsonObject,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
-};
-use rmcp::service::{RequestContext, RunningService, Service};
-use rmcp::RoleServer;
-use rmcp::{transport::stdio, ServiceExt};
 use serde::Serialize;
-use serde_json::{json, Value};
-use tokio::sync::watch;
+use serde_json::{json, Map, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{watch, Mutex as AsyncMutex};
+use tokio::task::JoinSet;
 
 use crate::agent_approvals::ApprovalStore;
 use crate::agent_runner::{run_approved_task, TaskRunOutcome, TaskRunStatus};
@@ -29,6 +24,47 @@ use crate::store::Store;
 
 const LIST_TASKS: &str = "list_tasks";
 const RUN_TASK: &str = "run_task";
+
+const INSTRUCTIONS: &str = "Sotto exposes declared project tasks. Running a task requires local approval and a separately unlocked Sotto session. Approved project code receives plaintext secrets from the selected environment and is trusted to use them safely.";
+const DEFAULT_PROTOCOL_VERSION: &str = "2025-11-25";
+const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+
+const CODE_PARSE_ERROR: i64 = -32700;
+const CODE_INVALID_REQUEST: i64 = -32600;
+const CODE_METHOD_NOT_FOUND: i64 = -32601;
+const CODE_INVALID_PARAMS: i64 = -32602;
+const CODE_NOT_INITIALIZED: i64 = -32002;
+
+/// A tool result in the wire shape MCP clients already consume from this server.
+struct ToolResult {
+    structured: Value,
+    is_error: bool,
+}
+
+impl ToolResult {
+    fn wire(&self) -> Value {
+        json!({
+            "content": [{"type": "text", "text": self.structured.to_string()}],
+            "structuredContent": self.structured,
+            "isError": self.is_error,
+        })
+    }
+}
+
+/// A JSON-RPC protocol error, as opposed to a tool execution error result.
+struct RpcError {
+    code: i64,
+    message: String,
+}
+
+impl RpcError {
+    fn invalid_params(message: impl Into<String>) -> Self {
+        Self {
+            code: CODE_INVALID_PARAMS,
+            message: message.into(),
+        }
+    }
+}
 
 /// MCP server state. SQLite and keychain access is held behind a short synchronous lock because
 /// the runner performs all authorization/decryption before returning its owned async future.
@@ -110,15 +146,12 @@ impl SottoMcpServer {
         )
     }
 
-    async fn execute_task<C>(
+    async fn execute_task(
         &self,
         task: &str,
         environment: &str,
-        request_cancellation: C,
-    ) -> CallToolResult
-    where
-        C: Future<Output = ()> + Send,
-    {
+        cancelled: watch::Receiver<bool>,
+    ) -> ToolResult {
         let (cancel, receiver) = watch::channel(false);
         let run = match self.prepare_run(task, environment, receiver) {
             Ok(run) => run,
@@ -131,7 +164,7 @@ impl SottoMcpServer {
                 Ok(outcome) => outcome_result(outcome),
                 Err(error) => run_error(task, environment, safe_error_message(&error)),
             },
-            _ = request_cancellation => {
+            () = wait_cancelled(cancelled) => {
                 let _ = cancel.send(true);
                 match run.await {
                     Ok(outcome) => outcome_result(outcome),
@@ -143,119 +176,284 @@ impl SottoMcpServer {
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResponse, ErrorData> {
-        let arguments = request.arguments.unwrap_or_default();
-        match request.name.as_ref() {
+        name: &str,
+        arguments: &Map<String, Value>,
+        cancelled: watch::Receiver<bool>,
+    ) -> std::result::Result<ToolResult, RpcError> {
+        match name {
             LIST_TASKS => {
                 if !arguments.is_empty() {
-                    return Err(ErrorData::invalid_params(
-                        "list_tasks accepts no arguments",
-                        None,
-                    ));
+                    return Err(RpcError::invalid_params("list_tasks accepts no arguments"));
                 }
                 match self.list_tasks() {
-                    Ok(tasks) => Ok(CallToolResult::structured(tasks).into()),
-                    Err(error) => Ok(tool_error(safe_error_message(&error)).into()),
+                    Ok(tasks) => Ok(ToolResult {
+                        structured: tasks,
+                        is_error: false,
+                    }),
+                    Err(error) => Ok(tool_error(safe_error_message(&error))),
                 }
             }
             RUN_TASK => {
-                let (task, environment) = parse_run_arguments(&arguments)?;
-                Ok(self
-                    .execute_task(&task, &environment, context.ct.cancelled())
-                    .await
-                    .into())
+                let (task, environment) = parse_run_arguments(arguments)?;
+                Ok(self.execute_task(&task, &environment, cancelled).await)
             }
-            _ => Err(ErrorData::invalid_params("unknown Sotto tool", None)),
+            _ => Err(RpcError::invalid_params("unknown Sotto tool")),
+        }
+    }
+
+    /// Serve newline-delimited MCP JSON-RPC over a split transport until the
+    /// reader closes or `shutdown` resolves. In-flight runs are cancelled and
+    /// awaited before returning, so no approved child outlives the server.
+    async fn serve_transport<R, W, F>(self, reader: R, writer: W, shutdown: F) -> Result<()>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+        F: Future<Output = ()> + Send,
+    {
+        let writer = Arc::new(AsyncMutex::new(tokio::io::BufWriter::new(writer)));
+        let inflight: Arc<Mutex<HashMap<String, watch::Sender<bool>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let mut lines = BufReader::new(reader).lines();
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        let mut initialized = false;
+        tokio::pin!(shutdown);
+
+        loop {
+            tokio::select! {
+                () = &mut shutdown => break,
+                line = lines.next_line() => {
+                    match line {
+                        Ok(Some(line)) => {
+                            if line.len() > MAX_MESSAGE_BYTES {
+                                return Err(Error::Io("MCP message exceeds size limit".into()));
+                            }
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+                            // A failed write means the client is going away;
+                            // the read side will report the disconnect.
+                            let _ = self
+                                .handle_message(&line, &writer, &inflight, &mut tasks, &mut initialized)
+                                .await;
+                        }
+                        Ok(None) => break,
+                        Err(error) => return Err(Error::Io(format!("reading MCP request: {error}"))),
+                    }
+                }
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
+            }
+        }
+
+        // Shutdown and disconnect both cancel active runs and wait for their
+        // children to stop; a cancelled request gets no response.
+        if let Ok(mut inflight) = inflight.lock() {
+            for (_, cancel) in inflight.drain() {
+                let _ = cancel.send(true);
+            }
+        }
+        while tasks.join_next().await.is_some() {}
+        let mut writer = writer.lock().await;
+        writer
+            .flush()
+            .await
+            .map_err(|error| Error::Io(format!("flushing MCP response: {error}")))?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_message<W>(
+        &self,
+        line: &str,
+        writer: &Arc<AsyncMutex<tokio::io::BufWriter<W>>>,
+        inflight: &Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
+        tasks: &mut JoinSet<()>,
+        initialized: &mut bool,
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let message: Value = match serde_json::from_str(line) {
+            Ok(message) => message,
+            Err(_) => {
+                return write_message(
+                    writer,
+                    &failure(Value::Null, CODE_PARSE_ERROR, "parse error"),
+                )
+                .await;
+            }
+        };
+        let Some(object) = message.as_object() else {
+            return write_message(
+                writer,
+                &failure(Value::Null, CODE_INVALID_REQUEST, "invalid request"),
+            )
+            .await;
+        };
+        let Some(method) = object.get("method").and_then(Value::as_str) else {
+            // Responses to requests this server never sends need no handling.
+            return Ok(());
+        };
+        let method = method.to_owned();
+
+        // Notifications carry no id and never get a response.
+        let Some(id) = object.get("id").cloned() else {
+            if method == "notifications/cancelled" {
+                if let Some(request_id) = object
+                    .get("params")
+                    .and_then(|params| params.get("requestId"))
+                {
+                    let key = request_id.to_string();
+                    if let Ok(inflight) = inflight.lock() {
+                        if let Some(cancel) = inflight.get(&key) {
+                            let _ = cancel.send(true);
+                        }
+                    }
+                }
+            }
+            return Ok(());
+        };
+
+        if method != "initialize" && !*initialized {
+            return write_message(
+                writer,
+                &failure(id, CODE_NOT_INITIALIZED, "server not initialized"),
+            )
+            .await;
+        }
+
+        match method.as_str() {
+            "initialize" => {
+                *initialized = true;
+                let version = object
+                    .get("params")
+                    .and_then(|params| params.get("protocolVersion"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+                let result = json!({
+                    "protocolVersion": version,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "sotto", "version": env!("CARGO_PKG_VERSION")},
+                    "instructions": INSTRUCTIONS,
+                });
+                write_message(writer, &success(id, result)).await
+            }
+            "ping" => write_message(writer, &success(id, json!({}))).await,
+            "tools/list" => {
+                write_message(writer, &success(id, json!({"tools": tool_definitions()}))).await
+            }
+            "tools/call" => {
+                let params = object.get("params").and_then(Value::as_object);
+                let name = params
+                    .and_then(|params| params.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let arguments = params
+                    .and_then(|params| params.get("arguments"))
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                let (cancel, cancelled) = watch::channel(false);
+                let key = id.to_string();
+                if let Ok(mut inflight) = inflight.lock() {
+                    inflight.insert(key.clone(), cancel);
+                }
+                let server = self.clone();
+                let writer = Arc::clone(writer);
+                let inflight = Arc::clone(inflight);
+                tasks.spawn(async move {
+                    let result = server.call_tool(&name, &arguments, cancelled.clone()).await;
+                    if let Ok(mut inflight) = inflight.lock() {
+                        inflight.remove(&key);
+                    }
+                    if *cancelled.borrow() {
+                        return;
+                    }
+                    let response = match result {
+                        Ok(result) => success(id, result.wire()),
+                        Err(error) => failure(id, error.code, &error.message),
+                    };
+                    let _ = write_message(&writer, &response).await;
+                });
+                Ok(())
+            }
+            _ => {
+                write_message(
+                    writer,
+                    &failure(id, CODE_METHOD_NOT_FOUND, "method not found"),
+                )
+                .await
+            }
         }
     }
 }
 
-impl ServerHandler for SottoMcpServer {
-    fn get_info(&self) -> ServerConfig {
-        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions(
-                "Sotto exposes declared project tasks. Running a task requires local approval and a separately unlocked Sotto session. Approved project code receives plaintext secrets from the selected environment and is trusted to use them safely.",
-            );
-        info.server_info = Implementation::new("sotto", env!("CARGO_PKG_VERSION"));
-        info
+async fn wait_cancelled(mut cancelled: watch::Receiver<bool>) {
+    loop {
+        if *cancelled.borrow() {
+            return;
+        }
+        if cancelled.changed().await.is_err() {
+            return;
+        }
     }
+}
 
-    fn list_tools(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> impl Future<Output = std::result::Result<ListToolsResult, ErrorData>> + Send + '_ {
-        std::future::ready(Ok(ListToolsResult::with_all_items(tool_definitions())))
-    }
+fn success(id: Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
 
-    fn get_tool(&self, name: &str) -> Option<Tool> {
-        tool_definitions()
-            .into_iter()
-            .find(|tool| tool.name.as_ref() == name)
-    }
+fn failure(id: Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
 
-    async fn call_tool(
-        &self,
-        request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResponse, ErrorData> {
-        SottoMcpServer::call_tool(self, request, context).await
-    }
+async fn write_message<W>(
+    writer: &Arc<AsyncMutex<tokio::io::BufWriter<W>>>,
+    message: &Value,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin + Send,
+{
+    let mut writer = writer.lock().await;
+    writer
+        .write_all(message.to_string().as_bytes())
+        .await
+        .map_err(|error| Error::Io(format!("writing MCP response: {error}")))?;
+    writer
+        .write_all(b"\n")
+        .await
+        .map_err(|error| Error::Io(format!("writing MCP response: {error}")))?;
+    writer
+        .flush()
+        .await
+        .map_err(|error| Error::Io(format!("writing MCP response: {error}")))?;
+    Ok(())
 }
 
 /// Run the stdio service until the MCP client closes its input or the server is stopped.
 pub async fn serve_stdio(server: SottoMcpServer) -> Result<()> {
-    let service = server
-        .serve(stdio())
+    server
+        .serve_transport(tokio::io::stdin(), tokio::io::stdout(), async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
         .await
-        .map_err(|error| Error::Io(format!("starting Sotto MCP server: {error}")))?;
-    wait_for_shutdown(service, tokio::signal::ctrl_c()).await
 }
 
-async fn wait_for_shutdown<S, F>(service: RunningService<RoleServer, S>, shutdown: F) -> Result<()>
-where
-    S: Service<RoleServer>,
-    F: Future<Output = std::io::Result<()>> + Send,
-{
-    let cancellation = service.cancellation_token();
-    let waiting = service.waiting();
-    tokio::pin!(waiting);
-
-    tokio::select! {
-        result = &mut waiting => {
-            result.map_err(|error| Error::Io(format!("Sotto MCP server stopped unexpectedly: {error}")))?;
-            Ok(())
-        }
-        signal = shutdown => {
-            // Cancelling the RMCP service cancels active request contexts. The run_task handler
-            // forwards that cancellation to the shared runner and waits for its child to stop.
-            cancellation.cancel();
-            (&mut waiting)
-                .await
-                .map_err(|error| Error::Io(format!("stopping Sotto MCP server: {error}")))?;
-            signal.map_err(|error| Error::Io(format!("waiting for Sotto MCP shutdown signal: {error}")))?;
-            Ok(())
-        }
-    }
-}
-
-fn tool_definitions() -> Vec<Tool> {
+fn tool_definitions() -> Vec<Value> {
     vec![
-        Tool::new(
-            LIST_TASKS,
-            "List project-declared task names, descriptions, and allowed environments. Does not expose approvals or secret metadata.",
-            schema(json!({
+        json!({
+            "name": LIST_TASKS,
+            "description": "List project-declared task names, descriptions, and allowed environments. Does not expose approvals or secret metadata.",
+            "inputSchema": {
                 "type": "object",
                 "properties": {},
                 "additionalProperties": false
-            })),
-        ),
-        Tool::new(
-            RUN_TASK,
-            "Run a declared task with one allowed Sotto environment after local approval. The task receives that environment's plaintext secrets. Returns task, environment, status, exit_code, and a Sotto-generated summary. Child output is discarded.",
-            schema(json!({
+            },
+        }),
+        json!({
+            "name": RUN_TASK,
+            "description": "Run a declared task with one allowed Sotto environment after local approval. The task receives that environment's plaintext secrets. Returns task, environment, status, exit_code, and a Sotto-generated summary. Child output is discarded.",
+            "inputSchema": {
                 "type": "object",
                 "properties": {
                     "task": {
@@ -268,51 +466,44 @@ fn tool_definitions() -> Vec<Tool> {
                 },
                 "required": ["task", "environment"],
                 "additionalProperties": false
-            })),
-        )
-        .with_raw_output_schema(schema(json!({
-            "type": "object",
-            "properties": {
-                "task": { "type": "string" },
-                "environment": { "type": "string" },
-                "status": {
-                    "type": "string",
-                    "enum": ["completed", "failed", "timed_out", "cancelled", "could_not_start", "wait_failed", "error"]
-                },
-                "exit_code": { "type": ["integer", "null"] },
-                "summary": { "type": "string" }
             },
-            "required": ["task", "environment", "status", "exit_code", "summary"],
-            "additionalProperties": false
-        }))),
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string" },
+                    "environment": { "type": "string" },
+                    "status": {
+                        "type": "string",
+                        "enum": ["completed", "failed", "timed_out", "cancelled", "could_not_start", "wait_failed", "error"]
+                    },
+                    "exit_code": { "type": ["integer", "null"] },
+                    "summary": { "type": "string" }
+                },
+                "required": ["task", "environment", "status", "exit_code", "summary"],
+                "additionalProperties": false
+            },
+        }),
     ]
 }
 
-fn schema(value: Value) -> Arc<JsonObject> {
-    Arc::new(value.as_object().expect("tool schema is an object").clone())
-}
-
-fn parse_run_arguments(arguments: &JsonObject) -> std::result::Result<(String, String), ErrorData> {
+fn parse_run_arguments(
+    arguments: &Map<String, Value>,
+) -> std::result::Result<(String, String), RpcError> {
     if arguments.len() != 2 {
-        return Err(ErrorData::invalid_params(
+        return Err(RpcError::invalid_params(
             "run_task requires exactly task and environment",
-            None,
         ));
     }
     let task = arguments
         .get("task")
         .and_then(Value::as_str)
         .filter(|value| valid_task_name(value))
-        .ok_or_else(|| {
-            ErrorData::invalid_params("task must be a valid declared task name", None)
-        })?;
+        .ok_or_else(|| RpcError::invalid_params("task must be a valid declared task name"))?;
     let environment = arguments
         .get("environment")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty() && value.len() <= 4096 && !value.contains('\0'))
-        .ok_or_else(|| {
-            ErrorData::invalid_params("environment must be a valid environment name", None)
-        })?;
+        .ok_or_else(|| RpcError::invalid_params("environment must be a valid environment name"))?;
     Ok((task.to_owned(), environment.to_owned()))
 }
 
@@ -328,7 +519,7 @@ fn valid_task_name(value: &str) -> bool {
         })
 }
 
-fn outcome_result(outcome: TaskRunOutcome) -> CallToolResult {
+fn outcome_result(outcome: TaskRunOutcome) -> ToolResult {
     let value = json!({
         "task": outcome.task_name,
         "environment": outcome.environment,
@@ -336,10 +527,9 @@ fn outcome_result(outcome: TaskRunOutcome) -> CallToolResult {
         "exit_code": outcome.exit_code,
         "summary": outcome.summary(),
     });
-    if outcome.status == TaskRunStatus::Completed {
-        CallToolResult::structured(value)
-    } else {
-        CallToolResult::structured_error(value)
+    ToolResult {
+        is_error: outcome.status != TaskRunStatus::Completed,
+        structured: value,
     }
 }
 
@@ -367,18 +557,24 @@ fn safe_error_message(error: &Error) -> String {
     }
 }
 
-fn tool_error(message: String) -> CallToolResult {
-    CallToolResult::structured_error(json!({ "status": "error", "summary": message }))
+fn tool_error(message: String) -> ToolResult {
+    ToolResult {
+        structured: json!({ "status": "error", "summary": message }),
+        is_error: true,
+    }
 }
 
-fn run_error(task: &str, environment: &str, message: String) -> CallToolResult {
-    CallToolResult::structured_error(json!({
-        "task": task,
-        "environment": environment,
-        "status": "error",
-        "exit_code": null,
-        "summary": message,
-    }))
+fn run_error(task: &str, environment: &str, message: String) -> ToolResult {
+    ToolResult {
+        structured: json!({
+            "task": task,
+            "environment": environment,
+            "status": "error",
+            "exit_code": null,
+            "summary": message,
+        }),
+        is_error: true,
+    }
 }
 
 #[cfg(test)]
@@ -391,36 +587,123 @@ mod tests {
     use crate::vault::Vault;
     use std::time::Duration;
 
+    /// Minimal JSON-RPC client replacing the SDK client these tests used
+    /// before; it speaks the same newline-delimited wire protocol.
+    struct TestClient {
+        writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        lines: tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        next_id: u64,
+    }
+
+    impl TestClient {
+        async fn send(&mut self, message: Value) {
+            self.writer
+                .write_all(message.to_string().as_bytes())
+                .await
+                .unwrap();
+            self.writer.write_all(b"\n").await.unwrap();
+            self.writer.flush().await.unwrap();
+        }
+
+        async fn send_request(&mut self, method: &str, params: Value) -> u64 {
+            self.next_id += 1;
+            let id = self.next_id;
+            self.send(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
+                .await;
+            id
+        }
+
+        async fn request(&mut self, method: &str, params: Value) -> Value {
+            let id = self.send_request(method, params).await;
+            loop {
+                let line = self.lines.next_line().await.unwrap().unwrap();
+                let response: Value = serde_json::from_str(&line).unwrap();
+                if response["id"] == id {
+                    return response;
+                }
+            }
+        }
+
+        async fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
+            let response = self
+                .request("tools/call", json!({"name": name, "arguments": arguments}))
+                .await;
+            assert!(response.get("error").is_none(), "{response}");
+            response["result"].clone()
+        }
+
+        async fn close(mut self) {
+            let _ = self.writer.shutdown().await;
+        }
+    }
+
+    async fn start_test_server<F>(
+        server: SottoMcpServer,
+        shutdown: F,
+    ) -> (TestClient, tokio::task::JoinHandle<Result<()>>)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let (client_transport, server_transport) = tokio::io::duplex(64 * 1024);
+        let (server_reader, server_writer) = tokio::io::split(server_transport);
+        let server_task = tokio::spawn(async move {
+            server
+                .serve_transport(server_reader, server_writer, shutdown)
+                .await
+        });
+        let (client_reader, client_writer) = tokio::io::split(client_transport);
+        let mut client = TestClient {
+            writer: client_writer,
+            lines: BufReader::new(client_reader).lines(),
+            next_id: 0,
+        };
+        let initialized = client
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": {"name": "sotto-test", "version": "1"}
+                }),
+            )
+            .await;
+        assert!(initialized.get("error").is_none(), "{initialized}");
+        client
+            .send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await;
+        (client, server_task)
+    }
+
     #[test]
     fn tools_have_strict_schemas_and_only_the_agreed_names() {
         let mut tools = tool_definitions();
-        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
         assert_eq!(
             tools
                 .iter()
-                .map(|tool| tool.name.as_ref())
+                .map(|tool| tool["name"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             [LIST_TASKS, RUN_TASK]
         );
-        for tool in tools {
-            assert_eq!(tool.input_schema["additionalProperties"], false);
+        for tool in &tools {
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         }
         let run_task = tool_definitions()
             .into_iter()
-            .find(|tool| tool.name.as_ref() == RUN_TASK)
+            .find(|tool| tool["name"].as_str() == Some(RUN_TASK))
             .unwrap();
         assert_eq!(
-            run_task.input_schema["required"],
+            run_task["inputSchema"]["required"],
             json!(["task", "environment"])
         );
         assert_eq!(
-            run_task.input_schema["properties"]
+            run_task["inputSchema"]["properties"]
                 .as_object()
                 .unwrap()
                 .len(),
             2
         );
-        let output_schema = run_task.output_schema.unwrap();
+        let output_schema = &run_task["outputSchema"];
         assert_eq!(output_schema["additionalProperties"], false);
         assert_eq!(
             output_schema["required"],
@@ -498,38 +781,14 @@ mod tests {
         let server = SottoMcpServer::new(canonical_root, store, keychain, approvals);
         let state = server.state.clone();
         session::lock(state.lock().unwrap().keychain.as_ref()).unwrap();
-        let (client_transport, server_transport) = tokio::io::duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            server
-                .serve(server_transport)
-                .await
-                .unwrap()
-                .waiting()
-                .await
-                .unwrap();
-        });
-        let mut client = ().serve(client_transport).await.unwrap();
+        let (mut client, server_task) = start_test_server(server, std::future::pending()).await;
         let locked = client
-            .call_tool(
-                CallToolRequestParams::new(RUN_TASK).with_arguments(
-                    json!({"task":"verify", "environment":"dev"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            )
+            .call_tool(RUN_TASK, json!({"task":"verify", "environment":"dev"}))
             .await;
-        let locked = locked.unwrap();
-        assert_eq!(locked.is_error, Some(true));
-        assert_eq!(
-            locked.structured_content.as_ref().unwrap()["task"],
-            "verify"
-        );
-        assert_eq!(
-            locked.structured_content.as_ref().unwrap()["environment"],
-            "dev"
-        );
-        assert!(locked.structured_content.as_ref().unwrap()["summary"]
+        assert_eq!(locked["isError"], true);
+        assert_eq!(locked["structuredContent"]["task"], "verify");
+        assert_eq!(locked["structuredContent"]["environment"], "dev");
+        assert!(locked["structuredContent"]["summary"]
             .as_str()
             .unwrap()
             .contains("sotto unlock"));
@@ -547,24 +806,16 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(10));
         let expired = client
-            .call_tool(
-                CallToolRequestParams::new(RUN_TASK).with_arguments(
-                    json!({"task":"verify", "environment":"dev"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            )
+            .call_tool(RUN_TASK, json!({"task":"verify", "environment":"dev"}))
             .await;
-        let expired = expired.unwrap();
-        assert_eq!(expired.is_error, Some(true));
-        assert!(expired.structured_content.as_ref().unwrap()["summary"]
+        assert_eq!(expired["isError"], true);
+        assert!(expired["structuredContent"]["summary"]
             .as_str()
             .unwrap()
             .contains("sotto unlock"));
         assert!(!marker.exists());
-        client.close().await.unwrap();
-        server_task.await.unwrap();
+        client.close().await;
+        server_task.await.unwrap().unwrap();
     }
 
     #[cfg(unix)]
@@ -622,31 +873,14 @@ mod tests {
                 .unwrap();
         }
         let server = SottoMcpServer::new(canonical_root, store, keychain, approvals);
-        let (client_transport, server_transport) = tokio::io::duplex(64 * 1024);
-        let server_task = tokio::spawn(async move {
-            server
-                .serve(server_transport)
-                .await
-                .unwrap()
-                .waiting()
-                .await
-                .unwrap();
-        });
-        let mut client = ().serve(client_transport).await.unwrap();
-        assert_eq!(client.list_tools(None).await.unwrap().tools.len(), 2);
+        let (mut client, server_task) = start_test_server(server, std::future::pending()).await;
+        let listed = client.request("tools/list", json!({})).await;
+        assert_eq!(listed["result"]["tools"].as_array().unwrap().len(), 2);
 
         let result = client
-            .call_tool(
-                CallToolRequestParams::new(RUN_TASK).with_arguments(
-                    json!({"task":"verify", "environment":"dev"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.is_error, Some(false));
+            .call_tool(RUN_TASK, json!({"task":"verify", "environment":"dev"}))
+            .await;
+        assert_eq!(result["isError"], false);
         assert!(
             marker.exists(),
             "the approved task should receive its canary"
@@ -656,49 +890,24 @@ mod tests {
         assert!(!serialized.contains("child output"), "{serialized}");
 
         let failed = client
-            .call_tool(
-                CallToolRequestParams::new(RUN_TASK).with_arguments(
-                    json!({"task":"fail", "environment":"dev"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            )
-            .await
-            .unwrap();
-        assert_eq!(failed.is_error, Some(true));
-        assert_eq!(
-            failed.structured_content.as_ref().unwrap()["status"],
-            "failed"
-        );
-        assert_eq!(failed.structured_content.as_ref().unwrap()["exit_code"], 7);
+            .call_tool(RUN_TASK, json!({"task":"fail", "environment":"dev"}))
+            .await;
+        assert_eq!(failed["isError"], true);
+        assert_eq!(failed["structuredContent"]["status"], "failed");
+        assert_eq!(failed["structuredContent"]["exit_code"], 7);
         assert!(!serde_json::to_string(&failed)
             .unwrap()
             .contains("hidden failure output"));
 
         let timed_out = client
-            .call_tool(
-                CallToolRequestParams::new(RUN_TASK).with_arguments(
-                    json!({"task":"slow", "environment":"dev"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            )
-            .await
-            .unwrap();
-        assert_eq!(timed_out.is_error, Some(true));
-        assert_eq!(
-            timed_out.structured_content.as_ref().unwrap()["status"],
-            "timed_out"
-        );
-        assert_eq!(
-            timed_out.structured_content.as_ref().unwrap()["exit_code"],
-            Value::Null
-        );
+            .call_tool(RUN_TASK, json!({"task":"slow", "environment":"dev"}))
+            .await;
+        assert_eq!(timed_out["isError"], true);
+        assert_eq!(timed_out["structuredContent"]["status"], "timed_out");
+        assert_eq!(timed_out["structuredContent"]["exit_code"], Value::Null);
 
-        client.close().await.unwrap();
-        server_task.await.unwrap();
+        client.close().await;
+        server_task.await.unwrap().unwrap();
     }
 
     #[cfg(unix)]
@@ -757,31 +966,17 @@ mod tests {
                 .unwrap();
         }
         let server = SottoMcpServer::new(canonical_root, store, keychain, approvals);
-        let (client_transport, server_transport) = tokio::io::duplex(64 * 1024);
-        let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel();
-        let server_task = tokio::spawn(async move {
-            let service = server.serve(server_transport).await.unwrap();
-            wait_for_shutdown(service, async move {
-                let _ = shutdown_signal.await;
-                Ok(())
-            })
-            .await
-            .unwrap();
-        });
-        let mut client = ().serve(client_transport).await.unwrap();
-        let arguments = json!({"task":"slow", "environment":"dev"})
-            .as_object()
-            .unwrap()
-            .clone();
-        let request =
-            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
-                CallToolRequestParams::new(RUN_TASK).with_arguments(arguments),
-            ));
-        let handle = client
-            .peer()
-            .send_cancellable_request(request, rmcp::service::PeerRequestOptions::no_options())
-            .await
-            .unwrap();
+        let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel::<()>();
+        let (mut client, server_task) = start_test_server(server, async move {
+            let _ = shutdown_signal.await;
+        })
+        .await;
+        let slow_id = client
+            .send_request(
+                "tools/call",
+                json!({"name": RUN_TASK, "arguments": {"task":"slow", "environment":"dev"}}),
+            )
+            .await;
         tokio::time::timeout(Duration::from_secs(2), async {
             while !started.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -789,10 +984,13 @@ mod tests {
         })
         .await
         .expect("task child should start before cancellation");
-        handle
-            .cancel(Some("test cancellation".into()))
-            .await
-            .unwrap();
+        client
+            .send(json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"requestId": slow_id, "reason": "test cancellation"}
+            }))
+            .await;
         tokio::time::timeout(Duration::from_secs(3), async {
             while !marker.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -802,23 +1000,12 @@ mod tests {
         .expect_err("cancelled task must not complete its post-sleep action");
         assert!(!marker.exists());
 
-        let shutdown_request =
-            rmcp::model::ClientRequest::CallToolRequest(rmcp::model::CallToolRequest::new(
-                CallToolRequestParams::new(RUN_TASK).with_arguments(
-                    json!({"task":"shutdown_slow", "environment":"dev"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            ));
         let _active_run = client
-            .peer()
-            .send_cancellable_request(
-                shutdown_request,
-                rmcp::service::PeerRequestOptions::no_options(),
+            .send_request(
+                "tools/call",
+                json!({"name": RUN_TASK, "arguments": {"task":"shutdown_slow", "environment":"dev"}}),
             )
-            .await
-            .unwrap();
+            .await;
         tokio::time::timeout(Duration::from_secs(2), async {
             while !shutdown_started.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -830,8 +1017,9 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), server_task)
             .await
             .expect("server shutdown should wait for its active child to stop")
+            .unwrap()
             .unwrap();
         assert!(!shutdown_marker.exists());
-        client.close().await.unwrap();
+        client.close().await;
     }
 }
