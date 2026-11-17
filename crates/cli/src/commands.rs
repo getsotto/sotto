@@ -264,7 +264,11 @@ impl<'a> App<'a> {
 mod tests {
     use super::*;
     use crate::keychain::MemoryKeychain;
+    use std::collections::BTreeMap;
     use std::time::Duration;
+
+    /// Secret histories of one environment, keyed by name.
+    type Histories = BTreeMap<String, Vec<SecretHistoryItem>>;
 
     /// An unlocked store + keychain with one project, plus its config.
     fn unlocked() -> (Store, MemoryKeychain, Config) {
@@ -340,7 +344,8 @@ mod tests {
     }
 
     /// Seed dev + staging with an overlapping key set for the diff/copy tests:
-    /// SHARED (equal), CHANGED (differs), DEV_ONLY, STG_ONLY.
+    /// SHARED (equal), CHANGED (differs), DEV_ONLY, STG_ONLY. Every staging key and dev's
+    /// CHANGED carry an earlier version, so copy tests can prove whole histories are retained.
     fn seeded_for_promotion() -> (Store, MemoryKeychain, Config) {
         let (store, keychain, config) = unlocked();
         let app = App::new(&store, &keychain);
@@ -350,12 +355,46 @@ mod tests {
             ..config.clone()
         };
         app.set(&dev, "SHARED", b"same").unwrap();
+        app.set(&stg, "SHARED", b"shared-old").unwrap();
         app.set(&stg, "SHARED", b"same").unwrap();
+        app.set(&dev, "CHANGED", b"dev-old").unwrap();
         app.set(&dev, "CHANGED", b"dev-value").unwrap();
+        app.set(&stg, "CHANGED", b"stg-old").unwrap();
         app.set(&stg, "CHANGED", b"stg-value").unwrap();
         app.set(&dev, "DEV_ONLY", b"d").unwrap();
+        app.set(&stg, "STG_ONLY", b"s-old").unwrap();
         app.set(&stg, "STG_ONLY", b"s").unwrap();
         (store, keychain, config)
+    }
+
+    /// Every live key of `env` with its full `App::secret_history` (newest first), so one
+    /// before/after comparison covers key sets, version numbers, timestamps, and bytes.
+    fn histories(app: &App<'_>, config: &Config, env: &str) -> Histories {
+        let env_config = Config {
+            environment: env.into(),
+            ..config.clone()
+        };
+        app.list(&env_config)
+            .unwrap()
+            .into_iter()
+            .map(|name| {
+                let history = app.secret_history(&env_config, &name).unwrap();
+                (name, history)
+            })
+            .collect()
+    }
+
+    /// One `(name, version, bytes)` row per record, by name and then newest first. Timestamps
+    /// are left out on purpose: they are only compared, by equality, on retained records.
+    fn versions(env: &Histories) -> Vec<(&str, i64, &[u8])> {
+        let mut rows = Vec::new();
+        for (name, history) in env {
+            for item in history {
+                let value = item.value.as_deref().expect("version decrypts");
+                rows.push((name.as_str(), item.version, value));
+            }
+        }
+        rows
     }
 
     #[test]
@@ -424,6 +463,105 @@ mod tests {
         let again = app.env_copy(&config, "dev", "staging", true).unwrap();
         assert!(again.create.is_empty() && again.update.is_empty());
         assert_eq!(again.unchanged.len(), 3);
+    }
+
+    #[test]
+    fn env_copy_dry_run_keeps_every_history() {
+        let (store, keychain, config) = seeded_for_promotion();
+        let app = App::new(&store, &keychain);
+        let values_before = app.env_diff(&config, "dev", "staging").unwrap();
+        let dev_before = histories(&app, &config, "dev");
+        let stg_before = histories(&app, &config, "staging");
+        assert_eq!(
+            versions(&dev_before),
+            [
+                ("CHANGED", 2, b"dev-value".as_slice()),
+                ("CHANGED", 1, b"dev-old".as_slice()),
+                ("DEV_ONLY", 1, b"d".as_slice()),
+                ("SHARED", 1, b"same".as_slice()),
+            ]
+        );
+        assert_eq!(
+            versions(&stg_before),
+            [
+                ("CHANGED", 2, b"stg-value".as_slice()),
+                ("CHANGED", 1, b"stg-old".as_slice()),
+                ("SHARED", 2, b"same".as_slice()),
+                ("SHARED", 1, b"shared-old".as_slice()),
+                ("STG_ONLY", 2, b"s".as_slice()),
+                ("STG_ONLY", 1, b"s-old".as_slice()),
+            ]
+        );
+
+        app.env_copy(&config, "dev", "staging", false).unwrap();
+
+        // Same keys, current values, versions, timestamps, and bytes on both sides.
+        assert_eq!(
+            app.env_diff(&config, "dev", "staging").unwrap(),
+            values_before
+        );
+        assert_eq!(histories(&app, &config, "dev"), dev_before);
+        let stg_after = histories(&app, &config, "staging");
+        assert_eq!(stg_after, stg_before);
+        assert!(!stg_after.contains_key("DEV_ONLY"));
+    }
+
+    #[test]
+    fn env_copy_apply_appends_exactly_one_version_per_write() {
+        let (store, keychain, config) = seeded_for_promotion();
+        let app = App::new(&store, &keychain);
+        let dev_values = app.entries(&config).unwrap();
+        let dev_before = histories(&app, &config, "dev");
+        let stg_before = histories(&app, &config, "staging");
+
+        let plan = app.env_copy(&config, "dev", "staging", true).unwrap();
+        assert_eq!(plan.create, vec!["DEV_ONLY"]);
+        assert_eq!(plan.update, vec!["CHANGED"]);
+        assert_eq!(plan.unchanged, vec!["SHARED"]);
+
+        // CHANGED gains v3 and DEV_ONLY starts at v1, both with dev's latest bytes; nothing
+        // else is written.
+        let stg_after = histories(&app, &config, "staging");
+        assert_eq!(
+            versions(&stg_after),
+            [
+                ("CHANGED", 3, b"dev-value".as_slice()),
+                ("CHANGED", 2, b"stg-value".as_slice()),
+                ("CHANGED", 1, b"stg-old".as_slice()),
+                ("DEV_ONLY", 1, b"d".as_slice()),
+                ("SHARED", 2, b"same".as_slice()),
+                ("SHARED", 1, b"shared-old".as_slice()),
+                ("STG_ONLY", 2, b"s".as_slice()),
+                ("STG_ONLY", 1, b"s-old".as_slice()),
+            ]
+        );
+        // Every pre-existing destination record is retained exactly, timestamps included.
+        assert_eq!(stg_after["CHANGED"][1..], stg_before["CHANGED"]);
+        assert_eq!(stg_after["SHARED"], stg_before["SHARED"]);
+        assert_eq!(stg_after["STG_ONLY"], stg_before["STG_ONLY"]);
+        // The source is untouched.
+        assert_eq!(app.entries(&config).unwrap(), dev_values);
+        assert_eq!(histories(&app, &config, "dev"), dev_before);
+    }
+
+    #[test]
+    fn env_copy_reapply_adds_no_versions() {
+        let (store, keychain, config) = seeded_for_promotion();
+        let app = App::new(&store, &keychain);
+        app.env_copy(&config, "dev", "staging", true).unwrap();
+        let dev_applied = histories(&app, &config, "dev");
+        let stg_applied = histories(&app, &config, "staging");
+
+        let again = app.env_copy(&config, "dev", "staging", true).unwrap();
+        assert_eq!(
+            again,
+            CopyPlan {
+                unchanged: vec!["CHANGED".into(), "DEV_ONLY".into(), "SHARED".into()],
+                ..CopyPlan::default()
+            }
+        );
+        assert_eq!(histories(&app, &config, "staging"), stg_applied);
+        assert_eq!(histories(&app, &config, "dev"), dev_applied);
     }
 
     #[test]
