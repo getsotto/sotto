@@ -296,6 +296,14 @@ impl SottoMcpServer {
             )
             .await;
         };
+        if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            let id = object.get("id").cloned().unwrap_or(Value::Null);
+            return write_message(
+                writer,
+                &failure(id, CODE_INVALID_REQUEST, "invalid request"),
+            )
+            .await;
+        }
         let Some(method) = object.get("method").and_then(Value::as_str) else {
             // Responses to requests this server never sends need no handling.
             return Ok(());
@@ -620,8 +628,7 @@ mod tests {
             id
         }
 
-        async fn request(&mut self, method: &str, params: Value) -> Value {
-            let id = self.send_request(method, params).await;
+        async fn read_response(&mut self, id: u64) -> Value {
             loop {
                 let line = self.lines.next_line().await.unwrap().unwrap();
                 let response: Value = serde_json::from_str(&line).unwrap();
@@ -629,6 +636,11 @@ mod tests {
                     return response;
                 }
             }
+        }
+
+        async fn request(&mut self, method: &str, params: Value) -> Value {
+            let id = self.send_request(method, params).await;
+            self.read_response(id).await
         }
 
         async fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
@@ -1028,6 +1040,29 @@ mod tests {
             .unwrap();
         assert!(!shutdown_marker.exists());
         client.close().await;
+    }
+
+    #[tokio::test]
+    async fn requests_without_the_jsonrpc_version_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let keychain = MemoryKeychain::default();
+        let server = SottoMcpServer::new(
+            root.path().to_path_buf(),
+            store,
+            keychain,
+            ApprovalStore::open(data.path()).unwrap(),
+        );
+        let (mut client, server_task) = start_test_server(server, std::future::pending()).await;
+        client
+            .send(json!({"id": 99, "method": "tools/list", "params": {}}))
+            .await;
+        let response = client.read_response(99).await;
+        assert_eq!(response["error"]["code"], CODE_INVALID_REQUEST);
+        assert!(response.get("result").is_none(), "{response}");
+        client.close().await;
+        server_task.await.unwrap().unwrap();
     }
 
     struct FailingWriter;
