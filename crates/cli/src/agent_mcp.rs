@@ -374,11 +374,17 @@ impl SottoMcpServer {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                let arguments = params
-                    .and_then(|params| params.get("arguments"))
-                    .and_then(Value::as_object)
-                    .cloned()
-                    .unwrap_or_default();
+                let arguments = match params.and_then(|params| params.get("arguments")) {
+                    None | Some(Value::Null) => Map::new(),
+                    Some(Value::Object(arguments)) => arguments.clone(),
+                    Some(_) => {
+                        return write_message(
+                            writer,
+                            &failure(id, CODE_INVALID_PARAMS, "tool arguments must be an object"),
+                        )
+                        .await;
+                    }
+                };
                 let (cancel, cancelled) = watch::channel(false);
                 let key = id.to_string();
                 if let Ok(mut inflight) = inflight.lock() {
@@ -1067,6 +1073,29 @@ mod tests {
             DEFAULT_PROTOCOL_VERSION
         );
         assert_eq!(negotiate_protocol_version(None), DEFAULT_PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn non_object_tool_arguments_are_rejected_instead_of_emptied() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let keychain = MemoryKeychain::default();
+        let server = SottoMcpServer::new(
+            root.path().to_path_buf(),
+            store,
+            keychain,
+            ApprovalStore::open(data.path()).unwrap(),
+        );
+        let (mut client, server_task) = start_test_server(server, std::future::pending()).await;
+        let id = client
+            .send_request("tools/call", json!({"name": LIST_TASKS, "arguments": []}))
+            .await;
+        let response = client.read_response(id).await;
+        assert_eq!(response["error"]["code"], CODE_INVALID_PARAMS);
+        assert!(response.get("result").is_none(), "{response}");
+        client.close().await;
+        server_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
