@@ -216,6 +216,7 @@ impl SottoMcpServer {
         let mut lines = BufReader::new(reader).lines();
         let mut tasks: JoinSet<()> = JoinSet::new();
         let mut initialized = false;
+        let mut outcome: Result<()> = Ok(());
         tokio::pin!(shutdown);
 
         loop {
@@ -225,7 +226,8 @@ impl SottoMcpServer {
                     match line {
                         Ok(Some(line)) => {
                             if line.len() > MAX_MESSAGE_BYTES {
-                                return Err(Error::Io("MCP message exceeds size limit".into()));
+                                outcome = Err(Error::Io("MCP message exceeds size limit".into()));
+                                break;
                             }
                             if line.trim().is_empty() {
                                 continue;
@@ -237,15 +239,18 @@ impl SottoMcpServer {
                                 .await;
                         }
                         Ok(None) => break,
-                        Err(error) => return Err(Error::Io(format!("reading MCP request: {error}"))),
+                        Err(error) => {
+                            outcome = Err(Error::Io(format!("reading MCP request: {error}")));
+                            break;
+                        }
                     }
                 }
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             }
         }
 
-        // Shutdown and disconnect both cancel active runs and wait for their
-        // children to stop; a cancelled request gets no response.
+        // Every exit path cancels active runs and waits for their children to
+        // stop; a cancelled request gets no response.
         if let Ok(mut inflight) = inflight.lock() {
             for (_, cancel) in inflight.drain() {
                 let _ = cancel.send(true);
@@ -253,11 +258,11 @@ impl SottoMcpServer {
         }
         while tasks.join_next().await.is_some() {}
         let mut writer = writer.lock().await;
-        writer
+        let flushed = writer
             .flush()
             .await
-            .map_err(|error| Error::Io(format!("flushing MCP response: {error}")))?;
-        Ok(())
+            .map_err(|error| Error::Io(format!("flushing MCP response: {error}")));
+        outcome.and(flushed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1020,6 +1025,93 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!shutdown_marker.exists());
+        client.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_message_stops_the_active_child_before_returning_its_error() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let keychain = MemoryKeychain::default();
+        session::init(
+            &store,
+            &keychain,
+            b"test password",
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master = session::current_master_key(&keychain).unwrap().unwrap();
+        let keypair = session::account_keypair(&store, &master).unwrap();
+        let project = Vault::create_project(&store, &keypair, "MCP oversize test").unwrap();
+        let config = crate::config::Config {
+            project_id: project.id,
+            project: "MCP oversize test".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        config.save_to(root.path()).unwrap();
+        let started = root.path().join("started");
+        let marker = root.path().join("should-not-finish");
+        let manifest = format!(
+            "version = 1\n\n[[task]]\nname = \"slow\"\ndescription = \"Oversize test\"\nexecutable = \"/bin/sh\"\nargs = [\"-c\", {:?}]\nenvironments = [\"dev\"]\n",
+            format!("touch {:?}; sleep 1; touch {:?}", started, marker),
+        );
+        std::fs::write(root.path().join("sotto.tasks.toml"), manifest).unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let manifest = TaskManifest::load_from(&canonical_root).unwrap();
+        let approvals = ApprovalStore::open(data.path()).unwrap();
+        let task = &manifest.tasks()[0];
+        let executable = task.resolve_executable(&canonical_root).unwrap();
+        let fingerprint =
+            approval_fingerprint(&manifest.fingerprint_for(task.name()).unwrap(), &executable)
+                .unwrap();
+        approvals
+            .approve(
+                &config.project_id,
+                &project_root_key(&canonical_root),
+                task.name(),
+                "dev",
+                &fingerprint,
+            )
+            .unwrap();
+        let server = SottoMcpServer::new(canonical_root, store, keychain, approvals);
+        let (mut client, server_task) = start_test_server(server, std::future::pending()).await;
+        client
+            .send_request(
+                "tools/call",
+                json!({"name": RUN_TASK, "arguments": {"task":"slow", "environment":"dev"}}),
+            )
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("task child should start before the oversized message");
+        client
+            .writer
+            .write_all("x".repeat(MAX_MESSAGE_BYTES + 1).as_bytes())
+            .await
+            .unwrap();
+        client.writer.write_all(b"\n").await.unwrap();
+        client.writer.flush().await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("oversized message should end the server")
+            .unwrap()
+            .expect_err("oversized message should be reported");
+        assert!(error.to_string().contains("size limit"), "{error}");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect_err("the stopped child must not complete its post-sleep action");
+        assert!(!marker.exists());
         client.close().await;
     }
 }
