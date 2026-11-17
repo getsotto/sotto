@@ -218,7 +218,7 @@ impl SottoMcpServer {
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
-        F: Future<Output = ()> + Send,
+        F: Future<Output = Result<()>> + Send,
     {
         let writer = Arc::new(AsyncMutex::new(tokio::io::BufWriter::new(writer)));
         let inflight: Arc<Mutex<HashMap<String, watch::Sender<bool>>>> =
@@ -227,11 +227,15 @@ impl SottoMcpServer {
         let mut tasks: JoinSet<()> = JoinSet::new();
         let mut initialized = false;
         let mut outcome: Result<()> = Ok(());
+        let mut shutdown_outcome: Result<()> = Ok(());
         tokio::pin!(shutdown);
 
         loop {
             tokio::select! {
-                () = &mut shutdown => break,
+                result = &mut shutdown => {
+                    shutdown_outcome = result;
+                    break;
+                }
                 line = lines.next_line() => {
                     match line {
                         Ok(Some(line)) => {
@@ -274,7 +278,7 @@ impl SottoMcpServer {
             .flush()
             .await
             .map_err(|error| Error::Io(format!("flushing MCP response: {error}")));
-        outcome.and(flushed)
+        outcome.and(shutdown_outcome).and(flushed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -466,7 +470,9 @@ where
 pub async fn serve_stdio(server: SottoMcpServer) -> Result<()> {
     server
         .serve_transport(tokio::io::stdin(), tokio::io::stdout(), async {
-            let _ = tokio::signal::ctrl_c().await;
+            tokio::signal::ctrl_c().await.map_err(|error| {
+                Error::Io(format!("waiting for Sotto MCP shutdown signal: {error}"))
+            })
         })
         .await
 }
@@ -678,7 +684,7 @@ mod tests {
         shutdown: F,
     ) -> (TestClient, tokio::task::JoinHandle<Result<()>>)
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future<Output = Result<()>> + Send + 'static,
     {
         let (client_transport, server_transport) = tokio::io::duplex(64 * 1024);
         let (server_reader, server_writer) = tokio::io::split(server_transport);
@@ -1005,6 +1011,7 @@ mod tests {
         let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel::<()>();
         let (mut client, server_task) = start_test_server(server, async move {
             let _ = shutdown_signal.await;
+            Ok(())
         })
         .await;
         let slow_id = client
@@ -1073,6 +1080,41 @@ mod tests {
             DEFAULT_PROTOCOL_VERSION
         );
         assert_eq!(negotiate_protocol_version(None), DEFAULT_PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn a_failed_shutdown_signal_is_reported_instead_of_a_clean_stop() {
+        let root = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let keychain = MemoryKeychain::default();
+        let server = SottoMcpServer::new(
+            root.path().to_path_buf(),
+            store,
+            keychain,
+            ApprovalStore::open(data.path()).unwrap(),
+        );
+        let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel::<Result<()>>();
+        let (mut client, server_task) = start_test_server(server, async move {
+            match shutdown_signal.await {
+                Ok(result) => result,
+                Err(_) => Ok(()),
+            }
+        })
+        .await;
+        shutdown
+            .send(Err(Error::Io("signal handler failed".into())))
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("the shutdown signal should end the server")
+            .unwrap()
+            .expect_err("a failed signal should be reported");
+        assert!(
+            error.to_string().contains("signal handler failed"),
+            "{error}"
+        );
+        client.close().await;
     }
 
     #[tokio::test]
