@@ -1095,7 +1095,7 @@ mod tests {
             ApprovalStore::open(data.path()).unwrap(),
         );
         let (shutdown, shutdown_signal) = tokio::sync::oneshot::channel::<Result<()>>();
-        let (mut client, server_task) = start_test_server(server, async move {
+        let (client, server_task) = start_test_server(server, async move {
             match shutdown_signal.await {
                 Ok(result) => result,
                 Err(_) => Ok(()),
