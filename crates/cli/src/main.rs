@@ -2674,8 +2674,9 @@ mod tests {
     use sotto_cli::remote::api::{MachineTokenInfo, MemberInfo};
     use sotto_cli::remote::sync::HistoryVersion;
     use sotto_cli::session;
-    use sotto_cli::store::Store;
+    use sotto_cli::store::{SecretVersion, Store, SyncSecret};
     use sotto_cli::vault::Vault;
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use super::{
@@ -2685,8 +2686,8 @@ mod tests {
     };
     use super::{exec_or_replace, run_with_entries, Error};
 
-    #[test]
-    fn dotenv_import_parse_error_includes_path_and_writes_nothing() {
+    /// An unlocked in-memory store and keychain holding one project, configured for `dev`.
+    fn unlocked_project() -> (Store, MemoryKeychain, Config) {
         let store = Store::open_in_memory().expect("in-memory store");
         let keychain = MemoryKeychain::default();
         session::init(&store, &keychain, b"pw", Duration::from_secs(3600))
@@ -2702,6 +2703,233 @@ mod tests {
             environment: "dev".into(),
             org_id: None,
         };
+        (store, keychain, config)
+    }
+
+    const IMPORT_UPDATED: &str = "SYNTHETIC_UPDATED";
+    const IMPORT_OMITTED: &str = "SYNTHETIC_OMITTED";
+    const IMPORT_ADDED: &str = "SYNTHETIC_ADDED";
+
+    /// Seeds the import target `staging` with a secret that already has two versions and one
+    /// the import file omits, and `dev` with distinct values under the same names. Returns
+    /// `(store, keychain, staging, dev)`.
+    fn seeded_import_environments() -> (Store, MemoryKeychain, Config, Config) {
+        let (store, keychain, dev) = unlocked_project();
+        let staging = Config {
+            environment: "staging".into(),
+            ..dev.clone()
+        };
+        {
+            let app = App::new(&store, &keychain);
+            for (config, name, value) in [
+                (&staging, IMPORT_UPDATED, "staging-updated-v1"),
+                (&staging, IMPORT_UPDATED, "staging-updated-v2"),
+                (&staging, IMPORT_OMITTED, "staging-omitted-v1"),
+                (&dev, IMPORT_UPDATED, "dev-updated-v1"),
+                (&dev, IMPORT_OMITTED, "dev-omitted-v1"),
+            ] {
+                app.set(config, name, value.as_bytes())
+                    .expect("seed synthetic secret");
+            }
+        }
+        (store, keychain, staging, dev)
+    }
+
+    fn named_values(pairs: &[(&str, &str)]) -> Vec<(String, Vec<u8>)> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+            .collect()
+    }
+
+    /// The stable store id behind a secret name, so a delete and recreate shows up as a new id.
+    fn secret_id(store: &Store, keychain: &MemoryKeychain, config: &Config, name: &str) -> String {
+        let master = session::current_master_key(keychain)
+            .expect("read session")
+            .expect("unlocked session");
+        let keypair = session::account_keypair(store, &master).expect("account keypair");
+        Vault::open(store, &keypair, &config.project_id, &config.environment)
+            .expect("open vault")
+            .find_id_by_name(name)
+            .expect("resolve secret name")
+            .unwrap_or_else(|| panic!("{name} has no stored secret"))
+    }
+
+    /// Every stored row of one environment, tombstones included, keyed by secret id with its
+    /// retained versions. Equal ciphertext proves a secret was not rewritten.
+    type RawEnvironment = BTreeMap<String, (SyncSecret, Vec<SecretVersion>)>;
+
+    fn raw_environment(store: &Store, config: &Config) -> RawEnvironment {
+        let env = store
+            .get_environment(&config.project_id, &config.environment)
+            .expect("read environment")
+            .expect("environment exists");
+        store
+            .all_secrets(&env.id)
+            .expect("list stored secrets")
+            .into_iter()
+            .map(|row| {
+                let versions = store.secret_versions(&row.id).expect("list versions");
+                (row.id.clone(), (row, versions))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dotenv_import_updates_and_adds_in_target_environment_only() {
+        let (store, keychain, staging, dev) = seeded_import_environments();
+        let app = App::new(&store, &keychain);
+        let updated_id = secret_id(&store, &keychain, &staging, IMPORT_UPDATED);
+        let omitted_id = secret_id(&store, &keychain, &staging, IMPORT_OMITTED);
+        let staging_before = raw_environment(&store, &staging);
+        let dev_before = raw_environment(&store, &dev);
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let file = dir.path().join("synthetic.env");
+        let input =
+            format!("{IMPORT_UPDATED}=staging-updated-v3\n{IMPORT_ADDED}=staging-added-v1\n");
+        std::fs::write(&file, &input).expect("write fixture");
+
+        import_dotenv(&app, &staging, &file).expect("import succeeds");
+
+        assert!(file.is_file(), "import must leave its input in place");
+        assert_eq!(
+            std::fs::read(&file).expect("read input back"),
+            input.as_bytes()
+        );
+        assert_eq!(
+            app.entries(&staging).expect("staging entries"),
+            named_values(&[
+                (IMPORT_ADDED, "staging-added-v1"),
+                (IMPORT_OMITTED, "staging-omitted-v1"),
+                (IMPORT_UPDATED, "staging-updated-v3"),
+            ])
+        );
+
+        // The other environment keeps its values, rows and history byte for byte.
+        assert_eq!(raw_environment(&store, &dev), dev_before);
+        assert_eq!(
+            app.entries(&dev).expect("dev entries"),
+            named_values(&[
+                (IMPORT_OMITTED, "dev-omitted-v1"),
+                (IMPORT_UPDATED, "dev-updated-v1"),
+            ])
+        );
+
+        // Existing names keep their secret ids, so nothing was deleted and recreated.
+        assert_eq!(
+            secret_id(&store, &keychain, &staging, IMPORT_UPDATED),
+            updated_id
+        );
+        assert_eq!(
+            secret_id(&store, &keychain, &staging, IMPORT_OMITTED),
+            omitted_id
+        );
+        let added_id = secret_id(&store, &keychain, &staging, IMPORT_ADDED);
+
+        let mut staging_after = raw_environment(&store, &staging);
+        let omitted_after = staging_after
+            .remove(&omitted_id)
+            .expect("omitted secret row is kept");
+        assert_eq!(
+            omitted_after, staging_before[&omitted_id],
+            "omitted secret must not be rewritten"
+        );
+
+        let (updated_row, updated_versions) = staging_after
+            .remove(&updated_id)
+            .expect("updated secret row is kept");
+        let (_, versions_before) = &staging_before[&updated_id];
+        assert!(!updated_row.deleted);
+        assert_eq!(updated_row.version, 3);
+        assert_eq!(
+            updated_versions.len(),
+            versions_before.len() + 1,
+            "import must append exactly one version"
+        );
+        assert_eq!(
+            &updated_versions[..versions_before.len()],
+            versions_before.as_slice(),
+            "earlier versions must be kept as stored"
+        );
+        let updated_history: Vec<_> = app
+            .secret_history(&staging, IMPORT_UPDATED)
+            .expect("updated history")
+            .into_iter()
+            .map(|item| (item.version, item.value))
+            .collect();
+        assert_eq!(
+            updated_history,
+            vec![
+                (3, Some(b"staging-updated-v3".to_vec())),
+                (2, Some(b"staging-updated-v2".to_vec())),
+                (1, Some(b"staging-updated-v1".to_vec())),
+            ]
+        );
+
+        let (added_row, added_versions) = staging_after
+            .remove(&added_id)
+            .expect("added secret row is stored");
+        assert!(!added_row.deleted);
+        assert_eq!(added_row.version, 1);
+        assert_eq!(added_versions.len(), 1);
+        assert!(
+            staging_after.is_empty(),
+            "unexpected extra rows: {:?}",
+            staging_after.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dotenv_import_of_empty_or_comment_only_file_is_a_no_op() {
+        let (store, keychain, staging, dev) = seeded_import_environments();
+        let app = App::new(&store, &keychain);
+        let staging_before = raw_environment(&store, &staging);
+        let dev_before = raw_environment(&store, &dev);
+        let seeded = named_values(&[
+            (IMPORT_OMITTED, "staging-omitted-v1"),
+            (IMPORT_UPDATED, "staging-updated-v2"),
+        ]);
+        let dir = tempfile::tempdir().expect("temporary directory");
+
+        for (label, input) in [
+            ("empty", ""),
+            (
+                "comment-only",
+                "# synthetic comment\n\n# SYNTHETIC_UPDATED=commented-out\n",
+            ),
+        ] {
+            let file = dir.path().join(format!("{label}.env"));
+            std::fs::write(&file, input).expect("write fixture");
+
+            import_dotenv(&app, &staging, &file).expect("import succeeds");
+
+            assert_eq!(
+                app.entries(&staging).expect("staging entries"),
+                seeded,
+                "{label}"
+            );
+            assert_eq!(
+                raw_environment(&store, &staging),
+                staging_before,
+                "{label}: target rows or history changed"
+            );
+            assert_eq!(
+                raw_environment(&store, &dev),
+                dev_before,
+                "{label}: other environment changed"
+            );
+            assert!(file.is_file(), "{label}: input removed");
+            assert_eq!(
+                std::fs::read(&file).expect("read input back"),
+                input.as_bytes(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn dotenv_import_parse_error_includes_path_and_writes_nothing() {
+        let (store, keychain, config) = unlocked_project();
         let app = App::new(&store, &keychain);
         let dir = tempfile::tempdir().expect("temporary directory");
         let file = dir.path().join("broken dotenv.env");
