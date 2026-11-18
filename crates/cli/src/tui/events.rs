@@ -123,6 +123,12 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
     }
 
     if app.search_mode {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('u') {
+            app.search_query.clear();
+            app.apply_filter();
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Esc => {
                 app.search_query.clear();
@@ -181,6 +187,9 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Tab => {
             app.cycle_environment()?;
+        }
+        KeyCode::BackTab => {
+            app.cycle_environment_back()?;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.move_selection_up();
@@ -279,8 +288,8 @@ pub fn handle_mouse_event(app: &mut TuiApp, mouse: MouseEvent) -> Result<()> {
         MouseEventKind::ScrollUp => {
             app.move_selection_up();
         }
-        MouseEventKind::Down(MouseButton::Left) if app.show_help => {
-            app.show_help = false;
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.select_secret_at(mouse.column, mouse.row);
         }
         _ => {}
     }
@@ -335,9 +344,46 @@ mod tests {
     fn search_for(app: &mut TuiApp, query: &str) {
         handle_key_event(app, key(KeyCode::Char('/'))).unwrap();
         assert!(app.search_mode);
-        for character in query.chars() {
+        type_chars(app, query);
+    }
+
+    fn type_chars(app: &mut TuiApp, text: &str) {
+        for character in text.chars() {
             handle_key_event(app, key(KeyCode::Char(character))).unwrap();
         }
+    }
+
+    fn with_unlocked_dashboard(
+        seed: &[(&str, &[u8])],
+        check: impl FnOnce(&crate::commands::App<'_>, &mut TuiApp<'_>),
+    ) {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let keychain = crate::keychain::MemoryKeychain::default();
+        crate::session::init(
+            &store,
+            &keychain,
+            b"pw",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master = crate::session::current_master_key(&keychain)
+            .unwrap()
+            .unwrap();
+        let keypair = crate::session::account_keypair(&store, &master).unwrap();
+        let project = crate::vault::Vault::create_project(&store, &keypair, "acme").unwrap();
+        let config = crate::config::Config {
+            project_id: project.id,
+            project: "acme".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let theme = crate::theme::Theme::default();
+        let app = crate::commands::App::new(&store, &keychain);
+        for (name, value) in seed {
+            app.set(&config, name, value).unwrap();
+        }
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        check(&app, &mut tui_app);
     }
 
     fn filtered_names<'a>(app: &'a TuiApp) -> Vec<&'a str> {
@@ -397,10 +443,80 @@ mod tests {
             assert!(app.selected_secret().is_some());
         });
     }
+    #[test]
+    fn ctrl_u_clears_search_and_keeps_search_mode() {
+        with_search_app(|app| {
+            search_for(app, "api");
 
+            assert_eq!(app.search_query, "api");
+            assert_eq!(filtered_names(app), vec!["API_KEY"]);
+
+            handle_key_event(
+                app,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            )
+            .unwrap();
+
+            assert_eq!(app.search_query, "");
+            assert!(app.search_mode);
+            assert_eq!(
+                filtered_names(app),
+                vec!["API_KEY", "DATABASE_URL", "DATA_DIR"]
+            );
+
+            handle_key_event(app, key(KeyCode::Char('d'))).unwrap();
+
+            assert_eq!(app.search_query, "d");
+            assert!(app.search_mode);
+            assert_eq!(filtered_names(app), vec!["DATABASE_URL", "DATA_DIR"]);
+        });
+    }
+    #[test]
+    fn ctrl_u_restores_list_after_no_match_search() {
+        with_search_app(|app| {
+            search_for(app, "does-not-exist");
+
+            assert!(filtered_names(app).is_empty());
+
+            handle_key_event(
+                app,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            )
+            .unwrap();
+
+            assert_eq!(app.search_query, "");
+            assert!(app.search_mode);
+            assert_eq!(
+                filtered_names(app),
+                vec!["API_KEY", "DATABASE_URL", "DATA_DIR"]
+            );
+        });
+    }
+    #[test]
+    fn ctrl_u_with_empty_query_keeps_search_mode() {
+        with_search_app(|app| {
+            search_for(app, "");
+
+            assert_eq!(app.search_query, "");
+            assert!(app.search_mode);
+
+            handle_key_event(
+                app,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            )
+            .unwrap();
+
+            assert_eq!(app.search_query, "");
+            assert!(app.search_mode);
+            assert_eq!(
+                filtered_names(app),
+                vec!["API_KEY", "DATABASE_URL", "DATA_DIR"]
+            );
+        });
+    }
     #[test]
     fn search_shortcuts_are_query_text() {
-        for character in ['q', 'c', 'r', 't', '?'] {
+        for character in ['q', 'c', 'r', 't', 'u', '?'] {
             with_search_app(|app| {
                 search_for(app, &character.to_string());
                 assert_eq!(app.search_query, character.to_string());
@@ -662,6 +778,141 @@ mod tests {
         assert_eq!(tui_app.selected_filtered_index, 1);
     }
 
+    fn left_click_at(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// Run `check` against a dashboard holding `KEY_00..KEY_{count}` after one 80x24 draw, which is
+    /// what tells the mouse handler where the secret list is.
+    fn with_drawn_app(count: usize, check: impl FnOnce(&mut TuiApp<'_>, &mut dyn FnMut(&TuiApp))) {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let keychain = crate::keychain::MemoryKeychain::default();
+        crate::session::init(
+            &store,
+            &keychain,
+            b"pw",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master = crate::session::current_master_key(&keychain)
+            .unwrap()
+            .unwrap();
+        let keypair = crate::session::account_keypair(&store, &master).unwrap();
+        let project = crate::vault::Vault::create_project(&store, &keypair, "click-test").unwrap();
+        let config = crate::config::Config {
+            project_id: project.id,
+            project: "click-test".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let theme = crate::theme::Theme::default();
+        let app = crate::commands::App::new(&store, &keychain);
+        for i in 0..count {
+            app.set(&config, &format!("KEY_{i:02}"), b"value").unwrap();
+        }
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut redraw = move |app: &TuiApp| {
+            terminal.draw(|f| crate::tui::ui::draw(f, app)).unwrap();
+        };
+        redraw(&tui_app);
+        check(&mut tui_app, &mut redraw);
+    }
+
+    #[test]
+    fn left_click_selects_the_clicked_secret_row() {
+        with_drawn_app(5, |app, _| {
+            let view = app.secret_list_view.get();
+            handle_mouse_event(app, left_click_at(view.area.x + 2, view.area.y + 2)).unwrap();
+
+            assert_eq!(app.selected_filtered_index, 2);
+            assert_eq!(app.selected_secret().unwrap().name, "KEY_02");
+        });
+    }
+
+    #[test]
+    fn left_click_accounts_for_list_scrolling() {
+        with_drawn_app(30, |app, redraw| {
+            app.move_selection_end();
+            redraw(app);
+            let view = app.secret_list_view.get();
+            assert!(view.offset > 0, "the list should have scrolled");
+
+            handle_mouse_event(app, left_click_at(view.area.x, view.area.y)).unwrap();
+            assert_eq!(app.selected_filtered_index, view.offset);
+            assert_eq!(
+                app.selected_secret().unwrap().name,
+                format!("KEY_{:02}", view.offset)
+            );
+
+            let last_visible = view.area.y + view.area.height - 1;
+            handle_mouse_event(app, left_click_at(view.area.x, last_visible)).unwrap();
+            assert_eq!(
+                app.selected_filtered_index,
+                view.offset + usize::from(view.area.height) - 1
+            );
+        });
+    }
+
+    #[test]
+    fn left_click_outside_the_secret_rows_changes_nothing() {
+        with_drawn_app(3, |app, _| {
+            let view = app.secret_list_view.get();
+            app.selected_filtered_index = 1;
+            let (x, y, w, h) = (view.area.x, view.area.y, view.area.width, view.area.height);
+
+            for (column, row) in [
+                (x, y + 3),     // empty space below the last secret
+                (x, y + h - 1), // bottom of the pane, still empty
+                (x, y - 1),     // the list's top border
+                (x - 1, y),     // the list's left border
+                (x + w, y),     // the list's right border
+                (x, y - 4),     // the search bar
+                (x + w + 5, y), // the inspector pane
+                (0, 0),         // the header
+                (0, 23),        // the footer
+            ] {
+                handle_mouse_event(app, left_click_at(column, row)).unwrap();
+                assert_eq!(app.selected_filtered_index, 1, "click at ({column}, {row})");
+            }
+        });
+    }
+
+    #[test]
+    fn left_click_selects_without_revealing_the_secret() {
+        with_drawn_app(3, |app, _| {
+            let view = app.secret_list_view.get();
+            app.revealed = true;
+
+            handle_mouse_event(app, left_click_at(view.area.x, view.area.y + 1)).unwrap();
+
+            assert_eq!(app.selected_filtered_index, 1);
+            assert!(
+                !app.revealed,
+                "moving to another secret hides the revealed value"
+            );
+            assert!(app.decrypted_cache.is_none());
+        });
+    }
+
+    #[test]
+    fn left_click_is_ignored_while_a_modal_is_open() {
+        with_drawn_app(3, |app, _| {
+            let view = app.secret_list_view.get();
+            app.show_delete_modal = true;
+
+            handle_mouse_event(app, left_click_at(view.area.x, view.area.y + 2)).unwrap();
+
+            assert_eq!(app.selected_filtered_index, 0);
+        });
+    }
+
     #[test]
     fn theme_modal_mouse_scroll_events() {
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -773,10 +1024,17 @@ mod tests {
         assert!(!tui_app.secret_modal_masked);
 
         // Enter commits
+        let created_value = tui_app.secret_modal_value.as_bytes().to_vec();
         handle_key_event(&mut tui_app, key(KeyCode::Enter)).unwrap();
         assert!(!tui_app.show_secret_modal);
         assert_eq!(tui_app.secrets.len(), 1);
         assert_eq!(tui_app.secrets[0].name, "TOKEN");
+        assert_eq!(tui_app.secrets[0].version, 1);
+        assert_eq!(app.get(&tui_app.config, "TOKEN").unwrap(), created_value);
+        assert_eq!(
+            app.secret_history(&tui_app.config, "TOKEN").unwrap().len(),
+            1
+        );
 
         // 'e' opens edit modal on selected secret
         handle_key_event(&mut tui_app, key(KeyCode::Char('e'))).unwrap();
@@ -787,9 +1045,154 @@ mod tests {
         );
         assert_eq!(tui_app.secret_modal_name, "TOKEN");
 
-        // Esc cancels edit modal
+        // Esc cancels an unchanged edit dialogue
         handle_key_event(&mut tui_app, key(KeyCode::Esc)).unwrap();
         assert!(!tui_app.show_secret_modal);
+
+        // Editing the value and pressing Enter still saves and adds a version.
+        handle_key_event(&mut tui_app, key(KeyCode::Char('e'))).unwrap();
+        handle_key_event(&mut tui_app, key(KeyCode::Char('x'))).unwrap();
+        let updated_value = tui_app.secret_modal_value.as_bytes().to_vec();
+        handle_key_event(&mut tui_app, key(KeyCode::Enter)).unwrap();
+        assert!(!tui_app.show_secret_modal);
+        assert_eq!(app.get(&tui_app.config, "TOKEN").unwrap(), updated_value);
+        assert_eq!(tui_app.secrets[0].version, 2);
+        assert_eq!(
+            app.secret_history(&tui_app.config, "TOKEN").unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn cancelling_new_secret_draft_leaves_vault_unchanged() {
+        with_unlocked_dashboard(&[("KEEP_ME", b"keep-value")], |app, tui_app| {
+            handle_key_event(tui_app, key(KeyCode::Char('n'))).unwrap();
+            assert!(tui_app.show_secret_modal);
+            assert_eq!(
+                tui_app.secret_modal_mode,
+                crate::tui::app::SecretModalMode::New
+            );
+
+            type_chars(tui_app, "DRAFT_TOKEN");
+            handle_key_event(tui_app, key(KeyCode::Tab)).unwrap();
+            type_chars(tui_app, "discarded-draft");
+            assert_eq!(tui_app.secret_modal_name, "DRAFT_TOKEN");
+            assert_eq!(tui_app.secret_modal_value.as_str(), "discarded-draft");
+
+            handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+            assert!(!tui_app.show_secret_modal);
+            assert!(tui_app.running);
+
+            assert_eq!(app.list(&tui_app.config).unwrap(), ["KEEP_ME"]);
+            assert_eq!(app.get(&tui_app.config, "KEEP_ME").unwrap(), b"keep-value");
+            assert!(matches!(
+                app.get(&tui_app.config, "DRAFT_TOKEN"),
+                Err(crate::error::Error::NotFound(_))
+            ));
+            assert_eq!(
+                app.secret_history(&tui_app.config, "KEEP_ME")
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(tui_app.secrets.len(), 1);
+            assert_eq!(tui_app.secrets[0].name, "KEEP_ME");
+            assert_eq!(tui_app.secrets[0].version, 1);
+        });
+    }
+
+    #[test]
+    fn cancelling_edit_secret_draft_leaves_value_and_history_unchanged() {
+        with_unlocked_dashboard(
+            &[("EXISTING", b"v1-value"), ("EXISTING", b"v2-value")],
+            |app, tui_app| {
+                assert_eq!(tui_app.secrets[0].version, 2);
+
+                handle_key_event(tui_app, key(KeyCode::Char('e'))).unwrap();
+                assert!(tui_app.show_secret_modal);
+                assert_eq!(
+                    tui_app.secret_modal_mode,
+                    crate::tui::app::SecretModalMode::Edit
+                );
+                assert_eq!(tui_app.secret_modal_value.as_str(), "v2-value");
+
+                type_chars(tui_app, "-discarded");
+                assert_eq!(tui_app.secret_modal_value.as_str(), "v2-value-discarded");
+
+                handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+                assert!(!tui_app.show_secret_modal);
+                assert!(tui_app.running);
+
+                // Persistence is checked through the store, not only the cached list.
+                assert_eq!(app.get(&tui_app.config, "EXISTING").unwrap(), b"v2-value");
+                let history = app.secret_history(&tui_app.config, "EXISTING").unwrap();
+                assert_eq!(history.len(), 2);
+                assert_eq!(history[0].version, 2);
+                assert_eq!(history[0].value.as_deref(), Some(b"v2-value".as_slice()));
+                assert_eq!(history[1].version, 1);
+                assert_eq!(history[1].value.as_deref(), Some(b"v1-value".as_slice()));
+                assert_eq!(app.list_items(&tui_app.config).unwrap()[0].version, 2);
+                assert_eq!(tui_app.secrets[0].version, 2);
+            },
+        );
+    }
+
+    #[test]
+    fn reopening_secret_modal_after_cancel_loads_original_masked_fields() {
+        with_unlocked_dashboard(&[("EXISTING", b"stored-value")], |app, tui_app| {
+            handle_key_event(tui_app, key(KeyCode::Char('n'))).unwrap();
+            type_chars(tui_app, "DRAFT_TOKEN");
+            handle_key_event(tui_app, key(KeyCode::Tab)).unwrap();
+            type_chars(tui_app, "discarded-draft");
+            handle_key_event(
+                tui_app,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            )
+            .unwrap();
+            assert!(!tui_app.secret_modal_masked);
+            handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+
+            handle_key_event(tui_app, key(KeyCode::Char('n'))).unwrap();
+            assert!(tui_app.show_secret_modal);
+            assert_eq!(
+                tui_app.secret_modal_mode,
+                crate::tui::app::SecretModalMode::New
+            );
+            assert_eq!(tui_app.secret_modal_name, "");
+            assert_eq!(tui_app.secret_modal_value.as_str(), "");
+            assert!(tui_app.secret_modal_masked);
+            handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+
+            handle_key_event(tui_app, key(KeyCode::Char('e'))).unwrap();
+            type_chars(tui_app, "-discarded");
+            handle_key_event(
+                tui_app,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            )
+            .unwrap();
+            assert!(!tui_app.secret_modal_masked);
+            handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+
+            handle_key_event(tui_app, key(KeyCode::Char('e'))).unwrap();
+            assert!(tui_app.show_secret_modal);
+            assert_eq!(
+                tui_app.secret_modal_mode,
+                crate::tui::app::SecretModalMode::Edit
+            );
+            assert_eq!(tui_app.secret_modal_name, "EXISTING");
+            assert_eq!(tui_app.secret_modal_value.as_str(), "stored-value");
+            assert!(tui_app.secret_modal_masked);
+            assert_eq!(
+                app.get(&tui_app.config, "EXISTING").unwrap(),
+                b"stored-value"
+            );
+            assert_eq!(
+                app.secret_history(&tui_app.config, "EXISTING")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        });
     }
 
     #[test]
@@ -895,5 +1298,83 @@ mod tests {
         assert!(tui_app.show_history_modal);
         handle_key_event(&mut tui_app, key(KeyCode::Esc)).unwrap();
         assert!(!tui_app.show_history_modal);
+    }
+
+    fn shift_tab() -> KeyEvent {
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+    }
+
+    #[test]
+    fn tab_and_shift_tab_step_environments_in_both_directions() {
+        with_search_app(|app| {
+            assert_eq!(app.config.environment, "dev");
+
+            handle_key_event(app, key(KeyCode::Tab)).unwrap();
+            assert_eq!(app.config.environment, "prod");
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(app.config.environment, "dev");
+
+            // Backwards wraps from the first environment to the last.
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(app.config.environment, "staging");
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(app.config.environment, "prod");
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(app.config.environment, "dev");
+        });
+    }
+
+    #[test]
+    fn shift_tab_with_one_environment_keeps_it_selected() {
+        with_search_app(|app| {
+            app.environments = vec!["dev".into()];
+            app.active_env_index = 0;
+
+            handle_key_event(app, shift_tab()).unwrap();
+
+            assert_eq!(app.config.environment, "dev");
+            let notice = app.status_message.as_ref().unwrap();
+            assert_eq!(notice.kind, crate::tui::app::StatusKind::Information);
+        });
+    }
+
+    #[test]
+    fn shift_tab_in_secret_modal_moves_field_not_environment() {
+        with_search_app(|app| {
+            handle_key_event(app, key(KeyCode::Char('n'))).unwrap();
+            assert!(app.show_secret_modal);
+            assert_eq!(
+                app.secret_modal_field,
+                crate::tui::app::SecretModalField::Name
+            );
+
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(
+                app.secret_modal_field,
+                crate::tui::app::SecretModalField::Value
+            );
+            assert_eq!(app.config.environment, "dev");
+            assert_eq!(app.active_env_index, 0);
+
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(
+                app.secret_modal_field,
+                crate::tui::app::SecretModalField::Name
+            );
+            assert_eq!(app.config.environment, "dev");
+        });
+    }
+
+    #[test]
+    fn shift_tab_in_search_mode_is_ignored() {
+        with_search_app(|app| {
+            search_for(app, "api");
+
+            handle_key_event(app, shift_tab()).unwrap();
+
+            assert!(app.search_mode);
+            assert_eq!(app.search_query, "api");
+            assert_eq!(app.config.environment, "dev");
+        });
     }
 }

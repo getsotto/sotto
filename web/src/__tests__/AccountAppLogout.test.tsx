@@ -15,6 +15,27 @@ afterEach(cleanup);
 beforeEach(() => vi.resetAllMocks());
 
 describe("AccountApp logout recovery", () => {
+  it("blocks a second logout while the request is pending", async () => {
+    vi.mocked(api.me).mockResolvedValue({ userId: "synthetic-user" });
+    let resolve!: () => void;
+    const pending = new Promise<void>((res) => { resolve = res; });
+    vi.mocked(api.logout).mockReturnValueOnce(pending);
+
+    render(<AccountApp />);
+    expect(await screen.findByRole("heading", { name: "Cloud account controls" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Log out" }));
+    const busy = screen.getByRole("button", { name: "Logging out…" });
+    expect(busy).toBeDisabled();
+    fireEvent.click(busy);
+    fireEvent.click(busy);
+    expect(api.logout).toHaveBeenCalledOnce();
+
+    await act(async () => { resolve(); });
+    expect(screen.getByRole("button", { name: "Log in with GitHub" })).toBeInTheDocument();
+    expect(api.logout).toHaveBeenCalledOnce();
+  });
+
   it("shows a logout failure and clears it while retrying successfully", async () => {
     vi.mocked(api.me).mockResolvedValue({ userId: "synthetic-user" });
     let resolve!: () => void;

@@ -32,6 +32,18 @@ function date(epoch: number): string {
   return new Date(epoch * 1000).toLocaleDateString("en-GB");
 }
 
+function deadline(epoch: number): string {
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "UTC",
+    timeZoneName: "short",
+  }).format(new Date(epoch * 1000));
+}
+
 function pounds(pence: number): string {
   return new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(pence / 100);
 }
@@ -40,11 +52,15 @@ function payer(kind: string, organizationId: string | null): string {
   return kind === "personal" ? "personal billing" : `organisation ${organizationId ?? "billing"}`;
 }
 
-function stateCopy(state: string, expiredInvitation = false): string {
+// Which deadline closed an open invitation: the response deadline or the renewal boundary, whichever came first.
+type InvitationExpiry = "response_deadline" | "renewal";
+
+function stateCopy(state: string, invitationExpiry: InvitationExpiry | null = null): string {
   switch (state) {
-    case "awaiting_consent": return expiredInvitation
-      ? "This invitation expired at the renewal boundary. Ask the initiator to start a new request."
-      : "Waiting for the other payer to respond.";
+    case "awaiting_consent":
+      if (invitationExpiry === "renewal") return "This invitation expired at the renewal boundary. Ask the initiator to start a new request.";
+      if (invitationExpiry === "response_deadline") return "This invitation expired because its response deadline passed. Ask the initiator to start a new request.";
+      return "Waiting for the other payer to respond.";
     case "pending": return "Accepted. The billing change is being prepared; it is not complete yet.";
     case "destination_prepared": return "The change is being prepared for the renewal date.";
     case "destination_paid":
@@ -84,6 +100,7 @@ export function PayerTransferInbox() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [expiryTick, setExpiryTick] = useState(0);
+  const refreshGeneration = useRef(0);
   const [discoveryError, setDiscoveryError] = useState<string | null>(null);
   const [discoveryLoading, setDiscoveryLoading] = useState(true);
   const discoveryInFlight = useRef(false);
@@ -117,34 +134,43 @@ export function PayerTransferInbox() {
       discoveryInFlight.current = false;
     }
   }
-
   async function refresh() {
+    const generation = ++refreshGeneration.current;
+    const isCurrent = () => generation === refreshGeneration.current;
     setLoading(true);
     setError(null);
     try {
       const page = await fetchPayerTransfers();
+      if (!isCurrent()) return;
       setTransfers(page.transfers);
       setNextCursor(page.nextCursor);
       setListLoaded(true);
     } catch (e) {
+      if (!isCurrent()) return;
       setError(message(e));
     } finally {
-      setLoading(false);
+      if (isCurrent()) {
+        setLoading(false);
+      }
     }
   }
 
   async function loadMore() {
     if (nextCursor === null || loadingMore) return;
+    const generation = refreshGeneration.current;
+    const isCurrent = () => generation === refreshGeneration.current;
     setLoadingMore(true);
     setError(null);
     try {
       const page = await fetchPayerTransfers(nextCursor);
+      if (!isCurrent()) return;
       setTransfers((current) => {
         const known = new Set(current.map((transfer) => transfer.transferId));
         return [...current, ...page.transfers.filter((transfer) => !known.has(transfer.transferId))];
       });
       setNextCursor(page.nextCursor);
     } catch (e) {
+      if (!isCurrent()) return;
       setError(message(e));
     } finally {
       setLoadingMore(false);
@@ -258,6 +284,8 @@ export function PayerTransferInbox() {
         const incoming = transfer.participantRole === "counterparty";
         const invitationExpired = transfer.state === "awaiting_consent"
           && Math.floor(Date.now() / 1000) >= Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom);
+        const invitationExpiry: InvitationExpiry | null = !invitationExpired ? null
+          : transfer.consentExpiresAtEpoch < transfer.effectiveFrom ? "response_deadline" : "renewal";
         const actionable = transfer.state === "awaiting_consent" && !invitationExpired;
         const setupRequired = transfer.state === "pending"
           && transfer.destinationKind === "personal"
@@ -268,8 +296,8 @@ export function PayerTransferInbox() {
           <strong>{incoming ? "Incoming request" : "Outgoing request"}</strong>
           <span className="meta">{payer(transfer.sourceKind, transfer.sourceOrganizationId)} → {payer(transfer.destinationKind, transfer.destinationOrganizationId)}</span>
           <p>{pounds(transfer.amountPence)} per {transfer.interval}; renewal {date(transfer.effectiveFrom)}.</p>
-          {actionable && <p className="muted">Respond by {date(Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom))}.</p>}
-          <p className="muted">{stateCopy(transfer.state, invitationExpired)}</p>
+          {actionable && <p className="muted">Respond by {deadline(Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom))}.</p>}
+          <p className="muted">{stateCopy(transfer.state, invitationExpiry)}</p>
           {transfer.state === "unknown" && <p className="muted">Contact Sotto support before making another billing change.</p>}
           {actionable && incoming && transfer.destinationKind === "personal" && !setupAvailable
             && <p className="muted">Personal payment setup is not available on this server yet. The request has not been accepted.</p>}

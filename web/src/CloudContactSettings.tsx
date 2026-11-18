@@ -30,9 +30,12 @@ export function CloudContactSettings() {
   const [status, setStatus] = useState<CloudContactStatus | "unsupported" | "error" | null>(null);
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const requestKey = useRef<string | null>(null);
+  // State alone cannot stop two clicks that land before React re-renders the disabled button.
+  const retryInFlight = useRef(false);
 
   async function refresh() {
     setError(null);
@@ -45,6 +48,18 @@ export function CloudContactSettings() {
       }
       setStatus("error");
       setError(message(cause));
+    }
+  }
+
+  async function retry() {
+    if (retryInFlight.current) return;
+    retryInFlight.current = true;
+    setRetrying(true);
+    try {
+      await refresh();
+    } finally {
+      retryInFlight.current = false;
+      setRetrying(false);
     }
   }
 
@@ -120,7 +135,7 @@ export function CloudContactSettings() {
       {notice !== null && <p role="status">{notice}</p>}
       {status === null ? <p className="muted" role="status">Checking contact settings…</p>
         : status === "unsupported" ? <p className="muted">Email contact settings require a newer Sotto server version.</p>
-        : status === "error" ? <><p className="muted">Contact settings could not be loaded.</p><button type="button" onClick={() => void refresh()}>Retry</button></>
+        : status === "error" ? <><p className="muted">Contact settings could not be loaded.</p><button type="button" disabled={retrying} onClick={() => void retry()}>{retrying ? "Retrying…" : "Retry"}</button></>
         : <>
         {status.email === null
           ? <p>No verified email contact is set.</p>
