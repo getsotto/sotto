@@ -10,6 +10,7 @@ type Phase = "checking" | "loggedOut" | "signedIn" | "error";
 export function AccountApp() {
   const [phase, setPhase] = useState<Phase>("checking");
   const [error, setError] = useState<string | null>(null);
+  const [loggingOut, setLoggingOut] = useState(false);
 
   useEffect(() => {
     void me()
@@ -21,12 +22,16 @@ export function AccountApp() {
   }, []);
 
   async function doLogout() {
+    if (loggingOut) return;
+    setLoggingOut(true);
     setError(null);
     try {
       await logout();
       setPhase("loggedOut");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoggingOut(false);
     }
   }
 
@@ -39,5 +44,5 @@ export function AccountApp() {
   if (phase === "loggedOut") {
     return <Shell><h1>Manage your Sotto Cloud account</h1><p className="muted">Sign in to view billing, recovery and export controls. Unlocking your vault is not required.</p><button className="primary" onClick={() => startLogin("/cloud")}>Log in with GitHub</button></Shell>;
   }
-  return <Shell onLogout={() => void doLogout()}>{error !== null && <p role="alert">{error}</p>}<CloudAccountPanel /></Shell>;
+  return <Shell onLogout={() => void doLogout()} logoutPending={loggingOut}>{error !== null && <p role="alert">{error}</p>}<CloudAccountPanel /></Shell>;
 }

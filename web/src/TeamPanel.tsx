@@ -86,6 +86,8 @@ export function TeamPanel({
   const [members, setMembers] = useState<Member[] | null>(null);
   const [membersLoading, setMembersLoading] = useState(false);
   const [audit, setAudit] = useState<AuditEvent[] | null>(null);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditError, setAuditError] = useState<string | null>(null);
   const [plan, setPlan] = useState<Entitlements | null>(null);
   const [email, setEmail] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
@@ -110,6 +112,7 @@ export function TeamPanel({
   const orgLoadGeneration = useRef(0);
   const billingGeneration = useRef(0);
   const inviteInFlight = useRef(false);
+  const auditInFlight = useRef(false);
 
   useEffect(() => {
     if (billingOutcome !== null) {
@@ -134,6 +137,25 @@ export function TeamPanel({
     void loadOrgs();
   }, [master, encPrivateKeys]);
 
+  async function loadAudit(orgId: string, generation: number) {
+    const isCurrent = () => generation === orgLoadGeneration.current;
+    if (!isCurrent() || auditInFlight.current) return;
+    auditInFlight.current = true;
+    setAuditLoading(true);
+    setAuditError(null);
+    try {
+      const nextAudit = await fetchAudit(orgId);
+      if (isCurrent()) setAudit(nextAudit);
+    } catch (e) {
+      if (isCurrent()) setAuditError(message(e));
+    } finally {
+      if (isCurrent()) {
+        auditInFlight.current = false;
+        setAuditLoading(false);
+      }
+    }
+  }
+
   async function selectOrg(no: NamedOrg) {
     const generation = ++orgLoadGeneration.current;
     const isCurrent = () => generation === orgLoadGeneration.current;
@@ -147,6 +169,9 @@ export function TeamPanel({
     setMembers(null);
     setMembersLoading(true);
     setAudit(null);
+    setAuditLoading(false);
+    setAuditError(null);
+    auditInFlight.current = false;
     setPlan(null);
     setDeletionActive(false);
     setSponsoredSeats([]);
@@ -160,6 +185,10 @@ export function TeamPanel({
       const entitlements = await fetchEntitlements(no.org.id);
       if (!isCurrent()) return;
       setPlan(entitlements);
+      const auditAllowed =
+        ["owner", "admin"].includes(no.org.role) &&
+        entitlements.effectiveTier === "team";
+      setAuditLoading(auditAllowed);
       if (["owner", "admin"].includes(no.org.role)) {
         // Sponsored billing is opt-in and may be absent on older servers. It must not hide the
         // established membership surface when that capability is unavailable.
@@ -175,13 +204,8 @@ export function TeamPanel({
         }
       }
       // The audit log is admin/owner-only AND a Team feature; skip the fetch when gated.
-      if (
-        ["owner", "admin"].includes(no.org.role) &&
-        entitlements.effectiveTier === "team"
-      ) {
-        const nextAudit = await fetchAudit(no.org.id);
-        if (!isCurrent()) return;
-        setAudit(nextAudit);
+      if (auditAllowed) {
+        await loadAudit(no.org.id, generation);
       }
     } catch (e) {
       if (isCurrent()) {
@@ -518,10 +542,25 @@ export function TeamPanel({
               </button>
             </form>
           )}
-          {audit !== null && (
-            <>
-              <h3>Audit log</h3>
-              {audit.length === 0 ? (
+          {["owner", "admin"].includes(openOrg.org.role) &&
+            plan?.effectiveTier === "team" && (
+            <section aria-labelledby="audit-heading">
+              <h3 id="audit-heading">Audit log</h3>
+              {auditLoading && (
+                <p role="status" className="muted">Loading audit log…</p>
+              )}
+              {auditError !== null && (
+                <p role="alert">Could not load audit log: {auditError}</p>
+              )}
+              {(auditError !== null || auditLoading) && (
+                <button
+                  disabled={auditLoading}
+                  onClick={() => void loadAudit(openOrg.org.id, orgLoadGeneration.current)}
+                >
+                  Retry audit log
+                </button>
+              )}
+              {audit !== null && (audit.length === 0 ? (
                 <p className="muted">No events yet.</p>
               ) : (
                 <ul>
@@ -534,8 +573,8 @@ export function TeamPanel({
                     </li>
                   ))}
                 </ul>
-              )}
-            </>
+              ))}
+            </section>
           )}
         </>
       )}
