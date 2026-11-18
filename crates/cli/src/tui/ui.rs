@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::tui::app::{StatusKind, StatusNotice, TuiApp};
+use crate::tui::app::{SecretListView, StatusKind, StatusNotice, TuiApp};
 use crate::tui::theme::{to_ratatui_color, TuiStyles};
 
 /// Render the complete TUI dashboard frame.
@@ -178,10 +178,15 @@ fn draw_left_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
             .collect()
     };
 
+    let list_inner = list_block.inner(left_chunks[1]);
     let list = List::new(items).block(list_block);
     let mut list_state = ListState::default()
         .with_selected((!app.filtered_indices.is_empty()).then_some(app.selected_filtered_index));
     f.render_stateful_widget(list, left_chunks[1], &mut list_state);
+    app.secret_list_view.set(SecretListView {
+        area: list_inner,
+        offset: list_state.offset(),
+    });
 }
 
 fn draw_right_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
@@ -297,7 +302,11 @@ fn draw_right_pane(f: &mut Frame, app: &TuiApp, area: Rect) {
         ]));
         lines.push(Line::from(vec![
             Span::styled("  [Tab] ", styles.bold_accent()),
-            Span::styled("Cycle active environment", styles.text()),
+            Span::styled("Next environment", styles.text()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  [Shift+Tab] ", styles.bold_accent()),
+            Span::styled("Previous environment", styles.text()),
         ]));
 
         let paragraph = Paragraph::new(lines)
@@ -401,12 +410,20 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled("Focus search filter", styles.text()),
         ]),
         Line::from(vec![
+            Span::styled("  Ctrl+U      ", styles.bold_accent()),
+            Span::styled("Clear search and stay in search mode", styles.text()),
+        ]),
+        Line::from(vec![
             Span::styled("  Esc         ", styles.bold_accent()),
-            Span::styled("Clear filter / close modal", styles.text()),
+            Span::styled("Clear search and exit / close modal", styles.text()),
         ]),
         Line::from(vec![
             Span::styled("  Tab         ", styles.bold_accent()),
-            Span::styled("Cycle active environment", styles.text()),
+            Span::styled("Next environment", styles.text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  Shift+Tab   ", styles.bold_accent()),
+            Span::styled("Previous environment", styles.text()),
         ]),
         Line::from(vec![
             Span::styled("  n           ", styles.bold_accent()),
@@ -1407,7 +1424,9 @@ mod tests {
         assert!(content.contains("Toggle this help screen"));
         assert!(content.contains("Copy secret to clipboard"));
         assert!(content.contains("Open live theme switcher modal"));
-        assert!(content.contains("Cycle active environment"));
+        assert!(content.contains("Next environment"));
+        assert!(content.contains("Previous environment"));
+        assert!(content.contains("Shift+Tab"));
     }
 
     #[test]
