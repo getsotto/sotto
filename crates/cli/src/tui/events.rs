@@ -99,6 +99,9 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
             (KeyModifiers::CONTROL, KeyCode::Char('r')) => {
                 app.toggle_secret_modal_mask();
             }
+            (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
+                app.secret_modal_clear_field();
+            }
             (_, KeyCode::Esc) => {
                 app.close_secret_modal();
             }
@@ -299,6 +302,7 @@ pub fn handle_mouse_event(app: &mut TuiApp, mouse: MouseEvent) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::{SecretModalField, SecretModalMode};
     use crossterm::event::KeyEventState;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1193,6 +1197,130 @@ mod tests {
                 1
             );
         });
+    }
+
+    fn ctrl(character: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
+    }
+
+    /// Assert that the vault still holds only the seeded `KEEP_ME` secret at its first version.
+    fn assert_only_seed_is_stored(app: &crate::commands::App<'_>, tui_app: &TuiApp) {
+        assert_eq!(app.list(&tui_app.config).unwrap(), ["KEEP_ME"]);
+        assert_eq!(app.get(&tui_app.config, "KEEP_ME").unwrap(), b"keep-value");
+        let history = app.secret_history(&tui_app.config, "KEEP_ME").unwrap();
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_u_clears_only_the_focused_new_secret_name() {
+        with_unlocked_dashboard(&[("KEEP_ME", b"keep-value")], |app, tui_app| {
+            handle_key_event(tui_app, key(KeyCode::Char('n'))).unwrap();
+            // Clearing an already-empty field is harmless.
+            handle_key_event(tui_app, ctrl('u')).unwrap();
+            assert!(tui_app.show_secret_modal);
+            assert_eq!(tui_app.secret_modal_name, "");
+
+            type_chars(tui_app, "DRAFT_NAME");
+            handle_key_event(tui_app, key(KeyCode::Tab)).unwrap();
+            type_chars(tui_app, "draft-value");
+            handle_key_event(tui_app, shift_tab()).unwrap();
+            handle_key_event(tui_app, ctrl('u')).unwrap();
+
+            assert!(tui_app.show_secret_modal);
+            assert_eq!(tui_app.secret_modal_mode, SecretModalMode::New);
+            assert_eq!(tui_app.secret_modal_field, SecretModalField::Name);
+            assert_eq!(tui_app.secret_modal_name, "");
+            assert_eq!(tui_app.secret_modal_value.as_str(), "draft-value");
+            assert!(tui_app.secret_modal_masked);
+            assert_only_seed_is_stored(app, tui_app);
+
+            // Plain `u` is still typed into the focused field.
+            handle_key_event(tui_app, key(KeyCode::Char('u'))).unwrap();
+            assert_eq!(tui_app.secret_modal_name, "u");
+
+            handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+            assert!(!tui_app.show_secret_modal);
+            assert_only_seed_is_stored(app, tui_app);
+        });
+    }
+
+    #[test]
+    fn ctrl_u_clears_only_the_focused_new_secret_value() {
+        with_unlocked_dashboard(&[("KEEP_ME", b"keep-value")], |app, tui_app| {
+            handle_key_event(tui_app, key(KeyCode::Char('n'))).unwrap();
+            type_chars(tui_app, "DRAFT_NAME");
+            handle_key_event(tui_app, key(KeyCode::Tab)).unwrap();
+            type_chars(tui_app, "draft-value");
+            handle_key_event(tui_app, ctrl('r')).unwrap();
+            handle_key_event(tui_app, ctrl('u')).unwrap();
+
+            assert!(tui_app.show_secret_modal);
+            assert_eq!(tui_app.secret_modal_field, SecretModalField::Value);
+            assert_eq!(tui_app.secret_modal_name, "DRAFT_NAME");
+            assert_eq!(tui_app.secret_modal_value.as_str(), "");
+            // The value stays revealed because Ctrl+U does not touch masking.
+            assert!(!tui_app.secret_modal_masked);
+            assert_only_seed_is_stored(app, tui_app);
+
+            // A second clear on the now-empty value is harmless.
+            handle_key_event(tui_app, ctrl('u')).unwrap();
+            assert!(tui_app.show_secret_modal);
+            assert_eq!(tui_app.secret_modal_value.as_str(), "");
+
+            handle_key_event(tui_app, key(KeyCode::Char('u'))).unwrap();
+            assert_eq!(tui_app.secret_modal_value.as_str(), "u");
+
+            handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+            assert!(!tui_app.show_secret_modal);
+            assert_only_seed_is_stored(app, tui_app);
+        });
+    }
+
+    #[test]
+    fn ctrl_u_clears_edit_value_but_keeps_identity_and_vault_until_save() {
+        with_unlocked_dashboard(
+            &[("EXISTING", b"v1-value"), ("EXISTING", b"v2-value")],
+            |app, tui_app| {
+                handle_key_event(tui_app, key(KeyCode::Char('e'))).unwrap();
+                handle_key_event(tui_app, ctrl('u')).unwrap();
+
+                assert!(tui_app.show_secret_modal);
+                assert_eq!(tui_app.secret_modal_mode, SecretModalMode::Edit);
+                assert_eq!(tui_app.secret_modal_field, SecretModalField::Value);
+                assert_eq!(tui_app.secret_modal_name, "EXISTING");
+                assert_eq!(tui_app.secret_modal_value.as_str(), "");
+                assert!(tui_app.secret_modal_masked);
+
+                // Edit never clears the identity, even if focus were moved onto the name.
+                tui_app.secret_modal_field = SecretModalField::Name;
+                handle_key_event(tui_app, ctrl('u')).unwrap();
+                assert_eq!(tui_app.secret_modal_name, "EXISTING");
+                tui_app.secret_modal_field = SecretModalField::Value;
+
+                // Nothing reaches the vault before Save.
+                assert_eq!(app.get(&tui_app.config, "EXISTING").unwrap(), b"v2-value");
+                let history = app.secret_history(&tui_app.config, "EXISTING").unwrap();
+                assert_eq!(history.len(), 2);
+
+                handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+                assert!(!tui_app.show_secret_modal);
+                assert_eq!(app.get(&tui_app.config, "EXISTING").unwrap(), b"v2-value");
+                let history = app.secret_history(&tui_app.config, "EXISTING").unwrap();
+                assert_eq!(history.len(), 2);
+                assert_eq!(tui_app.secrets[0].version, 2);
+
+                // Clearing, retyping and saving writes exactly one new version.
+                handle_key_event(tui_app, key(KeyCode::Char('e'))).unwrap();
+                handle_key_event(tui_app, ctrl('u')).unwrap();
+                type_chars(tui_app, "v3-value");
+                handle_key_event(tui_app, key(KeyCode::Enter)).unwrap();
+                assert!(!tui_app.show_secret_modal);
+                assert_eq!(app.get(&tui_app.config, "EXISTING").unwrap(), b"v3-value");
+                let history = app.secret_history(&tui_app.config, "EXISTING").unwrap();
+                assert_eq!(history.len(), 3);
+                assert_eq!(tui_app.secrets[0].version, 3);
+            },
+        );
     }
 
     #[test]
