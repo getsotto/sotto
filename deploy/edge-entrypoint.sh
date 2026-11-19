@@ -1,6 +1,6 @@
 #!/bin/sh
 # Entrypoint for the edge (Caddy) container: raise TCP's initial congestion window, give up the
-# capability that needed, then hand over to Caddy.
+# capability it took to do that, then hand over to Caddy.
 #
 # A new connection may send only its initial window before the first acknowledgements return,
 # and Linux starts every connection at 10 segments, about 14 KB. A response larger than that
