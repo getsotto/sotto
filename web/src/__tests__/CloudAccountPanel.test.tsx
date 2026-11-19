@@ -257,6 +257,27 @@ describe("CloudAccountPanel", () => {
     expect(api.fetchPersonalQuote).not.toHaveBeenCalled();
   });
 
+  it("keeps the vault link available while account status loads and recovers", async () => {
+    const initial = deferred<EligibilityView>();
+    const retry = deferred<EligibilityView>();
+    vi.mocked(api.fetchEligibility)
+      .mockReturnValueOnce(initial.promise)
+      .mockReturnValueOnce(retry.promise);
+
+    render(<CloudAccountPanel />);
+
+    const vaultLink = () => screen.getByRole("link", { name: "Back to vault" });
+    expect(vaultLink()).toHaveAttribute("href", "/app");
+    await act(async () => { initial.reject(new Error("synthetic status failure")); });
+    expect(vaultLink()).toHaveAttribute("href", "/app");
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry account status" }));
+    expect(vaultLink()).toHaveAttribute("href", "/app");
+    await act(async () => { retry.resolve({ ...base, state: "unavailable" }); });
+    expect(vaultLink()).toHaveAttribute("href", "/app");
+    expect(screen.getAllByRole("link", { name: "Back to vault" })).toHaveLength(1);
+  });
+
   it("clears the error while retrying, prevents overlap, and shows eligible controls on success", async () => {
     let resolveRetry!: (eligibility: EligibilityView) => void;
     vi.mocked(api.fetchEligibility)

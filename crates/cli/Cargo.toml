@@ -35,12 +35,14 @@ keyring = { version = "3", default-features = false, features = [
 rpassword = "7"
 serde_json = "1"
 clap_complete = "4"
-# Sync client. Blocking reqwest keeps the CLI synchronous (no tokio runtime to manage); native-tls
-# matches the server (licence-clean). base64 transports opaque ciphertext as JSON strings.
+# Sync client. Blocking reqwest keeps the CLI synchronous (no tokio runtime to manage). base64
+# transports opaque ciphertext as JSON strings; gzip is negotiated automatically and shrinks a
+# large snapshot when the server or its proxy offers it. The TLS backend is chosen per platform
+# further down, beside the other target-specific dependencies.
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
+    "gzip",
     "json",
-    "native-tls",
 ] }
 base64 = "0.22"
 # Constant-time CSRF comparison for the loopback callback (S-10).
@@ -51,11 +53,9 @@ inquire.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
-rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io"] }
 
 [dev-dependencies]
 tempfile = "3"
-rmcp = { version = "3.5.1", default-features = false, features = ["client"] }
 # End-to-end test: run the real server in-process against Postgres and drive it over HTTP.
 sotto-server = { path = "../server" }
 axum = { workspace = true }
@@ -71,3 +71,16 @@ nix = { version = "0.29", features = ["term"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }
+
+# TLS for the sync client. On Linux, rustls, verifying against the system trust store: OpenSSL
+# parses every certificate in the distribution's bundle before the first connection, about 25 ms
+# on each `sotto run` in CI, where rustls only decodes them and parses a root when a chain needs
+# it. It also frees the binary from needing the machine's libssl. Private certificate authorities
+# and SSL_CERT_FILE keep working, because the roots still come from the system store.
+[target.'cfg(target_os = "linux")'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+
+# Elsewhere, the operating system's own TLS (Secure Transport, SChannel), which has no bundle to
+# parse and already reads the system trust store.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
