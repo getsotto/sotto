@@ -45,6 +45,8 @@ COPY Caddyfile /etc/caddy/Caddyfile
 COPY --from=build /app/web/dist /srv/web/dist
 # The entrypoint raises TCP's initial congestion window before Caddy starts (its header says why).
 # busybox's `ip` does not know `initcwnd`, hence iproute2; setpriv drops the capability afterwards.
+# Alpine ships setpriv as a package of its own (util-linux's other binaries are not needed), which
+# `apk search -x setpriv` shows.
 RUN apk add --no-cache iproute2 setpriv
 COPY deploy/edge-entrypoint.sh /usr/local/bin/edge-entrypoint
 ENTRYPOINT ["/usr/local/bin/edge-entrypoint"]
