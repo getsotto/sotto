@@ -794,6 +794,80 @@ describe("payer transfer journeys", () => {
     });
   });
 
+  it.each(["personal", "sponsored"] as const)(
+    "requires fresh terms before sending an expired %s quote",
+    async (payer) => {
+      vi.useFakeTimers();
+      const expiry = quote.quoteExpiresAtEpoch * 1000;
+      vi.setSystemTime(expiry - 1000);
+      try {
+        const expiredQuote = { ...quote, quoteId: "expired", quoteExpiresAtEpoch: quote.quoteExpiresAtEpoch - 1 };
+        const freshQuote = { ...quote, quoteId: "fresh", quoteExpiresAtEpoch: quote.quoteExpiresAtEpoch + 60 };
+        vi.mocked(api.quotePayerTransfer)
+          .mockResolvedValueOnce(expiredQuote)
+          .mockResolvedValueOnce(quote)
+          .mockResolvedValueOnce(freshQuote);
+        const invitation = deferred<api.PayerTransfer>();
+        vi.mocked(api.beginPayerTransfer).mockReturnValueOnce(invitation.promise);
+
+        if (payer === "personal") {
+          await act(async () => { render(<PersonalTransferStart />); });
+          await act(async () => {
+            fireEvent.change(screen.getByLabelText("Organisation"), { target: { value: "org-b" } });
+          });
+          fireEvent.change(screen.getByLabelText("Other payer administrator"), { target: { value: "admin-2" } });
+        } else {
+          await act(async () => {
+            render(<SponsoredTransferStart sourceOrganizationId="org-a" seats={[{
+              seatId: "seat-1", beneficiaryId: "beneficiary-1", offer: "standard_monthly",
+              effectiveFrom: 1, effectiveUntil: null, state: "active", foundingPriceEndEpoch: null,
+              standardRenewalAmountPence: null, foundingTransitionStatus: null, foundingTransitionReason: null,
+            }]} organisations={[org("org-a", "admin"), org("org-b", "admin")]} />);
+          });
+          fireEvent.change(screen.getByLabelText("Sponsored member"), { target: { value: "beneficiary-1" } });
+        }
+        const review = async () => {
+          const button = screen.getByRole("button", { name: "Review payer transfer" });
+          expect(button).toBeEnabled();
+          await act(async () => { fireEvent.click(button); });
+        };
+        const send = () => screen.getByRole("button", { name: "Send request for acceptance" });
+        const expectExpired = () => {
+          expect(screen.getByRole("status")).toHaveTextContent("This quote has expired.");
+          expect(screen.queryByRole("button", { name: "Send request for acceptance" })).not.toBeInTheDocument();
+          expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+        };
+        await review();
+        expectExpired();
+
+        await review();
+        const sendBeforeTimer = send();
+        vi.setSystemTime(expiry);
+        fireEvent.click(sendBeforeTimer);
+        expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+        await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+        expectExpired();
+
+        await review();
+        expect(api.beginPayerTransfer).not.toHaveBeenCalled();
+        const [first, second, third] = vi.mocked(api.quotePayerTransfer).mock.calls;
+        expect(second).toEqual(first);
+        expect(third).toEqual(first);
+        fireEvent.click(send());
+        expect(api.beginPayerTransfer).toHaveBeenCalledExactlyOnceWith({
+          quote: freshQuote, idempotencyKey: expect.any(String),
+        });
+        await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+        expect(screen.getByRole("button", { name: "Sending request…" })).toBeDisabled();
+        expect(screen.queryByText(/This quote has expired/)).not.toBeInTheDocument();
+        await act(async () => { invitation.resolve(transfer()); });
+        expect(screen.getByRole("status")).toHaveTextContent("Transfer request sent.");
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("does not offer a personal destination when its setup capability is disabled", async () => {
     vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: true, setupAvailable: false });
     render(<SponsoredTransferStart sourceOrganizationId="org-a" seats={[{
