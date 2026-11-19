@@ -13,11 +13,29 @@
 # sends, so it has to be set here, inside the container that owns the listening sockets; setting
 # it on the host changes nothing for a published port. It is set on every route rather than only
 # the default one, so it holds whichever route the replies leave by.
-#
-# Tuning must never keep the edge down. Without NET_ADMIN (compose grants it; a deployment that
-# removes the grant is choosing the kernel default) this says so once and starts Caddy anyway.
 INITCWND=40
 
+# Whether NET_ADMIN (capability 12) is in this process's bounding set.
+holds_net_admin() {
+    bounding=$(sed -n 's/^CapBnd:[[:space:]]*//p' /proc/self/status)
+    [ $(((0x${bounding:-0} >> 12) & 1)) -eq 1 ]
+}
+
+# Second pass, reached through setpriv from the end of the first. setpriv reports success even
+# when the kernel refused the drop (it needs SETPCAP), so the bounding set is read back here
+# and Caddy starts only if the capability is really gone. An edge that is down is found at once;
+# one quietly holding NET_ADMIN is not.
+if [ "${1:-}" = --net-admin-dropped ]; then
+    shift
+    if holds_net_admin; then
+        echo "edge: NET_ADMIN could not be removed from the bounding set (that needs SETPCAP); not starting Caddy with it" >&2
+        exit 1
+    fi
+    exec "$@"
+fi
+
+# Tuning never keeps the edge down. Without NET_ADMIN (compose grants it; a deployment that
+# removes the grant is choosing the kernel default) this says so once and starts Caddy anyway.
 tuned=0
 if routes=$(ip -4 route show 2>/dev/null); then
     tuned=1
@@ -33,10 +51,11 @@ else
     echo "edge: initial congestion window left at the kernel default (changing it needs NET_ADMIN)" >&2
 fi
 
-# Caddy faces the internet and has no use for NET_ADMIN, so it is removed from the bounding set
-# before Caddy exists: nothing it runs, or is made to run, can get it back.
-if setpriv --bounding-set -net_admin true 2>/dev/null; then
-    exec setpriv --bounding-set -net_admin "$@"
+# Holding on to the capability is the one thing that does keep the edge down. Caddy faces the
+# internet and has no use for NET_ADMIN, so it leaves the bounding set before Caddy exists and
+# nothing Caddy runs, or is made to run, can get it back. The second pass above checks that it
+# has gone.
+if holds_net_admin; then
+    exec setpriv --bounding-set -net_admin "$0" --net-admin-dropped "$@"
 fi
-echo "edge: could not drop NET_ADMIN from the bounding set; starting without dropping it" >&2
 exec "$@"
