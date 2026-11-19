@@ -3759,9 +3759,21 @@ mod tests {
     /// The wait is bounded so a regression cannot hang the suite, and the `--exact`
     /// filter names the helper below, so renaming that function moves this string too.
     fn run_helper(mode: &str) -> std::process::ExitStatus {
-        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        run_helper_with_environment(mode, &[])
+    }
+
+    fn run_helper_with_environment(
+        mode: &str,
+        inherited_environment: &[(&str, &str)],
+    ) -> std::process::ExitStatus {
+        let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
+        command
             .args(["--exact", "tests::child_exit_status_helper", "--ignored"])
-            .env("SOTTO_TEST_CHILD_MODE", mode)
+            .env("SOTTO_TEST_CHILD_MODE", mode);
+        for (name, value) in inherited_environment {
+            command.env(name, value);
+        }
+        let mut child = command
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -3786,16 +3798,71 @@ mod tests {
     #[ignore = "helper process for the exit-status tests; re-executed, never run directly"]
     fn child_exit_status_helper() {
         let mode = std::env::var("SOTTO_TEST_CHILD_MODE").expect("helper mode");
-        let code = mode.parse::<i32>().expect("helper mode is an exit code");
-        let (program, args) = exit_fixture(code);
+        let (program, args, entries) = if mode == "environment-overlay" {
+            (
+                std::env::current_exe()
+                    .expect("test binary")
+                    .display()
+                    .to_string(),
+                vec![
+                    "--exact".to_string(),
+                    "tests::child_environment_overlay_assertions".to_string(),
+                    "--ignored".to_string(),
+                ],
+                vec![
+                    ("SOTTO_TEST_ENV_REPLACE".to_string(), "injected".to_string()),
+                    ("SOTTO_TEST_ENV_EMPTY".to_string(), String::new()),
+                    (
+                        "SOTTO_TEST_ENV_LITERAL".to_string(),
+                        "café$HOME-雪".to_string(),
+                    ),
+                ],
+            )
+        } else {
+            let code = mode.parse::<i32>().expect("helper mode is an exit code");
+            let (program, args) = exit_fixture(code);
+            (program, args, Vec::new())
+        };
         let mut argv = vec![program];
         argv.extend(args);
 
         // Success never returns here: the process becomes the child on Unix, and exits
         // with the child's status on Windows.
-        let error = run_with_entries(Vec::new(), argv)
+        let error = run_with_entries(entries, argv)
             .expect_err("the execution boundary must not return on success");
         panic!("the execution boundary returned instead of running the child: {error}");
+    }
+
+    #[test]
+    fn run_overlays_entries_on_inherited_environment_in_child() {
+        let status = run_helper_with_environment(
+            "environment-overlay",
+            &[
+                ("SOTTO_TEST_ENV_KEEP", "inherited"),
+                ("SOTTO_TEST_ENV_REPLACE", "inherited"),
+                ("SOTTO_TEST_ENV_EMPTY", "inherited"),
+                ("SOTTO_TEST_ENV_LITERAL", "inherited"),
+            ],
+        );
+        assert_eq!(status.code(), Some(0), "status: {status:?}");
+    }
+
+    #[test]
+    #[ignore = "helper process environment assertions; re-executed, never run directly"]
+    fn child_environment_overlay_assertions() {
+        assert_eq!(
+            std::env::var("SOTTO_TEST_ENV_KEEP").as_deref(),
+            Ok("inherited")
+        );
+        assert_eq!(
+            std::env::var("SOTTO_TEST_ENV_REPLACE").as_deref(),
+            Ok("injected")
+        );
+        assert_eq!(std::env::var("SOTTO_TEST_ENV_EMPTY").as_deref(), Ok(""));
+        assert_eq!(
+            std::env::var("SOTTO_TEST_ENV_LITERAL").as_deref(),
+            Ok("café$HOME-雪"),
+        );
     }
 
     #[test]
