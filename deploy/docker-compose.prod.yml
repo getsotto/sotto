@@ -144,6 +144,10 @@ services:
         # declares its own canonical address rather than the hosted site's.
         SOTTO_PUBLIC_URL: https://${SOTTO_DOMAIN:?set SOTTO_DOMAIN in deploy/.env}
     restart: unless-stopped
+    # Only for the entrypoint, which raises TCP's initial congestion window and then drops this
+    # from the bounding set before starting Caddy (deploy/edge-entrypoint.sh). Caddy never holds it.
+    cap_add:
+      - NET_ADMIN
     environment:
       SOTTO_DOMAIN: ${SOTTO_DOMAIN}
       SOTTO_API: server:8080
