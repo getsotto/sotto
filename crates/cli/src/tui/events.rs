@@ -77,6 +77,12 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
             KeyCode::End | KeyCode::Char('G') => {
                 app.history_modal_end();
             }
+            KeyCode::PageUp => {
+                app.history_modal_page_up(10);
+            }
+            KeyCode::PageDown => {
+                app.history_modal_page_down(10);
+            }
             KeyCode::Char('r') | KeyCode::Char(' ') => {
                 app.toggle_history_reveal();
             }
@@ -187,6 +193,9 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Tab => {
             app.cycle_environment()?;
+        }
+        KeyCode::BackTab => {
+            app.cycle_environment_back()?;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             app.move_selection_up();
@@ -1295,5 +1304,204 @@ mod tests {
         assert!(tui_app.show_history_modal);
         handle_key_event(&mut tui_app, key(KeyCode::Esc)).unwrap();
         assert!(!tui_app.show_history_modal);
+    }
+
+    fn with_paged_history_app(
+        versions: usize,
+        extra_secret: bool,
+        check: impl FnOnce(&mut TuiApp<'_>),
+    ) {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let keychain = crate::keychain::MemoryKeychain::default();
+        crate::session::init(
+            &store,
+            &keychain,
+            b"pw",
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+        let master = crate::session::current_master_key(&keychain)
+            .unwrap()
+            .unwrap();
+        let keypair = crate::session::account_keypair(&store, &master).unwrap();
+        let project = crate::vault::Vault::create_project(&store, &keypair, "acme").unwrap();
+        let config = crate::config::Config {
+            project_id: project.id,
+            project: "acme".into(),
+            environment: "dev".into(),
+            org_id: None,
+        };
+        let theme = crate::theme::Theme::default();
+        let app = crate::commands::App::new(&store, &keychain);
+        for i in 0..versions {
+            app.set(&config, "PAGED_SECRET", format!("val-{i}").as_bytes())
+                .unwrap();
+        }
+        if extra_secret {
+            app.set(&config, "ZZZ_OTHER", b"other").unwrap();
+        }
+        let mut tui_app = TuiApp::new(&app, &store, config, &theme).unwrap();
+        check(&mut tui_app);
+    }
+
+    #[test]
+    fn history_modal_page_up_down_move_by_ten_and_clamp() {
+        with_paged_history_app(15, false, |tui_app| {
+            handle_key_event(tui_app, key(KeyCode::Char('h'))).unwrap();
+            assert!(tui_app.show_history_modal);
+            assert_eq!(tui_app.history_modal_items.len(), 15);
+            assert_eq!(tui_app.history_modal_selected_index, 0);
+
+            handle_key_event(tui_app, key(KeyCode::PageDown)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 10);
+
+            handle_key_event(tui_app, key(KeyCode::PageDown)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 14);
+
+            handle_key_event(tui_app, key(KeyCode::PageDown)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 14);
+
+            handle_key_event(tui_app, key(KeyCode::PageUp)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 4);
+
+            handle_key_event(tui_app, key(KeyCode::PageUp)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 0);
+
+            handle_key_event(tui_app, key(KeyCode::PageUp)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 0);
+        });
+    }
+
+    #[test]
+    fn history_modal_page_keys_clamp_empty_and_single_entry() {
+        with_paged_history_app(1, false, |tui_app| {
+            handle_key_event(tui_app, key(KeyCode::Char('h'))).unwrap();
+            assert_eq!(tui_app.history_modal_items.len(), 1);
+            assert_eq!(tui_app.history_modal_selected_index, 0);
+
+            handle_key_event(tui_app, key(KeyCode::PageDown)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 0);
+            handle_key_event(tui_app, key(KeyCode::PageUp)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 0);
+
+            tui_app.history_modal_items.clear();
+            handle_key_event(tui_app, key(KeyCode::PageDown)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 0);
+            handle_key_event(tui_app, key(KeyCode::PageUp)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 0);
+            assert!(tui_app.show_history_modal);
+        });
+    }
+
+    #[test]
+    fn history_modal_page_keys_do_not_affect_secret_list_or_actions() {
+        with_paged_history_app(15, true, |tui_app| {
+            assert_eq!(tui_app.secrets.len(), 2);
+            assert_eq!(tui_app.selected_filtered_index, 0);
+            assert_eq!(tui_app.selected_secret().unwrap().name, "PAGED_SECRET");
+
+            handle_key_event(tui_app, key(KeyCode::Char('h'))).unwrap();
+            assert!(tui_app.show_history_modal);
+            assert!(!tui_app.history_modal_revealed);
+            assert!(tui_app.status_message.is_none());
+
+            handle_key_event(tui_app, key(KeyCode::PageDown)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 10);
+            assert_eq!(tui_app.selected_filtered_index, 0);
+            assert_eq!(tui_app.selected_secret().unwrap().name, "PAGED_SECRET");
+            assert!(tui_app.show_history_modal);
+            assert!(!tui_app.history_modal_revealed);
+            assert!(tui_app.status_message.is_none());
+            assert_eq!(tui_app.secrets[0].version, 15);
+
+            handle_key_event(tui_app, key(KeyCode::Char('j'))).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 11);
+            handle_key_event(tui_app, key(KeyCode::Char('k'))).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 10);
+            handle_key_event(tui_app, key(KeyCode::Home)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 0);
+            handle_key_event(tui_app, key(KeyCode::End)).unwrap();
+            assert_eq!(tui_app.history_modal_selected_index, 14);
+            assert!(tui_app.show_history_modal);
+            assert_eq!(tui_app.selected_filtered_index, 0);
+        });
+    }
+
+    fn shift_tab() -> KeyEvent {
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)
+    }
+
+    #[test]
+    fn tab_and_shift_tab_step_environments_in_both_directions() {
+        with_search_app(|app| {
+            assert_eq!(app.config.environment, "dev");
+
+            handle_key_event(app, key(KeyCode::Tab)).unwrap();
+            assert_eq!(app.config.environment, "prod");
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(app.config.environment, "dev");
+
+            // Backwards wraps from the first environment to the last.
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(app.config.environment, "staging");
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(app.config.environment, "prod");
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(app.config.environment, "dev");
+        });
+    }
+
+    #[test]
+    fn shift_tab_with_one_environment_keeps_it_selected() {
+        with_search_app(|app| {
+            app.environments = vec!["dev".into()];
+            app.active_env_index = 0;
+
+            handle_key_event(app, shift_tab()).unwrap();
+
+            assert_eq!(app.config.environment, "dev");
+            let notice = app.status_message.as_ref().unwrap();
+            assert_eq!(notice.kind, crate::tui::app::StatusKind::Information);
+        });
+    }
+
+    #[test]
+    fn shift_tab_in_secret_modal_moves_field_not_environment() {
+        with_search_app(|app| {
+            handle_key_event(app, key(KeyCode::Char('n'))).unwrap();
+            assert!(app.show_secret_modal);
+            assert_eq!(
+                app.secret_modal_field,
+                crate::tui::app::SecretModalField::Name
+            );
+
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(
+                app.secret_modal_field,
+                crate::tui::app::SecretModalField::Value
+            );
+            assert_eq!(app.config.environment, "dev");
+            assert_eq!(app.active_env_index, 0);
+
+            handle_key_event(app, shift_tab()).unwrap();
+            assert_eq!(
+                app.secret_modal_field,
+                crate::tui::app::SecretModalField::Name
+            );
+            assert_eq!(app.config.environment, "dev");
+        });
+    }
+
+    #[test]
+    fn shift_tab_in_search_mode_is_ignored() {
+        with_search_app(|app| {
+            search_for(app, "api");
+
+            handle_key_event(app, shift_tab()).unwrap();
+
+            assert!(app.search_mode);
+            assert_eq!(app.search_query, "api");
+            assert_eq!(app.config.environment, "dev");
+        });
     }
 }
