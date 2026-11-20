@@ -358,6 +358,23 @@ enum EnvCommand {
         json: bool,
     },
     /// Set the active environment for this project.
+    #[command(after_help = r#"Examples:
+  sotto env ls
+  sotto env use staging
+  sotto env use
+
+Choose from the project's existing local environments, shown by sotto env ls.
+This command does not create an environment. It saves the chosen default in the
+nearest discovered sotto.toml, in the current directory or a parent, even when
+run from a project subdirectory.
+
+For one command only, use sotto ls --env staging. This does not save a new default.
+
+Omitting NAME opens a picker only when stdin, stdout and stderr are terminals,
+CI is inactive, and TERM is not dumb. In piped/non-interactive use, CI or
+TERM=dumb, provide an explicit name. Esc or Ctrl-C exits the picker without changing the saved environment.
+
+Selection does not copy secrets or push/pull data."#)]
     Use { name: Option<String> },
     /// Compare two environments key by key (presence + "differs" markers).
     #[command(
@@ -2806,6 +2823,39 @@ mod tests {
             "shell history and process arguments",
             "unlock the local identity first",
             "synthetic value",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
+
+    #[test]
+    fn env_use_help_explains_persistence_and_picker() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("env")
+            .unwrap()
+            .find_subcommand_mut("use")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+
+        for expected in [
+            "sotto env ls",
+            "sotto env use staging",
+            "sotto env use",
+            "nearest discovered sotto.toml",
+            "project subdirectory",
+            "existing local environments",
+            "does not create an environment",
+            "sotto ls --env staging",
+            "does not save a new default",
+            "stdin, stdout and stderr",
+            "CI",
+            "TERM=dumb",
+            "explicit name",
+            "Esc or Ctrl-C",
+            "without changing the saved environment",
+            "does not copy secrets or push/pull data",
         ] {
             assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
         }
