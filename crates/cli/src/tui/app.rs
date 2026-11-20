@@ -623,6 +623,21 @@ impl<'a> TuiApp<'a> {
         }
     }
 
+    /// Clear the currently focused secret modal field without touching the vault.
+    pub fn secret_modal_clear_field(&mut self) {
+        match self.secret_modal_field {
+            SecretModalField::Name if self.secret_modal_mode == SecretModalMode::New => {
+                self.secret_modal_name.clear();
+            }
+            SecretModalField::Value => {
+                // Replace the wrapper rather than calling `clear()`, so dropping the old one
+                // wipes its whole buffer instead of leaving the bytes in spare capacity.
+                self.secret_modal_value = Zeroizing::new(String::new());
+            }
+            _ => {}
+        }
+    }
+
     /// Toggle masking of the secret value field inside the modal dialogue.
     pub fn toggle_secret_modal_mask(&mut self) {
         self.secret_modal_masked = !self.secret_modal_masked;
