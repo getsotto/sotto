@@ -30,6 +30,7 @@ export function CloudContactSettings() {
   const [status, setStatus] = useState<CloudContactStatus | "unsupported" | "error" | null>(null);
   const [email, setEmail] = useState("");
   const [busy, setBusy] = useState(false);
+  const [requestingLink, setRequestingLink] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -94,19 +95,21 @@ export function CloudContactSettings() {
 
   async function start() {
     setBusy(true);
+    setRequestingLink(true);
     setError(null);
     setNotice(null);
     try {
       requestKey.current ??= crypto.randomUUID();
       await startCloudContactVerification(email, requestKey.current);
       requestKey.current = null;
-      setNotice("If this address can be used, a verification message will arrive shortly.");
       setEmail("");
       await refresh();
+      setNotice("If this address can be used, a verification message will arrive shortly.");
     } catch (cause) {
       if (cause instanceof UnsupportedCloudContactError) setNotice(cause.message);
       else setError(message(cause));
     } finally {
+      setRequestingLink(false);
       setBusy(false);
     }
   }
@@ -133,6 +136,9 @@ export function CloudContactSettings() {
       <p>Use an email address for important Cloud account notices. It is optional and does not affect your vault access.</p>
       {error !== null && <p role="alert">{error}</p>}
       {notice !== null && <p role="status">{notice}</p>}
+      <div aria-live="polite">
+        {requestingLink && <p className="muted">Requesting verification link…</p>}
+      </div>
       {status === null ? <p className="muted" role="status">Checking contact settings…</p>
         : status === "unsupported" ? <p className="muted">Email contact settings require a newer Sotto server version.</p>
         : status === "error" ? <><p className="muted">Contact settings could not be loaded.</p><button type="button" disabled={retrying} onClick={() => void retry()}>{retrying ? "Retrying…" : "Retry"}</button></>

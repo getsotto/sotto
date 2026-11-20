@@ -21,6 +21,7 @@ const emptyStatus: api.CloudContactStatus = {
 };
 
 const acknowledgement = "If this address can be used, a verification message will arrive shortly.";
+const requesting = "Requesting verification link…";
 
 function deliveryStatus(state: api.CloudEmailDeliveryState): api.CloudContactStatus {
   return {
@@ -81,20 +82,33 @@ describe("CloudContactSettings", () => {
 
   it("disables the controls and ignores repeated activation while a verification request is pending", async () => {
     const request = deferred();
+    const refresh = deferred();
     vi.mocked(api.startCloudContactVerification).mockReturnValue(request.promise);
+    vi.mocked(api.fetchCloudContactStatus)
+      .mockResolvedValueOnce(emptyStatus)
+      .mockReturnValueOnce(refresh.promise.then(() => emptyStatus));
     render(<CloudContactSettings />);
     await enterAddress("person@example.test");
+    expect(screen.queryByText(requesting)).not.toBeInTheDocument();
     sendLink();
 
     const input = screen.getByLabelText("Email address");
     const button = screen.getByRole("button", { name: "Send verification link" });
     expect(input).toBeDisabled();
     expect(button).toBeDisabled();
+    expect(screen.getByText(requesting).closest('[aria-live="polite"]')).toBeInTheDocument();
     fireEvent.click(button);
     expect(api.startCloudContactVerification).toHaveBeenCalledOnce();
 
     request.resolve();
+    await waitFor(() => expect(api.fetchCloudContactStatus).toHaveBeenCalledTimes(2));
+    expect(screen.getByText(requesting)).toBeInTheDocument();
+    expect(screen.queryByText(acknowledgement)).not.toBeInTheDocument();
+    expect(input).toBeDisabled();
+    refresh.resolve();
     expect(await screen.findByText(acknowledgement)).toBeInTheDocument();
+    expect(screen.queryByText(requesting)).not.toBeInTheDocument();
+    expect(input).toBeEnabled();
     expect(api.startCloudContactVerification).toHaveBeenCalledOnce();
   });
 
@@ -204,6 +218,7 @@ describe("CloudContactSettings", () => {
     render(<CloudContactSettings />);
 
     expect(api.fetchCloudContactStatus).not.toHaveBeenCalled();
+    expect(screen.queryByText(requesting)).not.toBeInTheDocument();
     resolveConfirmation(true);
 
     expect(await screen.findByText("p***@example.test")).toBeInTheDocument();
@@ -272,6 +287,7 @@ describe("CloudContactSettings", () => {
 
       fireEvent.click(remove);
       await waitFor(() => expect(remove).toBeDisabled());
+      expect(screen.queryByText(requesting)).not.toBeInTheDocument();
       fireEvent.click(remove);
       fireEvent.click(remove);
 
@@ -589,6 +605,8 @@ describe("CloudContactSettings", () => {
   });
 
   it("resends through the same form while a verification request is pending, and leaves removal alone", async () => {
+    const request = deferred();
+    vi.mocked(api.startCloudContactVerification).mockReturnValue(request.promise);
     vi.mocked(api.fetchCloudContactStatus).mockResolvedValue({
       email: {
         contactId: "contact-verified",
@@ -606,10 +624,19 @@ describe("CloudContactSettings", () => {
     expect(screen.getByRole("button", { name: "Remove verified email" })).not.toHaveAttribute("type", "submit");
     fireEvent.submit(form);
 
-    await waitFor(() => expect(api.startCloudContactVerification).toHaveBeenCalledWith(
+    expect(screen.getByText(requesting)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Resend verification link" })).toBeDisabled();
+    expect(api.startCloudContactVerification).toHaveBeenCalledWith(
       "next@example.test",
       expect.any(String),
-    ));
+    );
     expect(api.revokeCloudContact).not.toHaveBeenCalled();
+
+    request.reject(new Error("verification service unavailable"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("verification service unavailable");
+    expect(screen.queryByText(requesting)).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Email address")).toHaveValue("next@example.test");
+    expect(screen.getByRole("button", { name: "Resend verification link" })).toBeEnabled();
+    expect(api.startCloudContactVerification).toHaveBeenCalledOnce();
   });
 });
