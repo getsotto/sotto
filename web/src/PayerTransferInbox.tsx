@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   acceptPayerTransfer,
@@ -20,8 +20,28 @@ function message(error: unknown): string {
   return "The transfer service is temporarily unavailable. Refresh and try again.";
 }
 
+function discoveryMessage(error: unknown): string {
+  if (!(error instanceof Error)) return "Transfer service availability could not be checked. Try again shortly.";
+  const status = /server error \((\d+)\)/.exec(error.message)?.[1];
+  if (status === "403") return "You do not have authority to check payer transfers for this account.";
+  if (status === "404") return "Payer transfers are not available on this server.";
+  return "The transfer service is temporarily unavailable. Try again shortly.";
+}
+
 function date(epoch: number): string {
   return new Date(epoch * 1000).toLocaleDateString("en-GB");
+}
+
+function deadline(epoch: number): string {
+  return new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "UTC",
+    timeZoneName: "short",
+  }).format(new Date(epoch * 1000));
 }
 
 function pounds(pence: number): string {
@@ -80,34 +100,77 @@ export function PayerTransferInbox() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [expiryTick, setExpiryTick] = useState(0);
+  const refreshGeneration = useRef(0);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+  const [discoveryLoading, setDiscoveryLoading] = useState(true);
+  const discoveryInFlight = useRef(false);
+  const mounted = useRef(true);
 
+  async function discover() {
+    if (discoveryInFlight.current) return;
+    discoveryInFlight.current = true;
+    setDiscoveryLoading(true);
+    try {
+      const [capabilities, account] = await Promise.all([fetchPayerTransferCapabilities(), me()]);
+      if (!mounted.current) return;
+      setAvailable(capabilities.available);
+      setSetupAvailable(capabilities.setupAvailable);
+      setUserId(account?.userId ?? null);
+      setDiscoveryError(null);
+      if (capabilities.available) {
+        void refresh();
+      } else {
+        setLoading(false);
+      }
+    } catch (e) {
+      if (!mounted.current) return;
+      setAvailable(false);
+      setDiscoveryError(discoveryMessage(e));
+      setLoading(false);
+    } finally {
+      if (mounted.current) {
+        setDiscoveryLoading(false);
+      }
+      discoveryInFlight.current = false;
+    }
+  }
   async function refresh() {
+    const generation = ++refreshGeneration.current;
+    const isCurrent = () => generation === refreshGeneration.current;
     setLoading(true);
     setError(null);
     try {
       const page = await fetchPayerTransfers();
+      if (!isCurrent()) return;
       setTransfers(page.transfers);
       setNextCursor(page.nextCursor);
       setListLoaded(true);
     } catch (e) {
+      if (!isCurrent()) return;
       setError(message(e));
     } finally {
-      setLoading(false);
+      if (isCurrent()) {
+        setLoading(false);
+      }
     }
   }
 
   async function loadMore() {
     if (nextCursor === null || loadingMore) return;
+    const generation = refreshGeneration.current;
+    const isCurrent = () => generation === refreshGeneration.current;
     setLoadingMore(true);
     setError(null);
     try {
       const page = await fetchPayerTransfers(nextCursor);
+      if (!isCurrent()) return;
       setTransfers((current) => {
         const known = new Set(current.map((transfer) => transfer.transferId));
         return [...current, ...page.transfers.filter((transfer) => !known.has(transfer.transferId))];
       });
       setNextCursor(page.nextCursor);
     } catch (e) {
+      if (!isCurrent()) return;
       setError(message(e));
     } finally {
       setLoadingMore(false);
@@ -115,21 +178,11 @@ export function PayerTransferInbox() {
   }
 
   useEffect(() => {
-    let current = true;
-    void Promise.all([fetchPayerTransferCapabilities(), me()])
-      .then(([capabilities, account]) => {
-        if (!current) return;
-        setAvailable(capabilities.available);
-        setSetupAvailable(capabilities.setupAvailable);
-        setUserId(account?.userId ?? null);
-        if (capabilities.available) void refresh();
-        else setLoading(false);
-      })
-      .catch(() => {
-        // Older servers and temporary discovery failures keep the existing account page usable.
-        if (current) setLoading(false);
-      });
-    return () => { current = false; };
+    mounted.current = true;
+    void discover();
+    return () => {
+      mounted.current = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -206,6 +259,16 @@ export function PayerTransferInbox() {
     }
   }
 
+  if (discoveryError !== null && !available) {
+    return <section aria-labelledby="transfer-inbox-heading">
+      <h2 id="transfer-inbox-heading">Payer transfers</h2>
+      <p className="muted">Transfers take effect at renewal. The current payer remains responsible through the paid term; no mid-term credit is issued.</p>
+      <p role="alert">{discoveryError}</p>
+      <button type="button" disabled={discoveryLoading} aria-busy={discoveryLoading ? "true" : undefined} onClick={() => void discover()}>{discoveryLoading ? "Retrying…" : "Retry"}</button>
+      {discoveryLoading && <p className="muted" role="status">Checking transfer availability…</p>}
+    </section>;
+  }
+
   if (!available) return null;
 
   return <section aria-labelledby="transfer-inbox-heading">
@@ -233,7 +296,7 @@ export function PayerTransferInbox() {
           <strong>{incoming ? "Incoming request" : "Outgoing request"}</strong>
           <span className="meta">{payer(transfer.sourceKind, transfer.sourceOrganizationId)} → {payer(transfer.destinationKind, transfer.destinationOrganizationId)}</span>
           <p>{pounds(transfer.amountPence)} per {transfer.interval}; renewal {date(transfer.effectiveFrom)}.</p>
-          {actionable && <p className="muted">Respond by {date(Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom))}.</p>}
+          {actionable && <p className="muted">Respond by {deadline(Math.min(transfer.consentExpiresAtEpoch, transfer.effectiveFrom))}.</p>}
           <p className="muted">{stateCopy(transfer.state, invitationExpiry)}</p>
           {transfer.state === "unknown" && <p className="muted">Contact Sotto support before making another billing change.</p>}
           {actionable && incoming && transfer.destinationKind === "personal" && !setupAvailable
