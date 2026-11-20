@@ -77,6 +77,8 @@ lista os comandos que a sua versão suporta.
 Consulte [COMPATIBILITY.md](COMPATIBILITY.md) para ver os requisitos de versão das integrações,
 as plataformas declaradas e as evidências de teste disponíveis atualmente.
 
+Para escolher uma versão ou pasta de instalação, consulte as [opções e exemplos do instalador (em inglês)](INSTALLING.md).
+
 ### Homebrew (prévia)
 
 O [tap do Sotto](https://github.com/getsotto/homebrew-tap) oferece outra forma
@@ -190,6 +192,25 @@ aceita `shell` e `json`. A limpeza da área de transferência é uma medida de m
 substituir o conteúdo protege o novo valor, enquanto gerenciadores da área de transferência,
 suspensão ou encerramento do processo auxiliar podem manter uma cópia.
 
+`sotto run` inicia o comando com o seu ambiente atual mais os segredos do ambiente selecionado. Um
+segredo substitui uma variável herdada de mesmo nome, e as variáveis sem relação são mantidas.
+Quando isso acontece, o Sotto escreve `warning: overriding inherited environment variable NAME` no
+stderr, nunca o valor. Somente o comando e seus descendentes veem os segredos; o ambiente do seu
+shell não muda depois. Para usar outro ambiente, coloque `--env` antes de `--` (veja
+[Ambientes](#ambientes); [Importar um arquivo dotenv](#importar-um-arquivo-dotenv) mostra como
+preencher um).
+
+O Sotto executa o programa diretamente, então não expande variáveis nem interpreta pipes ou
+redirecionamentos nos seus argumentos. O seu próprio shell ainda processa a sintaxe dele antes de o
+Sotto iniciar: `sotto run -- echo "$EXAMPLE"` imprime o valor de `EXAMPLE` no shell pai, não o
+injetado. Para expandir uma variável dentro do processo filho, execute um shell como comando e
+coloque o script entre aspas simples (shells POSIX). Neste exemplo fictício, suponha que `EXAMPLE`
+esteja armazenado no Sotto com o valor `demo-only`:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
 Até aqui, tudo fica na sua máquina. Para sincronizar outro dispositivo, trabalhar em equipe ou usar
 CI, faça login em um servidor:
 
@@ -206,6 +227,7 @@ servidor escolhido. De todo modo, o servidor só armazena texto cifrado: o cofre
 mesmo servidor descriptografa no seu navegador, com chaves que nunca saem dos seus dispositivos.
 
 Para explorar os segredos interativamente, consulte o [guia do painel](#painel-interativo).
+Para guardar um arquivo inteiro como um único segredo, consulte [Segredos a partir de arquivos](#segredos-a-partir-de-arquivos).
 
 Se o navegador não abrir ou o login expirar, consulte [Solução de problemas do login](#solução-de-problemas-do-login).
 
@@ -258,7 +280,8 @@ sotto run --env staging -- npm test
 sotto ls --env staging
 ```
 
-`--env` vale apenas para esse comando; `sotto env use` altera o ambiente padrão.
+`--env` vale apenas para esse comando; `sotto env use` altera o ambiente padrão salvo no
+`sotto.toml` do projeto (veja [Configuração do projeto](#configuração-do-projeto)).
 
 Liste os ambientes, altere o padrão, compare dois ou visualize uma cópia entre eles:
 
@@ -273,6 +296,54 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 `env diff` marca cada chave com `=` (mesmo valor), `!` (valores diferentes), `<` (só no primeiro
 ambiente) ou `>` (só no segundo). Sem `--confirm`, a cópia é uma simulação. Uma cópia confirmada
 adiciona e atualiza segredos, mas mantém intactas as chaves que existem apenas no destino.
+
+### Configuração do projeto
+
+`sotto init` e `sotto clone` gravam um `sotto.toml` no diretório atual. Ele vincula esse diretório a
+um projeto local e a um ambiente padrão. Este exemplo ilustrativo usa identificadores inventados:
+
+```toml
+project_id = "11111111-1111-1111-1111-111111111111"
+project = "acme-api"
+environment = "dev"
+org_id = "22222222-2222-2222-2222-222222222222"
+```
+
+- `project_id` (obrigatório): o identificador estável do projeto.
+- `project` (obrigatório): o nome legível do projeto.
+- `environment` (obrigatório): o ambiente padrão para comandos executados neste diretório.
+- `org_id` (opcional): a organização dona do projeto. Omita-o em um projeto pessoal.
+
+O arquivo guarda metadados do projeto, não valores secretos, e foi feito para ser commitado. Ele não é
+um cofre e não concede acesso a nenhum segredo: um colega que o baixar ainda precisa da própria
+concessão. Escrever um arquivo com identificadores inventados não cria um projeto. Execute `sotto init`
+para criar um, ou siga [Trabalhar em equipe](#trabalhar-em-equipe) para clonar um ambiente compartilhado.
+
+Os comandos procuram `sotto.toml` no diretório atual e depois em cada diretório pai, e usam o mais
+próximo que encontrarem, como o `git` faz com `.git`. Em um projeto aninhado, o arquivo interno vence:
+
+```text
+monorepo/
+├── sotto.toml            # project "platform"
+├── tools/                # commands here use "platform"
+└── services/
+    └── billing/
+        ├── sotto.toml    # project "billing"
+        └── src/          # commands here use "billing"
+```
+
+Se o `sotto.toml` mais próximo estiver inválido ou ilegível, o comando falha com um erro que nomeia esse
+arquivo. Ele não recorre a um projeto pai.
+
+`sotto env use staging` salva `staging` como `environment` no `sotto.toml` encontrado, então ele vale
+também para os comandos seguintes. Um `--env staging` por comando lê esse ambiente para um único comando
+e deixa o arquivo sem alterações. Veja [Ambientes](#ambientes).
+
+`sotto.toml` pertence a um diretório de projeto. Separadamente, o diretório de dados do Sotto contém o
+`config.toml` global, com configurações da máquina inteira como o servidor salvo pelo `sotto login` e o
+seu tema, e o `store.db` criptografado que guarda o seu cofre. Nenhum dos dois deve ir para um
+repositório. Veja [Variáveis de ambiente](#variáveis-de-ambiente) para `SOTTO_DATA_DIR`, e
+[Temas de saída](#temas-de-saída) para o local padrão em cada plataforma.
 
 ### Importar um arquivo dotenv
 
@@ -312,6 +383,42 @@ uma falha durante a gravação não desfaz as atribuições já armazenadas; por
 Para recuperar um valor anterior, veja [Restaurar uma versão anterior de um segredo](#restaurar-uma-versão-anterior-de-um-segredo).
 Esse histórico vem do servidor, então só ajuda com valores que você já havia enviado. Execute
 `sotto import --help` para ver as regras de aspas e de valores literais em vez de repeti-las aqui.
+
+### Segredos a partir de arquivos
+
+O valor de um segredo são bytes, não apenas texto, então você pode guardar um arquivo inteiro (um
+certificado, um arquivo de chave ou um binário pequeno) como um único segredo. Você precisa de um
+projeto inicializado e de um cofre local desbloqueado. Este exemplo para shell POSIX usa um arquivo
+sintético e confere a ida e volta byte a byte sem imprimir o valor:
+
+```sh
+printf 'synthetic-demo-bytes\001\377\n' > example-input.bin   # a made-up file, not a real secret
+sotto set EXAMPLE_FILE --stdin < example-input.bin
+sotto get EXAMPLE_FILE > example-output.bin                   # redirected, so nothing is printed
+cmp example-input.bin example-output.bin && echo "round-trip OK"
+rm example-input.bin example-output.bin
+```
+
+`--stdin` lê até o fim do arquivo e mantém cada byte: nada é cortado, nem mesmo uma quebra de linha
+final. Toda a entrada vira um único valor; ela não é lida como dotenv, então use
+[`sotto import`](#importar-um-arquivo-dotenv) para um arquivo de atribuições. Quando a saída de
+`sotto get` é redirecionada ou enviada por um pipe, ele grava exatamente os bytes armazenados e não
+adiciona quebra de linha. O arquivo de saída contém texto puro, então apague-o ao terminar e nunca o
+envie ao repositório, nem como fixture de teste.
+
+Só `set --stdin` e `get` redirecionado lidam com bytes arbitrários. Os comandos que tratam segredos
+como texto precisam de UTF-8 válido:
+
+- `sotto run` e `sotto export` em texto puro, em qualquer `--format`, leem todas as entradas do
+  ambiente selecionado. Um único valor que não seja UTF-8 válido interrompe o comando inteiro com um
+  erro; o valor não é ignorado nem convertido para Base64.
+- `sotto get NAME --copy` também precisa de UTF-8 válido. Use `get` redirecionado para recuperar
+  bytes arbitrários.
+
+Guarde valores binários em um ambiente separado se você também injeta esse ambiente com `sotto run`.
+Essa recuperação para um arquivo em texto puro não é um backup: para uma cópia criptografada da sua
+conta, use a exportação criptografada da página de conta do Sotto Cloud em `/cloud`, e para o
+histórico consulte [Restaurar uma versão anterior de um segredo](#restaurar-uma-versão-anterior-de-um-segredo).
 
 ### Remover um segredo
 
@@ -559,8 +666,7 @@ terminais. Se faltar algum, a CI estiver ativa ou `TERM=dumb`, a execução sem 
 a ajuda na saída de erro padrão e termina com código 2. Use `sotto --help` para pedir a ajuda
 explicitamente.
 
-Use as setas ou `j` e `k` para navegar. Pressione `/` para buscar, `?` para ver a ajuda e Tab para
-trocar de ambiente. A troca vale apenas durante a sessão do painel; `sotto env use` altera o
+Use as setas ou `j` e `k` para navegar. Pressione `/` para buscar, `?` para ver a ajuda, Tab para ir ao próximo ambiente e Shift+Tab para voltar ao anterior. A troca vale apenas durante a sessão do painel; `sotto env use` altera o
 ambiente padrão do projeto. Pressione `r` para mostrar ou ocultar o valor selecionado, `c` para
 copiá-lo para a área de transferência e `q` para sair. `Esc` fecha a busca ou a caixa de diálogo
 atual; na tela principal, limpa uma busca ativa ou sai.
@@ -599,6 +705,7 @@ Sem `sotto.toml` nem identidade local:
 ```
 
 Sem `sotto.toml`, nenhum projeto está selecionado. Um arquivo inválido ou ilegível causa um erro.
+Veja [Configuração do projeto](#configuração-do-projeto) para os campos do arquivo e como ele é encontrado.
 
 ### Bloquear, desbloquear e sair
 
@@ -680,6 +787,8 @@ O formato JSON é útil para scripts. Sua estrutura de nível superior é:
 ```
 
 O exemplo é sintético; `actions` e as datas opcionais vêm do estado retornado da conta, e servidores antigos podem retornar null para qualquer um dos dois endpoints. `sotto cloud status` apenas informa o status e pode mostrar uma URL de cobrança. Ele não inicia uma compra nem altera a elegibilidade. Para diagnósticos do cofre local e dos ambientes, use `sotto status`; essa visão é separada das informações do servidor e da conta acima.
+
+Para adicionar ou remover um endereço de e-mail para avisos do Cloud, consulte o [guia de contatos de e-mail (em inglês)](CLOUD-EMAIL.md).
 
 Para mover a cobrança pessoal para uma organização a partir da página de conta do Sotto Cloud,
 consulte o [guia de transferência de cobrança](CLOUD-BILLING-TRANSFER.md).
