@@ -108,6 +108,9 @@ export function PersonalTransferStart() {
   const [counterpartyId, setCounterpartyId] = useState("");
   const [quote, setQuote] = useState<PayerTransferQuote | null>(null);
   const quoteExpired = useQuoteExpiry(quote);
+  const [submittedQuote, setSubmittedQuote] = useState<PayerTransferQuote | null>(null);
+  const retryingQuote = quote !== null && submittedQuote === quote;
+  const needsFreshQuote = quoteExpired && !retryingQuote;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [membersError, setMembersError] = useState<string | null>(null);
@@ -219,7 +222,8 @@ export function PersonalTransferStart() {
   }
 
   async function createInvitation() {
-    if (quote === null || quoteExpired || quoteHasExpired(quote)) return;
+    if (quote === null || (!retryingQuote && (quoteExpired || quoteHasExpired(quote)))) return;
+    setSubmittedQuote(quote);
     setBusy(true); setError(null); setNotice(null);
     try {
       const result = await beginPayerTransfer({ quote, idempotencyKey: idempotencyKey.current ?? crypto.randomUUID() });
@@ -258,13 +262,13 @@ export function PersonalTransferStart() {
       </button>}
       {error !== null && <p role="alert">{error}</p>}
       {notice !== null && <p className="notice" role="status">{notice}</p>}
-      {quoteExpired && !busy && <p role="status">This quote has expired. Review a new quote before sending a request.</p>}
-      {quote === null || (quoteExpired && !busy)
+      {needsFreshQuote && !busy && <p role="status">This quote has expired. Review a new quote before sending a request.</p>}
+      {quote === null || (needsFreshQuote && !busy)
         ? <button disabled={formBusy || destinationOrgId === "" || counterpartyId === ""} onClick={() => void requestQuote()}>{busy ? "Loading transfer quote…" : "Review payer transfer"}</button>
         : <div className="notice" role="status">
           <p>At renewal on {date(quote.effectiveFrom)}, {quote.destinationKind === "sponsor" ? "the organisation" : "you"} would pay {money(quote.amountPence)} per {quote.interval}. No mid-term credit is due.</p>
           {quote.founding && <p className="muted">The server has included the founding price applicable at this renewal.</p>}
-          <button disabled={formBusy} onClick={() => void createInvitation()}>{busy ? "Sending request…" : "Send request for acceptance"}</button>{" "}
+          <button disabled={formBusy} onClick={() => void createInvitation()}>{busy ? "Sending request…" : retryingQuote ? "Retry sending request" : "Send request for acceptance"}</button>{" "}
           <button disabled={formBusy} onClick={() => { setQuote(null); idempotencyKey.current = null; }}>Cancel</button>
         </div>}
     </>}
@@ -290,6 +294,9 @@ export function SponsoredTransferStart({
   const [counterpartyId, setCounterpartyId] = useState("");
   const [quote, setQuote] = useState<PayerTransferQuote | null>(null);
   const quoteExpired = useQuoteExpiry(quote);
+  const [submittedQuote, setSubmittedQuote] = useState<PayerTransferQuote | null>(null);
+  const retryingQuote = quote !== null && submittedQuote === quote;
+  const needsFreshQuote = quoteExpired && !retryingQuote;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -355,7 +362,8 @@ export function SponsoredTransferStart({
   }
 
   async function createInvitation() {
-    if (quote === null || quoteExpired || quoteHasExpired(quote)) return;
+    if (quote === null || (!retryingQuote && (quoteExpired || quoteHasExpired(quote)))) return;
+    setSubmittedQuote(quote);
     setBusy(true); setError(null); setNotice(null);
     try {
       const result = await beginPayerTransfer({ quote, idempotencyKey: idempotencyKey.current ?? crypto.randomUUID() });
@@ -403,13 +411,13 @@ export function SponsoredTransferStart({
     </>}
     {error !== null && <p role="alert">{error}</p>}
     {notice !== null && <p className="notice" role="status">{notice}</p>}
-    {quoteExpired && !busy && <p role="status">This quote has expired. Review a new quote before sending a request.</p>}
-    {quote === null || (quoteExpired && !busy)
+    {needsFreshQuote && !busy && <p role="status">This quote has expired. Review a new quote before sending a request.</p>}
+    {quote === null || (needsFreshQuote && !busy)
       ? <button disabled={busy || beneficiaryId === "" || counterpartyId === "" || (destinationKind === "personal" && !setupAvailable) || (destinationKind === "sponsor" && destinationOrgId === "")} onClick={() => void requestQuote()}>{busy ? "Loading transfer quote…" : "Review payer transfer"}</button>
       : <div className="notice" role="status">
         <p>At renewal on {date(quote.effectiveFrom)}, {quote.destinationKind === "sponsor" ? "the destination organisation" : "the member"} would pay {money(quote.amountPence)} per {quote.interval}. No mid-term credit is due.</p>
         {quote.founding && <p className="muted">The server has included the founding price applicable at this renewal.</p>}
-        <button disabled={busy} onClick={() => void createInvitation()}>{busy ? "Sending request…" : "Send request for acceptance"}</button>{" "}
+        <button disabled={busy} onClick={() => void createInvitation()}>{busy ? "Sending request…" : retryingQuote ? "Retry sending request" : "Send request for acceptance"}</button>{" "}
         <button disabled={busy} onClick={() => { setQuote(null); idempotencyKey.current = null; }}>Cancel</button>
       </div>}
   </section>;

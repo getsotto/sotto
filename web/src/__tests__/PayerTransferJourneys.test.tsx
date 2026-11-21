@@ -612,7 +612,7 @@ describe("payer transfer journeys", () => {
     expect(organisation).toHaveValue("org-b");
     expect(screen.getByLabelText("Other payer administrator")).toHaveValue("admin-2");
     expect(api.fetchMembers).toHaveBeenCalledExactlyOnceWith("org-b");
-    expect(screen.getByRole("button", { name: failure === "quote" ? "Review payer transfer" : "Send request for acceptance" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: failure === "quote" ? "Review payer transfer" : "Retry sending request" })).toBeEnabled();
   });
 
   it("does not claim a second payer must accept when the caller can authorise both sides", async () => {
@@ -723,6 +723,69 @@ describe("payer transfer journeys", () => {
       }
     },
   );
+
+  it.each([
+    ["personal", "before", "success"], ["personal", "after", "success"],
+    ["sponsored", "before", "success"], ["sponsored", "after", "success"],
+    ["personal", "before", "conflict"], ["personal", "after", "conflict"],
+    ["sponsored", "before", "conflict"], ["sponsored", "after", "conflict"],
+  ] as const)("retries the same %s request when its response is lost %s quote expiry until %s", async (payer, failureTime, result) => {
+    vi.useFakeTimers();
+    const expiry = quote.quoteExpiresAtEpoch * 1000;
+    vi.setSystemTime(expiry - 1000);
+    try {
+      const invitation = deferred<api.PayerTransfer>();
+      vi.mocked(api.beginPayerTransfer)
+        .mockReturnValueOnce(invitation.promise)
+        .mockRejectedValueOnce(new Error("server error (504)"));
+      if (result === "conflict") vi.mocked(api.beginPayerTransfer).mockRejectedValueOnce(new Error("server error (409)"));
+      if (payer === "personal") {
+        await act(async () => { render(<PersonalTransferStart />); });
+        await act(async () => {
+          fireEvent.change(screen.getByLabelText("Organisation"), { target: { value: "org-b" } });
+        });
+        fireEvent.change(screen.getByLabelText("Other payer administrator"), { target: { value: "admin-2" } });
+      } else {
+        await act(async () => {
+          render(<SponsoredTransferStart sourceOrganizationId="org-a" seats={[{
+            seatId: "seat-1", beneficiaryId: "beneficiary-1", offer: "standard_monthly",
+            effectiveFrom: 1, effectiveUntil: null, state: "active", foundingPriceEndEpoch: null,
+            standardRenewalAmountPence: null, foundingTransitionStatus: null, foundingTransitionReason: null,
+          }]} organisations={[org("org-a", "admin"), org("org-b", "admin")]} />);
+        });
+        fireEvent.change(screen.getByLabelText("Sponsored member"), { target: { value: "beneficiary-1" } });
+      }
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Review payer transfer" })); });
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Send request for acceptance" })); });
+      const firstRequest = vi.mocked(api.beginPayerTransfer).mock.calls[0][0];
+      expect(firstRequest).toEqual({ quote, idempotencyKey: expect.any(String) });
+      if (failureTime === "after") {
+        await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+      }
+      await act(async () => { invitation.reject(new Error("server error (504)")); });
+      if (failureTime === "before") {
+        await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+      }
+      expect(screen.queryByText(/This quote has expired/)).not.toBeInTheDocument();
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Retry sending request" })); });
+      expect(api.beginPayerTransfer).toHaveBeenNthCalledWith(2, firstRequest);
+      expect(api.quotePayerTransfer).toHaveBeenCalledTimes(1);
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Retry sending request" })); });
+      expect(api.beginPayerTransfer).toHaveBeenNthCalledWith(3, firstRequest);
+      expect(screen.queryByRole("button", { name: "Retry sending request" })).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Review payer transfer" })).toBeEnabled();
+      if (result === "success") expect(screen.getByRole("status")).toHaveTextContent("Transfer request sent.");
+
+      vi.mocked(api.quotePayerTransfer).mockResolvedValueOnce({ ...quote, quoteId: "fresh", quoteExpiresAtEpoch: quote.quoteExpiresAtEpoch + 60 });
+      await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Review payer transfer" })); });
+      expect(screen.getByRole("button", { name: "Send request for acceptance" })).toBeEnabled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(screen.getByText(/This quote has expired/)).toBeInTheDocument();
+      expect(api.beginPayerTransfer).toHaveBeenCalledTimes(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("does not offer a personal destination when its setup capability is disabled", async () => {
     vi.mocked(api.fetchPayerTransferCapabilities).mockResolvedValue({ available: true, setupAvailable: false });
