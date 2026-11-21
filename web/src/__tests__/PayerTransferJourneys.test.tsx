@@ -104,6 +104,97 @@ describe("payer transfer journeys", () => {
     expect(view.container).toBeEmptyDOMElement();
   });
 
+  it("shows an error and offers retry when capability discovery fails, then loads transfers on success", async () => {
+    vi.mocked(api.fetchPayerTransferCapabilities)
+      .mockRejectedValueOnce(new Error("server error (503)"))
+      .mockResolvedValueOnce({ available: true, setupAvailable: true });
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
+      transfers: [transfer()],
+      nextCursor: null,
+    });
+
+    render(<PayerTransferInbox />);
+
+    expect(await screen.findByRole("heading", { name: "Payer transfers" })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("The transfer service is temporarily unavailable. Try again shortly.");
+    const retry = screen.getByRole("button", { name: "Retry" });
+    expect(retry).toBeEnabled();
+    expect(api.fetchPayerTransfers).not.toHaveBeenCalled();
+
+    fireEvent.click(retry);
+
+    expect(await screen.findByRole("button", { name: "Refresh transfers" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+    expect(api.fetchPayerTransfers).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Incoming request")).toBeInTheDocument();
+  });
+
+  it("keeps recovery available after repeated capability discovery failures without starting transfers", async () => {
+    vi.mocked(api.fetchPayerTransferCapabilities)
+      .mockRejectedValueOnce(new Error("Synthetic network error"))
+      .mockRejectedValueOnce(new Error("server error (500)"));
+
+    render(<PayerTransferInbox />);
+
+    expect(await screen.findByRole("heading", { name: "Payer transfers" })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("The transfer service is temporarily unavailable. Try again shortly.");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("The transfer service is temporarily unavailable. Try again shortly.");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    expect(api.fetchPayerTransfers).not.toHaveBeenCalled();
+    expect(api.acceptPayerTransfer).not.toHaveBeenCalled();
+    expect(api.withdrawPayerTransfer).not.toHaveBeenCalled();
+  });
+
+  it("prevents overlapping capability discovery retries while a retry is pending", async () => {
+    const retry = deferred<api.PayerTransferCapabilities>();
+    vi.mocked(api.fetchPayerTransferCapabilities)
+      .mockRejectedValueOnce(new Error("Synthetic network error"))
+      .mockReturnValueOnce(retry.promise);
+
+    render(<PayerTransferInbox />);
+
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    const retryBtn = screen.getByRole("button", { name: "Retry" });
+    fireEvent.click(retryBtn);
+
+    const retrying = screen.getByRole("button", { name: "Retrying…" });
+    expect(retrying).toBeDisabled();
+    expect(retrying).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Checking transfer availability…")).toBeInTheDocument();
+
+    // Secondary click should be ignored
+    fireEvent.click(retrying);
+    expect(api.fetchPayerTransferCapabilities).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      retry.resolve({ available: true, setupAvailable: true });
+    });
+
+    expect(await screen.findByRole("button", { name: "Refresh transfers" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("hides the inbox when discovery retry reports transfers unavailable", async () => {
+    vi.mocked(api.fetchPayerTransferCapabilities)
+      .mockRejectedValueOnce(new Error("Synthetic network error"))
+      .mockResolvedValueOnce({ available: false, setupAvailable: false });
+
+    const view = render(<PayerTransferInbox />);
+
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => {
+      expect(view.container).toBeEmptyDOMElement();
+    });
+    expect(api.fetchPayerTransfers).not.toHaveBeenCalled();
+  });
+
 
   it("shows Declining while a decline request is in progress", async () => {
     let resolveDecline!: (value: api.PayerTransfer) => void;
@@ -273,6 +364,59 @@ describe("payer transfer journeys", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("The transfer service is temporarily unavailable");
     expect(screen.getByText("Incoming request")).toBeInTheDocument();
     expect(screen.queryByText("There are no payer transfer requests for this account.")).not.toBeInTheDocument();
+  });
+
+  it("distinguishes response deadline times on the same date with explicit time and time zone", async () => {
+    const morning = transfer({
+      transferId: "morning",
+      consentExpiresAtEpoch: Math.floor(Date.UTC(2035, 0, 2, 9, 0, 0) / 1000),
+      effectiveFrom: Math.floor(Date.UTC(2035, 0, 10, 0, 0, 0) / 1000),
+    });
+    const evening = transfer({
+      transferId: "evening",
+      consentExpiresAtEpoch: Math.floor(Date.UTC(2035, 0, 2, 17, 0, 0) / 1000),
+      effectiveFrom: Math.floor(Date.UTC(2035, 0, 10, 0, 0, 0) / 1000),
+    });
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
+      transfers: [morning, evening],
+      nextCursor: null,
+    });
+
+    render(<PayerTransferInbox />);
+    expect(await screen.findByText("Respond by 02/01/2035, 09:00 UTC.")).toBeInTheDocument();
+    expect(screen.getByText("Respond by 02/01/2035, 17:00 UTC.")).toBeInTheDocument();
+  });
+
+  it("formats the response deadline when consent expiry precedes the renewal boundary", async () => {
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
+      transfers: [
+        transfer({
+          consentExpiresAtEpoch: Math.floor(Date.UTC(2035, 4, 15, 11, 30, 0) / 1000),
+          effectiveFrom: Math.floor(Date.UTC(2035, 5, 1, 0, 0, 0) / 1000),
+        }),
+      ],
+      nextCursor: null,
+    });
+
+    render(<PayerTransferInbox />);
+    expect(await screen.findByText("Respond by 15/05/2035, 11:30 UTC.")).toBeInTheDocument();
+    expect(screen.getByText(/renewal 01\/06\/2035\./)).toBeInTheDocument();
+  });
+
+  it("formats the response deadline when the renewal boundary precedes consent expiry", async () => {
+    vi.mocked(api.fetchPayerTransfers).mockResolvedValue({
+      transfers: [
+        transfer({
+          consentExpiresAtEpoch: Math.floor(Date.UTC(2035, 8, 20, 0, 0, 0) / 1000),
+          effectiveFrom: Math.floor(Date.UTC(2035, 8, 10, 14, 45, 0) / 1000),
+        }),
+      ],
+      nextCursor: null,
+    });
+
+    render(<PayerTransferInbox />);
+    expect(await screen.findByText("Respond by 10/09/2035, 14:45 UTC.")).toBeInTheDocument();
+    expect(screen.getByText(/renewal 10\/09\/2035\./)).toBeInTheDocument();
   });
 
   it("shows invitations as expired once their renewal boundary has passed", async () => {
