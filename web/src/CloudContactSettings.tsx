@@ -25,6 +25,32 @@ function deliveryMessage(state: NonNullable<CloudContactStatus["latestDelivery"]
   }
 }
 
+function formatPendingExpiry(epochSeconds: number | null): { iso: string; label: string } | null {
+  if (typeof epochSeconds !== "number" || !Number.isFinite(epochSeconds)) {
+    return null;
+  }
+
+  const date = new Date(epochSeconds * 1000);
+
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+
+  const label = new Intl.DateTimeFormat("en-GB", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(date);
+
+  return {
+    iso: date.toISOString(),
+    label,
+  };
+}
+
 /** Contact management is available on the signed-in Cloud page without unlocking the vault. */
 export function CloudContactSettings() {
   const [status, setStatus] = useState<CloudContactStatus | "unsupported" | "error" | null>(null);
@@ -127,6 +153,8 @@ export function CloudContactSettings() {
     }
   }
 
+  const pendingExpiry = status !== null && status !== "unsupported" && status !== "error" ? formatPendingExpiry(status.pendingExpiresAtEpoch) : null;
+
   return (
     <section aria-labelledby="contact-heading">
       <h2 id="contact-heading">Lifecycle email</h2>
@@ -143,7 +171,18 @@ export function CloudContactSettings() {
         {status.latestDelivery != null && <p className="muted" role="status">
           {deliveryMessage(status.latestDelivery.state)}
         </p>}
-        {status.pendingExpiresAtEpoch !== null && <p className="muted">A verification request is pending. You can request another link if it expires.</p>}
+        {status.pendingExpiresAtEpoch !== null && (
+          <p className="muted">
+            {pendingExpiry !== null ? (
+              <>
+                A verification request is pending and expires at{" "}
+                <time dateTime={pendingExpiry.iso}>{pendingExpiry.label}</time>. You can request another link if it expires.
+              </>
+            ) : (
+              "A verification request is pending. You can request another link if it expires."
+            )}
+          </p>
+        )}
         {status.enrolmentAvailable ? <form
           noValidate
           onSubmit={(event) => {
