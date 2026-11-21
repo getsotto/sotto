@@ -16,3 +16,9 @@
 {"at": "2026-11-21T16:26:34Z", "component": "signin", "detail": null, "state": "ok"}
 {"at": "2026-11-21T16:26:34Z", "component": "sync", "detail": null, "state": "ok"}
 {"at": "2026-11-21T16:26:34Z", "component": "web", "detail": null, "state": "ok"}
+{"at": "2026-11-21T21:45:40Z", "component": "api", "detail": null, "state": "ok"}
+{"at": "2026-11-21T21:45:40Z", "component": "billing", "detail": null, "state": "ok"}
+{"at": "2026-11-21T21:45:40Z", "component": "human-sync", "detail": "SOTTO_HUMAN_CANARY_ENVIRONMENT_ID is not set", "state": "unconfigured"}
+{"at": "2026-11-21T21:45:40Z", "component": "signin", "detail": null, "state": "ok"}
+{"at": "2026-11-21T21:45:40Z", "component": "sync", "detail": null, "state": "ok"}
+{"at": "2026-11-21T21:45:40Z", "component": "web", "detail": null, "state": "ok"}
