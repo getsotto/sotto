@@ -36,9 +36,22 @@ pub struct HttpClient {
     http: Client,
 }
 
+/// A client builder with this platform's TLS backend chosen, for every client the CLI makes.
+///
+/// Linux names rustls instead of leaving it to reqwest's default. A build that also compiles the
+/// server (`cargo test --workspace`, say) turns on the server's native-tls feature in the shared
+/// reqwest, and reqwest prefers native-tls whenever it is present, which would quietly bring back
+/// OpenSSL and its parse of the whole certificate bundle on every run.
+pub(crate) fn client_builder() -> reqwest::blocking::ClientBuilder {
+    let builder = Client::builder();
+    #[cfg(target_os = "linux")]
+    let builder = builder.use_rustls_tls();
+    builder
+}
+
 impl HttpClient {
     pub fn new(base_url: String, token: String) -> Self {
-        let http = Client::builder()
+        let http = client_builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .build()
@@ -559,6 +572,47 @@ mod tests {
             stream.write_all(response.as_bytes()).expect("write");
         });
         format!("http://{addr}")
+    }
+
+    /// The test build is the one that matters here: the server crate is a dev-dependency, so
+    /// native-tls is compiled into reqwest beside rustls and would be reqwest's own choice. A
+    /// peer that answers the handshake in plain HTTP is refused by each backend in its own words,
+    /// which tells them apart without a certificate.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_clients_use_rustls_even_with_native_tls_compiled_in() {
+        use std::io::Read;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            // Take the whole ClientHello record before answering. Closing with any of it unread
+            // resets the connection, and the reset can overtake the answer the client is to judge.
+            let mut header = [0u8; 5];
+            stream.read_exact(&mut header).expect("record header");
+            let mut hello = vec![0u8; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+            stream.read_exact(&mut hello).expect("client hello");
+            stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                .expect("write");
+            // Hold the socket until the client has given up on it, for the same reason.
+            let _ = stream.read_to_end(&mut Vec::new());
+        });
+
+        let err = client_builder()
+            // Never through a proxy named in the environment: the peer must be this listener.
+            .no_proxy()
+            .build()
+            .expect("client builds")
+            .get(format!("https://{addr}"))
+            .send()
+            .expect_err("plain HTTP is not a TLS handshake");
+        let detail = format!("{err:?}");
+        assert!(
+            detail.contains("InvalidContentType"),
+            "expected rustls to reject the handshake, got: {detail}"
+        );
     }
 
     #[test]

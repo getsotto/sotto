@@ -77,6 +77,8 @@ eso es posible que un comando descrito aquí aún no exista en la versión que t
 Consulta [COMPATIBILITY.md](COMPATIBILITY.md) para ver los requisitos de versión de las
 integraciones, las plataformas declaradas y las pruebas disponibles actualmente.
 
+Para elegir una versión o carpeta de instalación, consulta las [opciones y ejemplos del instalador (en inglés)](INSTALLING.md).
+
 ### Homebrew (versión preliminar)
 
 El [tap de Sotto](https://github.com/getsotto/homebrew-tap) ofrece otra vía de
@@ -190,6 +192,24 @@ plano, por lo que necesita `--reveal` en un terminal, igual que `sotto get`; `--
 `shell` y `json`. El borrado del portapapeles es una medida de mejor esfuerzo: si reemplazas el
 contenido se protege el nuevo valor, mientras que los gestores del portapapeles, la suspensión o la
 terminación del proceso auxiliar pueden conservar una copia.
+
+`sotto run` inicia el comando con tu entorno actual más los secretos del entorno seleccionado. Un
+secreto reemplaza a una variable heredada con el mismo nombre, y las variables sin relación se
+conservan. Cuando ocurre, Sotto escribe `warning: overriding inherited environment variable NAME` en
+stderr, nunca el valor. Solo el comando y sus descendientes ven los secretos; el entorno de tu shell
+no cambia después. Para usar otro entorno, pon `--env` antes de `--` (consulta
+[Entornos](#entornos); [Importar un archivo dotenv](#importar-un-archivo-dotenv) explica cómo llenarlo).
+
+Sotto ejecuta el programa directamente, por lo que no expande variables ni interpreta tuberías ni
+redirecciones en sus argumentos. Tu propio shell sigue procesando su sintaxis antes de que arranque
+Sotto: `sotto run -- echo "$EXAMPLE"` muestra el valor de `EXAMPLE` en el shell padre, no el
+inyectado. Para expandir una variable dentro del proceso hijo, ejecuta un shell como comando y pon el
+script entre comillas simples (shells POSIX). En este ejemplo ficticio, supón que `EXAMPLE` está
+guardado en Sotto con el valor `demo-only`:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
 
 Hasta aquí todo se queda en tu máquina. Para sincronizar otro dispositivo, trabajar en equipo o usar
 CI, inicia sesión en un servidor:
@@ -652,8 +672,7 @@ Si falta alguna, la CI está activa o `TERM=dumb`, la invocación sin subcomando
 en la salida de error estándar y termina con el código 2. Usa `sotto --help` para solicitar la
 ayuda expresamente.
 
-Usa las flechas o `j` y `k` para desplazarte. Pulsa `/` para buscar, `?` para abrir la ayuda y Tab
-para cambiar de entorno. Este cambio solo dura mientras el panel está abierto; `sotto env use`
+Usa las flechas o `j` y `k` para desplazarte. Pulsa `/` para buscar, `?` para abrir la ayuda, Tab para pasar al entorno siguiente y Shift+Tab para volver al anterior. Este cambio solo dura mientras el panel está abierto; `sotto env use`
 cambia el entorno predeterminado del proyecto. Pulsa `r` para mostrar u ocultar el valor
 seleccionado, `c` para copiarlo al portapapeles y `q` para salir. `Esc` cierra la búsqueda o el
 diálogo actual; en la vista principal, borra una búsqueda activa o sale.
@@ -773,6 +792,8 @@ El formato JSON es útil para scripts. Su estructura de nivel superior es:
 ```
 
 El ejemplo es sintético; `actions` y las fechas opcionales proceden del estado devuelto de la cuenta, y los servidores antiguos pueden devolver null para cualquiera de los dos endpoints. `sotto cloud status` solo informa del estado y puede mostrar una URL de facturación. No inicia una compra ni cambia la elegibilidad. Para diagnosticar el almacén local y los entornos, usa `sotto status`; esa vista es independiente de la información del servidor y de la cuenta anterior.
+
+Para añadir o quitar una dirección de correo para los avisos de Cloud, consulta la [guía de contactos de correo (en inglés)](CLOUD-EMAIL.md).
 
 Para trasladar la facturación personal a una organización desde la página de cuenta de Sotto Cloud,
 consulta la [guía de traslado de facturación](CLOUD-BILLING-TRANSFER.md).
