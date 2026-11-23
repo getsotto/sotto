@@ -43,3 +43,12 @@ COPY --from=caddy-build /usr/bin/caddy /usr/bin/caddy
 # The Caddyfile roots the SPA at ./web/dist, relative to Caddy's working directory (/srv).
 COPY Caddyfile /etc/caddy/Caddyfile
 COPY --from=build /app/web/dist /srv/web/dist
+# The entrypoint raises TCP's initial congestion window before Caddy starts (its header says why).
+# busybox's `ip` does not know `initcwnd`, hence iproute2; setpriv drops the capability afterwards.
+# Alpine ships setpriv as a package of its own (util-linux's other binaries are not needed), which
+# `apk search -x setpriv` shows.
+RUN apk add --no-cache iproute2 setpriv
+COPY deploy/edge-entrypoint.sh /usr/local/bin/edge-entrypoint
+ENTRYPOINT ["/usr/local/bin/edge-entrypoint"]
+# Restated because setting ENTRYPOINT clears the CMD inherited from the base image.
+CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
