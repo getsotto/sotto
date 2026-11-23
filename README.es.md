@@ -674,8 +674,9 @@ ayuda expresamente.
 
 Usa las flechas o `j` y `k` para desplazarte. Pulsa `/` para buscar, `?` para abrir la ayuda, Tab para pasar al entorno siguiente y Shift+Tab para volver al anterior. Este cambio solo dura mientras el panel está abierto; `sotto env use`
 cambia el entorno predeterminado del proyecto. Pulsa `r` para mostrar u ocultar el valor
-seleccionado, `c` para copiarlo al portapapeles y `q` para salir. `Esc` cierra la búsqueda o el
-diálogo actual; en la vista principal, borra una búsqueda activa o sale.
+seleccionado, `R` para recargar los secretos locales del entorno actual, `c` para copiarlo al
+portapapeles y `q` para salir. `Esc` cierra la búsqueda o el diálogo actual; en la vista principal,
+borra una búsqueda activa o sale.
 
 Pulsa `h` para [ver y restaurar el historial local de un secreto](LOCAL-HISTORY.md) (guía en inglés).
 

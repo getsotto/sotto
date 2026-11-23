@@ -656,9 +656,9 @@ with code 2.
 Use `sotto --help` to request help explicitly.
 
 Use the arrow keys or `j` and `k` to navigate. Press `/` to search, `?` for help, Tab to switch to the next environment and Shift+Tab to switch to the previous one. This switch lasts only for the dashboard session; `sotto env use` changes the
-project's default. Press `r` to reveal or conceal the selected value, `c` to copy it to the
-clipboard, and `q` to quit. `Esc` closes the current search or dialog; from the main view, it
-clears an active search or quits.
+project's default. Press `r` to reveal or conceal the selected value, `R` to reload the current
+environment's local secrets, `c` to copy it to the clipboard, and `q` to quit. `Esc` closes the
+current search or dialog; from the main view, it clears an active search or quits.
 
 Press `h` to [browse and restore local secret history](LOCAL-HISTORY.md) (English guide).
 
