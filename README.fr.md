@@ -529,6 +529,26 @@ donc pas un historique complet.
 La révocation empêche les récupérations futures via le lien. Elle ne peut pas annuler une
 récupération déjà effectuée : si le destinataire a pu révéler le secret, changez-le à la source.
 
+Un destinataire n'a pas besoin de compte Sotto, seulement du lien complet, y compris la partie
+située après `#`. Si vous avez créé le lien avec `--passphrase`, envoyez la phrase secrète par un
+autre canal que le lien. Ouvrir la page ne récupère pas le secret. La page ne récupère la charge
+chiffrée que lorsque le destinataire choisit `Reveal secret`, et cette récupération peut consommer
+l'une des consultations du lien avant que le déchiffrement n'aboutisse : une phrase secrète
+absente ou erronée peut donc quand même coûter une consultation.
+
+Si la phrase secrète est absente ou erronée, le destinataire peut la corriger et choisir
+`Reveal secret` de nouveau sur la même page. La page conserve la charge déjà récupérée et relance
+le déchiffrement en local, sans nouvelle récupération. Cela ne vaut que pour la session de page en
+cours : recharger, fermer ou quitter la page supprime la charge, et si le lien ne fonctionne alors
+plus, demandez à l'expéditeur un nouveau lien. Cela ne couvre pas tous les échecs, comme une
+erreur réseau ou serveur, ou un lien dont les consultations sont épuisées, qui a expiré ou qui a
+été révoqué.
+
+Après une révélation réussie, la page affiche le secret avec un bouton `Copy secret`. Si le
+navigateur refuse l'accès au presse-papiers, la page l'indique et le destinataire peut
+sélectionner la valeur affichée et la copier manuellement. Consulter ou copier le secret n'efface
+ni votre secret ni le texte chiffré conservé par le serveur.
+
 ### Travailler en équipe
 
 Les équipes partagent des environnements au sein d'une organisation. Chaque membre reçoit sa propre
