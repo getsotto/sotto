@@ -32,18 +32,18 @@ def read(path):
 
 def fenced_blocks(text):
     """Return [(fence_line, content_tuple)] for every fenced code block."""
-    blocks, current, fence = [], None, None
-    for line in text.splitlines():
+    blocks, current, fence, opened = [], None, None, 0
+    for number, line in enumerate(text.splitlines(), start=1):
         if FENCE_RE.match(line):
             if current is None:
-                current, fence = [], line.strip()
+                current, fence, opened = [], line.strip(), number
             else:
                 blocks.append((fence, tuple(current)))
                 current, fence = None, None
         elif current is not None:
             current.append(line)
     if current is not None:
-        raise ValueError("unclosed fenced code block")
+        raise ValueError(f"unclosed fenced code block opened on line {opened}")
     return blocks
 
 
@@ -129,6 +129,10 @@ def check_root(root):
         source_text = read(root / SOURCE)
     except OSError as exc:
         return [f"{SOURCE}: cannot read ({exc})"]
+    try:
+        fenced_blocks(source_text)
+    except ValueError as exc:
+        return [f"{SOURCE}: {exc}"]
     for name in TRANSLATIONS:
         if f"({name})" not in source_text:
             errors.append(f"{SOURCE}: missing nav link to {name}")
@@ -136,6 +140,11 @@ def check_root(root):
             trans_text = read(root / name)
         except OSError:
             errors.append(f"{name}: file missing")
+            continue
+        try:
+            fenced_blocks(trans_text)
+        except ValueError as exc:
+            errors.append(f"{name}: {exc}")
             continue
         errors.extend(check_translation(source_text, trans_text, name))
     return errors
