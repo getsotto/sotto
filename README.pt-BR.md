@@ -77,6 +77,8 @@ lista os comandos que a sua versão suporta.
 Consulte [COMPATIBILITY.md](COMPATIBILITY.md) para ver os requisitos de versão das integrações,
 as plataformas declaradas e as evidências de teste disponíveis atualmente.
 
+Para escolher uma versão ou pasta de instalação, consulte as [opções e exemplos do instalador (em inglês)](INSTALLING.md).
+
 ### Homebrew (prévia)
 
 O [tap do Sotto](https://github.com/getsotto/homebrew-tap) oferece outra forma
@@ -189,6 +191,25 @@ texto puro, portanto precisa de `--reveal` em um terminal, assim como `sotto get
 aceita `shell` e `json`. A limpeza da área de transferência é uma medida de melhor esforço:
 substituir o conteúdo protege o novo valor, enquanto gerenciadores da área de transferência,
 suspensão ou encerramento do processo auxiliar podem manter uma cópia.
+
+`sotto run` inicia o comando com o seu ambiente atual mais os segredos do ambiente selecionado. Um
+segredo substitui uma variável herdada de mesmo nome, e as variáveis sem relação são mantidas.
+Quando isso acontece, o Sotto escreve `warning: overriding inherited environment variable NAME` no
+stderr, nunca o valor. Somente o comando e seus descendentes veem os segredos; o ambiente do seu
+shell não muda depois. Para usar outro ambiente, coloque `--env` antes de `--` (veja
+[Ambientes](#ambientes); [Importar um arquivo dotenv](#importar-um-arquivo-dotenv) mostra como
+preencher um).
+
+O Sotto executa o programa diretamente, então não expande variáveis nem interpreta pipes ou
+redirecionamentos nos seus argumentos. O seu próprio shell ainda processa a sintaxe dele antes de o
+Sotto iniciar: `sotto run -- echo "$EXAMPLE"` imprime o valor de `EXAMPLE` no shell pai, não o
+injetado. Para expandir uma variável dentro do processo filho, execute um shell como comando e
+coloque o script entre aspas simples (shells POSIX). Neste exemplo fictício, suponha que `EXAMPLE`
+esteja armazenado no Sotto com o valor `demo-only`:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
 
 Até aqui, tudo fica na sua máquina. Para sincronizar outro dispositivo, trabalhar em equipe ou usar
 CI, faça login em um servidor:
@@ -645,12 +666,13 @@ terminais. Se faltar algum, a CI estiver ativa ou `TERM=dumb`, a execução sem 
 a ajuda na saída de erro padrão e termina com código 2. Use `sotto --help` para pedir a ajuda
 explicitamente.
 
-Use as setas ou `j` e `k` para navegar. Pressione `/` para buscar, `?` para ver a ajuda e Tab para
-trocar de ambiente. A troca vale apenas durante a sessão do painel; `sotto env use` altera o
+Use as setas ou `j` e `k` para navegar. Pressione `/` para buscar, `?` para ver a ajuda, Tab para ir ao próximo ambiente e Shift+Tab para voltar ao anterior. A troca vale apenas durante a sessão do painel; `sotto env use` altera o
 ambiente padrão do projeto. Pressione `r` para mostrar ou ocultar o valor selecionado, `R` para
 recarregar os segredos locais do ambiente atual, `c` para copiá-lo para a área de transferência e
 `q` para sair. `Esc` fecha a busca ou a caixa de diálogo atual; na tela principal, limpa uma busca
 ativa ou sai.
+
+Pressione `h` para [ver e restaurar o histórico local de um segredo](LOCAL-HISTORY.md) (guia em inglês).
 
 Pressione `t` para percorrer os temas com visualização ao vivo. Use as setas para ver cada tema
 e pressione `Enter` para salvar sua escolha ou `Esc` para cancelar. As
@@ -768,6 +790,8 @@ O formato JSON é útil para scripts. Sua estrutura de nível superior é:
 ```
 
 O exemplo é sintético; `actions` e as datas opcionais vêm do estado retornado da conta, e servidores antigos podem retornar null para qualquer um dos dois endpoints. `sotto cloud status` apenas informa o status e pode mostrar uma URL de cobrança. Ele não inicia uma compra nem altera a elegibilidade. Para diagnósticos do cofre local e dos ambientes, use `sotto status`; essa visão é separada das informações do servidor e da conta acima.
+
+Para adicionar ou remover um endereço de e-mail para avisos do Cloud, consulte o [guia de contatos de e-mail (em inglês)](CLOUD-EMAIL.md).
 
 Para mover a cobrança pessoal para uma organização a partir da página de conta do Sotto Cloud,
 consulte o [guia de transferência de cobrança](CLOUD-BILLING-TRANSFER.md).
