@@ -143,9 +143,37 @@ enum Command {
         #[arg(long)]
         no_copy: bool,
     },
-    /// Upload local changes for the active environment to the server.
+    /// Reconcile with the server, then upload remaining local changes.
+    #[command(after_help = r#"Examples:
+  sotto push
+  sotto push --env staging
+
+Syncs one environment in the current project, not every project or environment.
+Without --env, uses the saved default. --env changes only this invocation.
+
+Requires an existing local project and environment, a server login, and an
+unlocked local vault. Sotto prompts to unlock it when needed. Start with
+sotto init for a new project, or sotto setup / sotto clone on another device;
+login alone does not recreate the project.
+
+Push first applies a fresh server snapshot locally, then uploads the remaining
+changes. It can update local state before uploading."#)]
     Push,
     /// Download the active environment's secrets from the server into the local store.
+    #[command(after_help = r#"Examples:
+  sotto pull
+  sotto pull --env staging
+
+Syncs one environment in the current project, not every project or environment.
+Without --env, uses the saved default. --env changes only this invocation.
+
+Requires an existing local project and environment and a server login. Start
+with sotto init for a new project, or sotto setup / sotto clone on another
+device; login alone does not recreate the project. Pull does not require
+unlocking the local vault.
+
+Pull applies the server's encrypted snapshot locally. It does not upload local
+changes."#)]
     Pull,
     /// Set up this device from the server using your Emergency Kit (run after `login`).
     Setup,
@@ -2730,6 +2758,31 @@ mod tests {
         assert!(help.contains("sotto run --env staging -- npm test"));
         assert!(help.contains("sotto run -- python -c \"print('hello')\""));
         assert!(help.contains("Sotto options go before --"));
+    }
+
+    #[test]
+    fn sync_help_explains_scope_and_local_effects() {
+        for name in ["push", "pull"] {
+            let mut command = Cli::command();
+            let help = command
+                .find_subcommand_mut(name)
+                .expect("sync subcommand should exist")
+                .render_long_help()
+                .to_string();
+            assert!(help.contains(&format!("sotto {name} --env staging")));
+            assert!(help.contains("one environment in the current project"));
+            assert!(help.contains("--env changes only this invocation"));
+            assert!(help.contains("server login"));
+            if name == "push" {
+                assert!(help.contains("Push first applies a fresh server snapshot locally"));
+                assert!(help.contains("unlocked local vault"));
+            } else {
+                assert!(help.contains("Pull does not require"));
+                assert!(help.contains("It does not upload local"));
+            }
+            let cli = Cli::try_parse_from(["sotto", name, "--env", "staging"]).unwrap();
+            assert_eq!(cli.env.as_deref(), Some("staging"));
+        }
     }
 
     #[test]

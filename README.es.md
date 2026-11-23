@@ -77,6 +77,8 @@ eso es posible que un comando descrito aquí aún no exista en la versión que t
 Consulta [COMPATIBILITY.md](COMPATIBILITY.md) para ver los requisitos de versión de las
 integraciones, las plataformas declaradas y las pruebas disponibles actualmente.
 
+Para elegir una versión o carpeta de instalación, consulta las [opciones y ejemplos del instalador (en inglés)](INSTALLING.md).
+
 ### Homebrew (versión preliminar)
 
 El [tap de Sotto](https://github.com/getsotto/homebrew-tap) ofrece otra vía de
@@ -670,8 +672,7 @@ Si falta alguna, la CI está activa o `TERM=dumb`, la invocación sin subcomando
 en la salida de error estándar y termina con el código 2. Usa `sotto --help` para solicitar la
 ayuda expresamente.
 
-Usa las flechas o `j` y `k` para desplazarte. Pulsa `/` para buscar, `?` para abrir la ayuda y Tab
-para cambiar de entorno. Este cambio solo dura mientras el panel está abierto; `sotto env use`
+Usa las flechas o `j` y `k` para desplazarte. Pulsa `/` para buscar, `?` para abrir la ayuda, Tab para pasar al entorno siguiente y Shift+Tab para volver al anterior. Este cambio solo dura mientras el panel está abierto; `sotto env use`
 cambia el entorno predeterminado del proyecto. Pulsa `r` para mostrar u ocultar el valor
 seleccionado, `c` para copiarlo al portapapeles y `q` para salir. `Esc` cierra la búsqueda o el
 diálogo actual; en la vista principal, borra una búsqueda activa o sale.

@@ -120,7 +120,7 @@ pub fn exchange_code(server: &str, code: &str, state: &str) -> Result<String> {
     }
     // Unauthenticated endpoint, so a bare client rather than `HttpClient` (which always bears a
     // token); same timeouts.
-    let http = reqwest::blocking::Client::builder()
+    let http = super::http::client_builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))
         .build()
