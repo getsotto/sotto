@@ -358,21 +358,26 @@ function Terminal() {
         {"\n\n"}
         <span className="line l10">
           <span className="prompt">$ </span>
-          <span className="cmd c4">sotto push</span>
+          <span className="cmd c4">sotto login</span>
         </span>
-        {"\n"}
-        <span className="line l11 dim">pushed acme-api/dev - revision 1</span>
         {"\n\n"}
-        <span className="line l12">
+        <span className="line l11">
           <span className="prompt">$ </span>
-          <span className="cmd c5">sotto share DATABASE_URL</span>
+          <span className="cmd c5">sotto push</span>
         </span>
         {"\n"}
-        <span className="line l13 dim">{"share link (acme-api/dev) - burns after 1 view(s):"}</span>
-        {"\n"}
-        <span className="line l14 value">{"https://getsotto.co.uk/s/00112233445566778899aabbccddeeff#AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"}</span>
+        <span className="line l12 dim">pushed acme-api/dev - revision 1</span>
         {"\n\n"}
-        <span className="line l15">
+        <span className="line l13">
+          <span className="prompt">$ </span>
+          <span className="cmd c6">sotto share DATABASE_URL</span>
+        </span>
+        {"\n"}
+        <span className="line l14 dim">{"share link (acme-api/dev) - burns after 1 view(s):"}</span>
+        {"\n"}
+        <span className="line l15 value">{"https://getsotto.co.uk/s/00112233445566778899aabbccddeeff#AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"}</span>
+        {"\n\n"}
+        <span className="line l16">
           <span className="prompt">$ </span>
           <span className="cursor" />
         </span>
