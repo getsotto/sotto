@@ -49,18 +49,27 @@ test("reduced motion shows the whole terminal transcript with no animation", asy
     const cursors = await readMotion(page, ".cursor");
 
     // The transcript is present, including the tail a hidden final line would drop.
-    expect(lines).toHaveLength(15);
-    expect(commands).toHaveLength(5);
+    expect(lines).toHaveLength(16);
+    expect(commands).toHaveLength(6);
     expect(cursors).toHaveLength(1);
     await expect(page.locator(".landing .term .l1")).toContainText("sotto init");
-    await expect(page.locator(".landing .term .l14")).toContainText("https://getsotto.co.uk/s/");
-    await expect(page.locator(".landing .term .l15")).toBeVisible();
+    await expect(page.locator(".landing .term .l15")).toContainText("https://getsotto.co.uk/s/");
+    await expect(page.locator(".landing .term .l16")).toBeVisible();
+    // Login comes after the local commands and before the first sync command.
+    expect(await page.locator(".landing .term .cmd").allTextContents()).toEqual([
+      "sotto init",
+      "sotto set DATABASE_URL",
+      "sotto run -- npm start",
+      "sotto login",
+      "sotto push",
+      "sotto share DATABASE_URL",
+    ]);
 
     // Lines are opaque and commands are not clipped.
     for (const line of lines) expect(line.opacity).toBe("1");
     for (const command of commands) expect(command.clipPath).toBe("none");
-    await expect(page.locator(".landing .term .l15")).toHaveCSS("opacity", "1");
-    await expect(page.locator(".landing .term .c5")).toHaveCSS("clip-path", "none");
+    await expect(page.locator(".landing .term .l16")).toHaveCSS("opacity", "1");
+    await expect(page.locator(".landing .term .c6")).toHaveCSS("clip-path", "none");
 
     // No typing, reveal or blink animation is configured. A visible cursor alone would not show
     // that blinking is off.
@@ -81,8 +90,8 @@ test("without a reduced-motion preference the terminal animations stay configure
     const commands = await readMotion(page, ".cmd");
     const cursors = await readMotion(page, ".cursor");
 
-    expect(lines).toHaveLength(15);
-    expect(commands).toHaveLength(5);
+    expect(lines).toHaveLength(16);
+    expect(commands).toHaveLength(6);
     expect(cursors).toHaveLength(1);
     for (const line of lines) expect(line.animationName).toBe("sotto-appear");
     for (const command of commands) expect(command.animationName).toBe("sotto-type");

@@ -279,6 +279,8 @@ set DATABASE_URL (acme-api/dev)
 $ sotto run -- npm start
 ready on http://localhost:3000
 
+$ sotto login
+
 $ sotto push
 pushed acme-api/dev - revision 1
 
