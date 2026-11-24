@@ -12,7 +12,7 @@
 
 # Sotto
 
-La synchronisation de secrets chiffrés de bout en bout pour les équipes de développement. Arrêtez d'envoyer votre `.env` sur Slack.
+Gestionnaire de secrets open source à connaissance nulle et synchronisation chiffrée de bout en bout pour les équipes de développement. Arrêtez d'envoyer votre `.env` sur Slack.
 
 > [!WARNING]
 > Sotto est pré-1.0 et n'a **pas** fait l'objet d'un audit cryptographique par un tiers. Il fonctionne de bout en bout, mais

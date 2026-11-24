@@ -12,7 +12,7 @@
 
 # Sotto
 
-Ende-zu-Ende-verschlüsselte Secret-Synchronisierung für Entwicklerteams. Schluss mit `.env` per Slack.
+Open-Source-Zero-Knowledge-Secret-Manager und Ende-zu-Ende-verschlüsselte Secret-Synchronisierung für Entwicklerteams. Schluss mit `.env` per Slack.
 
 > [!WARNING]
 > Sotto ist Pre-1.0-Software und hat **kein** kryptografisches Audit durch Dritte durchlaufen. Es funktioniert Ende zu Ende,
