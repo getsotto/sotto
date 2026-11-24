@@ -609,12 +609,12 @@ export const guidePages: SeoPageData[] = [
       },
     ],
     terminal: [
-      { text: "sotto token create github-ci --expires-in 90d", kind: "cmd" },
+      { text: "sotto token create --name github-ci --expires-in-days 90", kind: "cmd" },
       {
         text: "machine token `github-ci` for acme-api/staging, expires 2027-02-22T00:00:00Z - save it now; it is never shown again:",
         kind: "dim",
       },
-      { text: "sotto_mt_...", kind: "value" },
+      { text: "smt_0011223344556677.MT1-XXXX-XXXX-XXXX", kind: "value" },
       { text: "SOTTO_SERVER=https://getsotto.co.uk SOTTO_TOKEN=... sotto run -- npm test", kind: "cmd" },
       { text: "ok", kind: "dim" },
     ],
