@@ -54,6 +54,9 @@ export function CloudAccountPanel() {
   const [quoteLoading, setQuoteLoading] = useState(false);
   const [quoteAttempt, setQuoteAttempt] = useState(0);
   const [lifecycle, setLifecycle] = useState<PersonalLifecycle | null>(null);
+  const [lifecycleRead, setLifecycleRead] = useState<"loading" | "ready" | "failed">("loading");
+  const [lifecycleAttempt, setLifecycleAttempt] = useState(0);
+  const lifecycleReadGeneration = useRef(0);
   const [refund, setRefund] = useState<RefundRequest | null>(null);
   const [operation, setOperation] = useState<PersonalOperation | null>(null);
   const operationRequestInFlight = useRef(false);
@@ -127,12 +130,21 @@ export function CloudAccountPanel() {
   }, [eligibility?.state]);
   useEffect(() => {
     if (eligibility?.payer !== "personal") return;
-    let current = true;
+    const generation = ++lifecycleReadGeneration.current;
+    setLifecycleRead("loading");
     void fetchPersonalLifecycle()
-      .then((next) => { if (current) setLifecycle(next); })
-      .catch(() => { if (current) setLifecycle(null); });
-    return () => { current = false; };
-  }, [eligibility?.payer, eligibility?.state]);
+      .then((next) => {
+        if (generation !== lifecycleReadGeneration.current) return;
+        setLifecycle(next);
+        setLifecycleRead("ready");
+      })
+      .catch(() => {
+        if (generation !== lifecycleReadGeneration.current) return;
+        setLifecycle(null);
+        setLifecycleRead("failed");
+      });
+    return () => { ++lifecycleReadGeneration.current; };
+  }, [eligibility?.payer, eligibility?.state, lifecycleAttempt]);
 
   async function checkout() {
     if (quote === null || quoteLoading || !quote.offer.endsWith(`_${offer}`)) return;
@@ -157,7 +169,14 @@ export function CloudAccountPanel() {
   }
   async function cancel() {
     setBusy(true); setError(null);
-    try { setLifecycle(await cancelPersonalBilling(crypto.randomUUID())); setNotice("Cancellation requested. Your paid period remains available until it ends."); }
+    try {
+      const next = await cancelPersonalBilling(crypto.randomUUID());
+      // A read started before cancellation must not overwrite the updated billing details.
+      ++lifecycleReadGeneration.current;
+      setLifecycle(next);
+      setLifecycleRead("ready");
+      setNotice("Cancellation requested. Your paid period remains available until it ends.");
+    }
     catch (e) { setError(message(e)); }
     finally { setBusy(false); }
   }
@@ -202,6 +221,11 @@ export function CloudAccountPanel() {
     {notices.length > 0 && <section aria-labelledby="notices-heading"><h2 id="notices-heading">Account notices</h2><ul>{notices.map((item) => <li key={item.noticeId}><strong>{item.content.title}</strong><p>{item.content.detail}</p>{item.kind === "price_change" && item.content.effectiveAtEpoch !== null && item.content.amountPence !== null && item.content.priceInterval !== null && item.content.priceInterval !== undefined && <p>From {date(item.content.effectiveAtEpoch)}, your price will be {pounds(item.content.amountPence)} per {item.content.priceInterval}.</p>}{item.content.deadlineEpoch !== null && <p className="muted">Deadline: {date(item.content.deadlineEpoch)}</p>}{item.kind === "failed_renewal" && <button disabled={busy} onClick={() => void portal()}>Update payment method</button>}{item.status === "failed" && <p role="alert">This notice could not be delivered{item.lastErrorCode === null ? "." : ` (${item.lastErrorCode}).`}</p>}</li>)}</ul></section>}
     <CloudContactSettings />
     <section aria-labelledby="status-heading"><h2 id="status-heading">Hosted access</h2><p><strong>{eligibility.state.replaceAll("_", " ")}</strong>{paidThrough !== null ? ` · paid through ${paidThrough}` : ""}</p>{recoveryUntil !== null && <p className="muted">Recovery is available until {recoveryUntil}.</p>}{eligibility.payer === null && eligibility.state === "paid" && <p className="muted">Your hosted access is sponsored or provided by another billing record. There is no personal upgrade to buy.</p>}{eligibility.state === "unavailable" && <p>Billing evidence is temporarily unavailable. Checkout is hidden until the account can be checked safely.</p>}{lifecycle?.foundingTransitionStatus !== null && lifecycle?.foundingTransitionStatus !== undefined && <p className="muted">{lifecycle.foundingPriceEndEpoch !== null && lifecycle.standardRenewalAmountPence !== null ? <>Founding price applies until {date(lifecycle.foundingPriceEndEpoch)}. The standard price after that is {pounds(lifecycle.standardRenewalAmountPence)}. </> : <>The founding transition date is not verified. </>}{lifecycle.foundingTransitionStatus === "scheduled" ? "Transition scheduled with the billing provider." : lifecycle.foundingTransitionStatus === "not_required" ? "No transition is needed because this subscription is ending." : <>The standard-price transition is not yet confirmed; we are checking it. {foundingTransitionReason(lifecycle.foundingTransitionReason)}</>}</p>}</section>
+    {eligibility.payer === "personal" && lifecycleRead === "loading" && <p className="muted" role="status">Loading personal billing details…</p>}
+    {eligibility.payer === "personal" && lifecycleRead === "failed" && <>
+      <p role="alert">Personal billing details could not be loaded.</p>
+      <button type="button" onClick={() => setLifecycleAttempt(lifecycleAttempt + 1)}>Retry billing details</button>
+    </>}
     {eligibility.actions.billing && <section aria-labelledby="billing-heading">
       <h2 id="billing-heading">Choose hosted billing</h2>
       <label>Term <select value={offer} disabled={busy} onChange={(e) => setOffer(e.target.value as PersonalBillingTerm)}><option value="monthly">Monthly</option><option value="annual">Annual</option></select></label>
