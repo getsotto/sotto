@@ -739,7 +739,11 @@ fn draw_secret_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     lines.push(Line::from(vec![
         Span::styled("  [Tab] ", styles.bold_accent()),
         Span::styled("Switch Field   ", styles.muted()),
-        Span::styled("[Ctrl+G] ", styles.bold_accent()),
+        Span::styled("[Ctrl+U] ", styles.bold_accent()),
+        Span::styled("Clear", styles.muted()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("  [Ctrl+G] ", styles.bold_accent()),
         Span::styled("Generate   ", styles.muted()),
         Span::styled("[Ctrl+R] ", styles.bold_accent()),
         Span::styled("Mask/Reveal", styles.muted()),
@@ -1608,6 +1612,9 @@ mod tests {
         assert!(content.contains("(masked)"));
         assert!(content.contains("Save"));
         assert!(content.contains("Cancel"));
+        // Each hint must sit on one row at 80 columns rather than wrap mid-hint.
+        assert!(content.contains("[Ctrl+U] Clear"));
+        assert!(content.contains("[Ctrl+R] Mask/Reveal"));
         assert!(!content.contains("xxxxxxxx"));
         assert_eq!(tui_app.secret_modal_value.len(), 500);
     }
@@ -1633,6 +1640,7 @@ mod tests {
         assert!(content.contains("\u{258f}"));
         assert!(content.contains("Save"));
         assert!(content.contains("Cancel"));
+        assert!(content.contains("[Ctrl+U] Clear"));
         assert_eq!(tui_app.secret_modal_value.as_str(), value);
     }
 
