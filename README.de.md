@@ -682,9 +682,11 @@ Mit `sotto --help` rufst du die Hilfe ausdrücklich auf.
 
 Navigiere mit den Pfeiltasten oder `j` und `k`. Drücke `/` zum Suchen, `?` für die Hilfe, Tab zum Wechsel zur nächsten Umgebung und Shift+Tab zum Wechsel zur vorherigen. Der Wechsel gilt nur für die Dashboard-Sitzung; `sotto env use` ändert
 die Standardumgebung des Projekts. Mit `r` zeigst du den ausgewählten Wert an oder verbirgst ihn,
-mit `c` kopierst du ihn in die Zwischenablage und mit `q` beendest du das Dashboard. `Esc`
-schließt die aktuelle Suche oder ein Dialogfenster; in der Hauptansicht löscht es eine aktive
-Suche oder beendet das Dashboard.
+mit `R` lädst du die lokalen Geheimnisse der aktuellen Umgebung neu, mit `c` kopierst du ihn in
+die Zwischenablage und mit `q` beendest du das Dashboard. `Esc` schließt die aktuelle Suche oder
+ein Dialogfenster; in der Hauptansicht löscht es eine aktive Suche oder beendet das Dashboard.
+
+Drücke `h`, um den [lokalen Verlauf eines Secrets anzusehen und wiederherzustellen](LOCAL-HISTORY.md) (Anleitung auf Englisch).
 
 Drücke `t`, um Themes mit einer Live-Vorschau durchzugehen. Mit den Pfeiltasten siehst du jedes
 Theme. Drücke `Enter`, um deine Wahl zu speichern, oder `Esc`, um abzubrechen. Die

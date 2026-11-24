@@ -450,6 +450,10 @@ fn draw_help_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled("Toggle secret reveal / mask", styles.text()),
         ]),
         Line::from(vec![
+            Span::styled("  R           ", styles.bold_accent()),
+            Span::styled("Reload local secrets", styles.text()),
+        ]),
+        Line::from(vec![
             Span::styled("  t           ", styles.bold_accent()),
             Span::styled("Open live theme switcher modal", styles.text()),
         ]),
@@ -1430,6 +1434,7 @@ mod tests {
         assert!(content.contains("Next environment"));
         assert!(content.contains("Previous environment"));
         assert!(content.contains("Shift+Tab"));
+        assert!(content.contains("Reload local secrets"));
     }
 
     #[test]

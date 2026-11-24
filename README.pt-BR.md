@@ -667,9 +667,12 @@ a ajuda na saída de erro padrão e termina com código 2. Use `sotto --help` pa
 explicitamente.
 
 Use as setas ou `j` e `k` para navegar. Pressione `/` para buscar, `?` para ver a ajuda, Tab para ir ao próximo ambiente e Shift+Tab para voltar ao anterior. A troca vale apenas durante a sessão do painel; `sotto env use` altera o
-ambiente padrão do projeto. Pressione `r` para mostrar ou ocultar o valor selecionado, `c` para
-copiá-lo para a área de transferência e `q` para sair. `Esc` fecha a busca ou a caixa de diálogo
-atual; na tela principal, limpa uma busca ativa ou sai.
+ambiente padrão do projeto. Pressione `r` para mostrar ou ocultar o valor selecionado, `R` para
+recarregar os segredos locais do ambiente atual, `c` para copiá-lo para a área de transferência e
+`q` para sair. `Esc` fecha a busca ou a caixa de diálogo atual; na tela principal, limpa uma busca
+ativa ou sai.
+
+Pressione `h` para [ver e restaurar o histórico local de um segredo](LOCAL-HISTORY.md) (guia em inglês).
 
 Pressione `t` para percorrer os temas com visualização ao vivo. Use as setas para ver cada tema
 e pressione `Enter` para salvar sua escolha ou `Esc` para cancelar. As
