@@ -142,7 +142,7 @@ www.{$SOTTO_DOMAIN} {
 		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
 	}
 
-	# Fold trailing slashes on the six indexable guide slugs onto their canonical clean URLs
+	# Fold trailing slashes on the indexable guide slugs onto their canonical clean URLs
 	# so crawlers and no-script visitors get the prerendered guide, not the homepage snapshot.
 	# Keep in sync with `guidePages` in web/src/seo/pages.ts. Ordinary SPA routes (`/app/`,
 	# `/s/:token`, unknown paths) are left to try_files below.
@@ -152,6 +152,10 @@ www.{$SOTTO_DOMAIN} {
 	redir /share-api-keys-securely/ /share-api-keys-securely permanent
 	redir /send-password-securely/ /send-password-securely permanent
 	redir /self-hosted-secret-management/ /self-hosted-secret-management permanent
+	redir /open-source-secret-manager/ /open-source-secret-manager permanent
+	redir /cli-secret-manager/ /cli-secret-manager permanent
+	redir /dotenv-alternative/ /dotenv-alternative permanent
+	redir /ci-cd-secret-manager/ /ci-cd-secret-manager permanent
 
 	# Everything else is the SPA, including client-side routes (/, /app, /s/:token, /auth/callback).
 	# The middle branch serves the prerendered guide files the build emits (`/<slug>` reads
