@@ -34,7 +34,7 @@ impl Config {
             // A genuinely-absent file is "no config"; anything else (permission denied, invalid
             // UTF-8, …) is a real I/O fault and must not masquerade as a missing config.
             std::io::ErrorKind::NotFound => Error::NoConfig(path.clone()),
-            _ => Error::Io(e.to_string()),
+            _ => Error::Io(format!("reading {}: {e}", path.display())),
         })?;
         toml::from_str(&text).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
     }
@@ -144,13 +144,26 @@ mod tests {
     fn discover_reports_invalid_utf8_in_nearest_config_instead_of_parent() {
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("parent");
-        let nested = parent.join("nested");
+        let nested = parent.join("nested project");
         let start = nested.join("src");
         std::fs::create_dir_all(&start).unwrap();
         sample().save_to(&parent).unwrap();
-        std::fs::write(nested.join(CONFIG_FILE), b"\xff\xfe").unwrap();
+        let config_path = nested.join(CONFIG_FILE);
+        std::fs::write(&config_path, b"\xff\xfe").unwrap();
 
-        assert!(matches!(Config::discover(&start), Err(Error::Io(_))));
+        let error = Config::discover(&start).unwrap_err();
+        assert_eq!(error.exit_code(), 5);
+        let rendered = error.to_string();
+        let path = config_path.display().to_string();
+        assert!(
+            matches!(
+                error,
+                Error::Io(message)
+                    if message.contains(&path)
+                        && message.contains("stream did not contain valid UTF-8")
+            ),
+            "{rendered}"
+        );
     }
 
     #[test]
