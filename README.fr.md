@@ -304,6 +304,34 @@ le premier environnement) ou `>` (seulement dans le second). Sans `--confirm`, l
 simulation. Une copie confirmée ajoute et met à jour les secrets, mais laisse intactes les clés
 présentes uniquement dans la destination.
 
+Pour les scripts, utilisez JSON plutôt que le marqueur d'environnement actif :
+
+```sh
+sotto env ls --json
+```
+
+Exemple de sortie pour un projet avec deux environnements locaux :
+
+```json
+[{"active":true,"name":"dev"},{"active":false,"name":"staging"}]
+```
+
+Chaque objet contient un nom d'environnement `name` et un indicateur `active`. Une liste vide est `[]`.
+Pour sélectionner staging pour cette commande seulement :
+
+```sh
+sotto --env staging env ls --json
+```
+
+Ici, `active` marque staging au lieu de dev. Cela n'enregistre pas de nouveau choix par défaut ;
+utilisez `sotto env use` pour cela, comme expliqué ci-dessus. Si le nom sélectionné ne figure
+pas dans la liste locale, tous les indicateurs sont faux. L'indicateur compare les noms ;
+il ne prouve ni l'accès à un environnement ni la réussite du déchiffrement.
+
+Cette commande lit les métadonnées locales des environnements du projet configuré sans déverrouiller
+le coffre ni contacter le serveur. Contrairement à `sotto ls --json`, elle liste les environnements,
+pas les noms des secrets. La sortie standard contient JSON ; les diagnostics vont sur la sortie d'erreur standard.
+
 ### Configuration du projet
 
 `sotto init` et `sotto clone` écrivent un `sotto.toml` dans le répertoire courant. Il associe ce
