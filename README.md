@@ -10,7 +10,7 @@
 
 # Sotto
 
-End-to-end encrypted secret sync for developer teams. Stop Slacking your `.env`.
+Open-source, zero-knowledge secret manager and end-to-end encrypted secret sync for developer teams. Stop Slacking your `.env`.
 
 > [!WARNING]
 > Sotto is pre-1.0 and has **not** had a third-party cryptographic audit. It works end to end, but

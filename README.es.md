@@ -12,7 +12,7 @@
 
 # Sotto
 
-Sincronización de secretos con cifrado de extremo a extremo para equipos de desarrollo. Deja de enviar tu `.env` por Slack.
+Gestor de secretos de código abierto con conocimiento cero y sincronización cifrada de extremo a extremo para equipos de desarrollo. Deja de enviar tu `.env` por Slack.
 
 > [!WARNING]
 > Sotto es una versión previa a la 1.0 y **no** ha pasado una auditoría criptográfica de terceros. Funciona de extremo a extremo, pero

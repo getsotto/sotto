@@ -6,8 +6,16 @@ import { join } from "node:path";
 import react from "@vitejs/plugin-react";
 import { defineConfig, type Plugin } from "vite";
 
-import { guidePages, type SeoPageData } from "./src/seo/pages";
-import { faqJsonLd, guideLinksHtml, snapshotFor } from "./src/seo/snapshot";
+import pkg from "./package.json" with { type: "json" };
+import { guidePages, landingFaqs, type SeoPageData } from "./src/seo/pages";
+import {
+  guideJsonLd,
+  guideLinksHtml,
+  inlineHtml,
+  landingJsonLd,
+  llmsTxt,
+  snapshotFor,
+} from "./src/seo/snapshot";
 
 // Strict Content-Security-Policy for the web client. `wasm-unsafe-eval` is required to instantiate
 // WebAssembly; everything else is locked to same-origin with no inline scripts, no embedding, and
@@ -110,7 +118,7 @@ function statusLink(url: string | undefined): string {
 // the build-time CSP bans both. The JSON-LD block in index.html is inert data rather than
 // an executable script, so script-src does not reach it.)
 // Machine-readable metadata (canonical address, social tags, structured data, crawler rules,
-// sitemap) carries the deployment's own origin from SOTTO_PUBLIC_URL at build time.
+// sitemap, llms.txt) carries the deployment's own origin from SOTTO_PUBLIC_URL at build time.
 // Illustrative copy keeps the hosted addresses verbatim, exactly as <Landing> renders them -
 // the transcript and quickstart are prose, not identity claims.
 function publicOrigin(): string {
@@ -121,6 +129,14 @@ function publicOrigin(): string {
     );
   }
   return raw;
+}
+
+function buildDate(): string {
+  const override = process.env.SOTTO_BUILD_DATE?.trim();
+  if (override && /^\d{4}-\d{2}-\d{2}$/.test(override)) {
+    return override;
+  }
+  return new Date().toISOString().slice(0, 10);
 }
 
 // The disallowed paths mirror the Caddyfile @ratelimited/@api matchers and the client-side
@@ -152,17 +168,18 @@ Sitemap: ${origin}/sitemap.xml
 `;
 }
 
-function sitemapXml(origin: string): string {
+function sitemapXml(origin: string, lastmod: string): string {
   const guides = guidePages
     .map(
       (page) =>
-        `  <url>\n    <loc>${origin}/${page.slug}</loc>\n    <changefreq>monthly</changefreq>\n    <priority>0.8</priority>\n  </url>`,
+        `  <url>\n    <loc>${origin}/${page.slug}</loc>\n    <lastmod>${lastmod}</lastmod>\n    <changefreq>monthly</changefreq>\n    <priority>0.8</priority>\n  </url>`,
     )
     .join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
     <loc>${origin}/</loc>
+    <lastmod>${lastmod}</lastmod>
     <changefreq>weekly</changefreq>
     <priority>1.0</priority>
   </url>
@@ -171,10 +188,21 @@ ${guides}
 `;
 }
 
+function securityTxt(origin: string): string {
+  const nextYear = new Date();
+  nextYear.setUTCFullYear(nextYear.getUTCFullYear() + 1);
+  return `Contact: https://github.com/getsotto/sotto/security/advisories/new
+Expires: ${nextYear.toISOString().replace(/\.\d{3}Z$/, "Z")}
+Preferred-Languages: en
+Canonical: ${origin}/.well-known/security.txt
+Policy: https://github.com/getsotto/sotto/blob/main/SECURITY.md
+`;
+}
+
 // Guide pages (/<slug>): one prerendered HTML file each, derived from the
 // finished index.html so every route ships the same CSP, SRI hashes, and
-// origin handling. Each file swaps the snapshot and the head tags (title,
-// description, social, canonical) and appends its FAQ structured data.
+// origin handling. Each file swaps the snapshot, head tags (title,
+// description, social, canonical, og:type), and structured data graph.
 // Replacements use function replacers throughout, so `$` sequences in future
 // copy can never be misread as replacement patterns.
 function escHead(text: string): string {
@@ -197,6 +225,8 @@ function swapOnce(
   }
   return html.replace(pattern, () => replacement);
 }
+
+const JSON_LD_PATTERN = /<script type="application\/ld\+json">[\s\S]*?<\/script>/;
 
 function guideFile(
   base: string,
@@ -236,6 +266,12 @@ function guideFile(
   );
   html = swapOnce(
     html,
+    '<meta property="og:type" content="website" />',
+    '<meta property="og:type" content="article" />',
+    "og:type tag",
+  );
+  html = swapOnce(
+    html,
     `<meta property="og:url" content="${origin}/" />`,
     `<meta property="og:url" content="${url}" />`,
     "og:url tag",
@@ -258,15 +294,26 @@ function guideFile(
     `<meta name="twitter:description" content="${description}" />`,
     "twitter:description tag",
   );
-  return swapOnce(html, "</head>", `${faqJsonLd(page)}\n  </head>`, "head closing tag");
+  return swapOnce(html, JSON_LD_PATTERN, guideJsonLd(page, origin), "JSON-LD script");
 }
+
+function landingFaqSnapshot(): string {
+  const items = landingFaqs
+    .map(
+      (faq, index) =>
+        `<details${index === 0 ? " open" : ""}><summary>${escHead(faq.q)}</summary><p>${inlineHtml(faq.a)}</p></details>`,
+    )
+    .join("");
+  return `<section id="faq"><h2>Frequently asked questions</h2>${items}</section>`;
+}
+
 export const pricingSnapshot = (cloudPricingVisible: boolean) => cloudPricingVisible
   ? `<section id="pricing"><h2>Pricing</h2><div class="plans"><div class="plan"><h3>Local and self-hosted</h3><p class="price">Free</p><ul><li>Open-source Sotto, running on your devices or your own server</li><li>Keep control of hosting and operating costs</li><li>Share links remain free for recipients</li></ul></div><div class="plan"><h3>Sotto Cloud</h3><p class="price">£2.99<span class="per"> / person / month</span></p><ul><li>Or £29.99 per person / year</li><li>First 100 named paid seats: £1.99 monthly for 12 months, then £2.99; or £19.99 for the first year, then £29.99</li><li>No trial; hosted access starts after payment is confirmed</li></ul></div></div><p class="muted">Cloud is operated by Sotto and has no SLA. The source is open and can be self-hosted. Prices and applicable taxes are confirmed at checkout. Free one-time links have a limit of three active links per account, one view each, with a seven-day expiry.</p><p class="muted">Or run it yourself: the <a href="https://github.com/getsotto/sotto/blob/main/deploy/README.md">server is self-hostable</a> and Apache-2.0.</p></section>`
   : `<section id="pricing"><h2>Pricing</h2><div class="plans"><div class="plan"><h3>Local and self-hosted</h3><p class="price">Free</p><ul><li>Open-source Sotto, running on your devices or your own server</li><li>Keep control of hosting and operating costs</li><li>Share links remain free for recipients</li></ul></div></div><p class="muted">Cloud availability and current billing options are shown after sign-in. <a href="/cloud">Check your Cloud account</a>. New personal hosted access starts after payment is confirmed. Or run it yourself: the <a href="https://github.com/getsotto/sotto/blob/main/deploy/README.md">server is self-hostable</a> and Apache-2.0.</p></section>`;
 
 export const seoSnapshot = (statusUrl: string | undefined, cloudPricingVisible: boolean) => `<main class="landing">
 <header><span class="wordmark">Sotto</span><nav aria-label="Site"><a href="#how">How it works</a><a href="#trust">Trust</a><a href="#pricing">Pricing</a><a href="#open-source">Contribute</a><a href="https://github.com/getsotto/sotto">GitHub</a><a class="login" href="/app">Log in</a></nav></header>
-<section class="hero"><h1>Stop Slacking your <code>.env</code> files.</h1><p class="lead">Sotto syncs secrets across your team with end-to-end encryption. Values are encrypted on your machine before they leave it and decrypted only on your teammates’ machines. The server stores ciphertext it cannot read.</p><div class="install"><code>curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh</code><button class="sm" type="button" disabled aria-live="polite">Copy</button></div><p class="muted">Signed binaries for macOS and Linux. The installer verifies the checksum, and the Sigstore signature when <code>cosign</code> is installed. Prefer to <a href="https://github.com/getsotto/sotto/blob/main/install.sh">read it first</a>? Or grab a tarball from <a href="https://github.com/getsotto/sotto/releases">releases</a>.</p></section>
+<section class="hero"><h1>Stop Slacking your <code>.env</code> files.</h1><p class="lead">Sotto is an <a href="/open-source-secret-manager">open-source, zero-knowledge secret manager</a> for developer teams. Encrypt <code>.env</code> files and secrets on your machine before they leave it, sync ciphertext across devices, and decrypt only on your teammates’ machines. The server never sees plaintext.</p><div class="install"><code>curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh</code><button class="sm" type="button" disabled aria-live="polite">Copy</button></div><p class="muted">On Windows, run this in PowerShell:</p><div class="install"><code>irm https://raw.githubusercontent.com/getsotto/sotto/main/install.ps1 | iex</code><button class="sm" type="button" disabled aria-live="polite">Copy</button></div><p class="muted">Prebuilt, signed binaries are available for macOS, Linux, and Windows x86_64. The installers verify the archive’s SHA-256 checksum and, when <code>cosign</code> is installed, its Sigstore signature. Read the <a href="https://github.com/getsotto/sotto/blob/main/install.sh">shell installer</a> or the <a href="https://github.com/getsotto/sotto/blob/main/install.ps1">PowerShell installer</a>, or download a tarball from <a href="https://github.com/getsotto/sotto/releases">releases</a>.</p></section>
 <pre class="term"><code>$ sotto init
   Save your Emergency Kit - these cannot be recovered:
     Secret Key:   SK1-9FKQ-XXXX-XXXX-XXXX
@@ -287,7 +334,7 @@ share link (acme-api/dev) - burns after 1 view(s):
 https://getsotto.co.uk/s/00112233445566778899aabbccddeeff#AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
 
 $ </code></pre>
-<section id="how"><h2>How it works</h2><ol class="steps"><li><strong>Encrypt locally.</strong> Your vault key is derived on your machine from your master password and secret key. Neither is ever sent anywhere.</li><li><strong>Sync ciphertext.</strong> The server stores and versions encrypted blobs. It never receives a plaintext value or a usable key, so there is nothing on it worth stealing.</li><li><strong>Decrypt on your devices.</strong> One Rust crypto core runs everywhere: the CLI natively, the browser through WebAssembly, with golden vectors in CI proving both produce identical bytes.</li></ol><p>Teams work the same way: sharing an environment grants its key to a member (an X25519 sealed box), so access is cryptographic, not a permission bit on the server. Removing a member rotates the keys.</p></section>
+<section id="how"><h2>How it works</h2><ol class="steps"><li><strong>Encrypt locally.</strong> Your vault key is derived on your machine from your master password and secret key. Neither is ever sent anywhere.</li><li><strong>Sync ciphertext.</strong> The server stores and versions encrypted blobs. It never receives a plaintext value or a usable key, so there is nothing on it worth stealing.</li><li><strong>Decrypt on your devices.</strong> One Rust crypto core runs everywhere: the <a href="/cli-secret-manager">CLI secret manager</a> natively, the browser through WebAssembly, with golden vectors in CI proving both produce identical bytes.</li></ol><p>Teams work the same way: sharing an environment grants its key to a member (an X25519 sealed box), so access is cryptographic, not a permission bit on the server. Removing a member rotates the keys. Use Sotto as an encrypted <a href="/dotenv-alternative">dotenv alternative</a> locally, inject <a href="/ci-cd-secret-manager">CI/CD secrets</a> with expiring machine tokens, or send <a href="/one-time-secret-links">one-time secret links</a> that burn after reading.</p></section>
 <section id="trust"><h2>Should you trust this?</h2><p>Not blindly. Sotto is pre-1.0 and has <strong>not had a third-party cryptographic audit</strong> yet. You should know that before putting anything important in it. Here is what you can verify yourself, today:</p><ul><li>A published <a href="https://github.com/getsotto/sotto/blob/main/THREAT-MODEL.md">threat model</a> with explicit non-goals.</li><li>One shared crypto core: the CLI and the browser client run the same Rust code, held to byte-for-byte golden vectors in CI.</li><li>Sigstore-signed releases with a documented <a href="https://github.com/getsotto/sotto/blob/main/SECURITY.md">verification procedure</a>.</li><li>Telemetry is four anonymous fields, opt-out, and pinned by a unit test so it cannot quietly grow.</li><li>Apache-2.0, and self-hostable from one docker-compose.</li></ul><p>Honest guidance: use it for your team’s development and staging secrets today. Keep the production crown jewels where they are until the audit.</p></section>
 ${pricingSnapshot(cloudPricingVisible)}
 <section id="open-source"><h2>Open source</h2><p>Apache-2.0. One repo, one crypto core. Star it if Sotto saved you from pasting a <code>.env</code> into Slack; pick a good first issue if you want to help.</p><p class="community-actions"><a href="https://github.com/getsotto/sotto">Star on GitHub</a><a href="https://github.com/getsotto/sotto/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22">Good first issues</a><a href="https://github.com/getsotto/sotto/blob/main/CONTRIBUTING.md">Contributing</a></p></section>
@@ -297,6 +344,7 @@ sotto import .env            # optional: pull in an existing file, still encrypt
 sotto run -- npm start       # inject secrets into any command
 sotto login &amp;&amp; sotto push    # optional: sync ciphertext via getsotto.co.uk
 sotto share DATABASE_URL     # one-time link for a single secret</code></pre><p>Sotto works fully offline until you <code>sotto login</code>. Sync is a feature, not a requirement. The web vault at this address decrypts in your browser, with keys that never leave your devices.</p></section>
+${landingFaqSnapshot()}
 <footer><nav aria-label="Guides">${guideLinksHtml()}</nav><nav aria-label="Footer"><a href="https://github.com/getsotto/sotto">GitHub</a><a href="#open-source">Contribute</a><a href="https://github.com/getsotto/sotto/releases">Releases</a><a href="https://github.com/getsotto/sotto/blob/main/THREAT-MODEL.md">Threat model</a><a href="https://github.com/getsotto/sotto/blob/main/SECURITY.md">Security policy</a><a href="https://github.com/getsotto/sotto/blob/main/deploy/README.md">Run your own</a>${statusLink(statusUrl)}<a href="/app">Log in</a></nav><p class="muted">Sotto takes its name from <em>sotto voce</em>: in a low voice, in confidence. Apache-2.0.</p></footer>
 </main>`;
 
@@ -316,18 +364,36 @@ function seoPrerenderPlugin(): Plugin {
     },
     transformIndexHtml(html) {
       if (!ROOT_PATTERN.test(html)) {
-        throw new Error("sotto-seo-prerender: <div id=\"root\"></div> not found in index.html");
+        throw new Error('sotto-seo-prerender: <div id="root"></div> not found in index.html');
       }
       const origin = publicOrigin();
-      return html
-        .replace(ROOT_PATTERN, `<div id="root">${seoSnapshot(clientEnv.VITE_STATUS_URL, clientEnv.VITE_CLOUD_PRICING_VISIBLE === "true")}</div>`)
+      const cloudPricingVisible = clientEnv.VITE_CLOUD_PRICING_VISIBLE === "true";
+      const withSnapshot = html
+        .replace(
+          ROOT_PATTERN,
+          `<div id="root">${seoSnapshot(clientEnv.VITE_STATUS_URL, cloudPricingVisible)}</div>`,
+        )
         .split("__SOTTO_PUBLIC_URL__")
         .join(origin);
+      if (JSON_LD_PATTERN.test(withSnapshot)) {
+        return withSnapshot.replace(
+          JSON_LD_PATTERN,
+          () => landingJsonLd(origin, pkg.version, cloudPricingVisible),
+        );
+      }
+      return withSnapshot;
     },
     generateBundle() {
       const origin = publicOrigin();
+      const lastmod = buildDate();
       this.emitFile({ type: "asset", fileName: "robots.txt", source: robotsTxt(origin) });
-      this.emitFile({ type: "asset", fileName: "sitemap.xml", source: sitemapXml(origin) });
+      this.emitFile({ type: "asset", fileName: "sitemap.xml", source: sitemapXml(origin, lastmod) });
+      this.emitFile({ type: "asset", fileName: "llms.txt", source: llmsTxt(origin) });
+      this.emitFile({
+        type: "asset",
+        fileName: ".well-known/security.txt",
+        source: securityTxt(origin),
+      });
     },
     // Guide files derive from the finished index.html on disk, not from the
     // bundle: HTML transforms run after bundle generation, so this is the
@@ -369,7 +435,7 @@ const apiProxy = {
   "/community": api,
 };
 
-// Mirror the Caddyfile's trailing-slash fold for the six guide slugs so `vite preview`
+// Mirror the Caddyfile's trailing-slash fold for the guide slugs so `vite preview`
 // (the funnel suite, and anyone previewing a production build) does not serve the homepage
 // snapshot at `/<slug>/`. Keep the slug list sourced from `guidePages`, same as the files
 // the build emits.
