@@ -129,7 +129,7 @@ pub fn expiry_warning(name: &str, expires_at: &str, days_left: i64) -> Option<St
 /// One request against a current server, whose snapshot carries the grant. An older server's
 /// snapshot does not, so the grant is fetched separately there.
 pub fn fetch_entries(server: &str, token: &MachineToken) -> Result<MachineFetch> {
-    let http = reqwest::blocking::Client::builder()
+    let http = super::http::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| Error::Network(e.to_string()))?;
