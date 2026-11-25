@@ -204,6 +204,30 @@
   line-height: var(--leading-normal);
 }
 
+/* ---- FAQ: quiet hairline disclosure rows, matching guide pages ------------ */
+
+.landing details {
+  border-top: var(--border-hairline);
+  padding: var(--space-3) 0;
+  max-width: var(--measure);
+}
+
+.landing details:last-of-type {
+  border-bottom: var(--border-hairline);
+}
+
+.landing summary {
+  cursor: pointer;
+  font-weight: var(--weight-semibold);
+  font-size: var(--text-base);
+}
+
+.landing details p {
+  margin: var(--space-2) 0 var(--space-1);
+  color: var(--text-muted);
+  font-size: var(--text-base);
+}
+
 /* ---- Footer ---------------------------------------------------------------- */
 
 .landing footer {

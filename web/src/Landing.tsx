@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 
 import { fetchCommunity, type Community } from "./api";
-import { guidePages } from "./seo/pages";
+import { guidePages, landingFaqs } from "./seo/pages";
+import { inlineHtml } from "./seo/snapshot";
 import "./styles/landing.css";
 
 const REPO = "https://github.com/getsotto/sotto";
@@ -38,9 +39,10 @@ export function Landing({
           Stop Slacking your <code>.env</code> files.
         </h1>
         <p className="lead">
-          Sotto syncs secrets across your team with end-to-end encryption. Values are encrypted on
-          your machine before they leave it and decrypted only on your teammates&rsquo; machines.
-          The server stores ciphertext it cannot read.
+          Sotto is an <a href="/open-source-secret-manager">open-source, zero-knowledge secret
+          manager</a> for developer teams. Encrypt <code>.env</code> files and secrets on your
+          machine before they leave it, sync ciphertext across devices, and decrypt only on your
+          teammates&rsquo; machines. The server never sees plaintext.
         </p>
         <div className="install">
           <code>{INSTALL_CMD}</code>
@@ -76,15 +78,18 @@ export function Landing({
             stealing.
           </li>
           <li>
-            <strong>Decrypt on your devices.</strong> One Rust crypto core runs everywhere: the CLI
-            natively, the browser through WebAssembly, with golden vectors in CI proving both
-            produce identical bytes.
+            <strong>Decrypt on your devices.</strong> One Rust crypto core runs everywhere: the{" "}
+            <a href="/cli-secret-manager">CLI secret manager</a> natively, the browser through
+            WebAssembly, with golden vectors in CI proving both produce identical bytes.
           </li>
         </ol>
         <p>
           Teams work the same way: sharing an environment grants its key to a member (an X25519
           sealed box), so access is cryptographic, not a permission bit on the server. Removing a
-          member rotates the keys.
+          member rotates the keys. Use Sotto as an encrypted{" "}
+          <a href="/dotenv-alternative">dotenv alternative</a> locally, inject{" "}
+          <a href="/ci-cd-secret-manager">CI/CD secrets</a> with expiring machine tokens, or send{" "}
+          <a href="/one-time-secret-links">one-time secret links</a> that burn after reading.
         </p>
       </section>
 
@@ -142,6 +147,16 @@ sotto share DATABASE_URL     # one-time link for a single secret`}</code>
           requirement. The web vault at this address decrypts in your browser, with keys that
           never leave your devices.
         </p>
+      </section>
+
+      <section id="faq">
+        <h2>Frequently asked questions</h2>
+        {landingFaqs.map((faq, index) => (
+          <details key={faq.q} open={index === 0}>
+            <summary>{faq.q}</summary>
+            <p dangerouslySetInnerHTML={{ __html: inlineHtml(faq.a) }} />
+          </details>
+        ))}
       </section>
 
       <footer>

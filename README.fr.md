@@ -12,7 +12,7 @@
 
 # Sotto
 
-La synchronisation de secrets chiffrés de bout en bout pour les équipes de développement. Arrêtez d'envoyer votre `.env` sur Slack.
+Gestionnaire de secrets open source à connaissance nulle et synchronisation chiffrée de bout en bout pour les équipes de développement. Arrêtez d'envoyer votre `.env` sur Slack.
 
 > [!WARNING]
 > Sotto est pré-1.0 et n'a **pas** fait l'objet d'un audit cryptographique par un tiers. Il fonctionne de bout en bout, mais
@@ -76,6 +76,8 @@ commande décrite ici n'existe donc peut-être pas encore dans la version que vo
 
 Consultez [COMPATIBILITY.md](COMPATIBILITY.md) pour connaître les versions requises par les
 intégrations, les plateformes annoncées et les tests actuellement disponibles.
+
+Pour choisir une version ou un dossier d'installation, consultez les [options et exemples de l'installateur (en anglais)](INSTALLING.md).
 
 ### Homebrew (aperçu)
 
@@ -302,6 +304,34 @@ le premier environnement) ou `>` (seulement dans le second). Sans `--confirm`, l
 simulation. Une copie confirmée ajoute et met à jour les secrets, mais laisse intactes les clés
 présentes uniquement dans la destination.
 
+Pour les scripts, utilisez JSON plutôt que le marqueur d'environnement actif :
+
+```sh
+sotto env ls --json
+```
+
+Exemple de sortie pour un projet avec deux environnements locaux :
+
+```json
+[{"active":true,"name":"dev"},{"active":false,"name":"staging"}]
+```
+
+Chaque objet contient un nom d'environnement `name` et un indicateur `active`. Une liste vide est `[]`.
+Pour sélectionner staging pour cette commande seulement :
+
+```sh
+sotto --env staging env ls --json
+```
+
+Ici, `active` marque staging au lieu de dev. Cela n'enregistre pas de nouveau choix par défaut ;
+utilisez `sotto env use` pour cela, comme expliqué ci-dessus. Si le nom sélectionné ne figure
+pas dans la liste locale, tous les indicateurs sont faux. L'indicateur compare les noms ;
+il ne prouve ni l'accès à un environnement ni la réussite du déchiffrement.
+
+Cette commande lit les métadonnées locales des environnements du projet configuré sans déverrouiller
+le coffre ni contacter le serveur. Contrairement à `sotto ls --json`, elle liste les environnements,
+pas les noms des secrets. La sortie standard contient JSON ; les diagnostics vont sur la sortie d'erreur standard.
+
 ### Configuration du projet
 
 `sotto init` et `sotto clone` écrivent un `sotto.toml` dans le répertoire courant. Il associe ce
@@ -351,6 +381,43 @@ contient le `config.toml` global, avec des réglages propres à la machine comme
 par `sotto login` et votre thème, ainsi que le `store.db` chiffré qui contient votre coffre. Aucun des
 deux n'a sa place dans un dépôt. Voir [Variables d'environnement](#variables-denvironnement) pour
 `SOTTO_DATA_DIR`, et [Thèmes de sortie](#thèmes-de-sortie) pour l'emplacement par défaut de chaque plateforme.
+
+### Lister les noms des secrets
+
+Depuis un projet configuré avec une identité locale déverrouillée, listez les noms
+des secrets de l'environnement sélectionné :
+
+```sh
+sotto ls
+```
+
+Exemple avec deux noms fictifs, triés avec un nom par ligne :
+
+```text
+API_URL
+REGION
+```
+
+Pour les scripts, utilisez JSON. Pour choisir un autre environnement pour cette commande seulement :
+
+```sh
+sotto ls --json
+sotto --env staging ls --json
+```
+
+Exemple de sortie JSON pour les mêmes noms :
+
+```json
+["API_URL","REGION"]
+```
+
+Un environnement vide n'affiche aucune ligne de noms, ou affiche `[]` en JSON. Les secrets
+supprimés sont exclus. Seuls les noms sont affichés, sans valeurs ni numéros de version.
+`sotto env ls` liste les environnements ; `sotto export` inclut les valeurs en clair.
+
+La liste est lue dans le stockage local. Elle ne contacte pas le serveur et ne récupère
+pas les changements récents. Consultez [la synchronisation d'un autre appareil](#un-autre-appareil)
+pour mettre à jour la copie locale.
 
 ### Importer un fichier dotenv
 
@@ -684,11 +751,35 @@ doivent toutes être reliées à des terminaux. Si l'une manque, si la CI est ac
 avec le code 2. Utilisez `sotto --help` pour demander l'aide explicitement.
 
 Utilisez les flèches ou `j` et `k` pour naviguer. Appuyez sur `/` pour rechercher, `?` pour afficher
-l'aide et Tab pour changer d'environnement. Ce changement ne dure que pendant la session du
+l'aide, Tab pour passer à l'environnement suivant et Shift+Tab pour revenir au précédent. Ce changement ne dure que pendant la session du
 tableau de bord ; `sotto env use` modifie l'environnement par défaut du projet. Appuyez sur `r`
-pour afficher ou masquer la valeur sélectionnée, `c` pour la copier dans le presse-papiers et `q`
-pour quitter. `Esc` ferme la recherche ou la boîte de dialogue en cours ; dans la vue principale,
-il efface une recherche active ou quitte.
+pour afficher ou masquer la valeur sélectionnée, `R` pour recharger les secrets locaux de
+l'environnement actuel, `c` pour la copier dans le presse-papiers et `q` pour quitter. `Esc` ferme
+la recherche ou la boîte de dialogue en cours ; dans la vue principale, il efface une recherche
+active ou quitte.
+
+Appuyez sur `h` pour [consulter et restaurer l'historique local d'un secret](LOCAL-HISTORY.md) (guide en anglais).
+
+Pour créer un secret depuis la navigation normale du tableau de bord (pas pendant une recherche
+ou la saisie dans un champ) :
+
+1. Appuyez sur `n` pour ouvrir New Secret.
+2. Saisissez un nom fictif comme `DEMO_API_KEY`, puis appuyez sur Tab pour passer à la valeur.
+3. Saisissez une valeur de test comme `demo-only`, ou appuyez sur `Ctrl+G` pour en générer une.
+4. Appuyez sur `Enter` pour enregistrer.
+
+En mode New, Tab et Shift+Tab passent entre le nom et la valeur. Sélectionnez un secret
+existant et appuyez sur `e` pour modifier sa valeur ; Edit ne change pas son nom.
+New refuse un nom existant et laisse le dialogue ouvert ; utilisez Edit pour le mettre à jour.
+
+Les valeurs sont masquées au départ. `Ctrl+R` affiche ou masque la valeur du brouillon.
+`Ctrl+G` la remplace par une chaîne générée de 32 caractères, sans l'enregistrer. `Enter`
+enregistre le dialogue même depuis le champ du nom ; `Esc` abandonne le brouillon et ferme le dialogue.
+Cet éditeur de texte ne peut pas modifier les valeurs non UTF-8 ; consultez [les secrets issus de fichiers](README.md#file-backed-secrets).
+
+L'enregistrement ne change que l'environnement local sélectionné. Il ne synchronise pas avec le serveur.
+Pour synchroniser ensuite, suivez [le guide de push](README.md#quick-start) et indiquez le même
+environnement explicitement si vous avez changé d'environnement dans le tableau de bord.
 
 Appuyez sur `t` pour parcourir les thèmes avec un aperçu en direct. Utilisez les flèches pour
 prévisualiser chaque thème, puis appuyez sur `Enter` pour enregistrer votre choix ou sur `Esc` pour
