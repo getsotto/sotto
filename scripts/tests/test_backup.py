@@ -52,7 +52,7 @@ OWN_LINE = re.compile(r"backup (started|ok|FAILED)|retention journal ok|error: "
 
 class Backup(unittest.TestCase):
     def run_script(self, bucket="gs://sotto-backups-test", tools=("docker", "gsutil"), env_file=None,
-                   env_mode=0o600, **environ):
+                   env_mode=0o600, extra_system=(), **environ):
         work = Path(self.enterContext(tempfile.TemporaryDirectory()))
         script = SCRIPT
         if env_file is not None:
@@ -71,7 +71,7 @@ class Backup(unittest.TestCase):
             (bin_dir / name).chmod(0o755)
         # Only what the script needs from the system, so a tool left out is genuinely absent.
         for name in ("sh", "dirname", "sed", "date", "mktemp", "rm", "mkdir", "wc", "tr", "cat",
-                     "python3", "sleep", "id"):
+                     "python3", "sleep", "id", *extra_system):
             found = shutil.which(name)
             if found:
                 (bin_dir / name).symlink_to(found)
@@ -96,6 +96,11 @@ class Backup(unittest.TestCase):
         for line in ours:
             self.assertRegex(line, TIMESTAMP)
 
+    def assert_only_marker(self, uploads, step):
+        """Nothing but the failure marker reached the bucket, and it names this step."""
+        self.assertEqual(len(uploads), 1, uploads)
+        self.assertRegex(uploads[0], r"^gs://sotto-backups-test/sotto-\d{8}T\d{6}Z\.failed\." + step + "$")
+
     def test_success_uploads_both_objects_and_says_so(self):
         result, uploads = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -112,7 +117,7 @@ class Backup(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("backup ok", result.stdout)
         self.assertIn("backup FAILED while uploading the dump", result.stderr)
-        self.assertEqual(uploads, [])
+        self.assert_only_marker(uploads, "uploading-the-dump")
         self.assert_timestamped(result.stderr)
 
     def test_failed_journal_upload_is_a_failure(self):
@@ -121,11 +126,11 @@ class Backup(unittest.TestCase):
         self.assertNotIn("backup ok", result.stdout)
         self.assertIn("backup FAILED while uploading the retention journal", result.stderr)
 
-    def test_failed_dump_names_the_step_and_uploads_nothing(self):
+    def test_failed_dump_names_the_step_and_uploads_only_the_marker(self):
         result, uploads = self.run_script(STUB_DUMP_FAILS="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("backup FAILED while dumping the database", result.stderr)
-        self.assertEqual(uploads, [])
+        self.assert_only_marker(uploads, "dumping-the-database")
 
     def test_transient_upload_failure_is_retried_not_failed(self):
         # One missed night breaches the freshness threshold, so a single blip must not fail
@@ -152,7 +157,7 @@ class Backup(unittest.TestCase):
         self.assertEqual(result.returncode, 127)
         self.assertIn("docker compose", result.stderr)
         self.assertIn("backup FAILED while checking tools", result.stderr)
-        self.assertEqual(uploads, [])
+        self.assert_only_marker(uploads, "checking-tools")
 
     def test_missing_upload_tool_fails_before_the_dump_and_names_cron_path(self):
         result, uploads = self.run_script(tools=("docker",))
@@ -203,11 +208,61 @@ class Backup(unittest.TestCase):
         self.assertEqual(len(uploads), 2)
         self.assertTrue(all(u.startswith("gs://sotto-backups-test/") for u in uploads))
 
+    def test_start_line_names_the_script_version(self):
+        # The stubbed PATH has no git, as on a deployment that is not a checkout: that must log
+        # `unknown` rather than fail the run.
+        result, uploads = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("backup started (script unknown)", result.stdout)
+        if shutil.which("git") is None:
+            self.skipTest("no git to read the checkout with")
+        result, _ = self.run_script(extra_system=("git",))
+        head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.assertIn(f"backup started (script {head})", result.stdout)
+
+    def test_failure_marker_names_the_step_without_its_destination(self):
+        # The journal upload's step reads "uploading the retention journal to gs://...". Only the
+        # words before the destination reach the name, so a bucket path never ends up in it.
+        result, uploads = self.run_script(STUB_UPLOAD_FAILS=".tombstones.jsonl")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(uploads), 2, uploads)
+        self.assertTrue(uploads[0].endswith(".dump"))
+        self.assertRegex(uploads[1], r"/sotto-\d{8}T\d{6}Z\.failed\.uploading-the-retention-journal$")
+        self.assertIn("recorded the failure in the bucket", result.stderr)
+
+    def test_marker_and_dump_share_the_run_stamp(self):
+        result, uploads = self.run_script(STUB_UPLOAD_FAILS=".tombstones.jsonl")
+        stamps = {re.search(r"sotto-(\d{8}T\d{6}Z)\.", u).group(1) for u in uploads}
+        self.assertEqual(len(stamps), 1, uploads)
+
+    def test_unreachable_bucket_still_fails_with_the_original_status(self):
+        # When the uploader is what is broken, the marker cannot be written either. That must be
+        # said, and must not replace the run's own exit status or failure line.
+        result, uploads = self.run_script(STUB_UPLOAD_FAILS="gs://")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(uploads, [])
+        self.assertIn("backup FAILED while uploading the dump", result.stderr)
+        self.assertIn("could not record the failure in the bucket either", result.stderr)
+
+    def test_success_leaves_no_marker(self):
+        result, uploads = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse([u for u in uploads if ".failed." in u])
+
+    def test_no_marker_without_a_destination(self):
+        result, uploads = self.run_script(bucket="")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(uploads, [])
+        self.assertNotIn("recorded the failure", result.stderr)
+
     def test_no_dump_is_left_behind(self):
-        before = set(Path("/tmp").glob("sotto-pgdump.*"))
+        def leftovers():
+            return {*Path("/tmp").glob("sotto-pgdump.*"), *Path("/tmp").glob("sotto-backup-failed.*")}
+        before = leftovers()
         for environ in ({}, {"STUB_UPLOAD_FAILS": ".dump"}, {"STUB_DUMP_FAILS": "1"}):
             self.run_script(**environ)
-        self.assertEqual(set(Path("/tmp").glob("sotto-pgdump.*")), before)
+        self.assertEqual(leftovers(), before)
 
 
 if __name__ == "__main__":

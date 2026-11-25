@@ -12,7 +12,7 @@
 
 # Sotto
 
-La synchronisation de secrets chiffrés de bout en bout pour les équipes de développement. Arrêtez d'envoyer votre `.env` sur Slack.
+Gestionnaire de secrets open source à connaissance nulle et synchronisation chiffrée de bout en bout pour les équipes de développement. Arrêtez d'envoyer votre `.env` sur Slack.
 
 > [!WARNING]
 > Sotto est pré-1.0 et n'a **pas** fait l'objet d'un audit cryptographique par un tiers. Il fonctionne de bout en bout, mais
@@ -76,6 +76,8 @@ commande décrite ici n'existe donc peut-être pas encore dans la version que vo
 
 Consultez [COMPATIBILITY.md](COMPATIBILITY.md) pour connaître les versions requises par les
 intégrations, les plateformes annoncées et les tests actuellement disponibles.
+
+Pour choisir une version ou un dossier d'installation, consultez les [options et exemples de l'installateur (en anglais)](INSTALLING.md).
 
 ### Homebrew (aperçu)
 
@@ -192,6 +194,25 @@ en clair ; il nécessite donc `--reveal` dans un terminal, comme `sotto get`, et
 aussi `shell` et `json`. L'effacement du presse-papiers est une mesure de meilleur effort : remplacer
 son contenu protège la nouvelle valeur, mais les gestionnaires de presse-papiers, la suspension ou
 l'arrêt du processus auxiliaire peuvent conserver une copie.
+
+`sotto run` lance la commande avec votre environnement actuel plus les secrets de l'environnement
+sélectionné. Un secret remplace une variable héritée du même nom, et les variables sans rapport sont
+conservées. Dans ce cas, Sotto écrit `warning: overriding inherited environment variable NAME` sur
+stderr, jamais la valeur. Seuls la commande et ses descendants voient les secrets ; l'environnement
+de votre shell n'est pas modifié ensuite. Pour utiliser un autre environnement, placez `--env` avant
+`--` (voir [Environnements](#environnements) ; [Importer un fichier dotenv](#importer-un-fichier-dotenv)
+explique comment en remplir un).
+
+Sotto exécute le programme directement : il ne développe pas les variables et n'interprète ni les
+tubes ni les redirections dans ses arguments. Votre propre shell traite toujours sa syntaxe avant le
+démarrage de Sotto : `sotto run -- echo "$EXAMPLE"` affiche la valeur de `EXAMPLE` dans le shell
+parent, pas celle injectée. Pour développer une variable dans le processus enfant, lancez un shell
+comme commande et mettez le script entre apostrophes (shells POSIX). Dans cet exemple fictif,
+supposez que `EXAMPLE` est enregistré dans Sotto avec la valeur `demo-only` :
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
 
 Jusqu'ici, tout reste sur votre machine. Pour synchroniser un autre appareil, travailler en équipe
 ou utiliser la CI, connectez-vous à un serveur :
@@ -702,11 +723,14 @@ doivent toutes être reliées à des terminaux. Si l'une manque, si la CI est ac
 avec le code 2. Utilisez `sotto --help` pour demander l'aide explicitement.
 
 Utilisez les flèches ou `j` et `k` pour naviguer. Appuyez sur `/` pour rechercher, `?` pour afficher
-l'aide et Tab pour changer d'environnement. Ce changement ne dure que pendant la session du
+l'aide, Tab pour passer à l'environnement suivant et Shift+Tab pour revenir au précédent. Ce changement ne dure que pendant la session du
 tableau de bord ; `sotto env use` modifie l'environnement par défaut du projet. Appuyez sur `r`
-pour afficher ou masquer la valeur sélectionnée, `c` pour la copier dans le presse-papiers et `q`
-pour quitter. `Esc` ferme la recherche ou la boîte de dialogue en cours ; dans la vue principale,
-il efface une recherche active ou quitte.
+pour afficher ou masquer la valeur sélectionnée, `R` pour recharger les secrets locaux de
+l'environnement actuel, `c` pour la copier dans le presse-papiers et `q` pour quitter. `Esc` ferme
+la recherche ou la boîte de dialogue en cours ; dans la vue principale, il efface une recherche
+active ou quitte.
+
+Appuyez sur `h` pour [consulter et restaurer l'historique local d'un secret](LOCAL-HISTORY.md) (guide en anglais).
 
 Appuyez sur `t` pour parcourir les thèmes avec un aperçu en direct. Utilisez les flèches pour
 prévisualiser chaque thème, puis appuyez sur `Enter` pour enregistrer votre choix ou sur `Esc` pour
@@ -824,6 +848,8 @@ Le format JSON est pratique pour les scripts. Sa structure de premier niveau est
 ```
 
 L'exemple est synthétique ; `actions` et les dates facultatives proviennent de l'état renvoyé du compte, et les serveurs anciens peuvent renvoyer null pour l'un ou l'autre endpoint. `sotto cloud status` ne fait que signaler l'état et peut afficher une URL de facturation. Il ne lance pas d'achat et ne modifie pas l'éligibilité. Pour diagnostiquer le coffre local et les environnements, utilisez `sotto status` ; cette vue est distincte des informations du serveur et du compte ci-dessus.
+
+Pour ajouter ou supprimer une adresse pour les notifications Cloud, consultez le [guide des contacts par e-mail (en anglais)](CLOUD-EMAIL.md).
 
 Pour transférer la facturation personnelle à une organisation depuis la page de compte Sotto Cloud,
 consultez le [guide du transfert de facturation](CLOUD-BILLING-TRANSFER.md).

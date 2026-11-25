@@ -10,7 +10,7 @@
 
 # Sotto
 
-End-to-end encrypted secret sync for developer teams. Stop Slacking your `.env`.
+Open-source, zero-knowledge secret manager and end-to-end encrypted secret sync for developer teams. Stop Slacking your `.env`.
 
 > [!WARNING]
 > Sotto is pre-1.0 and has **not** had a third-party cryptographic audit. It works end to end, but
@@ -74,6 +74,8 @@ version supports.
 
 See [COMPATIBILITY.md](COMPATIBILITY.md) for integration version requirements, platform claims,
 and the evidence currently available for them.
+
+To choose a release or install folder, see [installer options and examples](INSTALLING.md).
 
 ### Homebrew (preview)
 
@@ -186,6 +188,23 @@ sotto export --format dotenv --reveal   # print a .env; refuses a terminal witho
 plaintext, so it needs `--reveal` on a terminal, just like `sotto get`; `--format` also takes
 `shell` and `json`. Clipboard clearing is best-effort: replacing the clipboard protects the newer
 content, while clipboard managers, suspension, or a terminated helper may retain a history copy.
+
+`sotto run` starts the command with your current environment plus the selected environment's
+secrets. A secret replaces an inherited variable of the same name, and unrelated variables are kept.
+When that happens Sotto writes `warning: overriding inherited environment variable NAME` to stderr,
+never the value. Only the command and its descendants see the secrets; your shell's environment is
+unchanged afterwards. To use another environment, put `--env` before the `--` (see
+[Environments](#environments); [Import a dotenv file](#import-a-dotenv-file) covers filling one).
+
+Sotto runs the program directly, so it does not expand variables or interpret pipes and redirects in
+its arguments. Your own shell still processes its syntax before Sotto starts: `sotto run -- echo "$EXAMPLE"`
+prints the parent shell's value of `EXAMPLE`, not the injected one. To expand a variable inside the
+child, run a shell as the command and quote the script with single quotes (POSIX shells). In this
+synthetic example, suppose `EXAMPLE` is stored in Sotto with the value `demo-only`:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
 
 Everything so far stays on your machine. To sync another device, work with a team or run CI, log
 in to a server:
@@ -672,11 +691,12 @@ If one is missing, CI is active, or `TERM=dumb`, a bare invocation writes help t
 with code 2.
 Use `sotto --help` to request help explicitly.
 
-Use the arrow keys or `j` and `k` to navigate. Press `/` to search, `?` for help, and Tab to switch
-environments. This switch lasts only for the dashboard session; `sotto env use` changes the
-project's default. Press `r` to reveal or conceal the selected value, `c` to copy it to the
-clipboard, and `q` to quit. `Esc` closes the current search or dialog; from the main view, it
-clears an active search or quits.
+Use the arrow keys or `j` and `k` to navigate. Press `/` to search, `?` for help, Tab to switch to the next environment and Shift+Tab to switch to the previous one. This switch lasts only for the dashboard session; `sotto env use` changes the
+project's default. Press `r` to reveal or conceal the selected value, `R` to reload the current
+environment's local secrets, `c` to copy it to the clipboard, and `q` to quit. `Esc` closes the
+current search or dialog; from the main view, it clears an active search or quits.
+
+Press `h` to [browse and restore local secret history](LOCAL-HISTORY.md) (English guide).
 
 Press `t` to browse themes with a live preview. Use the arrow keys to preview each theme, then
 press `Enter` to save your choice or `Esc` to cancel. The [theme precedence rules](#output-themes)
@@ -790,6 +810,8 @@ The JSON form is useful for scripts. Its top-level shape is:
 
 The example is synthetic; `actions` and the optional dates come from the returned account state, and older servers can return null for either endpoint. `sotto cloud status` only reports status and may print a billing URL. It does not start a purchase or change eligibility. For local vault and environment diagnostics, use `sotto status`; that view is separate from the server and account information above.
 
+To add or remove an email contact for Cloud notices, see the [email contact guide](CLOUD-EMAIL.md).
+
 To move personal billing to an organisation from the Sotto Cloud account page, see the
 [billing transfer guide](CLOUD-BILLING-TRANSFER.md).
 
@@ -819,6 +841,8 @@ Custom themes are TOML files in the `themes` directory inside your platform data
 directory). Each `*.toml` file needs the tokens below and takes its name from a `name` field,
 or from the filename when the field is absent; a file that fails to parse is skipped. Colours
 accept hex values, ANSI colour names, `ansi(<index>)` indices, and `default`.
+Both the theme list and the dashboard picker show the built-in presets first, followed
+by custom themes sorted by their displayed names, ignoring case.
 
 ```toml
 bg = "#120024"
