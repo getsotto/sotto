@@ -1,8 +1,13 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Landing } from "../Landing";
+
+const INSTALL_CMD =
+  "curl -fsSL https://raw.githubusercontent.com/getsotto/sotto/main/install.sh | sh";
+const POWERSHELL_INSTALL_CMD =
+  "irm https://raw.githubusercontent.com/getsotto/sotto/main/install.ps1 | iex";
 
 afterEach(() => {
   cleanup();
@@ -21,15 +26,15 @@ async function renderLanding(fetchStub: ReturnType<typeof vi.fn>) {
   return view;
 }
 
-function expectLandingStillUsable(container: HTMLElement) {
+function expectLandingStillUsable() {
   expect(screen.getByRole("link", { name: "Star on GitHub" })).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Good first issues" })).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Contributing" })).toBeInTheDocument();
-  // Two install blocks now exist (curl + PowerShell); scope to the primary one.
-  const installBlock = container.querySelector(".install");
-  expect(installBlock).not.toBeNull();
   expect(
-    within(installBlock as HTMLElement).getByRole("button", { name: "Copy" }),
+    screen.getByRole("button", { name: "Copy macOS/Linux install command" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("button", { name: "Copy Windows PowerShell install command" }),
   ).toBeInTheDocument();
 }
 
@@ -63,7 +68,7 @@ describe("Landing community statistics", () => {
     expect(container.querySelector(".community-stats")).toHaveTextContent(
       "12 stars · 3 forks · 4 contributors",
     );
-    expectLandingStillUsable(container);
+    expectLandingStillUsable();
   });
 
   it("omits the statistics when the request is rejected", async () => {
@@ -73,7 +78,7 @@ describe("Landing community statistics", () => {
 
     expect(fetchStub).toHaveBeenCalledTimes(1);
     expectNoStatsAndNoFallbackNoise(container);
-    expectLandingStillUsable(container);
+    expectLandingStillUsable();
   });
 
   it("omits the statistics on an HTTP 503", async () => {
@@ -83,7 +88,7 @@ describe("Landing community statistics", () => {
 
     expect(fetchStub).toHaveBeenCalledTimes(1);
     expectNoStatsAndNoFallbackNoise(container);
-    expectLandingStillUsable(container);
+    expectLandingStillUsable();
   });
 
   it("omits the statistics when the response body is not valid JSON", async () => {
@@ -95,6 +100,35 @@ describe("Landing community statistics", () => {
 
     expect(fetchStub).toHaveBeenCalledTimes(1);
     expectNoStatsAndNoFallbackNoise(container);
-    expectLandingStillUsable(container);
+    expectLandingStillUsable();
+  });
+});
+
+describe("Landing install copy buttons", () => {
+  it("copies each install command from a distinctly named button", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const fetchStub = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+
+    await renderLanding(fetchStub);
+
+    const unix = screen.getByRole("button", { name: "Copy macOS/Linux install command" });
+    const windows = screen.getByRole("button", {
+      name: "Copy Windows PowerShell install command",
+    });
+
+    fireEvent.click(unix);
+    expect(await screen.findByRole("button", { name: "Copied macOS/Linux install command" })).toBeInTheDocument();
+    expect(writeText).toHaveBeenCalledExactlyOnceWith(INSTALL_CMD);
+
+    fireEvent.click(windows);
+    expect(
+      await screen.findByRole("button", { name: "Copied Windows PowerShell install command" }),
+    ).toBeInTheDocument();
+    expect(writeText).toHaveBeenNthCalledWith(2, POWERSHELL_INSTALL_CMD);
+    expect(writeText).toHaveBeenCalledTimes(2);
   });
 });

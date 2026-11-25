@@ -46,12 +46,18 @@ export function Landing({
         </p>
         <div className="install">
           <code>{INSTALL_CMD}</code>
-          <CopyButton text={INSTALL_CMD} />
+          <CopyButton
+            text={INSTALL_CMD}
+            label="Copy macOS/Linux install command"
+          />
         </div>
         <p className="muted">On Windows, run this in PowerShell:</p>
         <div className="install">
           <code>{POWERSHELL_INSTALL_CMD}</code>
-          <CopyButton text={POWERSHELL_INSTALL_CMD} />
+          <CopyButton
+            text={POWERSHELL_INSTALL_CMD}
+            label="Copy Windows PowerShell install command"
+          />
         </div>
         <p className="muted">
           Prebuilt, signed binaries are available for macOS, Linux, and Windows x86_64. The
@@ -310,8 +316,9 @@ function communitySummary(stats: Community | null): string | null {
   return parts.length > 0 ? parts.join(" · ") : null;
 }
 
-function CopyButton({ text }: { text: string }) {
+function CopyButton({ text, label }: { text: string; label: string }) {
   const [copied, setCopied] = useState(false);
+  const accessibleName = copied ? label.replace(/^Copy /, "Copied ") : label;
 
   useEffect(() => {
     if (!copied) {
@@ -324,6 +331,7 @@ function CopyButton({ text }: { text: string }) {
   return (
     <button
       className="sm"
+      aria-label={accessibleName}
       aria-live="polite"
       onClick={() => {
         void navigator.clipboard.writeText(text).then(() => setCopied(true));
