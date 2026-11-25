@@ -754,6 +754,28 @@ ein Dialogfenster; in der Hauptansicht löscht es eine aktive Suche oder beendet
 
 Drücke `h`, um den [lokalen Verlauf eines Secrets anzusehen und wiederherzustellen](LOCAL-HISTORY.md) (Anleitung auf Englisch).
 
+So erstellst du ein Secret in der normalen Dashboard-Navigation (nicht während einer Suche
+oder beim Bearbeiten eines Felds):
+
+1. Drücke `n`, um New Secret zu öffnen.
+2. Gib einen erfundenen Namen wie `DEMO_API_KEY` ein und wechsle mit Tab zum Wert.
+3. Gib einen Testwert wie `demo-only` ein oder drücke `Ctrl+G`, um einen Ersatz zu erzeugen.
+4. Drücke `Enter` zum Speichern.
+
+Im Modus New wechseln Tab und Shift+Tab zwischen Name und Wert. Wähle ein vorhandenes
+Secret und drücke `e`, um seinen Wert zu bearbeiten; Edit benennt es nicht um.
+New lehnt vorhandene Namen ab und lässt den Dialog offen. Nutze Edit zum Aktualisieren.
+
+Werte sind anfangs verdeckt. `Ctrl+R` zeigt oder verbirgt den Entwurfswert. `Ctrl+G`
+ersetzt ihn durch eine erzeugte Zeichenfolge mit 32 Zeichen, speichert sie aber nicht.
+`Enter` speichert den Dialog auch vom Namensfeld aus; `Esc` verwirft den ungespeicherten
+Entwurf und schließt den Dialog. Dieser Texteditor kann Nicht-UTF-8-Werte nicht bearbeiten;
+siehe [dateibasierte Secrets](README.md#file-backed-secrets).
+
+Speichern ändert nur die ausgewählte lokale Umgebung, ohne mit dem Server zu synchronisieren.
+Folge für eine spätere Synchronisation der [Push-Anleitung](README.md#quick-start) und gib
+dieselbe Umgebung ausdrücklich an, wenn du sie im Dashboard gewechselt hast.
+
 Drücke `t`, um Themes mit einer Live-Vorschau durchzugehen. Mit den Pfeiltasten siehst du jedes
 Theme. Drücke `Enter`, um deine Wahl zu speichern, oder `Esc`, um abzubrechen. Die
 [Vorrangregeln für Themes](#ausgabe-themes) erklären, wie Befehlsoptionen und Umgebungsvariablen

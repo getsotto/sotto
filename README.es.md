@@ -744,6 +744,27 @@ borra una búsqueda activa o sale.
 
 Pulsa `h` para [ver y restaurar el historial local de un secreto](LOCAL-HISTORY.md) (guía en inglés).
 
+Para crear un secreto desde la navegación normal del panel (no mientras escribes una búsqueda
+o editas un campo):
+
+1. Pulsa `n` para abrir New Secret.
+2. Escribe un nombre ficticio como `DEMO_API_KEY` y pulsa Tab para pasar al valor.
+3. Escribe un valor de prueba como `demo-only`, o pulsa `Ctrl+G` para generar uno nuevo.
+4. Pulsa `Enter` para guardar.
+
+En el modo New, Tab y Shift+Tab cambian entre los campos de nombre y valor. Selecciona un
+secreto existente y pulsa `e` para editar su valor; Edit no cambia el nombre.
+New rechaza un nombre existente y deja el diálogo abierto; usa Edit para actualizarlo.
+
+Los valores empiezan ocultos. `Ctrl+R` muestra u oculta el borrador del valor. `Ctrl+G`
+lo reemplaza por una cadena generada de 32 caracteres, pero no la guarda. `Enter` guarda
+el diálogo incluso desde el campo del nombre; `Esc` descarta el borrador sin guardar y lo cierra.
+Este editor de texto no admite valores que no sean UTF-8; consulta [los secretos a partir de archivos](README.md#file-backed-secrets).
+
+Guardar solo cambia el entorno local seleccionado. No sincroniza con el servidor.
+Para sincronizar después, sigue [la guía de push](README.md#quick-start) e indica el mismo
+entorno explícitamente si cambiaste de entorno en el panel.
+
 Pulsa `t` para recorrer los temas con vista previa en directo. Usa las flechas para ver cada tema
 y pulsa `Enter` para guardar tu elección o `Esc` para cancelar. Las
 [reglas de precedencia de los temas](#temas-de-salida) explican cómo los ajustes del comando y del
