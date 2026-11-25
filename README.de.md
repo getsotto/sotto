@@ -12,7 +12,7 @@
 
 # Sotto
 
-Ende-zu-Ende-verschlüsselte Secret-Synchronisierung für Entwicklerteams. Schluss mit `.env` per Slack.
+Open-Source-Zero-Knowledge-Secret-Manager und Ende-zu-Ende-verschlüsselte Secret-Synchronisierung für Entwicklerteams. Schluss mit `.env` per Slack.
 
 > [!WARNING]
 > Sotto ist Pre-1.0-Software und hat **kein** kryptografisches Audit durch Dritte durchlaufen. Es funktioniert Ende zu Ende,
@@ -76,6 +76,8 @@ beschriebener Befehl existiert in deiner installierten Version daher möglicherw
 
 In [COMPATIBILITY.md](COMPATIBILITY.md) findest du die Versionsanforderungen der Integrationen,
 die angegebenen Plattformen und die derzeit verfügbaren Testergebnisse.
+
+Für eine bestimmte Version oder einen anderen Installationsordner siehe die [Installationsoptionen und Beispiele (Englisch)](INSTALLING.md).
 
 ### Homebrew (Vorschau)
 
@@ -189,6 +191,25 @@ schreibt Klartext und benötigt daher in einem Terminal `--reveal`, genau wie `s
 akzeptiert außerdem `shell` und `json`. Das Löschen der Zwischenablage erfolgt nach bestem Bemühen:
 Das Ersetzen des Inhalts schützt den neuen Wert, während Zwischenablage-Manager, Ruhezustand oder
 ein beendeter Hilfsprozess eine Kopie behalten können.
+
+`sotto run` startet den Befehl mit deiner aktuellen Umgebung plus den Geheimnissen der gewählten
+Umgebung. Ein Geheimnis ersetzt eine geerbte Variable gleichen Namens, nicht zugehörige Variablen
+bleiben erhalten. In diesem Fall schreibt Sotto `warning: overriding inherited environment variable NAME`
+nach stderr, nie den Wert. Nur der Befehl und seine Nachfahren sehen die Geheimnisse; die Umgebung
+deiner Shell bleibt danach unverändert. Für eine andere Umgebung setze `--env` vor `--` (siehe
+[Umgebungen](#umgebungen); [Eine dotenv-Datei importieren](#eine-dotenv-datei-importieren) zeigt, wie
+man eine füllt).
+
+Sotto führt das Programm direkt aus und expandiert daher weder Variablen noch interpretiert es
+Pipes oder Umleitungen in seinen Argumenten. Deine eigene Shell verarbeitet ihre Syntax weiterhin,
+bevor Sotto startet: `sotto run -- echo "$EXAMPLE"` gibt den Wert von `EXAMPLE` aus der
+übergeordneten Shell aus, nicht den injizierten. Um eine Variable im Kindprozess zu expandieren,
+starte eine Shell als Befehl und setze das Skript in einfache Anführungszeichen (POSIX-Shells). In
+diesem fiktiven Beispiel ist `EXAMPLE` mit dem Wert `demo-only` in Sotto gespeichert:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
 
 Bis hierhin bleibt alles auf deinem Rechner. Um ein weiteres Gerät zu synchronisieren, im Team zu
 arbeiten oder CI zu nutzen, melde dich bei einem Server an:
@@ -355,6 +376,43 @@ globale `config.toml` mit rechnerweiten Einstellungen wie dem von `sotto login` 
 deinem Theme sowie die verschlüsselte `store.db` mit deinem Tresor. Beide gehören nicht in ein
 Repository. Siehe [Umgebungsvariablen](#umgebungsvariablen) für `SOTTO_DATA_DIR` und
 [Ausgabe-Themes](#ausgabe-themes) für den Standardort auf jeder Plattform.
+
+### Secret-Namen auflisten
+
+Liste in einem konfigurierten Projekt mit entsperrter lokaler Identität die
+Secret-Namen der ausgewählten Umgebung auf:
+
+```sh
+sotto ls
+```
+
+Beispiel mit zwei erfundenen Namen, sortiert und mit einem Namen pro Zeile:
+
+```text
+API_URL
+REGION
+```
+
+Nutze für Skripte JSON. So wählst du eine andere Umgebung nur für diesen Befehl:
+
+```sh
+sotto ls --json
+sotto --env staging ls --json
+```
+
+JSON-Beispiel für dieselben Namen:
+
+```json
+["API_URL","REGION"]
+```
+
+Eine leere Umgebung gibt keine Namenszeilen aus, mit JSON dagegen `[]`. Entfernte Secrets
+werden ausgelassen. Die Ausgabe enthält nur Namen, keine Werte oder Versionsnummern.
+`sotto env ls` listet Umgebungen auf; `sotto export` enthält Werte im Klartext.
+
+Die Liste kommt aus dem lokalen Speicher. Der Befehl kontaktiert den Server nicht und
+lädt keine neueren Änderungen herunter. Unter [Ein weiteres Gerät](#ein-weiteres-gerät)
+erfährst du, wie du die lokale Kopie aktualisierst.
 
 ### Eine dotenv-Datei importieren
 
@@ -688,12 +746,13 @@ oder gilt `TERM=dumb`,
 schreibt ein Aufruf ohne Unterbefehl die Hilfe auf die Standardfehlerausgabe und endet mit Code 2.
 Mit `sotto --help` rufst du die Hilfe ausdrücklich auf.
 
-Navigiere mit den Pfeiltasten oder `j` und `k`. Drücke `/` zum Suchen, `?` für die Hilfe und Tab
-zum Wechseln der Umgebung. Der Wechsel gilt nur für die Dashboard-Sitzung; `sotto env use` ändert
+Navigiere mit den Pfeiltasten oder `j` und `k`. Drücke `/` zum Suchen, `?` für die Hilfe, Tab zum Wechsel zur nächsten Umgebung und Shift+Tab zum Wechsel zur vorherigen. Der Wechsel gilt nur für die Dashboard-Sitzung; `sotto env use` ändert
 die Standardumgebung des Projekts. Mit `r` zeigst du den ausgewählten Wert an oder verbirgst ihn,
-mit `c` kopierst du ihn in die Zwischenablage und mit `q` beendest du das Dashboard. `Esc`
-schließt die aktuelle Suche oder ein Dialogfenster; in der Hauptansicht löscht es eine aktive
-Suche oder beendet das Dashboard.
+mit `R` lädst du die lokalen Geheimnisse der aktuellen Umgebung neu, mit `c` kopierst du ihn in
+die Zwischenablage und mit `q` beendest du das Dashboard. `Esc` schließt die aktuelle Suche oder
+ein Dialogfenster; in der Hauptansicht löscht es eine aktive Suche oder beendet das Dashboard.
+
+Drücke `h`, um den [lokalen Verlauf eines Secrets anzusehen und wiederherzustellen](LOCAL-HISTORY.md) (Anleitung auf Englisch).
 
 Drücke `t`, um Themes mit einer Live-Vorschau durchzugehen. Mit den Pfeiltasten siehst du jedes
 Theme. Drücke `Enter`, um deine Wahl zu speichern, oder `Esc`, um abzubrechen. Die
@@ -812,6 +871,8 @@ Das JSON-Format eignet sich für Skripte. Die Struktur auf oberster Ebene sieht 
 ```
 
 Das Beispiel ist synthetisch; `actions` und die optionalen Zeitwerte stammen aus dem zurückgegebenen Kontostatus, und ältere Server können für einen der beiden Endpoints null liefern. `sotto cloud status` meldet nur den Status und kann eine Abrechnungs-URL ausgeben. Der Befehl startet keinen Kauf und ändert die Berechtigung nicht. Für Diagnosen des lokalen Tresors und der Umgebungen verwende `sotto status`; diese Ansicht ist von den Server- und Kontoinformationen oben getrennt.
+
+Zum Hinzufügen oder Entfernen einer E-Mail-Adresse für Cloud-Mitteilungen siehe die [Anleitung für E-Mail-Kontakte (Englisch)](CLOUD-EMAIL.md).
 
 Wie du die persönliche Abrechnung auf der Sotto-Cloud-Kontoseite an eine Organisation übergibst,
 steht in der [Anleitung zur Abrechnungsübertragung](CLOUD-BILLING-TRANSFER.md).

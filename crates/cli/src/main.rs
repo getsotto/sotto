@@ -143,9 +143,37 @@ enum Command {
         #[arg(long)]
         no_copy: bool,
     },
-    /// Upload local changes for the active environment to the server.
+    /// Reconcile with the server, then upload remaining local changes.
+    #[command(after_help = r#"Examples:
+  sotto push
+  sotto push --env staging
+
+Syncs one environment in the current project, not every project or environment.
+Without --env, uses the saved default. --env changes only this invocation.
+
+Requires an existing local project and environment, a server login, and an
+unlocked local vault. Sotto prompts to unlock it when needed. Start with
+sotto init for a new project, or sotto setup / sotto clone on another device;
+login alone does not recreate the project.
+
+Push first applies a fresh server snapshot locally, then uploads the remaining
+changes. It can update local state before uploading."#)]
     Push,
     /// Download the active environment's secrets from the server into the local store.
+    #[command(after_help = r#"Examples:
+  sotto pull
+  sotto pull --env staging
+
+Syncs one environment in the current project, not every project or environment.
+Without --env, uses the saved default. --env changes only this invocation.
+
+Requires an existing local project and environment and a server login. Start
+with sotto init for a new project, or sotto setup / sotto clone on another
+device; login alone does not recreate the project. Pull does not require
+unlocking the local vault.
+
+Pull applies the server's encrypted snapshot locally. It does not upload local
+changes."#)]
     Pull,
     /// Set up this device from the server using your Emergency Kit (run after `login`).
     Setup,
@@ -362,7 +390,21 @@ enum TaskCommand {
     /// Approve one declared task for one environment after reviewing its full command.
     Approve { name: String },
     /// List local task approvals for this project.
-    Approvals,
+    #[command(after_help = r#"Examples:
+  sotto task approvals --json
+  sotto task approvals --json --env staging
+
+--json prints one JSON array of stored approval records with task and environment fields.
+Without --env, all stored environments for this project are listed, not just its default.
+An empty result prints []. Diagnostics stay on stderr.
+
+These records are not a guarantee that a task can currently run: a changed declaration
+or resolved executable can make an old approval unusable."#)]
+    Approvals {
+        /// Output stored approval records as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Revoke approval for one task and environment.
     Revoke { name: String },
     /// Run one locally approved task with the selected Sotto environment.
@@ -531,7 +573,9 @@ fn run() -> Result<()> {
                 })?;
                 return approve_task(name, environment);
             }
-            TaskCommand::Approvals => return list_task_approvals(cli.env.as_deref()),
+            TaskCommand::Approvals { json } => {
+                return list_task_approvals(cli.env.as_deref(), *json)
+            }
             TaskCommand::Revoke { name } => {
                 let environment = cli.env.as_deref().ok_or_else(|| {
                     Error::MissingArgument(
@@ -791,7 +835,7 @@ fn run() -> Result<()> {
             TaskCommand::Ls
             | TaskCommand::Validate
             | TaskCommand::Approve { .. }
-            | TaskCommand::Approvals
+            | TaskCommand::Approvals { .. }
             | TaskCommand::Revoke { .. } => {
                 unreachable!("task commands are handled before store init")
             }
@@ -1142,7 +1186,7 @@ fn approve_task(name: &str, environment: &str) -> Result<()> {
     Ok(())
 }
 
-fn list_task_approvals(environment: Option<&str>) -> Result<()> {
+fn list_task_approvals(environment: Option<&str>, json: bool) -> Result<()> {
     if environment.is_some_and(str::is_empty) {
         return Err(Error::Input(
             "task approval environment filter must not be empty".into(),
@@ -1159,6 +1203,19 @@ fn list_task_approvals(environment: Option<&str>) -> Result<()> {
         .into_iter()
         .filter(|approval| environment.is_none_or(|env| approval.environment == env))
         .collect::<Vec<_>>();
+    if json {
+        let records: Vec<_> = rows
+            .iter()
+            .map(|approval| {
+                serde_json::json!({
+                    "task": approval.task_name,
+                    "environment": approval.environment,
+                })
+            })
+            .collect();
+        println!("{}", to_json(&records)?);
+        return Ok(());
+    }
     if rows.is_empty() {
         println!("no task approvals for this project");
         return Ok(());
@@ -2733,6 +2790,31 @@ mod tests {
     }
 
     #[test]
+    fn sync_help_explains_scope_and_local_effects() {
+        for name in ["push", "pull"] {
+            let mut command = Cli::command();
+            let help = command
+                .find_subcommand_mut(name)
+                .expect("sync subcommand should exist")
+                .render_long_help()
+                .to_string();
+            assert!(help.contains(&format!("sotto {name} --env staging")));
+            assert!(help.contains("one environment in the current project"));
+            assert!(help.contains("--env changes only this invocation"));
+            assert!(help.contains("server login"));
+            if name == "push" {
+                assert!(help.contains("Push first applies a fresh server snapshot locally"));
+                assert!(help.contains("unlocked local vault"));
+            } else {
+                assert!(help.contains("Pull does not require"));
+                assert!(help.contains("It does not upload local"));
+            }
+            let cli = Cli::try_parse_from(["sotto", name, "--env", "staging"]).unwrap();
+            assert_eq!(cli.env.as_deref(), Some("staging"));
+        }
+    }
+
+    #[test]
     fn set_help_explains_prompt_and_stdin_input() {
         let mut command = Cli::command();
         let help = command
@@ -2753,6 +2835,36 @@ mod tests {
             "shell history and process arguments",
             "unlock the local identity first",
             "synthetic value",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
+
+    #[test]
+    fn task_approvals_json_flag_and_filter_parse() {
+        assert!(Cli::try_parse_from(["sotto", "task", "approvals", "--json"]).is_ok());
+        let cli = Cli::try_parse_from(["sotto", "task", "approvals", "--json", "--env", "staging"])
+            .unwrap();
+        assert_eq!(cli.env.as_deref(), Some("staging"));
+    }
+
+    #[test]
+    fn task_approvals_help_explains_json_and_stored_records() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("task")
+            .unwrap()
+            .find_subcommand_mut("approvals")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for expected in [
+            "--json",
+            "sotto task approvals --json",
+            "sotto task approvals --json --env staging",
+            "stored approval records",
+            "not a guarantee that a task can currently run",
+            "all stored environments",
         ] {
             assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
         }

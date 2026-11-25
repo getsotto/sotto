@@ -19,6 +19,7 @@ export function RecipientPage({ token }: { token: string }) {
 function RecipientSession({ token }: { token: string }) {
   const [state, setState] = useState<State>({ kind: "idle" });
   const [passphrase, setPassphrase] = useState("");
+  const [passphraseVisible, setPassphraseVisible] = useState(false);
   const [copyStatus, setCopyStatus] = useState<"idle" | "copying" | "copied" | "failed">("idle");
   const copyingRef = useRef(false);
   const revealedHeadingRef = useRef<HTMLHeadingElement>(null);
@@ -48,6 +49,7 @@ function RecipientSession({ token }: { token: string }) {
     }
 
     revealingRef.current = true;
+    setPassphraseVisible(false);
     setState({ kind: "revealing" });
     try {
       const fragment = window.location.hash.slice(1);
@@ -172,14 +174,28 @@ function RecipientSession({ token }: { token: string }) {
           void reveal();
         }}
       >
-        <label>
-          Passphrase (only if the sender set one)
-          <input
-            type="password"
-            value={passphrase}
-            onChange={(e) => setPassphrase(e.target.value)}
-          />
-        </label>
+        <div className="passphrase-field">
+          <label htmlFor="recipient-passphrase">
+            Passphrase (only if the sender set one)
+          </label>
+          <div className="passphrase-controls">
+            <input
+              id="recipient-passphrase"
+              className="passphrase-input"
+              type={passphraseVisible ? "text" : "password"}
+              value={passphrase}
+              onChange={(e) => setPassphrase(e.target.value)}
+            />
+            <button
+              type="button"
+              className="ghost sm"
+              disabled={state.kind === "revealing"}
+              onClick={() => setPassphraseVisible((visible) => !visible)}
+            >
+              {passphraseVisible ? "Hide passphrase" : "Show passphrase"}
+            </button>
+          </div>
+        </div>
         <button className="primary" type="submit" disabled={state.kind === "revealing"}>
           {state.kind === "revealing" ? "Revealing…" : "Reveal secret"}
         </button>
