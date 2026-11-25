@@ -12,7 +12,7 @@
 
 # Sotto
 
-Sincronización de secretos con cifrado de extremo a extremo para equipos de desarrollo. Deja de enviar tu `.env` por Slack.
+Gestor de secretos de código abierto con conocimiento cero y sincronización cifrada de extremo a extremo para equipos de desarrollo. Deja de enviar tu `.env` por Slack.
 
 > [!WARNING]
 > Sotto es una versión previa a la 1.0 y **no** ha pasado una auditoría criptográfica de terceros. Funciona de extremo a extremo, pero
@@ -76,6 +76,8 @@ eso es posible que un comando descrito aquí aún no exista en la versión que t
 
 Consulta [COMPATIBILITY.md](COMPATIBILITY.md) para ver los requisitos de versión de las
 integraciones, las plataformas declaradas y las pruebas disponibles actualmente.
+
+Para elegir una versión o carpeta de instalación, consulta las [opciones y ejemplos del instalador (en inglés)](INSTALLING.md).
 
 ### Homebrew (versión preliminar)
 
@@ -191,6 +193,24 @@ plano, por lo que necesita `--reveal` en un terminal, igual que `sotto get`; `--
 contenido se protege el nuevo valor, mientras que los gestores del portapapeles, la suspensión o la
 terminación del proceso auxiliar pueden conservar una copia.
 
+`sotto run` inicia el comando con tu entorno actual más los secretos del entorno seleccionado. Un
+secreto reemplaza a una variable heredada con el mismo nombre, y las variables sin relación se
+conservan. Cuando ocurre, Sotto escribe `warning: overriding inherited environment variable NAME` en
+stderr, nunca el valor. Solo el comando y sus descendientes ven los secretos; el entorno de tu shell
+no cambia después. Para usar otro entorno, pon `--env` antes de `--` (consulta
+[Entornos](#entornos); [Importar un archivo dotenv](#importar-un-archivo-dotenv) explica cómo llenarlo).
+
+Sotto ejecuta el programa directamente, por lo que no expande variables ni interpreta tuberías ni
+redirecciones en sus argumentos. Tu propio shell sigue procesando su sintaxis antes de que arranque
+Sotto: `sotto run -- echo "$EXAMPLE"` muestra el valor de `EXAMPLE` en el shell padre, no el
+inyectado. Para expandir una variable dentro del proceso hijo, ejecuta un shell como comando y pon el
+script entre comillas simples (shells POSIX). En este ejemplo ficticio, supón que `EXAMPLE` está
+guardado en Sotto con el valor `demo-only`:
+
+```sh
+sotto run -- sh -c 'echo "$EXAMPLE"'
+```
+
 Hasta aquí todo se queda en tu máquina. Para sincronizar otro dispositivo, trabajar en equipo o usar
 CI, inicia sesión en un servidor:
 
@@ -278,6 +298,34 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 entorno) o `>` (solo en el segundo). Sin `--confirm`, la copia es una simulación. Una copia confirmada
 añade y actualiza secretos, pero deja intactas las claves que solo existen en el destino.
 
+Para scripts, usa JSON en vez de leer el marcador de entorno activo:
+
+```sh
+sotto env ls --json
+```
+
+Ejemplo de salida para un proyecto con dos entornos locales:
+
+```json
+[{"active":true,"name":"dev"},{"active":false,"name":"staging"}]
+```
+
+Cada objeto tiene un nombre de entorno `name` y un indicador `active`. Una lista vacía es `[]`.
+Para elegir staging solo para este comando:
+
+```sh
+sotto --env staging env ls --json
+```
+
+Aquí, `active` marca staging en lugar de dev. Esto no guarda un nuevo valor predeterminado;
+para eso usa `sotto env use`, como se explica arriba. Si el nombre elegido no aparece
+en la lista local, todos los indicadores son falsos. El indicador compara nombres;
+no demuestra acceso al entorno ni que se haya descifrado correctamente.
+
+Esto lee los metadatos locales de los entornos del proyecto configurado sin desbloquear
+el almacén ni contactar al servidor. A diferencia de `sotto ls --json`, lista entornos,
+no nombres de secretos. La salida estándar contiene JSON; los diagnósticos van a la salida de error estándar.
+
 ### Configuración del proyecto
 
 `sotto init` y `sotto clone` escriben un `sotto.toml` en el directorio actual. Este archivo vincula
@@ -327,6 +375,42 @@ contiene el `config.toml` global, con ajustes de toda la máquina como el servid
 `sotto login` y tu tema, y el `store.db` cifrado que contiene tu bóveda. Ninguno de los dos debe ir en
 un repositorio. Consulta [Variables de entorno](#variables-de-entorno) para `SOTTO_DATA_DIR`, y
 [Temas de salida](#temas-de-salida) para la ubicación predeterminada en cada plataforma.
+
+### Listar nombres de secretos
+
+Desde un proyecto configurado con una identidad local desbloqueada, lista los nombres
+de los secretos del entorno seleccionado:
+
+```sh
+sotto ls
+```
+
+Ejemplo con dos nombres ficticios, ordenados y con un nombre por línea:
+
+```text
+API_URL
+REGION
+```
+
+Para scripts, usa JSON. Para elegir otro entorno solo para este comando:
+
+```sh
+sotto ls --json
+sotto --env staging ls --json
+```
+
+Ejemplo de salida JSON para los mismos nombres:
+
+```json
+["API_URL","REGION"]
+```
+
+Un entorno vacío no imprime líneas de nombres, o imprime `[]` con JSON. Los secretos
+eliminados no aparecen. Solo se muestran nombres, no valores ni números de versión.
+`sotto env ls` lista entornos; `sotto export` incluye valores en texto plano.
+
+La lista se lee del almacén local. No contacta al servidor ni descarga cambios nuevos.
+Consulta [la sincronización de otro dispositivo](#otro-dispositivo) para actualizar la copia local.
 
 ### Importar un archivo dotenv
 
@@ -652,11 +736,13 @@ Si falta alguna, la CI está activa o `TERM=dumb`, la invocación sin subcomando
 en la salida de error estándar y termina con el código 2. Usa `sotto --help` para solicitar la
 ayuda expresamente.
 
-Usa las flechas o `j` y `k` para desplazarte. Pulsa `/` para buscar, `?` para abrir la ayuda y Tab
-para cambiar de entorno. Este cambio solo dura mientras el panel está abierto; `sotto env use`
+Usa las flechas o `j` y `k` para desplazarte. Pulsa `/` para buscar, `?` para abrir la ayuda, Tab para pasar al entorno siguiente y Shift+Tab para volver al anterior. Este cambio solo dura mientras el panel está abierto; `sotto env use`
 cambia el entorno predeterminado del proyecto. Pulsa `r` para mostrar u ocultar el valor
-seleccionado, `c` para copiarlo al portapapeles y `q` para salir. `Esc` cierra la búsqueda o el
-diálogo actual; en la vista principal, borra una búsqueda activa o sale.
+seleccionado, `R` para recargar los secretos locales del entorno actual, `c` para copiarlo al
+portapapeles y `q` para salir. `Esc` cierra la búsqueda o el diálogo actual; en la vista principal,
+borra una búsqueda activa o sale.
+
+Pulsa `h` para [ver y restaurar el historial local de un secreto](LOCAL-HISTORY.md) (guía en inglés).
 
 Para crear un secreto desde la navegación normal del panel (no mientras escribes una búsqueda
 o editas un campo):
@@ -794,6 +880,8 @@ El formato JSON es útil para scripts. Su estructura de nivel superior es:
 ```
 
 El ejemplo es sintético; `actions` y las fechas opcionales proceden del estado devuelto de la cuenta, y los servidores antiguos pueden devolver null para cualquiera de los dos endpoints. `sotto cloud status` solo informa del estado y puede mostrar una URL de facturación. No inicia una compra ni cambia la elegibilidad. Para diagnosticar el almacén local y los entornos, usa `sotto status`; esa vista es independiente de la información del servidor y de la cuenta anterior.
+
+Para añadir o quitar una dirección de correo para los avisos de Cloud, consulta la [guía de contactos de correo (en inglés)](CLOUD-EMAIL.md).
 
 Para trasladar la facturación personal a una organización desde la página de cuenta de Sotto Cloud,
 consulta la [guía de traslado de facturación](CLOUD-BILLING-TRANSFER.md).

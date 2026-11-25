@@ -1,8 +1,23 @@
 /* Guide pages: the landing page's quiet-document voice, scoped to `main.seo`.
  * Base elements (main, header, h1-h3, p, section, code) inherit the Sordino
- * layer; everything here is what guides add: site nav, lead, steps, terminal
- * transcript, faq, and calls to action. Tokens come from sordino.css.
+ * layer; everything here is what guides add: site nav, breadcrumb, lead, steps,
+ * terminal transcript, faq, and calls to action. Tokens come from sordino.css.
  */
+
+main.seo a {
+  color: var(--link);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+
+main.seo a:visited {
+  color: var(--link-visited);
+}
+
+main.seo header.mast a.wordmark {
+  color: var(--ink);
+  text-decoration: none;
+}
 
 main.seo nav.site {
   display: flex;
@@ -20,6 +35,31 @@ main.seo nav.site a {
 main.seo nav.site a:hover {
   color: var(--text-body);
   text-decoration: underline;
+}
+
+main.seo nav.breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-4);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+main.seo nav.breadcrumb a {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+main.seo nav.breadcrumb a:hover {
+  color: var(--text-body);
+  text-decoration: underline;
+}
+
+main.seo section.plain {
+  border-top: none;
+  margin-top: 0;
+  padding-top: 0;
 }
 
 main.seo p.lead {
