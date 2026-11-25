@@ -51,6 +51,9 @@ async fn run() -> Result<()> {
         "warning: built with `e2e-test-clock` - business time can be overridden. Never deploy this build."
     );
     let config = Config::from_env()?;
+    #[cfg(feature = "e2e-access-protocol")]
+    let access_fixture =
+        sotto_server::access_protocol_fixture::Fixture::from_env(&config.bind_addr)?;
     let pool = db::connect(&config.database_url).await?;
     db::migrate(&pool).await?;
 
@@ -505,7 +508,13 @@ async fn run() -> Result<()> {
         .await
         .map_err(|e| Error::Io(e.to_string()))?;
     println!("sotto-server listening on http://{}", config.bind_addr);
-    axum::serve(listener, sotto_server::app(state))
+    #[cfg(feature = "e2e-access-protocol")]
+    let app = access_fixture
+        .router(state.clone())
+        .merge(sotto_server::app(state));
+    #[cfg(not(feature = "e2e-access-protocol"))]
+    let app = sotto_server::app(state);
+    axum::serve(listener, app)
         .await
         .map_err(|e| Error::Io(e.to_string()))
 }
