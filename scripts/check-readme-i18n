@@ -24,6 +24,7 @@ HEADING_RE = re.compile(r"^(#{1,6})\s")
 URL_RE = re.compile(r"https?://[^\s)<>\]`\"']+")
 LINK_DST_RE = re.compile(r"(?<!!)\[[^\]]*\]\(([^)\s]+)\)")
 CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+ALERT_RE = re.compile(r"^>\s*\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]", re.MULTILINE)
 
 
 def read(path):
@@ -93,7 +94,8 @@ def table_rows(text):
 
 
 def admonitions(text):
-    return text.count("[!WARNING]")
+    """Count GitHub alert markers per type in prose (fenced code ignored)."""
+    return Counter(ALERT_RE.findall(strip_fenced(text)))
 
 
 def check_translation(source_text, trans_text, name):
@@ -115,8 +117,14 @@ def check_translation(source_text, trans_text, name):
         errors.append(f"{name}: heading structure differs from {SOURCE}")
     if table_rows(source_text) != table_rows(trans_text):
         errors.append(f"{name}: table row count differs from {SOURCE}")
-    if admonitions(source_text) != admonitions(trans_text):
-        errors.append(f"{name}: admonition markers differ from {SOURCE}")
+    src_alerts, trans_alerts = admonitions(source_text), admonitions(trans_text)
+    if src_alerts != trans_alerts:
+        details = ", ".join(
+            f"[!{kind}] {src_alerts[kind]} in {SOURCE} vs {trans_alerts[kind]} in {name}"
+            for kind in ("NOTE", "TIP", "IMPORTANT", "WARNING", "CAUTION")
+            if src_alerts[kind] != trans_alerts[kind]
+        )
+        errors.append(f"{name}: admonition markers differ from {SOURCE} ({details})")
     if f"({SOURCE})" not in trans_text:
         errors.append(f"{name}: missing link back to {SOURCE}")
     return errors
