@@ -390,7 +390,21 @@ enum TaskCommand {
     /// Approve one declared task for one environment after reviewing its full command.
     Approve { name: String },
     /// List local task approvals for this project.
-    Approvals,
+    #[command(after_help = r#"Examples:
+  sotto task approvals --json
+  sotto task approvals --json --env staging
+
+--json prints one JSON array of stored approval records with task and environment fields.
+Without --env, all stored environments for this project are listed, not just its default.
+An empty result prints []. Diagnostics stay on stderr.
+
+These records are not a guarantee that a task can currently run: a changed declaration
+or resolved executable can make an old approval unusable."#)]
+    Approvals {
+        /// Output stored approval records as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Revoke approval for one task and environment.
     Revoke { name: String },
     /// Run one locally approved task with the selected Sotto environment.
@@ -559,7 +573,9 @@ fn run() -> Result<()> {
                 })?;
                 return approve_task(name, environment);
             }
-            TaskCommand::Approvals => return list_task_approvals(cli.env.as_deref()),
+            TaskCommand::Approvals { json } => {
+                return list_task_approvals(cli.env.as_deref(), *json)
+            }
             TaskCommand::Revoke { name } => {
                 let environment = cli.env.as_deref().ok_or_else(|| {
                     Error::MissingArgument(
@@ -819,7 +835,7 @@ fn run() -> Result<()> {
             TaskCommand::Ls
             | TaskCommand::Validate
             | TaskCommand::Approve { .. }
-            | TaskCommand::Approvals
+            | TaskCommand::Approvals { .. }
             | TaskCommand::Revoke { .. } => {
                 unreachable!("task commands are handled before store init")
             }
@@ -1170,7 +1186,7 @@ fn approve_task(name: &str, environment: &str) -> Result<()> {
     Ok(())
 }
 
-fn list_task_approvals(environment: Option<&str>) -> Result<()> {
+fn list_task_approvals(environment: Option<&str>, json: bool) -> Result<()> {
     if environment.is_some_and(str::is_empty) {
         return Err(Error::Input(
             "task approval environment filter must not be empty".into(),
@@ -1187,6 +1203,19 @@ fn list_task_approvals(environment: Option<&str>) -> Result<()> {
         .into_iter()
         .filter(|approval| environment.is_none_or(|env| approval.environment == env))
         .collect::<Vec<_>>();
+    if json {
+        let records: Vec<_> = rows
+            .iter()
+            .map(|approval| {
+                serde_json::json!({
+                    "task": approval.task_name,
+                    "environment": approval.environment,
+                })
+            })
+            .collect();
+        println!("{}", to_json(&records)?);
+        return Ok(());
+    }
     if rows.is_empty() {
         println!("no task approvals for this project");
         return Ok(());
@@ -2806,6 +2835,36 @@ mod tests {
             "shell history and process arguments",
             "unlock the local identity first",
             "synthetic value",
+        ] {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+    }
+
+    #[test]
+    fn task_approvals_json_flag_and_filter_parse() {
+        assert!(Cli::try_parse_from(["sotto", "task", "approvals", "--json"]).is_ok());
+        let cli = Cli::try_parse_from(["sotto", "task", "approvals", "--json", "--env", "staging"])
+            .unwrap();
+        assert_eq!(cli.env.as_deref(), Some("staging"));
+    }
+
+    #[test]
+    fn task_approvals_help_explains_json_and_stored_records() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("task")
+            .unwrap()
+            .find_subcommand_mut("approvals")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for expected in [
+            "--json",
+            "sotto task approvals --json",
+            "sotto task approvals --json --env staging",
+            "stored approval records",
+            "not a guarantee that a task can currently run",
+            "all stored environments",
         ] {
             assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
         }

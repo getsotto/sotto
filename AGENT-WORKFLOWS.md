@@ -87,8 +87,16 @@ Review and revoke local approvals from the project directory:
 ```sh
 sotto task approvals
 sotto task approvals --env dev
+sotto task approvals --json
+sotto task approvals --json --env staging
 sotto task revoke test --env dev
 ```
+
+`--json` prints one array of stored approval records with `task` and `environment` fields,
+or `[]` when there are no matching records. Without `--env`, it lists all stored environments
+for this project, not just the configured default. Stdout contains only JSON; diagnostics
+remain on stderr. Records are scoped to the project ID and canonical project root and ordered
+by task name, then environment. They are not a guarantee that a task can currently run.
 
 Revoking an approval prevents further CLI or MCP runs for that task/environment until it is
 approved again. Changing the task declaration or resolved executable also makes the old approval
