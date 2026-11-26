@@ -48,15 +48,11 @@ pub struct AccessIssuer {
 
 impl AccessIssuer {
     pub fn from_env(mode: DeploymentMode, oauth: Option<&OAuthConfig>) -> Result<Option<Self>> {
-        if [
-            CLIENT_ID,
-            CALLBACK,
-            DEPLOYMENT_KEY,
-            ISSUER_KEY,
-            PREVIOUS_KEY,
-        ]
-        .iter()
-        .all(|name| std::env::var_os(name).is_none())
+        let previous_path = std::env::var_os(PREVIOUS_KEY).filter(|path| !path.is_empty());
+        if previous_path.is_none()
+            && [CLIENT_ID, CALLBACK, DEPLOYMENT_KEY, ISSUER_KEY]
+                .iter()
+                .all(|name| std::env::var_os(name).is_none())
         {
             return Ok(None);
         }
@@ -92,7 +88,7 @@ impl AccessIssuer {
         let signing_key = SigningKey::from_pkcs8_pem(&key_file(ISSUER_KEY)?)
             .map_err(|_| Error::Config("invalid Access issuer signing key".into()))?;
         let client_key = public_key(DEPLOYMENT_KEY)?;
-        let previous_key = std::env::var_os(PREVIOUS_KEY)
+        let previous_key = previous_path
             .map(|_| public_key(PREVIOUS_KEY))
             .transpose()?;
         if signing_key.verifying_key() == &client_key
