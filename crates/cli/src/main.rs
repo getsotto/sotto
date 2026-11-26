@@ -3699,6 +3699,15 @@ mod tests {
         )
     }
 
+    /// Values the overlay helper injects and the child must receive unchanged: spaces, both
+    /// quote kinds, a newline, non-ASCII text and literal dollar-sign text.
+    const OVERLAY_LITERALS: [(&str, &str); 4] = [
+        ("SOTTO_TEST_ENV_SPACES", "  padded   value  "),
+        ("SOTTO_TEST_ENV_QUOTES", "say \"hi\" and 'bye'"),
+        ("SOTTO_TEST_ENV_NEWLINE", "first line\nsecond line\n"),
+        ("SOTTO_TEST_ENV_LITERAL", "café$HOME-雪"),
+    ];
+
     /// Runs one helper pass in its own process and returns that process's exit status.
     ///
     /// The helper cannot run in the harness: on Unix `exec_or_replace` replaces the
@@ -3706,29 +3715,48 @@ mod tests {
     /// The wait is bounded so a regression cannot hang the suite, and the `--exact`
     /// filter names the helper below, so renaming that function moves this string too.
     fn run_helper(mode: &str) -> std::process::ExitStatus {
-        run_helper_with_environment(mode, &[])
+        run_helper_with_environment(mode, &[]).0
     }
 
+    /// Like `run_helper`, with `inherited_environment` set on the helper's own `Command` and
+    /// the helper's stderr returned beside its status.
     fn run_helper_with_environment(
         mode: &str,
         inherited_environment: &[(&str, &str)],
-    ) -> std::process::ExitStatus {
+    ) -> (std::process::ExitStatus, String) {
+        use std::io::Read;
+
         let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
         command
-            .args(["--exact", "tests::child_exit_status_helper", "--ignored"])
+            // `--nocapture`: libtest would otherwise hold the helper's stderr back, and the
+            // process replacement discards it.
+            .args([
+                "--exact",
+                "tests::child_exit_status_helper",
+                "--ignored",
+                "--nocapture",
+            ])
             .env("SOTTO_TEST_CHILD_MODE", mode);
         for (name, value) in inherited_environment {
             command.env(name, value);
         }
         let mut child = command
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("spawn the helper process");
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(status) = child.try_wait().expect("wait for the helper") {
-                return status;
+                // The helper writes a few lines at most, so the unread pipe cannot fill first.
+                let mut stderr = Vec::new();
+                child
+                    .stderr
+                    .take()
+                    .expect("piped stderr")
+                    .read_to_end(&mut stderr)
+                    .expect("read the helper stderr");
+                return (status, String::from_utf8_lossy(&stderr).into_owned());
             }
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
@@ -3746,6 +3774,15 @@ mod tests {
     fn child_exit_status_helper() {
         let mode = std::env::var("SOTTO_TEST_CHILD_MODE").expect("helper mode");
         let (program, args, entries) = if mode == "environment-overlay" {
+            let mut entries = vec![
+                ("SOTTO_TEST_ENV_REPLACE".to_string(), "injected".to_string()),
+                ("SOTTO_TEST_ENV_EMPTY".to_string(), String::new()),
+            ];
+            entries.extend(
+                OVERLAY_LITERALS
+                    .iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string())),
+            );
             (
                 std::env::current_exe()
                     .expect("test binary")
@@ -3756,14 +3793,7 @@ mod tests {
                     "tests::child_environment_overlay_assertions".to_string(),
                     "--ignored".to_string(),
                 ],
-                vec![
-                    ("SOTTO_TEST_ENV_REPLACE".to_string(), "injected".to_string()),
-                    ("SOTTO_TEST_ENV_EMPTY".to_string(), String::new()),
-                    (
-                        "SOTTO_TEST_ENV_LITERAL".to_string(),
-                        "café$HOME-雪".to_string(),
-                    ),
-                ],
+                entries,
             )
         } else {
             let code = mode.parse::<i32>().expect("helper mode is an exit code");
@@ -3782,16 +3812,35 @@ mod tests {
 
     #[test]
     fn run_overlays_entries_on_inherited_environment_in_child() {
-        let status = run_helper_with_environment(
-            "environment-overlay",
-            &[
-                ("SOTTO_TEST_ENV_KEEP", "inherited"),
-                ("SOTTO_TEST_ENV_REPLACE", "inherited"),
-                ("SOTTO_TEST_ENV_EMPTY", "inherited"),
-                ("SOTTO_TEST_ENV_LITERAL", "inherited"),
-            ],
+        // The replaced variable's old value must not occur in the diagnostic's own wording
+        // ("overriding inherited environment variable"), or the leak check below proves nothing.
+        let mut inherited = vec![
+            ("SOTTO_TEST_ENV_KEEP", "inherited"),
+            ("SOTTO_TEST_ENV_REPLACE", "inherited-old"),
+            ("SOTTO_TEST_ENV_EMPTY", "inherited"),
+        ];
+        inherited.extend(
+            OVERLAY_LITERALS
+                .iter()
+                .map(|(name, _)| (*name, "inherited")),
         );
-        assert_eq!(status.code(), Some(0), "status: {status:?}");
+        let (status, stderr) = run_helper_with_environment("environment-overlay", &inherited);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "status: {status:?}\nstderr: {stderr}"
+        );
+
+        // The diagnostic names the overridden variable, not one that was only inherited, and
+        // prints neither the old nor the new value. Other stderr output is not constrained.
+        let warning = "warning: overriding inherited environment variable SOTTO_TEST_ENV_REPLACE";
+        assert!(
+            stderr.lines().any(|line| line == warning),
+            "stderr: {stderr}"
+        );
+        assert!(!stderr.contains("SOTTO_TEST_ENV_KEEP"), "stderr: {stderr}");
+        assert!(!stderr.contains("inherited-old"), "stderr: {stderr}");
+        assert!(!stderr.contains("injected"), "stderr: {stderr}");
     }
 
     #[test]
@@ -3806,10 +3855,9 @@ mod tests {
             Ok("injected")
         );
         assert_eq!(std::env::var("SOTTO_TEST_ENV_EMPTY").as_deref(), Ok(""));
-        assert_eq!(
-            std::env::var("SOTTO_TEST_ENV_LITERAL").as_deref(),
-            Ok("café$HOME-雪"),
-        );
+        for (name, value) in OVERLAY_LITERALS {
+            assert_eq!(std::env::var(name).as_deref(), Ok(value), "{name}");
+        }
     }
 
     #[test]
