@@ -86,8 +86,9 @@ def postgres(stack, image):
     return f"postgres://postgres:{password}@{address}/postgres", container
 
 
-def keys(directory):
-    for name in ("issuer", "deployment"):
+def keys(directory, issuer_key_overlap):
+    names = ("issuer", "deployment", "previous-issuer") if issuer_key_overlap else ("issuer", "deployment")
+    for name in names:
         run("openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256",
             "-out", str(directory / f"{name}.pem"))
         run("openssl", "pkey", "-in", str(directory / f"{name}.pem"), "-pubout",
@@ -238,17 +239,22 @@ def redirect_query(headers):
     return urllib.parse.parse_qs(urllib.parse.urlsplit(headers["Location"]).query)
 
 
-def check(client, container):
+def check(client, container, issuer_key_overlap):
     _, metadata = client.request(client.prefix + "/.well-known/openid-configuration", 200)
     metadata = json.loads(metadata)
     assert metadata["issuer"] == client.issuer
     assert metadata["jwks_uri"] == client.issuer + "/jwks"
     _, keys_body = client.request(urllib.parse.urlsplit(metadata["jwks_uri"]).path, 200)
-    key = json.loads(keys_body)["keys"][0]
-    assert key["kty"] == "EC" and key["crv"] == "P-256" and key["alg"] == "ES256"
-    public_key = output("openssl", "pkey", "-pubin", "-in", str(client.directory / "issuer.pub.pem"),
-                        "-pubout", "-outform", "DER")
-    assert public_key[-65:] == b"\x04" + from_b64url(key["x"]) + from_b64url(key["y"])
+    published_keys = json.loads(keys_body)["keys"]
+    expected_keys = ["issuer", "previous-issuer"] if issuer_key_overlap else ["issuer"]
+    assert len(published_keys) == len(expected_keys)
+    assert len({key["kid"] for key in published_keys}) == len(expected_keys)
+    for key, name in zip(published_keys, expected_keys):
+        assert key["kty"] == "EC" and key["crv"] == "P-256" and key["alg"] == "ES256"
+        public_key = output("openssl", "pkey", "-pubin", "-in", str(client.directory / f"{name}.pub.pem"),
+                            "-pubout", "-outform", "DER")
+        assert public_key[-65:] == b"\x04" + from_b64url(key["x"]) + from_b64url(key["y"])
+    active_key = published_keys[0]
     alice, alice_id = client.login("fixture-alice")
     _, bob_id = client.login("fixture-bob")
     assert alice_id != bob_id
@@ -285,7 +291,7 @@ def check(client, container):
     claims = json.loads(from_b64url(payload))
     token_header = json.loads(from_b64url(header))
     assert claims["iss"] == client.issuer and claims["sub"] == alice_id and claims["nonce"] == nonce
-    assert claims["aud"] == CLIENT and token_header["alg"] == "ES256" and token_header["kid"] == key["kid"]
+    assert claims["aud"] == CLIENT and token_header["alg"] == "ES256" and token_header["kid"] == active_key["kid"]
     sig = from_b64url(signature)
     assert len(sig) == 64
     encoded = b""
@@ -339,10 +345,13 @@ def main():
     parser.add_argument("--callback", default="http://127.0.0.1:8081/login/oauth2/code/sotto")
     parser.add_argument("--production-issuer", action="store_true", help="exercise the production issuer with mock GitHub")
     parser.add_argument("--postgres-image", default="postgres:16", help="PostgreSQL image reference or digest")
+    parser.add_argument("--issuer-key-overlap", action="store_true", help="publish a previous production issuer key")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="exercise the fixture through Caddy and exit")
     mode.add_argument("--check-default", action="store_true", help="prove the default build has no fixture routes")
     args = parser.parse_args()
+    if args.issuer_key_overlap and not args.production_issuer:
+        parser.error("--issuer-key-overlap requires --production-issuer")
     if args.production_issuer and args.check_default:
         parser.error("--check-default must run without issuer configuration")
     if args.check and not __debug__:
@@ -351,7 +360,7 @@ def main():
     signal.signal(signal.SIGTERM, terminate)
     with tempfile.TemporaryDirectory(prefix="sotto-access-protocol-") as temp, contextlib.ExitStack() as stack:
         directory = Path(temp)
-        keys(directory)
+        keys(directory, args.issuer_key_overlap)
         edge_port, api_port = port(), port()
         while api_port == edge_port:
             api_port = port()
@@ -375,6 +384,8 @@ def main():
                 "SOTTO_ACCESS_CALLBACK_URL": args.callback,
                 "SOTTO_ACCESS_DEPLOYMENT_PUBLIC_KEY_FILE": str(directory / "deployment.pub.pem"),
                 "SOTTO_ACCESS_ISSUER_PRIVATE_KEY_FILE": str(directory / "issuer.pem"),
+                "SOTTO_ACCESS_ISSUER_PREVIOUS_PUBLIC_KEY_FILE":
+                    str(directory / "previous-issuer.pub.pem") if args.issuer_key_overlap else "",
             })
         config = edge_config(args.caddy, directory, env, edge_port)
         server = start(stack, [str(args.server.resolve())], env, directory / "server.log")
@@ -403,7 +414,7 @@ def main():
             client.request(PRODUCTION_PREFIX + "/token", 404, "POST")
             print("passed: default Sotto build has no Access routes without configuration")
         elif args.check:
-            check(client, container)
+            check(client, container, args.issuer_key_overlap)
         else:
             settings = {
                 "issuer": client.issuer,
