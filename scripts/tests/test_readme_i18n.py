@@ -71,6 +71,16 @@ class HelperTest(unittest.TestCase):
         text = SOURCE + "\n[en](README.md) | [es](README.es.md) | [Sec](#sección)\n"
         self.assertEqual(checker.link_destinations(text), checker.link_destinations(SOURCE))
 
+    def test_important_downgraded_to_tip_fails(self):
+        source = SOURCE.replace("[!WARNING]", "[!IMPORTANT]")
+        tip = source.replace("[!IMPORTANT]", "[!TIP]")
+        self.assertEqual(checker.check_translation(source, source, "T"), [])
+        errors = checker.check_translation(source, tip, "T")
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("[!IMPORTANT] 1 in README.md vs 0 in T", errors[0])
+        restored = tip.replace("[!TIP]", "[!IMPORTANT]")
+        self.assertEqual(checker.check_translation(source, restored, "T"), [])
+
     def test_changed_heading_structure_fails(self):
         bad = TRANSLATION.replace("## Section", "### Section")
         errors = checker.check_translation(SOURCE, bad, "T")
