@@ -77,3 +77,61 @@ Keep your Emergency Kit safe when moving between installations or devices.
 The normal checksum and optional Sigstore checks still apply. See the
 [README installation section](README.md#install) for verification and Homebrew
 guidance, and [SECURITY.md](SECURITY.md) for manual verification steps.
+
+## Remove a script-installed copy
+
+The installers copy one executable, `sotto` (or `sotto.exe` on Windows), into the
+install folder. To remove that copy, delete only that file. For Homebrew, use the formula
+instructions in the [README](README.md#homebrew-preview) instead.
+
+First look at what is in the folder and what a plain `sotto` currently resolves to.
+The default folder is `~/.local/bin`. For a custom installation, replace the value
+with the folder you passed as `SOTTO_INSTALL_DIR`, for example `"$HOME/Sotto CLI/bin"`.
+Keep the double quotes so a path with spaces stays one argument:
+
+```sh
+dir="$HOME/.local/bin"
+ls -l "$dir/sotto"
+command -v sotto
+```
+
+If the listing shows the file you meant, remove just that file:
+
+```sh
+rm "$dir/sotto"
+```
+
+On Windows PowerShell the default folder is `%LOCALAPPDATA%\sotto\bin`. For a custom
+installation, use your `SOTTO_INSTALL_DIR` folder instead:
+
+```powershell
+$dir = "$env:LOCALAPPDATA\sotto\bin"
+Get-Item -LiteralPath "$dir\sotto.exe"
+Get-Command sotto -ErrorAction SilentlyContinue
+```
+
+```powershell
+Remove-Item -LiteralPath "$dir\sotto.exe"
+```
+
+Removing the executable does not touch your vault data, project files or Emergency
+Kit. The local store lives in the operating system's application data folder, or in
+`SOTTO_DATA_DIR` if you set it, and the commands above name one file only. Check that
+`SOTTO_DATA_DIR` does not point at the install folder before you remove anything. Completion
+scripts that either installer copied into your shell's completion folders, where those
+folders existed, are separate files and are also left in place.
+
+Then run the resolution check again:
+
+```sh
+command -v sotto
+```
+
+```powershell
+Get-Command sotto -ErrorAction SilentlyContinue
+```
+
+If this prints a path, another installation (for example an older copy earlier on
+`PATH`, or the Homebrew one) is now the one your shell finds. Run
+`sotto --version` on it before relying on it. If nothing is printed, no `sotto` is
+left on `PATH`.
