@@ -45,3 +45,15 @@ The routes below are relative to the issuer URL in the connection file.
 For the last two use RFC 9421 with the deployment key, key ID matching the client ID, and algorithm ecdsa-p256-sha256. Sign the following covered components in order: @method, @target-uri and, for the POST, content-digest. Use the external HTTPS URL as the target. Include created, expires and a fresh unique nonce. The POST digest uses RFC 9530 sha-256; the bodyless status lookup has no digest. A fresh signed confirmation of the same attempt returns the same connection ID. Repeating the earlier signature is rejected.
 
 Protocol state is intentionally in memory, while Sotto users and sessions use the disposable database. The fixture does not create production connection credentials. The Java client remains the next interoperability check.
+
+## Exercise the production issuer
+
+Build with only the mock GitHub feature and start the same runner with the production issuer profile. The runner supplies temporary registration and signing keys and points Caddy at the regular issuer handlers.
+
+```sh
+cargo build --locked -p sotto-server --features e2e-mock-oauth
+scripts/access-protocol-fixture --server target/debug/sotto-server \
+  --caddy /tmp/sotto-fixture-caddy --production-issuer --check
+```
+
+Omit `--check` to feed the emitted connection file and fixture certificate to the Access Java sign-in test. Run only `SottoSignInIT` against the production issuer. Deployment proof operations belong to the original fixture and later production slices.
