@@ -342,7 +342,11 @@ Values are imported literally: $OTHER and ${OTHER} are not expanded, and an inli
 #[derive(Subcommand)]
 enum ThemeCommand {
     /// List available themes (built-in presets and custom themes).
-    Ls,
+    Ls {
+        /// Output as a JSON array.
+        #[arg(long)]
+        json: bool,
+    },
     /// Set the active theme.
     Set { name: String },
     /// Show the current active theme.
@@ -2078,9 +2082,15 @@ fn theme_command(
     config_path: &Path,
     themes_dir: &Path,
 ) -> Result<()> {
-    match command.unwrap_or(&ThemeCommand::Ls) {
-        ThemeCommand::Ls => {
+    let default_ls = ThemeCommand::Ls { json: false };
+    match command.unwrap_or(&default_ls) {
+        ThemeCommand::Ls { json } => {
             let themes = sotto_cli::theme::available_themes(Some(themes_dir));
+            if *json {
+                println!("{}", theme_list_json(&themes, &current_theme.name)?);
+                return Ok(());
+            }
+
             for t in themes {
                 // Swatches paint with each theme's own palette, but styling as a whole is
                 // still gated by the resolved theme: piped/`NO_COLOR` output stays plain.
@@ -2372,6 +2382,25 @@ fn env_list_json(environments: &[String], active: &str) -> Result<String> {
     let value: Vec<_> = environments
         .iter()
         .map(|name| serde_json::json!({ "name": name, "active": name == active }))
+        .collect();
+    to_json(&value)
+}
+
+/// Stable machine-readable shape for `sotto theme ls --json`.
+///
+/// Returns a JSON array of one object per theme, in the same order as the human listing:
+/// built-in presets first, then custom themes sorted case-insensitively by name. `active`
+/// is true for the resolved theme using the same case-insensitive comparison as the human
+/// marker. Stdout contains JSON only.
+fn theme_list_json(themes: &[sotto_cli::theme::Theme], active_name: &str) -> Result<String> {
+    let value: Vec<_> = themes
+        .iter()
+        .map(|theme| {
+            serde_json::json!({
+                "name": theme.name,
+                "active": theme.name.eq_ignore_ascii_case(active_name),
+            })
+        })
         .collect();
     to_json(&value)
 }
@@ -3127,7 +3156,16 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Theme {
-                command: Some(ThemeCommand::Ls)
+                command: Some(ThemeCommand::Ls { json: false })
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["sotto", "theme", "ls", "--json"])
+            .expect("theme ls --json should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Theme {
+                command: Some(ThemeCommand::Ls { json: true })
             })
         ));
 
@@ -3721,6 +3759,24 @@ mod tests {
             env_list_json(&environments, "staging").unwrap(),
             r#"[{"active":false,"name":"dev"},{"active":false,"name":"prod"},{"active":true,"name":"staging"}]"#
         );
+    }
+
+    #[test]
+    fn theme_ls_json_marks_active_theme_and_escapes_names() {
+        use sotto_cli::theme::Theme;
+
+        let mut escaped = Theme::nord();
+        escaped.name = "quote\"and\\slash".into();
+        let themes = vec![Theme::nord(), Theme::sordino(), escaped];
+        let value: serde_json::Value =
+            serde_json::from_str(&super::theme_list_json(&themes, "SORDINO").unwrap()).unwrap();
+        assert_eq!(value[0]["name"], "nord");
+        assert_eq!(value[0]["active"], false);
+        assert_eq!(value[1]["name"], "sordino");
+        assert_eq!(value[1]["active"], true);
+        assert_eq!(value[2]["name"], "quote\"and\\slash");
+        assert_eq!(value[2]["active"], false);
+        assert_eq!(super::theme_list_json(&[], "nord").unwrap(), "[]");
     }
 
     #[test]

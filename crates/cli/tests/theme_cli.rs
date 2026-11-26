@@ -300,3 +300,94 @@ fn theme_set_rejects_malformed_global_config_without_overwriting_it() {
         );
     }
 }
+
+#[test]
+fn ls_json_lists_all_themes_and_marks_saved_custom_theme_active() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("themes")).unwrap();
+    std::fs::write(
+        dir.path().join("themes/synth.toml"),
+        "bg = \"#120024\"\n\
+         fg = \"#ffffff\"\n\
+         accent = \"#ff007f\"\n\
+         success = \"#00ff66\"\n\
+         warning = \"#ffaa00\"\n\
+         error = \"#ff0033\"\n\
+         muted = \"#775588\"\n\
+         border = \"#331144\"\n",
+    )
+    .unwrap();
+
+    let set = run(dir.path(), &["theme", "set", "synth"], &[]);
+    assert!(set.status.success(), "stderr: {}", stderr(&set));
+
+    let out = run(dir.path(), &["theme", "ls", "--json"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let themes = parsed.as_array().unwrap();
+    assert_eq!(themes.len(), 6, "{themes:#?}");
+    assert!(!stdout(&out).contains('\x1b'), "JSON output must be un-styled");
+
+    let synth = themes
+        .iter()
+        .find(|theme| theme["name"] == "synth")
+        .expect("custom theme synth should be listed");
+    assert_eq!(synth["active"], true);
+
+    let nord = themes
+        .iter()
+        .find(|theme| theme["name"] == "nord")
+        .expect("built-in nord should be listed");
+    assert_eq!(nord["active"], false);
+}
+
+#[test]
+fn ls_json_theme_override_marks_effective_selection_active() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("themes")).unwrap();
+    std::fs::write(
+        dir.path().join("themes/synth.toml"),
+        "bg = \"#120024\"\n\
+         fg = \"#ffffff\"\n\
+         accent = \"#ff007f\"\n\
+         success = \"#00ff66\"\n\
+         warning = \"#ffaa00\"\n\
+         error = \"#ff0033\"\n\
+         muted = \"#775588\"\n\
+         border = \"#331144\"\n",
+    )
+    .unwrap();
+    assert!(run(dir.path(), &["theme", "set", "synth"], &[])
+        .status
+        .success());
+
+    let out = run(
+        dir.path(),
+        &["--theme", "tokyo-night", "theme", "ls", "--json"],
+        &[],
+    );
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let themes = parsed.as_array().unwrap();
+
+    let synth = themes
+        .iter()
+        .find(|theme| theme["name"] == "synth")
+        .expect("custom theme synth should be listed");
+    assert_eq!(synth["active"], false);
+
+    let tokyo = themes
+        .iter()
+        .find(|theme| theme["name"] == "tokyo-night")
+        .expect("built-in tokyo-night should be listed");
+    assert_eq!(tokyo["active"], true);
+}
+
+#[test]
+fn ls_help_describes_json_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(dir.path(), &["theme", "ls", "--help"], &[]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("--json"));
+    assert!(stdout(&out).contains("Output as a JSON array"));
+}
