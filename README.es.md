@@ -583,6 +583,25 @@ completo.
 Revocar impide futuras recuperaciones a través del enlace. No puede deshacer una recuperación que
 ya ocurrió, así que si el destinatario pudo haber revelado el secreto, cámbialo en su origen.
 
+Un destinatario no necesita cuenta de Sotto, solo el enlace completo, incluida la parte posterior
+a `#`. Si creaste el enlace con `--passphrase`, envía la frase de contraseña por un canal distinto
+al del enlace. Abrir la página no recupera el secreto. La página solo obtiene la carga cifrada
+cuando el destinatario elige `Reveal secret`, y esa obtención puede consumir una de las
+visualizaciones del enlace antes de que el descifrado tenga éxito, de modo que una frase de
+contraseña ausente o incorrecta puede costar igualmente una visualización.
+
+Si la frase de contraseña falta o es incorrecta, el destinatario puede corregirla y elegir
+`Reveal secret` de nuevo en la misma página. La página conserva la carga que ya obtuvo y repite el
+descifrado en local, sin otra recuperación. Esto solo funciona durante la sesión actual de la
+página: recargar, cerrar o abandonar la página descarta la carga, y si el enlace deja de
+funcionar, pide al remitente un enlace nuevo. No cubre todos los fallos, como un error de red o de
+servidor, ni un enlace que haya agotado sus visualizaciones, caducado o sido revocado.
+
+Tras revelar el secreto con éxito, la página lo muestra junto con un botón `Copy secret`. Si el
+navegador rechaza el acceso al portapapeles, la página lo indica y el destinatario puede
+seleccionar el valor mostrado y copiarlo manualmente. Ver o copiar el secreto no borra tu secreto
+ni el texto cifrado que conserva el servidor.
+
 ### Trabajo en equipo
 
 Los equipos comparten entornos mediante una organización. Cada miembro recibe su propia copia

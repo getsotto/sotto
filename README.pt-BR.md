@@ -580,6 +580,25 @@ completo.
 Revogar impede novas recuperações pelo link. Não desfaz uma recuperação que já aconteceu; se o
 destinatário pode ter revelado o segredo, troque-o na origem.
 
+Um destinatário não precisa de conta Sotto, apenas do link completo, incluindo a parte depois de
+`#`. Se você criou o link com `--passphrase`, envie a frase secreta por um canal diferente do link.
+Abrir a página não busca o segredo. A página só busca o conteúdo cifrado quando o destinatário
+escolhe `Reveal secret`, e essa busca pode consumir uma das visualizações do link antes de a
+decifragem ter êxito; portanto, uma frase secreta ausente ou incorreta ainda pode custar uma
+visualização.
+
+Se a frase secreta estiver ausente ou incorreta, o destinatário pode corrigi-la e escolher
+`Reveal secret` novamente na mesma página. A página mantém o conteúdo já buscado e repete a
+decifragem localmente, sem nova busca. Isso vale apenas para a sessão atual da página: recarregar,
+fechar ou sair da página descarta o conteúdo, e, se o link deixar de funcionar, peça ao remetente
+um novo link. Isso não cobre todas as falhas, como um erro de rede ou de servidor, nem um link que
+esgotou as visualizações, expirou ou foi revogado.
+
+Depois de uma revelação bem-sucedida, a página mostra o segredo e um botão `Copy secret`. Se o
+navegador recusar o acesso à área de transferência, a página avisa, e o destinatário pode
+selecionar o valor exibido e copiá-lo manualmente. Ver ou copiar o segredo não apaga o seu segredo
+nem o texto cifrado mantido pelo servidor.
+
 ### Trabalhar em equipe
 
 Equipes compartilham ambientes por meio de uma organização. Cada membro recebe sua própria cópia

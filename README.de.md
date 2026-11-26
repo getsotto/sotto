@@ -590,6 +590,26 @@ Widerrufen verhindert künftige Abrufe über den Link. Ein bereits erfolgter Abr
 rückgängig machen: Wenn der Empfänger das Secret schon angezeigt haben könnte, ändere es an der
 Quelle.
 
+Ein Empfänger braucht kein Sotto-Konto, sondern nur den vollständigen Link einschließlich des
+Teils nach `#`. Wenn du den Link mit `--passphrase` erstellt hast, sende die Passphrase auf einem
+anderen Weg als den Link. Das Öffnen der Seite ruft das Secret nicht ab. Die Seite holt die
+verschlüsselte Nutzlast erst, wenn der Empfänger `Reveal secret` wählt, und dieser Abruf kann eine
+der Ansichten des Links verbrauchen, bevor die Entschlüsselung gelingt. Eine fehlende oder falsche
+Passphrase kann also trotzdem eine Ansicht kosten.
+
+Fehlt die Passphrase oder ist sie falsch, kann der Empfänger sie korrigieren und auf derselben
+Seite erneut `Reveal secret` wählen. Die Seite behält die bereits abgerufene Nutzlast und
+wiederholt die Entschlüsselung lokal, ohne erneuten Abruf. Das gilt nur für die aktuelle
+Seitensitzung: Neuladen, Schließen oder Verlassen der Seite verwirft die Nutzlast, und wenn der
+Link danach nicht mehr funktioniert, bitte den Absender um einen neuen Link. Nicht abgedeckt sind
+alle Fehler, etwa Netzwerk- oder Serverfehler oder ein Link, dessen Ansichten aufgebraucht sind,
+der abgelaufen ist oder widerrufen wurde.
+
+Nach erfolgreichem Aufdecken zeigt die Seite das Secret und eine Schaltfläche `Copy secret` an.
+Verweigert der Browser den Zugriff auf die Zwischenablage, weist die Seite darauf hin, und der
+Empfänger kann den angezeigten Wert markieren und von Hand kopieren. Ansehen oder Kopieren löscht
+weder dein Secret noch den vom Server gehaltenen Geheimtext.
+
 ### Im Team arbeiten
 
 Teams teilen Umgebungen über eine Organisation. Jedes Mitglied erhält eine eigene versiegelte Kopie

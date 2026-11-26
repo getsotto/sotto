@@ -571,6 +571,24 @@ history.
 Revoking stops future retrievals through the link. It cannot undo a retrieval that has already
 happened, so if the recipient may already have revealed the secret, change it at its source.
 
+A recipient needs no Sotto account, only the complete link, including the part after `#`. If you
+created the link with `--passphrase`, send the passphrase by a different route from the link.
+Opening the page does not fetch the secret. The page fetches the encrypted payload only when the
+recipient chooses `Reveal secret`, and that fetch can use one of the link's views before decryption
+succeeds, so a missing or wrong passphrase may still cost a view.
+
+If the passphrase is missing or wrong, the recipient can correct it and choose `Reveal secret`
+again on the same page. The page keeps the payload it already fetched and retries decryption
+locally, without another retrieval. This works only for the current page session: reloading,
+closing or leaving the page discards the payload, and if the link then no longer works, ask the
+sender for a fresh link. It does not cover every failure, such as a network or server error, or a
+link that has run out of views, expired or been revoked.
+
+After a successful reveal the page shows the secret and a `Copy secret` button. If the browser
+refuses clipboard access, the page says so, and the recipient can select the displayed value and
+copy it manually. Viewing or copying does not erase your secret or the ciphertext held by the
+server.
+
 ### Work with a team
 
 Teams share environments through an organisation. Each member receives their own sealed copy of an
