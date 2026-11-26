@@ -3,6 +3,10 @@
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -89,6 +93,57 @@ class HelperTest(unittest.TestCase):
     def test_unclosed_fence_raises(self):
         with self.assertRaises(ValueError):
             checker.fenced_blocks("```sh\nnever closed\n")
+
+
+class UnclosedFenceTest(unittest.TestCase):
+    """An unmatched fence is a validation message, not a traceback."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        for name in (checker.SOURCE,) + checker.TRANSLATIONS:
+            shutil.copy(ROOT / name, self.tmp / name)
+        self.assertEqual(checker.check_root(self.tmp), [])
+
+    def append_fence(self, name):
+        path = self.tmp / name
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text + "\n```\n", encoding="utf-8")
+        return len(text.splitlines()) + 2
+
+    def test_fence_error_reports_line_number(self):
+        with self.assertRaisesRegex(ValueError, "opened on line 2"):
+            checker.fenced_blocks("text\n```sh\nnever closed\n")
+
+    def test_unclosed_fence_in_translation_names_file_and_line(self):
+        line = self.append_fence("README.fr.md")
+        self.assertEqual(
+            checker.check_root(self.tmp),
+            [f"README.fr.md: unclosed fenced code block opened on line {line}"],
+        )
+
+    def test_unclosed_fence_in_source_names_file_and_line(self):
+        line = self.append_fence("README.md")
+        self.assertEqual(
+            checker.check_root(self.tmp),
+            [f"README.md: unclosed fenced code block opened on line {line}"],
+        )
+
+    def test_command_exits_nonzero_without_traceback(self):
+        self.append_fence("README.fr.md")
+        out = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/check-readme-i18n"), "--root", str(self.tmp)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("README.fr.md: unclosed fenced code block opened on line", out.stdout)
+        self.assertNotIn("Traceback", out.stdout + out.stderr)
+
+    def test_closing_the_fence_passes_again(self):
+        self.append_fence("README.de.md")
+        self.assertNotEqual(checker.check_root(self.tmp), [])
+        shutil.copy(ROOT / "README.de.md", self.tmp / "README.de.md")
+        self.assertEqual(checker.check_root(self.tmp), [])
 
 
 class RepoTest(unittest.TestCase):
