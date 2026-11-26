@@ -664,4 +664,80 @@ describe("CloudContactSettings", () => {
     ));
     expect(api.revokeCloudContact).not.toHaveBeenCalled();
   });
+
+  describe("pending verification expiry display", () => {
+    it("renders the expiry date, time and time zone in a semantic <time> element for two distinct times on the same date", async () => {
+      // 2027-01-15T12:00:00.000Z and 2027-01-15T13:00:00.000Z fall on the same local date in every time zone.
+      const firstEpoch = 1_800_014_400;
+      const secondEpoch = 1_800_018_000;
+
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce({
+        ...emptyStatus,
+        pendingExpiresAtEpoch: firstEpoch,
+      });
+
+      const { unmount } = render(<CloudContactSettings />);
+
+      const firstParagraph = await screen.findByText(/A verification request is pending/);
+      const firstTime = firstParagraph.querySelector("time");
+      expect(firstTime).not.toBeNull();
+      expect(firstTime).toHaveAttribute("datetime", "2027-01-15T12:00:00.000Z");
+      expect(firstTime?.textContent).toMatch(/2027/);
+      expect(firstTime?.textContent).toMatch(/\d{1,2}:\d{2}/);
+      expect(firstParagraph).toHaveTextContent("You can request another link if it expires.");
+      expect(screen.getByRole("button", { name: "Resend verification link" })).toBeInTheDocument();
+
+      const firstVisibleText = firstTime?.textContent;
+      unmount();
+
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce({
+        ...emptyStatus,
+        pendingExpiresAtEpoch: secondEpoch,
+      });
+
+      render(<CloudContactSettings />);
+
+      const secondParagraph = await screen.findByText(/A verification request is pending/);
+      const secondTime = secondParagraph.querySelector("time");
+      expect(secondTime).not.toBeNull();
+      expect(secondTime).toHaveAttribute("datetime", "2027-01-15T13:00:00.000Z");
+      expect(secondTime?.textContent).toMatch(/2027/);
+      expect(secondTime?.textContent).toMatch(/\d{1,2}:\d{2}/);
+      expect(secondTime?.textContent).not.toBe(firstVisibleText);
+      expect(screen.getByRole("button", { name: "Resend verification link"} )).toBeInTheDocument();
+      expect(api.startCloudContactVerification).not.toHaveBeenCalled();
+    });
+
+    it("shows no pending-expiry message when pendingExpiresAtEpoch is null", async () => {
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce({
+        ...emptyStatus,
+        pendingExpiresAtEpoch: null,
+      });
+
+      render(<CloudContactSettings />);
+
+      expect(await screen.findByLabelText("Email address")).toBeInTheDocument();
+      expect(screen.queryByText(/verification request is pending/i)).not.toBeInTheDocument();
+      expect(document.querySelector("time")).toBeNull();
+      expect(screen.getByRole("button", { name: "Send verification link" })).toBeInTheDocument();
+    });
+
+    it.each([
+      ["NaN", Number.NaN],
+      ["Infinity", Number.POSITIVE_INFINITY],
+      ["out-of-range epoch", 1e20],
+    ])("retains generic pending guidance without rendering Invalid Date when pendingExpiresAtEpoch is %s", async (__label, invalidEpoch) => {
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce({
+        ...emptyStatus,
+        pendingExpiresAtEpoch: invalidEpoch,
+      });
+
+      render(<CloudContactSettings />);
+
+      expect(await screen.findByText("A verification request is pending. You can request another link if it expires."),).toBeInTheDocument();
+      expect(screen.queryByText(/Invalid Date/i)).not.toBeInTheDocument();
+      expect(document.querySelector("time")).toBeNull();
+      expect(screen.getByRole("button", { name: "Resend verification link" })).toBeInTheDocument();
+    });
+  });
 });
