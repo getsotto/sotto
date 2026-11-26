@@ -60,11 +60,11 @@ def wait_for(label, action, timeout=45):
     raise RuntimeError(f"{label} did not become ready")
 
 
-def postgres(stack):
+def postgres(stack, image):
     password = secrets.token_hex(24)
     container = output(
         "docker", "run", "--detach", "--rm", "--publish", "127.0.0.1::5432",
-        "--env", "POSTGRES_PASSWORD", "postgres:16",
+        "--env", "POSTGRES_PASSWORD", image,
         env={**os.environ, "POSTGRES_PASSWORD": password},
     ).decode().strip()
     stack.callback(
@@ -338,6 +338,7 @@ def main():
     parser.add_argument("--caddy", default="caddy", help="Caddy with the Sotto rate limit plugin")
     parser.add_argument("--callback", default="http://127.0.0.1:8081/login/oauth2/code/sotto")
     parser.add_argument("--production-issuer", action="store_true", help="exercise the production issuer with mock GitHub")
+    parser.add_argument("--postgres-image", default="postgres:16", help="PostgreSQL image reference or digest")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="exercise the fixture through Caddy and exit")
     mode.add_argument("--check-default", action="store_true", help="prove the default build has no fixture routes")
@@ -356,7 +357,7 @@ def main():
             api_port = port()
         client = Client(edge_port, directory, args.callback, PRODUCTION_PREFIX if args.production_issuer else PREFIX)
         # Do not import a developer's Cloud flags, OAuth credentials or database configuration.
-        database_url, container = postgres(stack)
+        database_url, container = postgres(stack, args.postgres_image)
         env = {
             "PATH": os.environ["PATH"], "XDG_DATA_HOME": str(directory), "XDG_CONFIG_HOME": str(directory),
             "DATABASE_URL": database_url, "SOTTO_DEPLOYMENT_MODE": "self_hosted",
