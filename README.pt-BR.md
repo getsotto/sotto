@@ -12,7 +12,7 @@
 
 # Sotto
 
-Sincronização de segredos com criptografia de ponta a ponta para equipes de desenvolvimento. Pare de enviar seu `.env` pelo Slack.
+Gerenciador de segredos de código aberto com conhecimento zero e sincronização criptografada de ponta a ponta para equipes de desenvolvimento. Pare de enviar seu `.env` pelo Slack.
 
 > [!WARNING]
 > O Sotto é pré-1.0 e **não** passou por uma auditoria criptográfica de terceiros. Funciona de ponta a ponta, mas
@@ -297,6 +297,34 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 ambiente) ou `>` (só no segundo). Sem `--confirm`, a cópia é uma simulação. Uma cópia confirmada
 adiciona e atualiza segredos, mas mantém intactas as chaves que existem apenas no destino.
 
+Para scripts, use JSON em vez de ler o marcador de ambiente ativo:
+
+```sh
+sotto env ls --json
+```
+
+Exemplo de saída para um projeto com dois ambientes locais:
+
+```json
+[{"active":true,"name":"dev"},{"active":false,"name":"staging"}]
+```
+
+Cada objeto tem um nome de ambiente `name` e um indicador `active`. Uma lista vazia é `[]`.
+Para selecionar staging apenas para este comando:
+
+```sh
+sotto --env staging env ls --json
+```
+
+Aqui, `active` marca staging em vez de dev. Isso não salva um novo padrão;
+use `sotto env use` para isso, como explicado acima. Se o nome selecionado não estiver
+na lista local, todos os indicadores serão falsos. O indicador compara nomes;
+não comprova acesso a um ambiente nem uma descriptografia bem-sucedida.
+
+O comando lê os metadados locais dos ambientes do projeto configurado sem desbloquear
+o cofre nem contatar o servidor. Ao contrário de `sotto ls --json`, ele lista ambientes,
+não nomes de segredos. A saída padrão contém JSON; os diagnósticos vão para a saída de erro padrão.
+
 ### Configuração do projeto
 
 `sotto init` e `sotto clone` gravam um `sotto.toml` no diretório atual. Ele vincula esse diretório a
@@ -344,6 +372,42 @@ e deixa o arquivo sem alterações. Veja [Ambientes](#ambientes).
 seu tema, e o `store.db` criptografado que guarda o seu cofre. Nenhum dos dois deve ir para um
 repositório. Veja [Variáveis de ambiente](#variáveis-de-ambiente) para `SOTTO_DATA_DIR`, e
 [Temas de saída](#temas-de-saída) para o local padrão em cada plataforma.
+
+### Listar nomes de segredos
+
+Em um projeto configurado com uma identidade local desbloqueada, liste os nomes
+dos segredos do ambiente selecionado:
+
+```sh
+sotto ls
+```
+
+Exemplo com dois nomes fictícios, ordenados e com um nome por linha:
+
+```text
+API_URL
+REGION
+```
+
+Para scripts, use JSON. Para escolher outro ambiente apenas para este comando:
+
+```sh
+sotto ls --json
+sotto --env staging ls --json
+```
+
+Exemplo de saída JSON para os mesmos nomes:
+
+```json
+["API_URL","REGION"]
+```
+
+Um ambiente vazio não imprime linhas de nomes, ou imprime `[]` com JSON. Segredos
+removidos não aparecem. A lista contém apenas nomes, sem valores ou números de versão.
+`sotto env ls` lista ambientes; `sotto export` inclui valores em texto simples.
+
+A lista vem do armazenamento local. O comando não contata o servidor nem baixa alterações
+recentes. Veja [a sincronização de outro dispositivo](#outro-dispositivo) para atualizar a cópia local.
 
 ### Importar um arquivo dotenv
 
@@ -667,9 +731,33 @@ a ajuda na saída de erro padrão e termina com código 2. Use `sotto --help` pa
 explicitamente.
 
 Use as setas ou `j` e `k` para navegar. Pressione `/` para buscar, `?` para ver a ajuda, Tab para ir ao próximo ambiente e Shift+Tab para voltar ao anterior. A troca vale apenas durante a sessão do painel; `sotto env use` altera o
-ambiente padrão do projeto. Pressione `r` para mostrar ou ocultar o valor selecionado, `c` para
-copiá-lo para a área de transferência e `q` para sair. `Esc` fecha a busca ou a caixa de diálogo
-atual; na tela principal, limpa uma busca ativa ou sai.
+ambiente padrão do projeto. Pressione `r` para mostrar ou ocultar o valor selecionado, `R` para
+recarregar os segredos locais do ambiente atual, `c` para copiá-lo para a área de transferência e
+`q` para sair. `Esc` fecha a busca ou a caixa de diálogo atual; na tela principal, limpa uma busca
+ativa ou sai.
+
+Pressione `h` para [ver e restaurar o histórico local de um segredo](LOCAL-HISTORY.md) (guia em inglês).
+
+Para criar um segredo na navegação normal do painel (não enquanto digita uma busca
+ou edita um campo):
+
+1. Pressione `n` para abrir New Secret.
+2. Digite um nome fictício como `DEMO_API_KEY` e pressione Tab para ir ao valor.
+3. Digite um valor de teste como `demo-only`, ou pressione `Ctrl+G` para gerar outro.
+4. Pressione `Enter` para salvar.
+
+No modo New, Tab e Shift+Tab alternam entre os campos de nome e valor. Selecione um
+segredo existente e pressione `e` para editar seu valor; Edit não muda o nome.
+New rejeita um nome existente e mantém a caixa de diálogo aberta; use Edit para atualizá-lo.
+
+Os valores começam ocultos. `Ctrl+R` mostra ou oculta o valor do rascunho. `Ctrl+G`
+o substitui por uma sequência gerada de 32 caracteres, mas não a salva. `Enter`
+salva a caixa de diálogo mesmo no campo do nome; `Esc` descarta o rascunho não salvo e a fecha.
+Este editor de texto não edita valores que não sejam UTF-8; veja [os segredos a partir de arquivos](README.md#file-backed-secrets).
+
+Salvar altera apenas o ambiente local selecionado. Não sincroniza com o servidor.
+Para sincronizar depois, siga [a orientação de push](README.md#quick-start) e informe o mesmo
+ambiente explicitamente se você mudou de ambiente no painel.
 
 Pressione `t` para percorrer os temas com visualização ao vivo. Use as setas para ver cada tema
 e pressione `Enter` para salvar sua escolha ou `Esc` para cancelar. As

@@ -15,6 +15,10 @@ const originalLinks = [
   ["/share-api-keys-securely", "Share API keys"],
   ["/send-password-securely", "Send passwords"],
   ["/self-hosted-secret-management", "Self-hosting"],
+  ["/open-source-secret-manager", "Open-source secret manager"],
+  ["/cli-secret-manager", "CLI secret manager"],
+  ["/dotenv-alternative", "Dotenv alternative"],
+  ["/ci-cd-secret-manager", "CI/CD secrets"],
 ];
 
 afterEach(() => {
