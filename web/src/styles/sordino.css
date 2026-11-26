@@ -328,6 +328,7 @@ select {
 /* Key material is mono, like everything that matters byte-for-byte. */
 input[type="password"],
 input.secret-key,
+input.master-password,
 input.passphrase-input {
   font-family: var(--font-mono);
 }

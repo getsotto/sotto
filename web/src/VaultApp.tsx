@@ -149,6 +149,7 @@ function UnlockForm({
   onLogout: () => void;
 }) {
   const [password, setPassword] = useState("");
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const [secretKey, setSecretKey] = useState("");
   const [secretKeyVisible, setSecretKeyVisible] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -157,6 +158,7 @@ function UnlockForm({
   async function unlock() {
     setBusy(true);
     setError(null);
+    setPasswordVisible(false);
     setSecretKeyVisible(false);
     let master: Uint8Array | null = null;
     try {
@@ -185,10 +187,26 @@ function UnlockForm({
           void unlock();
         }}
       >
-        <label>
-          Master password
-          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
-        </label>
+        <div className="secret-key-field">
+          <label htmlFor="unlock-master-password">Master password</label>
+          <div className="secret-key-controls">
+            <input
+              id="unlock-master-password"
+              className="master-password"
+              type={passwordVisible ? "text" : "password"}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+            <button
+              type="button"
+              className="ghost sm"
+              disabled={busy}
+              onClick={() => setPasswordVisible((visible) => !visible)}
+            >
+              {passwordVisible ? "Hide master password" : "Show master password"}
+            </button>
+          </div>
+        </div>
         <div className="secret-key-field">
           <label htmlFor="unlock-secret-key">Secret key (SK1-…)</label>
           <div className="secret-key-controls">
