@@ -1,7 +1,7 @@
 {
   "components": [
     {
-      "checked_at": "2026-11-26T03:00:09Z",
+      "checked_at": "2026-11-26T12:12:16Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -400,8 +400,8 @@
         },
         {
           "date": "2026-11-26",
-          "ok": 1,
-          "total": 1
+          "ok": 2,
+          "total": 2
         }
       ],
       "description": "Serving requests and reaching its database",
@@ -411,7 +411,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-11-26T03:00:09Z",
+      "checked_at": "2026-11-26T12:12:16Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -810,8 +810,8 @@
         },
         {
           "date": "2026-11-26",
-          "ok": 1,
-          "total": 1
+          "ok": 2,
+          "total": 2
         }
       ],
       "description": "The application shell loads",
@@ -821,7 +821,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-11-26T03:00:09Z",
+      "checked_at": "2026-11-26T12:12:16Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -1220,8 +1220,8 @@
         },
         {
           "date": "2026-11-26",
-          "ok": 1,
-          "total": 1
+          "ok": 2,
+          "total": 2
         }
       ],
       "description": "The GitHub sign-in flow starts",
@@ -1231,7 +1231,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-11-26T03:00:09Z",
+      "checked_at": "2026-11-26T12:12:16Z",
       "days": [
         {
           "date": "2026-09-08",
@@ -1630,8 +1630,8 @@
         },
         {
           "date": "2026-11-26",
-          "ok": 1,
-          "total": 1
+          "ok": 2,
+          "total": 2
         }
       ],
       "description": "Subscription webhooks are accepted and authenticated",
@@ -1641,7 +1641,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-11-26T03:00:09Z",
+      "checked_at": "2026-11-26T12:12:16Z",
       "days": [
         {
           "date": "2026-09-12",
@@ -2020,8 +2020,8 @@
         },
         {
           "date": "2026-11-26",
-          "ok": 1,
-          "total": 1
+          "ok": 2,
+          "total": 2
         }
       ],
       "description": "A canary machine token can retrieve its grant and its secrets",
@@ -2031,7 +2031,7 @@
       "state": "ok"
     },
     {
-      "checked_at": "2026-11-26T03:00:09Z",
+      "checked_at": "2026-11-26T12:12:16Z",
       "days": [],
       "description": "An ordinary signed-in user can retrieve synthetic encrypted secrets",
       "detail": "SOTTO_HUMAN_CANARY_ENVIRONMENT_ID is not set",
@@ -2040,6 +2040,6 @@
       "state": "unconfigured"
     }
   ],
-  "generated_at": "2026-11-26T03:00:09Z",
+  "generated_at": "2026-11-26T12:12:16Z",
   "schema": 1
 }
