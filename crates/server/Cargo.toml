@@ -47,7 +47,7 @@ sha2 = "0.10"
 subtle = "2"
 # Parse Stripe webhook events; also used by integration tests for response bodies.
 serde_json = "1"
-p256 = { version = "0.14", features = ["pem"], optional = true }
+p256 = { version = "0.14", features = ["pem"] }
 sfv = { version = "0.14", optional = true }
 
 [dev-dependencies]
@@ -64,7 +64,6 @@ e2e-mock-oauth = []
 # Loopback-only Sotto Access interoperability fixtures. Never enabled in release builds.
 e2e-access-protocol = [
     "e2e-mock-oauth",
-    "dep:p256",
     "dep:sfv",
     "uuid/serde",
 ]

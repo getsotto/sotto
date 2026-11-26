@@ -69,7 +69,7 @@ www.{$SOTTO_DOMAIN} {
 	# one office/NAT egress IP. The threshold is a generous starting point - raise it, or split
 	# into per-endpoint zones, to taste. Contact-verification POSTs are the deliberate exception:
 	# their dedicated per-IP zone below complements account/destination limits in the application.
-	@ratelimited path /auth/github/* /shares /shares/* /community /telemetry/* /health/ready /webhooks/resend
+	@ratelimited path /auth/github/* /integrations/access/oidc/.well-known/openid-configuration /integrations/access/oidc/jwks /integrations/access/oidc/authorize /integrations/access/oidc/token /shares /shares/* /community /telemetry/* /health/ready /webhooks/resend
 	handle @ratelimited {
 		rate_limit {
 			zone unauthenticated {
