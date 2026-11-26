@@ -47,6 +47,8 @@ sha2 = "0.10"
 subtle = "2"
 # Parse Stripe webhook events; also used by integration tests for response bodies.
 serde_json = "1"
+p256 = { version = "0.14", features = ["pem"], optional = true }
+sfv = { version = "0.14", optional = true }
 
 [dev-dependencies]
 # Drive the router in-process (ServiceExt::oneshot) for handler tests.
@@ -59,6 +61,13 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # enabled in release.yml or the production Dockerfile, so this code does not exist in any binary
 # a user runs. See docs/adr/0001-continuous-deploy-during-launch-waves.md.
 e2e-mock-oauth = []
+# Loopback-only Sotto Access interoperability fixtures. Never enabled in release builds.
+e2e-access-protocol = [
+    "e2e-mock-oauth",
+    "dep:p256",
+    "dep:sfv",
+    "uuid/serde",
+]
 # Allows a real-Stripe browser rehearsal to bind a runner-owned test-clock customer to one mock
 # OAuth identity. Must never be used with the local billing adapter or without mock OAuth.
 e2e-stripe-test-clock = []

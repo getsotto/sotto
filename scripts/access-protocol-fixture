@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Run the loopback Rust and Caddy half of the Access protocol gate."""
+
+import argparse
+import base64
+import contextlib
+import hashlib
+import http.client
+from http.cookies import SimpleCookie
+import json
+import os
+from pathlib import Path
+import secrets
+import signal
+import socket
+import ssl
+import subprocess
+import tempfile
+import time
+import urllib.parse
+import uuid
+
+ROOT = Path(__file__).resolve().parent.parent
+PREFIX = "/auth/github/access-fixture"
+CLIENT = "sotto-access-fixture"
+
+
+def run(*args, **kwargs):
+    return subprocess.run(args, check=True, **kwargs)
+
+
+def output(*args, **kwargs):
+    return subprocess.check_output(args, **kwargs)
+
+
+def b64url(value):
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
+
+
+def from_b64url(value):
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def port():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+def wait_for(label, action, timeout=45):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if action():
+                return
+        except (OSError, http.client.HTTPException):
+            pass
+        time.sleep(0.2)
+    raise RuntimeError(f"{label} did not become ready")
+
+
+def postgres(stack):
+    password = secrets.token_hex(24)
+    container = output(
+        "docker", "run", "--detach", "--rm", "--publish", "127.0.0.1::5432",
+        "--env", "POSTGRES_PASSWORD", "postgres:16",
+        env={**os.environ, "POSTGRES_PASSWORD": password},
+    ).decode().strip()
+    stack.callback(
+        subprocess.run, ["docker", "rm", "--force", container],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    def ready():
+        # The temporary init server has no TCP listener. Wait for the final server.
+        return subprocess.run(
+            ["docker", "exec", container, "pg_isready", "-h", "127.0.0.1", "-U", "postgres"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+
+    wait_for("disposable PostgreSQL", ready)
+    address = output("docker", "port", container, "5432/tcp").decode().strip()
+    if not address.startswith("127.0.0.1:"):
+        raise RuntimeError("PostgreSQL must publish to loopback")
+    return f"postgres://postgres:{password}@{address}/postgres"
+
+
+def keys(directory):
+    for name in ("issuer", "deployment"):
+        run("openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256",
+            "-out", str(directory / f"{name}.pem"))
+        run("openssl", "pkey", "-in", str(directory / f"{name}.pem"), "-pubout",
+            "-out", str(directory / f"{name}.pub.pem"))
+    run("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+        "-nodes", "-days", "1", "-subj", "/CN=localhost",
+        "-addext", "subjectAltName=DNS:localhost", "-addext", "basicConstraints=critical,CA:TRUE",
+        "-keyout", str(directory / "tls.key"), "-out", str(directory / "tls.crt"),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def start(stack, command, env, log):
+    with log.open("w") as stream:
+        process = subprocess.Popen(command, env=env, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT)
+
+    def stop():
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    stack.callback(stop)
+    return process
+
+
+def edge_config(caddy, directory, env, edge_port):
+    config = json.loads(output(
+        caddy, "adapt", "--config", str(ROOT / "Caddyfile"), "--adapter", "caddyfile",
+        env=env, cwd=ROOT,
+    ))
+    config["admin"] = {"disabled": True}
+    # Proxy errors can log request headers as well as the access logger.
+    config["logging"] = {"logs": {"default": {"exclude": ["http.log.error"]}}}
+    for server in config["apps"]["http"]["servers"].values():
+        server.pop("logs", None)  # Browser and signature proofs must not reach access logs.
+        server["listen"] = [f"127.0.0.1:{edge_port}"]
+        server["automatic_https"] = {"disable": True}
+        server["tls_connection_policies"] = [{}]
+    config["apps"]["tls"] = {"certificates": {"load_files": [{
+        "certificate": str(directory / "tls.crt"), "key": str(directory / "tls.key"),
+    }]}}
+    path = directory / "caddy.json"
+    path.write_text(json.dumps(config))
+    return path
+
+
+class Client:
+    def __init__(self, edge_port, directory, callback):
+        self.port = edge_port
+        self.origin = f"https://localhost:{edge_port}"
+        self.issuer = self.origin + PREFIX
+        self.context = ssl.create_default_context(cafile=str(directory / "tls.crt"))
+        self.directory = directory
+        self.callback = callback
+
+    def request(self, path, status, method="GET", headers=None, body=None):
+        conn = http.client.HTTPSConnection("localhost", self.port, context=self.context, timeout=3)
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            response = conn.getresponse()
+            content = response.read()
+            if response.status != status:
+                raise RuntimeError(f"{method} {path.partition('?')[0]} returned {response.status}, expected {status}")
+            return response.headers, content
+        finally:
+            conn.close()
+
+    def login(self, subject):
+        query = urllib.parse.urlencode({"redirect_uri": self.origin + "/", "state": "fixture"})
+        headers, _ = self.request("/auth/github/login?" + query, 303)
+        state = redirect_query(headers)["state"][0]
+        callback = urllib.parse.urlencode({"state": state, "code": subject})
+        headers, _ = self.request("/auth/github/callback?" + callback, 303)
+        cookie = SimpleCookie(headers["Set-Cookie"])["sotto_session"].value
+        headers = {"Cookie": f"sotto_session={cookie}"}
+        _, content = self.request("/auth/me", 200, headers=headers)
+        return headers, json.loads(content)["user_id"]
+
+    def authorise(self, cookie, verifier, nonce):
+        query = urllib.parse.urlencode({
+            "client_id": CLIENT, "redirect_uri": self.callback, "response_type": "code",
+            "scope": "openid", "state": "fixture-state", "nonce": nonce,
+            "code_challenge": b64url(hashlib.sha256(verifier.encode()).digest()),
+            "code_challenge_method": "S256",
+        })
+        headers, _ = self.request(PREFIX + "/authorize?" + query, 303, headers=cookie)
+        assert headers["Location"].partition("?")[0] == self.callback
+        fields = redirect_query(headers)
+        assert fields["state"] == ["fixture-state"]
+        return fields["code"][0]
+
+    def sign(self, message):
+        der = output("openssl", "dgst", "-sha256", "-sign", str(self.directory / "deployment.pem"),
+                     input=message)
+        # OpenSSL emits a DER sequence of two integers. This fixture uses only P-256, where
+        # the lengths fit in a single byte and each raw coordinate occupies 32 bytes.
+        assert der[0] == 0x30 and der[1] == len(der) - 2 and der[2] == 2
+        second = 4 + der[3]
+        assert der[second] == 2 and second + 2 + der[second + 1] == len(der)
+        values = [der[4:second], der[second + 2:]]
+        return b"".join(int.from_bytes(value, "big").to_bytes(32, "big") for value in values)
+
+    def assertion(self, audience):
+        instant = int(time.time())
+        values = [
+            {"alg": "ES256", "typ": "client-authentication+jwt"},
+            {"iss": CLIENT, "sub": CLIENT, "aud": audience, "iat": instant,
+             "exp": instant + 60, "jti": uuid.uuid4().hex},
+        ]
+        signed = ".".join(b64url(json.dumps(part).encode()) for part in values)
+        return f"{signed}.{b64url(self.sign(signed.encode()))}"
+
+    def exchange(self, code, verifier, assertion, status):
+        body = urllib.parse.urlencode({
+            "grant_type": "authorization_code", "code": code, "redirect_uri": self.callback,
+            "code_verifier": verifier, "client_assertion": assertion,
+            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        })
+        _, result = self.request(PREFIX + "/token", status, "POST",
+                                 {"Content-Type": "application/x-www-form-urlencoded"}, body)
+        return json.loads(result)
+
+    def proof(self, method, path, body=None, stale=False):
+        components = {"@method": method, "@target-uri": self.origin + path}
+        headers = {}
+        if body is not None:
+            digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
+            components["content-digest"] = headers["Content-Digest"] = f"sha-256=:{digest}:"
+            headers["Content-Type"] = "application/json"
+        instant = int(time.time()) - (240 if stale else 0)
+        fields = " ".join(f'"{name}"' for name in components)
+        params = (f'({fields});created={instant};expires={instant + 60};nonce="{uuid.uuid4().hex}";'
+                  f'keyid="{CLIENT}";alg="ecdsa-p256-sha256"')
+        base = "\n".join(f'"{name}": {value}' for name, value in components.items())
+        base += f'\n"@signature-params": {params}'
+        signature = base64.b64encode(self.sign(base.encode())).decode()
+        return {**headers, "Signature-Input": f"fixture={params}", "Signature": f"fixture=:{signature}:"}
+
+
+def redirect_query(headers):
+    return urllib.parse.parse_qs(urllib.parse.urlsplit(headers["Location"]).query)
+
+
+def check(client):
+    _, metadata = client.request(PREFIX + "/.well-known/openid-configuration", 200)
+    metadata = json.loads(metadata)
+    assert metadata["issuer"] == client.issuer
+    assert metadata["jwks_uri"] == client.issuer + "/jwks"
+    _, keys_body = client.request(urllib.parse.urlsplit(metadata["jwks_uri"]).path, 200)
+    key = json.loads(keys_body)["keys"][0]
+    assert key["kty"] == "EC" and key["crv"] == "P-256" and key["alg"] == "ES256"
+    public_key = output("openssl", "pkey", "-pubin", "-in", str(client.directory / "issuer.pub.pem"),
+                        "-pubout", "-outform", "DER")
+    assert public_key[-65:] == b"\x04" + from_b64url(key["x"]) + from_b64url(key["y"])
+    alice, alice_id = client.login("fixture-alice")
+    _, bob_id = client.login("fixture-bob")
+    assert alice_id != bob_id
+    verifier, nonce = secrets.token_urlsafe(40), secrets.token_urlsafe(20)
+    code = client.authorise(alice, verifier, nonce)
+
+    for audience in (client.issuer + "/token", [client.issuer, client.origin]):
+        result = client.exchange(code, verifier, client.assertion(audience), 401)
+        assert result["error"] == "invalid_client"
+    result = client.exchange(code, secrets.token_urlsafe(40), client.assertion(client.issuer), 400)
+    assert result["error"] == "invalid_grant"
+    assertion = client.assertion(client.issuer)
+    result = client.exchange(code, verifier, assertion, 200)
+    header, payload, signature = result["id_token"].split(".")
+    claims = json.loads(from_b64url(payload))
+    token_header = json.loads(from_b64url(header))
+    assert claims["iss"] == client.issuer and claims["sub"] == alice_id and claims["nonce"] == nonce
+    assert claims["aud"] == CLIENT and token_header["alg"] == "ES256" and token_header["kid"] == key["kid"]
+    sig = from_b64url(signature)
+    assert len(sig) == 64
+    encoded = b""
+    for coordinate in (sig[:32], sig[32:]):
+        coordinate = coordinate.lstrip(b"\x00") or b"\x00"
+        if coordinate[0] & 0x80:
+            coordinate = b"\x00" + coordinate
+        encoded += b"\x02" + bytes([len(coordinate)]) + coordinate
+    signature_file = client.directory / "id-signature.der"
+    signature_file.write_bytes(b"\x30" + bytes([len(encoded)]) + encoded)
+    run("openssl", "dgst", "-sha256", "-verify", str(client.directory / "issuer.pub.pem"),
+        "-signature", str(signature_file), input=f"{header}.{payload}".encode(),
+        stdout=subprocess.DEVNULL)
+    assert client.exchange(code, verifier, assertion, 401)["error"] == "invalid_client"
+    assert client.exchange(code, verifier, client.assertion(client.issuer), 400)["error"] == "invalid_grant"
+
+    path = PREFIX + "/confirm"
+    attempt = str(uuid.uuid4())
+    body = json.dumps({"attempt_id": attempt}).encode()
+    client.request(path, 401, "POST", client.proof("POST", path, body, stale=True), body)
+    client.request(path, 401, "POST", client.proof("POST", path + "?wrong=target", body), body)
+    client.request(path, 401, "POST", client.proof("POST", path, body), body + b" ")
+    signature = client.proof("POST", path, body)
+    _, initial = client.request(path, 200, "POST", signature, body)
+    client.request(path, 401, "POST", signature, body)
+    _, retry = client.request(path, 200, "POST", client.proof("POST", path, body), body)
+    status = PREFIX + "/connection-status/" + attempt
+    client.request(status, 401, headers=client.proof("POST", status))
+    _, observed = client.request(status, 200, headers=client.proof("GET", status))
+    assert json.loads(initial) == json.loads(retry) == json.loads(observed)
+    assert json.loads(observed)["attempt_id"] == attempt
+    print("passed: Caddy routing, two mock identities, OIDC, signed requests and confirmation retry")
+
+
+def terminate(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--server", type=Path, required=True, help="path to the Sotto binary")
+    parser.add_argument("--caddy", default="caddy", help="Caddy with the Sotto rate limit plugin")
+    parser.add_argument("--callback", default="http://127.0.0.1:8081/login/oauth2/code/sotto")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="exercise the fixture through Caddy and exit")
+    mode.add_argument("--check-default", action="store_true", help="prove the default build has no fixture routes")
+    args = parser.parse_args()
+    if args.check and not __debug__:
+        parser.error("--check requires Python assertions to be enabled")
+
+    signal.signal(signal.SIGTERM, terminate)
+    with tempfile.TemporaryDirectory(prefix="sotto-access-protocol-") as temp, contextlib.ExitStack() as stack:
+        directory = Path(temp)
+        keys(directory)
+        edge_port, api_port = port(), port()
+        while api_port == edge_port:
+            api_port = port()
+        client = Client(edge_port, directory, args.callback)
+        # Do not import a developer's Cloud flags, OAuth credentials or database configuration.
+        env = {
+            "PATH": os.environ["PATH"], "XDG_DATA_HOME": str(directory), "XDG_CONFIG_HOME": str(directory),
+            "DATABASE_URL": postgres(stack), "SOTTO_DEPLOYMENT_MODE": "self_hosted",
+            "SOTTO_BIND": f"127.0.0.1:{api_port}", "SOTTO_PUBLIC_URL": client.origin,
+            "SOTTO_WEB_ORIGIN": client.origin, "SOTTO_TELEMETRY": "off",
+            "GITHUB_CLIENT_ID": "fixture", "GITHUB_CLIENT_SECRET": "fixture",
+            "SOTTO_E2E_ACCESS_CALLBACK": args.callback,
+            "SOTTO_E2E_ACCESS_DEPLOYMENT_KEY": str(directory / "deployment.pub.pem"),
+            "SOTTO_E2E_ACCESS_ISSUER_KEY": str(directory / "issuer.pem"),
+            "SOTTO_DOMAIN": f"localhost:{edge_port}", "SOTTO_API": f"127.0.0.1:{api_port}",
+        }
+        config = edge_config(args.caddy, directory, env, edge_port)
+        server = start(stack, [str(args.server.resolve())], env, directory / "server.log")
+        caddy = start(stack, [args.caddy, "run", "--config", str(config)], env, directory / "caddy.log")
+
+        def ready():
+            for process, name in ((server, "Sotto"), (caddy, "Caddy")):
+                if process.poll() is not None:
+                    raise RuntimeError(f"{name} exited early with status {process.returncode}")
+            try:
+                client.request("/health/ready", 200)
+                return True
+            except RuntimeError:
+                return False
+
+        wait_for("Sotto and Caddy", ready)
+        if args.check_default:
+            client.request(PREFIX + "/.well-known/openid-configuration", 404)
+            client.request(PREFIX + "/jwks", 404)
+            client.request(PREFIX + "/authorize", 404)
+            client.request(PREFIX + "/token", 404, "POST")
+            client.request(PREFIX + "/confirm", 404, "POST")
+            client.request(PREFIX + "/connection-status/" + str(uuid.uuid4()), 404)
+            print("passed: default Sotto build has no Access fixture routes")
+        elif args.check:
+            check(client)
+        else:
+            settings = {
+                "issuer": client.issuer,
+                "discovery": client.issuer + "/.well-known/openid-configuration",
+                "client_id": CLIENT, "callback": args.callback, "ca": str(directory / "tls.crt"),
+                "deployment_key_path": str(directory / "deployment.pem"),
+            }
+            settings_path = directory / "connection.json"
+            settings_path.write_text(json.dumps(settings) + "\n")
+            print(f"Fixture ready. Connection details: {settings_path}", flush=True)
+            try:
+                while server.poll() is None and caddy.poll() is None:
+                    time.sleep(0.5)
+            except KeyboardInterrupt:
+                return
+            raise RuntimeError("a fixture process exited")
+
+
+if __name__ == "__main__":
+    main()
