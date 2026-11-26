@@ -1,0 +1,10 @@
+openapi: 3.1.0
+info:
+  title: Sotto Access integration
+  version: 0.1.0
+  description: >
+    Contract under development. The separate OpenID Connect issuer establishes Sotto identity.
+    This document does not advertise any version 1 operations.
+servers:
+  - url: /integrations/access/v1
+paths: {}
