@@ -169,7 +169,7 @@ async fn discovery(Extension(fixture): Extension<Fixture>) -> Json<Value> {
 }
 
 async fn jwks(Extension(fixture): Extension<Fixture>) -> Json<Value> {
-    let key = fixture.0.issuer_key.verifying_key().to_encoded_point(false);
+    let key = fixture.0.issuer_key.verifying_key().to_sec1_point(false);
     let x = URL_SAFE_NO_PAD.encode(key.x().expect("uncompressed issuer key"));
     let y = URL_SAFE_NO_PAD.encode(key.y().expect("uncompressed issuer key"));
     Json(json!({"keys": [{
