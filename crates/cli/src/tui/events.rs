@@ -42,6 +42,12 @@ pub fn handle_key_event(app: &mut TuiApp, key: KeyEvent) -> Result<()> {
             KeyCode::End => {
                 app.theme_end();
             }
+            KeyCode::PageUp => {
+                app.theme_page_up();
+            }
+            KeyCode::PageDown => {
+                app.theme_page_down();
+            }
             _ => {}
         }
         return Ok(());
@@ -1703,6 +1709,94 @@ mod tests {
             assert!(app.search_mode);
             assert_eq!(app.search_query, "api");
             assert_eq!(app.config.environment, "dev");
+        });
+    }
+
+    /// Redraw the theme picker on a 80x12 terminal, which shows five theme rows, and return the
+    /// rendered buffer so a test can check the highlighted theme is on screen.
+    fn draw_theme_picker(
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        app: &TuiApp,
+    ) -> String {
+        terminal.draw(|f| crate::tui::ui::draw(f, app)).unwrap();
+        format!("{:?}", terminal.backend().buffer())
+    }
+
+    fn open_paged_theme_picker(app: &mut TuiApp) {
+        app.available_themes = (0..15)
+            .map(|i| {
+                let mut theme = crate::theme::Theme::nord();
+                theme.name = format!("custom-{i:02}");
+                theme
+            })
+            .collect();
+        app.selected_theme_index = 0;
+        app.preview_selected_theme();
+        app.show_theme_modal = true;
+    }
+
+    #[test]
+    fn theme_picker_page_keys_move_by_visible_page_and_clamp() {
+        with_unlocked_dashboard(&[], |_, tui_app| {
+            assert_eq!(tui_app.original_theme.name, "nord");
+            open_paged_theme_picker(tui_app);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            let content = draw_theme_picker(&mut terminal, tui_app);
+            assert!(content.contains("↓ more"));
+            assert_eq!(tui_app.theme_modal_page_size.get(), 5);
+
+            // 15 themes with five per page: two full pages, then a partial final page.
+            for expected in [5, 10, 14, 14] {
+                handle_key_event(tui_app, key(KeyCode::PageDown)).unwrap();
+                assert_eq!(tui_app.selected_theme_index, expected);
+                let name = format!("custom-{expected:02}");
+                assert_eq!(tui_app.current_theme.name, name);
+                assert!(draw_theme_picker(&mut terminal, tui_app).contains(&name));
+            }
+
+            for expected in [9, 4, 0, 0] {
+                handle_key_event(tui_app, key(KeyCode::PageUp)).unwrap();
+                assert_eq!(tui_app.selected_theme_index, expected);
+                let name = format!("custom-{expected:02}");
+                assert_eq!(tui_app.current_theme.name, name);
+                assert!(draw_theme_picker(&mut terminal, tui_app).contains(&name));
+            }
+            assert!(tui_app.show_theme_modal);
+
+            // Escape after paging restores the theme that was active when the picker opened.
+            handle_key_event(tui_app, key(KeyCode::PageDown)).unwrap();
+            assert_eq!(tui_app.current_theme.name, "custom-05");
+            handle_key_event(tui_app, key(KeyCode::Esc)).unwrap();
+            assert!(!tui_app.show_theme_modal);
+            assert_eq!(tui_app.current_theme.name, "nord");
+        });
+    }
+
+    #[test]
+    fn theme_picker_enter_after_paging_applies_highlighted_theme() {
+        with_unlocked_dashboard(&[], |_, tui_app| {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let isolated_config = temp_dir.path().join("config.toml");
+            tui_app.config_path = Some(isolated_config.clone());
+
+            open_paged_theme_picker(tui_app);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+            draw_theme_picker(&mut terminal, tui_app);
+
+            handle_key_event(tui_app, key(KeyCode::PageDown)).unwrap();
+            handle_key_event(tui_app, key(KeyCode::PageDown)).unwrap();
+            handle_key_event(tui_app, key(KeyCode::PageUp)).unwrap();
+            assert_eq!(tui_app.selected_theme_index, 5);
+            handle_key_event(tui_app, key(KeyCode::Enter)).unwrap();
+
+            assert!(!tui_app.show_theme_modal);
+            assert_eq!(tui_app.current_theme.name, "custom-05");
+            let loaded = crate::remote::config::GlobalConfig::load_from(&isolated_config)
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.theme.as_deref(), Some("custom-05"));
         });
     }
 }
