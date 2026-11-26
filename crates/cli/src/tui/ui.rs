@@ -493,6 +493,7 @@ fn draw_theme_modal(f: &mut Frame, app: &TuiApp, area: Rect) {
     let max_visible = (popup_height.saturating_sub(5) as usize)
         .max(1)
         .min(total_themes);
+    app.theme_modal_page_size.set(max_visible);
 
     // Compute the scrolling window so selected_theme_index is always visible
     let start_idx = if app.selected_theme_index >= max_visible {
