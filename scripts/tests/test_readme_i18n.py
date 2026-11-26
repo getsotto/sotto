@@ -3,6 +3,10 @@
 import importlib.machinery
 import importlib.util
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -89,6 +93,55 @@ class HelperTest(unittest.TestCase):
     def test_unclosed_fence_raises(self):
         with self.assertRaises(ValueError):
             checker.fenced_blocks("```sh\nnever closed\n")
+
+
+class MissingGuideTest(unittest.TestCase):
+    """A guide linked from every README must exist."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        for name in (checker.SOURCE,) + checker.TRANSLATIONS:
+            text = (ROOT / name).read_text(encoding="utf-8")
+            (self.tmp / name).write_text(text + "\n[Guide](MISSING-GUIDE.md#setup)\n", encoding="utf-8")
+        # Stand in for the guides the shipped READMEs already link, so only the new link is missing.
+        for name in (checker.SOURCE,) + checker.TRANSLATIONS:
+            for path in checker.missing_local_guides((self.tmp / name).read_text(encoding="utf-8"), self.tmp):
+                if path != "MISSING-GUIDE.md":
+                    (self.tmp / path).parent.mkdir(parents=True, exist_ok=True)
+                    (self.tmp / path).write_text("# stand-in\n", encoding="utf-8")
+
+    def test_missing_guide_names_each_readme_and_path(self):
+        errors = checker.check_root(self.tmp)
+        for name in (checker.SOURCE,) + checker.TRANSLATIONS:
+            self.assertIn(f"{name}: linked guide not found: MISSING-GUIDE.md", errors)
+
+    def test_command_exits_nonzero_for_missing_guide(self):
+        out = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/check-readme-i18n"), "--root", str(self.tmp)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(out.returncode, 1)
+        self.assertIn("README.fr.md: linked guide not found: MISSING-GUIDE.md", out.stdout)
+
+    def test_creating_the_guide_passes_again(self):
+        self.assertNotEqual(checker.check_root(self.tmp), [])
+        (self.tmp / "MISSING-GUIDE.md").write_text("# Guide\n", encoding="utf-8")
+        self.assertEqual(checker.check_root(self.tmp), [])
+
+    def test_links_in_fences_urls_and_fragments_are_ignored(self):
+        text = "[a](https://example.com/x.md) [b](#top)\n```md\n[c](nope.md)\n```\n"
+        self.assertEqual(checker.missing_local_guides(text, self.tmp), [])
+
+    def test_inline_code_and_percent_encoding(self):
+        (self.tmp / "my g.md").write_text("x", encoding="utf-8")
+        text = "`[a](nope.md)` [b](my%20g.md)"
+        self.assertEqual(checker.missing_local_guides(text, self.tmp), [])
+
+    def test_fragment_is_stripped_before_checking(self):
+        (self.tmp / "docs").mkdir(exist_ok=True)
+        (self.tmp / "docs/guide.md").write_text("x", encoding="utf-8")
+        self.assertEqual(checker.missing_local_guides("[g](docs/guide.md#setup)", self.tmp), [])
 
 
 class RepoTest(unittest.TestCase):

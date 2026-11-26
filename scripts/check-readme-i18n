@@ -14,6 +14,7 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
+from urllib.parse import unquote
 
 SOURCE = "README.md"
 TRANSLATIONS = ("README.es.md", "README.fr.md", "README.de.md", "README.pt-BR.md")
@@ -75,6 +76,22 @@ def link_destinations(text):
     return Counter(dsts)
 
 
+def missing_local_guides(text, base):
+    """Relative Markdown links outside fenced code whose file does not exist.
+
+    Offline only: external URLs and same-page fragments are skipped, and the
+    file part of `guide.md#section` is checked relative to the referring file."""
+    missing = []
+    for dst in LINK_DST_RE.findall(CODE_SPAN_RE.sub("", strip_fenced(text))):
+        path = unquote(dst.split("#")[0].split("?")[0])
+        if not path or "://" in path or path.startswith(("mailto:", "/")):
+            continue
+        if path.lower().endswith(".md") and not (base / path).is_file():
+            if path not in missing:
+                missing.append(path)
+    return missing
+
+
 def code_spans(text):
     return Counter(CODE_SPAN_RE.findall(strip_fenced(text)))
 
@@ -129,6 +146,8 @@ def check_root(root):
         source_text = read(root / SOURCE)
     except OSError as exc:
         return [f"{SOURCE}: cannot read ({exc})"]
+    for path in missing_local_guides(source_text, root):
+        errors.append(f"{SOURCE}: linked guide not found: {path}")
     for name in TRANSLATIONS:
         if f"({name})" not in source_text:
             errors.append(f"{SOURCE}: missing nav link to {name}")
@@ -138,6 +157,8 @@ def check_root(root):
             errors.append(f"{name}: file missing")
             continue
         errors.extend(check_translation(source_text, trans_text, name))
+        for path in missing_local_guides(trans_text, root):
+            errors.append(f"{name}: linked guide not found: {path}")
     return errors
 
 
