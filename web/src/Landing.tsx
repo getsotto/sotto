@@ -20,6 +20,9 @@ export function Landing({
 }: { cloudPricingVisible?: boolean } = {}) {
   return (
     <main className="landing">
+      <a className="skip-link" href="#content">
+        Skip to content
+      </a>
       <header>
         <span className="wordmark">Sotto</span>
         <nav aria-label="Site">
@@ -34,7 +37,7 @@ export function Landing({
         </nav>
       </header>
 
-      <section className="hero">
+      <section className="hero" id="content" tabIndex={-1}>
         <h1>
           Stop Slacking your <code>.env</code> files.
         </h1>
