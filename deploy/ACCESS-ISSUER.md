@@ -9,6 +9,7 @@ The Access issuer is an opt-in feature for a self-hosted Sotto installation. Con
 | `SOTTO_ACCESS_DEPLOYMENT_PUBLIC_KEY_FILE` | Path inside the server to the deployment's P-256 public key in PEM format |
 | `SOTTO_ACCESS_ISSUER_PRIVATE_KEY_FILE` | Path inside the server to Sotto's separate PKCS#8 P-256 private key in PEM format |
 | `SOTTO_ACCESS_ISSUER_PREVIOUS_PUBLIC_KEY_FILE` | Optional path to the previous issuer's P-256 public key in PEM format |
+| `SOTTO_ACCESS_SETUP_CALLBACK_URL` | Enables connection management. Set a separate exact HTTPS URL on the registered Access application's origin for the setup handoff. |
 
 Mount keys as read-only files and keep private keys readable only by the service that uses them. The Access service holds the deployment private key. Sotto holds the issuer private key. Restart Sotto after changing the registration or key files.
 
@@ -35,6 +36,14 @@ During a planned issuer rotation, keep the old public key published in JWKS with
 
 For deployment key rotation, coordinate a switch of Access's private key and Sotto's registered public key. Sotto accepts one deployment public key at a time. The previous deployment key and authorisation codes tied to its registration cease to work after the switch.
 
+## Manage an organisation connection
+
+With a setup callback configured, a current owner can inspect the connection or start, rotate or disconnect it through the version 1 API. A start or rotation returns a URL with a one-time code in the fragment. The Access setup page can read the fragment, clear it from the address bar and pass the code to its own backend. The backend signs the redemption request and receives a credential that stays staged for up to ten minutes. An unused handoff code also expires after ten minutes.
+
+After storing the credential, Access verifies it with Sotto, then signs a confirmation containing the same credential. Sotto activates the credential only after verification and confirmation. After a lost response, sign a new confirmation for the same attempt to retrieve the current receipt. A revoked, superseded or expired pending attempt requires a fresh owner handoff.
+
+Routine rotation leaves the existing credential active until the new credential is confirmed. Disconnect revokes active and staged credentials directly in Sotto. The owner status reports an expired pending attempt so the owner can restart setup or rotation. A change to the registered deployment key or callback invalidates credentials bound to the previous registration. An owner can rotate or disconnect that connection.
+
 ## Contract
 
-The [version 1 OpenAPI document](../contracts/access/v1.openapi.yaml) is the canonical placeholder for the JSON integration surface. Add implemented operations and executable contract checks together. Publish a supported version when its operations and compatibility have been verified.
+The [version 1 OpenAPI document](../contracts/access/v1.openapi.yaml) specifies the implemented owner and setup operations. Organisation metadata and deletion status are separate slices.

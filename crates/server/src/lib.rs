@@ -19,7 +19,9 @@
 
 #![allow(clippy::double_must_use)]
 
+pub mod access_connections;
 pub mod access_issuer;
+mod access_proof;
 #[cfg(feature = "e2e-access-protocol")]
 #[doc(hidden)]
 pub mod access_protocol_fixture;

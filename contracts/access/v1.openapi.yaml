@@ -3,8 +3,212 @@ info:
   title: Sotto Access integration
   version: 0.1.0
   description: >
-    Contract under development. The separate OpenID Connect issuer establishes Sotto identity.
-    This document does not advertise any version 1 operations.
+    Self-hosted owner-managed Access connections. Configure a setup callback to enable these routes.
+    Sotto issues identity through its separate OpenID Connect issuer.
 servers:
   - url: /integrations/access/v1
-paths: {}
+
+paths:
+  /orgs/{org_id}/connection:
+    parameters:
+      - $ref: '#/components/parameters/Organisation'
+    get:
+      operationId: getAccessConnection
+      security:
+        - sottoSession: []
+        - sessionCookie: []
+      responses:
+        '200':
+          description: Current connection and pending attempt, if present.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConnectionStatus' }
+        default: { $ref: '#/components/responses/Failure' }
+    delete:
+      operationId: disconnectAccess
+      security:
+        - sottoSession: []
+        - sessionCookie: []
+      responses:
+        '204':
+          description: Active and staged credentials are revoked.
+        default: { $ref: '#/components/responses/Failure' }
+  /orgs/{org_id}/connection/enable:
+    parameters:
+      - $ref: '#/components/parameters/Organisation'
+    post:
+      operationId: enableAccess
+      security:
+        - sottoSession: []
+        - sessionCookie: []
+      responses:
+        '200': { $ref: '#/components/responses/Handoff' }
+        default: { $ref: '#/components/responses/Failure' }
+  /orgs/{org_id}/connection/rotate:
+    parameters:
+      - $ref: '#/components/parameters/Organisation'
+    post:
+      operationId: rotateAccessCredential
+      security:
+        - sottoSession: []
+        - sessionCookie: []
+      responses:
+        '200': { $ref: '#/components/responses/Handoff' }
+        default: { $ref: '#/components/responses/Failure' }
+  /connection-attempts/redeem:
+    post:
+      operationId: redeemAccessHandoff
+      security:
+        - deploymentProof: []
+      parameters:
+        - $ref: '#/components/parameters/SignatureInput'
+        - $ref: '#/components/parameters/ContentDigest'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, writeOnly: true }
+      responses:
+        '200':
+          description: Single-use redemption returned a staged credential.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StagedCredential' }
+        default: { $ref: '#/components/responses/Failure' }
+  /connection-attempts/{attempt_id}/verify:
+    parameters:
+      - $ref: '#/components/parameters/Attempt'
+    post:
+      operationId: verifyStagedAccessCredential
+      security:
+        - stagedBearer: []
+      responses:
+        '204':
+          description: Sotto verified possession of the staged credential.
+        default: { $ref: '#/components/responses/Failure' }
+  /connection-attempts/{attempt_id}/confirm:
+    parameters:
+      - $ref: '#/components/parameters/Attempt'
+    post:
+      operationId: confirmAccessConnection
+      security:
+        - deploymentProof: []
+      parameters:
+        - $ref: '#/components/parameters/SignatureInput'
+        - $ref: '#/components/parameters/ContentDigest'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [credential]
+              properties:
+                credential: { type: string, writeOnly: true }
+      responses:
+        '200':
+          description: The credential is active. A new proof for the current attempt returns the same receipt.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Receipt' }
+        default: { $ref: '#/components/responses/Failure' }
+
+components:
+  securitySchemes:
+    sottoSession:
+      type: http
+      scheme: bearer
+      description: The actor must be a current organisation owner.
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: sotto_session
+      description: The actor must be a current organisation owner.
+    deploymentProof:
+      type: apiKey
+      in: header
+      name: Signature
+      description: >
+        RFC 9421 proof using ecdsa-p256-sha256 with the registered client ID as keyid.
+        Covers @method, @target-uri and content-digest in order. Sign the external HTTPS URL.
+        Include created, expires and a unique nonce. The maximum lifetime is 120 seconds.
+    stagedBearer:
+      type: http
+      scheme: bearer
+      description: The exact staged credential issued for this attempt.
+  parameters:
+    Organisation:
+      name: org_id
+      in: path
+      required: true
+      schema: { type: string }
+    Attempt:
+      name: attempt_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SignatureInput:
+      name: Signature-Input
+      in: header
+      required: true
+      schema: { type: string }
+    ContentDigest:
+      name: Content-Digest
+      in: header
+      required: true
+      description: RFC 9530 SHA-256 digest of the exact JSON bytes.
+      schema: { type: string }
+  schemas:
+    ConnectionStatus:
+      type: object
+      required: [connection, pending]
+      properties:
+        connection:
+          enum: [disconnected, active, registration_changed]
+        pending:
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [attempt_id, kind, state]
+              properties:
+                attempt_id: { type: string, format: uuid }
+                kind: { enum: [enable, rotate] }
+                state: { enum: [issued, staged, verified, expired] }
+    StagedCredential:
+      type: object
+      required: [attempt_id, organisation_id, credential, expires_in]
+      properties:
+        attempt_id: { type: string, format: uuid }
+        organisation_id: { type: string }
+        credential: { type: string }
+        expires_in: { type: integer, const: 600 }
+    Receipt:
+      type: object
+      required: [attempt_id, connection_id]
+      properties:
+        attempt_id: { type: string, format: uuid }
+        connection_id: { type: string, format: uuid }
+  responses:
+    Handoff:
+      description: Short-lived owner handoff. Use the URL fragment to read the code.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [attempt_id, handoff_url, expires_in]
+            properties:
+              attempt_id: { type: string, format: uuid }
+              handoff_url: { type: string, format: uri }
+              expires_in: { type: integer, const: 600 }
+    Failure:
+      description: >
+        400 malformed request, 401 invalid proof or credential, 403 actor is no longer an owner,
+        404 unavailable route or organisation, 409 expired, superseded or incompatible attempt.
+        A 409 requires a fresh owner handoff before retrying setup.
+      content:
+        text/plain:
+          schema: { type: string }

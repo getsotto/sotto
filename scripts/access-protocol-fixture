@@ -4,6 +4,7 @@
 import argparse
 import base64
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 from http.cookies import SimpleCookie
@@ -154,7 +155,8 @@ class Client:
             conn.request(method, path, body=body, headers=headers or {})
             response = conn.getresponse()
             content = response.read()
-            if response.status != status:
+            expected = status if isinstance(status, tuple) else (status,)
+            if response.status not in expected:
                 raise RuntimeError(f"{method} {path.partition('?')[0]} returned {response.status}, expected {status}")
             return response.headers, content
         finally:
@@ -218,7 +220,7 @@ class Client:
                                  {"Content-Type": "application/x-www-form-urlencoded"}, body)
         return json.loads(result)
 
-    def proof(self, method, path, body=None, stale=False):
+    def proof(self, method, path, body=None, stale=False, key="deployment.pem"):
         components = {"@method": method, "@target-uri": self.origin + path}
         headers = {}
         if body is not None:
@@ -231,7 +233,7 @@ class Client:
                   f'keyid="{CLIENT}";alg="ecdsa-p256-sha256"')
         base = "\n".join(f'"{name}": {value}' for name, value in components.items())
         base += f'\n"@signature-params": {params}'
-        signature = base64.b64encode(self.sign(base.encode())).decode()
+        signature = base64.b64encode(self.sign(base.encode(), key)).decode()
         return {**headers, "Signature-Input": f"fixture={params}", "Signature": f"fixture=:{signature}:"}
 
 
@@ -334,6 +336,136 @@ def check(client, container, issuer_key_overlap):
     print("passed: Caddy routing, two mock identities, OIDC, signed requests and confirmation retry")
 
 
+def check_connections(client, container):
+    owner, owner_id = client.login("fixture-owner")
+    admin, admin_id = client.login("fixture-admin")
+    org_id = str(uuid.uuid4())
+    base = "/integrations/access/v1"
+    connection = base + "/orgs/" + org_id + "/connection"
+    attempts = base + "/connection-attempts"
+
+    def db(statement, **variables):
+        command = ["docker", "exec", "-i", container, "psql", "-U", "postgres", "-d", "postgres",
+                   "-Atq", "-v", "ON_ERROR_STOP=1"]
+        for name, value in variables.items():
+            command += ["-v", f"{name}={value}"]
+        return output(*command, input=statement.encode()).decode().strip()
+
+    db("""
+        INSERT INTO organizations (id, enc_name) VALUES (:'org', decode('00', 'hex'));
+        INSERT INTO organization_memberships (org_id, user_id, role)
+        VALUES (:'org', :'owner', 'owner'), (:'org', :'admin', 'admin');
+    """, org=org_id, owner=owner_id, admin=admin_id)
+
+    def handoff(kind):
+        headers, content = client.request(connection + "/" + kind, 200, "POST", owner)
+        assert headers["Cache-Control"] == "no-store"
+        data = json.loads(content)
+        url = urllib.parse.urlsplit(data["handoff_url"])
+        assert url.path == "/access/setup" and not url.query and data["expires_in"] == 600
+        return data["attempt_id"], urllib.parse.parse_qs(url.fragment)["code"][0]
+
+    def signed(path, payload, status, **proof_options):
+        body = json.dumps(payload).encode()
+        signature = client.proof("POST", path, body, **proof_options)
+        headers, content = client.request(path, status, "POST", signature, body)
+        if status == 200:
+            assert headers["Cache-Control"] == "no-store"
+            return json.loads(content)
+        return None
+
+    def check_credential(credential, expected, scope=org_id):
+        client.request(f"{base}/orgs/{scope}/fixture-active-credential", expected, headers={
+            "Authorization": f"Bearer {credential}",
+        })
+
+    def verify(id, credential, expected=204):
+        client.request(f"{attempts}/{id}/verify", expected, "POST",
+                       {"Authorization": f"Bearer {credential}"})
+
+    client.request(connection + "/enable", 401, "POST")
+    client.request(connection + "/enable", 403, "POST", {**owner, "Origin": "https://other.invalid"})
+    client.request(connection + "/enable", 403, "POST", admin)
+    client.request(connection + "/rotate", 403, "POST", admin)
+    client.request(connection, 403, "DELETE", admin)
+    expired, expired_code = handoff("enable")
+    db("UPDATE access_connection_attempts SET expires_at = clock_timestamp() WHERE id = :'id';", id=expired)
+    signed(attempts + "/redeem", {"code": expired_code}, 409)
+    _, content = client.request(connection, 200, headers=owner)
+    assert json.loads(content)["pending"]["state"] == "expired"
+
+    id, code = handoff("enable")
+    path = attempts + "/redeem"
+    signed(path, {"code": code}, 401, key="issuer.pem")
+    signed(path, {"code": code}, 401, stale=True)
+    payload = json.dumps({"code": code}).encode()
+    signature = client.proof("POST", path, payload)
+    client.request(path, 401, "POST", signature, payload + b" ")
+    _, content = client.request(path, 200, "POST", signature, payload)
+    staged = json.loads(content)
+    token = staged["credential"]
+    assert staged["attempt_id"] == id and staged["organisation_id"] == org_id
+    client.request(path, 401, "POST", signature, payload)
+    signed(path, {"code": code}, 409)
+    confirm_path = f"{attempts}/{id}/confirm"
+    check_credential(token, 401)
+    signed(confirm_path, {"credential": token}, 409)
+    verify(id, "sac_wrong", 401)
+    verify(id, token)
+
+    db("""UPDATE organization_memberships SET role = 'admin'
+          WHERE org_id = :'org' AND user_id = :'owner';""", org=org_id, owner=owner_id)
+    signed(confirm_path, {"credential": token}, 403)
+    db("""UPDATE organization_memberships SET role = 'owner'
+          WHERE org_id = :'org' AND user_id = :'owner';""", org=org_id, owner=owner_id)
+    signed(confirm_path, {"credential": "sac_wrong"}, 401)
+    receipt = signed(confirm_path, {"credential": token}, 200)
+    assert receipt == signed(confirm_path, {"credential": token}, 200)
+    db("""UPDATE organization_memberships SET role = 'admin'
+          WHERE org_id = :'org' AND user_id = :'owner';""", org=org_id, owner=owner_id)
+    assert receipt == signed(confirm_path, {"credential": token}, 200)
+    db("""UPDATE organization_memberships SET role = 'owner'
+          WHERE org_id = :'org' AND user_id = :'owner';""", org=org_id, owner=owner_id)
+    check_credential(token, 204)
+    check_credential(token, 401, str(uuid.uuid4()))
+
+    rotation, rotation_code = handoff("rotate")
+    replacement = signed(path, {"code": rotation_code}, 200)["credential"]
+    verify(rotation, replacement)
+    check_credential(token, 204)
+    check_credential(replacement, 401)
+    db("UPDATE access_connection_attempts SET expires_at = clock_timestamp() WHERE id = :'id';", id=rotation)
+    signed(f"{attempts}/{rotation}/confirm", {"credential": replacement}, 409)
+    check_credential(token, 204)
+
+    rotation, rotation_code = handoff("rotate")
+    replacement = signed(path, {"code": rotation_code}, 200)["credential"]
+    verify(rotation, replacement)
+    rotated = signed(f"{attempts}/{rotation}/confirm", {"credential": replacement}, 200)
+    assert rotated["connection_id"] == receipt["connection_id"]
+    check_credential(replacement, 204)
+    check_credential(token, 401)
+    signed(confirm_path, {"credential": token}, 409)
+
+    rotation, rotation_code = handoff("rotate")
+    pending = signed(path, {"code": rotation_code}, 200)["credential"]
+    verify(rotation, pending)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        confirmation = workers.submit(signed, f"{attempts}/{rotation}/confirm", {"credential": pending}, (200, 409))
+        disconnection = workers.submit(client.request, connection, 204, "DELETE", owner)
+        confirmation.result()
+        disconnection.result()
+    signed(f"{attempts}/{rotation}/confirm", {"credential": pending}, 409)
+    check_credential(replacement, 401)
+    check_credential(pending, 401)
+    _, content = client.request(connection, 200, headers=owner)
+    assert json.loads(content) == {"connection": "disconnected", "pending": None}
+    assert db("SELECT count(*) FROM access_prior_links WHERE org_id = :'org';", org=org_id) == "1"
+    logs = (client.directory / "server.log").read_text() + (client.directory / "caddy.log").read_text()
+    assert all(value not in logs for value in (code, rotation_code, token, replacement, pending))
+    print("passed: owner-managed setup, expiry, confirmation retry, rotation, and concurrent disconnect through Caddy")
+
+
 def terminate(signum, _frame):
     raise SystemExit(128 + signum)
 
@@ -346,10 +478,13 @@ def main():
     parser.add_argument("--production-issuer", action="store_true", help="exercise the production issuer with mock GitHub")
     parser.add_argument("--postgres-image", default="postgres:16", help="PostgreSQL image reference or digest")
     parser.add_argument("--issuer-key-overlap", action="store_true", help="publish a previous production issuer key")
+    parser.add_argument("--connection-lifecycle", action="store_true", help="exercise owner-managed production connections")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="exercise the fixture through Caddy and exit")
     mode.add_argument("--check-default", action="store_true", help="prove the default build has no fixture routes")
     args = parser.parse_args()
+    if args.connection_lifecycle and not (args.production_issuer and args.check):
+        parser.error("--connection-lifecycle requires --production-issuer --check")
     if args.issuer_key_overlap and not args.production_issuer:
         parser.error("--issuer-key-overlap requires --production-issuer")
     if args.production_issuer and args.check_default:
@@ -387,6 +522,8 @@ def main():
                 "SOTTO_ACCESS_ISSUER_PREVIOUS_PUBLIC_KEY_FILE":
                     str(directory / "previous-issuer.pub.pem") if args.issuer_key_overlap else "",
             })
+        if args.connection_lifecycle:
+            env["SOTTO_ACCESS_SETUP_CALLBACK_URL"] = urllib.parse.urljoin(args.callback, "/access/setup")
         config = edge_config(args.caddy, directory, env, edge_port)
         server = start(stack, [str(args.server.resolve())], env, directory / "server.log")
         caddy = start(stack, [args.caddy, "run", "--config", str(config)], env, directory / "caddy.log")
@@ -415,6 +552,8 @@ def main():
             print("passed: default Sotto build has no Access routes without configuration")
         elif args.check:
             check(client, container, args.issuer_key_overlap)
+            if args.connection_lifecycle:
+                check_connections(client, container)
         else:
             settings = {
                 "issuer": client.issuer,

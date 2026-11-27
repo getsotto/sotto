@@ -32,24 +32,28 @@ const CLIENT_ID: &str = "SOTTO_ACCESS_CLIENT_ID";
 const CALLBACK: &str = "SOTTO_ACCESS_CALLBACK_URL";
 const DEPLOYMENT_KEY: &str = "SOTTO_ACCESS_DEPLOYMENT_PUBLIC_KEY_FILE";
 const ISSUER_KEY: &str = "SOTTO_ACCESS_ISSUER_PRIVATE_KEY_FILE";
+const SETUP_CALLBACK: &str = "SOTTO_ACCESS_SETUP_CALLBACK_URL";
 const PREVIOUS_KEY: &str = "SOTTO_ACCESS_ISSUER_PREVIOUS_PUBLIC_KEY_FILE";
 
 pub struct AccessIssuer {
-    origin: Url,
+    pub(crate) origin: Url,
     issuer: Url,
-    client_id: String,
+    pub(crate) client_id: String,
     callback: Url,
-    client_key: VerifyingKey,
+    pub(crate) client_key: VerifyingKey,
     signing_key: SigningKey,
     previous_key: Option<VerifyingKey>,
     key_id: String,
     registration: Vec<u8>,
+    pub(crate) setup_callback: Option<Url>,
 }
 
 impl AccessIssuer {
     pub fn from_env(mode: DeploymentMode, oauth: Option<&OAuthConfig>) -> Result<Option<Self>> {
         let previous_path = std::env::var_os(PREVIOUS_KEY).filter(|path| !path.is_empty());
+        let setup_path = std::env::var_os(SETUP_CALLBACK).filter(|value| !value.is_empty());
         if previous_path.is_none()
+            && setup_path.is_none()
             && [CLIENT_ID, CALLBACK, DEPLOYMENT_KEY, ISSUER_KEY]
                 .iter()
                 .all(|name| std::env::var_os(name).is_none())
@@ -77,6 +81,17 @@ impl AccessIssuer {
         }
         let issuer = origin.join(PREFIX).expect("static issuer path");
         let callback = configured_url(CALLBACK)?;
+        let setup_callback = setup_path
+            .map(|_| configured_url(SETUP_CALLBACK))
+            .transpose()?;
+        if setup_callback
+            .as_ref()
+            .is_some_and(|setup| setup.origin() != callback.origin() || setup == &callback)
+        {
+            return Err(Error::Config(
+                "Access setup requires a separate callback on the registered Access origin".into(),
+            ));
+        }
         let client_id = required(CLIENT_ID)?;
         if client_id.len() > 128
             || !client_id
@@ -115,11 +130,18 @@ impl AccessIssuer {
             previous_key,
             key_id,
             registration,
+            setup_callback,
         }))
     }
 
     pub fn router(self, state: AppState) -> Router {
+        let connections = if self.setup_callback.is_some() {
+            crate::access_connections::router()
+        } else {
+            Router::new()
+        };
         Router::new()
+            .merge(connections)
             .nest(
                 PREFIX,
                 Router::new()
@@ -131,6 +153,14 @@ impl AccessIssuer {
             .layer(DefaultBodyLimit::max(8192))
             .layer(Extension(Arc::new(self)))
             .with_state(state)
+    }
+
+    pub(crate) fn connection_registration(&self) -> Vec<u8> {
+        let mut material = self.registration.clone();
+        if let Some(callback) = &self.setup_callback {
+            material.extend_from_slice(callback.as_str().as_bytes());
+        }
+        Sha256::digest(material).to_vec()
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -166,7 +196,7 @@ fn configured_url(name: &str) -> Result<Url> {
             "{name} requires an HTTPS URL without credentials, query or fragment"
         )));
     }
-    if name == CALLBACK && value != url.as_str() {
+    if matches!(name, CALLBACK | SETUP_CALLBACK) && value != url.as_str() {
         return Err(Error::Config(
             "the Access callback must use its canonical URL form".into(),
         ));

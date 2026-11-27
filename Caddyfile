@@ -49,6 +49,8 @@ www.{$SOTTO_DOMAIN} {
 			fields {
 				request>headers>Cookie delete
 				request>headers>Authorization delete
+				request>headers>Signature delete
+				request>headers>Signature-Input delete
 				request>headers>Proxy-Authorization delete
 				resp_headers>Set-Cookie delete
 				# Not a credential header, and Caddy's default redaction never touches it: the OAuth
@@ -69,7 +71,7 @@ www.{$SOTTO_DOMAIN} {
 	# one office/NAT egress IP. The threshold is a generous starting point - raise it, or split
 	# into per-endpoint zones, to taste. Contact-verification POSTs are the deliberate exception:
 	# their dedicated per-IP zone below complements account/destination limits in the application.
-	@ratelimited path /auth/github/* /integrations/access/oidc/.well-known/openid-configuration /integrations/access/oidc/jwks /integrations/access/oidc/authorize /integrations/access/oidc/token /shares /shares/* /community /telemetry/* /health/ready /webhooks/resend
+	@ratelimited path /auth/github/* /integrations/access/oidc/.well-known/openid-configuration /integrations/access/oidc/jwks /integrations/access/oidc/authorize /integrations/access/oidc/token /integrations/access/v1/connection-attempts/* /shares /shares/* /community /telemetry/* /health/ready /webhooks/resend
 	handle @ratelimited {
 		rate_limit {
 			zone unauthenticated {
@@ -137,7 +139,7 @@ www.{$SOTTO_DOMAIN} {
 	# `crates/server/src/lib.rs` serve - keep the two in sync. Note that `path` matches exactly, so
 	# /health does not cover /health/ready: a new sub-path needs its own entry or it falls through
 	# to the SPA below and answers a probe with HTML.
-	@api path /health /server/info /auth/me /auth/logout /account /account/* /projects /projects/* /environments/* /orgs /orgs/* /machine/* /billing/* /ops/organisation-deletion/metrics /ops/organisation-deletion/* /ops/billing/transfers/* /ops/billing/founding-price-notices /ops/cloud/metrics /ops/cloud/coverage-rejections /ops/cloud/coverage-rejections/* /ops/cloud/retention /ops/cloud/retention/* /ops/cloud/notices /ops/cloud/notices/*
+	@api path /integrations/access/v1/orgs/* /health /server/info /auth/me /auth/logout /account /account/* /projects /projects/* /environments/* /orgs /orgs/* /machine/* /billing/* /ops/organisation-deletion/metrics /ops/organisation-deletion/* /ops/billing/transfers/* /ops/billing/founding-price-notices /ops/cloud/metrics /ops/cloud/coverage-rejections /ops/cloud/coverage-rejections/* /ops/cloud/retention /ops/cloud/retention/* /ops/cloud/notices /ops/cloud/notices/*
 	handle @api {
 		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
 	}
