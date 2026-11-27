@@ -59,3 +59,5 @@ scripts/access-protocol-fixture --server target/debug/sotto-server \
 Omit `--check` to feed the emitted connection file and fixture certificate to the Access Java sign-in test. Run only `SottoSignInIT` against the production issuer. Deployment proof operations belong to the original fixture and later production slices.
 
 The default production check starts with an empty previous-key setting and verifies that JWKS contains only the active key. Add `--issuer-key-overlap` to publish a previous key and check both keys while new tokens still use the active key. The Sotto server CI job runs both variants.
+
+Use `--production-issuer --connection-lifecycle --check` to exercise the owner connection routes, signed handoffs, staged verification, rotation and disconnect. This mode also checks the organisation credential validator through a route compiled only with the mock OAuth test feature.

@@ -260,7 +260,7 @@ jobs:
             --with github.com/mholt/caddy-ratelimit@v0.1.0 --output "$caddy_bin"
           cargo build --locked -p sotto-server --features e2e-mock-oauth
           scripts/access-protocol-fixture --server target/debug/sotto-server --caddy "$caddy_bin" \
-            --postgres-image "$postgres_image" --production-issuer --check
+            --postgres-image "$postgres_image" --production-issuer --connection-lifecycle --check
           scripts/access-protocol-fixture --server target/debug/sotto-server --caddy "$caddy_bin" \
             --postgres-image "$postgres_image" --production-issuer --issuer-key-overlap --check
       - name: Server authorisation and transaction assurance
