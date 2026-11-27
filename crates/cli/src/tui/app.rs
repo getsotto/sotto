@@ -87,6 +87,9 @@ pub struct TuiApp<'a> {
     pub original_theme: Theme,
     pub available_themes: Vec<Theme>,
     pub selected_theme_index: usize,
+    /// Number of theme rows the picker showed on its last frame, written by the renderer and
+    /// used as the Page Up / Page Down step.
+    pub theme_modal_page_size: Cell<usize>,
     pub show_theme_modal: bool,
     pub show_secret_modal: bool,
     pub secret_modal_mode: SecretModalMode,
@@ -148,6 +151,7 @@ impl<'a> TuiApp<'a> {
             original_theme: theme.clone(),
             available_themes: Vec::new(),
             selected_theme_index: 0,
+            theme_modal_page_size: Cell::new(1),
             show_theme_modal: false,
             show_secret_modal: false,
             secret_modal_mode: SecretModalMode::New,
@@ -495,6 +499,25 @@ impl<'a> TuiApp<'a> {
     pub fn theme_end(&mut self) {
         if !self.available_themes.is_empty() {
             self.selected_theme_index = self.available_themes.len() - 1;
+            self.preview_selected_theme();
+        }
+    }
+
+    /// Move the theme selection up by one visible page, stopping at the first theme.
+    pub fn theme_page_up(&mut self) {
+        if !self.available_themes.is_empty() {
+            let step = self.theme_modal_page_size.get().max(1);
+            self.selected_theme_index = self.selected_theme_index.saturating_sub(step);
+            self.preview_selected_theme();
+        }
+    }
+
+    /// Move the theme selection down by one visible page, stopping at the last theme.
+    pub fn theme_page_down(&mut self) {
+        if !self.available_themes.is_empty() {
+            let step = self.theme_modal_page_size.get().max(1);
+            let last_idx = self.available_themes.len() - 1;
+            self.selected_theme_index = (self.selected_theme_index + step).min(last_idx);
             self.preview_selected_theme();
         }
     }
