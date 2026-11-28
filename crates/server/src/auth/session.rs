@@ -7,7 +7,7 @@ use axum::extract::FromRequestParts;
 use axum::http::header::{AUTHORIZATION, COOKIE};
 use axum::http::request::Parts;
 use axum::http::HeaderMap;
-use dryoc::generichash::{GenericHash, Key as GhKey};
+use dryoc::generichash::{DefaultGenericHash, Key as GhKey};
 use sqlx::PgPool;
 
 use crate::error::{Error, Result};
@@ -126,7 +126,7 @@ pub fn clear_cookie(secure: bool) -> String {
 /// BLAKE2b hash of the token string; this is what we persist and compare against. Shared with
 /// machine tokens (`crate::machine`), which follow the same hash-only storage scheme.
 pub(crate) fn hash_token(token: &str) -> Vec<u8> {
-    GenericHash::hash_with_defaults_to_vec::<_, GhKey>(token.as_bytes(), None)
+    DefaultGenericHash::hash_to_vec::<_, GhKey>(token.as_bytes(), None)
         .expect("BLAKE2b over a small input cannot fail")
 }
 

@@ -12,7 +12,7 @@ exclude = ["fuzz"]
 version = "0.11.1"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.89"  # dryoc 0.8 requires Rust >= 1.89
+rust-version = "1.89"  # dryoc 2 requires Rust >= 1.89
 repository = "https://github.com/getsotto/sotto"
 
 [workspace.dependencies]
@@ -20,7 +20,7 @@ repository = "https://github.com/getsotto/sotto"
 sotto-core = { path = "crates/core" }
 
 # Crypto core: dryoc (pure-Rust libsodium) for Argon2, BLAKE2b kdf, X25519 sealed boxes, RNG.
-dryoc = "0.8"
+dryoc = "2.0.1"
 # AEAD: RustCrypto XChaCha20-Poly1305 (wasm32-safe; dryoc's secretstream panics on 32-bit).
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
 sha2 = "0.10"

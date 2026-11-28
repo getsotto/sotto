@@ -7,7 +7,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
-use dryoc::generichash::{GenericHash, Key as GhKey};
+use dryoc::generichash::{DefaultGenericHash, Key as GhKey};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
@@ -29,7 +29,7 @@ const BENEFICIARY_MIGRATION: i64 = 45;
 /// The stored form of a bearer token: the same BLAKE2b the server's `session::hash_token` uses,
 /// which is crate-private. The seeded token has to authenticate through the real extractor.
 fn hash_token(token: &str) -> Vec<u8> {
-    GenericHash::hash_with_defaults_to_vec::<_, GhKey>(token.as_bytes(), None).expect("hash")
+    DefaultGenericHash::hash_to_vec::<_, GhKey>(token.as_bytes(), None).expect("hash")
 }
 
 fn app(pool: PgPool) -> Router {
