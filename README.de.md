@@ -12,7 +12,7 @@
 
 # Sotto
 
-Ende-zu-Ende-verschlüsselte Secret-Synchronisierung für Entwicklerteams. Schluss mit `.env` per Slack.
+Open-Source-Zero-Knowledge-Secret-Manager und Ende-zu-Ende-verschlüsselte Secret-Synchronisierung für Entwicklerteams. Schluss mit `.env` per Slack.
 
 > [!WARNING]
 > Sotto ist Pre-1.0-Software und hat **kein** kryptografisches Audit durch Dritte durchlaufen. Es funktioniert Ende zu Ende,
@@ -299,6 +299,35 @@ in der ersten Umgebung) oder `>` (nur in der zweiten). Ohne `--confirm` ist die 
 Eine bestätigte Kopie fügt Geheimnisse hinzu und aktualisiert sie, lässt aber Schlüssel unverändert,
 die nur in der Zielumgebung vorhanden sind.
 
+Nutze für Skripte JSON statt der Markierung für die aktive Umgebung:
+
+```sh
+sotto env ls --json
+```
+
+Beispielausgabe für ein Projekt mit zwei lokalen Umgebungen:
+
+```json
+[{"active":true,"name":"dev"},{"active":false,"name":"staging"}]
+```
+
+Jedes Objekt enthält den Umgebungsnamen `name` und das Kennzeichen `active`. Eine leere Liste ist `[]`.
+So wählst du staging nur für diesen Befehl:
+
+```sh
+sotto --env staging env ls --json
+```
+
+Hier markiert `active` staging statt dev. Das speichert keinen neuen Standard;
+nutze dafür `sotto env use`, wie oben beschrieben. Fehlt der ausgewählte Name
+in der lokalen Liste, sind alle Kennzeichen falsch. Das Kennzeichen vergleicht Namen;
+es belegt weder den Zugriff auf eine Umgebung noch eine erfolgreiche Entschlüsselung.
+
+Der Befehl liest die lokalen Umgebungsmetadaten des konfigurierten Projekts, ohne
+den Tresor zu entsperren oder den Server zu kontaktieren. Anders als `sotto ls --json`
+listet er Umgebungen auf, keine Secret-Namen. JSON steht auf der Standardausgabe,
+Diagnosen auf der Standardfehlerausgabe.
+
 ### Projektkonfiguration
 
 `sotto init` und `sotto clone` schreiben eine `sotto.toml` in das aktuelle Verzeichnis. Sie verknüpft
@@ -347,6 +376,43 @@ globale `config.toml` mit rechnerweiten Einstellungen wie dem von `sotto login` 
 deinem Theme sowie die verschlüsselte `store.db` mit deinem Tresor. Beide gehören nicht in ein
 Repository. Siehe [Umgebungsvariablen](#umgebungsvariablen) für `SOTTO_DATA_DIR` und
 [Ausgabe-Themes](#ausgabe-themes) für den Standardort auf jeder Plattform.
+
+### Secret-Namen auflisten
+
+Liste in einem konfigurierten Projekt mit entsperrter lokaler Identität die
+Secret-Namen der ausgewählten Umgebung auf:
+
+```sh
+sotto ls
+```
+
+Beispiel mit zwei erfundenen Namen, sortiert und mit einem Namen pro Zeile:
+
+```text
+API_URL
+REGION
+```
+
+Nutze für Skripte JSON. So wählst du eine andere Umgebung nur für diesen Befehl:
+
+```sh
+sotto ls --json
+sotto --env staging ls --json
+```
+
+JSON-Beispiel für dieselben Namen:
+
+```json
+["API_URL","REGION"]
+```
+
+Eine leere Umgebung gibt keine Namenszeilen aus, mit JSON dagegen `[]`. Entfernte Secrets
+werden ausgelassen. Die Ausgabe enthält nur Namen, keine Werte oder Versionsnummern.
+`sotto env ls` listet Umgebungen auf; `sotto export` enthält Werte im Klartext.
+
+Die Liste kommt aus dem lokalen Speicher. Der Befehl kontaktiert den Server nicht und
+lädt keine neueren Änderungen herunter. Unter [Ein weiteres Gerät](#ein-weiteres-gerät)
+erfährst du, wie du die lokale Kopie aktualisierst.
 
 ### Eine dotenv-Datei importieren
 
@@ -682,9 +748,33 @@ Mit `sotto --help` rufst du die Hilfe ausdrücklich auf.
 
 Navigiere mit den Pfeiltasten oder `j` und `k`. Drücke `/` zum Suchen, `?` für die Hilfe, Tab zum Wechsel zur nächsten Umgebung und Shift+Tab zum Wechsel zur vorherigen. Der Wechsel gilt nur für die Dashboard-Sitzung; `sotto env use` ändert
 die Standardumgebung des Projekts. Mit `r` zeigst du den ausgewählten Wert an oder verbirgst ihn,
-mit `c` kopierst du ihn in die Zwischenablage und mit `q` beendest du das Dashboard. `Esc`
-schließt die aktuelle Suche oder ein Dialogfenster; in der Hauptansicht löscht es eine aktive
-Suche oder beendet das Dashboard.
+mit `R` lädst du die lokalen Geheimnisse der aktuellen Umgebung neu, mit `c` kopierst du ihn in
+die Zwischenablage und mit `q` beendest du das Dashboard. `Esc` schließt die aktuelle Suche oder
+ein Dialogfenster; in der Hauptansicht löscht es eine aktive Suche oder beendet das Dashboard.
+
+Drücke `h`, um den [lokalen Verlauf eines Secrets anzusehen und wiederherzustellen](LOCAL-HISTORY.md) (Anleitung auf Englisch).
+
+So erstellst du ein Secret in der normalen Dashboard-Navigation (nicht während einer Suche
+oder beim Bearbeiten eines Felds):
+
+1. Drücke `n`, um New Secret zu öffnen.
+2. Gib einen erfundenen Namen wie `DEMO_API_KEY` ein und wechsle mit Tab zum Wert.
+3. Gib einen Testwert wie `demo-only` ein oder drücke `Ctrl+G`, um einen Ersatz zu erzeugen.
+4. Drücke `Enter` zum Speichern.
+
+Im Modus New wechseln Tab und Shift+Tab zwischen Name und Wert. Wähle ein vorhandenes
+Secret und drücke `e`, um seinen Wert zu bearbeiten; Edit benennt es nicht um.
+New lehnt vorhandene Namen ab und lässt den Dialog offen. Nutze Edit zum Aktualisieren.
+
+Werte sind anfangs verdeckt. `Ctrl+R` zeigt oder verbirgt den Entwurfswert. `Ctrl+G`
+ersetzt ihn durch eine erzeugte Zeichenfolge mit 32 Zeichen, speichert sie aber nicht.
+`Enter` speichert den Dialog auch vom Namensfeld aus; `Esc` verwirft den ungespeicherten
+Entwurf und schließt den Dialog. Dieser Texteditor kann Nicht-UTF-8-Werte nicht bearbeiten;
+siehe [dateibasierte Secrets](README.md#file-backed-secrets).
+
+Speichern ändert nur die ausgewählte lokale Umgebung, ohne mit dem Server zu synchronisieren.
+Folge für eine spätere Synchronisation der [Push-Anleitung](README.md#quick-start) und gib
+dieselbe Umgebung ausdrücklich an, wenn du sie im Dashboard gewechselt hast.
 
 Drücke `t`, um Themes mit einer Live-Vorschau durchzugehen. Mit den Pfeiltasten siehst du jedes
 Theme. Drücke `Enter`, um deine Wahl zu speichern, oder `Esc`, um abzubrechen. Die

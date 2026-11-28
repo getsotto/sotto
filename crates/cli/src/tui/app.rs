@@ -192,6 +192,22 @@ impl<'a> TuiApp<'a> {
         Ok(())
     }
 
+    /// Reload the current environment from the local store and report the outcome.
+    ///
+    /// Failures stay on the dashboard as a status notice so the user can retry.
+    pub fn reload_local_secrets(&mut self) {
+        match self.refresh_secrets() {
+            Ok(()) => self.set_status(
+                StatusKind::Success,
+                format!("Reloaded local secrets for `{}`", self.config.environment),
+            ),
+            Err(err) => self.set_status(
+                StatusKind::Failure,
+                format!("Failed to reload local secrets: {err}"),
+            ),
+        }
+    }
+
     /// Filter the secret list using the current search query.
     pub fn apply_filter(&mut self) {
         if self.search_query.trim().is_empty() {
@@ -811,6 +827,25 @@ impl<'a> TuiApp<'a> {
     pub fn history_modal_end(&mut self) {
         if !self.history_modal_items.is_empty() {
             self.history_modal_selected_index = self.history_modal_items.len() - 1;
+        }
+    }
+
+    /// Move history selection up by a page step.
+    pub fn history_modal_page_up(&mut self, step: usize) {
+        if self.history_modal_selected_index > 0 {
+            self.history_modal_selected_index =
+                self.history_modal_selected_index.saturating_sub(step);
+        }
+    }
+
+    /// Move history selection down by a page step.
+    pub fn history_modal_page_down(&mut self, step: usize) {
+        if !self.history_modal_items.is_empty() {
+            let last_idx = self.history_modal_items.len() - 1;
+            if self.history_modal_selected_index < last_idx {
+                self.history_modal_selected_index =
+                    (self.history_modal_selected_index + step).min(last_idx);
+            }
         }
     }
 

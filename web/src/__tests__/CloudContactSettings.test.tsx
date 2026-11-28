@@ -10,7 +10,11 @@ vi.mock("../api", () => ({
   fetchCloudContactStatus: vi.fn(),
   revokeCloudContact: vi.fn(),
   startCloudContactVerification: vi.fn(),
-  UnsupportedCloudContactError: class UnsupportedCloudContactError extends Error {},
+  UnsupportedCloudContactError: class UnsupportedCloudContactError extends Error {
+    constructor() {
+      super("Email contact settings require a newer Sotto server version.");
+    }
+  },
 }));
 
 const emptyStatus: api.CloudContactStatus = {
@@ -208,6 +212,54 @@ describe("CloudContactSettings", () => {
 
     expect(await screen.findByText("p***@example.test")).toBeInTheDocument();
     expect(api.fetchCloudContactStatus).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { error: null, feedback: "This verification link is invalid or has expired.", role: "status" },
+    { error: new Error("verification unavailable"), feedback: "verification unavailable", role: "alert" },
+  ])("recovers the form after confirmation: $feedback", async ({ error, feedback, role }) => {
+    window.history.replaceState(null, "", `/cloud#contact_token=${"c".repeat(64)}`);
+    vi.mocked(api.confirmCloudContactVerification).mockImplementation(async () => {
+      expect(window.location.hash).toBe("");
+      if (error) throw error;
+      return false;
+    });
+
+    render(<CloudContactSettings />);
+
+    expect(await screen.findByText(feedback)).toHaveAttribute("role", role);
+    expect(screen.queryByText("Email address verified.")).not.toBeInTheDocument();
+    expect(screen.getByText("No verified email contact is set.")).toBeInTheDocument();
+    expect(api.fetchCloudContactStatus).toHaveBeenCalledOnce();
+    expect(api.confirmCloudContactVerification).toHaveBeenCalledOnce();
+    expect(window.location.hash).toBe("");
+    expect(screen.getByLabelText("Email address")).toBeEnabled();
+    await enterAddress("person@example.test");
+    expect(screen.getByRole("button", { name: "Send verification link" })).toBeEnabled();
+    expect(api.startCloudContactVerification).not.toHaveBeenCalled();
+  });
+
+  it("shows compatibility feedback when the server cannot confirm the link", async () => {
+    const feedback = "Email contact settings require a newer Sotto server version.";
+    window.history.replaceState(null, "", `/cloud#contact_token=${"d".repeat(64)}`);
+    vi.mocked(api.confirmCloudContactVerification).mockImplementation(async () => {
+      expect(window.location.hash).toBe("");
+      throw new api.UnsupportedCloudContactError();
+    });
+    vi.mocked(api.fetchCloudContactStatus).mockRejectedValue(
+      Object.assign(new api.UnsupportedCloudContactError(), { message: "synthetic server diagnostic" }),
+    );
+
+    render(<CloudContactSettings />);
+
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(feedback));
+    expect(screen.queryByText("synthetic server diagnostic")).not.toBeInTheDocument();
+    expect(screen.queryByText("Checking contact settings…")).not.toBeInTheDocument();
+    expect(screen.queryByText("Email address verified.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.fetchCloudContactStatus).toHaveBeenCalledOnce();
+    expect(api.confirmCloudContactVerification).toHaveBeenCalledOnce();
+    expect(window.location.hash).toBe("");
   });
 
   it("does not leave a failed initial status request looking like it is still loading", async () => {
@@ -611,5 +663,81 @@ describe("CloudContactSettings", () => {
       expect.any(String),
     ));
     expect(api.revokeCloudContact).not.toHaveBeenCalled();
+  });
+
+  describe("pending verification expiry display", () => {
+    it("renders the expiry date, time and time zone in a semantic <time> element for two distinct times on the same date", async () => {
+      // 2027-01-15T12:00:00.000Z and 2027-01-15T13:00:00.000Z fall on the same local date in every time zone.
+      const firstEpoch = 1_800_014_400;
+      const secondEpoch = 1_800_018_000;
+
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce({
+        ...emptyStatus,
+        pendingExpiresAtEpoch: firstEpoch,
+      });
+
+      const { unmount } = render(<CloudContactSettings />);
+
+      const firstParagraph = await screen.findByText(/A verification request is pending/);
+      const firstTime = firstParagraph.querySelector("time");
+      expect(firstTime).not.toBeNull();
+      expect(firstTime).toHaveAttribute("datetime", "2027-01-15T12:00:00.000Z");
+      expect(firstTime?.textContent).toMatch(/2027/);
+      expect(firstTime?.textContent).toMatch(/\d{1,2}:\d{2}/);
+      expect(firstParagraph).toHaveTextContent("You can request another link if it expires.");
+      expect(screen.getByRole("button", { name: "Resend verification link" })).toBeInTheDocument();
+
+      const firstVisibleText = firstTime?.textContent;
+      unmount();
+
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce({
+        ...emptyStatus,
+        pendingExpiresAtEpoch: secondEpoch,
+      });
+
+      render(<CloudContactSettings />);
+
+      const secondParagraph = await screen.findByText(/A verification request is pending/);
+      const secondTime = secondParagraph.querySelector("time");
+      expect(secondTime).not.toBeNull();
+      expect(secondTime).toHaveAttribute("datetime", "2027-01-15T13:00:00.000Z");
+      expect(secondTime?.textContent).toMatch(/2027/);
+      expect(secondTime?.textContent).toMatch(/\d{1,2}:\d{2}/);
+      expect(secondTime?.textContent).not.toBe(firstVisibleText);
+      expect(screen.getByRole("button", { name: "Resend verification link"} )).toBeInTheDocument();
+      expect(api.startCloudContactVerification).not.toHaveBeenCalled();
+    });
+
+    it("shows no pending-expiry message when pendingExpiresAtEpoch is null", async () => {
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce({
+        ...emptyStatus,
+        pendingExpiresAtEpoch: null,
+      });
+
+      render(<CloudContactSettings />);
+
+      expect(await screen.findByLabelText("Email address")).toBeInTheDocument();
+      expect(screen.queryByText(/verification request is pending/i)).not.toBeInTheDocument();
+      expect(document.querySelector("time")).toBeNull();
+      expect(screen.getByRole("button", { name: "Send verification link" })).toBeInTheDocument();
+    });
+
+    it.each([
+      ["NaN", Number.NaN],
+      ["Infinity", Number.POSITIVE_INFINITY],
+      ["out-of-range epoch", 1e20],
+    ])("retains generic pending guidance without rendering Invalid Date when pendingExpiresAtEpoch is %s", async (__label, invalidEpoch) => {
+      vi.mocked(api.fetchCloudContactStatus).mockResolvedValueOnce({
+        ...emptyStatus,
+        pendingExpiresAtEpoch: invalidEpoch,
+      });
+
+      render(<CloudContactSettings />);
+
+      expect(await screen.findByText("A verification request is pending. You can request another link if it expires."),).toBeInTheDocument();
+      expect(screen.queryByText(/Invalid Date/i)).not.toBeInTheDocument();
+      expect(document.querySelector("time")).toBeNull();
+      expect(screen.getByRole("button", { name: "Resend verification link" })).toBeInTheDocument();
+    });
   });
 });

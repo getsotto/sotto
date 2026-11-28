@@ -436,8 +436,8 @@ async function generateAll() {
       <div class="icon-box">${appIconSvg}</div>
       <div class="info">
         <h1>Sotto</h1>
-        <div class="tagline">Frictionless secret sync. Zero-knowledge by design.</div>
-        <p>End-to-end encrypted secret sync for developer teams. Stop Slacking your .env files. Built on an audited Rust cryptographic core with micro-radii industrial precision.</p>
+        <div class="tagline">Open-source, zero-knowledge secret manager.</div>
+        <p>End-to-end encrypted secret sync for developer teams. Stop Slacking your .env files. One Rust crypto core shared across native CLI and browser WebAssembly.</p>
       </div>
     </div>
     <div class="footer">
@@ -453,8 +453,171 @@ async function generateAll() {
   await page.setContent(showcaseHtml);
   const showcaseBuffer = await page.screenshot();
   fs.writeFileSync(path.join(brandDir, 'showcase.png'), showcaseBuffer);
-  fs.writeFileSync(path.join(publicDir, 'og-image.png'), showcaseBuffer);
-  console.log('✓ Generated showcase.png and og-image.png (1200x630)');
+  console.log('✓ Generated showcase.png (1200x630)');
+
+  // Generate Dedicated OpenGraph Social Preview Card (1200x630)
+  const ogCardHtml = `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      body {
+        width: 1200px;
+        height: 630px;
+        background: #0B0F17;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        color: #F8FAFC;
+        padding: 52px 60px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        border: 1px solid #1E293B;
+      }
+      .top-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+      .top-brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+      .top-brand .mark-wrap {
+        width: 40px;
+        height: 40px;
+        flex-shrink: 0;
+      }
+      .top-brand .mark-wrap svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      .top-brand .brand-text {
+        font-size: 28px;
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        color: #F8FAFC;
+      }
+      .top-badge {
+        font-family: ui-monospace, monospace;
+        font-size: 13px;
+        letter-spacing: 0.08em;
+        color: #38BDF8;
+        background: #111827;
+        border: 1px solid #1E293B;
+        padding: 6px 14px;
+        border-radius: 4px;
+        text-transform: uppercase;
+      }
+      .center-content {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 44px;
+      }
+      .hero-text {
+        flex: 1 1 auto;
+      }
+      .hero-text h1 {
+        font-size: 46px;
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        line-height: 1.12;
+        margin-bottom: 16px;
+      }
+      .hero-text .cyan {
+        color: #38BDF8;
+      }
+      .hero-text p {
+        font-size: 19px;
+        color: #94A3B8;
+        line-height: 1.5;
+        max-width: 565px;
+      }
+      .term-preview {
+        background: #070A10;
+        border: 1px solid #1E293B;
+        border-radius: 6px;
+        padding: 22px 24px;
+        font-family: ui-monospace, "SF Mono", monospace;
+        font-size: 14px;
+        line-height: 1.75;
+        width: 470px;
+        flex-shrink: 0;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+      }
+      .term-preview .prompt { color: #06B6D4; }
+      .term-preview .cmd { color: #F8FAFC; font-weight: 600; }
+      .term-preview .dim { color: #64748B; }
+      .term-preview .val { color: #38BDF8; }
+      .bottom-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-top: 1px solid #1E293B;
+        padding-top: 20px;
+        font-family: ui-monospace, monospace;
+        font-size: 13px;
+        color: #94A3B8;
+      }
+      .bottom-tags {
+        display: flex;
+        gap: 18px;
+      }
+      .tag span {
+        color: #06B6D4;
+        margin-right: 5px;
+      }
+      .domain {
+        color: #F8FAFC;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="top-row">
+      <div class="top-brand">
+        <div class="mark-wrap">${markDarkSvg}</div>
+        <div class="brand-text">Sotto</div>
+      </div>
+      <div class="top-badge">Open-Source · Apache-2.0</div>
+    </div>
+
+    <div class="center-content">
+      <div class="hero-text">
+        <h1>Zero-knowledge<br><span class="cyan">secret manager.</span></h1>
+        <p>Stop Slacking your .env files. Encrypt locally with one Rust crypto core for CLI and browser, sync ciphertext, or self-host.</p>
+      </div>
+
+      <div class="term-preview">
+        <div><span class="prompt">$ </span><span class="cmd">sotto import .env</span></div>
+        <div class="dim">imported 14 secret(s) into acme-api (dev)</div>
+        <div><span class="prompt">$ </span><span class="cmd">sotto run -- npm start</span></div>
+        <div class="dim">ready on http://localhost:3000</div>
+        <div><span class="prompt">$ </span><span class="cmd">sotto share DATABASE_URL</span></div>
+        <div class="val">https://getsotto.co.uk/s/8f2a...</div>
+      </div>
+    </div>
+
+    <div class="bottom-row">
+      <div class="bottom-tags">
+        <div class="tag"><span>●</span>XChaCha20-Poly1305</div>
+        <div class="tag"><span>●</span>X25519 Team Grants</div>
+        <div class="tag"><span>●</span>CLI + Browser WASM</div>
+        <div class="tag"><span>●</span>Self-Hostable</div>
+      </div>
+      <div class="domain">getsotto.co.uk</div>
+    </div>
+  </body>
+</html>`;
+
+  await page.setViewportSize({ width: 1200, height: 630 });
+  await page.setContent(ogCardHtml);
+  const ogBuffer = await page.screenshot();
+  fs.writeFileSync(path.join(publicDir, 'og-image.png'), ogBuffer);
+  console.log('✓ Generated og-image.png (1200x630)');
 
   // 3. Generate GitHub Organization / Repository Avatars (1024x1024 & 512x512)
   console.log('Generating GitHub Organization & Repository Avatar Assets...');
@@ -555,6 +718,12 @@ async function generateAll() {
       .top-brand .mark-wrap {
         width: 36px;
         height: 36px;
+        flex-shrink: 0;
+      }
+      .top-brand .mark-wrap svg {
+        width: 100%;
+        height: 100%;
+        display: block;
       }
       .top-brand .brand-text {
         font-size: 26px;
@@ -644,16 +813,17 @@ async function generateAll() {
 
     <div class="center-content">
       <div class="hero-text">
-        <h1>Frictionless secret sync.<br><span class="cyan">Zero-knowledge by design.</span></h1>
-        <p>Stop Slacking your .env files. Built on an audited Rust cryptographic core with native CLI and WebAssembly parity.</p>
+        <h1>Zero-knowledge<br><span class="cyan">secret manager.</span></h1>
+        <p>Stop Slacking your .env files. Open-source secret sync built on one Rust crypto core with native CLI and WebAssembly parity.</p>
       </div>
 
       <div class="term-preview">
+        <div><span class="prompt">$ </span><span class="cmd">sotto import .env</span></div>
+        <div class="dim">imported 14 secret(s) into acme-api (dev)</div>
         <div><span class="prompt">$ </span><span class="cmd">sotto run -- npm start</span></div>
-        <div class="dim">injected 14 secrets into environment</div>
+        <div class="dim">ready on http://localhost:3000</div>
         <div><span class="prompt">$ </span><span class="cmd">sotto share DATABASE_URL</span></div>
         <div class="val">https://getsotto.co.uk/s/8f2a...</div>
-        <div class="dim"># burns on first read</div>
       </div>
     </div>
 
@@ -662,7 +832,7 @@ async function generateAll() {
         <div class="tag"><span>●</span> XChaCha20-Poly1305</div>
         <div class="tag"><span>●</span> X25519 Key Wrapping</div>
         <div class="tag"><span>●</span> Argon2id KDF</div>
-        <div class="tag"><span>●</span> Anycast Edge Mesh</div>
+        <div class="tag"><span>●</span> Self-Hostable</div>
       </div>
       <div>getsotto.co.uk</div>
     </div>

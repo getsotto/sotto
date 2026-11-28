@@ -30,7 +30,7 @@ www.{$SOTTO_DOMAIN} {
 }
 
 {$SOTTO_DOMAIN:localhost} {
-	encode gzip
+	encode zstd gzip
 
 	# JSON access logs - ops forensics and the funnel's demand counter: a 402 in these logs is a
 	# free-tier limit hit. Written to the caddy_logs volume (deploy/docker-compose.prod.yml) and
@@ -69,7 +69,7 @@ www.{$SOTTO_DOMAIN} {
 	# one office/NAT egress IP. The threshold is a generous starting point - raise it, or split
 	# into per-endpoint zones, to taste. Contact-verification POSTs are the deliberate exception:
 	# their dedicated per-IP zone below complements account/destination limits in the application.
-	@ratelimited path /auth/github/* /shares /shares/* /community /telemetry/* /health/ready /webhooks/resend
+	@ratelimited path /auth/github/* /integrations/access/oidc/.well-known/openid-configuration /integrations/access/oidc/jwks /integrations/access/oidc/authorize /integrations/access/oidc/token /shares /shares/* /community /telemetry/* /health/ready /webhooks/resend
 	handle @ratelimited {
 		rate_limit {
 			zone unauthenticated {
@@ -142,7 +142,10 @@ www.{$SOTTO_DOMAIN} {
 		reverse_proxy {$SOTTO_API:127.0.0.1:8080}
 	}
 
-	# Fold trailing slashes on the six indexable guide slugs onto their canonical clean URLs
+	# Canonicalise /index.html onto the apex homepage so crawlers never see a duplicate root URL.
+	redir /index.html / permanent
+
+	# Fold trailing slashes on the indexable guide slugs onto their canonical clean URLs
 	# so crawlers and no-script visitors get the prerendered guide, not the homepage snapshot.
 	# Keep in sync with `guidePages` in web/src/seo/pages.ts. Ordinary SPA routes (`/app/`,
 	# `/s/:token`, unknown paths) are left to try_files below.
@@ -152,6 +155,15 @@ www.{$SOTTO_DOMAIN} {
 	redir /share-api-keys-securely/ /share-api-keys-securely permanent
 	redir /send-password-securely/ /send-password-securely permanent
 	redir /self-hosted-secret-management/ /self-hosted-secret-management permanent
+	redir /open-source-secret-manager/ /open-source-secret-manager permanent
+	redir /cli-secret-manager/ /cli-secret-manager permanent
+	redir /dotenv-alternative/ /dotenv-alternative permanent
+	redir /ci-cd-secret-manager/ /ci-cd-secret-manager permanent
+
+	# Keep private application, share-link, auth, and API paths out of search indexes even when
+	# linked externally (robots.txt stops crawling, X-Robots-Tag stops URL-only indexing).
+	@noindex path /app /app/* /cloud /cloud/* /s/* /auth/* /account /account/* /projects /projects/* /environments/* /orgs /orgs/* /machine/* /billing/* /shares /shares/* /community /telemetry/* /health /health/* /ops/* /webhooks/*
+	header @noindex X-Robots-Tag "noindex, nofollow"
 
 	# Everything else is the SPA, including client-side routes (/, /app, /s/:token, /auth/callback).
 	# The middle branch serves the prerendered guide files the build emits (`/<slug>` reads
@@ -163,11 +175,13 @@ www.{$SOTTO_DOMAIN} {
 		file_server
 
 		# Caching: Vite's content-hashed assets never change under the same name, so they may be
-		# cached forever; everything else (index.html, favicons) must revalidate each load via the
-		# ETag, so a deploy is visible on the next refresh. Without this, browsers cache the SPA
-		# heuristically and keep showing a stale build after upgrades. `?` = set only if unset.
+		# cached forever; static brand images and icons cache for a day; everything else
+		# (HTML, robots.txt, sitemap.xml, llms.txt) revalidates each load via ETag so a deploy
+		# is visible on the next refresh. `?` = set only if unset.
 		@hashed path /assets/*
 		header @hashed Cache-Control "public, max-age=31536000, immutable"
+		@static_media path /og-image.png /github-social-preview.png /icon-*.png /favicon* /apple-touch-icon.png /mark-*.svg /site.webmanifest
+		header @static_media Cache-Control "public, max-age=86400"
 		header ?Cache-Control "no-cache"
 	}
 

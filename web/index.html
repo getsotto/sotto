@@ -5,25 +5,44 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       name="description"
-      content="End-to-end encrypted secret sync for developer teams. Stop Slacking your .env files."
+      content="Sotto (getsotto) is an open-source, zero-knowledge secret manager for developer teams. Sync .env files, inject CLI secrets, self-host, or send one-time links."
     />
-    <meta property="og:title" content="Sotto: end-to-end encrypted secret sync" />
+    <meta
+      name="robots"
+      content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1"
+    />
+    <meta name="application-name" content="Sotto" />
+    <meta name="author" content="Sotto (getsotto)" />
+    <meta property="og:locale" content="en_GB" />
+    <meta property="og:title" content="Sotto - Open-Source Encrypted Secret Manager for Developers" />
     <meta
       property="og:description"
-      content="Stop Slacking your .env files. Secrets are encrypted before they leave your machine; the server only ever stores ciphertext."
+      content="Sotto (getsotto) is an open-source, zero-knowledge secret manager for developer teams. Sync .env files, inject CLI secrets, self-host, or send one-time links."
     />
     <meta property="og:type" content="website" />
     <meta property="og:site_name" content="Sotto" />
     <meta property="og:url" content="__SOTTO_PUBLIC_URL__/" />
-    <meta property="og:image" content="__SOTTO_PUBLIC_URL__/icon-512.png" />
-    <meta property="og:image:alt" content="Sotto logo" />
-    <meta name="twitter:card" content="summary" />
-    <meta name="twitter:title" content="Sotto: end-to-end encrypted secret sync" />
+    <meta property="og:image" content="__SOTTO_PUBLIC_URL__/og-image.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta
+      property="og:image:alt"
+      content="Sotto (getsotto.co.uk) - Open-source zero-knowledge secret manager for developer teams"
+    />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Sotto - Open-Source Encrypted Secret Manager for Developers" />
     <meta
       name="twitter:description"
-      content="Stop Slacking your .env files. Secrets are encrypted before they leave your machine; the server only ever stores ciphertext."
+      content="Sotto (getsotto) is an open-source, zero-knowledge secret manager for developer teams. Sync .env files, inject CLI secrets, self-host, or send one-time links."
+    />
+    <meta name="twitter:image" content="__SOTTO_PUBLIC_URL__/og-image.png" />
+    <meta
+      name="twitter:image:alt"
+      content="Sotto (getsotto.co.uk) - Open-source zero-knowledge secret manager for developer teams"
     />
     <link rel="canonical" href="__SOTTO_PUBLIC_URL__/" />
+    <link rel="alternate" type="text/plain" title="LLMs.txt" href="__SOTTO_PUBLIC_URL__/llms.txt" />
     <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0b0f17" />
     <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f8fafc" />
     <link rel="icon" href="/favicon.svg?v=20261101" type="image/svg+xml" />
@@ -32,33 +51,29 @@
     <link rel="icon" href="/favicon.ico?v=20261101" sizes="16x16 32x32 48x48" type="image/x-icon" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=20261101" />
     <link rel="manifest" href="/site.webmanifest" />
-    <title>Sotto: end-to-end encrypted secret sync</title>
+    <title>Sotto - Open-Source Encrypted Secret Manager for Developers</title>
     <script type="application/ld+json">
       {
         "@context": "https://schema.org",
         "@graph": [
           {
+            "@type": "WebSite",
+            "@id": "__SOTTO_PUBLIC_URL__/#website",
+            "url": "__SOTTO_PUBLIC_URL__/",
+            "name": "Sotto",
+            "alternateName": ["getsotto", "getsotto.co.uk", "Sotto Secret Manager"]
+          },
+          {
             "@type": "Organization",
             "@id": "__SOTTO_PUBLIC_URL__/#org",
             "name": "Sotto",
+            "alternateName": ["getsotto", "Sotto Secret Manager"],
             "url": "__SOTTO_PUBLIC_URL__/",
             "logo": "__SOTTO_PUBLIC_URL__/icon-512.png",
-            "sameAs": ["https://github.com/getsotto/sotto"]
-          },
-          {
-            "@type": "SoftwareApplication",
-            "name": "Sotto",
-            "url": "__SOTTO_PUBLIC_URL__/",
-            "applicationCategory": "DeveloperApplication",
-            "operatingSystem": ["macOS", "Linux"],
-            "offers": {
-              "@type": "AggregateOffer",
-              "lowPrice": "0",
-              "highPrice": "15",
-              "priceCurrency": "GBP",
-              "offerCount": "2"
-            },
-            "publisher": { "@id": "__SOTTO_PUBLIC_URL__/#org" }
+            "sameAs": [
+              "https://github.com/getsotto",
+              "https://github.com/getsotto/sotto"
+            ]
           }
         ]
       }

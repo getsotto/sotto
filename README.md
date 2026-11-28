@@ -10,7 +10,7 @@
 
 # Sotto
 
-End-to-end encrypted secret sync for developer teams. Stop Slacking your `.env`.
+Open-source, zero-knowledge secret manager and end-to-end encrypted secret sync for developer teams. Stop Slacking your `.env`.
 
 > [!WARNING]
 > Sotto is pre-1.0 and has **not** had a third-party cryptographic audit. It works end to end, but
@@ -293,6 +293,34 @@ sotto env copy dev staging --confirm  # apply the copy; never delete destination
 environment) or `>` (only in the second). Without `--confirm`, copying is a dry-run. A confirmed
 copy adds and updates secrets but leaves keys that exist only in the destination untouched.
 
+For scripts, use JSON instead of reading the listing's active marker:
+
+```sh
+sotto env ls --json
+```
+
+Illustrative output for a project with two local environments:
+
+```json
+[{"active":true,"name":"dev"},{"active":false,"name":"staging"}]
+```
+
+Each object has an environment `name` and an `active` flag. An empty list is `[]`.
+To select staging for this command only:
+
+```sh
+sotto --env staging env ls --json
+```
+
+Here, `active` marks staging instead of dev. This does not save a new default;
+use `sotto env use` for that, as described above. If the selected name is absent
+from the local list, every flag is false. The flag compares names; it does not
+prove access to an environment or successful decryption.
+
+This reads the configured project's local environment metadata without unlocking
+the vault or contacting the server. Unlike `sotto ls --json`, it lists environments,
+not secret names. Stdout contains the JSON result; diagnostics go to stderr.
+
 ### Project configuration
 
 `sotto init` and `sotto clone` write a `sotto.toml` in the current directory. It binds that
@@ -341,6 +369,42 @@ and leaves the file unchanged. See [Environments](#environments).
 theme, and the encrypted `store.db` that holds your vault. Neither belongs in a repository. See
 [Environment variables](#environment-variables) for `SOTTO_DATA_DIR`, and
 [Output themes](#output-themes) for each platform's default location.
+
+### List secret names
+
+From a configured project with an unlocked local identity, list the selected
+environment's secret names:
+
+```sh
+sotto ls
+```
+
+Example output for two synthetic names, sorted with one name per line:
+
+```text
+API_URL
+REGION
+```
+
+For scripts, use JSON. To select a different environment for just this command:
+
+```sh
+sotto ls --json
+sotto --env staging ls --json
+```
+
+Example JSON output for the same names:
+
+```json
+["API_URL","REGION"]
+```
+
+An empty environment prints no name lines, or `[]` with JSON. Removed secrets are
+omitted. This lists names only, not values or version numbers. `sotto env ls` lists
+environments instead; `sotto export` includes plaintext values.
+
+Listing reads the local store. It does not contact the server or pull newer changes.
+See [syncing another device](#another-device) if you need to update the local copy.
 
 ### Import a dotenv file
 
@@ -656,9 +720,32 @@ with code 2.
 Use `sotto --help` to request help explicitly.
 
 Use the arrow keys or `j` and `k` to navigate. Press `/` to search, `?` for help, Tab to switch to the next environment and Shift+Tab to switch to the previous one. This switch lasts only for the dashboard session; `sotto env use` changes the
-project's default. Press `r` to reveal or conceal the selected value, `c` to copy it to the
-clipboard, and `q` to quit. `Esc` closes the current search or dialog; from the main view, it
-clears an active search or quits.
+project's default. Press `r` to reveal or conceal the selected value, `R` to reload the current
+environment's local secrets, `c` to copy it to the clipboard, and `q` to quit. `Esc` closes the
+current search or dialog; from the main view, it clears an active search or quits.
+
+Press `h` to [browse and restore local secret history](LOCAL-HISTORY.md) (English guide).
+
+To create a secret from normal dashboard navigation (not while typing a search or
+editing a field):
+
+1. Press `n` to open New Secret.
+2. Enter a synthetic name such as `DEMO_API_KEY`, then press Tab to move to the value.
+3. Enter a dummy value such as `demo-only`, or press `Ctrl+G` to generate a replacement.
+4. Press `Enter` to save.
+
+In New mode, Tab and Shift+Tab move between the name and value fields. Select an
+existing secret and press `e` to edit its value; Edit does not rename it.
+New rejects an existing live name and leaves the dialogue open, so use Edit to update it.
+
+Values start masked. `Ctrl+R` shows or hides the draft value. `Ctrl+G` replaces it
+with a generated 32-character string, but does not save it. `Enter` saves the
+dialogue even from the name field; `Esc` discards the unsaved draft and closes it.
+This text editor cannot edit non-UTF-8 values; see [file-backed secrets](README.md#file-backed-secrets).
+
+Saving changes the selected local environment only. It does not sync to the server.
+To sync later, follow [the push guidance](README.md#quick-start) and use the same
+environment explicitly if you switched environments in the dashboard.
 
 Press `t` to browse themes with a live preview. Use the arrow keys to preview each theme, then
 press `Enter` to save your choice or `Esc` to cancel. The [theme precedence rules](#output-themes)

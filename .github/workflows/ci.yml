@@ -34,6 +34,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check the Access protocol fixture
+        run: cargo check --locked -p sotto-server --features e2e-access-protocol
       - name: Test
         # The server job runs the server and CLI suites against Postgres, so running them here as
         # well only repeated them with the database tests skipped. Clippy above still compiles
@@ -246,6 +248,21 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Server + end-to-end tests (with Postgres)
         run: cargo test -p sotto-server -p sotto-cli
+      - name: Exercise the production Access issuer through Caddy
+        timeout-minutes: 15
+        env:
+          GOTOOLCHAIN: auto
+        run: |
+          set -euo pipefail
+          caddy_bin="$RUNNER_TEMP/sotto-fixture-caddy"
+          postgres_image=postgres@sha256:07abc3f43c9395b0bdbbab36bc25ddb0e8d83cd4fcafb5fb7d6abe14ff156dd8
+          go run github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7 build v2.11.9 \
+            --with github.com/mholt/caddy-ratelimit@v0.1.0 --output "$caddy_bin"
+          cargo build --locked -p sotto-server --features e2e-mock-oauth
+          scripts/access-protocol-fixture --server target/debug/sotto-server --caddy "$caddy_bin" \
+            --postgres-image "$postgres_image" --production-issuer --check
+          scripts/access-protocol-fixture --server target/debug/sotto-server --caddy "$caddy_bin" \
+            --postgres-image "$postgres_image" --production-issuer --issuer-key-overlap --check
       - name: Server authorisation and transaction assurance
         # Select the same packages as the step above. The CLI enables reqwest's blocking feature,
         # so naming the server alone resolves different features and recompiles the server just
@@ -319,6 +336,10 @@ jobs:
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Validate the Access OpenAPI contract
+        run: |
+          python3 -m pip install openapi-spec-validator==0.9.0
+          python3 -m openapi_spec_validator contracts/access/v1.openapi.yaml
       - name: Build the server test binaries
         # Both runners give every cargo command a fixed timeout, starting with test discovery.
         # Compiling inside that window would turn a slow build into a reported scenario failure,
