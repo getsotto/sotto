@@ -8,7 +8,7 @@
 
 use dryoc::classic::crypto_kdf::crypto_kdf_derive_from_key;
 use dryoc::classic::crypto_pwhash::{crypto_pwhash, PasswordHashAlgorithm};
-use dryoc::generichash::{GenericHash, Key as GhKey};
+use dryoc::generichash::{DefaultGenericHash, Key as GhKey};
 use zeroize::Zeroize;
 
 use crate::error::Error;
@@ -42,7 +42,7 @@ pub fn derive_master_key(
     )?;
 
     let gh_key = GhKey::try_from(&a[..]).map_err(|_| Error::Crypto)?;
-    let out = GenericHash::hash_with_defaults_to_vec::<_, GhKey>(secret_key, Some(&gh_key))
+    let out = DefaultGenericHash::hash_to_vec::<_, GhKey>(secret_key, Some(&gh_key))
         .map_err(|_| Error::Crypto)?;
     a.zeroize();
 

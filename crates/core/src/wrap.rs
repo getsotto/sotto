@@ -71,7 +71,7 @@ pub fn keypair_from_secret(secret: &[u8; SECRET_KEY_LEN]) -> Keypair {
 pub fn open_sealed(keypair: &Keypair, sealed: &[u8]) -> Result<Vec<u8>, Error> {
     let kp = StackKeyPair::from_secret_key(SecretKey::from(keypair.secret));
     let boxed: VecBox = DryocBox::from_sealed_bytes(sealed)?;
-    Ok(boxed.unseal_to_vec(&kp)?)
+    Ok(boxed.open_to_vec(&kp)?)
 }
 
 /// Symmetric key length, in bytes.
